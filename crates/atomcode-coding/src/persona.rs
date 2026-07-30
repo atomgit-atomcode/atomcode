@@ -906,14 +906,16 @@ mod tests {
             p.contains("UNDERSTAND → SEARCH → PLAN"),
             "non-trivial workflow leads with UNDERSTAND: {p}"
         );
-        // The UNDERSTAND guideline ties intent to the plan / todowrite first items.
+        // The UNDERSTAND guideline ties intent to the task plan / its first items.
+        // Wording stays tool-agnostic here: RULES is injected unconditionally, so it must
+        // not name the env-gated `todowrite` tool (that lives in the gated TASK TRACKING).
         assert!(
             p.contains("pin down what the user actually wants"),
             "UNDERSTAND guideline present: {p}"
         );
         assert!(
             p.contains("its first items are the outcomes the user asked for"),
-            "understanding is carried by the todowrite plan: {p}"
+            "understanding is carried by the task plan: {p}"
         );
 
         // OUTPUT is reconciled: filler-restate still banned, plan-capture allowed.
