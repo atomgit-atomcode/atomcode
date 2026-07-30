@@ -371,7 +371,7 @@ verified. If space is running out, state plainly what is DONE and what still REM
 exact next steps) and keep going or hand off transparently — a false \"all done\" that \
 unravels the next time the user asks wastes their trust far more than an honest \"here is \
 what's left\".\n\
-- SIGNPOST BEFORE ACTING: before each batch of tool calls, say in ONE short sentence (no more than ~12 words) what you're about to do. A run of tool calls with zero text leaves the user blind. This is the required progress signpost, NOT the verbose reasoning banned elsewhere; 'Act decisively' / 'FINISH THE JOB' mean act WITH a one-line heads-up, never in silence.";
+- SIGNPOST BEFORE ACTING: before each batch of tool calls, say in ONE short sentence, in the user's language (no more than ~12 words), what you're about to do. A run of tool calls with zero text leaves the user blind. This is the required progress signpost, NOT the verbose reasoning banned elsewhere; 'Act decisively' / 'FINISH THE JOB' mean act WITH a one-line heads-up, never in silence.";
 
 /// The frozen date-anchor section appended to the persona. Pure (the date is INJECTED)
 /// so the formatting is unit-testable; `coding_persona` sources `today` from the wall
@@ -582,7 +582,7 @@ Operate only within the working directory shown in the session context — do no
 After creating or editing a preview/binary format (HTML, PDF, image, SVG), do NOT automatically open it in the user's browser or viewer — the file existing on disk is enough, and opening a window is a visible side effect the user may not want. Ask first (\"Want me to open it for preview?\") and open it only when the user explicitly asks. When opening local files or directories, call `open_file`; do not shell out to `open`, `xdg-open`, `start`, or `wslview`.
 
 ## PROGRESS SIGNPOSTS:
-Before a batch of tool calls, send ONE short line saying what you're about to do — a signpost the user follows along with, not a reasoning dump. Keep it to a single sentence (aim for 12 words or fewer). Group related actions into one signpost instead of narrating each call. After the first batch, connect briefly to what you just learned. Skip the signpost for a single trivial read (one file read or one lookup) unless it's part of a larger action. A run of tool calls with zero text leaves the user blind — that is worse than one plain line.
+Before a batch of tool calls, send ONE short line saying what you're about to do — a signpost the user follows along with, not a reasoning dump. Keep it to a single sentence (aim for 12 words or fewer). Group related actions into one signpost instead of narrating each call. After the first batch, connect briefly to what you just learned. Skip the signpost for a single trivial read (one file read or one lookup) unless it's part of a larger action. A run of tool calls with zero text leaves the user blind — that is worse than one plain line. Write the signpost in the user's language — a Chinese request gets a Chinese signpost.
 
 ## OUTPUT:
 When executing tasks: keep text brief and direct. Lead with action — a one-line signpost before a batch of tool calls (see PROGRESS SIGNPOSTS) is expected, but skip verbose reasoning and filler.
@@ -968,6 +968,12 @@ mod tests {
             frontier.contains("leaves the user blind"),
             "signpost rationale present: {frontier}"
         );
+        // Signpost must be produced in the user's language (Chinese request → Chinese
+        // signpost); reinforced at point-of-use since the signpost is the turn's first text.
+        assert!(
+            frontier.contains("Write the signpost in the user's language"),
+            "signpost binds to the user's language: {frontier}"
+        );
 
         // OUTPUT no longer nukes preamble: bare terse line gone, new reconciled form in.
         assert!(
@@ -995,6 +1001,10 @@ mod tests {
             deepseek.contains("SIGNPOST BEFORE ACTING"),
             "deepseek gets the firm signpost bullet: {deepseek}"
         );
+        assert!(
+            deepseek.contains("in the user's language"),
+            "deepseek firm signpost binds to the user's language: {deepseek}"
+        );
         let glm = coding_persona("glm-5.2", false, false);
         assert!(
             !glm.contains("SIGNPOST BEFORE ACTING"),
@@ -1007,7 +1017,7 @@ mod tests {
 
         // Boundary guards against a stray `\` welding sections/bullets together.
         assert!(
-            frontier.contains("plain line.\n\n## OUTPUT:"),
+            frontier.contains("Chinese signpost.\n\n## OUTPUT:"),
             "SIGNPOSTS section must end with a blank line before OUTPUT: {frontier}"
         );
         assert!(
