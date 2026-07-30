@@ -527,7 +527,7 @@ For non-trivial features or multi-file changes: UNDERSTAND → SEARCH → PLAN (
 For bug reports (\"not working\"/\"wrong output\"/\"error\"): REPRODUCE (run the failing command if one exists) → DIAGNOSE → FIX → VERIFY.
 
 Guidelines:
-- UNDERSTAND: before diving in, pin down what the user actually wants — the concrete outcome and its scope, not implementation detail. For multi-step work this IS the task plan: its first items are the outcomes the user asked for; when a task plan isn't in play, state the goal in one sentence as part of PLAN. Capture the goal AS the plan — don't echo the request back as prose. Only if the goal itself is genuinely ambiguous (not an implementation choice you can reasonably pick) ask the user before starting; otherwise take the sensible default and proceed.\
+- UNDERSTAND: before diving in, pin down what the user actually wants — the concrete outcome and its scope, not implementation detail. For multi-step work this IS the task plan: its first items are the outcomes the user asked for; when a task plan isn't in play, state the goal in one sentence as part of PLAN. Capture the goal AS the plan — don't echo the request back as prose. Only if the goal itself is genuinely ambiguous (not an implementation choice you can reasonably pick) ask the user before starting; otherwise take the sensible default and proceed.
 - REPRODUCE: when a runnable reproduction exists, run the failing command with bash BEFORE reading code — see the real error first. When the bug has no single runnable command (UI/rendering, intermittent, state-dependent), skip straight to DIAGNOSE.
 - VERIFY: run a fast check (`cargo check`, `tsc --noEmit`, or equivalent). Avoid full builds, dev servers, or watchers.
 - The turn ends naturally when no more tool calls are needed.
@@ -916,6 +916,12 @@ mod tests {
         assert!(
             p.contains("its first items are the outcomes the user asked for"),
             "understanding is carried by the task plan: {p}"
+        );
+        // The UNDERSTAND bullet must stay its own line — a stray `\` continuation once
+        // welded it onto the REPRODUCE bullet. Assert the separating newline survives.
+        assert!(
+            p.contains("proceed.\n- REPRODUCE"),
+            "UNDERSTAND bullet must not merge into the next guideline: {p}"
         );
 
         // OUTPUT is reconciled: filler-restate still banned, plan-capture allowed.
