@@ -150,6 +150,10 @@ fn sanitize_account_name(name: &str) -> String {
 struct EditForm {
     id: String,
     is_legacy: bool,
+    /// An unconfigured preset row has no persisted account yet. Keep its preset
+    /// id so save can materialize the account instead of reporting a no-op
+    /// success.
+    materialize_provider: Option<String>,
     preset_idx: usize,
     /// The preset the account started on — so save_edit rewrites the vendor ONLY
     /// when the user actually changed it (a no-op edit must not lossily normalize
@@ -158,6 +162,10 @@ struct EditForm {
     /// CodingPlan (AtomGit) account: gateway-managed, so only base_url is editable
     /// — the protocol and api_key are locked (rewriting them breaks the gateway).
     vendor_locked: bool,
+    /// A curated preset quick-add row has a fixed wire protocol. Its endpoint
+    /// and key are editable, but changing the protocol would turn (for example)
+    /// a DeepSeek row into an Anthropic-compatible account with a DeepSeek URL.
+    protocol_locked: bool,
     api_key: String,
     base_url: String,
     focus: FormField,
@@ -181,7 +189,11 @@ impl EditForm {
         if self.vendor_locked {
             return vec![FormField::BaseUrl];
         }
-        let mut v = vec![FormField::Preset, FormField::BaseUrl];
+        let mut v = Vec::new();
+        if !self.protocol_locked {
+            v.push(FormField::Preset);
+        }
+        v.push(FormField::BaseUrl);
         if !matches!(self.preset().auth_kind, provider_preset::AuthKind::None) {
             v.push(FormField::ApiKey);
         }
@@ -200,8 +212,8 @@ impl EditForm {
     }
 
     fn cycle_preset(&mut self, _forward: bool) {
-        if self.vendor_locked {
-            return; // gateway-managed — protocol not editable
+        if self.vendor_locked || self.protocol_locked {
+            return; // managed/curated vendor — protocol not editable
         }
         // Only two choices (OpenAI-compatible ↔ Anthropic-compatible), so both
         // directions just toggle. Neither ships a default endpoint, so base_url
@@ -674,6 +686,8 @@ impl ProviderPanel {
     fn open_edit(config: &Config, id: &str) -> EditForm {
         let is_legacy =
             !config.provider_accounts.contains_key(id) && config.providers.contains_key(id);
+        let configured_account = config.provider_accounts.get(id);
+        let virtual_preset = !is_legacy && configured_account.is_none();
         let (base_url, provider) = if is_legacy {
             let p = config.providers.get(id);
             (
@@ -681,12 +695,18 @@ impl ProviderPanel {
                 p.map(|p| p.provider_type.clone()).unwrap_or_default(),
             )
         } else {
-            let a = config.provider_accounts.get(id);
             (
-                a.and_then(|a| a.base_url.clone()),
-                a.map(|a| a.provider.clone()).unwrap_or_default(),
+                configured_account.and_then(|a| a.base_url.clone()),
+                configured_account
+                    .map(|a| a.provider.clone())
+                    .unwrap_or_else(|| id.to_string()),
             )
         };
+        let effective_base_url = base_url.or_else(|| {
+            provider_preset::preset(&provider)
+                .and_then(|preset| preset.default_base_url)
+                .map(str::to_string)
+        });
         // Map the stored provider to a protocol toggle (OpenAI/Anthropic
         // compatible). original == preset so a no-op edit leaves the real stored
         // provider (e.g. "deepseek"/"openai") untouched (see save_edit's guard).
@@ -699,13 +719,15 @@ impl ProviderPanel {
         EditForm {
             id: id.to_string(),
             is_legacy,
+            materialize_provider: virtual_preset.then_some(provider),
             preset_idx,
             original_preset_idx: preset_idx,
             vendor_locked,
+            protocol_locked: virtual_preset,
             api_key: String::new(),
-            base_url: base_url.unwrap_or_default(),
+            base_url: effective_base_url.unwrap_or_default(),
             // Locked accounts start on the only editable field.
-            focus: if vendor_locked {
+            focus: if vendor_locked || virtual_preset {
                 FormField::BaseUrl
             } else {
                 FormField::Preset
@@ -715,6 +737,18 @@ impl ProviderPanel {
 
     /// Apply an account edit in place (blank fields keep the current value), save.
     fn save_edit(&self, form: &EditForm, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> bool {
+        let mut desired = ctx.config.clone();
+        Self::apply_account_edit(form, &mut desired);
+        save_and_reload(
+            ctx,
+            desired,
+            renderer,
+            crate::i18n::t(crate::i18n::Msg::ProviderUpdated { name: &form.id }).into_owned(),
+            true,
+        )
+    }
+
+    fn apply_account_edit(form: &EditForm, desired: &mut Config) {
         let api_key = form.api_key.trim();
         let base_url = form.base_url.trim();
         let preset = form.preset();
@@ -723,10 +757,11 @@ impl ProviderPanel {
         // `deepseek`/custom provider to the fallback preset, and a CodingPlan
         // account's wire must never change. When the new preset is keyless, drop
         // any stale api_key.
-        let vendor_changed = !form.vendor_locked && form.preset_idx != form.original_preset_idx;
+        let vendor_changed = !form.vendor_locked
+            && !form.protocol_locked
+            && form.preset_idx != form.original_preset_idx;
         let clear_key =
             vendor_changed && matches!(preset.auth_kind, provider_preset::AuthKind::None);
-        let mut desired = ctx.config.clone();
         if form.is_legacy {
             if let Some(p) = desired.providers.get_mut(&form.id) {
                 if vendor_changed {
@@ -753,16 +788,36 @@ impl ProviderPanel {
                 a.api_key = Some(api_key.to_string());
             }
             if !base_url.is_empty() {
-                a.base_url = Some(base_url.to_string());
+                let default = provider_preset::preset(&a.provider).and_then(|p| p.default_base_url);
+                a.base_url = (Some(base_url) != default).then(|| base_url.to_string());
             }
+        } else if let Some(original_provider) = &form.materialize_provider {
+            let provider = if vendor_changed {
+                preset.id.to_string()
+            } else {
+                original_provider.clone()
+            };
+            let provider_default =
+                provider_preset::preset(&provider).and_then(|p| p.default_base_url);
+            desired.provider_accounts.insert(
+                form.id.clone(),
+                ProviderAccountConfig {
+                    provider,
+                    display_name: None,
+                    api_key: (!api_key.is_empty()).then(|| api_key.to_string()),
+                    base_url: (!base_url.is_empty() && Some(base_url) != provider_default)
+                        .then(|| base_url.to_string()),
+                    user_agent: None,
+                    skip_tls_verify: false,
+                    enterprise_url: None,
+                    ephemeral: false,
+                },
+            );
         }
-        save_and_reload(
-            ctx,
-            desired,
-            renderer,
-            crate::i18n::t(crate::i18n::Msg::ProviderUpdated { name: &form.id }).into_owned(),
-            true,
-        )
+    }
+
+    fn is_virtual_account_row(config: &Config, id: &str) -> bool {
+        !config.provider_accounts.contains_key(id) && !config.providers.contains_key(id)
     }
 
     /// Add a model to an existing account, or edit an existing model's wire name
@@ -1126,9 +1181,14 @@ impl Modal for ProviderPanel {
                     .filter(|i| i != ADD_PROVIDER_ROW)
                 {
                     let is_account = self.tab == Tab::Accounts;
+                    let is_virtual_preset =
+                        is_account && Self::is_virtual_account_row(&ctx.config, &id);
                     // The CodingPlan (AtomGit) provider is managed by /login and
-                    // can't be deleted here.
-                    if is_account && atomcode_config::config::is_codingplan_provider_name(&id) {
+                    // can't be deleted here. Unconfigured preset rows likewise
+                    // have no persisted object to delete.
+                    if is_virtual_preset
+                        || (is_account && atomcode_config::config::is_codingplan_provider_name(&id))
+                    {
                         self.pending_delete = None;
                     } else if self.confirm_double_delete(&id, is_account)
                         && self.commit_delete(&id, is_account, ctx, renderer)
@@ -1359,8 +1419,9 @@ impl Modal for ProviderPanel {
                 ));
                 items.push((String::new(), String::new()));
                 let p = form.preset();
-                if form.vendor_locked {
-                    // Gateway-managed: protocol read-only, no api_key.
+                if form.vendor_locked || form.protocol_locked {
+                    // Gateway-managed accounts lock protocol + key; curated
+                    // preset rows lock only the protocol.
                     items.push((
                         format!("  协议: {} (锁定)", form.protocol_label()),
                         String::new(),
@@ -1394,6 +1455,8 @@ impl Modal for ProviderPanel {
                 }
                 hint = if form.vendor_locked {
                     "Tab 下一项  ↵ 保存  Esc 返回  （CodingPlan 仅可改 base_url）".into()
+                } else if form.protocol_locked {
+                    "Tab 下一项  ↵ 保存  Esc 返回  （厂商协议已锁定）".into()
                 } else {
                     "Tab 下一项  ←→ 切协议  ↵ 保存  Esc 返回".into()
                 };
@@ -1558,6 +1621,74 @@ mod tests {
     }
 
     #[test]
+    fn open_edit_prefills_and_materializes_virtual_preset_account() {
+        let mut cfg = Config::default();
+        let mut edit = ProviderPanel::open_edit(&cfg, "deepseek");
+
+        assert_eq!(edit.base_url, "https://api.deepseek.com/v1");
+        assert_eq!(edit.materialize_provider.as_deref(), Some("deepseek"));
+        assert!(edit.protocol_locked);
+        assert!(!edit.fields().contains(&FormField::Preset));
+        assert!(edit.fields().contains(&FormField::ApiKey));
+        let original_preset = edit.preset_idx;
+        edit.cycle_preset(true);
+        assert_eq!(
+            edit.preset_idx, original_preset,
+            "curated vendor protocol must stay locked"
+        );
+        edit.api_key = "sk-test".into();
+        ProviderPanel::apply_account_edit(&edit, &mut cfg);
+
+        let account = cfg
+            .provider_accounts
+            .get("deepseek")
+            .expect("editing a virtual preset must create its account");
+        assert_eq!(account.provider, "deepseek");
+        assert_eq!(account.api_key.as_deref(), Some("sk-test"));
+        assert!(
+            account.base_url.is_none(),
+            "the preset default need not be duplicated in persisted config"
+        );
+    }
+
+    #[test]
+    fn configured_account_without_override_edits_with_preset_default_url() {
+        let mut cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "main": { "provider": "openai" } }
+        }))
+        .unwrap();
+
+        let edit = ProviderPanel::open_edit(&cfg, "main");
+        assert_eq!(edit.base_url, "https://api.openai.com/v1");
+        assert!(edit.materialize_provider.is_none());
+        ProviderPanel::apply_account_edit(&edit, &mut cfg);
+        assert!(
+            cfg.provider_accounts["main"].base_url.is_none(),
+            "a no-op edit should keep using the preset instead of persisting its default"
+        );
+    }
+
+    #[test]
+    fn only_unconfigured_rows_are_virtual_accounts() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "configured": { "provider": "deepseek" } },
+            "providers": {
+                "legacy": {
+                    "type": "openai",
+                    "base_url": "https://legacy/v1",
+                    "model": "m",
+                    "context_window": 8000
+                }
+            }
+        }))
+        .unwrap();
+
+        assert!(ProviderPanel::is_virtual_account_row(&cfg, "deepseek"));
+        assert!(!ProviderPanel::is_virtual_account_row(&cfg, "configured"));
+        assert!(!ProviderPanel::is_virtual_account_row(&cfg, "legacy"));
+    }
+
+    #[test]
     fn model_form_add_vs_edit() {
         let cfg: Config = serde_json::from_value(serde_json::json!({
             "provider_accounts": { "acc": { "provider": "deepseek" } },
@@ -1611,9 +1742,11 @@ mod tests {
         let mut edit = EditForm {
             id: "account".into(),
             is_legacy: false,
+            materialize_provider: None,
             preset_idx: compat_preset_idx(false),
             original_preset_idx: compat_preset_idx(false),
             vendor_locked: false,
+            protocol_locked: false,
             api_key: String::new(),
             base_url: String::new(),
             focus: FormField::ApiKey,
