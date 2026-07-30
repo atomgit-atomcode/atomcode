@@ -1001,8 +1001,10 @@ mod tests {
             deepseek.contains("SIGNPOST BEFORE ACTING"),
             "deepseek gets the firm signpost bullet: {deepseek}"
         );
+        // FIRM-bullet-specific phrase — NOT the bare "in the user's language", which the
+        // universal SIGNPOSTS section (also in deepseek's persona) would satisfy on its own.
         assert!(
-            deepseek.contains("in the user's language"),
+            deepseek.contains("in ONE short sentence, in the user's language"),
             "deepseek firm signpost binds to the user's language: {deepseek}"
         );
         let glm = coding_persona("glm-5.2", false, false);
