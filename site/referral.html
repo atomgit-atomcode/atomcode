@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="referrer" content="strict-origin-when-cross-origin">
-<title>邀请有礼 · AtomCode</title>
-<meta name="description" content="邀请开发者安装并使用 AtomCode，按每月（4周）结算安装与活跃奖励。">
+<title>「邀请有礼」裂变计划活动结束公告 · AtomCode</title>
+<meta name="description" content="「邀请有礼」裂变计划收官说明与最终结算、数据留存及奖励申诉安排。">
 <link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
 <style>
   *,*::before,*::after{box-sizing:border-box}
@@ -84,7 +84,7 @@
   .spinner{width:32px;height:32px;border:3px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;margin:70px auto}
   @keyframes spin{to{transform:rotate(360deg)}}
 
-  .panel,.leaderboard,.rules{border:1px solid rgba(255,255,255,.16);background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,.02));border-radius:12px;box-shadow:0 22px 60px rgba(0,0,0,.34);overflow:hidden}
+  .panel,.announcement-card,.resource-card{border:1px solid rgba(255,255,255,.16);background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,.02));border-radius:12px;box-shadow:0 22px 60px rgba(0,0,0,.34);overflow:hidden}
   .panel{margin-bottom:34px}
   .panel-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:17px 24px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.025)}
   .panel-title{display:flex;align-items:center;gap:10px;font-size:16px;font-weight:700;color:#fff}
@@ -129,39 +129,34 @@
 
   .section-bar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:30px 0 12px}
   .section-title{display:flex;align-items:center;gap:10px;font-size:22px;font-weight:800;letter-spacing:-.3px}
-  .section-title .mark{color:var(--accent);font-family:var(--mono)}
+  .section-title .mark{color:#2f8cff;font-family:var(--mono)}
   .section-hint{margin-top:6px;color:var(--faint);font-size:12px}
-  .period{display:flex;align-items:center;gap:10px;padding:6px 8px;border:1px solid var(--line);border-radius:9px;background:rgba(255,255,255,.035);font-size:12px;color:var(--muted);white-space:nowrap}
-  .period b{display:inline-flex;align-items:center;min-height:28px;padding:0 4px;color:#fff}
-  .period-arrow{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border:1px solid rgba(255,255,255,.18);border-radius:7px;background:rgba(255,255,255,.06);color:rgba(255,255,255,.76);font-size:13px;line-height:1;cursor:pointer;transition:background .2s,color .2s,border-color .2s,box-shadow .2s}
-  .period-arrow:hover{color:#fff;border-color:rgba(232,160,80,.55);background:rgba(232,160,80,.14);box-shadow:0 0 0 3px rgba(232,160,80,.10)}
-
-  .leaderboard{margin-bottom:20px}
-  .rank-table{width:100%;border-collapse:collapse;font-size:13px}
-  .rank-table th{padding:14px 16px;text-align:left;border-bottom:1px solid var(--line);background:rgba(255,255,255,.025);color:var(--muted);font-size:12px;font-weight:600;white-space:nowrap}
-  .rank-table td{padding:15px 16px;border-bottom:1px solid rgba(255,255,255,.075);color:rgba(255,255,255,.78);font-variant-numeric:tabular-nums}
-  .rank-table tr:last-child td{border-bottom:none}
-  .rank-table .mono{font-family:var(--mono)}
-  .rank-table .num-blue{color:#2f8cff;font-weight:700}.rank-table .num-green{color:#0fa85b;font-weight:700}.rank-table .money{color:var(--accent);font-weight:800}
-  .rank-table tr.me td{background:rgba(47,140,255,.15)}
-  .rank-table tr.blocked td{background:rgba(255,110,110,.30)}
-  .rank{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:4px;border:1px solid var(--line);font-family:var(--mono);font-size:12px;color:var(--muted);background:rgba(255,255,255,.04)}
-  .rank.top1{color:#f5bd4f;background:rgba(232,160,80,.18);border-color:rgba(232,160,80,.45)}
-  .rank.top2{color:#cdd6e4;background:rgba(255,255,255,.10)}.rank.top3{color:#df8753;background:rgba(183,65,14,.20);border-color:rgba(183,65,14,.45)}
-  .me-badge{display:inline-flex;margin-left:8px;padding:2px 6px;border-radius:4px;background:rgba(47,140,255,.25);color:#8fb9ff;font-size:10px}
-  .rate-bad{display:inline-flex;padding:4px 8px;border-radius:4px;border:1px solid rgba(255,110,110,.45);background:rgba(255,110,110,.12);color:#ff6868;font-family:var(--mono);font-size:12px}
-  .status-ok{color:var(--muted)}.status-bad{color:#ff4f4f;font-size:12px}
-  .sep-dots{text-align:center;padding:6px 0;color:var(--faint);font-size:16px;letter-spacing:6px}
-  .empty{padding:30px;text-align:center;color:var(--muted);font-size:13px}
-
-  .rules{padding:18px 22px;margin-top:18px}
-  .rules-title{display:flex;align-items:center;gap:10px;margin-bottom:8px;font-size:15px;font-weight:700}
-  .rules-title .info{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;background:#2f8cff;color:#fff;font-family:var(--mono);font-size:11px}
-  .rules p,.rules li{color:var(--muted);font-size:13px;line-height:1.75}
-  .rules p{margin:0}
-  .rules ul{margin:6px 0 0;padding-left:20px}
-  .rules code{padding:2px 6px;border-radius:4px;background:#050505;border:1px solid rgba(255,255,255,.12);color:#fff;font-family:var(--mono);font-size:12px}
-  .rules .red{color:#ff4f4f;font-weight:700}
+  .announcement-date{padding:8px 12px;border:1px solid var(--line);border-radius:8px;background:rgba(255,255,255,.035);font-size:12px;color:var(--muted);white-space:nowrap}
+  .announcement-date b{color:#fff;font-weight:500}
+  .announcement-card{margin-bottom:18px}
+  .announcement-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 24px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.025)}
+  .announcement-title{display:flex;align-items:center;gap:12px;font-size:16px;font-weight:700}
+  .announcement-title .flag{color:#f0b429}
+  .announcement-audience{font-size:12px;color:var(--faint)}
+  .announcement-body{padding:26px 24px 22px;color:rgba(255,255,255,.75);font-size:14px;line-height:1.8}
+  .announcement-body p{margin:0 0 18px}
+  .announcement-body strong{color:#fff}
+  .announcement-body .deadline{color:#f0b429}
+  .announcement-items{display:grid;gap:12px;margin:20px 0}
+  .announcement-item{display:grid;grid-template-columns:22px 1fr;column-gap:10px;padding:16px;border:1px solid var(--line);border-radius:10px;background:rgba(0,0,0,.12)}
+  .announcement-item .item-icon{grid-row:1 / span 2;font-size:15px;line-height:1.5}
+  .announcement-item h3{margin:0 0 3px;font-size:14px;color:#fff}
+  .announcement-item p{margin:0;color:var(--muted);font-size:12px;line-height:1.75}
+  .announcement-item.stop .item-icon{color:#ff4f4f}.announcement-item.settlement .item-icon{color:#f0b429}.announcement-item.retention .item-icon{color:#2f8cff}.announcement-item.appeal .item-icon{color:#32b85c}
+  .announcement-body a{color:#2f8cff}
+  .announcement-signature{margin-top:24px;padding-top:18px;border-top:1px solid var(--line);text-align:right;color:#fff}
+  .announcement-signature span{display:block;margin-top:2px;color:var(--faint);font-size:12px}
+  .resource-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  .resource-card{display:block;padding:20px;box-shadow:none;transition:border-color .2s,transform .2s,background .2s}
+  .resource-card:hover{transform:translateY(-2px);border-color:rgba(47,140,255,.55);background:rgba(47,140,255,.06)}
+  .resource-card .resource-icon{display:block;margin-bottom:13px;color:#2f8cff;font-size:18px}
+  .resource-card h3{margin:0 0 5px;font-size:15px}
+  .resource-card p{margin:0;color:var(--faint);font-size:12px;line-height:1.6}
   .error-msg{margin:16px 0 0;padding:14px 16px;border:1px solid rgba(255,110,110,.3);border-radius:8px;background:rgba(255,110,110,.1);color:var(--red);font-size:13px}
   .retry-btn{margin-top:14px;height:34px;padding:0 16px;border:1px solid var(--line);border-radius:6px;background:rgba(255,255,255,.08);color:#fff}
 
@@ -176,24 +171,24 @@
   html.light .btn-pill.primary{background:var(--accent);color:#000;border-color:var(--accent)}html.light .btn-pill.primary:hover{background:#0d0d0d;color:#f6f3ec;border-color:#0d0d0d}
   html.light .main::before{background:radial-gradient(ellipse 72% 46% at 50% 0%,rgba(232,160,80,.16),transparent 62%),repeating-linear-gradient(transparent 0,transparent 39px,rgba(0,0,0,.025) 40px)}
   html.light h1{background:linear-gradient(180deg,#171717,#5d6470);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-  html.light .sub,html.light .login-card p,html.light .cmd-label,html.light .section-hint,html.light .rules p,html.light .rules li{color:rgba(0,0,0,.58)}
-  html.light .panel,html.light .leaderboard,html.light .rules{border-color:rgba(0,0,0,.14);background:linear-gradient(180deg,rgba(255,255,255,.72),rgba(255,255,255,.42));box-shadow:0 22px 60px rgba(0,0,0,.10)}
-  html.light .panel-head,html.light .rank-table th{background:rgba(0,0,0,.025);border-color:rgba(0,0,0,.10)}
-  html.light .panel-title,html.light .section-title,html.light .user-name,html.light .period b{color:#0d0d0d}
-  html.light .panel-meta,html.light .user-id,html.light .metric-label,html.light .metric-note,html.light .rank-table th{color:rgba(0,0,0,.48)}
-  html.light .period{color:rgba(0,0,0,.62);border-color:rgba(0,0,0,.16);background:rgba(255,255,255,.64);box-shadow:0 8px 24px rgba(0,0,0,.06)}
-  html.light .period-arrow{color:#8a4f12;border-color:rgba(200,118,24,.38);background:rgba(200,118,24,.12)}
-  html.light .period-arrow:hover{color:#fff;border-color:#c87618;background:#c87618;box-shadow:0 0 0 3px rgba(200,118,24,.16)}
+  html.light .sub,html.light .login-card p,html.light .cmd-label,html.light .section-hint{color:rgba(0,0,0,.58)}
+  html.light .panel,html.light .announcement-card,html.light .resource-card{border-color:rgba(0,0,0,.14);background:linear-gradient(180deg,rgba(255,255,255,.72),rgba(255,255,255,.42));box-shadow:0 22px 60px rgba(0,0,0,.10)}
+  html.light .panel-head,html.light .announcement-head{background:rgba(0,0,0,.025);border-color:rgba(0,0,0,.10)}
+  html.light .panel-title,html.light .section-title,html.light .user-name,html.light .announcement-title,html.light .announcement-body strong,html.light .announcement-item h3,html.light .resource-card h3,html.light .announcement-date b{color:#0d0d0d}
+  html.light .panel-meta,html.light .user-id,html.light .metric-label,html.light .metric-note{color:rgba(0,0,0,.48)}
+  html.light .announcement-date{color:rgba(0,0,0,.58);border-color:rgba(0,0,0,.14);background:rgba(255,255,255,.5)}
+  html.light .announcement-body{color:rgba(0,0,0,.7)}
+  html.light .announcement-item{border-color:rgba(0,0,0,.12);background:rgba(255,255,255,.45)}
+  html.light .announcement-item p{color:rgba(0,0,0,.58)}
+  html.light .announcement-signature{color:#0d0d0d;border-color:rgba(0,0,0,.10)}
+  html.light .resource-card:hover{border-color:rgba(47,140,255,.45);background:rgba(47,140,255,.08)}
   html.light .invite-link-box{background:#fff;border-color:rgba(0,0,0,.10)}
   html.light .invite-url{color:#1f6fd1}
   html.light .invite-link-box .copy-btn{background:rgba(200,118,24,.10);border-color:rgba(200,118,24,.34);color:#9b5d14}
   html.light .invite-link-box .copy-btn:hover{background:#c87618;border-color:#c87618;color:#fff}
   html.light .invite-link-box .copy-btn.copied{background:var(--green);border-color:var(--green);color:#000}
-  html.light .rules code{color:#0d0d0d;background:rgba(0,0,0,.035);border-color:rgba(0,0,0,.12)}
   html.light .metric{background:rgba(255,255,255,.5);border-color:rgba(0,0,0,.12)}
   html.light .metric-value{color:#0d0d0d}.metric-value.blue{color:#2f8cff}.metric-value.red{color:#ff4f4f}.metric-value.gold{color:var(--accent)}
-  html.light .rank-table td{color:rgba(0,0,0,.72);border-bottom-color:rgba(0,0,0,.08)}
-  html.light .rank-table tr.me td{background:rgba(47,140,255,.12)}html.light .rank-table tr.blocked td{background:rgba(255,110,110,.18)}
   html.light .toast{background:rgba(255,255,255,.98);color:#0d0d0d;border-color:#c87618;box-shadow:0 14px 36px rgba(0,0,0,.16)}
   html.light .toast.error{border-color:#d83d3d}
   html.light .mb-drawer{background:rgba(246,243,236,.97)}html.light .mb-drawer a{color:rgba(0,0,0,.72);border-color:rgba(0,0,0,.08)}html.light .mb-drawer a:hover{color:#0d0d0d}
@@ -203,13 +198,18 @@
     .hdr-nav{display:none}.hdr-right .btn-pill{display:none}.mb-toggle{display:inline-flex}
     .hdr{padding:0 18px}.main{padding:96px 18px 54px}
     h1{font-size:34px}.metrics{grid-template-columns:repeat(2,1fr)}
-    .rank-wrap{overflow-x:auto}.rank-table{min-width:820px}
   }
   @media (max-width:640px){
     .panel-head,.section-bar{align-items:flex-start;flex-direction:column}
-    .panel-body{padding:18px}.metrics{grid-template-columns:1fr}
+    .panel-body{padding:18px}.metrics,.resource-grid{grid-template-columns:1fr}
     .invite-link-box{padding:12px 14px}.invite-url{font-size:13px}
+    .ver{display:none}
+    h1,.panel-title,.announcement-title{overflow-wrap:anywhere}
     .invite-code{font-size:24px;max-width:100%;word-break:break-all}.sub{font-size:13px}
+    .announcement-head{align-items:flex-start;flex-direction:column;padding:16px 18px}
+    .announcement-body{padding:20px 18px;font-size:13px}
+    .announcement-item{grid-template-columns:18px minmax(0,1fr);padding:14px}
+    .announcement-item p{overflow-wrap:anywhere}
   }
 
   /* ---------- payment-info button ---------- */
@@ -324,9 +324,9 @@
 <main class="main">
   <div class="wrap">
     <section class="hero">
-      <div class="badge"><span class="dot"></span><span data-i18n="hero.badge">长期进行中•每月（4周）汇总结算</span></div>
-      <h1 data-i18n="hero.title">邀请有礼：AtomCode 星推官计划</h1>
-      <p class="sub" data-i18n="hero.sub">获取您的官网邀请链接，邀请开发者安装并使用 AtomCode。高转化享双倍京东E卡奖励，排行榜每周公示。</p>
+      <div class="badge"><span class="dot"></span><span data-i18n="hero.badge">活动将于 2026.07.31 23:59 正式收官</span></div>
+      <h1 data-i18n="hero.title">邀请有礼 · AtomCode 裂变计划</h1>
+      <p class="sub" data-i18n="hero.sub">感谢每一位推广者与新用户的信任和参与。请查看活动收官说明与后续安排。</p>
     </section>
 
     <div id="loading-state" class="state active"><div class="spinner"></div></div>
@@ -345,8 +345,7 @@
           <button class="login-btn" onclick="login()" data-magnetic data-i18n="login.btn">使用 AtomGit 账号登录</button>
         </div>
       </section>
-      <div id="public-board"></div>
-      <div id="public-rules"></div>
+      <div id="public-announcement" data-announcement></div>
     </div>
 
     <div id="auth-no-code-state" class="state">
@@ -372,8 +371,7 @@
           <p id="gen-error" class="error-msg" style="display:none"></p>
         </div>
       </section>
-      <div id="no-code-board"></div>
-      <div id="no-code-rules"></div>
+      <div id="no-code-announcement" data-announcement></div>
     </div>
 
     <div id="auth-code-state" class="state">
@@ -407,8 +405,7 @@
           </div>
         </div>
       </section>
-      <div id="board-content"></div>
-      <div id="rules-content"></div>
+      <div id="announcement-content" data-announcement></div>
     </div>
 
     <div id="error-state" class="state">
@@ -459,13 +456,12 @@ const T = {
   'theme.to.light': { zh: '切换到浅色模式', en: 'Switch to light' },
   'lang.to.en': { zh: '切换到 English', en: 'Switch to English' },
   'lang.to.zh': { zh: '切换到 简体中文', en: 'Switch to Chinese' },
-  'hero.badge': { zh: '长期进行中•每月（4周）汇总结算', en: 'Ongoing • Monthly (4-week) settlement summary' },
-  'hero.title': { zh: '邀请有礼：AtomCode 星推官计划', en: 'Referral Rewards: AtomCode Star Promoter Program' },
-  'hero.sub': { zh: '获取您的官网邀请链接，邀请开发者安装并使用 AtomCode。高转化享双倍京东E卡奖励，排行榜每周公示。', en: 'Get your official invite link and invite developers to install and use AtomCode. High conversion earns double JD E-Card rewards, with weekly leaderboard updates.' },
+  'hero.badge': { zh: '活动将于 2026.07.31 23:59 正式收官', en: 'Program ends at 23:59 on July 31, 2026' },
+  'hero.title': { zh: '邀请有礼 · AtomCode 裂变计划', en: 'Referral Rewards · AtomCode Referral Program' },
+  'hero.sub': { zh: '感谢每一位推广者与新用户的信任和参与。请查看活动收官说明与后续安排。', en: 'Thank you to every promoter and new user for your trust and participation. See the closure notice and follow-up arrangements below.' },
   'panel.login.title': { zh: '登录后领取专属邀请链接', en: 'Sign in to get your invite link' },
   'panel.mine': { zh: '我的专属邀请面板', en: 'My Referral Dashboard' },
   'panel.meta.prefix': { zh: '数据更新时间：', en: 'Updated: ' },
-  'time.now': { zh: '刚刚', en: 'just now' },
   'login.desc': { zh: '使用 AtomGit 账号登录后即可生成邀请码，并查看本周邀请、活跃和预计结算金额。', en: 'Sign in with AtomGit to generate your invite code and view this week\'s installs, active users, and estimated settlement.' },
   'login.btn': { zh: '使用 AtomGit 账号登录', en: 'Sign in with AtomGit' },
   'logout': { zh: '退出', en: 'Log out' },
@@ -491,36 +487,38 @@ const T = {
   'toast.lang.zh': { zh: '已切换到 简体中文', en: 'Switched to 简体中文' },
   'toast.lang.en': { zh: '已切换到 English', en: 'Switched to English' },
   'toast.copied': { zh: '✓ 已复制 · 粘贴到终端运行', en: '✓ Copied · paste into your terminal' },
-  'board.empty': { zh: '本周排行榜暂无数据', en: 'No leaderboard data this week' },
-  'board.title': { zh: '每周邀请风云榜', en: 'Weekly Referral Leaderboard' },
-  'board.hint': { zh: '按"本周新增活跃设备数"降序排列。每周日 23:59截榜', en: 'Sorted by new active devices this week. Cutoff is Sunday 23:59.' },
-  'board.prev': { zh: '上一周', en: 'Previous week' },
-  'board.next': { zh: '下一周', en: 'Next week' },
-  'board.week.label': { zh: '第 {week} 周 ({range})', en: 'Week {week} ({range})' },
-  'board.rank': { zh: '排名', en: 'Rank' },
-  'board.promoter': { zh: '推广者昵称', en: 'Promoter' },
-  'board.devices': { zh: '设备安装 (A)', en: 'Installs (A)' },
-  'board.active': { zh: '活跃设备 (B)', en: 'Active (B)' },
-  'board.rate': { zh: '转化率 (R)', en: 'Rate (R)' },
-  'board.amount': { zh: '预估结算金额', en: 'Estimated settlement' },
-  'board.status': { zh: '状态', en: 'Status' },
-  'board.me': { zh: '我', en: 'Me' },
-  'status.blocked': { zh: '触发熔断，仅结算活跃', en: 'Quality guard triggered; active only' },
-  'status.normal': { zh: '正常结算', en: 'Normal settlement' },
-  'status.pending': { zh: '审核中', en: 'Under review' },
-  'rules.title': { zh: '结算规则与防刷熔断说明', en: 'Settlement Rules and Quality Guard' },
-  'rules.desc': { zh: '为保障社区健康发展，系统自动计算安装与活跃的转化率（R = 活跃数/安装数）。', en: 'To keep the community healthy, the system calculates conversion automatically (R = active / installs).' },
-  'rules.good': { zh: '当 <b>R ≥ 25%</b> 时，视为优质推广，结算公式为：<code>安装数×2元 + 活跃数×5元</code>', en: 'When <b>R ≥ 25%</b>, it is counted as quality promotion: <code>installs×2 + active×5</code>.' },
-  'rules.bad': { zh: '当 <span class="red">R &lt; 25%</span> 时，触发质量防刷熔断，安装量清零，仅保留有效活跃结算：<code>活跃数×5元</code>', en: 'When <span class="red">R &lt; 25%</span>, the quality guard is triggered: installs are cleared and only active referrals count: <code>active×5</code>.' },
-  'rules.cash': { zh: '所有京东E卡奖励每月（4周）汇总结算，并于第五周统一完成上一周期的京东E卡发放，请及时填写接收信息。', en: 'All JD E-Card rewards are summarized and settled monthly (4 weeks), and JD E-Cards for the previous cycle will be issued together in the fifth week. Please fill in your receipt details promptly.' },
-  'rules.anti.title': { zh: '严禁以下作弊行为', en: 'The following cheating behaviors are strictly prohibited:' },
-  'rules.anti.1': { zh: '使用虚拟机、模拟器、设备指纹修改工具等在同一台物理设备上重复安装激活。', en: 'Using VMs, emulators, or device fingerprint spoofing tools to repeatedly install and activate on the same physical device.' },
-  'rules.anti.2': { zh: '批量注册虚假账号、使用自动化脚本刷量。', en: 'Registering fake accounts in bulk or using automated scripts to inflate numbers.' },
-  'rules.anti.3': { zh: '通过机房 IP、公共代理、云服务器（VPS）等高风险网络环境恶意挂机。', en: 'Maliciously idling via high-risk network environments such as data center IPs, public proxies, or cloud servers (VPS).' },
-  'rules.anti.penalty': { zh: '处罚措施：系统识别到中高风险样本后，该笔奖励将自动转入人工深度审核队列，审核耗时可能延长。一经核实为恶意刷量，平台有权清空该邀请人的全部未发放奖励、收回邀请资格，情节严重者将依法封禁 AtomCode 账号。', en: 'Penalties: When the system detects medium-to-high risk samples, the reward will be automatically routed to a manual deep review queue, which may delay processing. Once confirmed as fraudulent, the platform reserves the right to forfeit all unpaid rewards of the inviter, revoke their invitation eligibility, and in severe cases, ban the AtomCode account in accordance with the law.' },
-  'rules.jd.title': { zh: '发放规则：京东E卡', en: 'Distribution Rules: JD E-Card' },
-  'rules.jd.cycle': { zh: '结算周期：每月（4周）汇总结算，并于第五周统一完成上一周期的京东E卡发放。', en: 'Settlement cycle: rewards are summarized every month (4 weeks), and JD E-Cards for the previous cycle are issued together in the fifth week.' },
-  'rules.jd.amount': { zh: '金额规则：单期发放金额向下取10的整数倍，结余部分将自动滚入下一结算池。', en: 'Amount rule: the issued amount per period is rounded down to the nearest multiple of 10; any remainder automatically rolls over into the next settlement pool.' },
+  'announcement.section.title': { zh: '活动公告', en: 'Program Notice' },
+  'announcement.section.hint': { zh: '「邀请有礼」裂变计划收官说明与后续安排。', en: 'Closure notice and follow-up arrangements for the Referral Rewards program.' },
+  'announcement.date.label': { zh: '公告日期：', en: 'Published: ' },
+  'announcement.date': { zh: '2026.07.30', en: '2026.07.30' },
+  'announcement.title': { zh: '「邀请有礼」裂变计划活动结束公告', en: 'Referral Rewards Program Closure Notice' },
+  'announcement.audience': { zh: '致全体推广者', en: 'To all promoters' },
+  'announcement.greeting': { zh: '亲爱的各位开发者、推广者朋友：', en: 'Dear developers and promoters,' },
+  'announcement.intro': { zh: '自「邀请有礼 · AtomCode 裂变计划」正式启动以来，我们共同走过了 9 个结算周。在这段时间里，感谢每一位推广者把 AtomCode 带给身边的开发者，也感谢每一位新用户对我们的信任与耐心。', en: 'Since the Referral Rewards · AtomCode Referral Program began, we have completed nine settlement weeks together. We thank every promoter who introduced AtomCode to fellow developers, and every new user for your trust and patience.' },
+  'announcement.closure.prefix': { zh: '经团队评估，本次活动将于', en: 'Following a team review, the program will officially conclude at' },
+  'announcement.closure.time': { zh: '2026 年 7 月 31 日 23:59 正式收官', en: '23:59 on July 31, 2026' },
+  'announcement.closure.suffix': { zh: '。收官后相关安排如下：', en: '. The following arrangements will apply:' },
+  'announcement.stop.title': { zh: '归因停止', en: 'Attribution Ends' },
+  'announcement.stop.body': { zh: '2026.07.31 23:59 起，专属安装命令不再进行推广归因计数，新安装将不再计入任何推广者名下。', en: 'Starting at 23:59 on July 31, 2026, dedicated install commands will no longer record referral attribution, and new installs will not be credited to any promoter.' },
+  'announcement.settlement.title': { zh: '最终结算', en: 'Final Settlement' },
+  'announcement.settlement.body': { zh: '已结算的前四周金额，已陆续发送到各位开发者的账户中；未结算金额将于 2026.08.20 统一通过京东 E 卡发放，并陆续通过短信通知您完成领取。', en: 'Amounts settled for the first four weeks have been sent to developers’ accounts. Outstanding rewards will be issued as JD E-Cards on August 20, 2026, with SMS notifications sent progressively.' },
+  'announcement.retention.title': { zh: '数据留存', en: 'Data Retention' },
+  'announcement.retention.body': { zh: '历史推广数据（安装数 / 活跃数 / 转化率 / 结算明细）将在后台保留 30 天，期间可通过个人面板随时查阅。', en: 'Historical referral data (installs, active users, conversion rate, and settlement details) will remain available in the dashboard for 30 days.' },
+  'announcement.appeal.title': { zh: '未结奖励申诉', en: 'Outstanding Reward Appeals' },
+  'announcement.appeal.prefix': { zh: '如对最终结算金额有异议，请于 2026.08.10 前联系', en: 'If you dispute the final settlement amount, contact' },
+  'announcement.appeal.suffix': { zh: '提交申诉，逾期不再受理。', en: 'by August 10, 2026. Appeals submitted after the deadline will not be accepted.' },
+  'announcement.future.prefix': { zh: 'AtomCode 仍会持续迭代。下一阶段，我们将把更多精力投入到', en: 'AtomCode will continue to evolve. In the next phase, we will devote more effort to' },
+  'announcement.future.focus': { zh: '产品体验、社区共建与开发者共创大赛', en: 'product experience, community collaboration, and developer co-creation competitions' },
+  'announcement.future.middle': { zh: '等长期机制上，欢迎继续关注', en: 'as long-term initiatives. Please continue to follow' },
+  'announcement.future.suffix': { zh: '。', en: '.' },
+  'announcement.thanks': { zh: '再次感谢每一位同路人。代码改变世界，而你们改变了 AtomCode。', en: 'Thank you again to everyone who joined us on this journey. Code changes the world, and you changed AtomCode.' },
+  'announcement.signature': { zh: 'AtomGit 开发者社区', en: 'AtomGit Developer Community' },
+  'announcement.signature.date': { zh: '2026 年 7 月 30 日', en: 'July 30, 2026' },
+  'resource.atomcode.title': { zh: 'AtomCode 主站', en: 'AtomCode Website' },
+  'resource.atomcode.desc': { zh: '了解产品最新动态与版本发布。', en: 'See the latest product updates and releases.' },
+  'resource.atomgit.title': { zh: 'AtomGit 社区', en: 'AtomGit Community' },
+  'resource.atomgit.desc': { zh: '参与开源协作、提交 Issue 与 PR。', en: 'Collaborate on open source, issues, and pull requests.' },
+  'resource.appeal.title': { zh: '奖励与申诉咨询', en: 'Rewards and Appeals' },
 
   /* payment info */
   'payment.fill': { zh: '完善收款信息', en: 'Add Payment Info' },
@@ -629,9 +627,6 @@ let currentSid = null;
 let currentCode = null;
 let currentUser = null;
 let currentSummary = { devices: 0, active: 0, attributions: 0, rate: 0, amount: 0 };
-let lastLeaderboardRefreshedAt = null;
-const boardRenderState = {};
-const renderedRuleTargets = new Set();
 
 function getSid() {
   if (currentSid) return currentSid;
@@ -675,7 +670,7 @@ async function login() {
     alert('login failed: ' + e.message);
   }
 }
-function logout() { clearSid(); currentCode = null; currentUser = null; showState('unauth'); renderStaticSections('public'); }
+function logout() { clearSid(); currentCode = null; currentUser = null; showState('unauth'); renderAnnouncement('public-announcement'); }
 
 async function apiCall(endpoint, sid, method = 'GET') {
   const url = API_BASE + '/' + endpoint + (sid ? '?sid=' + encodeURIComponent(sid) : '');
@@ -689,17 +684,6 @@ async function fetchReferralMe() { return apiCall('me', getSid()); }
 async function postInviteCode() { return apiCall('invite-code', getSid(), 'POST'); }
 async function fetchSummary() { return apiCall('summary', getSid()); }
 async function fetchRecords() { return apiCall('records', getSid()); }
-async function fetchLeaderboard(weekStart) {
-  const sid = getSid();
-  const params = new URLSearchParams();
-  if (sid) params.set('sid', sid);
-  if (weekStart) params.set('week_start', weekStart);
-  const qs = params.toString();
-  const url = API_BASE + '/leaderboard' + (qs ? '?' + qs : '');
-  const resp = await fetch(url, { credentials: 'omit' });
-  if (!resp.ok) throw new Error('HTTP ' + resp.status);
-  return resp.json();
-}
 
 function showState(name) {
   document.querySelectorAll('.state').forEach(el => el.classList.remove('active'));
@@ -708,7 +692,7 @@ function showState(name) {
 
 async function initPage() {
   const sid = getSid();
-  if (!sid) { renderStaticSections('public'); showState('unauth'); return; }
+  if (!sid) { renderAnnouncement('public-announcement'); showState('unauth'); return; }
   showState('loading');
   try {
     const data = await fetchReferralMe();
@@ -721,7 +705,7 @@ async function initPage() {
         clearSid();
         currentCode = null;
         currentUser = null;
-        renderStaticSections('public');
+        renderAnnouncement('public-announcement');
         showState('unauth');
         return;
       }
@@ -747,13 +731,13 @@ function renderAuthenticated(data) {
     currentCode = data.invite_code;
     fillUser('2', currentUser);
     updateInviteLink(currentCode);
+    renderAnnouncement('announcement-content');
     showState('auth-code');
     loadSummary();
-    loadLeaderboard(formatLocalDate(getMonday()));
   } else {
     fillUser('1', currentUser);
+    renderAnnouncement('no-code-announcement');
     showState('auth-no-code');
-    loadLeaderboard(formatLocalDate(getMonday()), 'no-code-board', 'no-code-rules');
   }
 }
 
@@ -825,166 +809,46 @@ function renderSummary(s) {
   document.getElementById('rate-note').textContent = healthy ? t('note.healthy') : t('note.unhealthy');
   document.getElementById('amount-note').textContent = healthy ? t('note.amount.healthy') : t('note.amount.unhealthy') + ' (' + s.active + '\xd75)';
 }
-function timeAgo(isoStr) {
-  if (!isoStr) return t('time.now');
-  const then = new Date(isoStr);
-  if (isNaN(then.getTime())) return t('time.now');
-  const diff = Date.now() - then.getTime();
-  const seconds = Math.floor(diff / 1000);
-  if (seconds < 10) return t('time.now');
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 1) return t('time.now');
-  if (minutes < 60) return minutes + (LANG === 'en' ? ' min ago' : '\u5206\u949f\u524d');
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return hours + (LANG === 'en' ? ' h ago' : '\u5c0f\u65f6\u524d');
-  const days = Math.floor(hours / 24);
-  if (days < 30) return days + (LANG === 'en' ? ' d ago' : '\u5929\u524d');
-  return formatLocalDate(then);
+function renderAnnouncement(targetId) {
+  const target = document.getElementById(targetId);
+  if (!target) return;
+  target.innerHTML = '<div class="section-bar">' +
+    '<div><div class="section-title"><span class="mark">⚑</span>' + esc(t('announcement.section.title')) + '</div>' +
+    '<div class="section-hint">' + esc(t('announcement.section.hint')) + '</div></div>' +
+    '<div class="announcement-date">' + esc(t('announcement.date.label')) + '<b>' + esc(t('announcement.date')) + '</b></div></div>' +
+    '<article class="announcement-card">' +
+    '<header class="announcement-head"><div class="announcement-title"><span class="flag">⚑</span>' + esc(t('announcement.title')) + '</div>' +
+    '<div class="announcement-audience">' + esc(t('announcement.audience')) + '</div></header>' +
+    '<div class="announcement-body"><p>' + esc(t('announcement.greeting')) + '</p>' +
+    '<p>' + esc(t('announcement.intro')) + '</p>' +
+    '<p>' + esc(t('announcement.closure.prefix')) + ' <strong class="deadline">' + esc(t('announcement.closure.time')) + '</strong>' + esc(t('announcement.closure.suffix')) + '</p>' +
+    '<div class="announcement-items">' +
+    announcementItem('stop', '●', 'announcement.stop.title', 'announcement.stop.body') +
+    announcementItem('settlement', '◉', 'announcement.settlement.title', 'announcement.settlement.body') +
+    announcementItem('retention', '↻', 'announcement.retention.title', 'announcement.retention.body') +
+    '<div class="announcement-item appeal"><span class="item-icon">♨</span><h3>' + esc(t('announcement.appeal.title')) + '</h3><p>' +
+    esc(t('announcement.appeal.prefix')) + ' <a href="mailto:linjy@gitcode.com">linjy@gitcode.com</a> ' + esc(t('announcement.appeal.suffix')) + '</p></div></div>' +
+    '<p>' + esc(t('announcement.future.prefix')) + ' <strong>' + esc(t('announcement.future.focus')) + '</strong> ' + esc(t('announcement.future.middle')) +
+    ' <a href="https://atomcode.atomgit.com/" target="_blank" rel="noopener">atomcode.atomgit.com</a>' + esc(t('announcement.future.suffix')) + '</p>' +
+    '<p>' + esc(t('announcement.thanks')) + '</p>' +
+    '<footer class="announcement-signature"><strong>' + esc(t('announcement.signature')) + '</strong><span>' + esc(t('announcement.signature.date')) + '</span></footer></div></article>' +
+    '<div class="resource-grid">' +
+    resourceCard('↗', 'https://atomcode.atomgit.com/', 'resource.atomcode.title', 'resource.atomcode.desc') +
+    resourceCard('↗', 'https://atomgit.com/atomgit_atomcode/atomcode', 'resource.atomgit.title', 'resource.atomgit.desc') +
+    '<a class="resource-card" href="mailto:linjy@gitcode.com"><span class="resource-icon">✉</span><h3>' + esc(t('resource.appeal.title')) + '</h3><p>linjy@gitcode.com</p></a></div>';
+}
+function announcementItem(className, icon, titleKey, bodyKey) {
+  return '<div class="announcement-item ' + className + '"><span class="item-icon">' + icon + '</span><h3>' + esc(t(titleKey)) + '</h3><p>' + esc(t(bodyKey)) + '</p></div>';
+}
+function resourceCard(icon, href, titleKey, descKey) {
+  return '<a class="resource-card" href="' + href + '" target="_blank" rel="noopener"><span class="resource-icon">' + icon + '</span><h3>' + esc(t(titleKey)) + '</h3><p>' + esc(t(descKey)) + '</p></a>';
 }
 
-async function loadLeaderboard(weekStart, targetId, rulesId) {
-  targetId = targetId || 'board-content';
-  rulesId = rulesId || 'rules-content';
-  try {
-    const data = await fetchLeaderboard(weekStart);
-    const items = normalizeBoardItems(data);
-    const meRow = data.me ? normalizeBoardItem(data.me, 0) : null;
-    const resolvedWeekStart = data.week_start || weekStart || formatLocalDate(getMonday());
-    renderBoard(targetId, {
-      items: items,
-      meRow: meRow,
-      weekLabel: weekLabelFromStart(resolvedWeekStart),
-      weekStart: resolvedWeekStart,
-    });
-    if (data.refreshed_at) {
-      lastLeaderboardRefreshedAt = data.refreshed_at;
-      updateLeaderboardRefreshedText();
-    }
-  } catch (e) {
-    console.error('Failed to load leaderboard', e);
-    const resolvedWeekStart = weekStart || formatLocalDate(getMonday());
-    renderBoard(targetId, { items: [], meRow: null, weekLabel: weekLabelFromStart(resolvedWeekStart), weekStart: resolvedWeekStart });
-  }
-  renderRules(rulesId);
-}
-function updateLeaderboardRefreshedText() {
-  if (!lastLeaderboardRefreshedAt) return;
-  const text = timeAgo(lastLeaderboardRefreshedAt);
-  document.querySelectorAll('.js-updated-at').forEach(el => el.textContent = text);
-}
 function rerenderDynamicSections() {
-  Object.keys(boardRenderState).forEach(targetId => {
-    renderBoard(targetId, boardRenderState[targetId]);
-  });
-  renderedRuleTargets.forEach(targetId => renderRules(targetId));
-  updateLeaderboardRefreshedText();
+  document.querySelectorAll('[data-announcement]').forEach(el => renderAnnouncement(el.id));
 }
 
-function changeWeek(delta, targetId, rulesId) {
-  targetId = targetId || 'board-content';
-  rulesId = rulesId || 'rules-content';
-  const target = document.getElementById(targetId);
-  if (!target) return;
-  const current = target.dataset.weekStart || '';
-  const base = current ? new Date(current + 'T00:00:00') : getMonday();
-  base.setDate(base.getDate() + delta * 7);
-  const newStart = formatLocalDate(base);
-  target.dataset.weekStart = newStart;
-  loadLeaderboard(newStart, targetId, rulesId);
-}
-
-function getMonday() { const d = new Date(); d.setDate(d.getDate() - (d.getDay() + 6) % 7); return d; }
-
-function renderStaticSections(prefix) {
-  const boardId = prefix === 'public' ? 'public-board' : 'no-code-board';
-  const rulesId = prefix === 'public' ? 'public-rules' : 'no-code-rules';
-  loadLeaderboard(formatLocalDate(getMonday()), boardId, rulesId);
-}
-
-function normalizeBoardItem(item, i) {
-  const devices = parseNumber(item.devices ?? item.installs ?? item.install_count ?? item.device_count);
-  const active = parseNumber(item.active ?? item.qualified ?? item.active_count ?? item.qualified_count);
-  const rate = normalizeRate(item.rate ?? item.conversion_rate, devices, active);
-  const fallbackAmount = rate >= .25 ? devices * 2 + active * 5 : active * 5;
-  const amount = parseNumber(item.amount ?? item.settlement_amount ?? item.reward_amount, fallbackAmount);
-  return {
-    rank: item.rank ?? (i + 1),
-    username: maskDisplayName(item.username ?? item.nickname ?? item.name ?? item.promoter_name ?? 'Dev***er'),
-    devices, active, rate, amount,
-    me: !!(item.me ?? item.is_me ?? item.current_user),
-    status: item.status_text ?? item.status ?? '',
-  };
-}
-function normalizeBoardItems(data) {
-  const items = Array.isArray(data.items) ? data.items : Array.isArray(data.leaderboard) ? data.leaderboard : [];
-  return items.map((item, i) => normalizeBoardItem(item, i));
-}
-
-function renderBoard(targetId, data) {
-  const target = document.getElementById(targetId);
-  if (!target) return;
-  const rows = data.items || [];
-  const meRow = data.meRow || null;
-  const weekStart = data.weekStart || '';
-  const weekLabel = weekStart ? weekLabelFromStart(weekStart) : (data.weekLabel || currentWeekLabel());
-  target.dataset.weekStart = weekStart;
-  boardRenderState[targetId] = { items: rows, meRow: meRow, weekStart: weekStart, readonly: !!data.readonly };
-  const rulesTargetId = targetId === 'no-code-board' ? 'no-code-rules' : targetId === 'public-board' ? 'public-rules' : 'rules-content';
-  const prevControl = data.readonly ? '' : '<button class="period-arrow" onclick="changeWeek(-1,\'' + escAttr(targetId) + '\',\'' + escAttr(rulesTargetId) + '\')" title="' + escAttr(t('board.prev')) + '">◂</button>';
-  const nextControl = data.readonly ? '' : '<button class="period-arrow" onclick="changeWeek(1,\'' + escAttr(targetId) + '\',\'' + escAttr(rulesTargetId) + '\')" title="' + escAttr(t('board.next')) + '">▸</button>';
-  var body = rows.length
-    ? rows.map(rowHtml).join('')
-    : '<tr><td colspan="7"><div class="empty">' + esc(t('board.empty')) + '</div></td></tr>';
-  if (meRow) {
-    body += '<tr class="sep"><td colspan="7"><div class="sep-dots">···</div></td></tr>';
-    body += rowHtml(meRow);
-  }
-
-  const html = '<div class="section-bar">' +
-    '<div><div class="section-title"><span class="mark">▣</span>' + esc(t('board.title')) + '</div><div class="section-hint">' + esc(t('board.hint')) + '</div></div>' +
-    '<div class="period">' + prevControl + '<b>' + esc(weekLabel) + '</b>' + nextControl + '</div></div>' +
-    '<section class="leaderboard"><div class="rank-wrap"><table class="rank-table"><thead><tr>' +
-    '<th>' + esc(t('board.rank')) + '</th><th>' + esc(t('board.promoter')) + '</th><th>' + esc(t('board.devices')) + '</th><th>' + esc(t('board.active')) + '</th><th>' + esc(t('board.rate')) + '</th><th>' + esc(t('board.amount')) + '</th><th>' + esc(t('board.status')) + '</th>' +
-    '</tr></thead><tbody>' + body + '</tbody></table></div></section>';
-  target.innerHTML = html;
-}
-function rowHtml(row) {
-  const blocked = Number(row.rate) < .25;
-  const rankClass = row.rank === 1 ? ' top1' : row.rank === 2 ? ' top2' : row.rank === 3 ? ' top3' : '';
-  const statusText = row.status || t('status.pending');
-  return '<tr class="' + (row.me ? 'me ' : '') + (blocked ? 'blocked' : '') + '">' +
-    '<td><span class="rank' + rankClass + '">' + esc(row.rank) + '</span></td>' +
-    '<td><b>' + esc(maskDisplayName(row.username)) + '</b>' + (row.me ? '<span class="me-badge">' + esc(t('board.me')) + '</span>' : '') + '</td>' +
-    '<td class="mono">' + row.devices + '</td>' +
-    '<td class="mono num-blue">' + row.active + '</td>' +
-    '<td>' + (blocked ? '<span class="rate-bad">' + pct(row.rate) + '</span>' : '<span class="num-green">' + pct(row.rate) + '</span>') + '</td>' +
-    '<td class="money">￥' + Number(row.amount).toFixed(2) + '</td>' +
-    '<td class="' + (blocked ? 'status-bad' : 'status-ok') + '">' + esc(statusText) + '</td></tr>';
-}
-
-function renderRules(targetId) {
-  const target = document.getElementById(targetId);
-  if (!target) return;
-  renderedRuleTargets.add(targetId);
-  target.innerHTML = '<section class="rules">' +
-    '<div class="rules-title"><span class="info">i</span>' + esc(t('rules.title')) + '</div>' +
-    '<p>' + esc(t('rules.desc')) + '</p>' +
-    '<ul><li>' + t('rules.good') + '</li>' +
-    '<li>' + t('rules.bad') + '</li>' +
-    '<li>' + t('rules.cash') + '</li></ul>' +
-    '<div class="rules-title" style="margin-top:18px"><span class="info" style="background:#e8a050">￥</span>' + esc(t('rules.jd.title')) + '</div>' +
-    '<ul><li>' + t('rules.jd.cycle') + '</li>' +
-    '<li>' + t('rules.jd.amount') + '</li></ul>' +
-    '<div class="rules-title" style="margin-top:18px"><span class="info" style="background:#ff4f4f">!</span>' + esc(t('rules.anti.title')) + '</div>' +
-    '<ul><li>' + t('rules.anti.1') + '</li>' +
-    '<li>' + t('rules.anti.2') + '</li>' +
-    '<li>' + t('rules.anti.3') + '</li></ul>' +
-    '<p style="margin-top:8px;color:#ff6868">' + esc(t('rules.anti.penalty')) + '</p></section>';
-}
-
-function pct(v) { return (v * 100).toFixed(2) + '%'; }
 function esc(str) { return String(str || '-').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-function escAttr(str) { return String(str || '').replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
 function parseNumber(value, fallback) {
   fallback = fallback || 0;
   if (value === null || value === undefined || value === '') return fallback;
@@ -997,59 +861,6 @@ function normalizeRate(value, devices, active) {
     : parseNumber(value);
   return raw > 1 ? raw / 100 : raw;
 }
-function maskDisplayName(value) {
-  const name = String(value || '').trim();
-  if (!name || name.includes('***')) return name || 'Dev***er';
-  const chars = Array.from(name);
-  if (chars.length === 1) return chars[0] + '***';
-  if (chars.length === 2) return chars[0] + '***' + chars[1];
-  if (chars.length <= 5) return chars[0] + '***' + chars[chars.length - 1];
-  return chars.slice(0, 3).join('') + '***' + chars.slice(-2).join('');
-}
-function currentWeekLabel() {
-  return weekLabelFromDate(new Date());
-}
-function weekLabelFromStart(value) {
-  const date = value ? new Date(value + 'T00:00:00') : new Date();
-  return weekLabelFromDate(date);
-}
-function weekLabelFromDate(date) {
-  const now = new Date(date);
-  const day = now.getDay() || 7;
-  const monday = new Date(now);
-  monday.setHours(0, 0, 0, 0);
-  monday.setDate(now.getDate() - day + 1);
-  const sunday = new Date(monday);
-  sunday.setDate(monday.getDate() + 6);
-  const weekDate = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
-  const utcDay = weekDate.getUTCDay() || 7;
-  weekDate.setUTCDate(weekDate.getUTCDate() + 4 - utcDay);
-  const yearStart = new Date(Date.UTC(weekDate.getUTCFullYear(), 0, 1));
-  const weekNo = Math.ceil((((weekDate - yearStart) / 86400000) + 1) / 7);
-  return t('board.week.label')
-    .replace('{week}', weekNo)
-    .replace('{range}', shortDate(monday) + ' - ' + shortDate(sunday));
-}
-function shortDate(date) {
-  return String(date.getMonth() + 1).padStart(2, '0') + '.' + String(date.getDate()).padStart(2, '0');
-}
-function formatLocalDate(date) {
-  return date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0');
-}
-
-function reloadVisibleLeaderboard() {
-  if (document.getElementById('auth-code-state').classList.contains('active')) {
-    const start = document.getElementById('board-content').dataset.weekStart || formatLocalDate(getMonday());
-    loadLeaderboard(start, 'board-content', 'rules-content');
-  } else if (document.getElementById('auth-no-code-state').classList.contains('active')) {
-    const start = document.getElementById('no-code-board').dataset.weekStart || formatLocalDate(getMonday());
-    loadLeaderboard(start, 'no-code-board', 'no-code-rules');
-  } else {
-    const start = document.getElementById('public-board').dataset.weekStart || formatLocalDate(getMonday());
-    loadLeaderboard(start, 'public-board', 'public-rules');
-  }
-}
-
 /* ========== aurora + ripple ========== */
 (function(){
   const aurora=document.getElementById('aurora');
