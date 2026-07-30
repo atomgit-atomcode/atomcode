@@ -174,6 +174,9 @@
       </table>
       <pre><code>示例：为这个 Bug 创建一个 AtomGit Issue，并附上复现步骤和环境信息。</code></pre>
 
+      <h2>大型工具输出</h2>
+      <p>当工具结果太长时，AtomCode 会在界面中显示稳定的摘要，并把完整内容保存到当前会话。模型可通过 <code>fetch_output</code> 分页读取后续内容，因此“输出已截断”不代表结果丢失；删除会话时对应的完整输出也会一并清理。</p>
+
       <h2>禁用特定工具</h2>
       <p>用 <code>--disable-tools</code> 参数可以在启动时把某些工具对模型完全隐藏。例如在 SWE-bench 沙箱里:</p>
       <pre><code>atomcode -p "solve this issue" --disable-tools web_search,web_fetch</code></pre>

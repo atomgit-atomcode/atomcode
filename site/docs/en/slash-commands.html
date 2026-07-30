@@ -90,7 +90,7 @@
           <tr><td><code>/bg</code></td><td>Send the current session to the background and open a new foreground; subcommands: <code>/bg list</code>, <code>/bg &lt;N&gt;</code>, <code>/bg drop &lt;N&gt;</code>, <code>/bg help</code>. See <a href="./sessions.html#bg">Background sessions</a></td></tr>
           <tr><td><code>/background &lt;task&gt;</code></td><td>Compatibility entry: start a one-shot task in a <code>/bg</code> slot (<a href="./sessions.html#bg">details</a>)</td></tr>
           <tr><td><code>/rename &lt;new-name&gt;</code></td><td>Rename the current session (changes the display name in the <code>/resume</code> picker)</td></tr>
-          <tr><td><code>/provider</code></td><td>Open the provider manager: add / edit / remove / switch</td></tr>
+          <tr><td><code>/provider</code></td><td>Manage provider accounts and their models, using a vendor preset or a custom endpoint</td></tr>
           <tr><td><code>/model</code></td><td>Set the default model / provider and switch the current session; other open sessions are unchanged</td></tr>
           <tr><td><code>/cd</code></td><td>Change working directory and start a new session, writing it back as <code>default_workdir</code>. You can also just type <code>cd /path</code> (no slash prefix)</td></tr>
         </tbody>
@@ -110,6 +110,7 @@
           <tr><td><code>/cost</code></td><td>Local token cost for the current session — works with any model (including self-integrated ones); APIs without usage reporting are estimated. Distinct from <code>/usage</code>, which queries the CodingPlan gateway for your plan quota</td></tr>
           <tr><td><code>/context</code></td><td>Show this turn's context budget breakdown: system prompt, tool defs, cold-zone compaction, total messages, and context-window usage</td></tr>
           <tr><td><code>/compact</code></td><td>Compact history: summarise earlier messages to free up context budget</td></tr>
+          <tr><td><code>/rewind</code></td><td>Choose an earlier prompt and roll back the conversation, code, or both; see <a href="./sessions.html">Sessions &amp; Undo</a></td></tr>
           <tr><td><code>/clear</code></td><td>Clear the current session's messages (working directory and model are kept)</td></tr>
           <tr><td><code>/init</code></td><td>Scan the working directory and generate / refresh the <code>.atomcode.md</code> project instructions file — covering build / test commands, tech-stack summary, layout, etc.; injected as system prompt on subsequent launches</td></tr>
           <tr><td><code>/background &lt;task&gt;</code></td><td>Dispatch a task to an isolated background agent (read-only-leaning tool subset) without polluting the main conversation. Useful for "go check X on the side" sort of light exploration. See <a href="./sessions.html#bg">Background sessions</a></td></tr>

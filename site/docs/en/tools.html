@@ -174,6 +174,9 @@
       </table>
       <pre><code>Ask: Create an AtomGit issue for this bug, including the reproduction steps and environment.</code></pre>
 
+      <h2>Large tool outputs</h2>
+      <p>When a tool result is too large, AtomCode shows a stable preview and stores the full content with the current session. The model can page through the remainder with <code>fetch_output</code>, so “output truncated” does not mean the result was lost. Stored output is removed when its session is deleted.</p>
+
       <h2>Disabling specific tools</h2>
       <p>Use the <code>--disable-tools</code> flag at launch to hide tools from the model entirely. For example, inside the SWE-bench sandbox:</p>
       <pre><code>atomcode -p "solve this issue" --disable-tools web_search,web_fetch</code></pre>

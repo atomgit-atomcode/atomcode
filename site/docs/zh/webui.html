@@ -101,7 +101,7 @@
         <tbody>
           <tr><td>侧边栏</td><td>按项目分组的历史会话列表、搜索会话、新建对话、重命名 / 删除会话；可收起为图标栏，移动端为抽屉。</td></tr>
           <tr><td>模型选择器</td><td>输入框下方直接切换 provider / 模型；同名模型会附带 provider 标识消歧。</td></tr>
-          <tr><td>模型配置</td><td>设置里增 / 删 / 改 provider：名称、类型（openai / claude / ollama）、模型、Base URL、API Key、上下文窗口，以及设为默认。</td></tr>
+          <tr><td>模型配置</td><td>设置里管理供应商账号和账号下的多个模型，并配置协议、Base URL、API Key、上下文窗口及默认模型。</td></tr>
           <tr><td>设置</td><td>主题（浅色 / 深色）、语言（中 / 英）、模型配置、远程访问入口。</td></tr>
           <tr><td>图片附件</td><td>粘贴或选择图片随消息发送（单张上限 2MB），非视觉模型走 VL 兜底；历史里显示缩略图。</td></tr>
           <tr><td>工具执行</td><td>实时展示工具调用的参数与输出，可逐行展开查看，历史回看同样可见。</td></tr>
@@ -116,6 +116,8 @@
         <li>运行 <code>/webui</code> 时，当前 TUI 会话会<strong>自动接入</strong>同步 —— 你在终端发的消息会出现在浏览器里，反之亦然。</li>
         <li>在<strong>另一个</strong> TUI 里运行 <code>/sync</code>，即可接入当前正在运行的 webui 会话（需先有 <code>/webui</code> 在跑）。</li>
         <li><code>/sync off</code> —— 退出同步，回到独立会话。</li>
+        <li>同步模式支持 <code>/compact</code>；模型切换以运行时确认结果为准，回合执行中不会切到一半。</li>
+        <li>上传图片、当前工作目录和正在进行的会话会在刷新或切换视图后保留。</li>
       </ul>
       <p>这让「终端里发起、手机 / 平板上盯进度」或「多人围观同一个 agent 会话」成为可能。</p>
 

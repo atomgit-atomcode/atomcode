@@ -160,6 +160,12 @@
         <p><code>/undo</code> <em>只</em>回滚对话记忆,<strong>不会恢复磁盘上的文件</strong>。如果那几轮里 AI 改过代码,这些改动仍保留在工作区——需要还原请用 <code>/diff</code> 查看后手动处理,或借助 git。当前回合进行中时无法 <code>/undo</code>,请先按 Esc 取消。</p>
       </div>
 
+      <h2>用 <code>/rewind</code> 安全回退</h2>
+      <p><code>/rewind</code> 会列出最近的用户提示，并让你选择回退范围：仅对话、仅代码，或对话与代码。代码回退需要 Git 工作区；执行前会显示确认界面。只想撤销最近一轮对话时仍可使用更轻量的 <code>/undo</code>。</p>
+
+      <h2>异常退出后的恢复</h2>
+      <p>回合进行中，AtomCode 会保存临时进度。终端异常退出或网络中断后，使用 <code>/resume</code> 会尽量恢复最后一条用户输入、已经生成的回复和工具调用进度，而不是只回到上一个完整回合。待确认的权限和问题不会被自动批准。</p>
+
       <h2>查看和清理成本</h2>
       <pre><code>/cost</code></pre>
       <p>显示当前会话累计输入 / 输出 tokens。当数字逼近 provider 的 <code>context_window</code> 时:</p>

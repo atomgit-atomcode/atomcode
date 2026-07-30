@@ -96,6 +96,10 @@ model = "deepseek-chat"
 base_url = "https://api.deepseek.com/v1"
 context_window = 64000</code></pre>
       <p>This config is enough to launch atomcode and start chatting with DeepSeek.</p>
+      <div class="callout callout-info">
+        <strong>Provider management in v5.0.3</strong>
+        <p>The recommended path is <code>/provider</code>: add a provider account, then add one or more models under it. Protocol, base URL, and API key are shared by the account; model name and context window are stored per model. Legacy <code>[providers.*]</code> entries remain supported and are projected automatically.</p>
+      </div>
 
       <h2>Top-level fields</h2>
       <table>
@@ -258,8 +262,13 @@ base_url = "https://api.deepseek.com/v1"
 type = "ollama"
 model = "qwen2.5:14b"
 base_url = "http://localhost:11434"</code></pre>
-      <p>In the TUI, use <code>/provider</code> to manage provider entries. Use <code>/model</code> to switch the current session and save the selected entry as the default for sessions opened later; other already-open sessions are unchanged. The CLI also accepts one-shot overrides:</p>
+      <p>In the TUI, use <code>/provider</code> to manage provider accounts and their models. Built-in presets fill in the protocol and base URL for vendors such as AtomGit and TaoToken; choose Custom for another endpoint. Use <code>/model</code> to switch the current session and save the selected model as the default for sessions opened later; other already-open sessions are unchanged. The CLI also accepts one-shot overrides:</p>
       <pre><code>atomcode --provider deepseek --model deepseek-reasoner</code></pre>
+
+      <h2>Turn round limit</h2>
+      <pre><code>[coding]
+max_rounds = 200</code></pre>
+      <p>When the limit is reached, the TUI asks whether to continue or stop instead of dropping the task. Set it to <code>0</code> for no limit.</p>
 
       <h2 id="vision-preprocessor">Vision preprocessor</h2>
       <p>When the active provider's model can't read images (text-only models like DeepSeek-V3 / Kimi) and the user <a href="./basic-usage.html#image-attach">attaches an image</a>, AtomCode doesn't refuse — it forwards the image to a separate "vision preprocessor" provider for OCR + description, then splices the resulting text into the user message before sending to the main model.</p>
@@ -290,7 +299,7 @@ base_url = "https://api.siliconflow.cn/v1"</code></pre>
       <ul>
         <li><strong>Hand-edit</strong> — open <code>~/.atomcode/config.toml</code> in your favourite editor.</li>
         <li><strong><code>/config</code> in the TUI</strong> — atomcode opens the config in your default editor.</li>
-        <li><strong><code>/provider</code> in the TUI</strong> — interactively add / edit / remove providers; changes are written back to disk.</li>
+        <li><strong><code>/provider</code> in the TUI</strong> — interactively manage provider accounts and their models; changes are written back to disk.</li>
       </ul>
 
       <h2>Next steps</h2>

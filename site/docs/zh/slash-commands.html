@@ -90,7 +90,7 @@
           <tr><td><code>/bg</code></td><td>将当前会话放到后台并打开新的前台会话;子命令: <code>/bg list</code>、<code>/bg &lt;N&gt;</code>、<code>/bg drop &lt;N&gt;</code>、<code>/bg help</code>。详见 <a href="./sessions.html#bg">后台会话</a></td></tr>
           <tr><td><code>/background &lt;task&gt;</code></td><td>兼容入口:在一个 <code>/bg</code> 槽位中启动一次性后台任务(<a href="./sessions.html#bg">详解</a>)</td></tr>
           <tr><td><code>/rename &lt;新名字&gt;</code></td><td>重命名当前会话(影响 <code>/resume</code> 选择器里的显示名)</td></tr>
-          <tr><td><code>/provider</code></td><td>打开 provider 管理界面,增删改切换</td></tr>
+          <tr><td><code>/provider</code></td><td>管理供应商账号及其模型；支持预设供应商和自定义接口</td></tr>
           <tr><td><code>/model</code></td><td>设置默认模型 / provider，并切换当前会话；其他已打开会话不变</td></tr>
           <tr><td><code>/cd</code></td><td>切换工作目录并开启新建对话,并写回 <code>default_workdir</code>。也可以直接输入 <code>cd /path</code>(无需斜杠前缀)</td></tr>
         </tbody>
@@ -110,6 +110,7 @@
           <tr><td><code>/cost</code></td><td>当前会话的本地 token 花费 —— 适用于任意模型(含自接入模型);不支持 usage 报告的 API 会自动估算。与 <code>/usage</code> 不同,后者查询的是 CodingPlan 网关的套餐额度</td></tr>
           <tr><td><code>/context</code></td><td>显示本轮上下文预算分解:系统提示、工具定义、冷区压缩、总消息数、context window 占用</td></tr>
           <tr><td><code>/compact</code></td><td>压缩历史消息,把早期对话压缩成摘要以腾出上下文预算</td></tr>
+          <tr><td><code>/rewind</code></td><td>选择历史提示，并回退对话、代码或两者；详见 <a href="./sessions.html">会话与撤销</a></td></tr>
           <tr><td><code>/clear</code></td><td>清空当前会话的消息(保留工作目录和模型)</td></tr>
           <tr><td><code>/init</code></td><td>扫描当前工作目录,生成 / 刷新 <code>.atomcode.md</code> 项目指令文件 — 内含 build / test 命令、技术栈摘要、目录结构等,后续每次启动都会作为系统提示注入</td></tr>
           <tr><td><code>/background &lt;任务&gt;</code></td><td>把任务派发给一个隔离的后台 agent(只读为主的工具子集),不污染当前主对话上下文。用于"顺手让它去查一下 X"这类轻探索。详见 <a href="./sessions.html#bg">后台会话</a></td></tr>
