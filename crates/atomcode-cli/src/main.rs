@@ -2214,7 +2214,7 @@ fn apply_cli_runtime_overrides(
 /// points to a deleted section). Reading `default_provider` directly silently
 /// ignored `--provider`, so a headless `--provider X` run picked the config
 /// default instead of X.
-fn runtime_config_from(
+pub(crate) fn runtime_config_from(
     config: &atomcode_config::config::Config,
     working_dir: &std::path::Path,
     provider_override: Option<&str>,
@@ -2241,7 +2241,7 @@ fn runtime_config_from(
 /// Inspecting the raw config here would either see only the legacy schema or
 /// repeat resolution with subtly different fallback behavior. `runtime_cfg`
 /// already owns the exact resolved provider/model for this spawn.
-fn interactive_provider_bootstrap(
+pub(crate) fn interactive_provider_bootstrap(
     runtime_cfg: &atomcode_coding::CodingRuntimeConfig,
 ) -> atomcode_coding::ProviderBootstrap {
     if !runtime_cfg.model.is_empty() {
@@ -2253,7 +2253,7 @@ fn interactive_provider_bootstrap(
     }
 }
 
-async fn spawn_native_cli_runtime(
+pub(crate) async fn spawn_native_cli_runtime(
     cfg: &atomcode_coding::CodingRuntimeConfig,
     resume_session_id: Option<String>,
     bootstrap: atomcode_coding::ProviderBootstrap,
@@ -2347,7 +2347,7 @@ async fn spawn_native_cli_runtime(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ContinuedCliSession {
+pub(crate) struct ContinuedCliSession {
     id: String,
     forked_from: Option<String>,
 }
@@ -2363,7 +2363,7 @@ fn should_fork_busy_continue(
         )
 }
 
-async fn run_native_headless(
+pub(crate) async fn run_native_headless(
     notifications_cfg: atomcode_config::config::NotificationConfig,
     runtime: atomcode_coding::CodingRuntime,
     prompt: String,

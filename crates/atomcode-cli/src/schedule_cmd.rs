@@ -296,11 +296,159 @@ pub async fn handle_schedule(cli: ScheduleCli) -> Result<i32> {
             Ok(0)
         }
 
-        ScheduleCli::Run { id } => {
-            eprintln!("schedule run is implemented in the next task (id={})", id);
-            Ok(2)
-        }
+        ScheduleCli::Run { id } => run_task(&id).await,
     }
+}
+
+// ── Pure helpers (also tested below) ──────────────────────────────────────────
+
+/// Map a permission-mode string from [`ScheduleTask::permission_mode`] to the
+/// corresponding [`atomcode_coding::RuntimeMode`].  Unknown strings default to
+/// `Plan` (safe default: read-only, never auto-approves destructive operations).
+pub(crate) fn mode_from_str(s: &str) -> atomcode_coding::RuntimeMode {
+    match s {
+        "accept_edits" => atomcode_coding::RuntimeMode::AcceptEdits,
+        "auto" => atomcode_coding::RuntimeMode::Auto,
+        _ => atomcode_coding::RuntimeMode::Plan, // plan + unknown → safe default
+    }
+}
+
+/// Map a headless exit code to the `last_status` string stored in the task record.
+pub(crate) fn last_status_for(exit_code: i32) -> &'static str {
+    match exit_code {
+        0 => "ok",
+        130 => "cancelled",
+        _ => "error",
+    }
+}
+
+// ── Executor ──────────────────────────────────────────────────────────────────
+
+/// Run a scheduled task by id, reusing the same headless bootstrap as `-p`.
+///
+/// Returns an exit code:  0 = ok, 130 = cancelled (SIGINT), other non-zero = error.
+/// If the task is disabled this returns 0 immediately.  If the task's working
+/// directory does not exist the task's `last_status` is set to "error" and the
+/// function returns non-zero.
+async fn run_task(id: &str) -> Result<i32> {
+    use atomcode_capabilities::session::manager::SessionOrigin;
+    use atomcode_capabilities::session::SessionManager;
+    use atomcode_coding::ProviderBootstrap;
+    use atomcode_config::config::Config;
+
+    // 1. Load task record.
+    let mut task = schedule::load(id)
+        .with_context(|| format!("task {:?} not found", id))?;
+
+    // 2. Skip if disabled.
+    if !task.enabled {
+        println!("  schedule run: task {} is disabled, skipping", task.id);
+        return Ok(0);
+    }
+
+    // 3. Load user config from default path.
+    let config_path = Config::default_path();
+    let config = if config_path.exists() {
+        Config::load(&config_path).unwrap_or_default()
+    } else {
+        Config::default()
+    };
+
+    // 4. Resolve working directory.
+    let cwd = std::path::PathBuf::from(&task.cwd);
+    if !cwd.exists() {
+        eprintln!(
+            "[schedule] working directory {:?} does not exist for task {}",
+            cwd, task.id
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        task.last_run_at = Some(now);
+        task.last_status = Some("error".to_string());
+        let _ = schedule::save(&task);
+        return Ok(1);
+    }
+
+    // 5. Build runtime config.  auto → skip_permissions; plan/accept_edits → false.
+    let mode = mode_from_str(&task.permission_mode);
+    let runtime_cfg = crate::runtime_config_from(
+        &config,
+        &cwd,
+        None,
+        None, // no per-task telemetry arc needed
+        mode.is_auto(),
+        false, // headless: fail-closed approval timeout
+    );
+
+    // 6. Spawn runtime (Fresh session — no resume).
+    // Headless path always uses ProviderBootstrap::Required so it fails fast
+    // when no provider is configured, mirroring the `-p` / `--prompt` flow.
+    let (runtime, _agent, _cont) = crate::spawn_native_cli_runtime(
+        &runtime_cfg,
+        None,
+        ProviderBootstrap::Required,
+        false,
+        false,
+    )
+    .await?;
+
+    // 7. Mark session origin = Scheduled.
+    if let Some(ref session_info) = runtime.session {
+        let sid = session_info.id.clone();
+        let manager = SessionManager::for_project(&cwd);
+        // Best-effort — don't abort the run if meta update fails.
+        let _ = manager.update_meta(&sid, |m| {
+            m.origin = SessionOrigin::Scheduled;
+        });
+    }
+
+    // 8. For non-auto modes, set the runtime mode explicitly after spawn.
+    //    (auto was already set inside spawn_native_cli_runtime via dangerously_skip_permissions.)
+    if !mode.is_auto() {
+        runtime
+            .handle
+            .set_mode(mode)
+            .await
+            .map_err(anyhow::Error::new)?;
+    }
+
+    // 9. Build notification config.
+    //    "off" → disabled config; anything else → use the user's config.
+    let notifications_cfg = if task.notify == "off" {
+        atomcode_config::config::NotificationConfig {
+            enabled: false,
+            ..Default::default()
+        }
+    } else {
+        config.notifications.clone()
+    };
+
+    // 10. Run headless.
+    let (exit_code, _captured) = crate::run_native_headless(
+        notifications_cfg,
+        runtime,
+        task.prompt.clone(),
+        None,
+        false,
+        false,
+        cwd.clone(),
+        mode.is_auto(),
+        false,
+    )
+    .await?;
+
+    // 11. Write back last_run_at and last_status.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    task.last_run_at = Some(now);
+    task.last_status = Some(last_status_for(exit_code).to_string());
+    let _ = schedule::save(&task);
+
+    Ok(exit_code)
 }
 
 /// Format an epoch-seconds timestamp as a human-readable UTC string.
@@ -357,6 +505,22 @@ mod tests {
     use super::*;
 
     // ── Pure-function tests (no I/O, no env) ──────────────────────────────────
+
+    #[test]
+    fn permission_mode_str_maps_to_runtime_mode() {
+        use atomcode_coding::RuntimeMode;
+        assert_eq!(mode_from_str("plan"), RuntimeMode::Plan);
+        assert_eq!(mode_from_str("accept_edits"), RuntimeMode::AcceptEdits);
+        assert_eq!(mode_from_str("auto"), RuntimeMode::Auto);
+        assert_eq!(mode_from_str("bogus"), RuntimeMode::Plan); // safe default
+    }
+
+    #[test]
+    fn exit_code_maps_to_last_status() {
+        assert_eq!(last_status_for(0), "ok");
+        assert_eq!(last_status_for(130), "cancelled");
+        assert_eq!(last_status_for(1), "error");
+    }
 
     #[test]
     fn build_task_daily_fields() {
