@@ -37,5 +37,8 @@ pub mod store;
 /// and macOS `scutil --proxy` output → normalized HTTP(S)_PROXY / NO_PROXY values.
 pub mod system_proxy;
 
+/// Local scheduled-task model, file store, and next-run calculator.
+pub mod schedule;
+
 pub use config::{provider::ProviderConfig, Config};
 pub use store::{ConfigCommit, ConfigRevision, ConfigSnapshot, ConfigStore};
