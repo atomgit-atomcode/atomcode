@@ -11360,10 +11360,7 @@ fn handle_idle_key(
                 {
                     renderer.render(UiLine::Error(format!(
                         "{}: {error}",
-                        match crate::i18n::current_locale() {
-                            crate::i18n::Locale::ZhCn => "暂时无法打开回退",
-                            crate::i18n::Locale::En => "Rewind is unavailable",
-                        }
+                        crate::i18n::t(crate::i18n::Msg::CmdRewindUnavailable)
                     )));
                     renderer.flush();
                 }

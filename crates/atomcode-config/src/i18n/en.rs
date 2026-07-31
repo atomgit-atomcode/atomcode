@@ -557,6 +557,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  Invalid turn {requested} (conversation has {available} turn(s)).\n").into(),
         Msg::CmdUndoBusy =>
             "  Can't undo while the agent is working — press Esc to cancel first.\n".into(),
+        Msg::CmdRewindBusy =>
+            "  Can't rewind while the agent is working — press Esc to cancel first.\n".into(),
+        Msg::CmdRewindUnavailable => "Rewind is unavailable".into(),
         Msg::CmdUndoBadArg =>
             "  Usage: /undo  or  /undo N  (N = turn number).\n".into(),
         Msg::CmdNoChanges =>
@@ -972,6 +975,9 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescMemory => "Show all saved memories".into(),
         Msg::CmdDescMcp => "Show MCP server status (subcommand: reload)".into(),
         Msg::CmdDescUndo => "Undo: roll conversation memory back a turn (/undo or /undo N)".into(),
+        Msg::CmdDescRewind => {
+            "Rewind: restore the conversation (and files) to an earlier checkpoint".into()
+        }
         Msg::CmdDescWorktree => "Git worktree isolation (create/list/done/cleanup)".into(),
         Msg::CmdDescUpgrade => "Upgrade atomcode to latest (subcommand: rollback)".into(),
         Msg::CmdDescPlan => "Switch to Plan mode (read-only exploration)".into(),

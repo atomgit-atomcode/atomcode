@@ -533,6 +533,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  无效的轮次 {requested}（当前共 {available} 轮）。\n").into(),
         Msg::CmdUndoBusy =>
             "  当前回合进行中，无法撤销——请先按 Esc 取消。\n".into(),
+        Msg::CmdRewindBusy =>
+            "  当前回合进行中，无法回退——请先按 Esc 取消。\n".into(),
+        Msg::CmdRewindUnavailable => "暂时无法打开回退".into(),
         Msg::CmdUndoBadArg =>
             "  用法：/undo 或 /undo N（N 为轮次号）。\n".into(),
         Msg::CmdNoChanges =>
@@ -945,6 +948,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescMemory => "显示所有已保存的记忆".into(),
         Msg::CmdDescMcp => "显示 MCP 服务器状态（子命令：reload）".into(),
         Msg::CmdDescUndo => "撤销：把对话记忆回退一轮（/undo 或 /undo N）".into(),
+        Msg::CmdDescRewind => "回退：把对话（及文件）恢复到更早的检查点".into(),
         Msg::CmdDescWorktree => "Git 工作树隔离（create/list/done/cleanup）".into(),
         Msg::CmdDescUpgrade => "升级到最新版本（子命令：rollback）".into(),
         Msg::CmdDescPlan => "切换到 Plan 模式（只读探索）".into(),

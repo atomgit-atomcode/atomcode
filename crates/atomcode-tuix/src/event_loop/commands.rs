@@ -58,6 +58,27 @@ fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
     }
 }
 
+/// `/rewind`: open the checkpoint picker — the exact flow the double-Esc
+/// gesture triggers. Kicks off an async catalog refresh; the runtime replies
+/// with `RewindCatalogRefreshed`, which the main loop turns into the Rewind
+/// modal (or a "no rewind points" notice) via `install_pending_rewind_modal`.
+/// Idle-only: rewinding mutates conversation + files, so it must not race a
+/// running turn (mirrors the double-Esc gate and `dispatch_undo`).
+pub(super) fn dispatch_rewind(state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    if state.phase != crate::state::UiPhase::Idle {
+        renderer.render(UiLine::CommandOutput(t(Msg::CmdRewindBusy).into_owned()));
+        renderer.flush();
+        return;
+    }
+    if let Err(error) = ctx
+        .runtime
+        .refresh_rewind_catalog(ctx.foreground_runtime_id, ctx.runtime_event_tx.clone())
+    {
+        renderer.render(UiLine::Error(format!("{}: {error}", t(Msg::CmdRewindUnavailable))));
+        renderer.flush();
+    }
+}
+
 pub(super) fn dispatch_undo(
     arg: &str,
     state: &UiState,
@@ -1820,6 +1841,9 @@ fn execute_slash_command_impl(
         }
         "undo" => {
             dispatch_undo(arg, state, ctx, renderer);
+        }
+        "rewind" => {
+            dispatch_rewind(state, ctx, renderer);
         }
         "usage" => {
             // Mid-turn (Streaming): keep a text snapshot in the footer directly
