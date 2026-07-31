@@ -24,6 +24,20 @@ impl CommandRunner for RealCommandRunner {
     }
 }
 
+/// Run a command and bail if it exits non-zero.
+fn run_checked(
+    runner: &dyn CommandRunner,
+    prog: &str,
+    args: &[String],
+) -> anyhow::Result<()> {
+    let out = runner.run(prog, args)?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("{prog} failed: {stderr}");
+    }
+    Ok(())
+}
+
 // ---- OsScheduler ----
 
 pub trait OsScheduler {
@@ -54,13 +68,13 @@ impl Launchd {
             LaunchdTrigger::Calendar { hour, minute, weekday } => {
                 let mut dict = String::from("\t\t<dict>\n");
                 if let Some(h) = hour {
-                    dict.push_str(&format!("\t\t\t<key>Hour</key><integer>{h}</integer>\n"));
+                    dict.push_str(&format!("\t\t\t<key>Hour</key>\n\t\t\t<integer>{h}</integer>\n"));
                 }
                 if let Some(m) = minute {
-                    dict.push_str(&format!("\t\t\t<key>Minute</key><integer>{m}</integer>\n"));
+                    dict.push_str(&format!("\t\t\t<key>Minute</key>\n\t\t\t<integer>{m}</integer>\n"));
                 }
                 if let Some(wd) = weekday {
-                    dict.push_str(&format!("\t\t\t<key>Weekday</key><integer>{wd}</integer>\n"));
+                    dict.push_str(&format!("\t\t\t<key>Weekday</key>\n\t\t\t<integer>{wd}</integer>\n"));
                 }
                 dict.push_str("\t\t</dict>");
                 format!("\t<key>StartCalendarInterval</key>\n{dict}")
@@ -95,6 +109,10 @@ impl Launchd {
 
 impl OsScheduler for Launchd {
     fn install(&self, task: &ScheduleTask) -> anyhow::Result<()> {
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("launchd is only available on macOS/Unix");
+        }
         let trigger = launchd_calendar(&task.schedule)?;
         let exe = std::env::current_exe()?;
         let exe_str = exe.to_string_lossy();
@@ -104,7 +122,8 @@ impl OsScheduler for Launchd {
         std::fs::write(&path, plist_content)?;
         let uid = get_uid();
         let domain = format!("gui/{uid}");
-        self.runner.run(
+        run_checked(
+            self.runner.as_ref(),
             "launchctl",
             &[
                 "bootstrap".to_string(),
@@ -167,7 +186,7 @@ impl SystemdTimer {
     fn render_service(id: &str, exe: &str) -> String {
         format!(
             "[Unit]\nDescription=Atomcode scheduled task: {id}\n\n\
-             [Service]\nType=oneshot\nExecStart={exe} schedule run {id}\n"
+             [Service]\nType=oneshot\nExecStart=\"{exe}\" schedule run {id}\n"
         )
     }
 
@@ -192,11 +211,11 @@ impl OsScheduler for SystemdTimer {
         std::fs::create_dir_all(&self.root)?;
         std::fs::write(self.service_path(&task.id), Self::render_service(&task.id, &exe_str))?;
         std::fs::write(self.timer_path(&task.id), Self::render_timer(&task.id, &cal))?;
-        self.runner.run("systemctl", &[
+        run_checked(self.runner.as_ref(), "systemctl", &[
             "--user".to_string(),
             "daemon-reload".to_string(),
         ])?;
-        self.runner.run("systemctl", &[
+        run_checked(self.runner.as_ref(), "systemctl", &[
             "--user".to_string(),
             "enable".to_string(),
             "--now".to_string(),
@@ -263,7 +282,7 @@ impl OsScheduler for TaskSched {
             tr,
         ];
         args.extend(sched_args);
-        self.runner.run("schtasks", &args)?;
+        run_checked(self.runner.as_ref(), "schtasks", &args)?;
         Ok(())
     }
 
@@ -312,44 +331,44 @@ fn get_uid() -> u32 {
 // ---- current() — platform selector ----
 
 #[cfg(target_os = "macos")]
-pub fn current() -> Box<dyn OsScheduler + Send + Sync> {
+pub fn current() -> anyhow::Result<Box<dyn OsScheduler + Send + Sync>> {
     let root = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("~"))
+        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
         .join("Library/LaunchAgents");
-    Box::new(Launchd {
+    Ok(Box::new(Launchd {
         root,
         runner: Arc::new(RealCommandRunner),
-    })
+    }))
 }
 
 #[cfg(target_os = "linux")]
-pub fn current() -> Box<dyn OsScheduler + Send + Sync> {
+pub fn current() -> anyhow::Result<Box<dyn OsScheduler + Send + Sync>> {
     let root = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("~"))
+        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
         .join(".config/systemd/user");
-    Box::new(SystemdTimer {
+    Ok(Box::new(SystemdTimer {
         root,
         runner: Arc::new(RealCommandRunner),
-    })
+    }))
 }
 
 #[cfg(target_os = "windows")]
-pub fn current() -> Box<dyn OsScheduler + Send + Sync> {
-    Box::new(TaskSched {
+pub fn current() -> anyhow::Result<Box<dyn OsScheduler + Send + Sync>> {
+    Ok(Box::new(TaskSched {
         runner: Arc::new(RealCommandRunner),
-    })
+    }))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-pub fn current() -> Box<dyn OsScheduler + Send + Sync> {
+pub fn current() -> anyhow::Result<Box<dyn OsScheduler + Send + Sync>> {
     // Fallback for other platforms — returns SystemdTimer as best-effort.
     let root = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("~"))
+        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
         .join(".config/systemd/user");
-    Box::new(SystemdTimer {
+    Ok(Box::new(SystemdTimer {
         root,
         runner: Arc::new(RealCommandRunner),
-    })
+    }))
 }
 
 // ---- Shared helpers ----
@@ -545,13 +564,23 @@ mod tests {
 
     struct FakeRunner {
         calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
-        /// If Some, the runner returns error for commands matching this prefix.
-        fail_cmd: Option<String>,
+        /// If Some((prog_substr, arg_substr)), return non-zero exit for calls where
+        /// the program contains prog_substr AND any arg contains arg_substr.
+        fail_if: Option<(String, String)>,
     }
 
     impl FakeRunner {
         fn new() -> Arc<Self> {
-            Arc::new(Self { calls: Default::default(), fail_cmd: None })
+            Arc::new(Self { calls: Default::default(), fail_if: None })
+        }
+
+        /// Return a FakeRunner that fails when program matches prog_substr AND
+        /// any argument contains arg_substr.
+        fn failing(prog_substr: &str, arg_substr: &str) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Default::default(),
+                fail_if: Some((prog_substr.into(), arg_substr.into())),
+            })
         }
 
         fn calls(&self) -> Vec<(String, Vec<String>)> {
@@ -562,8 +591,10 @@ mod tests {
     impl CommandRunner for FakeRunner {
         fn run(&self, p: &str, a: &[String]) -> std::io::Result<std::process::Output> {
             self.calls.lock().unwrap().push((p.into(), a.to_vec()));
-            if let Some(fail) = &self.fail_cmd {
-                if p == fail {
+            if let Some((prog_sub, arg_sub)) = &self.fail_if {
+                if p.contains(prog_sub.as_str())
+                    && a.iter().any(|x| x.contains(arg_sub.as_str()))
+                {
                     return Ok(std::process::Output {
                         status: {
                             #[cfg(unix)]
@@ -572,7 +603,7 @@ mod tests {
                             { Default::default() }
                         },
                         stdout: vec![],
-                        stderr: b"not found".to_vec(),
+                        stderr: b"simulated failure".to_vec(),
                     });
                 }
             }
@@ -660,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn systemd_service_contains_exec_start() {
+    fn systemd_service_contains_quoted_exec_start() {
         let tmp = tempfile::tempdir().unwrap();
         let runner = FakeRunner::new();
         let sched = SystemdTimer { root: tmp.path().to_path_buf(), runner: runner.clone() };
@@ -671,9 +702,25 @@ mod tests {
         let svc_content = std::fs::read_to_string(
             tmp.path().join("atomcode-schedule-t3.service")
         ).unwrap();
-        assert!(svc_content.contains("ExecStart="), "no ExecStart in service: {svc_content}");
+        // ExecStart must quote the exe path
+        assert!(svc_content.contains("ExecStart=\""), "ExecStart must open with quote: {svc_content}");
         assert!(svc_content.contains("schedule run t3"), "no 'schedule run t3' in service: {svc_content}");
         assert!(svc_content.contains("Type=oneshot"), "no Type=oneshot in service: {svc_content}");
+    }
+
+    /// #3: install must propagate non-zero exit from systemctl enable as an error.
+    #[test]
+    fn systemd_install_fails_when_enable_returns_nonzero() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Fail when systemctl is called with "enable" as an argument
+        let runner = FakeRunner::failing("systemctl", "enable");
+        let sched = SystemdTimer { root: tmp.path().to_path_buf(), runner };
+        let task = sample_task("t_fail");
+
+        let result = sched.install(&task);
+        assert!(result.is_err(), "install should fail when systemctl enable returns non-zero");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("systemctl"), "error should mention systemctl: {msg}");
     }
 
     // ---- Launchd fake-runner tests ----
@@ -689,17 +736,32 @@ mod tests {
 
         // plist file written with the right label
         let plist_path = tmp.path().join("com.atomcode.schedule.lt1.plist");
-        assert!(plist_path.exists(), "plist not written");
+        assert!(plist_path.exists(), "plist not written at {}", plist_path.display());
         let plist_content = std::fs::read_to_string(&plist_path).unwrap();
         assert!(plist_content.contains("com.atomcode.schedule.lt1"), "label missing");
         assert!(plist_content.contains("schedule"), "ProgramArguments missing schedule");
         assert!(plist_content.contains("StartCalendarInterval"), "trigger missing");
-
-        // launchctl bootstrap called
-        let calls = runner.calls();
+        // #7: plist key/integer must be on separate lines
         assert!(
-            calls.iter().any(|(p, a)| p == "launchctl" && a.iter().any(|x| x == "bootstrap")),
-            "no launchctl bootstrap call: {calls:?}"
+            !plist_content.contains("<key>Hour</key><integer>"),
+            "Hour key and integer must be on separate lines: {plist_content}"
+        );
+
+        // launchctl bootstrap called with gui/<uid> domain (#4)
+        let calls = runner.calls();
+        let bootstrap_call = calls.iter().find(|(p, a)| {
+            p == "launchctl" && a.iter().any(|x| x == "bootstrap")
+        });
+        assert!(bootstrap_call.is_some(), "no launchctl bootstrap call: {calls:?}");
+        let (_, boot_args) = bootstrap_call.unwrap();
+        assert!(
+            boot_args.iter().any(|x| x.starts_with("gui/")),
+            "bootstrap domain must be gui/<uid>: {boot_args:?}"
+        );
+        // plist path must appear in the bootstrap args (#4)
+        assert!(
+            boot_args.iter().any(|x| x.ends_with(".plist")),
+            "bootstrap args must include plist path: {boot_args:?}"
         );
 
         assert_eq!(sched.status("lt1"), InstallState::Installed);
@@ -752,16 +814,40 @@ mod tests {
     }
 
     #[test]
-    fn tasksched_uninstall_calls_delete() {
+    fn tasksched_uninstall_calls_delete_with_task_name() {
         let runner = FakeRunner::new();
         let sched = TaskSched { runner: runner.clone() };
 
         sched.uninstall("ws1").unwrap();
 
         let calls = runner.calls();
+        let delete_call = calls.iter().find(|(p, a)| {
+            p == "schtasks" && a.iter().any(|x| x == "/Delete")
+        });
+        assert!(delete_call.is_some(), "no schtasks /Delete call: {calls:?}");
+        let (_, del_args) = delete_call.unwrap();
+        // #5: assert /TN is present and task name contains the id
         assert!(
-            calls.iter().any(|(p, a)| p == "schtasks" && a.iter().any(|x| x == "/Delete")),
-            "no schtasks /Delete call: {calls:?}"
+            del_args.iter().any(|x| x == "/TN"),
+            "/TN flag missing in delete call: {del_args:?}"
         );
+        assert!(
+            del_args.iter().any(|x| x.contains("ws1")),
+            "task name containing 'ws1' missing in delete call: {del_args:?}"
+        );
+    }
+
+    /// #3: install must propagate non-zero exit from schtasks /Create as an error.
+    #[test]
+    fn tasksched_install_fails_when_schtasks_returns_nonzero() {
+        // Fail when schtasks is called with "/Create" as an argument
+        let runner = FakeRunner::failing("schtasks", "/Create");
+        let sched = TaskSched { runner };
+        let task = sample_task("ws_fail");
+
+        let result = sched.install(&task);
+        assert!(result.is_err(), "install should fail when schtasks /Create returns non-zero");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("schtasks"), "error should mention schtasks: {msg}");
     }
 }
