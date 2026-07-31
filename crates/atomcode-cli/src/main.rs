@@ -2241,7 +2241,7 @@ pub(crate) fn runtime_config_from(
 /// Inspecting the raw config here would either see only the legacy schema or
 /// repeat resolution with subtly different fallback behavior. `runtime_cfg`
 /// already owns the exact resolved provider/model for this spawn.
-pub(crate) fn interactive_provider_bootstrap(
+fn interactive_provider_bootstrap(
     runtime_cfg: &atomcode_coding::CodingRuntimeConfig,
 ) -> atomcode_coding::ProviderBootstrap {
     if !runtime_cfg.model.is_empty() {

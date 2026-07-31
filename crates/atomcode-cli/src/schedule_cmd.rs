@@ -385,7 +385,7 @@ async fn run_task(id: &str) -> Result<i32> {
     // 6. Spawn runtime (Fresh session — no resume).
     // Headless path always uses ProviderBootstrap::Required so it fails fast
     // when no provider is configured, mirroring the `-p` / `--prompt` flow.
-    let (runtime, _agent, _cont) = crate::spawn_native_cli_runtime(
+    let (runtime, agent, _cont) = crate::spawn_native_cli_runtime(
         &runtime_cfg,
         None,
         ProviderBootstrap::Required,
@@ -397,7 +397,7 @@ async fn run_task(id: &str) -> Result<i32> {
     // 7. Mark session origin = Scheduled.
     if let Some(ref session_info) = runtime.session {
         let sid = session_info.id.clone();
-        let manager = SessionManager::for_project(&cwd);
+        let manager = SessionManager::for_project(&agent.working_dir);
         // Best-effort — don't abort the run if meta update fails.
         let _ = manager.update_meta(&sid, |m| {
             m.origin = SessionOrigin::Scheduled;
