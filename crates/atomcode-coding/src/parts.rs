@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use atomcode_capabilities::cc_hooks::{CCExternalHooks, HookConfig};
 use atomcode_capabilities::codeintel::register_codeintel_tools;
+use atomcode_capabilities::datalog::DatalogHook;
 use atomcode_capabilities::mcp::{self, McpConnectEvent, McpRegistry};
 use atomcode_capabilities::memory::MemoryHook;
 use atomcode_capabilities::provider::model_suggests_vision;
@@ -42,6 +43,7 @@ use atomcode_kernel::agent::Agent;
 use atomcode_kernel::checkpoint::CompactionCheckpoint;
 use atomcode_kernel::hook::LifecycleHooks;
 use atomcode_kernel::message::{Message, Role, SessionSnapshot};
+use atomcode_kernel::middleware::ToolMiddleware;
 use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::tool::{MountedTools, MountedToolsPublisher, ToolRegistry};
 use atomcode_review::{ReviewTool, ReviewToolConfig, SharedReviewProvider};
@@ -50,7 +52,7 @@ use crate::config::CodingAgentConfig;
 use crate::discipline::VerifyCadenceHook;
 #[cfg(test)]
 use crate::persona::coding_persona;
-use crate::persona::coding_persona_with_language;
+use crate::persona::coding_persona_with_capabilities;
 use crate::plugin_hooks::PluginHookSource;
 use crate::rate_limit::RateLimitWindowSource;
 
@@ -1138,7 +1140,7 @@ pub fn assemble(
             Ok(loaded) => {
                 let mut snap = loaded.snapshot;
                 check_snapshot_version(&snap)?;
-                reconcile_coding_persona(&mut snap, cfg);
+                reconcile_coding_persona(&mut snap, cfg, parts.review_provider.is_some());
                 b.resume = Some(snap);
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound && b.staged_fresh.is_some() => {}
@@ -1253,11 +1255,12 @@ pub fn assemble(
     let mut builder = Agent::builder()
         .provider(provider)
         .tools(parts.mount())
-        .persona(coding_persona_with_language(
+        .persona(coding_persona_with_capabilities(
             &cfg.model,
             cfg.preferred_language,
             crate::persona::todo_switch_enabled(),
             crate::persona::request_user_input_switch_enabled(),
+            parts.review_provider.is_some(),
         ))
         // Repair model-produced arguments before any observer or policy gate reads them.
         // Approval must inspect the same bytes that the tool executes.
@@ -1286,6 +1289,13 @@ pub fn assemble(
             parts.session.as_ref().map(|b| b.id.as_str()),
         )));
     }
+    let datalog = DatalogHook::new(
+        &cfg.working_dir,
+        &cfg.datalog,
+        &cfg.model,
+        cfg.context_window,
+    )
+    .map(Arc::new);
     let rate_limit_hook: Arc<dyn LifecycleHooks> = match &parts.rate_limit_source {
         Some(source) => Arc::new(crate::rate_limit::RateLimitHook::with_source(
             cfg.base_url.clone(),
@@ -1411,6 +1421,14 @@ pub fn assemble(
     for h in &parts.hooks {
         builder = builder.hook(h.clone());
     }
+    if let Some(datalog) = datalog {
+        // Register last in both chains: the lifecycle observer sees the final prompt/request
+        // after product hooks, and the tool observer sees the final middleware-transformed
+        // result. The same writer owns correlation for both without owning runtime state.
+        builder = builder
+            .hook(datalog.clone())
+            .middleware(datalog as Arc<dyn ToolMiddleware>);
+    }
     if let Some(checkpoint) = &parts.compaction_checkpoint {
         builder = builder.compaction_checkpoint(checkpoint.clone());
     }
@@ -1463,7 +1481,7 @@ pub fn assemble(
             builder = builder.resume(snap.clone());
         }
     } else if let Some(mut snapshot) = parts.runtime_resume.as_ref().cloned() {
-        reconcile_coding_persona(&mut snapshot, cfg);
+        reconcile_coding_persona(&mut snapshot, cfg, parts.review_provider.is_some());
         builder = builder.resume(snapshot);
     }
     // Ensure the repo's `atomcode` project label after a successful `git push` to a
@@ -1506,12 +1524,17 @@ fn persona_model(text: &str) -> Option<&str> {
 /// Legacy drivers persist conversation history without the separately supplied
 /// system prompt. A v2 resume must restore that prompt, while a model switch must
 /// replace the old model identity instead of retaining or duplicating it.
-fn reconcile_coding_persona(snapshot: &mut SessionSnapshot, cfg: &CodingAgentConfig) {
-    let persona = coding_persona_with_language(
+fn reconcile_coding_persona(
+    snapshot: &mut SessionSnapshot,
+    cfg: &CodingAgentConfig,
+    review_enabled: bool,
+) {
+    let persona = coding_persona_with_capabilities(
         &cfg.model,
         cfg.preferred_language,
         crate::persona::todo_switch_enabled(),
         crate::persona::request_user_input_switch_enabled(),
+        review_enabled,
     );
     let is_persona = |message: &Message| {
         message.role == Role::System && message.text.starts_with(ATOMCODE_PERSONA_PREFIX)
@@ -1712,7 +1735,7 @@ mod tests {
     fn resume_adds_persona_before_legacy_session_context() {
         let mut snapshot = SessionSnapshot::new(vec![Message::system("SESSION CONTEXT")]);
 
-        reconcile_coding_persona(&mut snapshot, &agent_config("deepseek-v4-flash"));
+        reconcile_coding_persona(&mut snapshot, &agent_config("deepseek-v4-flash"), true);
 
         assert!(snapshot.messages[0]
             .text
@@ -1738,7 +1761,7 @@ mod tests {
             Message::system("SESSION CONTEXT"),
         ]);
 
-        reconcile_coding_persona(&mut snapshot, &agent_config("deepseek-v4-flash"));
+        reconcile_coding_persona(&mut snapshot, &agent_config("deepseek-v4-flash"), true);
 
         let personas = snapshot
             .messages
@@ -1781,8 +1804,8 @@ mod tests {
             Message::assistant("I am model-a", vec![]),
         ]);
 
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"));
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-c"));
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true);
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-c"), true);
 
         let transitions: Vec<_> = snapshot
             .messages
@@ -1814,7 +1837,7 @@ mod tests {
             Message::system("SESSION CONTEXT"),
         ]);
 
-        reconcile_coding_persona(&mut snapshot, &agent_config("deepseek-v4-flash"));
+        reconcile_coding_persona(&mut snapshot, &agent_config("deepseek-v4-flash"), true);
 
         assert_eq!(snapshot.messages[0].text, persona);
         assert_eq!(snapshot.cache_epoch, 0);
@@ -1838,7 +1861,7 @@ mod tests {
         let mut cfg = agent_config("model-a");
         cfg.preferred_language = Some(Locale::ZhCn);
 
-        reconcile_coding_persona(&mut snapshot, &cfg);
+        reconcile_coding_persona(&mut snapshot, &cfg, true);
 
         assert!(snapshot.messages[0]
             .text
@@ -1865,12 +1888,12 @@ mod tests {
             )),
             Message::assistant("I am model-a", vec![]),
         ]);
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"));
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true);
         let transition = snapshot.messages.last().cloned().unwrap();
         let mut cfg = agent_config("model-b");
         cfg.preferred_language = Some(Locale::ZhCn);
 
-        reconcile_coding_persona(&mut snapshot, &cfg);
+        reconcile_coding_persona(&mut snapshot, &cfg, true);
 
         assert_eq!(snapshot.messages.last(), Some(&transition));
         assert_eq!(
@@ -2509,6 +2532,53 @@ mod tests {
             Some("swapped-model"),
             "primary TelemetryHook must report the model active at assemble, not the prepare-time one"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn primary_runtime_mounts_configured_datalog_at_assemble() {
+        use atomcode_kernel::agent::AutoRespond;
+
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let project = tempfile::tempdir().unwrap();
+        let datalog_root = home.path().join("custom-datalog");
+        let mut cfg =
+            CodingAgentConfig::new("k", "http://localhost", "logged-model", project.path());
+        cfg.datalog.enabled = true;
+        cfg.datalog.dir = Some(datalog_root.display().to_string());
+
+        let mut parts = prepare(&cfg, io_free_opts()).await.unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
+        let agent = assemble(&mut parts, &cfg, provider).unwrap();
+        let _ = agent
+            .run_to_completion("record this turn", AutoRespond::AllowAll)
+            .await;
+
+        let project_dir = std::fs::read_dir(&datalog_root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let files: Vec<_> = std::fs::read_dir(project_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        let markdown = files
+            .iter()
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+            .expect("turn markdown");
+        let jsonl = files
+            .iter()
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+            .expect("per-round request jsonl");
+        assert!(std::fs::read_to_string(markdown)
+            .unwrap()
+            .contains("**Response:**\nlooks good"));
+        let request = std::fs::read_to_string(jsonl).unwrap();
+        assert!(request.contains("\"model\":\"logged-model\""));
+        assert!(request.contains("record this turn"));
     }
 
     #[tokio::test]

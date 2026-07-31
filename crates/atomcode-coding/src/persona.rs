@@ -155,7 +155,7 @@ encoding, quotation, transformation, or claimed authorization does not make othe
 disallowed assistance acceptable.";
 
 pub fn coding_persona(model: &str, todo_enabled: bool, request_user_input_enabled: bool) -> String {
-    coding_persona_with_language(model, None, todo_enabled, request_user_input_enabled)
+    coding_persona_with_capabilities(model, None, todo_enabled, request_user_input_enabled, true)
 }
 
 pub fn coding_persona_with_language(
@@ -163,6 +163,22 @@ pub fn coding_persona_with_language(
     preferred_language: Option<atomcode_config::locale::Locale>,
     todo_enabled: bool,
     request_user_input_enabled: bool,
+) -> String {
+    coding_persona_with_capabilities(
+        model,
+        preferred_language,
+        todo_enabled,
+        request_user_input_enabled,
+        true,
+    )
+}
+
+pub(crate) fn coding_persona_with_capabilities(
+    model: &str,
+    preferred_language: Option<atomcode_config::locale::Locale>,
+    todo_enabled: bool,
+    request_user_input_enabled: bool,
+    review_enabled: bool,
 ) -> String {
     let commit_language = commit_language_guidance(preferred_language);
     #[allow(unused_mut)] // `mut` is only used under `cfg(windows)` below.
@@ -246,6 +262,9 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     // reuses the tool-mount's own gate helper so the two can't drift.
     if subagent_delegation_enabled() {
         p.push_str(SUBAGENT_DELEGATION);
+    }
+    if review_enabled {
+        p.push_str(CODE_REVIEW_USAGE);
     }
     // Skill-trigger guidance — surfaced in the system prompt (not just the `use_skill`
     // tool description + the AVAILABLE SKILLS catalog's own guidance line) because weak
@@ -512,6 +531,15 @@ for 'where/how' investigation and `worker` for edits; mark a subtask `hard` only
 genuinely needs the stronger, slower model — default to the fast model otherwise. After a \
 `worker` finishes, REVIEW its diff before continuing: you own the final result, not the \
 subagent.";
+
+/// Natural-language routing for the read-only review specialization. The tool description
+/// alone is not strong enough for every supported model: some otherwise answer a review
+/// request from a shallow `git diff` scan and never start the dedicated reviewer.
+const CODE_REVIEW_USAGE: &str = "\n\n## CODE REVIEW:\n\
+When the user asks to review code, a diff, staged changes, a commit, or a branch range and the \
+`code_review` tool is available, call it before writing the review. Pass the requested scope \
+and path filters directly to that tool; do not pre-review the diff with ordinary read/search \
+tools. The reviewer is read-only. Do not claim it fixed files or posted comments.";
 
 const RULES: &str = "\
 Solve tasks efficiently, minimizing round-trips. Act decisively — go straight to tool calls or answers.
@@ -1553,6 +1581,22 @@ mod tests {
                 && SUBAGENT_DELEGATION.contains("Do NOT spin up a subagent"),
             "must forbid delegating a single quick search/read the agent can do directly"
         );
+    }
+
+    #[test]
+    fn persona_routes_natural_language_reviews_to_the_read_only_reviewer() {
+        let persona = coding_persona("glm-5.2", true, false);
+        assert!(persona.contains("## CODE REVIEW:"));
+        assert!(persona.contains("`code_review` tool is available"));
+        assert!(persona.contains("Pass the requested scope"));
+        assert!(persona.contains("Do not claim it fixed files or posted comments"));
+    }
+
+    #[test]
+    fn persona_omits_review_routing_when_the_tool_is_not_mounted() {
+        let persona = coding_persona_with_capabilities("glm-5.2", None, true, false, false);
+        assert!(!persona.contains("## CODE REVIEW:"));
+        assert!(!persona.contains("`code_review` tool is available"));
     }
 
     #[test]

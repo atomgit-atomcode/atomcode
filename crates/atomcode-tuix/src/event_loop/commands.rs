@@ -79,6 +79,32 @@ pub(super) fn dispatch_rewind(state: &UiState, ctx: &LoopCtx, renderer: &mut dyn
     }
 }
 
+/// Translate the compact TUI `/review` syntax into the explicit schema accepted by the
+/// `code_review` tool. Keeping this pure makes command semantics testable and avoids the
+/// legacy top-level `base` form whose diff included the working tree as an accidental side
+/// effect. `/review <base>` now consistently means the committed `<base>..HEAD` range.
+fn review_prompt(arg: &str) -> String {
+    let scope = arg.trim();
+    if scope.is_empty() {
+        return "Review my current uncommitted changes: call the `code_review` tool with \
+                {\"scope\":{\"kind\":\"working_tree\"}}, then give me a concise summary of \
+                its findings."
+            .to_string();
+    }
+    if scope.eq_ignore_ascii_case("staged") {
+        return "Review my staged changes: call the `code_review` tool with \
+                {\"scope\":{\"kind\":\"staged\"}}, then give me a concise summary of its \
+                findings."
+            .to_string();
+    }
+    format!(
+        "Review the requested committed range: call the `code_review` tool with \
+         {{\"scope\":{{\"kind\":\"range\",\"base\":{base},\"head\":\"HEAD\"}}}}, then give \
+         me a concise summary of its findings.",
+        base = serde_json::to_string(scope).expect("serializing a string cannot fail")
+    )
+}
+
 pub(super) fn dispatch_undo(
     arg: &str,
     state: &UiState,
@@ -1604,22 +1630,7 @@ fn execute_slash_command_impl(
             // arg to the tool's scope (default = working-tree changes; `staged`; or a base
             // ref), then the model calls the tool and summarizes its findings. If the
             // configured runtime lacks the tool, the model simply says so.
-            let scope = arg.trim();
-            let text = if scope.is_empty() {
-                "Review my current uncommitted changes: call the `code_review` tool with no \
-                 arguments, then give me a concise summary of its findings."
-                    .to_string()
-            } else if scope.eq_ignore_ascii_case("staged") {
-                "Review my staged changes: call the `code_review` tool with {\"staged\": true}, \
-                 then give me a concise summary of its findings."
-                    .to_string()
-            } else {
-                format!(
-                    "Review the changes since `{scope}`: call the `code_review` tool with \
-                     {{\"base\": \"{scope}\"}}, then give me a concise summary of its findings."
-                )
-            };
-            submit_agent_turn(ctx, state, text);
+            submit_agent_turn(ctx, state, review_prompt(arg));
         }
         "config" => {
             // Head: current active provider + config path so users know
@@ -7226,6 +7237,28 @@ mod expand_cd_target_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_prompt_uses_explicit_tool_scopes() {
+        assert!(review_prompt("").contains(
+            r#"{"scope":{"kind":"working_tree"}}"#
+        ));
+        assert!(review_prompt("staged").contains(
+            r#"{"scope":{"kind":"staged"}}"#
+        ));
+        let range = review_prompt("release/v5.0.3");
+        assert!(range.contains(
+            r#"{"scope":{"kind":"range","base":"release/v5.0.3","head":"HEAD"}}"#
+        ));
+        assert!(!range.contains(r#"{"base":"#));
+    }
+
+    #[test]
+    fn review_prompt_json_escapes_the_base_ref() {
+        let prompt = review_prompt("odd\"ref");
+        assert!(prompt.contains(r#""base":"odd\"ref""#));
+        assert!(!prompt.contains("`odd\"ref..HEAD`"));
+    }
 
     #[test]
     fn context_file_status_shows_instruction_and_memory_paths() {

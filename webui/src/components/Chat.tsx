@@ -1434,6 +1434,20 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         });
       },
       notice: (text) => pushCommandNotice(text),
+      submitPrompt: (text) => {
+        if (busyRef.current) {
+          setQueued((q) => [
+            ...q,
+            {
+              id: queueIdRef.current++,
+              text,
+              approvalMode: modeState.confirmedMode,
+            },
+          ]);
+          return;
+        }
+        return deliver(text, [], modeState.confirmedMode);
+      },
       execServerCommand: async (command, arg) => {
         const SESSION_MUTATING = new Set(['undo', 'compact']);
         if (SESSION_MUTATING.has(command)) {
@@ -1544,7 +1558,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       t,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [t, modeState, sync, onCwdChanged, slashSkills, slashLoading, sessionId, cwd, activeSession, provider],
+    [t, modeState, sync, onCwdChanged, slashSkills, slashLoading, sessionId, cwd, activeSession, provider, messages.length],
   );
 
   // Append a non-fatal advisory as its OWN notice part (never merged into a text run,
@@ -2612,7 +2626,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
   // 落地页快捷提示胶囊：点击把文本填入输入框并聚焦（不自动发送，便于二次编辑）。
   const quickChips: { label: string; insert: string }[] = [
-    { label: t('chat.chipReview'), insert: '/code-review ' },
+    { label: t('chat.chipReview'), insert: '/review ' },
     { label: t('chat.chipExplain'), insert: t('chat.chipExplain') },
     { label: t('chat.chipTest'), insert: t('chat.chipTest') },
   ];

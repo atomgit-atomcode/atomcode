@@ -34,6 +34,11 @@ fn _isolate_atomcode_home() {
 /// is always available regardless of which capability features are enabled.
 pub mod hooks;
 
+/// Best-effort native-runtime datalog writer. It observes the final kernel request and
+/// records the historical per-turn Markdown + per-round JSONL layout.
+#[cfg(feature = "session")]
+pub mod datalog;
+
 /// The `<system-reminder>` convention — one constructor ([`reminder::system_reminder`]) so
 /// every runtime-context injector wraps consistently and the wrapper can't be forgotten.
 /// Dependency-free, so it is always available regardless of capability features.

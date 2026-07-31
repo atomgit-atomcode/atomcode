@@ -137,6 +137,8 @@ pub struct CodingAgentConfig {
     ///
     /// [`TelemetryHook`]: crate::TelemetryHook
     pub telemetry: Option<std::sync::Arc<atomcode_telemetry::Telemetry>>,
+    /// Best-effort per-turn Markdown + per-round JSONL logging.
+    pub datalog: atomcode_config::config::DatalogConfig,
     /// Provider `reasoning_history` override (`"include"` | `"exclude"`), passed
     /// through verbatim to the provider builder. `None`/empty (default) ⇒ the
     /// adapter's per-model auto-detect ([`ReasoningPolicy::derive`]). This is the
@@ -209,6 +211,7 @@ pub struct CodingRuntimeConfig {
     pub max_tokens: Option<u32>,
     pub mcp: bool,
     pub telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
+    pub datalog: atomcode_config::config::DatalogConfig,
     pub reasoning_history: Option<String>,
     pub reasoning_effort: Option<String>,
     pub provider_type: String,
@@ -275,6 +278,7 @@ impl CodingRuntimeConfig {
             max_tokens: r.and_then(|r| r.max_tokens).map(|value| value as u32),
             mcp: true,
             telemetry,
+            datalog: config.datalog.clone(),
             reasoning_history: r.and_then(|r| r.reasoning_history.clone()),
             reasoning_effort: r.and_then(|r| r.reasoning_effort.clone()),
             provider_type: r
@@ -316,6 +320,7 @@ impl CodingRuntimeConfig {
         config.provider_name = self.provider_name.clone();
         config.chat_options.max_tokens = self.max_tokens;
         config.telemetry = self.telemetry.clone();
+        config.datalog = self.datalog.clone();
         config.reasoning_history = self.reasoning_history.clone();
         config.chat_options.reasoning_effort =
             atomcode_kernel::provider::ReasoningEffort::from_config(
@@ -588,6 +593,7 @@ impl CodingAgentConfig {
             loop_max_rounds: default_loop_max_rounds(),
             chat_options: Default::default(),
             telemetry: None,
+            datalog: atomcode_config::config::DatalogConfig::default(),
             reasoning_history: None,
             provider_type: "openai".into(),
             thinking_enabled: None,
@@ -634,6 +640,29 @@ mod tests {
         assert_eq!(
             runtime.agent_config().preferred_language,
             Some(Locale::ZhCn)
+        );
+    }
+
+    #[test]
+    fn runtime_config_passes_datalog_settings_to_agent() {
+        let mut source = atomcode_config::config::Config::default();
+        source.datalog = atomcode_config::config::DatalogConfig {
+            enabled: false,
+            dir: Some("/var/tmp/atomcode-datalog".into()),
+        };
+        let runtime = CodingRuntimeConfig::from_config(
+            &source,
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            true,
+        );
+
+        assert!(!runtime.datalog.enabled);
+        assert_eq!(
+            runtime.agent_config().datalog.dir.as_deref(),
+            Some("/var/tmp/atomcode-datalog")
         );
     }
 

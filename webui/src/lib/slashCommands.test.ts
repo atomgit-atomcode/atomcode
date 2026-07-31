@@ -191,3 +191,32 @@ test('/remember and /forget without arg emit a notice', async () => {
   await dispatchSlashCommand('/forget', map, h);
   assert.deepEqual(calls, ['cmd.remember.needArg', 'cmd.forget.needArg']);
 });
+
+test('/review dispatches an explicit code_review scope through chat', async () => {
+  const prompts: string[] = [];
+  const h: SlashHandlers = {
+    setMode: () => {}, openModelPicker: () => {}, setProvider: () => {},
+    changeDir: () => {}, openSessionSidebar: () => {}, reloadConfig: () => {},
+    openSlashSkillsMenu: () => {}, notice: () => {},
+    submitPrompt: (text) => { prompts.push(text); },
+    execServerCommand: () => {}, t: (k) => k,
+  };
+  const map = buildCommandMap(FRONTEND_COMMANDS);
+  await dispatchSlashCommand('/review staged', map, h);
+  assert.equal(prompts.length, 1);
+  assert.match(prompts[0], /"scope":\{"kind":"staged"\}/);
+});
+
+test('/review range JSON-escapes the ref without duplicating it into prose', async () => {
+  const prompts: string[] = [];
+  const h: SlashHandlers = {
+    setMode: () => {}, openModelPicker: () => {}, setProvider: () => {},
+    changeDir: () => {}, openSessionSidebar: () => {}, reloadConfig: () => {},
+    openSlashSkillsMenu: () => {}, notice: () => {},
+    submitPrompt: (text) => { prompts.push(text); },
+    execServerCommand: () => {}, t: (k) => k,
+  };
+  await dispatchSlashCommand('/review odd"ref', buildCommandMap(FRONTEND_COMMANDS), h);
+  assert.match(prompts[0], /"base":"odd\\"ref"/);
+  assert.doesNotMatch(prompts[0], /odd"ref\.\.HEAD/);
+});
