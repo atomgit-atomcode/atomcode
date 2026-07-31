@@ -164,6 +164,84 @@ fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// Decode a packed `CF_DIB` clipboard payload (a `BITMAPINFOHEADER`-family
+/// header, optional bitfield masks + palette, then the pixel array) into
+/// `(width, height, RGBA8)`.
+///
+/// The payload is wrapped in a synthesized `BITMAPFILEHEADER` and decoded via
+/// the BMP *file* path so the explicit `bfOffBits` pins the pixel offset. That
+/// is the crux of the Windows paste bug: arboard's header-less decode
+/// mis-places the pixel offset for V4/V5 headers with `BI_BITFIELDS`
+/// compression (it skips the 12 trailing mask bytes those headers embed), so it
+/// rejects the DIBs that Qt-based screenshot tools (PixPin, Snipaste) and the
+/// Windows Snipping Tool produce, and `/paste` then reports "no image". Ported
+/// from oh-my-pi's fix for the identical arboard limitation.
+///
+/// Kept target-independent (not `cfg(windows)`) so the pure decoder and its
+/// fixtures are unit-tested on every host; only the raw clipboard read
+/// (`read_raw_cf_dib`) is Windows-only.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn decode_cf_dib_to_rgba(dib: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    const FILE_HEADER_SIZE: u64 = 14;
+    const INFO_HEADER_SIZE: u64 = 40;
+    const BI_BITFIELDS: u32 = 3;
+
+    if dib.len() < INFO_HEADER_SIZE as usize {
+        return None;
+    }
+    let u32_at = |at: usize| u32::from_le_bytes(dib[at..at + 4].try_into().expect("bounds checked"));
+    let header_size = u64::from(u32_at(0));
+    if header_size < INFO_HEADER_SIZE || header_size > dib.len() as u64 {
+        return None;
+    }
+    let bit_count = u16::from_le_bytes([dib[14], dib[15]]);
+    let compression = u32_at(16);
+    let colors_used = u64::from(u32_at(32));
+
+    // A plain BITMAPINFOHEADER with BI_BITFIELDS is trailed by three DWORD
+    // masks; larger (V2..V5) headers embed the masks in the header itself.
+    let mask_bytes: u64 = if header_size == INFO_HEADER_SIZE && compression == BI_BITFIELDS {
+        12
+    } else {
+        0
+    };
+    let palette_entries: u64 = if colors_used != 0 {
+        colors_used
+    } else if bit_count <= 8 {
+        1u64 << bit_count
+    } else {
+        0
+    };
+    let pixel_offset =
+        u32::try_from(FILE_HEADER_SIZE + header_size + mask_bytes + palette_entries * 4).ok()?;
+    let file_size = u32::try_from(FILE_HEADER_SIZE + dib.len() as u64).ok()?;
+
+    let mut bmp = Vec::with_capacity(FILE_HEADER_SIZE as usize + dib.len());
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&file_size.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&pixel_offset.to_le_bytes());
+    bmp.extend_from_slice(dib);
+
+    let decoded = image::load_from_memory_with_format(&bmp, image::ImageFormat::Bmp).ok()?;
+    let rgba = decoded.into_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some((w, h, rgba.into_raw()))
+}
+
+/// Read the raw `CF_DIB` bytes from the Windows clipboard. Windows synthesizes
+/// `CF_DIB` from whatever bitmap formats are present, so it is available
+/// whenever the clipboard holds any image at all — including the Qt/Snipping-
+/// Tool payloads arboard's `get_image()` rejects.
+#[cfg(windows)]
+fn read_raw_cf_dib() -> Option<Vec<u8>> {
+    let clip = clipboard_win::Clipboard::new_attempts(10).ok()?;
+    let mut dib = Vec::new();
+    clipboard_win::raw::get_vec(clipboard_win::formats::CF_DIB, &mut dib).ok()?;
+    drop(clip);
+    (!dib.is_empty()).then_some(dib)
+}
+
 /// Try to grab an image from the system clipboard via `arboard`.
 /// Returns `Some((ImageContent, fingerprint))` if the clipboard holds an
 /// image, `None` otherwise. The fingerprint is hashed off the raw RGBA
@@ -210,17 +288,46 @@ fn try_paste_clipboard_image() -> Option<(ImageContent, u64)> {
     //   Sources: Cmd+Shift+Ctrl+4 screenshot, Preview "Copy", browser
     //   "Copy image", any app's Edit-menu Copy on a bitmap. arboard's
     //   get_image decodes these into RGBA.
-    if let Ok(img) = clipboard.get_image() {
-        let hash = rgba_fingerprint(img.width, img.height, img.bytes.as_ref());
-        let png_data = encode_rgba_to_png(img.width as u32, img.height as u32, img.bytes.as_ref())?;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
-        return Some((
-            ImageContent {
-                media_type: "image/png".into(),
-                data: b64,
-            },
-            hash,
-        ));
+    match clipboard.get_image() {
+        Ok(img) => {
+            let hash = rgba_fingerprint(img.width, img.height, img.bytes.as_ref());
+            if let Some(png_data) =
+                encode_rgba_to_png(img.width as u32, img.height as u32, img.bytes.as_ref())
+            {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
+                return Some((
+                    ImageContent {
+                        media_type: "image/png".into(),
+                        data: b64,
+                    },
+                    hash,
+                ));
+            }
+        }
+        Err(_e) => {
+            // arboard's header-less DIB decode rejects the CF_DIBV5 payloads
+            // that Qt-based screenshot tools (PixPin, Snipaste) and the Windows
+            // Snipping Tool produce (V4/V5 header + BI_BITFIELDS) — the reported
+            // "剪贴板中没有图片" on Windows Terminal. Windows synthesizes a raw
+            // CF_DIB from any clipboard bitmap, so read + decode that ourselves
+            // before giving up. The error is otherwise swallowed, so log it too.
+            crate::tuix_trace!("IMG", "arboard get_image failed: {_e}");
+            #[cfg(windows)]
+            if let Some((w, h, rgba)) = read_raw_cf_dib().and_then(|dib| decode_cf_dib_to_rgba(&dib))
+            {
+                let hash = rgba_fingerprint(w as usize, h as usize, &rgba);
+                if let Some(png_data) = encode_rgba_to_png(w, h, &rgba) {
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
+                    return Some((
+                        ImageContent {
+                            media_type: "image/png".into(),
+                            data: b64,
+                        },
+                        hash,
+                    ));
+                }
+            }
+        }
     }
 
     // Tier 2: file URL / path arriving via the text type (`public.utf8-
@@ -638,6 +745,140 @@ mod image_path_tests {
     use super::*;
     use std::io::Write as _;
     use tempfile::tempdir;
+
+    // ── CF_DIB clipboard fallback decoder (Windows paste bug) ──
+    // Fixtures + assertions ported from oh-my-pi (#3426): the exact DIB byte
+    // shapes that arboard's header-less decode rejects. The decoder is
+    // target-independent, so these run and guard the fix on every host.
+
+    fn push32(v: u32, out: &mut Vec<u8>) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    fn push16(v: u16, out: &mut Vec<u8>) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// 2x2 bottom-up BGRA pixel array: memory rows are [red, green] (bottom)
+    /// then [blue, white] (top), all with alpha 0xff.
+    const PIXELS_2X2: [u8; 16] = [
+        0x00, 0x00, 0xff, 0xff, // (0,1) red
+        0x00, 0xff, 0x00, 0xff, // (1,1) green
+        0xff, 0x00, 0x00, 0xff, // (0,0) blue
+        0xff, 0xff, 0xff, 0xff, // (1,0) white
+    ];
+
+    /// `CF_DIB` as Qt's clipboard writer emits it for 32-bit content: a plain
+    /// `BITMAPINFOHEADER` with `BI_BITFIELDS` and three trailing DWORD masks.
+    fn qt_cf_dib(width: u32, height: u32, pixels_bgra: &[u8], compression: u32) -> Vec<u8> {
+        let mut d = Vec::with_capacity(52 + pixels_bgra.len());
+        push32(40, &mut d); // biSize
+        push32(width, &mut d);
+        push32(height, &mut d); // positive: bottom-up
+        push16(1, &mut d); // biPlanes
+        push16(32, &mut d); // biBitCount
+        push32(compression, &mut d);
+        push32(pixels_bgra.len() as u32, &mut d); // biSizeImage
+        push32(0, &mut d); // biXPelsPerMeter
+        push32(0, &mut d); // biYPelsPerMeter
+        push32(0, &mut d); // biClrUsed
+        push32(0, &mut d); // biClrImportant
+        if compression == 3 {
+            push32(0x00ff_0000, &mut d); // red mask
+            push32(0x0000_ff00, &mut d); // green mask
+            push32(0x0000_00ff, &mut d); // blue mask
+        }
+        d.extend_from_slice(pixels_bgra);
+        d
+    }
+
+    /// `CF_DIBV5` as `PixPin` (Qt) places it, after arboard's
+    /// `maybe_tweak_header` rewrite: a 124-byte `BITMAPV5HEADER` with
+    /// `BI_BITFIELDS` and masks embedded in the header. This is the exact
+    /// buffer arboard's header-less BMP decode rejects with `ConversionFailure`.
+    fn pixpin_dibv5_tweaked(width: u32, height: u32, pixels_bgra: &[u8]) -> Vec<u8> {
+        let mut d = Vec::with_capacity(124 + pixels_bgra.len());
+        push32(124, &mut d); // bV5Size
+        push32(width, &mut d);
+        push32(height, &mut d);
+        push16(1, &mut d); // bV5Planes
+        push16(32, &mut d); // bV5BitCount
+        push32(3, &mut d); // bV5Compression = BI_BITFIELDS
+        push32(0, &mut d); // bV5SizeImage
+        push32(0, &mut d); // bV5XPelsPerMeter
+        push32(0, &mut d); // bV5YPelsPerMeter
+        push32(0, &mut d); // bV5ClrUsed
+        push32(0, &mut d); // bV5ClrImportant
+        push32(0x00ff_0000, &mut d); // bV5RedMask
+        push32(0x0000_ff00, &mut d); // bV5GreenMask
+        push32(0x0000_00ff, &mut d); // bV5BlueMask
+        push32(0xff00_0000, &mut d); // bV5AlphaMask
+        push32(0x7352_4742, &mut d); // bV5CSType = LCS_sRGB
+        d.extend_from_slice(&[0u8; 36]); // bV5Endpoints
+        push32(0, &mut d); // bV5GammaRed
+        push32(0, &mut d); // bV5GammaGreen
+        push32(0, &mut d); // bV5GammaBlue
+        push32(4, &mut d); // bV5Intent = LCS_GM_IMAGES
+        push32(0, &mut d); // bV5ProfileData
+        push32(0, &mut d); // bV5ProfileSize
+        push32(0, &mut d); // bV5Reserved
+        assert_eq!(d.len(), 124);
+        d.extend_from_slice(pixels_bgra);
+        d
+    }
+
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const GREEN: [u8; 4] = [0, 255, 0, 255];
+    const BLUE: [u8; 4] = [0, 0, 255, 255];
+    const WHITE: [u8; 4] = [255, 255, 255, 255];
+
+    fn decoded_pixels(dib: &[u8]) -> (u32, u32, Vec<[u8; 4]>) {
+        let (w, h, rgba) = decode_cf_dib_to_rgba(dib).expect("DIB must decode");
+        let px = rgba.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
+        (w, h, px)
+    }
+
+    #[test]
+    fn decodes_qt_cf_dib_with_bitfields_masks() {
+        let dib = qt_cf_dib(2, 2, &PIXELS_2X2, 3);
+        let (w, h, px) = decoded_pixels(&dib);
+        assert_eq!((w, h), (2, 2));
+        // Row order flipped versus the bottom-up pixel array; BGRA -> RGBA.
+        assert_eq!(px, vec![BLUE, WHITE, RED, GREEN]);
+    }
+
+    #[test]
+    fn decodes_pixpin_dibv5_payload_that_arboard_rejects() {
+        let dib = pixpin_dibv5_tweaked(2, 2, &PIXELS_2X2);
+        let (w, h, px) = decoded_pixels(&dib);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(px, vec![BLUE, WHITE, RED, GREEN]);
+    }
+
+    #[test]
+    fn decodes_plain_bi_rgb_dib() {
+        // Common "copy image" payload: BI_RGB, 32-bit, no masks. The 4th byte
+        // is unused per the DIB contract — zero it to prove decode still yields
+        // opaque pixels.
+        let mut pixels = PIXELS_2X2;
+        for alpha in pixels.iter_mut().skip(3).step_by(4) {
+            *alpha = 0;
+        }
+        let dib = qt_cf_dib(2, 2, &pixels, 0);
+        let (w, h, px) = decoded_pixels(&dib);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(px, vec![BLUE, WHITE, RED, GREEN]);
+    }
+
+    #[test]
+    fn rejects_malformed_dib() {
+        assert!(decode_cf_dib_to_rgba(&[0u8; 12]).is_none(), "short buffer");
+        let mut oversized = qt_cf_dib(2, 2, &PIXELS_2X2, 3);
+        oversized[0..4].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        assert!(
+            decode_cf_dib_to_rgba(&oversized).is_none(),
+            "header size beyond buffer"
+        );
+    }
 
     #[test]
     fn paste_image_chord_accepts_ctrl_v_and_ctrl_alt_v_only() {

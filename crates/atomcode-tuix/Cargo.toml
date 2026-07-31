@@ -46,6 +46,14 @@ qrcode = { version = "0.14", default-features = false }
 ignore = "0.4"
 arboard = "3"
 png = "0.17"
+# BMP/DIB decode for the Windows clipboard-image fallback: arboard's headerless
+# decode mis-places the pixel offset for the V4/V5 + BI_BITFIELDS DIBs that Qt /
+# PixPin / Snipaste / the Windows Snipping Tool produce, so it rejects them. We
+# re-wrap the raw CF_DIB in a BITMAPFILEHEADER and decode via the BMP *file*
+# path. Kept all-target (not cfg(windows)) so the pure `decode_cf_dib_to_rgba`
+# and its fixtures are unit-tested on every host; bmp-only to stay light, and
+# `image` 0.25 is already in the tree transitively via arboard.
+image = { version = "0.25", default-features = false, features = ["bmp"] }
 base64 = "0.22"
 urlencoding = "2"
 futures = "0.3"
@@ -68,6 +76,9 @@ objc2-app-kit = { version = "0.3", default-features = false, features = ["NSPast
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSString"] }
 
 [target.'cfg(windows)'.dependencies]
+# Raw CF_DIB read for the clipboard-image fallback (see `image` dep note above).
+# Already present transitively via arboard, so no fresh registry fetch.
+clipboard-win = "5.4"
 
 [dev-dependencies]
 # Redirect ATOMCODE_HOME to a throwaway temp dir before any test runs (via a
