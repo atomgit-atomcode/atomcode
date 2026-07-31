@@ -71,7 +71,9 @@ impl Launchd {
     /// invocation and waits for the next scheduled time.  This is a known
     /// launchd limitation.
     fn render_plist(id: &str, exe: &str, trigger: &LaunchdTrigger) -> String {
-        let label = Self::label(id);
+        let label = xml_escape(&Self::label(id));
+        let exe = xml_escape(exe);
+        let id_esc = xml_escape(id);
         let trigger_xml = match trigger {
             LaunchdTrigger::Calendar { hour, minute, weekday } => {
                 let mut dict = String::from("\t\t<dict>\n");
@@ -103,7 +105,7 @@ impl Launchd {
 		<string>{exe}</string>
 		<string>schedule</string>
 		<string>run</string>
-		<string>{id}</string>
+		<string>{id_esc}</string>
 	</array>
 {trigger_xml}
 	<key>RunAtLoad</key>
@@ -129,6 +131,14 @@ impl OsScheduler for Launchd {
         let path = self.plist_path(&task.id);
         std::fs::write(&path, plist_content)?;
         let uid = get_uid();
+        let label = Self::label(&task.id);
+        // Best-effort bootout before bootstrap to make install idempotent.
+        // If the service is not currently loaded, bootout returns an error which
+        // we intentionally ignore.
+        let _ = self.runner.run(
+            "launchctl",
+            &["bootout".to_string(), format!("gui/{uid}/{label}")],
+        );
         let domain = format!("gui/{uid}");
         run_checked(
             self.runner.as_ref(),
@@ -380,6 +390,24 @@ pub fn current() -> anyhow::Result<Box<dyn OsScheduler + Send + Sync>> {
 }
 
 // ---- Shared helpers ----
+
+/// Escape a string for safe inclusion inside a plist `<string>` element.
+///
+/// Replaces `&`, `<`, `>`, and `"` with their XML entity equivalents so that
+/// paths containing those characters produce well-formed plist XML.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
 
 fn hhmm(s: &str) -> anyhow::Result<(u8, u8)> {
     let (h, m) = s.split_once(':').ok_or_else(|| anyhow::anyhow!("bad time {s}"))?;
@@ -791,6 +819,30 @@ mod tests {
         sched.uninstall("lt1").unwrap();
     }
 
+    /// A: install twice on same task must be Ok (idempotent via bootout before bootstrap).
+    #[test]
+    fn launchd_install_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new();
+        let sched = Launchd { root: tmp.path().to_path_buf(), runner: runner.clone() };
+        let task = sample_task("lt_idem");
+
+        // First install — must succeed.
+        sched.install(&task).unwrap();
+        // Second install — must also succeed (bootout before bootstrap makes it idempotent).
+        sched.install(&task).unwrap();
+
+        // Both installs must have issued a bootout call (best-effort pre-cleanup).
+        let calls = runner.calls();
+        let bootout_calls: Vec<_> = calls.iter()
+            .filter(|(p, a)| p == "launchctl" && a.iter().any(|x| x == "bootout"))
+            .collect();
+        assert!(bootout_calls.len() >= 2, "expected ≥2 bootout calls (one per install): {calls:?}");
+
+        // Status still shows installed after second install.
+        assert_eq!(sched.status("lt_idem"), InstallState::Installed);
+    }
+
     #[test]
     fn launchd_interval_uses_start_interval() {
         let tmp = tempfile::tempdir().unwrap();
@@ -866,5 +918,28 @@ mod tests {
         assert!(result.is_err(), "install should fail when schtasks /Create returns non-zero");
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("schtasks"), "error should mention schtasks: {msg}");
+    }
+
+    // ---- D: xml_escape tests ----
+
+    #[test]
+    fn xml_escape_ampersand_in_exe_produces_amp_entity() {
+        let escaped = xml_escape("/usr/local/bin/foo&bar");
+        assert!(escaped.contains("&amp;"), "expected &amp; entity: {escaped}");
+        assert!(!escaped.contains("&b"), "bare & must not appear: {escaped}");
+    }
+
+    #[test]
+    fn xml_escape_lt_gt_quote() {
+        assert_eq!(xml_escape("<tag>"), "&lt;tag&gt;");
+        assert_eq!(xml_escape("\"hello\""), "&quot;hello&quot;");
+    }
+
+    #[test]
+    fn render_plist_escapes_special_chars_in_exe() {
+        let trigger = LaunchdTrigger::Calendar { hour: Some(9), minute: Some(0), weekday: None };
+        let plist = Launchd::render_plist("my-task", "/path/to/foo&bar", &trigger);
+        assert!(plist.contains("&amp;"), "plist must contain &amp; entity: {plist}");
+        assert!(!plist.contains("&b"), "plist must not contain bare & followed by b: {plist}");
     }
 }
