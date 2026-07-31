@@ -62,10 +62,10 @@ pub fn systemd_calendar(s: &Schedule) -> anyhow::Result<OnCalendar> {
 }
 
 fn dow_abbr(wd: u8) -> anyhow::Result<&'static str> {
-    Ok(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-        .get((wd.max(1) - 1) as usize)
-        .copied()
-        .ok_or_else(|| anyhow::anyhow!("bad weekday {wd}"))?)
+    if wd == 0 || wd > 7 {
+        anyhow::bail!("bad weekday {wd}");
+    }
+    Ok(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][(wd - 1) as usize])
 }
 
 // ---- launchd ----
@@ -87,11 +87,14 @@ pub fn launchd_calendar(s: &Schedule) -> anyhow::Result<LaunchdTrigger> {
             LaunchdTrigger::Calendar { hour: Some(h), minute: Some(m), weekday: None }
         }
         Schedule::Weekly { weekday, time } => {
+            if *weekday == 0 || *weekday > 7 {
+                anyhow::bail!("bad weekday {weekday}");
+            }
             let (h, m) = hhmm(time)?;
             LaunchdTrigger::Calendar {
                 hour: Some(h),
                 minute: Some(m),
-                weekday: Some(*weekday % 7), // launchd Sunday=0
+                weekday: Some(*weekday % 7), // launchd Sunday=0; 7 % 7 == 0
             }
         }
         Schedule::Hourly => LaunchdTrigger::Calendar { hour: None, minute: Some(0), weekday: None },
@@ -135,10 +138,10 @@ pub fn schtasks_args(s: &Schedule) -> anyhow::Result<Vec<String>> {
 }
 
 fn schtasks_dow(wd: u8) -> anyhow::Result<&'static str> {
-    Ok(["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
-        .get((wd.max(1) - 1) as usize)
-        .copied()
-        .ok_or_else(|| anyhow::anyhow!("bad weekday {wd}"))?)
+    if wd == 0 || wd > 7 {
+        anyhow::bail!("bad weekday {wd}");
+    }
+    Ok(["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"][(wd - 1) as usize])
 }
 
 // ---- Tests ----
@@ -193,5 +196,26 @@ mod tests {
     #[test]
     fn cron_kind_rejected_on_launchd() {
         assert!(launchd_calendar(&Schedule::Cron { expr: "0 9 * * *".into() }).is_err());
+    }
+
+    #[test]
+    fn cron_kind_rejected_on_schtasks() {
+        assert!(schtasks_args(&Schedule::Cron { expr: "0 9 * * *".into() }).is_err());
+    }
+
+    #[test]
+    fn launchd_weekly_sunday_conversion() {
+        // weekday=7 (Sun in 1-7 convention) must map to launchd weekday=0 (Sun)
+        assert_eq!(
+            launchd_calendar(&Schedule::Weekly { weekday: 7, time: "08:00".into() }).unwrap(),
+            LaunchdTrigger::Calendar { hour: Some(8), minute: Some(0), weekday: Some(0) }
+        );
+    }
+
+    #[test]
+    fn invalid_weekday_zero_rejected() {
+        assert!(dow_abbr(0).is_err());
+        assert!(launchd_calendar(&Schedule::Weekly { weekday: 0, time: "08:00".into() }).is_err());
+        assert!(schtasks_args(&Schedule::Weekly { weekday: 0, time: "08:00".into() }).is_err());
     }
 }
