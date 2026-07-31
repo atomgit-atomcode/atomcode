@@ -62,6 +62,14 @@ impl Launchd {
         self.root.join(format!("{}.plist", Self::label(id)))
     }
 
+    /// Renders a launchd plist for the given task.
+    ///
+    /// Note: launchd `StartCalendarInterval` calendar triggers are **not**
+    /// retried after a missed fire (e.g. if the machine was asleep at the
+    /// scheduled time).  Unlike systemd's `Persistent=true` or Windows Task
+    /// Scheduler's default catch-up behaviour, launchd simply skips the missed
+    /// invocation and waits for the next scheduled time.  This is a known
+    /// launchd limitation.
     fn render_plist(id: &str, exe: &str, trigger: &LaunchdTrigger) -> String {
         let label = Self::label(id);
         let trigger_xml = match trigger {
@@ -398,7 +406,11 @@ pub fn systemd_calendar(s: &Schedule) -> anyhow::Result<OnCalendar> {
         }
         Schedule::Hourly => OnCalendar::Calendar("hourly".into()),
         Schedule::Interval { every_minutes } => OnCalendar::Interval(format!("{every_minutes}min")),
-        Schedule::Cron { expr } => OnCalendar::Calendar(expr.clone()),
+        Schedule::Cron { .. } => {
+            anyhow::bail!(
+                "cron schedules are not supported on systemd timers; use a simple frequency"
+            )
+        }
     })
 }
 
@@ -542,6 +554,11 @@ mod tests {
     #[test]
     fn cron_kind_rejected_on_schtasks() {
         assert!(schtasks_args(&Schedule::Cron { expr: "0 9 * * *".into() }).is_err());
+    }
+
+    #[test]
+    fn cron_kind_rejected_on_systemd() {
+        assert!(systemd_calendar(&Schedule::Cron { expr: "0 9 * * *".into() }).is_err());
     }
 
     #[test]

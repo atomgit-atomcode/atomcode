@@ -642,6 +642,8 @@ mod tests {
         assert!(!crate::headless_auto_approve(true, false, "edit_file"));
         // strict + skip_permissions still denies (scheduled never skips, but defensive).
         assert!(!crate::headless_auto_approve(true, true, "bash"));
+        // non-strict + skip_permissions (-p flag) → skip_permissions dominates, any tool allowed.
+        assert!(crate::headless_auto_approve(false, true, "edit_file"));
     }
 
     #[test]
