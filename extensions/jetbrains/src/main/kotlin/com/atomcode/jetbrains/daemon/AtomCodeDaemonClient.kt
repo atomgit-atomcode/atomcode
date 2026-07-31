@@ -1,5 +1,6 @@
 package com.atomcode.jetbrains.daemon
 
+import com.google.gson.JsonParser
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -19,6 +20,8 @@ class AtomCodeDaemonClient(
 
     private val baseUrl = "http://$host:$port"
 
+    internal fun loginCoordinatorKey(): String = baseUrl
+
     fun health(): CompletableFuture<HealthResponse> =
         send("GET", "/health").thenApply {
             HealthResponse(
@@ -26,6 +29,7 @@ class AtomCodeDaemonClient(
                 version = it.jsonString("version").orEmpty(),
                 service = it.jsonString("service").orEmpty(),
                 binaryHash = it.jsonString("binary_hash"),
+                instanceId = it.jsonString("instance_id"),
             )
         }
 
@@ -65,6 +69,7 @@ class AtomCodeDaemonClient(
         send("GET", "/auth/status").thenApply { raw ->
             AuthStatusResponse(
                 loggedIn = raw.jsonBoolean("logged_in") ?: false,
+                expired = raw.jsonBoolean("expired") ?: false,
                 authPath = raw.jsonString("auth_path").orEmpty(),
                 userName = raw.jsonNestedObject("user")?.let {
                     it.jsonString("name") ?: it.jsonString("username") ?: it.jsonString("email")
@@ -78,6 +83,7 @@ class AtomCodeDaemonClient(
                 loginId = raw.jsonString("login_id").orEmpty(),
                 url = raw.jsonString("url").orEmpty(),
                 expiresInSeconds = raw.jsonInt("expires_in_seconds") ?: 600,
+                daemonInstanceId = raw.jsonString("daemon_instance_id"),
             )
         }
 
@@ -88,6 +94,9 @@ class AtomCodeDaemonClient(
                 userName = raw.jsonNestedObject("user")?.let {
                     it.jsonString("name") ?: it.jsonString("username") ?: it.jsonString("email")
                 },
+                code = raw.jsonString("code"),
+                message = raw.jsonString("message"),
+                retryAfterMs = raw.jsonInt("retry_after_ms"),
             )
         }
 
@@ -223,12 +232,7 @@ class AtomCodeDaemonClient(
                 name = raw.jsonString("name").orEmpty(),
                 workingDir = raw.jsonString("working_dir").orEmpty(),
                 projectHash = projectHash,
-                messages = raw.jsonArrayObjects("messages").map {
-                    MessageInfo(
-                        role = it.jsonString("role").orEmpty(),
-                        content = it.jsonString("content").orEmpty(),
-                    )
-                },
+                messages = raw.jsonArrayObjects("messages").map(::parseMessageInfo),
             )
         }
 
@@ -280,6 +284,7 @@ class AtomCodeDaemonClient(
             append("\"working_dir\":${request.workingDir.jsonQuoted()},")
             append("\"session_id\":${request.sessionId.jsonQuoted()}")
             request.provider?.let { append(",\"provider\":${it.jsonQuoted()}") }
+            request.approvalMode?.let { append(",\"approval_mode\":${it.jsonQuoted()}") }
             if (request.images.isNotEmpty()) {
                 append(",\"images\":[")
                 request.images.forEachIndexed { index, image ->
@@ -308,7 +313,7 @@ class AtomCodeDaemonClient(
                 try {
                     if (response.statusCode() >= 400) {
                         val error = response.body().bufferedReader().use { it.readText() }
-                        onEvent(ChatEvent.Error("Daemon request failed: HTTP ${response.statusCode()}${error.daemonErrorSuffix()}"))
+                        onEvent(ChatEvent.Error(formatDaemonHttpError(response.statusCode(), error)))
                         future.complete(null)
                         return@thenAcceptAsync
                     }
@@ -338,6 +343,24 @@ class AtomCodeDaemonClient(
         return future
     }
 
+    fun getApprovalMode(): CompletableFuture<ApprovalModeResponse> =
+        send("GET", "/approval_mode").thenApply {
+            ApprovalModeResponse(
+                ok = it.jsonBoolean("ok") ?: false,
+                mode = it.jsonString("mode").orEmpty(),
+            )
+        }
+
+    fun setApprovalMode(mode: ApprovalMode): CompletableFuture<ApprovalModeResponse> {
+        val body = "{\"mode\":${mode.wire.jsonQuoted()}}"
+        return send("POST", "/approval_mode", body).thenApply {
+            ApprovalModeResponse(
+                ok = it.jsonBoolean("ok") ?: false,
+                mode = it.jsonString("mode").orEmpty(),
+            )
+        }
+    }
+
     private fun send(method: String, path: String, body: String? = null): CompletableFuture<String> {
         val builder = requestBuilder(path)
         val publisher = if (body == null) HttpRequest.BodyPublishers.noBody() else HttpRequest.BodyPublishers.ofString(body)
@@ -345,7 +368,7 @@ class AtomCodeDaemonClient(
 
         return client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).thenApply { response ->
             if (response.statusCode() >= 400) {
-                throw IllegalStateException("Daemon request failed: HTTP ${response.statusCode()}")
+                throw DaemonHttpException.from(response.statusCode(), response.body())
             }
             response.body()
         }
@@ -364,13 +387,78 @@ class AtomCodeDaemonClient(
     }
 }
 
-internal fun String.jsonQuoted(): String =
-    "\"" + replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\""
-
-private fun String.daemonErrorSuffix(): String {
-    val message = jsonString("error") ?: jsonString("message") ?: trim()
-    return message.takeIf { it.isNotBlank() }?.let { ": $it" }.orEmpty()
+class DaemonHttpException(
+    val statusCode: Int,
+    val code: String?,
+    val retryable: Boolean,
+    message: String,
+) : IllegalStateException(message) {
+    companion object {
+        internal fun from(statusCode: Int, body: String): DaemonHttpException =
+            DaemonHttpException(
+                statusCode = statusCode,
+                code = body.jsonString("code"),
+                retryable = body.jsonBoolean("retryable") ?: (statusCode >= 500),
+                message = formatDaemonHttpError(statusCode, body),
+            )
+    }
 }
+
+internal fun String.jsonQuoted(): String = buildString(length + 2) {
+    append('"')
+    for (ch in this@jsonQuoted) {
+        when (ch) {
+            '\\' -> append("\\\\")
+            '"' -> append("\\\"")
+            '\b' -> append("\\b")
+            '\u000C' -> append("\\f")
+            '\n' -> append("\\n")
+            '\r' -> append("\\r")
+            '\t' -> append("\\t")
+            else -> {
+                if (ch.code < 0x20) {
+                    append("\\u")
+                    append(ch.code.toString(16).padStart(4, '0'))
+                } else {
+                    append(ch)
+                }
+            }
+        }
+    }
+    append('"')
+}
+
+internal fun formatDaemonHttpError(statusCode: Int, body: String): String {
+    val prefix = "Daemon request failed: HTTP $statusCode"
+    val detail = daemonErrorMessage(body).takeIf { it.isNotBlank() } ?: return prefix
+    val message = "$prefix: $detail"
+    return message.takeIf { it.length <= MAX_DAEMON_ERROR_MESSAGE_CHARS }
+        ?: message.take(MAX_DAEMON_ERROR_MESSAGE_CHARS - 3) + "..."
+}
+
+private const val MAX_DAEMON_ERROR_MESSAGE_CHARS = 550
+
+private fun daemonErrorMessage(body: String): String {
+    val trimmed = body.trim()
+    if (trimmed.isBlank()) return ""
+    jsonObjectErrorMessage(trimmed)?.let { return it }
+    jsonStringBody(trimmed)?.let { return it }
+    return trimmed
+}
+
+private fun jsonObjectErrorMessage(body: String): String? =
+    body.jsonString("error") ?: body.jsonString("message")
+
+private fun jsonStringBody(body: String): String? =
+    try {
+        val parsed = JsonParser.parseString(body)
+        parsed.takeIf { it.isJsonPrimitive }
+            ?.asJsonPrimitive
+            ?.takeIf { it.isString }
+            ?.asString
+    } catch (_: Exception) {
+        null
+    }
 
 internal fun String?.jsonQuotedOrNull(): String = this?.jsonQuoted() ?: "null"
 
@@ -392,6 +480,22 @@ internal fun parseSessionMetaList(raw: String): List<SessionMeta> =
         )
     }.filter { it.id.isNotBlank() }
 
+internal fun parseMessageInfo(raw: String): MessageInfo =
+    MessageInfo(
+        role = raw.jsonString("role").orEmpty(),
+        content = raw.jsonString("content").orEmpty(),
+        synthetic = raw.jsonBoolean("synthetic") ?: false,
+        internalOrigin = raw.jsonString("internal_origin") ?: raw.jsonString("internalOrigin"),
+        toolCalls = raw.jsonArrayObjects("tool_calls").map(::parseToolCallInfo),
+    )
+
+private fun parseToolCallInfo(raw: String): ToolCallInfo =
+    ToolCallInfo(
+        id = raw.jsonString("id"),
+        name = raw.jsonString("name").orEmpty(),
+        arguments = raw.jsonString("arguments") ?: raw.jsonString("display").orEmpty(),
+    )
+
 private fun String.toProviderInfo(): ProviderInfo =
     ProviderInfo(
         name = jsonString("name").orEmpty(),
@@ -399,6 +503,7 @@ private fun String.toProviderInfo(): ProviderInfo =
         model = jsonString("model").orEmpty(),
         isDefault = jsonBoolean("is_default") ?: false,
         hasApiKey = jsonBoolean("has_api_key") ?: false,
+        requiresLogin = jsonBoolean("requires_login"),
         thinkingEnabled = jsonBoolean("thinking_enabled") ?: false,
         thinkingBudget = jsonInt("thinking_budget"),
         thinkingType = jsonString("thinking_type"),

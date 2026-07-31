@@ -69,10 +69,11 @@ class AtomCodeDaemonProcess(
             args += binary.argsPrefix
             args += listOf("--port", settings.port.toString(), "--client", "jetbrains")
 
-            val process = ProcessBuilder(args)
+            val builder = ProcessBuilder(args)
                 .redirectOutput(ProcessBuilder.Redirect.DISCARD)
                 .redirectError(ProcessBuilder.Redirect.DISCARD)
-                .start()
+            normalizeDaemonEnvForUtf8Locale(builder.environment())
+            val process = builder.start()
             synchronized(processLock) {
                 ownedProcess?.takeIf { it.isAlive }?.let {
                     it.destroy()
@@ -201,4 +202,51 @@ class AtomCodeDaemonProcess(
         }
         return Path.of(expanded)
     }
+}
+
+fun normalizeDaemonEnvForUtf8Locale(
+    env: MutableMap<String, String>,
+    osName: String = System.getProperty("os.name"),
+) {
+    val normalizedOs = osName.lowercase()
+    if (normalizedOs.contains("win")) return
+    if (isUtf8Locale(env["LC_ALL"]) && !isBareUtf8Locale(env["LC_ALL"])) return
+    if (isCLocale(env["LC_ALL"]) || isBareUtf8Locale(env["LC_ALL"])) {
+        env.remove("LC_ALL")
+    }
+
+    val isMac = normalizedOs.contains("mac")
+    val ctypeFallback = if (isMac) {
+        "UTF-8"
+    } else {
+        "C.UTF-8"
+    }
+    val langFallback = if (isMac) {
+        "en_US.UTF-8"
+    } else {
+        "C.UTF-8"
+    }
+    val hasUtf8Ctype = isUtf8Locale(env["LC_CTYPE"]) &&
+        (isMac || !isBareUtf8Locale(env["LC_CTYPE"]))
+    if (!hasUtf8Ctype) {
+        env["LC_CTYPE"] = ctypeFallback
+    }
+    if (isCLocale(env["LANG"]) || isBareUtf8Locale(env["LANG"])) {
+        env["LANG"] = langFallback
+    }
+}
+
+private fun isCLocale(value: String?): Boolean {
+    val normalized = value?.trim()?.lowercase().orEmpty()
+    return normalized.isEmpty() || normalized == "c" || normalized == "posix"
+}
+
+private fun isUtf8Locale(value: String?): Boolean {
+    val normalized = value?.trim()?.lowercase().orEmpty()
+    return normalized.contains("utf-8") || normalized.contains("utf8")
+}
+
+private fun isBareUtf8Locale(value: String?): Boolean {
+    val normalized = value?.trim()?.lowercase().orEmpty()
+    return normalized == "utf-8" || normalized == "utf8"
 }

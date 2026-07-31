@@ -1,7 +1,7 @@
 // Task 15b — Working directory picker modal
 
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { listDir, getProjects, changeDir, mkdir, ProjectInfo } from '../api';
+import { listDir, getProjects, changeDir, deleteProject, mkdir, ProjectInfo } from '../api';
 import { useT } from '../settings';
 
 interface CwdPickerProps {
@@ -52,7 +52,6 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
   const [dirLoading, setDirLoading] = useState(false);
   const [dirError, setDirError] = useState<string | null>(null);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
-  const [setAsDefault, setSetAsDefault] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [newFolder, setNewFolder] = useState('');
   const [mkdirError, setMkdirError] = useState<string | null>(null);
@@ -102,6 +101,16 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
     setInputPath(workingDir);
   }
 
+  async function handleDeleteProject(hash: string, e: MouseEvent) {
+    e.stopPropagation();
+    try {
+      await deleteProject(hash);
+      setProjects((prev) => prev.filter((p) => p.hash !== hash));
+    } catch {
+      setProjects((prev) => prev.filter((p) => p.hash !== hash));
+    }
+  }
+
   async function handleCreateFolder() {
     const name = newFolder.trim();
     if (!name) return;
@@ -121,8 +130,7 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
     if (!finalPath) return;
     setConfirming(true);
     try {
-      // 始终同步到 daemon 的当前项目（刷新后保持）；勾选框只决定是否写回 config 默认。
-      await changeDir(finalPath, setAsDefault);
+      await changeDir(finalPath);
       onPick(finalPath);
       onClose();
     } catch {
@@ -237,14 +245,22 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
               {projects.slice(0, 6).map((p) => {
                 const isCurrent = p.working_dir === browsePath;
                 return (
-                  <button
+                  <div
                     key={p.hash}
                     class={'list-row' + (isCurrent ? ' active' : '')}
                     onClick={() => handleProjectClick(p.working_dir)}
                   >
-                    <span class="mono">{p.working_dir}</span>
+                    <span class="mono" style="flex:1;min-width:0">{p.working_dir}</span>
                     {isCurrent && <span class="badge">● {t('cwd.current')}</span>}
-                  </button>
+                    <button
+                      type="button"
+                      title="移除此项目"
+                      style="background:none;border:none;cursor:pointer;padding:2px 4px;opacity:0.6;font-size:12px;margin-left:auto;color:inherit;"
+                      onClick={(e) => handleDeleteProject(p.hash, e)}
+                    >
+                      ✕
+                    </button>
+                  </div>
                 );
               })}
             </div>
@@ -252,16 +268,6 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
         </div>
 
         <div class="modal-footer">
-          <label class="checkbox-label">
-            <input
-              type="checkbox"
-              checked={setAsDefault}
-              onChange={(e) =>
-                setSetAsDefault((e.target as HTMLInputElement).checked)
-              }
-            />
-            {t('cwd.setDefault')}
-          </label>
           <button class="btn" onClick={onClose}>
             {t('cwd.cancel')}
           </button>

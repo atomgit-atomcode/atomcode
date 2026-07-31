@@ -1,23 +1,15 @@
 //! Proxy policy for L1 outbound HTTP clients.
 //!
-//! `atomcode-capabilities` must not depend on `atomcode-core` (L1 layering is
-//! compile-enforced — see Cargo.toml), so it cannot call core's proxy module.
-//! Instead it honors the process-global `ATOMCODE_PROXY_MODE` env var that the
-//! CLI / daemon publish at startup via
-//! `atomcode_core::proxy::apply_process_proxy_config` (which runs before any v2
-//! client is built). This mirrors the identical self-contained helper in
-//! `atomcode-telemetry` (`sender/http.rs`), which sits below core for the same
-//! layering reason.
+//! It honors the process-global `ATOMCODE_PROXY_MODE` env var published from
+//! `atomcode-config` policy by the CLI/daemon before clients are built. This
+//! mirrors the self-contained helper in `atomcode-telemetry` (`sender/http.rs`).
 //!
-//! Default = bypass. `no_proxy` is the app's documented default, so when the
-//! mode is `no_proxy` OR the env var is **unset** we call `.no_proxy()` on the
-//! builder — the unset case matters because a host that never published the var
-//! (a standalone embedder, or `cargo test`, where `apply_process_proxy_config`
-//! never runs) must still fall back to the NoProxy default rather than silently
-//! honoring the developer's ambient `HTTP_PROXY`/`ALL_PROXY`. This matches v1's
-//! `apply_async_proxy_policy`, which lazily applies the same NoProxy default via
-//! `ensure_runtime_initialized()` on an unset var. For the explicit
-//! `follow_system` / `default_proxy` modes the builder is returned untouched and
+//! We call `.no_proxy()` ONLY when the mode is explicitly `no_proxy`. The app's
+//! default is `follow_system` (respect the environment proxy — corporate-proxy
+//! users would otherwise time out), so an **unset** env var (standalone embedder,
+//! or `cargo test`, where `apply_process_proxy_config` never runs) falls back to
+//! honoring the ambient proxy rather than bypassing it. For
+//! `follow_system` / `default_proxy` the builder is returned untouched and
 //! reqwest's default env-based proxy detection picks up the published vars.
 
 use std::env;
@@ -29,10 +21,10 @@ const NO_PROXY_MODE: &str = "no_proxy";
 
 /// Whether outbound clients must bypass all proxies, given the published proxy
 /// mode (`None` = env var unset). Pure so it is testable without mutating the
-/// process environment. Bypass when the mode is explicitly `no_proxy` OR unset
-/// (the unset case falls back to the app's documented NoProxy default).
+/// process environment. Bypass ONLY when the mode is explicitly `no_proxy`; an
+/// unset var falls back to the app's `follow_system` default (honor env proxy).
 fn mode_disables_proxy(mode: Option<&str>) -> bool {
-    matches!(mode, None | Some(NO_PROXY_MODE))
+    matches!(mode, Some(NO_PROXY_MODE))
 }
 
 /// Whether outbound clients must bypass all proxies for the current process.
@@ -40,23 +32,60 @@ fn proxy_disabled() -> bool {
     mode_disables_proxy(env::var(MODE_ENV).ok().as_deref())
 }
 
-/// Apply the process proxy policy to an async reqwest client builder.
+/// The env override that caps outbound TLS at 1.2 (kept in sync with
+/// `atomcode_config::tls::MAX_ENV` — hardcoded here for the same layering reason
+/// `MODE_ENV` is: this module must build in config-less feature combos). Only read
+/// on the config-less path; the `provider` build defers to `atomcode_config::tls`.
+#[cfg(not(feature = "provider"))]
+const TLS_MAX_ENV: &str = "ATOMCODE_TLS_MAX";
+
+/// Whether the user explicitly requested a process-wide TLS 1.2 ceiling.
+/// Automatic AtomGit fallback is endpoint-aware and lives in the provider.
+fn force_tls12() -> bool {
+    #[cfg(feature = "provider")]
+    {
+        atomcode_config::tls::env_forces_tls12()
+    }
+    #[cfg(not(feature = "provider"))]
+    {
+        env::var(TLS_MAX_ENV)
+            .ok()
+            .map(|raw| {
+                let v = raw.trim();
+                v == "1.2" || v.eq_ignore_ascii_case("tlsv1.2") || v.eq_ignore_ascii_case("tls1.2")
+            })
+            .unwrap_or(false)
+    }
+}
+
+/// Apply the process proxy policy to an async reqwest client builder, then cap at
+/// TLS 1.2 when [`force_tls12`] is set.
 pub(crate) fn apply_async_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-    if proxy_disabled() {
+    let builder = if proxy_disabled() {
         builder.no_proxy()
+    } else {
+        builder
+    };
+    if force_tls12() {
+        builder.max_tls_version(reqwest::tls::Version::TLS_1_2)
     } else {
         builder
     }
 }
 
 /// Apply the process proxy policy to a blocking reqwest client builder
-/// (the one-shot MCP OAuth login / refresh flow).
+/// (the one-shot MCP OAuth login / refresh flow), then cap TLS as above.
 #[cfg(feature = "mcp")]
 pub(crate) fn apply_blocking_proxy_policy(
     builder: reqwest::blocking::ClientBuilder,
 ) -> reqwest::blocking::ClientBuilder {
-    if proxy_disabled() {
+    let builder = if proxy_disabled() {
         builder.no_proxy()
+    } else {
+        builder
+    };
+    if force_tls12() {
+        builder.max_tls_version(reqwest::tls::Version::TLS_1_2)
     } else {
         builder
     }
@@ -69,14 +98,14 @@ mod tests {
     // Pure predicate test — no process-env mutation, so it cannot race or leak
     // state into the sibling tests that build reqwest clients in this binary.
     #[test]
-    fn mode_disables_proxy_for_no_proxy_and_unset() {
+    fn mode_disables_proxy_only_for_explicit_no_proxy() {
         assert!(
             mode_disables_proxy(Some(NO_PROXY_MODE)),
             "explicit no_proxy bypasses"
         );
         assert!(
-            mode_disables_proxy(None),
-            "unset falls back to the NoProxy default (bypass)"
+            !mode_disables_proxy(None),
+            "unset falls back to follow_system (honor env proxy), not bypass"
         );
         assert!(
             !mode_disables_proxy(Some("follow_system")),

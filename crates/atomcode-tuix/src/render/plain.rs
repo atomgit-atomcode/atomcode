@@ -60,6 +60,10 @@ pub struct PlainRenderer<W: Write + Send> {
     ///   with the assistant's reply.
     interactive_terminal: bool,
     last_prompt_written: bool,
+    /// Last pending-message snapshot surfaced in interactive plain mode.
+    /// Plain terminals cannot repaint a footer panel, so only newly appended
+    /// entries are written as a compact acknowledgement.
+    last_pending_messages: Vec<String>,
     /// True iff the last write was a transient (spinner) line that
     /// hasn't been wiped yet. The next non-transient render needs to
     /// emit `\r\x1b[K` first so it doesn't append to the spinner row.
@@ -112,6 +116,7 @@ impl<W: Write + Send> PlainRenderer<W> {
             caps,
             interactive_terminal,
             last_prompt_written: false,
+            last_pending_messages: Vec::new(),
             transient_active: false,
         }
     }
@@ -125,6 +130,13 @@ impl<W: Write + Send> PlainRenderer<W> {
             let _ = self.out.write_all(b"\r\x1b[K");
             self.transient_active = false;
         }
+    }
+
+    /// ASCII-downgrade decorative glyphs when the terminal lacks unicode support
+    /// (mirrors the retained renderer; see `crate::glyph`). No-op / zero-copy on
+    /// unicode terminals and pure-ASCII text.
+    fn dg<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
+        crate::glyph::downgrade_glyphs(s, self.caps.unicode_symbols)
     }
 
     fn render_user(&mut self, text: &str, attachments: &[usize]) {
@@ -141,15 +153,57 @@ impl<W: Write + Send> PlainRenderer<W> {
                     SGR_BOLD_CYAN,
                     chev,
                     SGR_RESET,
-                    scrub_controls(text)
+                    self.dg(&scrub_controls(text))
                 );
             } else {
-                let _ = writeln!(self.out, "{}{}", chev, scrub_controls(text));
+                let _ = writeln!(self.out, "{}{}", chev, self.dg(&scrub_controls(text)));
             }
         }
         for n in attachments {
-            let _ = writeln!(self.out, "  └ [Image #{}]", n);
+            let branch = if self.caps.unicode_symbols {
+                "\u{2514}"
+            } else {
+                "`"
+            };
+            let _ = writeln!(self.out, "  {} [Image #{}]", branch, n);
         }
+    }
+
+    fn render_pending_messages(&mut self, pending: &[String]) {
+        if pending == self.last_pending_messages {
+            return;
+        }
+        if !self.interactive_terminal {
+            self.last_pending_messages = pending.to_vec();
+            return;
+        }
+
+        let appended_from = if pending.starts_with(&self.last_pending_messages) {
+            self.last_pending_messages.len()
+        } else {
+            0
+        };
+        if appended_from < pending.len() {
+            self.drop_transient();
+            let _ = writeln!(
+                self.out,
+                "{}",
+                crate::i18n::t(crate::i18n::Msg::PendingMessagesTitle)
+            );
+            let branch = if self.caps.unicode_symbols {
+                "\u{21b3}"
+            } else {
+                "->"
+            };
+            for message in &pending[appended_from..] {
+                let preview = scrub_controls(message)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let _ = writeln!(self.out, "  {} {}", branch, self.dg(&preview));
+            }
+        }
+        self.last_pending_messages = pending.to_vec();
     }
 }
 
@@ -179,37 +233,54 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
             }
             UiLine::AssistantText(text) => {
                 self.drop_transient();
-                let _ = self.out.write_all(scrub_controls(&text).as_bytes());
+                let _ = self
+                    .out
+                    .write_all(self.dg(&scrub_controls(&text)).as_bytes());
             }
             UiLine::ReasoningText(text) => {
                 // Display reasoning in gray/dimmed style
-                let _ = write!(self.out, "\x1b[2m{}\x1b[0m", scrub_controls(&text));
+                let _ = write!(
+                    self.out,
+                    "\x1b[2m{}\x1b[0m",
+                    self.dg(&scrub_controls(&text))
+                );
             }
             UiLine::AssistantLineBreak => {
                 self.drop_transient();
                 let _ = self.out.write_all(b"\n");
             }
-            UiLine::ToolCall { name, detail } | UiLine::ToolCallInFlight { id: _, name, detail } => {
+            UiLine::ToolCall { name, detail }
+            | UiLine::ToolCallInFlight {
+                id: _,
+                name,
+                detail,
+                hint: _,
+            } => {
                 // Plain mode has no in-place rewrite, so the in-flight
                 // variant degrades to the same single static line that
                 // the static `ToolCall` produces — the user just sees
                 // `▸ Name(detail)` once, when the call lands.
                 self.drop_transient();
-                let name = scrub_controls(&name);
-                let detail = scrub_controls(&detail);
+                let name = self.dg(&scrub_controls(&name)).into_owned();
+                let detail = self.dg(&scrub_controls(&detail)).into_owned();
                 let arrow_color = if self.caps.colors { SGR_CYAN } else { "" };
                 let reset = if self.caps.colors { SGR_RESET } else { "" };
+                let bullet = if self.caps.unicode_symbols {
+                    "\u{25cf}"
+                } else {
+                    "*"
+                };
                 // ● (U+25CF) — Geometric Shapes block; broadly available
                 // across Windows monospace fonts. Aligns with retained
                 // and alt-screen renderers (see retained.rs ToolCall
                 // arm for the Windows-font tofu rationale).
                 if detail.is_empty() {
-                    let _ = writeln!(self.out, "{}● {}{}", arrow_color, name, reset);
+                    let _ = writeln!(self.out, "{}{} {}{}", arrow_color, bullet, name, reset);
                 } else {
                     let _ = writeln!(
                         self.out,
-                        "{}● {}{}({})",
-                        arrow_color, name, reset, detail
+                        "{}{} {}{}({})",
+                        arrow_color, bullet, name, reset, detail
                     );
                 }
             }
@@ -217,7 +288,11 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 // Plain mode never animated the row, so there is
                 // nothing to freeze. Skip silently.
             }
-            UiLine::ToolGroupRender { batch_id: _, header, children } => {
+            UiLine::ToolGroupRender {
+                batch_id: _,
+                header,
+                children,
+            } => {
                 // Plain mode lacks CUP-rewrite — print header + each
                 // child row plainly. Subsequent ToolGroupChildUpdate
                 // events also print plainly (see the ChildUpdate arm
@@ -225,42 +300,72 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 // children, then update lines. Less elegant than
                 // retained's in-place ✓, but functional.
                 self.drop_transient();
-                let _ = writeln!(self.out, "{}", header);
+                let _ = writeln!(self.out, "{}", self.dg(&header));
                 for c in children {
-                    let _ = writeln!(self.out, "{}", c.text);
+                    let _ = writeln!(self.out, "{}", self.dg(&c.text));
                 }
             }
-            UiLine::ToolGroupChildUpdate { batch_id: _, call_id: _, new_text } => {
+            UiLine::ToolGroupChildUpdate {
+                batch_id: _,
+                call_id: _,
+                new_text,
+            } => {
                 self.drop_transient();
-                let _ = writeln!(self.out, "{}", new_text);
+                let _ = writeln!(self.out, "{}", self.dg(&new_text));
             }
             UiLine::ToolGroupSummary { text } => {
                 self.drop_transient();
-                let _ = writeln!(self.out, "{}", text);
+                let _ = writeln!(self.out, "{}", self.dg(&text));
             }
-            UiLine::ToolResult { success, summary } => {
+            UiLine::ToolResult {
+                success,
+                summary,
+                diff_stats,
+            } => {
                 self.drop_transient();
-                let icon = if success { "✓" } else { "✗" };
+                let icon = if self.caps.unicode_symbols {
+                    if success {
+                        "\u{2713}"
+                    } else {
+                        "\u{2717}"
+                    }
+                } else if success {
+                    "v"
+                } else {
+                    "x"
+                };
                 let icon_color = if self.caps.colors {
-                    if success { SGR_GREEN } else { SGR_RED }
+                    if success {
+                        SGR_GREEN
+                    } else {
+                        SGR_RED
+                    }
                 } else {
                     ""
                 };
                 let reset = if self.caps.colors { SGR_RESET } else { "" };
+                let stats = diff_stats
+                    .map(|(added, removed)| format!(" (+{added} -{removed})"))
+                    .unwrap_or_default();
                 let _ = writeln!(
                     self.out,
-                    "{}{}{} {}",
+                    "{}{}{} {}{}",
                     icon_color,
                     icon,
                     reset,
-                    scrub_controls(&summary)
+                    scrub_controls(&summary),
+                    stats
                 );
             }
             UiLine::DiffLine { added, text } => {
                 self.drop_transient();
                 let sign = if added { "+" } else { "-" };
                 let color = if self.caps.colors {
-                    if added { SGR_GREEN } else { SGR_RED }
+                    if added {
+                        SGR_GREEN
+                    } else {
+                        SGR_RED
+                    }
                 } else {
                     ""
                 };
@@ -276,34 +381,47 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
             }
             UiLine::DiffBlock(entries) => {
                 self.drop_transient();
-                for entry in entries {
-                    let sign = if entry.added { "+" } else { "-" };
+                let gutter = crate::render::diff::diff_gutter_width(&entries);
+                for entry in &entries {
                     let color = if self.caps.colors {
-                        if entry.added { SGR_GREEN } else { SGR_RED }
+                        match entry.kind {
+                            crate::render::DiffKind::Add => SGR_GREEN,
+                            crate::render::DiffKind::Del => SGR_RED,
+                            _ => "",
+                        }
                     } else {
                         ""
                     };
-                    let reset = if self.caps.colors { SGR_RESET } else { "" };
-                    let _ = writeln!(
-                        self.out,
-                        "  {}{} {}{}",
-                        color,
-                        sign,
-                        scrub_controls(&entry.text),
-                        reset
-                    );
+                    let reset = if self.caps.colors && !color.is_empty() {
+                        SGR_RESET
+                    } else {
+                        ""
+                    };
+                    let body = crate::render::diff::diff_row_text(entry, gutter);
+                    let _ = writeln!(self.out, "{}{}{}", color, scrub_controls(&body), reset);
                 }
             }
-            UiLine::ApprovalPrompt { tool, detail } => {
+            UiLine::EditDiffBlock(entries) => {
                 self.drop_transient();
-                let _ = writeln!(
-                    self.out,
-                    "{}",
-                    crate::i18n::t(crate::i18n::Msg::ApprovalPromptAlt {
-                        tool: &scrub_controls(&tool),
-                        detail: &scrub_controls(&detail),
-                    })
-                );
+                let gutter = crate::render::diff::diff_gutter_width(&entries);
+                for entry in &entries {
+                    let color = if self.caps.colors {
+                        match entry.kind {
+                            crate::render::DiffKind::Add => SGR_GREEN,
+                            crate::render::DiffKind::Del => SGR_RED,
+                            _ => "",
+                        }
+                    } else {
+                        ""
+                    };
+                    let reset = if self.caps.colors && !color.is_empty() {
+                        SGR_RESET
+                    } else {
+                        ""
+                    };
+                    let body = crate::render::diff::diff_row_text(entry, gutter);
+                    let _ = writeln!(self.out, "{}{}{}", color, scrub_controls(&body), reset);
+                }
             }
             UiLine::Error(msg) => {
                 self.drop_transient();
@@ -319,15 +437,13 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
             }
             UiLine::Warning(msg) => {
                 self.drop_transient();
-                let color = if self.caps.colors { SGR_BOLD_YELLOW } else { "" };
+                let color = if self.caps.colors {
+                    SGR_BOLD_YELLOW
+                } else {
+                    ""
+                };
                 let reset = if self.caps.colors { SGR_RESET } else { "" };
-                let _ = writeln!(
-                    self.out,
-                    "{}! {}{}",
-                    color,
-                    scrub_controls(&msg),
-                    reset
-                );
+                let _ = writeln!(self.out, "{}! {}{}", color, scrub_controls(&msg), reset);
             }
             UiLine::Muted(msg) => {
                 self.drop_transient();
@@ -381,18 +497,76 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                     self.transient_active = false;
                 }
             }
-            UiLine::StreamingBox { .. } => {
-                // No streaming-box rendering in plain mode — assistant
-                // text streams as plain text via AssistantText.
+            UiLine::StreamingBox { status, .. } => {
+                // No streaming-box repaint in plain mode — assistant text
+                // streams as plain text. Pending steers still need a static
+                // acknowledgement because this renderer has no footer panel.
+                self.render_pending_messages(&status.pending_messages);
             }
             UiLine::TurnSeparator { label } => {
                 self.drop_transient();
                 let _ = writeln!(self.out, "--- {} ---", scrub_controls(&label));
             }
-            UiLine::InputPrompt { buf, .. } => {
+            UiLine::InputPrompt { buf, status, .. } => {
                 if !self.last_prompt_written {
                     self.drop_transient();
                     if self.interactive_terminal {
+                        // Plain approval fallback: the retained footer panel is
+                        // not drawn in this renderer, so we must print the
+                        // approval guidance text as a body line before the
+                        // chevron — reproducing the OLD UiLine::ApprovalPrompt
+                        // behaviour (deleted in the selectable-panel refactor).
+                        // Pipe mode is excluded: no human is watching, and the
+                        // bot-driving stdin does not need the hint.
+                        if let Some(panel) = &status.approval {
+                            let _ = writeln!(
+                                self.out,
+                                "{}",
+                                crate::i18n::t(crate::i18n::Msg::ApprovalPromptAlt {
+                                    tool: &scrub_controls(&panel.tool),
+                                    detail: &scrub_controls(&panel.detail),
+                                })
+                            );
+                        }
+                        // request_user_input has no retained footer panel in this
+                        // renderer either — print the question (and options, if any)
+                        // as plain body text before the chevron so a human on a
+                        // dumb TTY can still answer.
+                        if let Some(panel) = &status.user_input {
+                            use atomcode_capabilities::tools::request_user_input::UserInputMode;
+                            if !panel.header.trim().is_empty() {
+                                let _ = writeln!(self.out, "{}", scrub_controls(&panel.header));
+                            }
+                            let _ = writeln!(self.out, "{}", scrub_controls(&panel.question));
+                            for (i, (label, desc)) in panel.options.iter().enumerate() {
+                                let _ =
+                                    writeln!(self.out, "  {}. {}", i + 1, scrub_controls(label));
+                                if let Some(d) = desc {
+                                    if !d.trim().is_empty() {
+                                        let _ = writeln!(self.out, "       {}", scrub_controls(d));
+                                    }
+                                }
+                            }
+                            // For single/multiple, append the always-on custom-answer
+                            // row (index N, number N+1) as a ONE-LINE inline input so a
+                            // human on a dumb TTY can type a custom answer. No "Other"
+                            // label / subtitle — the typed text (or a faint placeholder)
+                            // is shown directly.
+                            if matches!(panel.mode, UserInputMode::Single | UserInputMode::Multiple)
+                            {
+                                let other_no = panel.options.len() + 1;
+                                let custom = if panel.custom_text.trim().is_empty() {
+                                    "输入自己的答案\u{2026}".to_string()
+                                } else {
+                                    scrub_controls(&panel.custom_text)
+                                };
+                                let _ = writeln!(self.out, "  {}. {}", other_no, custom);
+                                // Multiple: explicit Submit row after Other.
+                                if matches!(panel.mode, UserInputMode::Multiple) {
+                                    let _ = writeln!(self.out, "  + Submit");
+                                }
+                            }
+                        }
                         // Real TTY — write `❯ ` so the user can see we
                         // are ready and the kernel will overlay their
                         // typed input on top of this prefix.
@@ -425,7 +599,12 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 // Plain mode echoes attachment markers with the same
                 // 2-space indent as the TTY renderers, then a newline.
                 self.drop_transient();
-                let _ = writeln!(self.out, "  └ [Image #{}]", n);
+                let branch = if self.caps.unicode_symbols {
+                    "\u{2514}"
+                } else {
+                    "`"
+                };
+                let _ = writeln!(self.out, "  {} [Image #{}]", branch, n);
             }
             UiLine::VisionPreprocessSuccess { msg, model } => {
                 // Plain mode loses styling distinctions; print
@@ -436,7 +615,7 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 let _ = writeln!(self.out, "  {}  {}", msg, model);
                 let _ = writeln!(self.out);
             }
-            UiLine::ModalOverlay { .. } => {
+            UiLine::DiffPanel { .. } => {
                 // No overlay rendering in plain mode.
             }
             UiLine::ModalOverlayClear => {
@@ -496,6 +675,7 @@ mod tests {
             unicode_symbols: false,
             legacy_conhost: false,
             jediterm: false,
+            modern_emulator: false,
         }
     }
 
@@ -514,6 +694,7 @@ mod tests {
             unicode_symbols: true,
             legacy_conhost: false,
             jediterm: true,
+            modern_emulator: false,
         }
     }
 
@@ -528,12 +709,29 @@ mod tests {
         r.render(UiLine::ToolResult {
             success: true,
             summary: "done".into(),
+            diff_stats: None,
         });
         r.flush();
         let s = String::from_utf8(buf).unwrap();
-        assert!(!s.contains('\x1b'), "dumb mode must emit zero SGR. got: {}", s);
-        assert!(s.contains("● read_file(x.rs)"));
-        assert!(s.contains("✓ done"));
+        assert!(
+            !s.contains('\x1b'),
+            "dumb mode must emit zero SGR. got: {}",
+            s
+        );
+        // Dumb mode (`!unicode_symbols`) now genuinely lives up to this test's name:
+        // decorative glyphs downgrade to ASCII, so `●`→`*` and `✓`→`v` — no tofu on
+        // fonts that lack them (the reported `✗`→`□` bug). See `crate::glyph`.
+        assert!(
+            s.contains("* read_file(x.rs)"),
+            "● should downgrade to * in dumb mode. got: {}",
+            s
+        );
+        assert!(
+            s.contains("v done"),
+            "✓ should downgrade to v in dumb mode. got: {}",
+            s
+        );
+        assert!(s.is_ascii(), "dumb mode must be pure ASCII. got: {}", s);
     }
 
     #[test]
@@ -543,13 +741,22 @@ mod tests {
         r.render(UiLine::ToolResult {
             success: false,
             summary: "boom".into(),
+            diff_stats: None,
         });
         r.render(UiLine::Error("kaboom".into()));
         r.flush();
         let s = String::from_utf8(buf).unwrap();
         // Red ✗ and red [Error: …] both present.
-        assert!(s.contains("\x1b[31m"), "expected red SGR for failure / error. got: {}", s);
-        assert!(s.contains("\x1b[0m"), "expected SGR reset after coloured spans. got: {}", s);
+        assert!(
+            s.contains("\x1b[31m"),
+            "expected red SGR for failure / error. got: {}",
+            s
+        );
+        assert!(
+            s.contains("\x1b[0m"),
+            "expected SGR reset after coloured spans. got: {}",
+            s
+        );
     }
 
     #[test]
@@ -570,11 +777,25 @@ mod tests {
         // the CR and the braille glyph, so we assert each piece exists
         // rather than that they're contiguous: CR (so the next frame
         // overwrites), the glyph itself, and EL after each frame.
-        assert!(s.starts_with('\r'), "spinner must start with CR. got: {:?}", s);
+        assert!(
+            s.starts_with('\r'),
+            "spinner must start with CR. got: {:?}",
+            s
+        );
         assert!(s.contains("⠋"), "first frame missing. got: {:?}", s);
         assert!(s.contains("⠙"), "second frame missing. got: {:?}", s);
-        assert_eq!(s.matches('\r').count(), 2, "expected exactly 2 CR (one per frame). got: {:?}", s);
-        assert_eq!(s.matches("\x1b[K").count(), 2, "expected EL per frame. got: {:?}", s);
+        assert_eq!(
+            s.matches('\r').count(),
+            2,
+            "expected exactly 2 CR (one per frame). got: {:?}",
+            s
+        );
+        assert_eq!(
+            s.matches("\x1b[K").count(),
+            2,
+            "expected EL per frame. got: {:?}",
+            s
+        );
     }
 
     #[test]
@@ -587,7 +808,11 @@ mod tests {
         });
         r.flush();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.is_empty(), "no-spinner caps must produce no output. got: {:?}", s);
+        assert!(
+            s.is_empty(),
+            "no-spinner caps must produce no output. got: {:?}",
+            s
+        );
     }
 
     /// Spinner stays on screen until something else needs to write —
@@ -623,11 +848,8 @@ mod tests {
         // is covered by `input_prompt_suppressed_in_pipe_mode` below).
         // Unicode caps → `❯ ` (U+276F + space, two display columns).
         let mut buf = Vec::new();
-        let mut r = PlainRenderer::with_writer_caps_and_interactive(
-            &mut buf,
-            caps_jediterm_ish(),
-            true,
-        );
+        let mut r =
+            PlainRenderer::with_writer_caps_and_interactive(&mut buf, caps_jediterm_ish(), true);
         r.render(UiLine::InputPrompt {
             buf: "hi".into(),
             cursor_byte: 2,
@@ -637,7 +859,11 @@ mod tests {
         });
         r.flush();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.starts_with("\u{276f} "), "unicode caps must use ❯ chevron. got: {:?}", s);
+        assert!(
+            s.starts_with("\u{276f} "),
+            "unicode caps must use ❯ chevron. got: {:?}",
+            s
+        );
 
         // Dumb caps → ASCII `> ` fallback.
         let mut buf = Vec::new();
@@ -651,7 +877,11 @@ mod tests {
         });
         r.flush();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.starts_with("> "), "dumb caps must use ASCII chevron. got: {:?}", s);
+        assert!(
+            s.starts_with("> "),
+            "dumb caps must use ASCII chevron. got: {:?}",
+            s
+        );
     }
 
     /// Real-TTY force_plain (JediTerm / conhost / ATOMCODE_PLAIN=1):
@@ -798,5 +1028,148 @@ mod tests {
         r.flush();
         let s = String::from_utf8(buf).unwrap();
         assert_eq!(s, "hello\n");
+    }
+
+    /// Interactive plain mode (JediTerm / conhost / ATOMCODE_PLAIN=1 on a
+    /// real TTY): when an approval panel is present in the status, the
+    /// renderer must print the ApprovalPromptAlt text BEFORE the chevron so
+    /// the user knows what they are approving — reproducing the old body
+    /// UiLine::ApprovalPrompt behaviour that was removed in the
+    /// selectable-panel refactor (Task 4).
+    #[test]
+    fn approval_panel_printed_before_chevron_in_interactive_mode() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let mut buf = Vec::new();
+        let mut r = PlainRenderer::with_writer_caps_and_interactive(
+            &mut buf,
+            caps_jediterm_ish(),
+            true, // interactive — a real TTY in plain mode
+        );
+        let status = crate::render::StatusLine {
+            approval: Some(crate::render::ApprovalPanelView {
+                tool: "bash".to_string(),
+                detail: "rm -rf /tmp/x".to_string(),
+                options: vec![],
+                selected: 0,
+            }),
+            ..Default::default()
+        };
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush();
+        let s = String::from_utf8(buf).unwrap();
+        // The approval guidance line must appear.
+        assert!(
+            s.contains("bash"),
+            "approval text must contain the tool name. got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("[Y]es"),
+            "approval text must contain [Y]es key hint. got: {:?}",
+            s
+        );
+        // The guidance line must come BEFORE the chevron.
+        let approval_pos = s.find("bash").expect("approval text must be present");
+        let chev_pos = s
+            .find('\u{276f}')
+            .expect("❯ chevron must follow the approval line");
+        assert!(
+            approval_pos < chev_pos,
+            "approval guidance must precede the chevron. got: {:?}",
+            s
+        );
+    }
+
+    #[test]
+    fn pending_messages_are_acknowledged_once_in_interactive_plain_mode() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let mut buf = Vec::new();
+        let mut r =
+            PlainRenderer::with_writer_caps_and_interactive(&mut buf, caps_jediterm_ish(), true);
+        let streaming = |pending_messages: Vec<String>| UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "*",
+            label: "Working".into(),
+            status: crate::render::StatusLine {
+                pending_messages,
+                ..Default::default()
+            },
+            menu: None,
+            attachments: Vec::new(),
+        };
+
+        r.render(streaming(vec!["first".into()]));
+        r.render(streaming(vec!["first".into()])); // spinner repaint: no duplicate
+        r.render(streaming(vec!["first".into(), "second\nmessage".into()]));
+        r.flush();
+
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(output.matches("Messages to be submitted").count(), 2);
+        assert_eq!(output.matches("first").count(), 1);
+        assert_eq!(output.matches("second message").count(), 1);
+    }
+
+    #[test]
+    fn pending_messages_stay_silent_in_pipe_mode() {
+        let mut buf = Vec::new();
+        let mut r = PlainRenderer::with_writer_caps_and_interactive(&mut buf, caps_dumb(), false);
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "*",
+            label: "Working".into(),
+            status: crate::render::StatusLine {
+                pending_messages: vec!["secret input".into()],
+                ..Default::default()
+            },
+            menu: None,
+            attachments: Vec::new(),
+        });
+        r.flush();
+        assert!(buf.is_empty());
+    }
+
+    /// Pipe / CI mode: no human watching, so the approval panel text must NOT
+    /// be emitted (mirrors the original arm which only printed for humans).
+    #[test]
+    fn approval_panel_suppressed_in_pipe_mode() {
+        let mut buf = Vec::new();
+        let mut r = PlainRenderer::with_writer_caps_and_interactive(
+            &mut buf,
+            caps_dumb(),
+            false, // non-interactive (pipe)
+        );
+        let status = crate::render::StatusLine {
+            approval: Some(crate::render::ApprovalPanelView {
+                tool: "bash".to_string(),
+                detail: "rm -rf /tmp/x".to_string(),
+                options: vec![],
+                selected: 0,
+            }),
+            ..Default::default()
+        };
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            s.is_empty(),
+            "pipe mode must suppress all InputPrompt output including approval text. got: {:?}",
+            s
+        );
     }
 }

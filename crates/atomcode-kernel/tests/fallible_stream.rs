@@ -2,7 +2,8 @@
 //! reasoning content, and a `finish_reason=length` truncation are all first-class
 //! — none silently degrades into an empty SUCCESSFUL turn.
 
-use atomcode_kernel::event::AgentEvent;
+use atomcode_kernel::event::{AgentCommand, AgentEvent};
+use atomcode_kernel::message::{Message, Role};
 use atomcode_kernel::stream::{ProviderError, StreamEvent};
 use atomcode_kernel::testkit::{MockProvider, RecorderHook, ScriptedProvider};
 use atomcode_kernel::tool::ToolRegistry;
@@ -46,7 +47,10 @@ async fn provider_open_error_surfaces_and_fails_turn() {
         Some("auth failed (401)"),
         "an open failure must surface as AgentEvent::Error"
     );
-    assert!(completed, "the turn must still complete (cleanly fail), not hang");
+    assert!(
+        completed,
+        "the turn must still complete (cleanly fail), not hang"
+    );
     assert!(!got_text, "no bogus assistant text on an open failure");
     assert!(
         log.lock().unwrap().contains(&"on_error".to_string()),
@@ -95,7 +99,10 @@ async fn mid_stream_error_surfaces_and_fails_turn() {
         Some("upstream 503"),
         "a mid-stream error must surface as AgentEvent::Error"
     );
-    assert_eq!(complete_count, 1, "the failed turn ends with exactly one TurnComplete");
+    assert_eq!(
+        complete_count, 1,
+        "the failed turn ends with exactly one TurnComplete"
+    );
     assert!(
         log.lock().unwrap().contains(&"on_error".to_string()),
         "the on_error hook must fire on a mid-stream error"
@@ -103,7 +110,9 @@ async fn mid_stream_error_surfaces_and_fails_turn() {
     // A mid-stream failure must NOT fall through to a normal-success completion:
     // on_model_response (the success path) must NOT have run.
     assert!(
-        !log.lock().unwrap().contains(&"on_model_response".to_string()),
+        !log.lock()
+            .unwrap()
+            .contains(&"on_model_response".to_string()),
         "a failed turn must NOT run the success path (no bogus assistant message)"
     );
 }
@@ -168,7 +177,10 @@ async fn recovered_truncation_continues_without_warning() {
         .tools(reg.mount(&[] as &[&str]))
         .build()
         .spawn();
-    handle.commands.send(send("translate the whole file")).unwrap();
+    handle
+        .commands
+        .send(send("translate the whole file"))
+        .unwrap();
 
     let mut warning: Option<String> = None;
     let mut completed = false;
@@ -182,14 +194,28 @@ async fn recovered_truncation_continues_without_warning() {
             _ => {}
         }
     }
-    handle.commands.send(AgentCommand::Shutdown).unwrap();
-    let _ = handle.task.await;
 
     assert!(
         warning.is_none(),
         "a truncation that auto-recovers must NOT surface the scary warning; got {warning:?}"
     );
     assert!(completed, "the turn still completes after the continuation");
+    handle.commands.send(AgentCommand::Snapshot).unwrap();
+    let snapshot = loop {
+        match handle.events.recv().await {
+            Some(AgentEvent::Snapshot { snapshot }) => break snapshot.messages,
+            Some(_) => continue,
+            None => panic!("never received a Snapshot reply"),
+        }
+    };
+    assert!(
+        snapshot.iter().any(|m| {
+            m.role == Role::User && m.synthetic && m.text.to_lowercase().contains("output limit")
+        }),
+        "the stored truncation resume nudge must be a synthetic user message: {snapshot:?}"
+    );
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
 
     let calls = received.lock().unwrap();
     assert_eq!(
@@ -248,7 +274,10 @@ async fn repeated_truncation_is_bounded() {
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 
-    assert!(completed, "the turn must terminate despite endless truncation");
+    assert!(
+        completed,
+        "the turn must terminate despite endless truncation"
+    );
     let calls = received.lock().unwrap();
     assert!(
         calls.len() <= 4,
@@ -266,11 +295,13 @@ async fn repeated_truncation_is_bounded() {
 // --- local helpers (keep each test terse; mirror spike_claims.rs style) ---
 
 use atomcode_kernel::agent::{Agent, AgentHandle};
-use atomcode_kernel::event::AgentCommand;
 use atomcode_kernel::provider::LlmProvider;
 
 fn send(text: &str) -> AgentCommand {
-    AgentCommand::SendMessage { text: text.into(), images: vec![] }
+    AgentCommand::SendMessage {
+        text: text.into(),
+        images: vec![],
+    }
 }
 
 fn spawn_agent(
@@ -289,7 +320,6 @@ fn spawn_agent(
 // --- agent-layer visible retry (second tier above the transport retry) ---
 
 use async_trait::async_trait;
-use atomcode_kernel::message::Message;
 use atomcode_kernel::provider::ChatOptions;
 use atomcode_kernel::tool::ToolDef;
 use futures::stream::BoxStream;
@@ -308,7 +338,11 @@ struct FlakyProvider {
 
 impl FlakyProvider {
     fn new(fail_first: u32, err: ProviderError) -> Self {
-        Self { fail_first, err, calls: AtomicU32::new(0) }
+        Self {
+            fail_first,
+            err,
+            calls: AtomicU32::new(0),
+        }
     }
 }
 
@@ -382,8 +416,15 @@ async fn retryable_open_failure_retries_visibly_then_succeeds() {
         retry_notes[0].contains("(1/3)") && retry_notes[1].contains("(2/3)"),
         "retry notices must be numbered 1/3 then 2/3; got {retry_notes:?}"
     );
-    assert!(!errored, "a recovered turn must NOT surface a terminal Error");
-    assert_eq!(stop.as_deref(), Some("Stopped"), "the turn must end successfully");
+    assert!(
+        !errored,
+        "a recovered turn must NOT surface a terminal Error"
+    );
+    assert_eq!(
+        stop.as_deref(),
+        Some("Stopped"),
+        "the turn must end successfully"
+    );
     assert_eq!(
         calls_seen.calls.load(Ordering::SeqCst),
         3,
@@ -490,12 +531,20 @@ async fn empty_response_is_retried_then_succeeds() {
         calls, 2,
         "the empty 200 must be RETRIED → a second chat_stream call; got {calls}"
     );
-    assert_eq!(text, "hello", "the recovered response text must reach the driver");
+    assert_eq!(
+        text, "hello",
+        "the recovered response text must reach the driver"
+    );
     assert!(
-        warnings.iter().any(|w| w.contains("空响应") && w.contains("重试")),
+        warnings
+            .iter()
+            .any(|w| w.contains("空响应") && w.contains("重试")),
         "an empty response must emit a VISIBLE retry notice; got {warnings:?}"
     );
-    assert!(!errored, "a recovered empty response must NOT surface a terminal Error");
+    assert!(
+        !errored,
+        "a recovered empty response must NOT surface a terminal Error"
+    );
     assert_eq!(
         stop.as_deref(),
         Some("Stopped"),
@@ -536,7 +585,10 @@ async fn empty_response_exhaustion_fails_visibly() {
         }
     }
 
-    assert_eq!(retry_notices, 5, "the dedicated budget is 5 visible retries");
+    assert_eq!(
+        retry_notices, 5,
+        "the dedicated budget is 5 visible retries"
+    );
     let calls = received.lock().unwrap().len();
     assert_eq!(
         calls, 6,
@@ -565,7 +617,10 @@ async fn malformed_response_retried_with_distinct_notice() {
     // Call 1: a malformed-only round (adapter dropped a garbage chunk, no content).
     // Call 2: a clean recovery.
     let provider = Arc::new(MockProvider::new(vec![
-        vec![StreamEvent::Malformed, StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::Malformed,
+            StreamEvent::Done { truncated: false },
+        ],
         vec![
             StreamEvent::TextDelta("ok".into()),
             StreamEvent::Done { truncated: false },
@@ -594,15 +649,24 @@ async fn malformed_response_retried_with_distinct_notice() {
     }
 
     let calls = received.lock().unwrap().len();
-    assert_eq!(calls, 2, "a malformed (content-free) response must be RETRIED; got {calls}");
+    assert_eq!(
+        calls, 2,
+        "a malformed (content-free) response must be RETRIED; got {calls}"
+    );
     assert_eq!(text, "ok", "the recovered response must reach the driver");
     assert!(
-        warnings.iter().any(|w| w.contains("格式异常") && w.contains("重试")),
+        warnings
+            .iter()
+            .any(|w| w.contains("格式异常") && w.contains("重试")),
         "a malformed response must emit a格式异常 retry notice; got {warnings:?}"
     );
     assert!(
         !warnings.iter().any(|w| w.contains("空响应")),
         "a malformed response must NOT use the empty-response (空响应) wording; got {warnings:?}"
     );
-    assert_eq!(stop.as_deref(), Some("Stopped"), "the recovered turn must succeed");
+    assert_eq!(
+        stop.as_deref(),
+        Some("Stopped"),
+        "the recovered turn must succeed"
+    );
 }

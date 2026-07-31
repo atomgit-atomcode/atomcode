@@ -87,8 +87,14 @@ class StreamEventHandler(
         messageView.updateToolCall(name, status, activeToolOutput, activeToolSummary)
     }
 
+    fun onToolProgress(progress: String) {
+        if (progress.isBlank()) return
+        val name = activeToolName ?: return
+        messageView.updateToolCall(name, progress, activeToolOutput, activeToolSummary)
+    }
+
     fun onToolResult(name: String, output: String, success: Boolean, durationMs: Long) {
-        val status = if (success) "done (${durationMs}ms)" else "failed"
+        val status = toolResultStatus(success, output, durationMs)
         val detail = output.ifBlank { activeToolOutput }
         messageView.updateToolCall(name, status, detail, activeToolSummary)
         activeToolName = null
@@ -342,3 +348,10 @@ internal fun summarizeToolArguments(name: String, arguments: String): String {
         .trim()
     return if (singleLine.length <= 120) singleLine else singleLine.take(117) + "..."
 }
+
+internal fun toolResultStatus(success: Boolean, output: String, durationMs: Long = 0): String =
+    when {
+        success -> "done (${durationMs}ms)"
+        output.startsWith("Code review incomplete") -> "incomplete"
+        else -> "failed"
+    }

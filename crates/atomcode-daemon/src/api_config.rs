@@ -1,5 +1,6 @@
-use atomcode_core::config::provider::ProviderConfig;
-use atomcode_core::config::Config;
+use atomcode_config::config::provider::ProviderConfig;
+use atomcode_config::config::Config;
+use atomcode_config::ConfigStore;
 use axum::{response::IntoResponse, Json};
 
 use crate::{json_error, ConfigResponse, ProviderInfo};
@@ -29,15 +30,26 @@ fn empty_config() -> Config {
 }
 
 /// Build a sanitized ConfigResponse from a loaded Config.
+///
+/// Lists the unified model catalog (`logical_models`) so new-schema and folded
+/// CodingPlan models — which no longer live in `config.providers` — are still
+/// selectable in the webui. Each selection id is reconstructed into a
+/// `ProviderConfig` view via the resolution boundary.
 pub(crate) fn config_response(config: &Config) -> ConfigResponse {
-    let providers = config
-        .providers
+    let default_selection = config.effective_model_selection().unwrap_or_default();
+    let mut ids: Vec<String> = config.logical_models().into_keys().collect();
+    ids.sort();
+    let providers = ids
         .iter()
-        .map(|(name, p)| provider_info(name, p, &config.default_provider))
+        .filter_map(|id| {
+            config
+                .provider_config_for_selection(id)
+                .map(|p| provider_info(id, &p, &default_selection))
+        })
         .collect();
     ConfigResponse {
         path: Config::default_path(),
-        default_provider: config.default_provider.clone(),
+        default_provider: default_selection,
         default_workdir: config.default_workdir.clone(),
         providers,
     }
@@ -54,7 +66,11 @@ pub(crate) fn provider_info(
         provider_type: p.provider_type.clone(),
         model: p.model.clone(),
         base_url: p.base_url.clone(),
-        has_api_key: p.api_key.is_some(),
+        has_api_key: p.resolved_api_key().is_some(),
+        requires_login: p
+            .base_url
+            .as_deref()
+            .is_some_and(atomcode_auth::gateway_crypto::is_atomgit_gateway),
         is_default: name == default_provider,
         context_window: p.context_window,
         max_tokens: p.max_tokens,
@@ -66,6 +82,7 @@ pub(crate) fn provider_info(
         reasoning_effort: p.reasoning_effort.clone(),
         skip_tls_verify: p.skip_tls_verify,
         ephemeral: p.ephemeral,
+        pricing: p.pricing,
     }
 }
 
@@ -92,19 +109,16 @@ pub(crate) fn validate_provider_name(name: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-/// Save config to disk.
-pub(crate) fn save_config(config: &Config) -> Result<(), String> {
-    let path = Config::default_path();
-    config
-        .save(&path)
-        .map_err(|e| format!("Failed to save config: {:#}", e))
-}
-
-/// Clean up expired login sessions (TTL: 10 minutes).
-pub(crate) async fn cleanup_expired_sessions(login_sessions: &crate::LoginSessionsStore) {
-    let mut sessions = login_sessions.write().await;
-    let now = std::time::Instant::now();
-    sessions.retain(|_, entry| now.duration_since(entry.created_at).as_secs() < 600);
+/// Apply one config delta to the latest on-disk snapshot. Provider/config API
+/// handlers should use this instead of load-mutate-save to avoid lost updates
+/// when an IDE and TUI write concurrently.
+pub(crate) fn update_config(
+    mutate: impl FnOnce(&mut Config) -> anyhow::Result<()>,
+) -> Result<Config, String> {
+    ConfigStore::default_store()
+        .update(mutate)
+        .map(|commit| commit.snapshot.config)
+        .map_err(|e| format!("Failed to update config: {e:#}"))
 }
 
 // ============================================================================
@@ -131,4 +145,96 @@ pub(crate) async fn reload_config() -> impl IntoResponse {
         }
     };
     Json(config_response(&config)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider(base_url: &str) -> ProviderConfig {
+        ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: None,
+            model: "model".into(),
+            base_url: Some(base_url.into()),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128_000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            reasoning_effort: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+            capable_model: None,
+            pricing: None,
+        }
+    }
+
+    #[test]
+    fn config_response_lists_new_schema_and_folded_codingplan_models() {
+        // A config where the selectable models live ONLY in the new schema
+        // (provider_accounts + models) — none in [providers.*].
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "AtomGit-GLM-5.2",
+            "provider_accounts": { "AtomGit": { "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1" } },
+            "models": {
+                "AtomGit-GLM-5.2": { "account": "AtomGit", "model": "GLM-5.2", "context_window": 128000 },
+                "AtomGit-Qwen": { "account": "AtomGit", "model": "Qwen", "context_window": 128000 }
+            }
+        }))
+        .unwrap();
+        let resp = config_response(&config);
+        let names: Vec<&str> = resp.providers.iter().map(|p| p.name.as_str()).collect();
+        assert!(
+            names.contains(&"AtomGit-GLM-5.2"),
+            "new-schema model listed"
+        );
+        assert!(names.contains(&"AtomGit-Qwen"));
+        assert_eq!(resp.default_provider, "AtomGit-GLM-5.2");
+        let glm = resp
+            .providers
+            .iter()
+            .find(|p| p.name == "AtomGit-GLM-5.2")
+            .unwrap();
+        assert!(glm.is_default);
+        assert!(glm.requires_login, "gateway base_url ⇒ requires login");
+        assert_eq!(glm.model, "GLM-5.2");
+    }
+
+    #[test]
+    fn provider_info_reports_login_dependency_from_gateway() {
+        assert!(
+            provider_info(
+                "renamed",
+                &provider("https://llm-api.atomgit.com/v1"),
+                "renamed"
+            )
+            .requires_login
+        );
+        assert!(
+            !provider_info(
+                "AtomGit-looking-custom",
+                &provider("https://example.test/v1"),
+                "AtomGit-looking-custom"
+            )
+            .requires_login
+        );
+    }
+
+    #[test]
+    fn provider_info_exposes_pricing_without_credentials() {
+        let mut configured = provider("https://example.test/v1");
+        configured.pricing = Some(atomcode_config::config::provider::ProviderPricing {
+            input_per_million: 1.0,
+            output_per_million: 2.0,
+            cached_input_per_million: 0.25,
+        });
+        let info = provider_info("custom", &configured, "custom");
+        assert_eq!(info.pricing, configured.pricing);
+        assert!(!info.has_api_key);
+    }
 }

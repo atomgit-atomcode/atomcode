@@ -5,12 +5,13 @@
 //! [`StreamEvent::Error`](atomcode_kernel::stream::StreamEvent) and NEVER retried —
 //! partial deltas may already have reached the consumer.
 //!
-//! Faithful port of `atomcode-core`'s neutral retry helpers. The locale-specific
-//! 429 quota-vs-transient classifier (`is_non_retryable_rate_limit`) is intentionally
-//! NOT ported here (it leans product/L3); a quota-exhausted 429 currently consumes a
-//! few retries before failing — tracked as a follow-up.
+//! HTTP 429 ownership is selected per call: direct consumers retain the bounded
+//! provider OPEN retry, while kernel turns surface the first 429 so their
+//! lifecycle can provide cancellable waits, countdowns, and a fuse.
 
 use std::time::Duration;
+
+use atomcode_kernel::provider::RateLimitRetryOwner;
 
 /// How long an idle keep-alive connection may sit in the pool before we drop
 /// it. reqwest's default is 90s; gateway load balancers commonly close idle
@@ -62,6 +63,13 @@ pub(crate) fn is_retryable_status(code: u16) -> bool {
     matches!(code, 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
 }
 
+/// Whether a transient status should be retried inside the provider's OPEN loop.
+/// HTTP 429 follows the per-call owner; all other transient statuses remain
+/// provider-owned fast retries.
+pub(crate) fn should_retry_open_status(code: u16, owner: RateLimitRetryOwner) -> bool {
+    is_retryable_status(code) && (code != 429 || owner == RateLimitRetryOwner::Provider)
+}
+
 /// Transient transport errors worth retrying.
 ///
 /// `is_timeout() || is_connect()` alone is too narrow: reqwest only reports
@@ -74,13 +82,22 @@ pub(crate) fn is_retryable_status(code: u16) -> bool {
 /// rebuilding the client's pool). We now also walk the source chain for a
 /// transient transport `io::Error` so the open loop reconnects transparently.
 pub(crate) fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
-    err.is_timeout() || err.is_connect() || chain_has_transient_io(err)
+    err.is_timeout()
+        || err.is_connect()
+        || chain_has_transient_io(err)
+        || chain_has_tls_corruption(err)
 }
 
 /// True if any error in `err`'s `source()` chain is an `io::Error` whose kind
 /// indicates a dropped/half-open connection (as opposed to a logical failure
 /// like NotFound). Retrying these is safe **only on the OPEN path** (no
 /// response bytes consumed yet) — mid-stream errors stay non-retryable.
+///
+/// `TimedOut` (Linux `ETIMEDOUT` / `os error 110`, Windows `10060`) is included:
+/// the kernel gave up on a dead/stalled TCP connection while reading the streamed
+/// body. It's a transport drop just like a reset — re-opening is safe, and it
+/// earns the plain-language notice from [`stream_read_error_message`] instead of
+/// the opaque raw chain.
 pub(crate) fn chain_has_transient_io(err: &(dyn std::error::Error + 'static)) -> bool {
     use std::io::ErrorKind::*;
     let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
@@ -88,10 +105,53 @@ pub(crate) fn chain_has_transient_io(err: &(dyn std::error::Error + 'static)) ->
         if let Some(io) = e.downcast_ref::<std::io::Error>() {
             if matches!(
                 io.kind(),
-                ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof | NotConnected
+                ConnectionReset
+                    | ConnectionAborted
+                    | BrokenPipe
+                    | UnexpectedEof
+                    | NotConnected
+                    | TimedOut
             ) {
                 return true;
             }
+        }
+        cur = e.source();
+    }
+    false
+}
+
+/// True if any error in `err`'s `source()` chain is a TLS **record corruption**
+/// failure — a data record whose AEAD tag / MAC did not verify. This covers
+/// BOTH directions of a mangled record (verified against rustls 0.23 `error.rs`
+/// Display, since we match the rendered chain, not a typed error — L1 avoids a
+/// rustls dep):
+///   - the PEER rejects a record WE sent → we receive its fatal alert, rendered
+///     `received fatal alert: BadRecordMac` / `… DecryptError`;
+///   - WE fail to authenticate a record the peer (or a middlebox) sent →
+///     rustls `Error::DecryptError`, rendered `cannot decrypt peer's message`.
+///
+/// Both are the signature of a stale/long-lived pooled TLS-1.3 connection whose
+/// state desynced, or a middlebox mangling TLS-1.3 records once the connection
+/// has run for a while ("跑着跑着就 BadRecordMac").
+///
+/// rustls surfaces these as an `io::Error` of kind `InvalidData` — too broad to
+/// fold into [`chain_has_transient_io`] (a malformed response *body* is also
+/// `InvalidData` and must stay non-retryable). Handshake-negotiation alerts
+/// (`HandshakeFailure`, …) are deliberately excluded: a fresh pool / TLS-1.2
+/// *corruption* escalation is the wrong remedy for those — the `is_connect()`
+/// fallback path owns handshake failures.
+///
+/// The recovery is scoped to the OPEN path (no response bytes consumed yet):
+/// rebuild the client's pool and, on a managed endpoint, escalate to TLS 1.2.
+pub(crate) fn chain_has_tls_corruption(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        let msg = e.to_string();
+        if msg.contains("BadRecordMac")
+            || msg.contains("DecryptError")
+            || msg.contains("cannot decrypt peer's message")
+        {
+            return true;
         }
         cur = e.source();
     }
@@ -124,7 +184,10 @@ pub(crate) fn err_chain(err: &(dyn std::error::Error + 'static)) -> String {
 /// (e.g. a malformed body) keep the verbatim `stream read error: <chain>` form.
 pub(crate) fn stream_read_error_message(err: &(dyn std::error::Error + 'static)) -> String {
     if chain_has_transient_io(err) {
-        format!("网络连接中断:远端关闭或重置了连接(已自动重连仍失败,可重试)。详情: {}", err_chain(err))
+        format!(
+            "网络连接中断:远端关闭或重置了连接(已自动重连仍失败,可重试)。详情: {}",
+            err_chain(err)
+        )
     } else {
         format!("stream read error: {}", err_chain(err))
     }
@@ -143,7 +206,10 @@ pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
     }
     // HTTP-date form: wait until that instant (a past date → retry now = ZERO).
     let when = httpdate::parse_http_date(trimmed).ok()?;
-    Some(when.duration_since(std::time::SystemTime::now()).unwrap_or(Duration::ZERO))
+    Some(
+        when.duration_since(std::time::SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    )
 }
 
 /// Exponential backoff with real ±25% jitter, capped at `max_delay`. `attempt`
@@ -208,6 +274,22 @@ mod tests {
     }
 
     #[test]
+    fn open_retry_ownership_excludes_429_only() {
+        assert!(
+            is_retryable_status(429),
+            "kernel must still receive a retryable 429"
+        );
+        assert!(should_retry_open_status(429, RateLimitRetryOwner::Provider));
+        assert!(!should_retry_open_status(429, RateLimitRetryOwner::Kernel));
+        for code in [408, 425, 500, 502, 503, 504, 529] {
+            assert!(
+                should_retry_open_status(code, RateLimitRetryOwner::Kernel),
+                "{code} should keep provider fast retry"
+            );
+        }
+    }
+
+    #[test]
     fn parse_retry_after_seconds() {
         let mut h = HeaderMap::new();
         h.insert(RETRY_AFTER, HeaderValue::from_static("3"));
@@ -225,23 +307,35 @@ mod tests {
         // is stable. HTTP-date has 1s resolution; allow slack for test execution time.
         let future = std::time::SystemTime::now() + Duration::from_secs(3600);
         let mut h = HeaderMap::new();
-        h.insert(RETRY_AFTER, HeaderValue::from_str(&httpdate::fmt_http_date(future)).unwrap());
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(&httpdate::fmt_http_date(future)).unwrap(),
+        );
         let got = parse_retry_after(&h).expect("future HTTP-date must parse");
-        assert!(got.as_secs() >= 3590 && got.as_secs() <= 3600, "got {got:?}");
+        assert!(
+            got.as_secs() >= 3590 && got.as_secs() <= 3600,
+            "got {got:?}"
+        );
     }
 
     #[test]
     fn parse_retry_after_http_date_past_is_zero() {
         // A past HTTP-date means "retry now" → ZERO (not None, not an underflow panic).
         let mut h = HeaderMap::new();
-        h.insert(RETRY_AFTER, HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"));
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
         assert_eq!(parse_retry_after(&h), Some(Duration::ZERO));
     }
 
     #[test]
     fn parse_retry_after_garbage_is_none() {
         let mut h = HeaderMap::new();
-        h.insert(RETRY_AFTER, HeaderValue::from_static("not-a-date-or-number"));
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("not-a-date-or-number"),
+        );
         assert_eq!(parse_retry_after(&h), None);
     }
 
@@ -283,8 +377,14 @@ mod tests {
             base_delay: Duration::from_millis(1000),
             max_delay: Duration::from_secs(10),
         };
-        assert_eq!(compute_backoff_jittered(1, &policy, 0.0), Duration::from_millis(750));
-        assert_eq!(compute_backoff_jittered(1, &policy, 0.5), Duration::from_millis(1000));
+        assert_eq!(
+            compute_backoff_jittered(1, &policy, 0.0),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            compute_backoff_jittered(1, &policy, 0.5),
+            Duration::from_millis(1000)
+        );
         let hi = compute_backoff_jittered(1, &policy, 0.999);
         assert!(
             (Duration::from_millis(1240)..Duration::from_millis(1250)).contains(&hi),
@@ -310,7 +410,10 @@ mod tests {
         let d1 = compute_backoff_jittered(1, &p, 0.5);
         let d2 = compute_backoff_jittered(2, &p, 0.5);
         let d3 = compute_backoff_jittered(3, &p, 0.5);
-        assert!(d1 < d2 && d2 < d3, "backoff must grow: {d1:?} {d2:?} {d3:?}");
+        assert!(
+            d1 < d2 && d2 < d3,
+            "backoff must grow: {d1:?} {d2:?} {d3:?}"
+        );
     }
 
     #[test]
@@ -386,7 +489,36 @@ mod tests {
             );
         }
         // A bare io error (no wrapper) is detected too.
-        assert!(chain_has_transient_io(&Error::new(ErrorKind::BrokenPipe, "bp")));
+        assert!(chain_has_transient_io(&Error::new(
+            ErrorKind::BrokenPipe,
+            "bp"
+        )));
+    }
+
+    #[test]
+    fn chain_has_transient_io_detects_connection_timeout() {
+        use std::io::{Error, ErrorKind};
+        // The reported case: a streamed body read that dies with
+        // `Connection timed out (os error 110)` (Linux ETIMEDOUT → ErrorKind::TimedOut)
+        // must be treated as a transport drop — both for the plain-language message
+        // and for open-path retry.
+        let e = Wrap(Error::new(
+            ErrorKind::TimedOut,
+            "Connection timed out (os error 110)",
+        ));
+        assert!(
+            chain_has_transient_io(&e),
+            "ETIMEDOUT buried in the chain is a transport drop"
+        );
+        let msg = stream_read_error_message(&e);
+        assert!(
+            msg.contains("网络连接中断"),
+            "leads with a plain-language notice: {msg}"
+        );
+        assert!(
+            msg.contains("os error 110"),
+            "still appends the raw cause: {msg}"
+        );
     }
 
     #[test]
@@ -394,8 +526,14 @@ mod tests {
         use std::io::{Error, ErrorKind};
         // NotFound / PermissionDenied are not transport hiccups — must NOT
         // be retried (re-sending won't help and could mask a real fault).
-        assert!(!chain_has_transient_io(&Wrap(Error::new(ErrorKind::NotFound, "nf"))));
-        assert!(!chain_has_transient_io(&Wrap(Error::new(ErrorKind::PermissionDenied, "pd"))));
+        assert!(!chain_has_transient_io(&Wrap(Error::new(
+            ErrorKind::NotFound,
+            "nf"
+        ))));
+        assert!(!chain_has_transient_io(&Wrap(Error::new(
+            ErrorKind::PermissionDenied,
+            "pd"
+        ))));
         // An error chain with no io::Error at all → not classified transient.
         #[derive(Debug)]
         struct Plain;
@@ -409,16 +547,99 @@ mod tests {
     }
 
     #[test]
+    fn chain_has_tls_corruption_detects_record_mac_and_decrypt_alerts() {
+        use std::io::{Error, ErrorKind};
+        // A gateway/middlebox mangling a TLS 1.3 data record surfaces as the
+        // peer's fatal alert. rustls maps it to ErrorKind::InvalidData — too
+        // broad to add to the transient list (a malformed *body* is also
+        // InvalidData) — so we detect the corruption class by its alert
+        // signature instead. Both the AEAD-tag failure (BadRecordMac) and its
+        // sibling DecryptError count.
+        assert!(chain_has_tls_corruption(&Wrap(Error::new(
+            ErrorKind::InvalidData,
+            "received fatal alert: BadRecordMac",
+        ))));
+        assert!(chain_has_tls_corruption(&Wrap(Error::new(
+            ErrorKind::InvalidData,
+            "received fatal alert: DecryptError",
+        ))));
+    }
+
+    #[test]
+    fn chain_has_tls_corruption_detects_local_inbound_decrypt_failure() {
+        use std::io::{Error, ErrorKind};
+        // The SYMMETRIC direction: a middlebox mangles a record the peer sent
+        // US, so OUR rustls fails to authenticate it and returns
+        // Error::DecryptError — which renders "cannot decrypt peer's message"
+        // (rustls 0.23 error.rs:991), containing NEITHER "BadRecordMac" nor the
+        // token "DecryptError". Must still be classified as corruption.
+        assert!(chain_has_tls_corruption(&Wrap(Error::new(
+            ErrorKind::InvalidData,
+            "cannot decrypt peer's message",
+        ))));
+    }
+
+    #[test]
+    fn chain_has_tls_corruption_ignores_logical_and_handshake_failures() {
+        use std::io::{Error, ErrorKind};
+        // A malformed response body is ALSO InvalidData but is a logical
+        // failure — a fresh connection won't help, so it must NOT be read as
+        // TLS corruption (mirrors chain_has_transient_io's InvalidData carve-out).
+        assert!(!chain_has_tls_corruption(&Wrap(Error::new(
+            ErrorKind::InvalidData,
+            "bad frame",
+        ))));
+        // A handshake-negotiation failure is fatal in a different way: a fresh
+        // pool / TLS-1.2 *corruption* escalation is the wrong remedy — the
+        // existing is_connect() fallback path owns handshake failures.
+        assert!(!chain_has_tls_corruption(&Wrap(Error::new(
+            ErrorKind::InvalidData,
+            "received fatal alert: HandshakeFailure",
+        ))));
+    }
+
+    #[test]
+    fn tls_corruption_and_transient_io_are_disjoint_classes() {
+        use std::io::{Error, ErrorKind};
+        // The two recovery classes must not overlap: corruption earns a fresh
+        // pool + managed TLS-1.2 escalation; a half-open socket drop just
+        // reconnects. A BadRecordMac must not be misread as ConnectionReset,
+        // and a reset must not be misread as corruption.
+        let corruption = Wrap(Error::new(
+            ErrorKind::InvalidData,
+            "received fatal alert: BadRecordMac",
+        ));
+        assert!(chain_has_tls_corruption(&corruption));
+        assert!(!chain_has_transient_io(&corruption));
+
+        let reset = Wrap(Error::new(
+            ErrorKind::ConnectionReset,
+            "connection reset by peer",
+        ));
+        assert!(chain_has_transient_io(&reset));
+        assert!(!chain_has_tls_corruption(&reset));
+    }
+
+    #[test]
     fn err_chain_appends_the_underlying_cause() {
         use std::io::{Error, ErrorKind};
         // The whole point of the probe: the top-level reqwest Display
         // ("error sending request") hides the cause; err_chain must surface
         // the buried "connection reset by peer" so the next failure is
         // diagnosable at a glance.
-        let e = Wrap(Error::new(ErrorKind::ConnectionReset, "connection reset by peer (os error 54)"));
+        let e = Wrap(Error::new(
+            ErrorKind::ConnectionReset,
+            "connection reset by peer (os error 54)",
+        ));
         let s = err_chain(&e);
-        assert!(s.contains("error sending request"), "keeps the top message: {s}");
-        assert!(s.contains("connection reset by peer (os error 54)"), "appends the cause: {s}");
+        assert!(
+            s.contains("error sending request"),
+            "keeps the top message: {s}"
+        );
+        assert!(
+            s.contains("connection reset by peer (os error 54)"),
+            "appends the cause: {s}"
+        );
     }
 
     #[test]
@@ -433,8 +654,14 @@ mod tests {
             "远程主机强迫关闭了一个现有的连接。 (os error 10054)",
         ));
         let msg = stream_read_error_message(&e);
-        assert!(msg.contains("网络连接中断"), "leads with a plain-language notice: {msg}");
-        assert!(msg.contains("os error 10054"), "still appends the raw cause for diagnosis: {msg}");
+        assert!(
+            msg.contains("网络连接中断"),
+            "leads with a plain-language notice: {msg}"
+        );
+        assert!(
+            msg.contains("os error 10054"),
+            "still appends the raw cause for diagnosis: {msg}"
+        );
     }
 
     #[test]
@@ -445,7 +672,13 @@ mod tests {
         // a connection interruption.
         let e = Wrap(Error::new(ErrorKind::InvalidData, "bad frame"));
         let msg = stream_read_error_message(&e);
-        assert!(msg.starts_with("stream read error:"), "verbatim form for logical errors: {msg}");
-        assert!(!msg.contains("网络连接中断"), "must not mislabel a logical error: {msg}");
+        assert!(
+            msg.starts_with("stream read error:"),
+            "verbatim form for logical errors: {msg}"
+        );
+        assert!(
+            !msg.contains("网络连接中断"),
+            "must not mislabel a logical error: {msg}"
+        );
     }
 }

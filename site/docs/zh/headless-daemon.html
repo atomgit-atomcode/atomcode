@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.25.9</span>
+    <span class="dhdr-ver">v5.0.3</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -51,11 +51,13 @@
     <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
     <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
     <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
   </div>
 
   <div class="dside-group">
     <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
     <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
     <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
     <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
     <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
@@ -128,7 +130,7 @@ atomcode -p "解释这段代码" --provider local --model qwen2.5:14b</code></pr
       </div>
 
       <h2>atomcode-daemon</h2>
-      <p><code>atomcode-daemon</code> 是独立的二进制,直接复用 <code>atomcode-core</code>。它对外暴露 HTTP + Server-Sent Events 接口,可以被 Web 前端、IDE 插件、编辑器扩展消费。AtomCode 官方的 VS Code 扩展和 AtomCode Air 桌面端都是通过它连过来的。</p>
+      <p><code>atomcode-daemon</code> 是构建在 <code>CodingRuntime</code> 之上的独立传输适配器。它对外暴露 HTTP + Server-Sent Events 接口,可以被 Web 前端、IDE 插件、编辑器扩展消费。AtomCode 官方的 VS Code 扩展和 AtomCode Air 桌面端都是通过它连过来的。</p>
 
       <h3>启动</h3>
       <pre><code># 推荐:通过 CLI 子命令启动,自动调用同目录下的 atomcode-daemon 二进制
@@ -238,7 +240,7 @@ atomcode-daemon --host 127.0.0.1 --port 13456 \
       </table>
 
       <h3>SSE 流式聊天</h3>
-      <p><code>POST /chat</code> 返回的 SSE 流事件包含:AI 增量文本、推理 (reasoning) 增量、工具调用批次 (开始 / 结束)、token 统计、错误等。具体事件 schema 见 <code>crates/atomcode-core/src/turn/event.rs</code> 的 <code>TurnEvent</code> 定义。</p>
+      <p><code>POST /chat</code> 返回的 SSE 流事件包含:AI 增量文本、推理 (reasoning) 增量、工具调用批次 (开始 / 结束)、token 统计、错误等。daemon wire schema 见 <code>crates/atomcode-daemon/src/live_api.rs</code> 中的 <code>LiveWireEvent</code>。</p>
       <p>前端可以用原生 <code>EventSource</code> 消费,也可以借助任何 SSE 客户端库。</p>
 
       <h3>CORS</h3>

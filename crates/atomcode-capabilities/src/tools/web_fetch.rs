@@ -23,6 +23,13 @@ const REQUEST_TIMEOUT_SECS: u64 = 20;
 const CONNECT_TIMEOUT_SECS: u64 = 5;
 const MAX_CHARS_CAP: usize = 50_000;
 
+/// A real browser UA — many sites 403 a generic/bot UA. Shared by the reqwest client and the
+/// curl fallback so both present the same identity.
+const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
+/// Sentinel we append via curl's `-w` so we can split the fetched body from the trailing
+/// `<status>\t<content_type>` metadata line. Deliberately unlikely to occur in real content.
+const CURL_META_MARKER: &str = "\n__ATOMCODE_FETCH_META__";
+
 pub struct WebFetchTool;
 
 #[derive(Deserialize)]
@@ -66,9 +73,13 @@ impl Tool for WebFetchTool {
     fn description(&self) -> &str {
         "Fetch a web page over http(s) and return its content (HTML is converted to clean \
          text, or to Markdown with `format:\"markdown\"` to keep headings/links/code). Use \
-         after `web_search` to read a specific page (docs, README, API reference). Only \
-         http/https URLs are allowed; requests to localhost / private / cloud-metadata \
-         addresses are blocked. Returns the full page by default; pass `max_chars` to cap."
+         this tool when the user provides a specific http(s) URL to read, extract, or summarize; \
+         prefer it over running `curl` or `wget` through the shell because it handles page \
+         charset and rendering. Also use it after `web_search` to read a specific result. Do NOT \
+         call this tool if a more specific, dedicated skill (listed under AVAILABLE SKILLS in the system prompt) \
+         matches the URL or domain of the page you want to fetch (e.g., platform-specific issue trackers or document sites); \
+         instead, you MUST use the use_skill tool. Only http/https URLs are allowed; requests to localhost / private / \
+         cloud-metadata addresses are blocked. Returns the full page by default; pass `max_chars` to cap."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -85,8 +96,13 @@ impl Tool for WebFetchTool {
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
         let a: Args = match serde_json::from_str(args) {
             Ok(a) => a,
-            Err(e) => return err(format!("web_fetch: invalid arguments: {e}. Expected {{\"url\":\"https://...\"}}.")),
+            Err(e) => {
+                return err(format!(
+                    "web_fetch: invalid arguments: {e}. Expected {{\"url\":\"https://...\"}}."
+                ))
+            }
         };
+
         let max = a.max_chars.map(|m| m.min(MAX_CHARS_CAP));
         let fmt = OutputFormat::from_arg(a.format.as_deref());
 
@@ -113,24 +129,50 @@ impl Tool for WebFetchTool {
             };
             let resp = match client.get(url.clone()).send().await {
                 Ok(r) => r,
-                Err(e) => return err(format!("web_fetch: failed to fetch {url}: {e}")),
+                Err(e) => {
+                    // reqwest's TLS stack (rustls) is fingerprinted and reset by some hosts at
+                    // the connection layer — the same block `web_search` dodges by using curl.
+                    // Retry the SAME url with a curl subprocess, PINNED to the already-validated
+                    // IP(s) (single hop, no redirect follow) so SSRF protection still holds;
+                    // curl's mainstream TLS fingerprint often passes where rustls is reset.
+                    if let Some((code, ct, body, hit_cap)) = curl_fallback(&url, &pinned).await {
+                        return render_body(&url.to_string(), code, ct, body, hit_cap, fmt, max);
+                    }
+                    // Surface the REAL cause (TLS handshake / connection reset / DNS) — reqwest's
+                    // top-level Display is opaque ("error sending request for url (…)").
+                    return err(format!(
+                        "web_fetch: failed to fetch {url}: {} (curl fallback also failed or curl is unavailable)",
+                        error_chain(&e)
+                    ));
+                }
             };
             if !resp.status().is_redirection() {
                 break resp;
             }
             if hops >= MAX_REDIRECTS {
-                return err(format!("web_fetch: too many redirects (>{MAX_REDIRECTS}) from {}", a.url));
+                return err(format!(
+                    "web_fetch: too many redirects (>{MAX_REDIRECTS}) from {}",
+                    a.url
+                ));
             }
             let Some(loc) = resp.headers().get(reqwest::header::LOCATION) else {
                 break resp; // redirect without Location → treat as terminal
             };
             let loc_str = match loc.to_str() {
                 Ok(s) => s,
-                Err(_) => return err(format!("web_fetch: redirect from {url} has a non-ASCII Location header")),
+                Err(_) => {
+                    return err(format!(
+                        "web_fetch: redirect from {url} has a non-ASCII Location header"
+                    ))
+                }
             };
             url = match url.join(loc_str) {
                 Ok(u) => u,
-                Err(e) => return err(format!("web_fetch: bad redirect target `{loc_str}` from {url}: {e}")),
+                Err(e) => {
+                    return err(format!(
+                        "web_fetch: bad redirect target `{loc_str}` from {url}: {e}"
+                    ))
+                }
             };
             hops += 1;
         };
@@ -138,18 +180,16 @@ impl Tool for WebFetchTool {
         let final_url = url.to_string();
         let status = response.status();
         if !status.is_success() {
-            return err(format!("web_fetch: HTTP {} from {final_url}", status.as_u16()));
+            return err(format!(
+                "web_fetch: HTTP {} from {final_url}",
+                status.as_u16()
+            ));
         }
-
         let ct_header = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_ascii_lowercase());
-        let ct_is_html = ct_header
-            .as_deref()
-            .map(|s| s.contains("text/html") || s.contains("application/xhtml"))
-            .unwrap_or(false);
+            .map(|s| s.to_string());
 
         // Stream with a byte cap (defends against an endless slow-serve under the timeout).
         let mut stream = response.bytes_stream();
@@ -167,38 +207,186 @@ impl Tool for WebFetchTool {
             }
             buf.extend_from_slice(&chunk);
         }
-        if buf.is_empty() {
-            return err(format!("web_fetch: empty response from {final_url}"));
-        }
-        // Decode honoring the page's charset (HTTP header → HTML <meta> → UTF-8), so a
-        // legacy-encoded page (GBK/Big5/Shift_JIS/…) is not mangled into mojibake by a blind
-        // UTF-8 read. `ct_header` is already lowercased.
-        let body = decode_body(&buf, ct_header.as_deref());
-
-        // Shape-sniff only when no Content-Type was sent (don't misread JSON starting with '<').
-        let is_html = ct_is_html || (ct_header.is_none() && body.trim_start().starts_with('<'));
-        // Non-HTML (raw source, JSON, plain text) always comes through verbatim — `format`
-        // only chooses how an HTML page is flattened.
-        let text = if is_html {
-            match fmt {
-                OutputFormat::Markdown => html_to_markdown(&body),
-                OutputFormat::Text => html_to_text(&body),
-            }
-        } else {
-            body
-        };
-
-        let output = apply_char_cap(text, max);
-        if output.trim().is_empty() {
-            return err(format!("web_fetch: page fetched but no readable text at {final_url}"));
-        }
-        let cap_note = if hit_cap {
-            format!("\n\n[Response exceeded {MAX_RESPONSE_BYTES} bytes — truncated before text extraction]")
-        } else {
-            String::new()
-        };
-        ok(format!("Content from {final_url}:\n\n{output}{cap_note}"))
+        render_body(
+            &final_url,
+            status.as_u16(),
+            ct_header,
+            buf,
+            hit_cap,
+            fmt,
+            max,
+        )
     }
+}
+
+/// Turn a fetched response (from either the reqwest path or the curl fallback) into the tool
+/// output: decode honoring the page's charset (HTTP header → HTML `<meta>` → UTF-8, so a
+/// legacy-encoded GBK/Big5/… page isn't mojibake'd), render HTML to text/markdown (non-HTML
+/// comes through verbatim), then apply the char cap.
+fn render_body(
+    final_url: &str,
+    status: u16,
+    content_type: Option<String>,
+    body_bytes: Vec<u8>,
+    hit_cap: bool,
+    fmt: OutputFormat,
+    max: Option<usize>,
+) -> ToolResult {
+    if !(200..300).contains(&status) {
+        return err(format!("web_fetch: HTTP {status} from {final_url}"));
+    }
+    if body_bytes.is_empty() {
+        return err(format!("web_fetch: empty response from {final_url}"));
+    }
+    let ct_header = content_type.map(|s| s.to_ascii_lowercase());
+    let ct_is_html = ct_header
+        .as_deref()
+        .map(|s| s.contains("text/html") || s.contains("application/xhtml"))
+        .unwrap_or(false);
+    let body = decode_body(&body_bytes, ct_header.as_deref());
+
+    // Shape-sniff only when no Content-Type was sent (don't misread JSON starting with '<').
+    let is_html = ct_is_html || (ct_header.is_none() && body.trim_start().starts_with('<'));
+    let text = if is_html {
+        match fmt {
+            OutputFormat::Markdown => html_to_markdown(&body),
+            OutputFormat::Text => html_to_text(&body),
+        }
+    } else {
+        body
+    };
+
+    let output = apply_char_cap(text, max);
+    if output.trim().is_empty() {
+        return err(format!(
+            "web_fetch: page fetched but no readable text at {final_url}.\n\n\
+             Hint: If this page belongs to a specific platform (e.g. GitCode/GitHub issues, documentation databases, API specs), \
+             check if there is a dedicated skill listed under AVAILABLE SKILLS in the system prompt that can fetch it via API."
+        ));
+    }
+    let cap_note = if hit_cap {
+        format!(
+            "\n\n[Response exceeded {MAX_RESPONSE_BYTES} bytes — truncated before text extraction]"
+        )
+    } else {
+        String::new()
+    };
+    ok(format!("Content from {final_url}:\n\n{output}{cap_note}"))
+}
+
+/// Flatten an error's `source()` chain into one line. reqwest's top-level `Display` for a
+/// transport failure is opaque (`error sending request for url (…)`); the actual cause — a TLS
+/// handshake error, connection reset, or DNS failure — lives deeper in the chain. Skips only a
+/// layer whose text is IDENTICAL to the previous one (some layers re-wrap verbatim); a distinct
+/// cause is always kept, even if it happens to be a substring of an earlier layer.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut prev = out.clone();
+    let mut src = e.source();
+    while let Some(inner) = src {
+        let msg = inner.to_string();
+        if msg != prev {
+            out.push_str(": ");
+            out.push_str(&msg);
+            prev = msg;
+        }
+        src = inner.source();
+    }
+    out
+}
+
+/// A curl `--resolve host:port:ip` entry, bracketing an IPv6 literal (`[2606::1]`) so older curl
+/// builds don't silently drop the entry (which would let curl fall back to unpinned DNS).
+fn resolve_entry(host: &str, port: u16, ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V6(v6) => format!("{host}:{port}:[{v6}]"),
+        IpAddr::V4(v4) => format!("{host}:{port}:{v4}"),
+    }
+}
+
+/// Split curl's stdout into `(http_status, content_type, body)`. We appended a trailing
+/// `<CURL_META_MARKER><http_code>\t<content_type>` line via `-w`; find it (last occurrence)
+/// and peel it off. `None` if the marker is absent (curl produced no metadata → treat as a miss).
+/// The meta tail is decoded lossily so a non-UTF8 byte in the server's Content-Type doesn't
+/// discard an otherwise-good body.
+fn parse_curl_meta(stdout: &[u8]) -> Option<(u16, Option<String>, Vec<u8>)> {
+    let marker = CURL_META_MARKER.as_bytes();
+    let pos = stdout.windows(marker.len()).rposition(|w| w == marker)?;
+    let body = stdout[..pos].to_vec();
+    let meta = String::from_utf8_lossy(&stdout[pos + marker.len()..]);
+    let meta = meta.trim();
+    let mut parts = meta.splitn(2, '\t');
+    let code = parts.next()?.trim().parse::<u16>().ok()?;
+    let ct = parts
+        .next()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "(nil)");
+    Some((code, ct, body))
+}
+
+/// Curl fallback for when reqwest's TLS fingerprint is blocked. Fetches the SAME url with a
+/// curl subprocess, PINNED via `--resolve` to the already-validated IP(s) so DNS can't rebind
+/// to an internal host, single-hop (`--max-redirs 0`, no `-L`) so no unvalidated redirect can
+/// reach a private address, and `--noproxy '*'` so curl connects DIRECTLY — going through a
+/// proxy would make curl ignore `--resolve` and let the proxy resolve the host, defeating the
+/// pin. (Trade-off: in a proxy-mandatory network the fallback simply can't reach the target and
+/// yields the improved error — acceptable for a best-effort fallback; SSRF pinning comes first.)
+/// Returns `(http_code, content_type, body, hit_cap)` only on a 2xx with a non-empty body;
+/// `None` if curl is missing / also blocked / non-2xx. Memory note: like the `web_search` curl
+/// path, stdout is buffered by `.output()`; `--max-filesize` caps sized responses and
+/// `--max-time` bounds the rest.
+async fn curl_fallback(
+    url: &Url,
+    pinned: &[SocketAddr],
+) -> Option<(u16, Option<String>, Vec<u8>, bool)> {
+    let host = url.host_str()?;
+    let port = url
+        .port_or_known_default()
+        .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
+    let curl_bin = if cfg!(windows) { "curl.exe" } else { "curl" };
+    let mut cmd = tokio::process::Command::new(curl_bin);
+    cmd.arg("-sS")
+        .arg("--compressed")
+        .arg("--noproxy")
+        .arg("*") // connect directly so --resolve pinning holds (a proxy would bypass it)
+        .arg("--proto")
+        .arg("-all,http,https") // never file://, gopher, …
+        .arg("--max-redirs")
+        .arg("0") // single hop → only the validated IP is dialed
+        .arg("--max-time")
+        .arg(REQUEST_TIMEOUT_SECS.to_string())
+        .arg("--max-filesize")
+        .arg((MAX_RESPONSE_BYTES as u64 * 2).to_string())
+        .arg("-A")
+        .arg(BROWSER_UA)
+        .arg("-w")
+        .arg(format!(
+            "{CURL_META_MARKER}%{{http_code}}\t%{{content_type}}"
+        ));
+    for addr in pinned {
+        cmd.arg("--resolve")
+            .arg(resolve_entry(host, port, addr.ip()));
+    }
+    cmd.arg("--").arg(url.as_str());
+    cmd.kill_on_drop(true);
+    crate::process_utils::suppress_console_window(&mut cmd);
+
+    let out = tokio::time::timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS + 5), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None; // curl couldn't reach it either (transport failure) — nothing to add
+    }
+    let (code, ct, mut body) = parse_curl_meta(&out.stdout)?;
+    if !(200..300).contains(&code) || body.is_empty() {
+        return None; // non-2xx / empty → fallback got nothing usable; surface the real error
+    }
+    let hit_cap = body.len() > MAX_RESPONSE_BYTES;
+    if hit_cap {
+        body.truncate(MAX_RESPONSE_BYTES);
+    }
+    Some((code, ct, body, hit_cap))
 }
 
 // ---------------------------------------------------------------------------
@@ -209,7 +397,11 @@ fn apply_char_cap(text: String, max: Option<usize>) -> String {
     match max {
         Some(m) if text.chars().count() > m => {
             let truncated: String = text.chars().take(m).collect();
-            format!("{}\n\n[Truncated at {m} chars, {} total]", truncated, text.chars().count())
+            format!(
+                "{}\n\n[Truncated at {m} chars, {} total]",
+                truncated,
+                text.chars().count()
+            )
         }
         _ => text,
     }
@@ -222,14 +414,20 @@ fn apply_char_cap(text: String, max: Option<usize>) -> String {
 fn validate_scheme(url: &Url) -> Result<(), String> {
     match url.scheme() {
         "http" | "https" => Ok(()),
-        other => Err(format!("scheme `{other}` not allowed — only http(s) URLs can be fetched")),
+        other => Err(format!(
+            "scheme `{other}` not allowed — only http(s) URLs can be fetched"
+        )),
     }
 }
 
 /// Reject IPs pointing at the host / local network / cloud metadata (loopback, RFC1918,
 /// link-local 169.254/CGNAT/reserved, IPv6 ULA/link-local, IPv4-mapped v6).
 fn is_safe_ip(ip: IpAddr) -> Result<(), String> {
-    let reject = |cat: &str| Err(format!("refusing to connect to {ip} ({cat}) — SSRF protection"));
+    let reject = |cat: &str| {
+        Err(format!(
+            "refusing to connect to {ip} ({cat}) — SSRF protection"
+        ))
+    };
     match ip {
         IpAddr::V4(v4) => {
             if v4.is_loopback() {
@@ -302,7 +500,9 @@ fn is_safe_ip(ip: IpAddr) -> Result<(), String> {
 /// private IP between the two lookups. Returns an EMPTY vec for a literal-IP host — there
 /// is no DNS to rebind, so reqwest dials the URL's address directly and nothing is pinned.
 async fn validate_host(url: &Url) -> Result<Vec<SocketAddr>, String> {
-    let host = url.host_str().ok_or_else(|| format!("URL has no host: {url}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| format!("URL has no host: {url}"))?;
     if let Ok(ip) = host.parse::<IpAddr>() {
         is_safe_ip(ip)?; // literal IP — bypass DNS, nothing to pin
         return Ok(Vec::new());
@@ -335,11 +535,13 @@ fn build_client(host: &str, pinned: &[SocketAddr]) -> Result<reqwest::Client, St
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         // A real browser UA — many sites (docs hosts, forges) 403 a generic/bot UA.
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36");
+        .user_agent(BROWSER_UA);
     if !pinned.is_empty() {
         builder = builder.resolve_to_addrs(host, pinned);
     }
-    builder.build().map_err(|e| format!("web_fetch: failed to build HTTP client: {e}"))
+    builder
+        .build()
+        .map_err(|e| format!("web_fetch: failed to build HTTP client: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -357,8 +559,23 @@ fn html_to_text(html: &str) -> String {
 
     let mut result = cleaned;
     for tag in &[
-        "p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "article", "section",
-        "blockquote", "pre", "dd", "dt",
+        "p",
+        "div",
+        "br",
+        "li",
+        "tr",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "article",
+        "section",
+        "blockquote",
+        "pre",
+        "dd",
+        "dt",
     ] {
         result = replace_tag_with(&result, tag, "\n");
     }
@@ -451,13 +668,22 @@ fn tokenize_html(html: &str) -> Vec<HtmlToken> {
             continue;
         }
         if let Some(rest) = inner_trim.strip_prefix('/') {
-            let name = rest.trim().split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+            let name = rest
+                .trim()
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
             if !name.is_empty() {
                 toks.push(HtmlToken::Close(name));
             }
         } else {
             let mut parts = inner_trim.splitn(2, |c: char| c.is_whitespace());
-            let name = parts.next().unwrap_or("").trim_end_matches('/').to_ascii_lowercase();
+            let name = parts
+                .next()
+                .unwrap_or("")
+                .trim_end_matches('/')
+                .to_ascii_lowercase();
             let attrs = parts.next().unwrap_or("").to_string();
             if !name.is_empty() {
                 toks.push(HtmlToken::Open { name, attrs });
@@ -487,7 +713,11 @@ fn extract_href(attrs: &str) -> Option<String> {
         None => body.find(|c: char| c.is_whitespace()).unwrap_or(body.len()),
     };
     let href = body[..end].trim();
-    if href.is_empty() { None } else { Some(decode_entities(href)) }
+    if href.is_empty() {
+        None
+    } else {
+        Some(decode_entities(href))
+    }
 }
 
 /// Collapse internal whitespace runs (incl. newlines) to single spaces — for inline text
@@ -709,14 +939,31 @@ fn charset_from_meta(buf: &[u8]) -> Option<String> {
 }
 
 /// Decode the response body honoring its charset: HTTP `Content-Type` charset first, then an
-/// HTML `<meta>` charset, else UTF-8. Fixes mojibake on legacy-encoded pages (GBK/Big5/…).
+/// HTML `<meta>` charset, then valid UTF-8, and finally best-effort detection. Fixes mojibake
+/// on legacy-encoded pages (GBK/Big5/…) even when the server omits a charset declaration.
 fn decode_body(buf: &[u8], content_type: Option<&str>) -> String {
-    let enc = content_type
+    let declared = content_type
         .and_then(charset_from_content_type)
         .and_then(|l| encoding_rs::Encoding::for_label(l.as_bytes()))
-        .or_else(|| charset_from_meta(buf).and_then(|l| encoding_rs::Encoding::for_label(l.as_bytes())))
-        .unwrap_or(encoding_rs::UTF_8);
-    enc.decode(buf).0.into_owned()
+        .or_else(|| {
+            charset_from_meta(buf).and_then(|l| encoding_rs::Encoding::for_label(l.as_bytes()))
+        });
+    if let Some(encoding) = declared {
+        return encoding.decode(buf).0.into_owned();
+    }
+    if let Ok(text) = std::str::from_utf8(buf) {
+        return text.to_owned();
+    }
+
+    let mut detector = chardetng::EncodingDetector::new();
+    detector.feed(buf, true);
+    let encoding = detector.guess(None, true);
+    let (decoded, _, had_errors) = encoding.decode(buf);
+    if had_errors {
+        String::from_utf8_lossy(buf).into_owned()
+    } else {
+        decoded.into_owned()
+    }
 }
 
 fn decode_entities(s: &str) -> String {
@@ -735,7 +982,10 @@ fn decode_entities(s: &str) -> String {
 /// Tag-name boundary: the byte after `<tag` must terminate the name so `<head` doesn't
 /// match `<header` and `<p` doesn't match `<pre>`.
 fn is_tag_boundary(next: Option<u8>) -> bool {
-    matches!(next, None | Some(b'>') | Some(b'/') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r'))
+    matches!(
+        next,
+        None | Some(b'>') | Some(b'/') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+    )
 }
 
 /// Remove a tag AND its content (`<script>…</script>`). On a prefix collision emit `<`
@@ -812,6 +1062,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn description_prefers_web_fetch_for_user_supplied_urls() {
+        let description = WebFetchTool.description();
+        assert!(description.contains("user provides a specific http(s) URL"));
+        assert!(description.contains("prefer it over running `curl` or `wget`"));
+        assert!(description.contains("more specific, dedicated skill"));
+    }
+
+    #[test]
     fn decode_body_honors_charset_to_avoid_gbk_mojibake() {
         // Real GBK bytes (the gxeea.cn case): a blind UTF-8 read mangles these into mojibake.
         let (gbk, _, _) = encoding_rs::GBK.encode("广西考试院 2026");
@@ -831,8 +1089,20 @@ mod tests {
         let d3 = decode_body("héllo 世界".as_bytes(), Some("text/html"));
         assert_eq!(d3, "héllo 世界");
 
-        assert_eq!(charset_from_content_type("text/html; charset=GBK".to_ascii_lowercase().as_str()), Some("gbk"));
-        assert_eq!(charset_from_meta(b"<meta http-equiv=\"Content-Type\" content=\"text/html; charset=big5\">"), Some("big5".to_string()));
+        // 4. no declaration: invalid UTF-8 falls back to best-effort detection.
+        let d4 = decode_body(&gbk, Some("text/html"));
+        assert_eq!(d4, "广西考试院 2026");
+
+        assert_eq!(
+            charset_from_content_type("text/html; charset=GBK".to_ascii_lowercase().as_str()),
+            Some("gbk")
+        );
+        assert_eq!(
+            charset_from_meta(
+                b"<meta http-equiv=\"Content-Type\" content=\"text/html; charset=big5\">"
+            ),
+            Some("big5".to_string())
+        );
     }
 
     #[test]
@@ -845,11 +1115,19 @@ mod tests {
         let prefix = "İ".repeat(1000); // 2000 bytes in html, 3000 in full-lowercase
         let html = format!("{prefix}<script>x=1;</script>{prefix}");
         let out = remove_tag_content(&html, "script");
-        assert_eq!(out, format!("{prefix}{prefix}"), "script removed, İ text preserved");
+        assert_eq!(
+            out,
+            format!("{prefix}{prefix}"),
+            "script removed, İ text preserved"
+        );
 
         let html2 = format!("{prefix}<br>{prefix}");
         let out2 = replace_tag_with(&html2, "br", "\n");
-        assert_eq!(out2, format!("{prefix}\n{prefix}"), "br replaced, İ text preserved");
+        assert_eq!(
+            out2,
+            format!("{prefix}\n{prefix}"),
+            "br replaced, İ text preserved"
+        );
     }
 
     #[test]
@@ -893,7 +1171,10 @@ mod tests {
         // 5 CJK chars = 15 bytes. Cap at 3 CHARS must keep 3 chars (not 3 bytes = 1 char).
         let out = apply_char_cap("你好世界啊".to_string(), Some(3));
         assert!(out.starts_with("你好世"), "char-based slice: {out}");
-        assert!(out.contains("Truncated at 3 chars, 5 total"), "char counts: {out}");
+        assert!(
+            out.contains("Truncated at 3 chars, 5 total"),
+            "char counts: {out}"
+        );
         // Under the cap and no-cap leave text untouched.
         assert_eq!(apply_char_cap("abc".to_string(), Some(10)), "abc");
         assert_eq!(apply_char_cap("abc".to_string(), None), "abc");
@@ -904,7 +1185,10 @@ mod tests {
         assert!(is_safe_ip("127.0.0.1".parse().unwrap()).is_err());
         assert!(is_safe_ip("10.0.0.5".parse().unwrap()).is_err());
         assert!(is_safe_ip("192.168.1.1".parse().unwrap()).is_err());
-        assert!(is_safe_ip("169.254.169.254".parse().unwrap()).is_err(), "cloud metadata");
+        assert!(
+            is_safe_ip("169.254.169.254".parse().unwrap()).is_err(),
+            "cloud metadata"
+        );
         assert!(is_safe_ip("100.64.0.1".parse().unwrap()).is_err(), "CGNAT");
         assert!(is_safe_ip("::1".parse().unwrap()).is_err());
         assert!(is_safe_ip("fd00::1".parse().unwrap()).is_err(), "IPv6 ULA");
@@ -912,8 +1196,14 @@ mod tests {
         assert!(is_safe_ip("::ffff:127.0.0.1".parse().unwrap()).is_err());
         // IPv4-COMPATIBLE (::a.b.c.d) must ALSO be rejected — the form `to_ipv4_mapped()`
         // missed (regression: `::127.0.0.1` / `::169.254.169.254` slipped through as safe).
-        assert!(is_safe_ip("::127.0.0.1".parse().unwrap()).is_err(), "IPv4-compatible loopback");
-        assert!(is_safe_ip("::169.254.169.254".parse().unwrap()).is_err(), "IPv4-compatible metadata");
+        assert!(
+            is_safe_ip("::127.0.0.1".parse().unwrap()).is_err(),
+            "IPv4-compatible loopback"
+        );
+        assert!(
+            is_safe_ip("::169.254.169.254".parse().unwrap()).is_err(),
+            "IPv4-compatible metadata"
+        );
         // A real public IP is allowed (genuine public v6 yields None from to_ipv4 → no false reject).
         assert!(is_safe_ip("1.1.1.1".parse().unwrap()).is_ok());
         assert!(is_safe_ip("2606:4700:4700::1111".parse().unwrap()).is_ok());
@@ -923,8 +1213,149 @@ mod tests {
     async fn validate_host_literal_ip_pins_nothing() {
         // A literal-IP host has no DNS to rebind → returns an empty pin set so the caller
         // dials the URL's address directly. A safe literal IP must pass.
-        let pinned = validate_host(&Url::parse("http://1.1.1.1/x").unwrap()).await.unwrap();
+        let pinned = validate_host(&Url::parse("http://1.1.1.1/x").unwrap())
+            .await
+            .unwrap();
         assert!(pinned.is_empty(), "literal IP must yield an empty pin set");
+    }
+
+    #[test]
+    fn error_chain_flattens_source_so_real_cause_is_visible() {
+        use std::fmt;
+        #[derive(Debug)]
+        struct E(&'static str, Option<Box<E>>);
+        impl fmt::Display for E {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for E {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|e| e as &dyn std::error::Error)
+            }
+        }
+        // Opaque top layer + the real cause underneath (mirrors reqwest → hyper → rustls).
+        let e = E(
+            "error sending request for url (https://x)",
+            Some(Box::new(E("tls handshake eof", None))),
+        );
+        let s = error_chain(&e);
+        assert!(
+            s.contains("error sending request"),
+            "keeps the top layer: {s}"
+        );
+        assert!(
+            s.contains("tls handshake eof"),
+            "surfaces the real cause: {s}"
+        );
+
+        // A distinct inner cause that is a SUBSTRING of an earlier layer must NOT be dropped
+        // (the old `out.contains` dedup silently lost it).
+        let e2 = E("connection reset by peer", Some(Box::new(E("reset", None))));
+        assert!(
+            error_chain(&e2).ends_with(": reset"),
+            "distinct substring cause kept"
+        );
+        // Identical consecutive layers ARE collapsed.
+        let e3 = E("dup", Some(Box::new(E("dup", None))));
+        assert_eq!(error_chain(&e3), "dup");
+    }
+
+    #[test]
+    fn resolve_entry_brackets_ipv6_only() {
+        assert_eq!(
+            resolve_entry("example.com", 443, "1.2.3.4".parse().unwrap()),
+            "example.com:443:1.2.3.4"
+        );
+        assert_eq!(
+            resolve_entry("example.com", 443, "2606:4700::1111".parse().unwrap()),
+            "example.com:443:[2606:4700::1111]"
+        );
+    }
+
+    #[test]
+    fn parse_curl_meta_splits_body_and_trailing_meta() {
+        let mut out = b"<html>hi</html>".to_vec();
+        out.extend_from_slice(CURL_META_MARKER.as_bytes());
+        out.extend_from_slice(b"200\ttext/html; charset=utf-8");
+        let (code, ct, body) = parse_curl_meta(&out).expect("marker present");
+        assert_eq!(code, 200);
+        assert_eq!(ct.as_deref(), Some("text/html; charset=utf-8"));
+        assert_eq!(body, b"<html>hi</html>");
+
+        // curl's `(nil)` content_type → None; no marker → None.
+        let mut out2 = b"raw".to_vec();
+        out2.extend_from_slice(CURL_META_MARKER.as_bytes());
+        out2.extend_from_slice(b"404\t(nil)");
+        let (c2, ct2, _) = parse_curl_meta(&out2).unwrap();
+        assert_eq!(c2, 404);
+        assert!(ct2.is_none(), "(nil) content-type is dropped");
+        assert!(parse_curl_meta(b"no marker here").is_none());
+    }
+
+    #[test]
+    fn render_body_renders_html_and_guards_status_empty() {
+        // HTML → text.
+        let r = render_body(
+            "https://x/doc",
+            200,
+            Some("text/html".into()),
+            b"<h1>Title</h1><p>Body text</p>".to_vec(),
+            false,
+            OutputFormat::Text,
+            None,
+        );
+        assert!(
+            !r.is_error && r.content.contains("Title") && r.content.contains("Body text"),
+            "{r:?}"
+        );
+        // Non-2xx and empty body are errors.
+        assert!(
+            render_body(
+                "https://x",
+                404,
+                None,
+                b"x".to_vec(),
+                false,
+                OutputFormat::Text,
+                None
+            )
+            .is_error
+        );
+        assert!(
+            render_body(
+                "https://x",
+                200,
+                None,
+                Vec::new(),
+                false,
+                OutputFormat::Text,
+                None
+            )
+            .is_error
+        );
+    }
+
+    #[test]
+    fn render_body_decodes_gb2312_meta_without_http_charset() {
+        let source = "<html><head><meta charset=\"gb2312\"><title>中国广播网</title></head>\
+                      <body><h1>福建省新闻</h1><p>已移送司法机关处理。</p></body></html>";
+        let (body, _, had_errors) = encoding_rs::GBK.encode(source);
+        assert!(!had_errors);
+
+        let result = render_body(
+            "https://news.cnr.cn/example.shtml",
+            200,
+            Some("text/html".into()),
+            body.into_owned(),
+            false,
+            OutputFormat::Text,
+            None,
+        );
+
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.content.contains("福建省新闻"), "{result:?}");
+        assert!(result.content.contains("已移送司法机关处理"), "{result:?}");
     }
 
     #[test]
@@ -959,14 +1390,20 @@ mod tests {
         // wipe the body that follows.
         let html = "<head><meta></head><header>nav</header><p>body text</p>";
         let t = html_to_text(html);
-        assert!(t.contains("body text"), "body survived the head/header collision: {t}");
+        assert!(
+            t.contains("body text"),
+            "body survived the head/header collision: {t}"
+        );
     }
 
     #[test]
     fn block_elements_become_newlines() {
         let t = html_to_text("<p>a</p><p>b</p>");
         assert!(t.contains('a') && t.contains('b'));
-        assert!(t.lines().count() >= 2, "block elements split onto lines: {t:?}");
+        assert!(
+            t.lines().count() >= 2,
+            "block elements split onto lines: {t:?}"
+        );
     }
 
     #[test]
@@ -976,8 +1413,14 @@ mod tests {
         assert!(OutputFormat::from_arg(Some(" Markdown ")) == OutputFormat::Markdown);
         assert!(OutputFormat::from_arg(Some("text")) == OutputFormat::Text);
         assert!(OutputFormat::from_arg(Some("")) == OutputFormat::Text);
-        assert!(OutputFormat::from_arg(None) == OutputFormat::Text, "omitted → text default");
-        assert!(OutputFormat::from_arg(Some("xml")) == OutputFormat::Text, "unknown → text");
+        assert!(
+            OutputFormat::from_arg(None) == OutputFormat::Text,
+            "omitted → text default"
+        );
+        assert!(
+            OutputFormat::from_arg(Some("xml")) == OutputFormat::Text,
+            "unknown → text"
+        );
     }
 
     #[test]
@@ -989,7 +1432,10 @@ mod tests {
         let md = html_to_markdown(html);
         assert!(md.contains("# Title"), "h1 → #: {md}");
         assert!(md.contains("## Sub"), "h2 → ##: {md}");
-        assert!(md.contains("[the docs](https://example.com/doc)"), "link preserved: {md}");
+        assert!(
+            md.contains("[the docs](https://example.com/doc)"),
+            "link preserved: {md}"
+        );
     }
 
     #[test]
@@ -1001,13 +1447,17 @@ mod tests {
         assert!(md.contains("- first"), "list item: {md}");
         assert!(md.contains("- second"), "list item: {md}");
         assert!(md.contains("```"), "code fence present: {md}");
-        assert!(md.contains("println!(\"hi\");"), "code body kept verbatim: {md}");
+        assert!(
+            md.contains("println!(\"hi\");"),
+            "code body kept verbatim: {md}"
+        );
         assert!(md.contains("`x = 1`"), "inline code fenced: {md}");
     }
 
     #[test]
     fn markdown_strips_scripts_and_bold_italic() {
-        let html = "<body><script>evil()</script><p><strong>bold</strong> and <em>it</em></p></body>";
+        let html =
+            "<body><script>evil()</script><p><strong>bold</strong> and <em>it</em></p></body>";
         let md = html_to_markdown(html);
         assert!(!md.contains("evil()"), "script removed: {md}");
         assert!(md.contains("**bold**"), "strong → **: {md}");
@@ -1019,7 +1469,10 @@ mod tests {
         // An <a> with no href must not emit empty `[]( )` brackets — just the text.
         let md = html_to_markdown("<p>click <a>here</a> now</p>");
         assert!(md.contains("here"), "anchor text kept: {md}");
-        assert!(!md.contains("["), "no stray bracket for hrefless anchor: {md}");
+        assert!(
+            !md.contains("["),
+            "no stray bracket for hrefless anchor: {md}"
+        );
     }
 
     #[test]

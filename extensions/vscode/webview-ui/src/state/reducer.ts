@@ -1,4 +1,4 @@
-import {
+import type {
   ChatState,
   ChatAction,
   ChatMessage,
@@ -7,12 +7,35 @@ import {
   ArtifactData,
   MessageBlock,
   PermissionRequestData,
+  StatusData,
+  SearchState,
+  AuthStatus,
+  ProviderInfo,
+  SessionTerminalState,
 } from './types';
 import { blocksFromLegacyMessage } from './blocks';
+import { applyTodoCall, reduceTodosFromMessages } from './todo';
+import { buildSearchMatches } from '../utils/search';
 
 let _msgCounter = 0;
 function nextId(): string {
   return `msg-${Date.now()}-${++_msgCounter}`;
+}
+
+function providerSetupRequired(
+  providers: ProviderInfo[],
+  currentProvider: string,
+  auth?: AuthStatus,
+): boolean {
+  if (providers.length === 0) return true;
+  const current = providers.find((provider) => provider.name === currentProvider)
+    ?? providers.find((provider) => provider.is_default);
+  const authUnavailable = !auth?.logged_in || auth.expired === true;
+  // Older daemons did not expose requires_login. Preserve their previous
+  // conservative behaviour until the daemon is upgraded.
+  return current?.requires_login === undefined
+    ? authUnavailable
+    : current.requires_login && authUnavailable;
 }
 
 function lastAssistantIndex(messages: ChatMessage[]): number {
@@ -66,6 +89,30 @@ function normalizeRole(role: string): 'user' | 'assistant' | 'tool' | 'system' |
     return normalized;
   }
   return 'unknown';
+}
+
+const INTERNAL_USER_PREFIXES = [
+  '<system-reminder>',
+  'You made code edits but have not verified them.',
+  'Output limit hit — your last response was cut off',
+  'Output limit hit. If the task is already complete',
+  '[PLAN MODE',
+  '[Context was compressed',
+  '[Additional context from user]:',
+  '[SYNTAX CHECK:',
+  '[DEV SERVER ERROR',
+  '[Auto-read from error:',
+  '[Images returned by the tool calls above',
+];
+
+function isInternalHistoryUserMessage(text: string, synthetic?: boolean): boolean {
+  if (synthetic === true) return true;
+  const trimmed = text.trimStart();
+  return INTERNAL_USER_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
+}
+
+function internalOriginOf(message: { internal_origin?: string; internalOrigin?: string }): string | undefined {
+  return message.internal_origin ?? message.internalOrigin;
 }
 
 function textFromContent(content: unknown): string {
@@ -203,6 +250,125 @@ function upsertPermissionBlock(message: ChatMessage, request: PermissionRequestD
   return { ...message, blocks: nextBlocks };
 }
 
+function appendStatusBlock(message: ChatMessage, status: StatusData): ChatMessage {
+  const blocks = currentBlocks(message);
+  return {
+    ...message,
+    blocks: [
+      ...blocks,
+      { id: `${message.id}-status-${status.kind}-${blocks.length}`, type: 'status' as const, status },
+    ],
+  };
+}
+
+function upsertStatusBlock(message: ChatMessage, status: StatusData): ChatMessage {
+  const blocks = currentBlocks(message);
+  const existing = blocks.findIndex((block) => block.type === 'status' && block.status.kind === status.kind);
+  const nextBlocks = existing >= 0
+    ? blocks.map((block, index) => index === existing && block.type === 'status' ? { ...block, status } : block)
+    : [
+        ...blocks,
+        { id: `${message.id}-status-${status.kind}`, type: 'status' as const, status },
+      ];
+  return { ...message, blocks: nextBlocks };
+}
+
+function settleOpenTools(
+  message: ChatMessage,
+  status: 'incomplete' | 'error',
+  output?: string,
+): ChatMessage {
+  const openStatuses = new Set<ToolCallData['status']>(['queued', 'running', 'waiting_approval']);
+  const tools = message.toolCalls?.map((tool) =>
+    openStatuses.has(tool.status)
+      ? {
+          ...tool,
+          status,
+          output: output ?? tool.output,
+          success: status === 'error' ? false : tool.success,
+        }
+      : tool,
+  );
+  if (!tools) return message;
+  return tools.reduce<ChatMessage>(
+    (updatedMessage, tool) => upsertToolBlock(updatedMessage, tool),
+    { ...message, toolCalls: tools },
+  );
+}
+
+function mergeTerminalIntoHistory(
+  messages: ChatMessage[],
+  terminal?: SessionTerminalState,
+): ChatMessage[] {
+  if (!terminal) return messages;
+  const next = [...messages];
+  const assistantIndex = lastAssistantIndex(next);
+  const assistant = assistantIndex >= 0 ? next[assistantIndex] : undefined;
+
+  if (terminal.type === 'done') {
+    if (assistant) {
+      let settled = settleOpenTools({ ...assistant, streaming: false }, 'incomplete');
+      if (terminal.stopReason && terminal.stopReason !== 'stopped') {
+        settled = upsertStatusBlock(settled, {
+          kind: 'warning',
+          message: terminal.message || `The turn ended before completion (${terminal.stopReason}).`,
+        });
+      }
+      next[assistantIndex] = settled;
+    } else if (terminal.stopReason && terminal.stopReason !== 'stopped') {
+      next.push({
+        id: nextId(),
+        role: 'error',
+        text: terminal.message || `The turn ended before completion (${terminal.stopReason}).`,
+        timestamp: Date.now(),
+      });
+    }
+    return next;
+  }
+
+  if (terminal.type === 'stopped') {
+    if (assistant) {
+      next[assistantIndex] = settleOpenTools({ ...assistant, streaming: false }, 'incomplete');
+    }
+    return next;
+  }
+
+  if (assistant) {
+    next[assistantIndex] = settleOpenTools({ ...assistant, streaming: false }, 'error', terminal.message);
+  }
+  if (next.at(-1)?.role !== 'error' || next.at(-1)?.text !== terminal.message) {
+    next.push({
+      id: nextId(),
+      role: 'error',
+      text: terminal.message,
+      timestamp: Date.now(),
+    });
+  }
+  return next;
+}
+
+function updatePermissionBlock(
+  message: ChatMessage,
+  id: string,
+  update: (request: PermissionRequestData) => PermissionRequestData,
+): ChatMessage {
+  const blocks = currentBlocks(message);
+  let updatedRequest: PermissionRequestData | undefined;
+  const nextBlocks = blocks.map((block) => {
+    if (block.type !== 'permission' || block.request.id !== id) return block;
+    updatedRequest = update(block.request);
+    return { ...block, request: updatedRequest };
+  });
+  if (!updatedRequest) return message;
+  return {
+    ...message,
+    blocks: nextBlocks,
+    permissionRequest: message.permissionRequest?.id === id
+      ? updatedRequest
+      : message.permissionRequest,
+  };
+}
+
 // Matches the prefix emitted in provider.ts _handleSend when context files are attached.
 const ATTACHED_FILES_PREFIX = /^The user has attached the following file\(s\)(?:\/selection\(s\))? for context\./;
 
@@ -251,10 +417,30 @@ function stripVisionPreprocessText(rawText: string): { displayText: string; hadV
   };
 }
 
+const EMPTY_SEARCH: SearchState = { matches: [], currentMatchIndex: -1 };
+
+/** Recompute search matches for the given query. Keeps the current index
+ *  clamped to the new range so navigation stays valid after edits. */
+function recomputeSearch(
+  messages: ChatMessage[],
+  query: string,
+  prev?: SearchState,
+): SearchState {
+  const trimmed = query.trim();
+  if (!trimmed) return EMPTY_SEARCH;
+  const matches = buildSearchMatches(messages, query);
+  if (matches.length === 0) return { matches, currentMatchIndex: -1 };
+  let nextIndex = prev && prev.currentMatchIndex >= 0 ? prev.currentMatchIndex : 0;
+  if (nextIndex >= matches.length) nextIndex = 0;
+  return { matches, currentMatchIndex: nextIndex };
+}
+
 export const initialState: ChatState = {
   messages: [],
   queuedMessages: [],
+  activeTodos: [],
   isGenerating: false,
+  recoveryLocked: false,
   isSessionList: document.body.dataset.viewMode === 'sidebar',
   viewMode: document.body.dataset.viewMode === 'sidebar' ? 'sidebar' : 'tab',
   currentModel: 'default',
@@ -275,10 +461,31 @@ export const initialState: ChatState = {
   settingsOpen: false,
   searchQuery: '',
   searchOpen: false,
+  search: EMPTY_SEARCH,
   locale: document.body.dataset.locale,
+  approvalMode: 'build',
+  approvalModePending: false,
 };
 
 export function chatReducer(state: ChatState, action: ChatAction): ChatState {
+  const next = chatReducerInner(state, action);
+  // Keep search matches in sync when messages change and a query is active.
+  if (next.messages !== state.messages && next.searchQuery.trim()) {
+    const recomputed = recomputeSearch(next.messages, next.searchQuery, next.search);
+    // Skip if matches haven't meaningfully changed (avoids unnecessary re-renders).
+    const sameMatches =
+      recomputed.matches.length === next.search.matches.length &&
+      recomputed.matches.every((m, idx) =>
+        m.messageId === next.search.matches[idx]?.messageId &&
+        m.ranges.length === next.search.matches[idx]?.ranges.length);
+    if (!sameMatches || recomputed.currentMatchIndex !== next.search.currentMatchIndex) {
+      return { ...next, search: recomputed };
+    }
+  }
+  return next;
+}
+
+function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
   switch (action.type) {
     // ─── User sends a message ────────────────────────
     case 'ADD_USER_MESSAGE': {
@@ -350,6 +557,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         isGenerating: true,
+        recoveryLocked: false,
         messages: [...state.messages, assistant],
       };
     }
@@ -358,6 +566,11 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     // START_GENERATION: create a fresh streaming assistant message that
     // subsequent text/toolStart events will append to.
     case 'RESUME_STREAMING': {
+      if (state.messages.some((message) => message.role === 'assistant' && message.streaming)) {
+        return state.isGenerating && !state.recoveryLocked
+          ? state
+          : { ...state, isGenerating: true, recoveryLocked: false };
+      }
       const assistant: ChatMessage = {
         id: nextId(),
         role: 'assistant',
@@ -370,6 +583,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         isGenerating: true,
+        recoveryLocked: false,
         messages: [...state.messages, assistant],
       };
     }
@@ -389,12 +603,15 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       const assistantIndex = lastAssistantIndex(msgs);
       const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
       if (assistant) {
-        const tools: ToolCallData[] = action.calls.map((c) => ({
-          id: c.id,
-          name: c.name,
-          args: c.args,
-          status: 'queued' as const,
-        }));
+        const existingIds = new Set((assistant.toolCalls ?? []).map((tool) => tool.id));
+        const tools: ToolCallData[] = action.calls
+          .filter((call) => !existingIds.has(call.id))
+          .map((c) => ({
+            id: c.id,
+            name: c.name,
+            args: c.args,
+            status: 'queued' as const,
+          }));
         msgs[assistantIndex] = {
           ...assistant,
           toolCalls: [...(assistant.toolCalls ?? []), ...tools],
@@ -408,16 +625,23 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       const msgs = [...state.messages];
       const assistantIndex = lastAssistantIndex(msgs);
       const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      let shouldApplyTodo = false;
       if (assistant) {
         const existingIndex = assistant.toolCalls?.findIndex((t) => t.id === action.id);
         if (existingIndex !== undefined && existingIndex >= 0) {
-          // Tool was already announced via TOOL_BATCH_START — transition to running
-          const updated = assistant.toolCalls!.map((t, i) =>
-            i === existingIndex ? { ...t, args: action.args, status: 'running' as const } : t,
-          );
-          const updatedTool = updated[existingIndex];
-          msgs[assistantIndex] = upsertToolBlock({ ...assistant, toolCalls: updated }, updatedTool);
+          const existingStatus = assistant.toolCalls![existingIndex].status;
+          shouldApplyTodo = existingStatus === 'queued' || existingStatus === 'waiting_approval';
+          if (shouldApplyTodo) {
+            // Tool was already announced via TOOL_BATCH_START — transition to running.
+            // Replayed starts must not reopen terminal calls.
+            const updated = assistant.toolCalls!.map((t, i) =>
+              i === existingIndex ? { ...t, args: action.args, status: 'running' as const } : t,
+            );
+            const updatedTool = updated[existingIndex];
+            msgs[assistantIndex] = upsertToolBlock({ ...assistant, toolCalls: updated }, updatedTool);
+          }
         } else {
+          shouldApplyTodo = true;
           // Legacy path: tool wasn't in a batch, add it directly as running
           const tool: ToolCallData = {
             id: action.id,
@@ -432,6 +656,28 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           msgs[assistantIndex] = upsertToolBlock(msgs[assistantIndex], tool);
         }
       }
+      return {
+        ...state,
+        messages: msgs,
+        activeTodos: shouldApplyTodo
+          ? applyTodoCall(state.activeTodos, action.name, action.args)
+          : state.activeTodos,
+      };
+    }
+
+    case 'TOOL_PROGRESS': {
+      const msgs = [...state.messages];
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant?.toolCalls) {
+        const tools = assistant.toolCalls.map((tool) =>
+          tool.id === action.id ? { ...tool, progress: action.progress } : tool,
+        );
+        const updatedTool = tools.find((tool) => tool.id === action.id);
+        msgs[assistantIndex] = updatedTool
+          ? upsertToolBlock({ ...assistant, toolCalls: tools }, updatedTool)
+          : { ...assistant, toolCalls: tools };
+      }
       return { ...state, messages: msgs };
     }
 
@@ -440,15 +686,62 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       const assistantIndex = lastAssistantIndex(msgs);
       const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
       if (assistant?.toolCalls) {
+        const status = action.success
+          ? 'done' as const
+          : action.output.startsWith('Code review incomplete')
+            ? 'incomplete' as const
+            : 'error' as const;
         const tools = assistant.toolCalls.map((t) =>
           t.id === action.id
-            ? { ...t, output: action.output, success: action.success, durationMs: action.durationMs, status: 'done' as const }
+            ? { ...t, output: action.output, success: action.success, durationMs: action.durationMs, progress: undefined, status }
             : t,
         );
         const updatedTool = tools.find((tool) => tool.id === action.id);
         msgs[assistantIndex] = updatedTool
           ? upsertToolBlock({ ...assistant, toolCalls: tools }, updatedTool)
           : { ...assistant, toolCalls: tools };
+      }
+      return { ...state, messages: msgs };
+    }
+
+    case 'STREAM_WARNING': {
+      const msgs = [...state.messages];
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant) {
+        msgs[assistantIndex] = appendStatusBlock(assistant, {
+          kind: 'warning',
+          message: action.message,
+        });
+      }
+      return { ...state, messages: msgs };
+    }
+
+    case 'STREAM_RATE_LIMITED': {
+      const msgs = [...state.messages];
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant) {
+        msgs[assistantIndex] = upsertStatusBlock(assistant, {
+          kind: 'rate_limited',
+          message: action.message,
+          retryAfterSeconds: action.retryAfterSeconds,
+          attempt: action.attempt,
+          maxAttempts: action.maxAttempts,
+        });
+      }
+      return { ...state, messages: msgs };
+    }
+
+    case 'STREAM_IDLE_NOTICE': {
+      const msgs = [...state.messages];
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant) {
+        msgs[assistantIndex] = upsertStatusBlock(assistant, {
+          kind: 'idle',
+          message: action.message,
+        });
       }
       return { ...state, messages: msgs };
     }
@@ -535,7 +828,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       const assistantIndex = lastAssistantIndex(msgs);
       const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
       if (assistant) {
-        msgs[assistantIndex] = { ...assistant, streaming: false };
+        msgs[assistantIndex] = settleOpenTools({ ...assistant, streaming: false }, 'incomplete');
       }
       // action.tokens is a number (total), not a tokenCount object
       const tokenCount = typeof action.tokens === 'number'
@@ -544,6 +837,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         isGenerating: false,
+        recoveryLocked: false,
         messages: msgs,
         tokenCount,
       };
@@ -554,9 +848,9 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       const assistantIndex = lastAssistantIndex(msgs);
       const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
       if (assistant) {
-        msgs[assistantIndex] = { ...assistant, streaming: false };
+        msgs[assistantIndex] = settleOpenTools({ ...assistant, streaming: false }, 'incomplete');
       }
-      return { ...state, isGenerating: false, messages: msgs, queuedMessages: [] };
+      return { ...state, isGenerating: false, recoveryLocked: false, messages: msgs, queuedMessages: [] };
     }
 
     case 'GENERATION_ERROR': {
@@ -564,7 +858,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       const assistantIndex = lastAssistantIndex(msgs);
       const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
       if (assistant) {
-        msgs[assistantIndex] = { ...assistant, streaming: false };
+        msgs[assistantIndex] = settleOpenTools({ ...assistant, streaming: false }, 'error', action.message);
       }
       const errMsg: ChatMessage = {
         id: nextId(),
@@ -572,12 +866,18 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         text: action.message,
         timestamp: Date.now(),
       };
-      return { ...state, isGenerating: false, messages: [...msgs, errMsg], queuedMessages: [] };
+      return { ...state, isGenerating: false, recoveryLocked: false, messages: [...msgs, errMsg], queuedMessages: [] };
     }
+
+    case 'RECOVERY_REQUIRED':
+      return { ...state, recoveryLocked: true, queuedMessages: [] };
+
+    case 'RECOVERY_CLEARED':
+      return { ...state, recoveryLocked: false };
 
     // ─── Session management ─────────────────────────
     case 'CLEAR_CHAT':
-      return { ...state, messages: [], queuedMessages: [], tokenCount: undefined, contextFiles: [], isGenerating: false };
+      return { ...state, messages: [], queuedMessages: [], activeTodos: [], tokenCount: undefined, contextFiles: [], isGenerating: false, recoveryLocked: false };
 
     case 'SET_MODELS': {
       const hasCurrent = action.models.some((m) => m.provider === state.currentProvider);
@@ -600,7 +900,11 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         providers: action.providers,
         currentProvider: current?.name ?? state.currentProvider,
         currentModel: current?.model ?? state.currentModel,
-        setupRequired: state.auth?.logged_in === false || action.providers.length === 0,
+        setupRequired: providerSetupRequired(
+          action.providers,
+          current?.name ?? state.currentProvider,
+          state.auth,
+        ),
       };
     }
 
@@ -608,7 +912,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         auth: action.auth,
-        setupRequired: !action.auth.logged_in || state.providers.length === 0,
+        setupRequired: providerSetupRequired(state.providers, state.currentProvider, action.auth),
       };
 
     case 'SET_SETUP_STATE': {
@@ -643,6 +947,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         ...state,
         currentProvider: action.provider,
         currentModel: action.model ?? provider?.model ?? state.currentModel,
+        setupRequired: providerSetupRequired(state.providers, action.provider, state.auth),
       };
     }
 
@@ -654,6 +959,9 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         ),
       };
 
+    case 'SET_APPROVAL_MODE':
+      return { ...state, approvalMode: action.mode, approvalModePending: action.pending ?? false };
+
     case 'SET_SESSIONS':
       return { ...state, sessions: action.sessions };
 
@@ -661,7 +969,9 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         activeSessionId: action.sessionId,
-        activeProjectHash: action.projectHash,
+        activeTodos: action.sessionId === state.activeSessionId ? state.activeTodos : [],
+        activeProjectHash: action.projectHash
+          ?? (action.sessionId === state.activeSessionId ? state.activeProjectHash : undefined),
       };
 
     // ─── Context files ──────────────────────────────
@@ -749,6 +1059,13 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         }));
 
         const rawText = textFromContent(m.content);
+        if (role === 'user' && isInternalHistoryUserMessage(rawText, m.synthetic)) {
+          continue;
+        }
+        const internalOrigin = internalOriginOf(m);
+        if (role === 'assistant' && internalOrigin === 'verify_cadence' && toolCalls.length === 0) {
+          continue;
+        }
         const { displayText: userVisibleText, hadVisionMarker } = role === 'user'
           ? stripVisionPreprocessText(rawText)
           : { displayText: rawText, hadVisionMarker: false };
@@ -780,30 +1097,69 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         };
         messages.push({ ...message, blocks: role === 'assistant' ? blocksFromLegacyMessage(message) : undefined });
       }
-      return { ...state, messages, isGenerating: false };
+      const mergedMessages = mergeTerminalIntoHistory(messages, action.terminal);
+      return {
+        ...state,
+        messages: mergedMessages,
+        activeTodos: reduceTodosFromMessages(mergedMessages),
+        isGenerating: false,
+      };
     }
 
-    case 'SET_SEARCH_QUERY':
-      return { ...state, searchQuery: action.query };
+    case 'SET_SEARCH_QUERY': {
+      const search = recomputeSearch(state.messages, action.query, state.search);
+      return { ...state, searchQuery: action.query, search };
+    }
 
-    case 'TOGGLE_SEARCH':
-      return { ...state, searchOpen: !state.searchOpen, searchQuery: state.searchOpen ? '' : state.searchQuery };
+    case 'TOGGLE_SEARCH': {
+      const closing = state.searchOpen;
+      return {
+        ...state,
+        searchOpen: !state.searchOpen,
+        searchQuery: closing ? '' : state.searchQuery,
+        search: closing ? EMPTY_SEARCH : recomputeSearch(state.messages, state.searchQuery),
+      };
+    }
+
+    case 'SEARCH_NEXT': {
+      const { matches, currentMatchIndex } = state.search;
+      if (matches.length === 0) return state;
+      const next = (currentMatchIndex + 1) % matches.length;
+      return { ...state, search: { matches, currentMatchIndex: next } };
+    }
+
+    case 'SEARCH_PREV': {
+      const { matches, currentMatchIndex } = state.search;
+      if (matches.length === 0) return state;
+      const prev = currentMatchIndex <= 0 ? matches.length - 1 : currentMatchIndex - 1;
+      return { ...state, search: { matches, currentMatchIndex: prev } };
+    }
 
     case 'PERMISSION_REQUEST': {
       const msgs = [...state.messages];
       const last = msgs[msgs.length - 1];
       if (last?.role === 'assistant') {
+        const toolCalls = last.toolCalls?.map((tool) =>
+          tool.id === action.id ? { ...tool, status: 'waiting_approval' as const } : tool,
+        );
         const request: PermissionRequestData = {
           id: action.id,
+          sessionId: action.sessionId,
           toolName: action.toolName,
+          reason: action.reason,
           args: action.args,
           isDestructive: action.isDestructive,
           status: 'pending',
         };
-        msgs[msgs.length - 1] = upsertPermissionBlock({
+        let nextMessage = upsertPermissionBlock({
           ...last,
+          toolCalls,
           permissionRequest: request,
         }, request);
+        for (const tool of toolCalls ?? []) {
+          nextMessage = upsertToolBlock(nextMessage, tool);
+        }
+        msgs[msgs.length - 1] = nextMessage;
       }
       return { ...state, messages: msgs };
     }
@@ -811,31 +1167,55 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     case 'PERMISSION_RESPOND': {
       const msgs = [...state.messages];
       const last = msgs[msgs.length - 1];
-      if (last?.role === 'assistant' && last.permissionRequest?.id === action.id) {
-        const request: PermissionRequestData = {
-          ...last.permissionRequest,
-          status: action.allowed ? 'allowed' : 'denied',
-        };
-        msgs[msgs.length - 1] = upsertPermissionBlock({
-          ...last,
-          permissionRequest: request,
-        }, request);
+      if (last?.role === 'assistant') {
+        msgs[msgs.length - 1] = updatePermissionBlock(last, action.id, (request) => ({
+          ...request,
+          status: 'submitting',
+          decision: action.decision,
+          error: undefined,
+        }));
+      }
+      return { ...state, messages: msgs };
+    }
+
+    case 'PERMISSION_RESPONSE_RESULT': {
+      const msgs = [...state.messages];
+      const last = msgs[msgs.length - 1];
+      if (last?.role === 'assistant') {
+        msgs[msgs.length - 1] = updatePermissionBlock(last, action.id, (request) => action.success
+          ? {
+              ...request,
+              status: request.decision === 'deny' ? 'denied' : 'allowed',
+              error: undefined,
+            }
+          : {
+              ...request,
+              status: 'pending',
+              decision: undefined,
+              error: action.message || 'Permission response failed',
+            });
       }
       return { ...state, messages: msgs };
     }
 
     // ─── Init ───────────────────────────────────────
-    case 'INIT':
+    case 'INIT': {
+      const activeSessionId = action.activeSessionId ?? state.activeSessionId;
       return {
         ...state,
         isGenerating: action.generating,
+        recoveryLocked: action.recoveryLocked ?? false,
         currentModel: action.currentModel ?? state.currentModel,
         viewMode: action.viewMode ?? state.viewMode,
-        activeSessionId: action.activeSessionId ?? state.activeSessionId,
+        activeSessionId,
+        activeTodos: activeSessionId === state.activeSessionId ? state.activeTodos : [],
         activeProjectHash: action.projectHash ?? state.activeProjectHash,
         isSessionList: action.isSessionList ?? state.isSessionList,
         locale: action.locale ?? state.locale,
+        approvalMode: action.approvalMode ?? state.approvalMode,
+        approvalModePending: action.approvalModePending ?? state.approvalModePending,
       };
+    }
 
     default:
       return state;

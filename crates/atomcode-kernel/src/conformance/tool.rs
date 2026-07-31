@@ -24,6 +24,7 @@ fn probe_ctx() -> ToolContext {
         working_dir: std::env::temp_dir(),
         cancel: CancellationToken::new(),
         progress: ProgressSink::noop(),
+        requester: None,
     }
 }
 
@@ -33,34 +34,59 @@ fn probe_ctx() -> ToolContext {
 /// with — the harness cannot invent valid args for an arbitrary tool. If empty, a
 /// single `"{}"` is used.
 pub async fn check(tool: Arc<dyn Tool>, sample_args: &[&str]) -> ConformanceReport {
-    let subject = catch_sync(|| tool.name().to_string()).unwrap_or_else(|_| "<name() panicked>".into());
+    let subject =
+        catch_sync(|| tool.name().to_string()).unwrap_or_else(|_| "<name() panicked>".into());
     let mut r = ConformanceReport::new("Tool", subject);
-    let args: Vec<String> =
-        if sample_args.is_empty() { vec!["{}".into()] } else { sample_args.iter().map(|s| s.to_string()).collect() };
+    let args: Vec<String> = if sample_args.is_empty() {
+        vec!["{}".into()]
+    } else {
+        sample_args.iter().map(|s| s.to_string()).collect()
+    };
 
     // name(): non-empty + stable.
-    match (catch_sync(|| tool.name().to_string()), catch_sync(|| tool.name().to_string())) {
+    match (
+        catch_sync(|| tool.name().to_string()),
+        catch_sync(|| tool.name().to_string()),
+    ) {
         (Ok(a), Ok(b)) => {
             r.record("name_non_empty", !a.is_empty(), "name() must be non-empty (it is the registry key and the ToolDef name the model sees)");
-            r.record("name_stable", a == b, format!("name() must return the same value across calls; got {a:?} then {b:?}"));
+            r.record(
+                "name_stable",
+                a == b,
+                format!("name() must return the same value across calls; got {a:?} then {b:?}"),
+            );
         }
         _ => r.record("name_no_panic", false, "name() panicked"),
     }
 
     // description(): non-empty + stable.
-    match (catch_sync(|| tool.description().to_string()), catch_sync(|| tool.description().to_string())) {
+    match (
+        catch_sync(|| tool.description().to_string()),
+        catch_sync(|| tool.description().to_string()),
+    ) {
         (Ok(a), Ok(b)) => {
             r.record("description_non_empty", !a.is_empty(), "description() must be non-empty — it is rendered into the mounted ToolDef the model reads to decide WHEN to call the tool; an empty description gives the model no guidance");
-            r.record("description_stable", a == b, "description() must be stable across calls (it is rendered into the cached prompt)");
+            r.record(
+                "description_stable",
+                a == b,
+                "description() must be stable across calls (it is rendered into the cached prompt)",
+            );
         }
         _ => r.record("description_no_panic", false, "description() panicked"),
     }
 
     // parameters_schema(): a JSON object + stable.
-    match (catch_sync(|| tool.parameters_schema()), catch_sync(|| tool.parameters_schema())) {
+    match (
+        catch_sync(|| tool.parameters_schema()),
+        catch_sync(|| tool.parameters_schema()),
+    ) {
         (Ok(a), Ok(b)) => {
             r.record("schema_is_object", a.is_object(), format!("parameters_schema() must be a JSON object (a tool-parameters JSON Schema), got: {a}"));
-            r.record("schema_stable", a == b, "parameters_schema() must be stable across calls (prompt-cache stability)");
+            r.record(
+                "schema_stable",
+                a == b,
+                "parameters_schema() must be stable across calls (prompt-cache stability)",
+            );
         }
         _ => r.record("schema_no_panic", false, "parameters_schema() panicked"),
     }
@@ -105,10 +131,16 @@ pub async fn check(tool: Arc<dyn Tool>, sample_args: &[&str]) -> ConformanceRepo
 /// ignoring `ctx.cancel` fails `respects_cancel`; a fast tool passes trivially. Not part
 /// of [`check`] (most tools have no long work to cancel).
 pub async fn check_respects_cancel(tool: Arc<dyn Tool>, args: &str) -> ConformanceReport {
-    let subject = catch_sync(|| tool.name().to_string()).unwrap_or_else(|_| "<name() panicked>".into());
+    let subject =
+        catch_sync(|| tool.name().to_string()).unwrap_or_else(|_| "<name() panicked>".into());
     let mut r = ConformanceReport::new("Tool", subject);
     let cancel = CancellationToken::new();
-    let ctx = ToolContext { working_dir: std::env::temp_dir(), cancel: cancel.clone(), progress: ProgressSink::noop() };
+    let ctx = ToolContext {
+        working_dir: std::env::temp_dir(),
+        cancel: cancel.clone(),
+        progress: ProgressSink::noop(),
+        requester: None,
+    };
     cancel.cancel(); // pre-cancelled: a cooperative tool must observe it and bail.
     let fut = async { tool.execute(args, &ctx).await };
     match with_timeout(Duration::from_secs(2), catch_async(fut)).await {

@@ -73,18 +73,29 @@ fn render(index: &CodeIndex, root: &Path, from: &str, to: &str) -> ToolResult {
     for from_sym in &from_matches {
         for to_sym in &to_matches {
             if let Some(path) = g.shortest_path(from_sym.id, to_sym.id) {
-                let mut out = format!("Call chain from '{from}' to '{to}' ({} hops):\n", path.len().saturating_sub(1));
+                let mut out = format!(
+                    "Call chain from '{from}' to '{to}' ({} hops):\n",
+                    path.len().saturating_sub(1)
+                );
                 for (i, sid) in path.iter().enumerate() {
                     if let Some(node) = g.node(*sid) {
                         let arrow = if i == 0 { "" } else { "→ " };
-                        out.push_str(&format!("  {}{} ({:?}) — {}\n", arrow, node.name, node.kind, display_path(&node.file, root)));
+                        out.push_str(&format!(
+                            "  {}{} ({:?}) — {}\n",
+                            arrow,
+                            node.name,
+                            node.kind,
+                            display_path(&node.file, root)
+                        ));
                     }
                 }
                 return ok(out);
             }
         }
     }
-    ok(format!("No call chain found from '{from}' to '{to}' (max 10 hops)."))
+    ok(format!(
+        "No call chain found from '{from}' to '{to}' (max 10 hops)."
+    ))
 }
 
 #[cfg(test)]
@@ -96,13 +107,30 @@ mod tests {
     #[tokio::test]
     async fn finds_chain() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("a.rs"), "fn c() {}\nfn b() { c(); }\nfn a() { b(); }\n").unwrap();
+        std::fs::write(
+            d.path().join("a.rs"),
+            "fn c() {}\nfn b() { c(); }\nfn a() { b(); }\n",
+        )
+        .unwrap();
         let tool = TraceChainTool::new(Arc::new(CodeIndex::new()));
-        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() };
+        let ctx = ToolContext {
+            working_dir: d.path().to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
         let r = tool.execute(r#"{"from":"a","to":"c"}"#, &ctx).await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("Call chain from 'a' to 'c'"), "{}", r.content);
-        assert!(r.content.contains("a (") && r.content.contains("b (") && r.content.contains("c ("), "{}", r.content);
+        assert!(
+            r.content.contains("Call chain from 'a' to 'c'"),
+            "{}",
+            r.content
+        );
+        assert!(
+            r.content.contains("a (") && r.content.contains("b (") && r.content.contains("c ("),
+            "{}",
+            r.content
+        );
     }
 
     #[tokio::test]
@@ -110,7 +138,12 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
         let tool = TraceChainTool::new(Arc::new(CodeIndex::new()));
-        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() };
+        let ctx = ToolContext {
+            working_dir: d.path().to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
         let r = tool.execute(r#"{"from":"a","to":"b"}"#, &ctx).await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("No call chain"), "{}", r.content);

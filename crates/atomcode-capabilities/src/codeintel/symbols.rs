@@ -86,7 +86,9 @@ pub fn extract_symbols(source: &str, lang: Lang) -> Option<Vec<Symbol>> {
 
 /// Extract the first symbol named `name` from `source`.
 pub fn extract_symbol(source: &str, lang: Lang, name: &str) -> Option<Symbol> {
-    extract_symbols(source, lang)?.into_iter().find(|s| s.name == name)
+    extract_symbols(source, lang)?
+        .into_iter()
+        .find(|s| s.name == name)
 }
 
 /// Render a compact STRUCTURE skeleton of a source file: leading import lines + each
@@ -124,12 +126,18 @@ pub fn skeleton(path: &Path, source: &str) -> Option<String> {
         out.push('\n');
     }
     for s in &syms {
-        let mut sig = lines.get(s.start_line.saturating_sub(1)).map(|l| l.trim_end().to_string()).unwrap_or_else(|| s.name.clone());
+        let mut sig = lines
+            .get(s.start_line.saturating_sub(1))
+            .map(|l| l.trim_end().to_string())
+            .unwrap_or_else(|| s.name.clone());
         if sig.chars().count() > SIG_MAX {
             sig = sig.chars().take(SIG_MAX).collect::<String>() + "…";
         }
         let n = s.end_line.saturating_sub(s.start_line) + 1;
-        out.push_str(&format!("{:>6}| {}  // L{}-{} ({} lines)\n", s.start_line, sig, s.start_line, s.end_line, n));
+        out.push_str(&format!(
+            "{:>6}| {}  // L{}-{} ({} lines)\n",
+            s.start_line, sig, s.start_line, s.end_line, n
+        ));
     }
     Some(out)
 }
@@ -181,7 +189,10 @@ mod tests {
         let sk = skeleton(std::path::Path::new("a.rs"), &src).expect("skeleton");
         assert!(sk.contains("File skeleton"), "{}", &sk[..sk.len().min(120)]);
         assert!(sk.contains('…'), "long signature must be truncated");
-        assert!(!sk.contains(&"x".repeat(2100)), "must not show the full 5000-char line");
+        assert!(
+            !sk.contains(&"x".repeat(2100)),
+            "must not show the full 5000-char line"
+        );
     }
 
     #[test]
@@ -198,14 +209,30 @@ mod tests {
         // (lang, sample source, symbol names that MUST be found)
         let cases: &[(Lang, &str, &[&str])] = &[
             (Rust, "struct S;\nfn f() {}\n", &["S", "f"]),
-            (Python, "class A:\n    def m(self):\n        pass\n\ndef g():\n    pass\n", &["A", "g"]),
+            (
+                Python,
+                "class A:\n    def m(self):\n        pass\n\ndef g():\n    pass\n",
+                &["A", "g"],
+            ),
             (JavaScript, "function fn() {}\nclass C {}\n", &["fn", "C"]),
-            (TypeScript, "function fn(): void {}\ninterface I {}\nclass C {}\n", &["fn", "I", "C"]),
+            (
+                TypeScript,
+                "function fn(): void {}\ninterface I {}\nclass C {}\n",
+                &["fn", "I", "C"],
+            ),
             (Tsx, "function App() { return null; }\n", &["App"]),
             (Go, "package p\nfunc F() {}\ntype T struct{}\n", &["F", "T"]),
             (Java, "class C {\n  void m() {}\n}\n", &["C", "m"]),
-            (C, "struct S { int x; };\nint f(void) { return 0; }\n", &["S", "f"]),
-            (Cpp, "namespace N {}\nclass C {};\nvoid f() {}\n", &["N", "C", "f"]),
+            (
+                C,
+                "struct S { int x; };\nint f(void) { return 0; }\n",
+                &["S", "f"],
+            ),
+            (
+                Cpp,
+                "namespace N {}\nclass C {};\nvoid f() {}\n",
+                &["N", "C", "f"],
+            ),
             (CSharp, "class C {\n  void M() {}\n}\n", &["C", "M"]),
             (Php, "<?php\nfunction f() {}\nclass C {}\n", &["f", "C"]),
         ];
@@ -213,7 +240,10 @@ mod tests {
             let syms = extract_symbols(src, *lang).unwrap_or_default();
             let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
             for e in *expected {
-                assert!(names.contains(e), "{lang:?}: expected symbol {e:?}, got {names:?}");
+                assert!(
+                    names.contains(e),
+                    "{lang:?}: expected symbol {e:?}, got {names:?}"
+                );
             }
         }
         // HTML "symbols" are element-ish; just assert the query runs without error.
@@ -226,6 +256,10 @@ mod tests {
         // must not panic on multibyte identifiers / bodies.
         let src = "// 注释\nfn 计算(参数: i32) -> i32 {\n    参数 + 1\n}\n";
         let syms = extract_symbols(src, Lang::Rust).expect("parse");
-        assert!(syms.iter().any(|s| s.name == "计算"), "{:?}", syms.iter().map(|s| &s.name).collect::<Vec<_>>());
+        assert!(
+            syms.iter().any(|s| s.name == "计算"),
+            "{:?}",
+            syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
     }
 }

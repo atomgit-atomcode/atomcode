@@ -63,15 +63,28 @@ fn load_telemetry_config(config_override: Option<&Path>) -> TelemetryConfig {
         Ok(t) => t,
         Err(_) => return TelemetryConfig::default(),
     };
-    toml::from_str::<TelFile>(&text).map(|f| f.telemetry).unwrap_or_default()
+    toml::from_str::<TelFile>(&text)
+        .map(|f| f.telemetry)
+        .unwrap_or_default()
 }
 
-/// Build the telemetry sink: resolve the 4-level opt-out, then init the queue. ALWAYS returns
-/// a sink — a DISABLED one when opted out (every `track` is then a hard no-op), so callers
-/// wire it unconditionally and the sink itself enforces the opt-out.
+/// Build the telemetry sink: resolve the 5-level opt-out (offline + env×2 + cli + config),
+/// then init the queue. ALWAYS returns a sink — a DISABLED one when opted out (every `track`
+/// is then a hard no-op), so callers wire it unconditionally and the sink itself enforces the
+/// opt-out.
 pub fn build_sink(config_override: Option<&Path>, no_telemetry: bool) -> Arc<Telemetry> {
     let cfg = load_telemetry_config(config_override);
-    let resolved = resolve(&cfg, &CliOverride { disabled: no_telemetry }, atomcode_dir(), &ProcessEnv);
+    // clix does not participate in offline_mode (it never seeds the offline verdict),
+    // so telemetry is not offline-gated here — pass false explicitly, not a bug.
+    let resolved = resolve(
+        &cfg,
+        &CliOverride {
+            disabled: no_telemetry,
+        },
+        atomcode_dir(),
+        &ProcessEnv,
+        false,
+    );
     Telemetry::init(resolved, env!("CARGO_PKG_VERSION").into())
 }
 
@@ -109,6 +122,9 @@ pub fn build_review_provider(
     use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider};
     let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
     pc.context_window = cfg.context_window;
+    // Byte-idle liveness follows the review config's stream_timeout (mirrors
+    // `atomcode_review::build_review_agent`), not the adapter's hardcoded 120s.
+    pc.idle_timeout = cfg.stream_timeout;
     OpenAiCompatProvider::new(pc)
         .map(|p| Arc::new(p) as Arc<dyn LlmProvider>)
         .map_err(|e| e.message)
@@ -158,7 +174,11 @@ mod tests {
         ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
             Ok(Box::pin(futures::stream::iter(vec![
                 StreamEvent::TextDelta("ok".into()),
-                StreamEvent::Usage(TokenUsage { prompt: 400, completion: 20, cached: 0 }),
+                StreamEvent::Usage(TokenUsage {
+                    prompt: 400,
+                    completion: 20,
+                    cached: 0,
+                }),
                 StreamEvent::Done { truncated: false },
             ])))
         }
@@ -181,7 +201,10 @@ mod tests {
             .iter()
             .filter(|r| matches!(r.event, atomcode_telemetry::Event::LlmChat { .. }))
             .count();
-        assert_eq!(n, 1, "the standalone review provider must meter each LLM round");
+        assert_eq!(
+            n, 1,
+            "the standalone review provider must meter each LLM round"
+        );
     }
 
     #[test]

@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use atomcode_core::auth::oauth::{LoginSession, PollOutcome};
+use atomcode_auth::oauth::{LoginSession, PollOutcome};
 use atomcode_telemetry::Telemetry;
 
 /// Outcome the background poll thread emits at exactly one of: a
@@ -93,14 +93,10 @@ pub fn spawn_oauth_poll(
                 // /codingplan flow re-runs login, popping a second
                 // QR + asking the user to scan AGAIN.
                 match session.finish(tel.as_ref()) {
-                    Ok(auth_info) => {
-                        match atomcode_core::auth::save_auth(&auth_info) {
-                            Ok(()) => OauthEvent::Authorized,
-                            Err(e) => OauthEvent::Failed(format!(
-                                "auth.toml write failed: {e:#}"
-                            )),
-                        }
-                    }
+                    Ok(auth_info) => match atomcode_auth::save_auth(&auth_info) {
+                        Ok(()) => OauthEvent::Authorized,
+                        Err(e) => OauthEvent::Failed(format!("auth.toml write failed: {e:#}")),
+                    },
                     Err(e) => OauthEvent::Failed(format!("{e:#}")),
                 }
             }

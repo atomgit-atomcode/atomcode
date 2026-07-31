@@ -27,10 +27,10 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.25.9-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-5.0.3-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
-  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS%20PC%20%7C%20Windows-lightgrey" alt="platform">
     <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank">
     <img src="https://atomgit.com/atomgit_atomcode/atomcode/star/badge.svg" alt="AtomGit Star"/>
   </a>
@@ -92,7 +92,7 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 | Claude（Anthropic） | 支持 | Claude Sonnet 4.5/4.6、Opus 4.6 |
 | OpenAI | 支持 | GPT-4o、GPT-4.1 |
 | DeepSeek | 支持 | DeepSeek V3、DeepSeek R1、DeepSeek V4 |
-| 智谱（GLM） | 支持 | GLM-4、GLM-5 |
+| 智谱（GLM） | 支持 | GLM-4、GLM-5、GLM-5.2（AtomCode Pro 套餐专属模型） |
 | 通义千问（阿里） | 支持 | Qwen-Plus、Qwen-Max |
 | SiliconFlow | 支持 | 多种开源模型 |
 | Ollama（本地） | 部分支持 | Llama 3、Qwen2 等 |
@@ -129,7 +129,6 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 - **`/app`**（TUI 内）开启移动端远程访问，终端打印二维码，用手机 GitCode App 扫码即可在任意网络下连入当前对话
 - **任意网络可达** —— 电脑通过反向 WSS 隧道连接到公网中继，手机经中继访问电脑，不需要公网 IP、DDNS 或路由器端口映射
 - **双向实时同步** —— 任一端发消息，另一端实时显示（AI 流式回复、工具调用卡片、token 用量）
-- **工具审批** —— 电脑执行到需要授权的工具时，手机弹出审批卡片，可直接点允许/拒绝
 - **远程命令** —— 手机端支持 `/status`、`/cost`、`/diff`、`/whoami` 等斜杠命令，在桌面端执行并回显
 - **切项目 / 切会话** —— 手机端切换项目或点开历史对话，桌面端跟随切换
 - **模型双向同步** —— 任一端切换模型，另一端同步跟随
@@ -185,10 +184,54 @@ npm install -g @atomgit.com/atomcode
 brew install --cask atomcode
 ```
 
+### Shell 补全
+
+AtomCode 可为 Bash、Zsh、Fish、PowerShell 和 Elvish 生成补全脚本。例如：
+
+```bash
+# Bash（当前会话）
+source <(atomcode completion bash)
+
+# Zsh（持久生效）
+mkdir -p ~/.zfunc
+atomcode completion zsh > ~/.zfunc/_atomcode
+# 同时在 ~/.zshrc 的 `compinit` 之前加入：fpath=(~/.zfunc $fpath)
+
+# Fish（持久生效）
+mkdir -p ~/.config/fish/completions
+atomcode completion fish > ~/.config/fish/completions/atomcode.fish
+```
+
+PowerShell 可运行 `atomcode completion powershell | Out-String |
+Invoke-Expression`。完整 Shell 列表见 `atomcode completion --help`。该能力只作用于
+外部命令行，不会改变 TUI 内 `Tab` 的模式切换行为。
+
 ### 依赖
 
 - Rust 1.88+（用于构建；更旧的 Cargo 无法解析当前 lock 文件）
 - 任一支持的模型提供方的 API Key（或使用 `/login` 的 AtomGit 账号）
+
+### 权限 —— 不要用 `sudo` 启动
+
+请用**普通用户**运行 AtomCode，切勿 `sudo`。AtomCode 把配置、会话、日志都放在
+`~/.atomcode`；一旦用 root 跑过一次，就会在那里留下 root 属主的文件，之后非 root
+启动会在运行时初始化阶段报错：
+
+```
+coding runtime assemble failed: Permission denied (os error 13)
+```
+
+（提示里可能是 `prepare` 而非 `assemble`——同一个原因。）遇到这种情况，把属主收回
+并停止使用 `sudo`：
+
+```bash
+sudo chown -R "$(id -un):$(id -gn)" ~/.atomcode
+atomcode        # 不要再加 sudo
+```
+
+在 Linux 客户机上，工作目录若在 VirtualBox 共享文件夹（`/media/sf_*`，属主
+`root:vboxsf`）也会导致权限错误——用 `sudo usermod -aG vboxsf "$USER"` 把自己加进
+该组（重新登录后生效），而不是用 `sudo`。
 
 ### 卸载
 
@@ -297,7 +340,6 @@ atomcode --prompt-file task.md
 | `Enter` | 发送消息 |
 | `Shift+Enter` | 换行（需要终端支持 Kitty 键盘协议） |
 | `Ctrl+Enter` | 换行（需要终端支持 Kitty 键盘协议） |
-| `Ctrl+J` | 换行（需要终端支持 Kitty 键盘协议） |
 | `Alt+Enter` | 换行（多数终端可用，见下方兼容性说明） |
 | `\` + `Enter` | 换行（所有终端通用——输入一个 `\` 后按回车，`\` 会被自动删除） |
 | `Esc` | 清空输入 / 取消流式输出 |
@@ -310,7 +352,7 @@ atomcode --prompt-file task.md
 | `Ctrl+V` | 从剪贴板粘贴图片（Windows 下请改用 `/paste`，见下方说明） |
 
 > **换行快捷键的终端兼容性：**
-> - `Shift+Enter`、`Ctrl+Enter`、`Ctrl+J` 都需要终端支持 Kitty 键盘协议 — kitty、WezTerm、Alacritty、iTerm2 ≥3.5、Windows Terminal ≥1.21。不支持的终端会把它们都退化成普通 `Enter`（直接发送消息）。
+> - `Shift+Enter`、`Ctrl+Enter` 需要终端支持 Kitty 键盘协议 — kitty、WezTerm、Alacritty、iTerm2 ≥3.5、Windows Terminal ≥1.21。不支持的终端（以及 Windows，atomcode 在其上不启用该协议）会把它们退化成普通 `Enter`（直接发送消息）—— 请改用 `\` + `Enter`，它在所有终端都生效。
 > - `Alt+Enter` 在多数终端的字节层面就能工作，但 **Windows Terminal 默认把它绑给"切换全屏"** — 在 设置 → 操作 中删掉那条绑定即可释放。
 > - Xshell 不支持 Kitty 协议；可在键盘映射设置中把某个空闲组合映射为发送 `ESC, Enter`（`\x1b\r`）达到同样效果，或直接从剪贴板粘贴多行文本（已启用 bracketed paste）。
 
@@ -345,7 +387,7 @@ atomcode --prompt-file task.md
 | `/clear` | 开始新对话（清空上下文与屏幕） |
 | `/bg` | 将当前会话放到后台；子命令：`/bg list`、`/bg <N>`、`/bg drop <N>`、`/bg help` |
 | `/background <task>` | 兼容入口：在 `/bg` 槽位中启动一次性后台任务 |
-| `/cd` | 切换工作目录 |
+| `/cd` | 切换工作目录并开启新建对话 |
 | `/worktree` | Git worktree 隔离（`create` / `list` / `done` / `cleanup`） |
 | `/webui` | 启动浏览器 webui（子命令：`stop`、`lan`、`--host <地址>`） |
 | `/sync` | 连接到实时 webui 会话（`/sync off` 断开） |
@@ -367,7 +409,8 @@ atomcode --prompt-file task.md
 |---------|--------|
 | `/model` | 切换模型 / provider |
 | `/provider` | 管理 provider（添加 / 编辑 / 删除） |
-| `/login` | 通过 AtomGit OAuth 登录 |
+| `/proxy` | 切换出站代理模式 |
+| `/login` | 通过 AtomGit OAuth 登录并申领 CodingPlan 免费模型 |
 | `/logout` | 退出 AtomGit 登录 |
 | `/whoami` | 查看当前登录用户 |
 | `/status` | 查看登录状态和模型信息 |
@@ -380,6 +423,7 @@ atomcode --prompt-file task.md
 | `/undo` | 撤销某一轮的文件编辑（`/undo` 或 `/undo N`） |
 | `/view <文件路径>` | 在浮层窗口中查看文件内容 |
 | `/paste` | 从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口） |
+| `/copy` | 从上一条回复复制代码块（`/copy`、`/copy N`、`/copy all`） |
 | `/cost` | 显示本次会话的 token 消耗 |
 | `/context` | 查看上下文预算占用明细 |
 | `/compact` | 压缩对话历史 |
@@ -410,13 +454,14 @@ atomcode --prompt-file task.md
 | `/upgrade` | 升级 atomcode 到最新版（子命令：`rollback`） |
 | `/setup` | 首次运行：安装推荐 skill 并执行 |
 | `/welcome` | 重新运行引导向导 |
-| `/language` | 切换显示语言 |
-| `/issue` | 反馈 bug / 提交功能需求（交互式向导） |
+| `/language` | 切换显示语言及默认 Git 提交消息语言 |
 | `/guide <问题>` | 向 atomcode-guide 询问使用方式 |
 | `/keys` | 查看键盘快捷键 |
 | `/help` | 查看命令与快捷键 |
 | `/quit`、`/exit` | 退出 AtomCode（或连按 Ctrl+C） |
 
+> **AtomGit Issue**：`/issue` 已移除。执行 `/login` 后，直接用自然语言提出需求即可，例如“为这个 Bug 创建一个 AtomGit Issue”，AtomCode 会调用内置的 `atomgit_issue` 工具。读取 Issue 可直接执行；创建 Issue，以及新增、编辑或删除评论仍需权限确认。
+>
 > **插件命令**：除了上面的内置命令，插件还能注册自己的斜杠命令。例如安装官方频道插件后即可使用 `/wechat`（显示 AtomCode 微信用户群二维码）：
 >
 > ```text
@@ -424,44 +469,99 @@ atomcode --prompt-file task.md
 > /plugin install weixin@atomcode-channel
 > ```
 
+### 自定义命令
+
+除了内置命令和插件命令，你还可以通过 `.md` 模板文件定义自己的斜杠命令，适用于频繁使用的提示词。
+
+**存放位置**（按优先级从低到高）：
+
+| 位置 | 作用域 |
+|-----|--------|
+| `$ATOMCODE_HOME/commands/`（默认为 `~/.atomcode/commands/`） | 全局 —— 所有项目生效 |
+| `<project>/.atomcode/commands/` | 项目级 —— 覆盖同名的全局命令 |
+| `plugins/<name>/commands/` | 插件贡献 —— 通过 `/plugin install` 安装 |
+
+**文件格式**：
+
+```markdown
+---
+name: explain
+description: 解释指定函数或模块的工作原理
+args: required
+---
+
+请详细解释以下代码的工作原理：
+
+$ARGUMENTS
+
+包括：函数签名与参数含义、核心业务逻辑、数据流与副作用。
+```
+
+- **`name`** —— 必填。命令名，输入 `/explain` 触发。
+- **`description`** —— 可选。Tab 补全时显示。
+- **`args`** —— 可选。控制参数期望与交互行为：
+
+  | 值 | 菜单 Enter 行为 | 空参提交 |
+  |-----|----------------|---------|
+  | `none`（默认） | 立即执行 | 允许（替换为空字符串） |
+  | `optional` | 补全到 `/name `，等待输入 | 允许 |
+  | `required` | 补全到 `/name `，等待输入 | 拒绝并提示错误 |
+
+  模板变量 `$ARGUMENTS` / `${ARGUMENTS}` 始终替换为用户在命令名后输入的内容（未输入则为空字符串）。
+
+- **模板正文** —— 输入命令后发送给 AI 的提示词。`$ARGUMENTS` 或 `${ARGUMENTS}` 会被替换为用户输入的命令参数。
+
+**示例：创建一个审查命令**
+
+```bash
+mkdir -p .atomcode/commands
+
+cat > .atomcode/commands/codereview.md << 'EOF'
+---
+name: codereview
+description: 对当前 git diff 进行代码审查
+args: optional
+---
+
+请对当前 git diff 中的所有改动进行代码审查。
+如有指定文件则只审查: $ARGUMENTS
+EOF
+```
+
+输入 `/help commands` 可查看所有已加载的自定义命令。
+
+> **优先级规则**：自定义命令名不能覆盖同名内置命令。如果内置已有 `/review`，项目级自定义的 `review.md` 不会出现在补全菜单中，也不会被 dispatch。
+
 ## 架构
 
-AtomCode 是一个 Rust workspace，由四个 crate 组成：
+AtomCode 是一个分层的 Rust workspace：
 
 ```
 atomcode/
   crates/
-    atomcode-core/     # 无头核心库，不依赖 TUI
-      agent/           # AgentLoop：自主工具调用循环
-      turn/            # TurnRunner、datalog、权限决策器
-      config/          # 配置加载、provider 配置
-      conversation/    # 消息类型、窗口化上下文
-      provider/        # LlmProvider trait + OpenAI/Claude/Ollama
-      tool/            # Tool trait + 内置工具实现
-      session/         # 持久化会话
-      skill.rs         # 用户自定义 skill
-
-    atomcode-tuix/     # 终端 UI — retained-mode 渲染器（CC 风格 normal mode）
-      event_loop/      # App 状态机、命令分发
-      render/          # cell-level 渲染器、diff、retained-mode 帧循环
-      modals/          # 各种 picker（dir、model、session、provider、issue）
-
-    atomcode-cli/      # 可执行入口（TUI + headless -p 模式）
-      main.rs          # CLI 参数、首次运行向导、启动
-      auth/            # AtomGit OAuth 客户端
-
-    atomcode-daemon/   # 基于 atomcode-core 的 HTTP/SSE API 服务
+    atomcode-kernel/        # 中立 agent 循环与运行时 trait
+    atomcode-capabilities/  # provider、tools、MCP、skills、session、memory
+    atomcode-coding/        # coding 专业化与 CodingRuntime 生命周期
+    atomcode-review/        # 代码评审专业化
+    atomcode-tuix/          # 终端 UI
+    atomcode-cli/           # TUI 与 headless 入口
+    atomcode-daemon/        # HTTP/SSE/WebSocket 传输层及历史 session importer
 ```
+
+coding 主调用链是 `CLI/TUI/daemon → CodingRuntime → kernel`。已经退役的 core agent
+协议和 `atomcode-bridge` 不再位于运行时路径中。
 
 ### 设计原则
 
 1. **技术栈无关** —— 核心引擎不硬编码任何特定语言的逻辑，通过 `package.json`、`Cargo.toml`、`pyproject.toml`、`pom.xml` 等描述文件动态探测项目类型。
 
-2. **Agent 解耦** —— `AgentLoop` 作为独立的异步任务运行，通过 channel（`AgentCommand` / `AgentEvent`）与 TUI 通信。核心库完全不依赖 TUI，这也是 daemon 得以存在的基础。
+2. **单一运行时所有者** —— `CodingRuntime` 统一拥有 live coding agent、provider/session 生命周期、pending request、snapshot 和 controller。driver 只负责输入、展示和传输，不重建第二套 agent runtime。
 
 3. **工具安全** —— 所有破坏性操作必须经用户显式确认。工具失败会作为 observation 返回给模型，绝不 panic。
 
 4. **上下文感知** —— token 预算感知的会话窗口、项目文件树注入、每轮系统提醒，在不超出上下文限制的同时让模型保持专注。
+
+5. **依赖单向** —— kernel 保持中立；capabilities 和 coding 保持 core-free；历史 session 数据只在显式兼容边界处理，不作为 runtime fallback。
 
 ## 项目指令文件
 
@@ -524,11 +624,11 @@ cargo run -p atomcode-daemon
 cargo test
 
 # 运行指定 crate 的测试
-cargo test -p atomcode-core
+cargo test -p atomcode-capabilities
 cargo test -p atomcode-tuix
 
 # 运行指定的用例
-cargo test -p atomcode-core test_name
+cargo test -p atomcode-capabilities test_name
 ```
 
 ### 常用命令
@@ -597,10 +697,23 @@ cargo install --path crates/atomcode-cli
 
 ### 从哪里上手
 
-- **新增工具** —— 在 `crates/atomcode-core/src/tool/` 下实现 `Tool` trait
-- **新增模型提供方** —— 在 `crates/atomcode-core/src/provider/` 下实现 `LlmProvider`
+- **新增工具** —— 在 `crates/atomcode-capabilities/src/tools/` 下实现 `Tool` trait
+- **新增模型提供方** —— 在 `crates/atomcode-capabilities/src/provider/` 下实现 `LlmProvider`
 - **改进 UI** —— 渲染相关代码在 `crates/atomcode-tuix/src/render/`
 - **修 Bug** —— 到 [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) 上挑一个
+
+### 非 Rust 贡献者
+
+不会 Rust？没关系！有很多方式可以不写 Rust 代码就能参与贡献：
+
+- **📝 文档** — 改进 README、修正错别字、完善[官方文档站](https://atomcode.atomgit.com/docs/zh/)、添加使用示例。文档位于 `site/` 目录和 README 文件中。
+- **🌐 本地化与翻译** — 帮助将文档站、README 或界面文案翻译成更多语言。查看 `site/docs/` 了解现有翻译。
+- **🧩 Skills 与插件** — 创建新的 [skill](https://gitcode.com/atomgit_atomcode/atomcode-skills)（Markdown + JSON，无需 Rust），扩展 AtomCode 的能力。Skill 从 `~/.atomcode/skills/` 加载。
+- **🐛 Bug 报告** — 发现 Bug？在 [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) 中提交清晰的复现步骤、截图和环境信息。高质量的 Bug 报告非常宝贵。
+- **🧪 测试用例与示例** — 添加测试场景、示例项目或使用演示，帮助验证功能并帮助新用户上手。
+- **💬 社区支持** — 在社区群中回答问题、编写教程或制作视频指南。
+
+每一份贡献，无论是代码还是非代码，都能让 AtomCode 变得更好。不确定从哪里开始？开一个 Issue 或发起讨论吧！
 
 ## 社区交流
 ---

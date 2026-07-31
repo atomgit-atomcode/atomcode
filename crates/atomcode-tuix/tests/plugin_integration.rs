@@ -11,23 +11,25 @@
 
 use std::process::Command;
 
+// Redirect ATOMCODE_HOME to a throwaway temp dir before any test in this binary
+// runs, so tests never persist into the developer's real home. isolate_home is a
+// no-op when the var is already set.
+#[ctor::ctor]
+fn _isolate_atomcode_home() {
+    atomcode_kernel::test_support::isolate_home();
+}
+
 #[test]
 #[serial_test::serial]
 fn add_install_reload_flow() {
-    // Set + unset on drop via this guard mirrors the in-tree
-    // `plugin::test_support::isolated_home`. Test files outside the crate
-    // can't see `pub(crate)` items so we inline the small guard here.
-    // Held only for its `Drop` (removes ATOMCODE_HOME); the TempDir field is
-    // never read directly.
-    struct Guard(#[allow(dead_code)] tempfile::TempDir);
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            std::env::remove_var("ATOMCODE_HOME");
-        }
-    }
+    // Point ATOMCODE_HOME at a fresh tempdir for this test. We deliberately do
+    // NOT unset it afterwards: the isolate_home ctor keeps ATOMCODE_HOME pointed
+    // at a temp dir for the whole binary, so unsetting here would leak back to
+    // the real ~/.atomcode. Bind the TempDir to keep it (and its files) alive
+    // for the duration of the test.
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
-    let _guard = Guard(home);
+    let _home = home;
 
     // Build a minimal plugin repo with a skill and a command.
     let workspace = tempfile::tempdir().unwrap();
@@ -71,18 +73,23 @@ fn add_install_reload_flow() {
         .unwrap();
 
     let url = format!("file://{}", repo.display());
-    atomcode_core::plugin::marketplace::add_marketplace(&url).unwrap();
-    atomcode_core::plugin::installer::install("e2e", "e2e", atomcode_core::plugin::InstallScope::User).unwrap();
+    atomcode_capabilities::plugin::marketplace::add_marketplace(&url).unwrap();
+    atomcode_capabilities::plugin::installer::install(
+        "e2e",
+        "e2e",
+        atomcode_capabilities::plugin::InstallScope::User,
+    )
+    .unwrap();
 
-    // Verify SkillRegistry sees `e2e:sk`.
+    // Verify SkillRegistry sees `e2e:sk`. Load standard dirs then installed-plugin
+    // skill dirs — the two layers the retired `core::skill::reload` combined.
     let working = tempfile::tempdir().unwrap();
-    let mut reg = atomcode_core::skill::SkillRegistry::new();
-    reg.reload(working.path());
+    let mut reg = atomcode_capabilities::skills::SkillRegistry::new();
+    atomcode_capabilities::plugin::loader::reload_skill_registry(&mut reg, working.path());
     assert!(reg.get("e2e:sk").is_some(), "missing skill e2e:sk");
 
-    // Verify CustomCommandRegistry sees `e2e:c`. The registry moved to
-    // atomcode-tuix (refactor: driver-only modules out of core); the plugin
-    // install + skill reload it exercises still live in atomcode_core.
+    // Verify the TUI-owned CustomCommandRegistry sees `e2e:c`; plugin install
+    // and skill discovery are provided by atomcode-capabilities.
     let creg = atomcode_tuix::custom_commands::CustomCommandRegistry::load(working.path());
     assert!(creg.get("e2e:c").is_some(), "missing command e2e:c");
 }

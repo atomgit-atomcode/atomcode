@@ -1,8 +1,10 @@
 package com.atomcode.jetbrains.ui
 
+import com.atomcode.jetbrains.daemon.MessageInfo
 import com.atomcode.jetbrains.ui.input.slashCommandPrefix
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -63,6 +65,16 @@ and suggest improvements."""
     @Test
     fun `summarizeToolArguments omits unknown tool arguments`() {
         assertEquals("", summarizeToolArguments("unknown", """{"token":"secret"}"""))
+    }
+
+    @Test
+    fun `toolResultStatus distinguishes incomplete review`() {
+        assertEquals(
+            "incomplete",
+            toolResultStatus(false, "Code review incomplete (MaxRounds)"),
+        )
+        assertEquals("failed", toolResultStatus(false, "command failed"))
+        assertEquals("done (42ms)", toolResultStatus(true, "ok", 42))
     }
 
     @Test
@@ -195,6 +207,95 @@ def hello():
     fun `isInternalHistoryUserMessage hides verification nudges`() {
         assertTrue(
             isInternalHistoryUserMessage("You made code edits but have not verified them. Run a fast check (`cargo check`)."),
+        )
+    }
+
+    @Test
+    fun `isInternalHistoryUserMessage hides legacy synthetic prefixes`() {
+        listOf(
+            "Output limit hit — your last response was cut off before finishing.",
+            "Output limit hit. If the task is already complete, just output a short summary.",
+            "[PLAN MODE ACTIVATED] read only",
+            "[Context was compressed] summary",
+            "[Additional context from user]: note",
+            "[SYNTAX CHECK: broken braces]",
+            "[DEV SERVER ERROR in app.log:]",
+            "[Auto-read from error: src/main.rs]",
+            "[Images returned by the tool calls above are attached for you to view.]",
+        ).forEach {
+            assertTrue(isInternalHistoryUserMessage(it), "expected internal prefix: $it")
+        }
+    }
+
+    @Test
+    fun `isInternalHistoryUserMessage keeps real user messages with similar wording`() {
+        assertFalse(
+            isInternalHistoryUserMessage("Output limit hit when running pytest; how do I debug it?"),
+        )
+    }
+
+    @Test
+    fun `isInternalHistoryAssistantMessage hides verify cadence assistants`() {
+        assertTrue(
+            isInternalHistoryAssistantMessage(
+                MessageInfo(
+                    role = "assistant",
+                    content = "No verification is needed.",
+                    internalOrigin = "verify_cadence",
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `isInternalHistoryAssistantMessage keeps normal assistants`() {
+        assertFalse(
+            isInternalHistoryAssistantMessage(
+                MessageInfo(
+                    role = "assistant",
+                    content = "I am AtomCode.",
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `isInternalHistoryAssistantMessage keeps verify cadence assistants with tool calls`() {
+        assertFalse(
+            isInternalHistoryAssistantMessage(
+                MessageInfo(
+                    role = "assistant",
+                    content = "",
+                    internalOrigin = "verify_cadence",
+                    toolCalls = listOf(
+                        com.atomcode.jetbrains.daemon.ToolCallInfo(
+                            id = "t1",
+                            name = "bash",
+                            arguments = """{"command":"true"}""",
+                        ),
+                    ),
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `shouldRenderHistoryAssistantText skips empty assistant text with tool calls`() {
+        assertFalse(
+            shouldRenderHistoryAssistantText(
+                MessageInfo(
+                    role = "assistant",
+                    content = "",
+                    internalOrigin = "verify_cadence",
+                    toolCalls = listOf(
+                        com.atomcode.jetbrains.daemon.ToolCallInfo(
+                            id = "t1",
+                            name = "bash",
+                            arguments = """{"command":"true"}""",
+                        ),
+                    ),
+                ),
+            ),
         )
     }
 }

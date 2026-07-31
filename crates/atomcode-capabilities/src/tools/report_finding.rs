@@ -116,10 +116,16 @@ impl Tool for ReportFindingTool {
         }
         let priority = a.priority.trim().to_ascii_uppercase();
         if !PRIORITIES.contains(&priority.as_str()) {
-            return err(format!("report_finding: `priority` must be one of P0|P1|P2|P3 (got {:?}).", a.priority));
+            return err(format!(
+                "report_finding: `priority` must be one of P0|P1|P2|P3 (got {:?}).",
+                a.priority
+            ));
         }
         if !a.confidence.is_finite() || !(0.0..=1.0).contains(&a.confidence) {
-            return err(format!("report_finding: `confidence` must be in 0.0..=1.0 (got {}).", a.confidence));
+            return err(format!(
+                "report_finding: `confidence` must be in 0.0..=1.0 (got {}).",
+                a.confidence
+            ));
         }
         let line_end = a.line_end.unwrap_or(a.line_start).max(a.line_start);
 
@@ -140,7 +146,10 @@ impl Tool for ReportFindingTool {
         let loc = if finding.line_start == finding.line_end {
             format!("{}:{}", finding.file_path, finding.line_start)
         } else {
-            format!("{}:{}-{}", finding.file_path, finding.line_start, finding.line_end)
+            format!(
+                "{}:{}-{}",
+                finding.file_path, finding.line_start, finding.line_end
+            )
         };
         ok(format!(
             "Recorded {} finding ({:.2} confidence) at {} — {} ({total} total).",
@@ -159,6 +168,7 @@ mod tests {
             working_dir: std::path::PathBuf::from("."),
             cancel: CancellationToken::new(),
             progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
         }
     }
 
@@ -200,25 +210,46 @@ mod tests {
     async fn invalid_priority_and_confidence_error() {
         let t = ReportFindingTool::new();
         let bad_pri = t.execute(r#"{"title":"a","body":"b","priority":"high","confidence":0.5,"file_path":"f","line_start":1}"#, &ctx()).await;
-        assert!(bad_pri.is_error && bad_pri.content.contains("P0|P1|P2|P3"), "{}", bad_pri.content);
+        assert!(
+            bad_pri.is_error && bad_pri.content.contains("P0|P1|P2|P3"),
+            "{}",
+            bad_pri.content
+        );
         let bad_conf = t.execute(r#"{"title":"a","body":"b","priority":"P1","confidence":1.5,"file_path":"f","line_start":1}"#, &ctx()).await;
-        assert!(bad_conf.is_error && bad_conf.content.contains("0.0..=1.0"), "{}", bad_conf.content);
-        assert!(t.findings().is_empty(), "rejected findings are not recorded");
+        assert!(
+            bad_conf.is_error && bad_conf.content.contains("0.0..=1.0"),
+            "{}",
+            bad_conf.content
+        );
+        assert!(
+            t.findings().is_empty(),
+            "rejected findings are not recorded"
+        );
     }
 
     #[tokio::test]
     async fn empty_title_or_file_errors() {
         let t = ReportFindingTool::new();
         let r = t.execute(r#"{"title":"  ","body":"b","priority":"P1","confidence":0.5,"file_path":"f","line_start":1}"#, &ctx()).await;
-        assert!(r.is_error && r.content.contains("non-empty"), "{}", r.content);
+        assert!(
+            r.is_error && r.content.contains("non-empty"),
+            "{}",
+            r.content
+        );
     }
 
     #[test]
     fn finding_serializes() {
         let f = Finding {
-            title: "t".into(), body: "b".into(), priority: "P0".into(), confidence: 0.8,
-            file_path: "x.rs".into(), line_start: 1, line_end: 2,
-            suggestion: "fix it".into(), suggested_code: "let x = 1;".into(),
+            title: "t".into(),
+            body: "b".into(),
+            priority: "P0".into(),
+            confidence: 0.8,
+            file_path: "x.rs".into(),
+            line_start: 1,
+            line_end: 2,
+            suggestion: "fix it".into(),
+            suggested_code: "let x = 1;".into(),
         };
         let v = serde_json::to_value(&f).unwrap();
         assert_eq!(v["priority"], "P0");

@@ -6,7 +6,7 @@
 //! row. Any error (network, parse, non-matching format) silently returns
 //! `None` — this feature must never be noisy.
 
-use atomcode_core::self_update::{Manifest, MANIFEST_URL};
+use atomcode_updater::{Manifest, MANIFEST_URL};
 
 /// Compare a `latest.json` body against the current compiled-in version.
 ///
@@ -49,13 +49,34 @@ fn format_version(v: (u64, u64, u64)) -> String {
     format!("v{}.{}.{}", v.0, v.1, v.2)
 }
 
+/// Apply the process proxy policy to an async reqwest builder. Self-contained
+/// over the config leaf's proxy env machinery — mirrors the identical per-layer
+/// helpers in `atomcode-capabilities`/`atomcode-telemetry`.
+fn apply_async_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    atomcode_config::proxy::ensure_runtime_initialized();
+    let builder = if std::env::var(atomcode_config::proxy::MODE_ENV)
+        .ok()
+        .as_deref()
+        == Some(atomcode_config::proxy::ProxyMode::NoProxy.as_str())
+    {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    if atomcode_config::tls::env_forces_tls12() {
+        builder.max_tls_version(reqwest::tls::Version::TLS_1_2)
+    } else {
+        builder
+    }
+}
+
 /// Fetch `latest.json` and, if newer than `current`, return the advertised
 /// version. Short timeout keeps startup snappy; any error (network, HTTP,
 /// parse) returns `None` silently.
 pub async fn check_latest(current: &str) -> Option<String> {
-    let client = atomcode_core::proxy::apply_async_proxy_policy(reqwest::Client::builder())
+    let client = apply_async_proxy_policy(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(5))
-        .user_agent(atomcode_core::ATOMCODE_USER_AGENT)
+        .user_agent(atomcode_auth::ATOMCODE_USER_AGENT)
         .build()
         .ok()?;
     let resp = client.get(MANIFEST_URL).send().await.ok()?;
@@ -96,8 +117,8 @@ mod tests {
     #[test]
     fn newer_major_version_returns_some() {
         assert_eq!(
-            parse_and_compare("v4.15.3", &manifest_body("v5.0.0")),
-            Some("v5.0.0".to_string())
+            parse_and_compare("v4.15.3", &manifest_body("v5.0.3")),
+            Some("v5.0.3".to_string())
         );
     }
 

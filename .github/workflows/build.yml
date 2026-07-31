@@ -285,4 +285,4 @@ jobs:
         run: cargo build -p atomcode --features distro-pm
 
       - name: Test distro-pm gating
-        run: cargo test -p atomcode-core --lib --features distro-pm self_update::tests
+        run: cargo test -p atomcode-updater --lib --features distro-pm

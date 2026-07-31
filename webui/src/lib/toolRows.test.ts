@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { upsertToolPart, type MsgPart, type ToolRow } from './toolRows.ts';
+import { toolResultStatus, updateToolProgress, upsertToolPart, type MsgPart, type ToolRow } from './toolRows.ts';
 
 const tool = (id: string, over: Partial<ToolRow> = {}): ToolRow => ({
   id,
@@ -39,6 +39,14 @@ test('distinct tool ids each keep their own row (genuine repeat calls)', () => {
   assert.equal(parts.length, 2);
 });
 
+test('upsertToolPart replaces live progress instead of accumulating it', () => {
+  const first = updateToolProgress([{ kind: 'tool', tool: tool('a') }], 'a', 'round 1 · thinking');
+  const second = updateToolProgress(first, 'a', 'round 2 · read_file');
+  const current = second[0].kind === 'tool' ? second[0].tool : undefined;
+
+  assert.equal(current?.progress, 'round 2 · read_file');
+});
+
 test('non-tool parts and ordering are preserved', () => {
   const parts: MsgPart[] = [
     { kind: 'text', text: 'before' },
@@ -47,4 +55,8 @@ test('non-tool parts and ordering are preserved', () => {
   const next = upsertToolPart(parts, tool('a', { status: 'done' }));
   assert.equal(next.length, 2);
   assert.deepEqual(next[0], { kind: 'text', text: 'before' });
+});
+
+test('partial review result is incomplete rather than a clean success or generic failure', () => {
+  assert.equal(toolResultStatus(false, 'Code review incomplete (MaxRounds)'), 'incomplete');
 });

@@ -23,6 +23,41 @@ where
     }
 }
 
+/// Coerce a JSON value into a label list, tolerating every shape AtomGit/GitCode
+/// might send (the wire shape is unconfirmed — E2E is blocked): an array of
+/// strings, an array of `{ "name": "..." }` objects, `null`, or anything else.
+/// A non-array (or absent, via serde `default`) collapses to an empty list.
+///
+/// Presence of the *field* is a separate question from its contents — callers
+/// that must not clobber labels (see [`AtomgitClient::repo_labels`]) inspect the
+/// raw key themselves rather than relying on this lossy conversion.
+pub(crate) fn project_labels_from_json(v: &serde_json::Value) -> Vec<String> {
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|e| match e {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Object(o) => {
+                o.get("name").and_then(|n| n.as_str()).map(str::to_string)
+            }
+            _ => None,
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Tolerant deserializer for `project_labels`. Delegates to
+/// [`project_labels_from_json`] so the model path and the read-back path share
+/// one coercion. Absent (via serde `default`) → empty.
+fn de_project_labels<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(project_labels_from_json(&v))
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct User {
     #[serde(default)]
@@ -45,6 +80,8 @@ pub struct Repo {
     pub default_branch: String,
     #[serde(default)]
     pub owner: User,
+    #[serde(default, deserialize_with = "de_project_labels")]
+    pub project_labels: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -120,14 +157,38 @@ pub struct CreatedComment {
 }
 
 #[cfg(test)]
+mod label_shape_tests {
+    use super::Repo;
+    #[test]
+    fn project_labels_tolerates_all_wire_shapes() {
+        let strs: Repo =
+            serde_json::from_value(serde_json::json!({"name":"w","project_labels":["a","b"]}))
+                .unwrap();
+        assert_eq!(strs.project_labels, vec!["a".to_string(), "b".to_string()]);
+        let objs: Repo = serde_json::from_value(
+            serde_json::json!({"name":"w","project_labels":[{"name":"a"},{"name":"b"}]}),
+        )
+        .unwrap();
+        assert_eq!(objs.project_labels, vec!["a".to_string(), "b".to_string()]);
+        let nul: Repo =
+            serde_json::from_value(serde_json::json!({"name":"w","project_labels":null})).unwrap();
+        assert!(nul.project_labels.is_empty());
+        let absent: Repo = serde_json::from_value(serde_json::json!({"name":"w"})).unwrap();
+        assert!(absent.project_labels.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn pr_number_as_string_or_int() {
-        let a: PullRequest = serde_json::from_str(r#"{"number":"7","title":"t","state":"open"}"#).unwrap();
+        let a: PullRequest =
+            serde_json::from_str(r#"{"number":"7","title":"t","state":"open"}"#).unwrap();
         assert_eq!(a.number, 7);
-        let b: PullRequest = serde_json::from_str(r#"{"number":42,"title":"t","state":"open"}"#).unwrap();
+        let b: PullRequest =
+            serde_json::from_str(r#"{"number":42,"title":"t","state":"open"}"#).unwrap();
         assert_eq!(b.number, 42);
     }
 
@@ -140,10 +201,9 @@ mod tests {
         assert_eq!(r.owner.login, "o");
         assert!(r.private);
 
-        let pr: PullRequest = serde_json::from_str(
-            r#"{"number":1,"head":{"ref":"feat"},"base":{"ref":"main"}}"#,
-        )
-        .unwrap();
+        let pr: PullRequest =
+            serde_json::from_str(r#"{"number":1,"head":{"ref":"feat"},"base":{"ref":"main"}}"#)
+                .unwrap();
         assert_eq!(pr.head.ref_, "feat");
         assert_eq!(pr.base.ref_, "main");
     }

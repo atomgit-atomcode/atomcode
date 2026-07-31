@@ -68,12 +68,20 @@ pub struct ConformanceReport {
 
 impl ConformanceReport {
     pub fn new(seam: &'static str, subject: impl Into<String>) -> Self {
-        Self { seam, subject: subject.into(), checks: Vec::new() }
+        Self {
+            seam,
+            subject: subject.into(),
+            checks: Vec::new(),
+        }
     }
 
     /// Append a check outcome.
     pub fn record(&mut self, name: &'static str, passed: bool, detail: impl Into<String>) {
-        self.checks.push(CheckOutcome { name, passed, detail: detail.into() });
+        self.checks.push(CheckOutcome {
+            name,
+            passed,
+            detail: detail.into(),
+        });
     }
 
     /// True iff every recorded check passed.
@@ -92,8 +100,11 @@ impl ConformanceReport {
         if self.passed() {
             return;
         }
-        let lines: Vec<String> =
-            self.failures().iter().map(|c| format!("  ✗ {}: {}", c.name, c.detail)).collect();
+        let lines: Vec<String> = self
+            .failures()
+            .iter()
+            .map(|c| format!("  ✗ {}: {}", c.name, c.detail))
+            .collect();
         panic!(
             "{} conformance FAILED for `{}` ({} of {} checks failed):\n{}",
             self.seam,

@@ -11,7 +11,6 @@
 // daemon will attempt to re-attach to the parent console for stderr output.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-use atomcode_core::session::SessionManager;
 use atomcode_daemon::{run_server, ServerOpts};
 use atomcode_telemetry::{CliOverride, SessionMode};
 
@@ -110,6 +109,7 @@ fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode) {
 
     let mode = match client_mode.as_deref() {
         Some("vscode") => SessionMode::Vscode,
+        Some("jetbrains") => SessionMode::Jetbrains,
         Some("webui") => SessionMode::Webui,
         Some("atomcode-air") => SessionMode::AtomcodeAir,
         _ => SessionMode::Ide,
@@ -140,7 +140,7 @@ async fn main() {
     // Used by IDE packaging to reject a daemon compiled after the private
     // signer overlay was removed. Keep this check side-effect free.
     if std::env::args().any(|arg| arg == "--check-official-build") {
-        std::process::exit(if atomcode_core::coding_plan::signer_available() {
+        std::process::exit(if atomcode_capabilities::provider::signer_available() {
             0
         } else {
             1
@@ -149,7 +149,9 @@ async fn main() {
 
     // Ensure legacy sessions (macOS pre-v4.16 ~/Library/Application Support/atomcode/sessions)
     // are migrated to the canonical location ($ATOMCODE_HOME/sessions) before any handler reads it.
-    SessionManager::migrate_from_legacy();
+    if let Err(error) = atomcode_capabilities::session::SessionManager::migrate_from_legacy() {
+        tracing::warn!("[session] Failed to migrate legacy sessions: {error}");
+    }
 
     let (host, port, cli_override, idle_timeout_secs, startup_mode) = parse_daemon_args();
 
@@ -166,6 +168,8 @@ async fn main() {
         working_dir_override: None,
         // 独立二进制自行 bind host:port，不预绑定。
         prebound_listener: None,
+        // 独立 daemon 模式不需要 app user_id 校验。
+        app_user_id: None,
     })
     .await
     {

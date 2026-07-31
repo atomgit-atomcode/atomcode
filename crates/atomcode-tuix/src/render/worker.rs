@@ -39,7 +39,9 @@
 // explicit Shutdown gives clean "process the last queued line + flush"
 // semantics rather than "drop whatever is still in flight".
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -53,8 +55,6 @@ enum RenderCmd {
     /// Terminal resize — fire-and-forget, the worker updates its
     /// internal DECSTBM region and repaints the footer.
     Resize(u16, u16),
-    /// Remove the tail ApprovalPrompt body row (fire-and-forget).
-    PopApprovalPrompt,
     /// Scroll the body viewport by `delta` rows. Negative = up,
     /// positive = down. RetainedRenderer's append-only path leaves
     /// scrollback to the host terminal, so this is effectively a
@@ -106,6 +106,15 @@ enum AckOp {
 /// protocol is the same `UiLine` enum.
 pub struct TaskRenderer {
     cmd_tx: mpsc::Sender<RenderCmd>,
+    /// Coalesces the 5ms `FlushDeferred` heartbeat: `true` means one is already
+    /// queued and undrained, so we skip enqueuing another. Without this, when the
+    /// worker's terminal write blocks — classically the Windows console pausing
+    /// output in QuickEdit/mark-selection mode — the ~200/sec heartbeat piles
+    /// unbounded `FlushDeferred`s into the channel until allocation fails and the
+    /// `panic = "abort"` build fast-fails (Windows reports it as a "stack-based
+    /// buffer overrun"). A flush is idempotent, so collapsing redundant ones is
+    /// visually lossless — the single queued flush paints the latest state.
+    flush_pending: Arc<AtomicBool>,
     /// Join handle for the worker thread; `Some` until `Drop` takes it
     /// to `join()`.
     worker: Option<thread::JoinHandle<()>>,
@@ -117,12 +126,15 @@ impl TaskRenderer {
     /// renderer only via the returned facade.
     pub fn new(inner: Box<dyn Renderer>) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<RenderCmd>();
+        let flush_pending = Arc::new(AtomicBool::new(false));
+        let worker_flag = Arc::clone(&flush_pending);
         let worker = thread::Builder::new()
             .name("tuix-render".to_string())
-            .spawn(move || run_worker(inner, cmd_rx))
+            .spawn(move || run_worker(inner, cmd_rx, worker_flag))
             .expect("spawn render worker thread");
         Self {
             cmd_tx,
+            flush_pending,
             worker: Some(worker),
         }
     }
@@ -199,15 +211,16 @@ impl Renderer for TaskRenderer {
     }
 
     fn flush_deferred(&mut self) {
-        let _ = self.cmd_tx.send(RenderCmd::FlushDeferred);
+        // Only enqueue if none is already pending (coalesce the 5ms heartbeat).
+        // See `flush_pending` — prevents unbounded channel growth when the
+        // worker's write is stalled (Windows console pause).
+        if !self.flush_pending.swap(true, Ordering::AcqRel) {
+            let _ = self.cmd_tx.send(RenderCmd::FlushDeferred);
+        }
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16) {
         let _ = self.cmd_tx.send(RenderCmd::Resize(cols, rows));
-    }
-
-    fn pop_approval_prompt(&mut self) {
-        let _ = self.cmd_tx.send(RenderCmd::PopApprovalPrompt);
     }
 
     fn scroll_body(&mut self, delta: i32) {
@@ -251,7 +264,11 @@ impl Drop for TaskRenderer {
     }
 }
 
-fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
+fn run_worker(
+    mut inner: Box<dyn Renderer>,
+    cmd_rx: mpsc::Receiver<RenderCmd>,
+    flush_pending: Arc<AtomicBool>,
+) {
     use std::time::Instant;
     while let Ok(cmd) = cmd_rx.recv() {
         // Measure the wall-clock time each terminal I/O takes so the log
@@ -272,6 +289,10 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
                 crate::tuix_trace!("REN", "Flush flush={}µs", t0.elapsed().as_micros());
             }
             RenderCmd::FlushDeferred => {
+                // Clear the coalescing flag BEFORE flushing so any render that
+                // arrives during this (possibly slow / blocked) flush can queue a
+                // fresh FlushDeferred and repaint the latest state afterward.
+                flush_pending.store(false, Ordering::Release);
                 // Skip logging when it's a true no-op (no pending payload
                 // and window not elapsed). throttle.rs already logs when
                 // this path actually paints.
@@ -292,9 +313,6 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
                     rows,
                     t0.elapsed().as_micros()
                 );
-            }
-            RenderCmd::PopApprovalPrompt => {
-                inner.pop_approval_prompt();
             }
             RenderCmd::ScrollBody(delta) => {
                 inner.scroll_body(delta);
@@ -381,19 +399,19 @@ fn ui_line_tag(l: &UiLine) -> &'static str {
         UiLine::Welcome { .. } => "Welcome",
         UiLine::User(_) => "User",
         UiLine::UserWithAttachments { .. } => "UserWithAttachments",
-            UiLine::AssistantText(_) => "AssistantText",
-            UiLine::ReasoningText(_) => "ReasoningText",
-            UiLine::AssistantLineBreak => "AssistantLineBreak",
+        UiLine::AssistantText(_) => "AssistantText",
+        UiLine::ReasoningText(_) => "ReasoningText",
+        UiLine::AssistantLineBreak => "AssistantLineBreak",
         UiLine::ToolCall { .. } => "ToolCall",
-            UiLine::ToolCallInFlight { .. } => "ToolCallInFlight",
-            UiLine::ToolCallCommit { .. } => "ToolCallCommit",
-            UiLine::ToolGroupRender { .. } => "ToolGroupRender",
-            UiLine::ToolGroupChildUpdate { .. } => "ToolGroupChildUpdate",
-            UiLine::ToolGroupSummary { .. } => "ToolGroupSummary",
+        UiLine::ToolCallInFlight { .. } => "ToolCallInFlight",
+        UiLine::ToolCallCommit { .. } => "ToolCallCommit",
+        UiLine::ToolGroupRender { .. } => "ToolGroupRender",
+        UiLine::ToolGroupChildUpdate { .. } => "ToolGroupChildUpdate",
+        UiLine::ToolGroupSummary { .. } => "ToolGroupSummary",
         UiLine::ToolResult { .. } => "ToolResult",
         UiLine::DiffLine { .. } => "DiffLine",
         UiLine::DiffBlock(_) => "DiffBlock",
-        UiLine::ApprovalPrompt { .. } => "ApprovalPrompt",
+        UiLine::EditDiffBlock(_) => "EditDiffBlock",
         UiLine::Error(_) => "Error",
         UiLine::Warning(_) => "Warning",
         UiLine::Muted(_) => "Muted",
@@ -409,7 +427,7 @@ fn ui_line_tag(l: &UiLine) -> &'static str {
         UiLine::ImageAttachment(_) => "ImageAttachment",
         UiLine::VisionPreprocessSuccess { .. } => "VisionPreprocessSuccess",
         UiLine::TurnSeparator { .. } => "TurnSeparator",
-        UiLine::ModalOverlay { .. } => "ModalOverlay",
+        UiLine::DiffPanel { .. } => "DiffPanel",
         UiLine::ModalOverlayClear => "ModalOverlayClear",
     }
 }

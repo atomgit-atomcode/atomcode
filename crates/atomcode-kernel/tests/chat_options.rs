@@ -9,7 +9,7 @@
 
 use atomcode_kernel::agent::{Agent, AgentHandle};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
-use atomcode_kernel::provider::{ChatOptions, ReasoningEffort, ToolChoice};
+use atomcode_kernel::provider::{ChatOptions, RateLimitRetryOwner, ReasoningEffort, ToolChoice};
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::{EchoTool, RecordingProvider};
 use atomcode_kernel::tool::ToolRegistry;
@@ -22,7 +22,10 @@ const PERSONA: &str = "you are a neutral test agent";
 fn agent_handle(provider: Arc<RecordingProvider>, options: Option<ChatOptions>) -> AgentHandle {
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(EchoTool));
-    let mut builder = Agent::builder().provider(provider).tools(reg.mount(&["echo"])).persona(PERSONA);
+    let mut builder = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["echo"]))
+        .persona(PERSONA);
     if let Some(o) = options {
         builder = builder.chat_options(o);
     }
@@ -30,7 +33,13 @@ fn agent_handle(provider: Arc<RecordingProvider>, options: Option<ChatOptions>) 
 }
 
 async fn drive_one_turn(handle: &mut AgentHandle, text: &str) {
-    handle.commands.send(AgentCommand::SendMessage { text: text.into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: text.into(),
+            images: vec![],
+        })
+        .unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
             break;
@@ -53,6 +62,7 @@ async fn configured_chat_options_reach_the_provider() {
         max_tokens: Some(1000),
         tool_choice: ToolChoice::Required,
         temperature: Some(0.2),
+        rate_limit_retry_owner: RateLimitRetryOwner::Provider,
     };
 
     let mut handle = agent_handle(provider, Some(configured.clone()));
@@ -61,12 +71,15 @@ async fn configured_chat_options_reach_the_provider() {
     let _ = handle.task.await;
 
     let calls = calls.lock().unwrap();
-    assert!(!calls.is_empty(), "the turn must have made at least one chat_stream call");
-    // The provider received EXACTLY the configured options on its FIRST call.
-    assert_eq!(
-        calls[0].2, configured,
-        "the provider's first call must receive exactly the configured ChatOptions"
+    assert!(
+        !calls.is_empty(),
+        "the turn must have made at least one chat_stream call"
     );
+    // Request knobs are unchanged; the runtime-only 429 owner is overridden by
+    // the turn loop because it owns cancellation, countdowns, and terminal state.
+    let mut expected = configured;
+    expected.rate_limit_retry_owner = RateLimitRetryOwner::Kernel;
+    assert_eq!(calls[0].2, expected);
     // Spot-check each field for a clearer failure message if the whole-struct eq fails.
     assert_eq!(calls[0].2.reasoning_effort, Some(ReasoningEffort::High));
     assert_eq!(calls[0].2.max_tokens, Some(1000));
@@ -91,10 +104,14 @@ async fn default_agent_sends_neutral_options() {
     let _ = handle.task.await;
 
     let calls = calls.lock().unwrap();
-    assert!(!calls.is_empty(), "the turn must have made at least one chat_stream call");
+    assert!(
+        !calls.is_empty(),
+        "the turn must have made at least one chat_stream call"
+    );
+    let mut expected = ChatOptions::default();
+    expected.rate_limit_retry_owner = RateLimitRetryOwner::Kernel;
     assert_eq!(
-        calls[0].2,
-        ChatOptions::default(),
-        "an agent built without chat_options must send a NEUTRAL ChatOptions::default()"
+        calls[0].2, expected,
+        "an agent built without chat_options must keep neutral model knobs"
     );
 }

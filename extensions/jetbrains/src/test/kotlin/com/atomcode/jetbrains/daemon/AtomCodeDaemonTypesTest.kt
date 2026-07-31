@@ -4,6 +4,18 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 
 class AtomCodeDaemonTypesTest {
+    @Test
+    fun `approval modes keep canonical order display names and wire values`() {
+        assertEquals(
+            listOf(
+                Triple(ApprovalMode.Build, "Build", "build"),
+                Triple(ApprovalMode.AcceptEdits, "Accept Edits", "accept_edits"),
+                Triple(ApprovalMode.Auto, "Auto", "bypass"),
+                Triple(ApprovalMode.Plan, "Plan", "plan"),
+            ),
+            ApprovalMode.values().map { Triple(it, it.toString(), it.wire) },
+        )
+    }
 
     @Test
     fun `ProviderInfo toString with default provider`() {
@@ -75,5 +87,16 @@ class AtomCodeDaemonTypesTest {
     fun `SessionMeta toString uses id prefix when name blank`() {
         val meta = SessionMeta(id = "abcdefghij", name = "", projectHash = "hash1", updatedAt = 1000L, messageCount = 3)
         assertEquals("abcdefgh (3)", meta.toString())
+    }
+
+    @Test
+    fun `MessageInfo preserves internal origin`() {
+        val info = MessageInfo(
+            role = "assistant",
+            content = "No verification is needed.",
+            internalOrigin = "verify_cadence",
+        )
+
+        assertEquals("verify_cadence", info.internalOrigin)
     }
 }

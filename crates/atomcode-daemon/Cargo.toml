@@ -12,11 +12,19 @@ path = "src/lib.rs"
 name = "atomcode-daemon"
 path = "src/main.rs"
 
+[features]
+default = []
+codingplan-crypto = ["atomcode-auth/codingplan-crypto"]
+
 [dependencies]
-atomcode-core = { path = "../atomcode-core" }
-# Engine v2: drive the new stack behind the legacy command/event protocol. The
-# daemon's live turns can run on it via KernelTurnExecutor ($ATOMCODE_ENGINE=v2).
-atomcode-bridge = { path = "../atomcode-bridge" }
+atomcode-codingplan = { path = "../atomcode-codingplan" }
+# Config system used directly by the daemon.
+atomcode-config = { path = "../atomcode-config" }
+atomcode-auth = { path = "../atomcode-auth" }
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["plugin", "mcp", "atomgit"] }
+# Unified native runtime used by daemon live/chat/session paths.
+atomcode-kernel = { path = "../atomcode-kernel" }
+atomcode-coding = { path = "../atomcode-coding", features = ["atomgit"] }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 
 # HTTP
@@ -38,7 +46,6 @@ mime_guess = "2"
 async-trait = "0.1"
 
 # Utils
-dirs = "5"
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 tokio-util = "0.7"
@@ -50,6 +57,15 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 [dev-dependencies]
 atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] }
+# Redirect ATOMCODE_HOME to a throwaway temp dir before any test runs (via a
+# #[ctor] in the lib's #[cfg(test)] module) so tests never persist into the
+# developer's real ~/.atomcode.
+atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
+# test-util unlocks reset_offline_verdict_for_test / seed_offline_verdict for
+# the daemon parity test (offline block in build_api_system_prompt).
+atomcode-config = { path = "../atomcode-config", features = ["test-util"] }
+serial_test = "3"
+ctor = "0.2"
 tempfile = "3"
 
 [target.'cfg(target_os = "windows")'.dependencies]

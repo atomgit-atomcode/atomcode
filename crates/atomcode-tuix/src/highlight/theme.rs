@@ -28,7 +28,37 @@ static MODE: AtomicU8 = AtomicU8::new(MODE_DARK);
 /// Switch the palette. Idempotent. Call once during startup before the
 /// first markdown / highlight emission.
 pub fn set_theme_mode(light: bool) {
-    MODE.store(if light { MODE_LIGHT } else { MODE_DARK }, Ordering::Relaxed);
+    MODE.store(
+        if light { MODE_LIGHT } else { MODE_DARK },
+        Ordering::Relaxed,
+    );
+}
+
+#[cfg(test)]
+pub fn test_lock() -> ThemeTestGuard {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let guard = LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    ThemeTestGuard {
+        original: MODE.load(Ordering::Relaxed),
+        _guard: guard,
+    }
+}
+
+#[cfg(test)]
+pub struct ThemeTestGuard {
+    original: u8,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for ThemeTestGuard {
+    fn drop(&mut self) {
+        MODE.store(self.original, Ordering::Relaxed);
+    }
 }
 
 #[inline]
@@ -68,18 +98,28 @@ pub const RESET: &str = "\x1b[0m";
 /// on white in most light-theme terminal profiles; blue still maps to a
 /// dark, readable variant on light profiles.
 pub fn md_heading_open() -> &'static str {
-    if is_light() { "\x1b[1;34m" } else { "\x1b[1;96m" }
+    if is_light() {
+        "\x1b[1;34m"
+    } else {
+        "\x1b[1;96m"
+    }
 }
 
 /// Close heading: bold off + fg default (SGR 22;39). Theme-invariant.
 pub const MD_HEADING_CLOSE: &str = "\x1b[22;39m";
 
-/// Inline code.
-/// `dark`: bold + bright cyan (matches headings).
-/// `light`: bold + standard magenta (SGR 1;35) — distinct from headings,
-/// terminal profiles map 35 to a dark magenta that's readable on white.
+/// Inline code — NOT bold. Bold + bright cyan made every `` `code` `` span in
+/// dense prose flare (and rendered harshly on terminals that don't soften
+/// bright cyan); weight is reserved for `**bold**`. Color alone marks it as
+/// code, calmly and consistently across terminals.
+/// `dark`: bright cyan (matches headings, minus the bold).
+/// `light`: standard magenta (SGR 35) — distinct from headings, readable on white.
 pub fn md_inline_code_open() -> &'static str {
-    if is_light() { "\x1b[1;35m" } else { "\x1b[1;96m" }
+    if is_light() {
+        "\x1b[35m"
+    } else {
+        "\x1b[96m"
+    }
 }
 
 /// Close inline code: bold off + fg default. Theme-invariant.
@@ -110,31 +150,27 @@ pub const MD_MUTED_CLOSE: &str = "\x1b[39m";
 /// maps SGR 37 → `Color::Grey`; close with [`MD_MUTED_CLOSE`] (SGR 39,
 /// reset fg) on both themes.
 pub fn md_border_open() -> &'static str {
-    if is_light() { "\x1b[90m" } else { "\x1b[37m" }
+    if is_light() {
+        "\x1b[90m"
+    } else {
+        "\x1b[37m"
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Guard around theme-switching tests so they don't race each other
-    // (the static `MODE` is per-process). Each test takes the lock,
-    // switches, asserts, switches back.
-    static THEME_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_dark<F: FnOnce()>(f: F) {
-        let _g = THEME_LOCK.lock().unwrap();
+        let _g = test_lock();
         set_theme_mode(false);
         f();
-        set_theme_mode(false); // restore default
     }
 
     fn with_light<F: FnOnce()>(f: F) {
-        let _g = THEME_LOCK.lock().unwrap();
+        let _g = test_lock();
         set_theme_mode(true);
         f();
-        set_theme_mode(false); // restore default
     }
 
     #[test]
@@ -158,8 +194,8 @@ mod tests {
     }
 
     #[test]
-    fn dark_md_inline_code_is_bold_bright_cyan() {
-        with_dark(|| assert_eq!(md_inline_code_open(), "\x1b[1;96m"));
+    fn dark_md_inline_code_is_bright_cyan_not_bold() {
+        with_dark(|| assert_eq!(md_inline_code_open(), "\x1b[96m"));
     }
 
     #[test]
@@ -179,8 +215,8 @@ mod tests {
     }
 
     #[test]
-    fn light_md_inline_code_is_bold_magenta() {
-        with_light(|| assert_eq!(md_inline_code_open(), "\x1b[1;35m"));
+    fn light_md_inline_code_is_magenta_not_bold() {
+        with_light(|| assert_eq!(md_inline_code_open(), "\x1b[35m"));
     }
 
     #[test]

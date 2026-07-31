@@ -51,14 +51,58 @@ pub struct TurnCtx {
 /// to the user. Mirrors the spec's `RATE_LIMIT_AUTO_WAIT_SECS`.
 pub const RATE_LIMIT_AUTO_WAIT_SECS: u64 = 120;
 
-/// What the kernel knows about a 429 at the moment it fires. The kernel cannot
-/// see CodingPlan usage windows (that lives in `atomcode-core`, off-limits here)
-/// so this carries only its own best-effort signal: the status and any
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContinuationKind {
+    Generic,
+    VerifyCadence,
+    TruncationResume,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContinuationVisibility {
+    Normal,
+    InternalControl,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Continuation {
+    pub text: String,
+    pub kind: ContinuationKind,
+    pub visibility: ContinuationVisibility,
+}
+
+impl Continuation {
+    pub fn generic(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: ContinuationKind::Generic,
+            visibility: ContinuationVisibility::Normal,
+        }
+    }
+
+    pub fn verify_cadence(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: ContinuationKind::VerifyCadence,
+            visibility: ContinuationVisibility::InternalControl,
+        }
+    }
+}
+
+/// What the kernel knows about a 429 at the moment it fires. CodingPlan usage is
+/// product-layer state outside the neutral kernel, so this carries only the
+/// kernel's best-effort signal: the status and any
 /// `Retry-After`-style seconds parsed from the error text.
 #[derive(Debug, Clone)]
 pub struct RateLimitHint {
     pub http_status: Option<u16>,
     pub retry_after_secs: Option<u64>,
+    /// True when the provider explicitly reports a non-transient account or
+    /// billing condition. Such a 429 must never enter an automatic retry loop.
+    pub terminal: bool,
+    /// One-based consecutive 429 incident attempt for this turn. The kernel owns
+    /// this counter so provider-local retries cannot multiply the fallback wait.
+    pub attempt: u32,
 }
 
 /// The host's verdict on a 429. `WaitAndRetry` => kernel sleeps (cancellably)
@@ -66,7 +110,9 @@ pub struct RateLimitHint {
 /// turn cleanly (no red error), preserving already-produced content.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RateLimitDecision {
-    WaitAndRetry { secs: u64 },
+    WaitAndRetry {
+        secs: u64,
+    },
     Pause {
         reset_at_display: String,
         reset_label: String,
@@ -79,8 +125,35 @@ impl RateLimitDecision {
     /// or usage data unavailable): wait only if the kernel's own hint says the
     /// reset is imminent, otherwise pause with whatever little we know.
     pub fn from_hint(hint: &RateLimitHint) -> Self {
+        let jitter = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| (d.subsec_nanos() as f64) / 1_000_000_000.0)
+            .unwrap_or(0.5);
+        Self::from_hint_with_jitter(hint, jitter)
+    }
+
+    /// Deterministic variant used by tests and hosts that inject their own
+    /// randomness. `jitter` is clamped to `0..=1`; fallback delays vary ±25%.
+    pub fn from_hint_with_jitter(hint: &RateLimitHint, jitter: f64) -> Self {
+        if hint.terminal {
+            return RateLimitDecision::Pause {
+                reset_at_display: String::new(),
+                reset_label: String::new(),
+                secs_until_reset: hint.retry_after_secs,
+            };
+        }
         match hint.retry_after_secs {
-            Some(s) if s <= RATE_LIMIT_AUTO_WAIT_SECS => RateLimitDecision::WaitAndRetry { secs: s },
+            Some(s) if s <= RATE_LIMIT_AUTO_WAIT_SECS => {
+                RateLimitDecision::WaitAndRetry { secs: s }
+            }
+            None => {
+                let shift = hint.attempt.saturating_sub(1).min(4);
+                let base = 3u64 << shift;
+                let factor = 0.75 + 0.5 * jitter.clamp(0.0, 1.0);
+                RateLimitDecision::WaitAndRetry {
+                    secs: ((base as f64) * factor).round().max(1.0) as u64,
+                }
+            }
             _ => RateLimitDecision::Pause {
                 reset_at_display: String::new(),
                 reset_label: String::new(),
@@ -195,6 +268,12 @@ pub trait LifecycleHooks: Send + Sync {
     /// inject a follow-up USER message and CONTINUE; `None` to complete. Read-only.
     async fn offer_continuation(&self, _convo: &Conversation) -> Option<String> {
         None
+    }
+
+    async fn offer_typed_continuation(&self, convo: &Conversation) -> Option<Continuation> {
+        self.offer_continuation(convo)
+            .await
+            .map(Continuation::generic)
     }
 
     /// A turn has TERMINATED — fired EXACTLY ONCE per turn on EVERY terminal path
@@ -355,6 +434,17 @@ impl LifecycleHooks for HookChain {
         continuation
     }
 
+    async fn offer_typed_continuation(&self, convo: &Conversation) -> Option<Continuation> {
+        let mut continuation = None;
+        for h in &self.hooks {
+            let r = h.offer_typed_continuation(convo).await;
+            if continuation.is_none() {
+                continuation = r;
+            }
+        }
+        continuation
+    }
+
     async fn turn_complete(&self, convo: &Conversation, reason: &StopReason, ctx: &TurnCtx) {
         for h in &self.hooks {
             h.turn_complete(convo, reason, ctx).await;
@@ -391,10 +481,17 @@ mod tests {
     async fn empty_hookchain_is_noop() {
         let chain = HookChain::new(vec![]);
         let mut text = "hi".to_string();
-        assert!(chain.user_prompt_submit(&mut text).await.is_ok(), "empty chain must not block");
+        assert!(
+            chain.user_prompt_submit(&mut text).await.is_ok(),
+            "empty chain must not block"
+        );
         assert_eq!(text, "hi", "empty chain must not mutate the prompt");
         let convo = Conversation::new();
-        assert_eq!(chain.offer_continuation(&convo).await, None, "empty chain offer_continuation must be None");
+        assert_eq!(
+            chain.offer_continuation(&convo).await,
+            None,
+            "empty chain offer_continuation must be None"
+        );
     }
 
     #[test]
@@ -402,22 +499,80 @@ mod tests {
         let d = RateLimitDecision::from_hint(&RateLimitHint {
             http_status: Some(429),
             retry_after_secs: Some(45),
+            terminal: false,
+            attempt: 1,
         });
         assert_eq!(d, RateLimitDecision::WaitAndRetry { secs: 45 });
     }
 
     #[test]
-    fn from_hint_pauses_when_reset_far_or_unknown() {
+    fn from_hint_pauses_when_reset_far_but_retries_unknown() {
         let far = RateLimitDecision::from_hint(&RateLimitHint {
             http_status: Some(429),
             retry_after_secs: Some(600),
+            terminal: false,
+            attempt: 1,
         });
         assert!(matches!(far, RateLimitDecision::Pause { .. }));
         let unknown = RateLimitDecision::from_hint(&RateLimitHint {
             http_status: Some(429),
             retry_after_secs: None,
+            terminal: false,
+            attempt: 1,
         });
-        assert!(matches!(unknown, RateLimitDecision::Pause { .. }));
+        assert!(matches!(
+            unknown,
+            RateLimitDecision::WaitAndRetry { secs: 2..=4 }
+        ));
+    }
+
+    #[test]
+    fn missing_retry_after_uses_bounded_incident_backoff() {
+        for (attempt, secs) in [(1, 3), (2, 6), (3, 12), (4, 24), (5, 48), (6, 48)] {
+            assert_eq!(
+                RateLimitDecision::from_hint_with_jitter(
+                    &RateLimitHint {
+                        http_status: Some(429),
+                        retry_after_secs: None,
+                        terminal: false,
+                        attempt,
+                    },
+                    0.5
+                ),
+                RateLimitDecision::WaitAndRetry { secs },
+            );
+        }
+    }
+
+    #[test]
+    fn missing_retry_after_jitter_stays_within_quarter_window() {
+        let hint = RateLimitHint {
+            http_status: Some(429),
+            retry_after_secs: None,
+            terminal: false,
+            attempt: 3,
+        };
+        assert_eq!(
+            RateLimitDecision::from_hint_with_jitter(&hint, 0.0),
+            RateLimitDecision::WaitAndRetry { secs: 9 }
+        );
+        assert_eq!(
+            RateLimitDecision::from_hint_with_jitter(&hint, 1.0),
+            RateLimitDecision::WaitAndRetry { secs: 15 }
+        );
+    }
+
+    #[test]
+    fn terminal_rate_limit_never_retries() {
+        assert!(matches!(
+            RateLimitDecision::from_hint(&RateLimitHint {
+                http_status: Some(429),
+                retry_after_secs: None,
+                terminal: true,
+                attempt: 1,
+            }),
+            RateLimitDecision::Pause { .. }
+        ));
     }
 
     #[tokio::test]
@@ -425,7 +580,36 @@ mod tests {
         struct Bare;
         #[async_trait::async_trait]
         impl LifecycleHooks for Bare {}
-        let hint = RateLimitHint { http_status: Some(429), retry_after_secs: Some(10) };
+        let hint = RateLimitHint {
+            http_status: Some(429),
+            retry_after_secs: Some(10),
+            terminal: false,
+            attempt: 1,
+        };
         assert!(Bare.on_rate_limit(&hint).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn offer_typed_continuation_wraps_legacy_text_as_generic_visible() {
+        struct Legacy;
+
+        #[async_trait::async_trait]
+        impl LifecycleHooks for Legacy {
+            async fn offer_continuation(&self, _convo: &Conversation) -> Option<String> {
+                Some("continue".to_string())
+            }
+        }
+
+        let got = Legacy
+            .offer_typed_continuation(&Conversation::default())
+            .await;
+        assert_eq!(
+            got,
+            Some(Continuation {
+                text: "continue".to_string(),
+                kind: ContinuationKind::Generic,
+                visibility: ContinuationVisibility::Normal,
+            })
+        );
     }
 }

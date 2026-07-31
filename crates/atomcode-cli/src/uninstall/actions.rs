@@ -300,7 +300,7 @@ impl SelfDeleteStrategy for PlatformSelfDelete {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
 
         // Rename live exe to .atomcode.rolling so the install dir can be deleted.
-        let rolling = atomcode_core::self_update::rolling_path(exe);
+        let rolling = atomcode_updater::rolling_path(exe);
         if exe.file_name() != rolling.file_name() {
             let _ = std::fs::rename(exe, &rolling);
         }
@@ -314,10 +314,7 @@ impl SelfDeleteStrategy for PlatformSelfDelete {
         // reported in gitcode.com/atomgit_atomcode/atomcode/issues/352.
         // CREATE_NO_WINDOW prevents the console window from appearing at all
         // (DETACHED_PROCESS does NOT reliably hide the window on Win10).
-        let cmd_arg = format!(
-            "timeout /t 2 /nobreak >nul & rmdir /S /Q \"{}\"",
-            dir_str
-        );
+        let cmd_arg = format!("timeout /t 2 /nobreak >nul & rmdir /S /Q \"{}\"", dir_str);
         Command::new("cmd")
             .args(["/C", &cmd_arg])
             .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)

@@ -52,11 +52,16 @@ class SseParser {
         val json = data.jsonObjectOrNull() ?: return ChatEvent.Unknown("invalid_json")
         val type = json.string("type") ?: return ChatEvent.Unknown("missing")
         return when (type) {
+            "runtime_info" -> ChatEvent.RuntimeInfo(
+                json.string("provider").orEmpty(),
+                json.string("model").orEmpty(),
+            )
             "text" -> ChatEvent.Text(json.string("content").orEmpty())
             "reasoning" -> ChatEvent.Reasoning(json.string("content").orEmpty())
             "tool_batch" -> ChatEvent.ToolBatch(data)
             "tool_start" -> ChatEvent.ToolStart(json.string("id"), json.string("name").orEmpty(), json.string("arguments").orEmpty())
             "tool_output" -> ChatEvent.ToolOutput(json.string("chunk").orEmpty())
+            "tool_progress" -> ChatEvent.ToolProgress(json.string("id"), json.string("progress").orEmpty())
             "tool_result" -> ChatEvent.ToolResult(
                 json.string("id"),
                 json.string("name").orEmpty(),

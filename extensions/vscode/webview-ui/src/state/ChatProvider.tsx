@@ -1,8 +1,9 @@
 import React, { createContext, useContext, useReducer, useEffect, useCallback, useRef } from 'react';
-import { ChatState, ChatAction, ExtensionMessage, ImageData } from './types';
+import { ChatState, ChatAction, ExtensionMessage, ImageData, ApprovalMode } from './types';
 import { chatReducer, initialState } from './reducer';
 import { postMessage, getVSCodeApi } from '../vscode';
 import { createTranslator } from '../i18n';
+import { shouldShowIdleNotice } from '../utils/streamStatus';
 
 // ─── Context ────────────────────────────────────────────────────
 
@@ -14,6 +15,7 @@ interface ChatContextValue {
   newConversation: () => void;
   selectModel: (provider: string, model?: string) => void;
   selectReasoningEffort: (provider: string, effort: string | null) => void;
+  selectApprovalMode: (mode: ApprovalMode) => void;
   loadSession: (sessionId: string, projectHash?: string) => void;
   openSidebar: () => void;
   openSessionInTab: (sessionId?: string, projectHash?: string) => void;
@@ -42,23 +44,49 @@ let _toolIdCounter = 0;
 export function ChatProvider({ children }: { children: React.ReactNode }) {
   const [state, dispatch] = useReducer(chatReducer, initialState);
   const stateRef = useRef(state);
+  const lastStreamEventAtRef = useRef(Date.now());
+  const idleNoticeShownRef = useRef(false);
   stateRef.current = state;
 
   // ── Bridge: extension host -> reducer ──
   useEffect(() => {
     function handleMessage(event: MessageEvent<ExtensionMessage>) {
       const msg = event.data;
+      const markStreamActivity = () => {
+        lastStreamEventAtRef.current = Date.now();
+        idleNoticeShownRef.current = false;
+      };
       switch (msg.type) {
+        case 'chromeFont': {
+          // Live-apply a chat-font config change without reloading the webview. Edit the SAME
+          // `<style id="atomcode-chat-font">` rule the HTML injects (a stylesheet rule), so
+          // clearing (`null`) truly reverts to the CSS default (`--vscode-editor-font-family`) —
+          // an inline `documentElement.style.removeProperty` could not clear a stylesheet rule.
+          // `msg.value` is already sanitized provider-side (see resolveChatFontFamily).
+          let styleEl = document.getElementById('atomcode-chat-font');
+          if (!styleEl) {
+            styleEl = document.createElement('style');
+            styleEl.id = 'atomcode-chat-font';
+            document.head.appendChild(styleEl);
+          }
+          styleEl.textContent = msg.value
+            ? `:root{--app-monospace-font-family:${msg.value};}`
+            : '';
+          break;
+        }
         case 'init':
           dispatch({
             type: 'INIT',
             generating: msg.generating,
+            recoveryLocked: msg.recoveryLocked,
             currentModel: msg.currentModel,
             viewMode: msg.viewMode,
             activeSessionId: msg.activeSessionId,
             projectHash: msg.projectHash,
             isSessionList: msg.isSessionList,
             locale: msg.locale,
+            approvalMode: msg.approvalMode,
+            approvalModePending: msg.approvalModePending,
           });
           // Persist session binding so tabs survive VS Code restart
           if (msg.activeSessionId) {
@@ -71,19 +99,26 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
         case 'queuedMessageSent':
           dispatch({ type: 'SEND_QUEUED_MESSAGE', id: msg.id });
           break;
+        case 'clearQueuedMessages':
+          dispatch({ type: 'CLEAR_QUEUED_MESSAGES' });
+          break;
         case 'assistantMessage':
           dispatch({ type: 'ADD_ASSISTANT_MESSAGE', text: msg.text });
           break;
         case 'generationStarted':
+          markStreamActivity();
           dispatch({ type: 'START_GENERATION' });
           break;
         case 'text':
+          markStreamActivity();
           dispatch({ type: 'APPEND_TEXT', content: msg.content });
           break;
         case 'toolBatchStart':
+          markStreamActivity();
           dispatch({ type: 'TOOL_BATCH_START', calls: msg.calls });
           break;
         case 'toolStart':
+          markStreamActivity();
           dispatch({
             type: 'TOOL_START',
             id: msg.id || `tool-${++_toolIdCounter}`,
@@ -91,7 +126,12 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
             args: msg.args,
           });
           break;
+        case 'toolProgress':
+          markStreamActivity();
+          dispatch({ type: 'TOOL_PROGRESS', id: msg.id, progress: msg.progress });
+          break;
         case 'toolResult':
+          markStreamActivity();
           // Match tool by ID if provided, otherwise find the latest running tool
           {
             const msgs = stateRef.current.messages;
@@ -111,7 +151,22 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
             }
           }
           break;
+        case 'warning':
+          markStreamActivity();
+          dispatch({ type: 'STREAM_WARNING', message: msg.message });
+          break;
+        case 'rateLimited':
+          markStreamActivity();
+          dispatch({
+            type: 'STREAM_RATE_LIMITED',
+            message: msg.message,
+            retryAfterSeconds: msg.retryAfterSeconds,
+            attempt: msg.attempt,
+            maxAttempts: msg.maxAttempts,
+          });
+          break;
         case 'artifactStart':
+          markStreamActivity();
           dispatch({
             type: 'ARTIFACT_START',
             id: msg.id,
@@ -121,15 +176,29 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           });
           break;
         case 'artifactContent':
+          markStreamActivity();
           dispatch({ type: 'ARTIFACT_CONTENT', id: msg.id, content: msg.content });
           break;
         case 'artifactEnd':
+          markStreamActivity();
           dispatch({ type: 'ARTIFACT_END', id: msg.id });
           break;
         case 'tokens':
+          markStreamActivity();
           dispatch({ type: 'SET_TOKENS', prompt: msg.prompt, completion: msg.completion, total: msg.total });
           break;
         case 'done':
+          markStreamActivity();
+          if (msg.stopReason && msg.stopReason !== 'stopped') {
+            const detail = msg.message || createTranslator(stateRef.current.locale)(
+              'stream.incomplete',
+              { reason: msg.stopReason },
+            );
+            dispatch({
+              type: 'STREAM_WARNING',
+              message: detail,
+            });
+          }
           dispatch({ type: 'GENERATION_DONE', tokens: msg.tokens });
           if (msg.sessionId) {
             dispatch({ type: 'SET_ACTIVE_SESSION', sessionId: msg.sessionId });
@@ -137,15 +206,24 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           break;
         case 'stopped':
         case 'generationStopped':
+          markStreamActivity();
           dispatch({ type: 'GENERATION_STOPPED' });
           break;
         case 'error':
+          markStreamActivity();
           dispatch({ type: 'GENERATION_ERROR', message: msg.message });
+          break;
+        case 'recoveryRequired':
+          dispatch({ type: 'RECOVERY_REQUIRED' });
+          break;
+        case 'recoveryCleared':
+          dispatch({ type: 'RECOVERY_CLEARED' });
           break;
         case 'clearChat':
           dispatch({ type: 'CLEAR_CHAT' });
           break;
         case 'resumeStreaming':
+          markStreamActivity();
           dispatch({ type: 'RESUME_STREAMING' });
           break;
         case 'sessions':
@@ -153,12 +231,19 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           break;
         case 'sessionSelected':
           dispatch({ type: 'SET_ACTIVE_SESSION', sessionId: msg.sessionId, projectHash: msg.projectHash });
+          getVSCodeApi().setState({ sessionId: msg.sessionId, projectHash: msg.projectHash });
           break;
         case 'models':
           dispatch({ type: 'SET_MODELS', models: msg.models });
           break;
+        case 'approvalMode':
+          dispatch({ type: 'SET_APPROVAL_MODE', mode: msg.mode, pending: msg.pending });
+          break;
         case 'providers':
           dispatch({ type: 'SET_PROVIDERS', providers: msg.providers, defaultProvider: msg.defaultProvider });
+          break;
+        case 'runtimeInfo':
+          dispatch({ type: 'SET_CURRENT_PROVIDER', provider: msg.provider, model: msg.model });
           break;
         case 'authStatus':
           dispatch({ type: 'SET_AUTH', auth: msg.auth });
@@ -195,7 +280,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           dispatch({ type: 'SET_SETUP_STATUS', error: msg.message });
           break;
         case 'sessionMessages':
-          dispatch({ type: 'LOAD_SESSION_MESSAGES', messages: msg.messages });
+          dispatch({ type: 'LOAD_SESSION_MESSAGES', messages: msg.messages, terminal: msg.terminal });
           break;
         case 'context':
           dispatch({
@@ -212,12 +297,23 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           });
           break;
         case 'permissionRequest':
+          markStreamActivity();
           dispatch({
             type: 'PERMISSION_REQUEST',
             id: msg.id,
+            sessionId: msg.sessionId,
             toolName: msg.toolName,
+            reason: msg.reason,
             args: msg.args,
             isDestructive: msg.isDestructive,
+          });
+          break;
+        case 'permissionResponseResult':
+          dispatch({
+            type: 'PERMISSION_RESPONSE_RESULT',
+            id: msg.id,
+            success: msg.success,
+            message: msg.message,
           });
           break;
         case 'focusInput':
@@ -233,10 +329,34 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     return () => window.removeEventListener('message', handleMessage);
   }, []);
 
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      if (!shouldShowIdleNotice({
+        isGenerating: stateRef.current.isGenerating,
+        lastEventAt: lastStreamEventAtRef.current,
+        now,
+        thresholdMs: 15_000,
+        alreadyShown: idleNoticeShownRef.current,
+      })) {
+        return;
+      }
+
+      idleNoticeShownRef.current = true;
+      dispatch({
+        type: 'STREAM_IDLE_NOTICE',
+        message: createTranslator(stateRef.current.locale)('stream.idleNotice'),
+      });
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, []);
+
   // ── Outbound actions ──
   const send = useCallback(
     (text: string, images?: ImageData[]) => {
       const state = stateRef.current;
+      if (state.approvalModePending || state.recoveryLocked) return;
       const ctx = state.contextFiles.length > 0
         ? state.contextFiles.map((f) => ({
             path: f.path,
@@ -263,6 +383,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
         images,
         clientMessageId: isQueued ? clientMessageId : undefined,
         sessionId: state.activeSessionId,
+        approvalMode: state.approvalMode,
       });
       // Clear context after sending
       dispatch({ type: 'CLEAR_CONTEXT' });
@@ -271,7 +392,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
   );
 
   const stop = useCallback(() => {
-    postMessage({ type: 'stop' });
+    postMessage({ type: 'stop', sessionId: stateRef.current.activeSessionId });
   }, []);
 
   const newConversation = useCallback(() => {
@@ -286,6 +407,11 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
   const selectReasoningEffort = useCallback((provider: string, effort: string | null) => {
     dispatch({ type: 'SET_REASONING_EFFORT', provider, effort });
     postMessage({ type: 'selectReasoningEffort', provider, effort });
+  }, []);
+
+  const selectApprovalMode = useCallback((mode: ApprovalMode) => {
+    if (stateRef.current.approvalModePending) return;
+    postMessage({ type: 'selectApprovalMode', mode });
   }, []);
 
   const loadSession = useCallback((sessionId: string, projectHash?: string) => {
@@ -358,6 +484,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     newConversation,
     selectModel,
     selectReasoningEffort,
+    selectApprovalMode,
     loadSession,
     openSessionInTab,
     renameSession,

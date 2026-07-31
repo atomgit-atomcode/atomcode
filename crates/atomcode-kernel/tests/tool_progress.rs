@@ -27,7 +27,12 @@ impl Tool for ProgressTool {
     async fn execute(&self, _args: &str, ctx: &ToolContext) -> ToolResult {
         ctx.progress.emit("step 1");
         ctx.progress.emit("step 2");
-        ToolResult { call_id: String::new(), content: "done".into(), is_error: false, images: vec![] }
+        ToolResult {
+            call_id: String::new(),
+            content: "done".into(),
+            is_error: false,
+            images: vec![],
+        }
     }
 }
 
@@ -37,14 +42,31 @@ async fn tool_progress_reaches_the_driver_tagged_with_call_id() {
     reg.register(Arc::new(ProgressTool));
     let provider = Arc::new(MockProvider::new(vec![
         vec![
-            StreamEvent::ToolCall(ToolCall { id: "call-7".into(), name: "prog".into(), arguments: "{}".into() }),
+            StreamEvent::ToolCall(ToolCall {
+                id: "call-7".into(),
+                name: "prog".into(),
+                arguments: "{}".into(),
+            }),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("ok".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("ok".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
-    let mut handle = Agent::builder().provider(provider).tools(reg.mount(&["prog"])).build().spawn();
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["prog"]))
+        .build()
+        .spawn();
 
-    handle.commands.send(AgentCommand::SendMessage { text: "go".into(), images: vec![] }).unwrap();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
 
     let mut progress = Vec::new();
     while let Some(ev) = handle.events.recv().await {

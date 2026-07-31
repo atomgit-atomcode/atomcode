@@ -200,7 +200,7 @@ impl Drop for ReaderHandle {
         let _ = self.cmd_tx.send((ReaderCommand::Shutdown, None));
         if self.focus_tracking_enabled {
             let _ = execute!(std::io::stdout(), DisableFocusChange);
-            atomcode_core::notify::set_terminal_focus_state(None);
+            atomcode_capabilities::notify::set_terminal_focus_state(None);
         }
         // Let the thread finish on its own — we don't join here because
         // the reader may be blocked inside `event::poll` for up to 100ms
@@ -221,7 +221,7 @@ pub fn spawn(tx: mpsc::UnboundedSender<InputEvent>) -> ReaderHandle {
     let focus_tracking_enabled = terminal_supports_focus_tracking();
     if focus_tracking_enabled {
         let _ = execute!(std::io::stdout(), EnableFocusChange);
-        atomcode_core::notify::set_terminal_focus_state(Some(true));
+        atomcode_capabilities::notify::set_terminal_focus_state(Some(true));
     }
     let (cmd_tx, cmd_rx) = stdmpsc::channel::<(ReaderCommand, Option<stdmpsc::Sender<()>>)>();
     let join = std::thread::spawn(move || run(tx, cmd_rx));
@@ -488,11 +488,11 @@ fn run(
                         None => continue,
                     },
                     Event::FocusGained => {
-                        atomcode_core::notify::set_terminal_focus_state(Some(true));
+                        atomcode_capabilities::notify::set_terminal_focus_state(Some(true));
                         continue;
                     }
                     Event::FocusLost => {
-                        atomcode_core::notify::set_terminal_focus_state(Some(false));
+                        atomcode_capabilities::notify::set_terminal_focus_state(Some(false));
                         continue;
                     }
                 };
@@ -566,11 +566,11 @@ fn run(
                 None => continue,
             },
             Event::FocusGained => {
-                atomcode_core::notify::set_terminal_focus_state(Some(true));
+                atomcode_capabilities::notify::set_terminal_focus_state(Some(true));
                 continue;
             }
             Event::FocusLost => {
-                atomcode_core::notify::set_terminal_focus_state(Some(false));
+                atomcode_capabilities::notify::set_terminal_focus_state(Some(false));
                 continue;
             }
         };
@@ -586,7 +586,13 @@ fn mouse_input_event(m: crossterm::event::MouseEvent) -> Option<InputEvent> {
     // tick can arrive as `Moved` or another variant we silently drop,
     // and without this top-of-function trace there's no way to tell
     // "no mouse events arriving" from "events arriving but ignored".
-    crate::tuix_trace!("RD", "mouse kind={:?} col={} row={}", m.kind, m.column, m.row);
+    crate::tuix_trace!(
+        "RD",
+        "mouse kind={:?} col={} row={}",
+        m.kind,
+        m.column,
+        m.row
+    );
     match m.kind {
         crossterm::event::MouseEventKind::ScrollUp => {
             crate::tuix_trace!("RD", "mouse scroll up");
@@ -611,11 +617,11 @@ fn to_input_event(ev: Event) -> Option<InputEvent> {
         Event::Resize(w, h) => Some(InputEvent::Resize(w, h)),
         Event::Mouse(m) => mouse_input_event(m),
         Event::FocusGained => {
-            atomcode_core::notify::set_terminal_focus_state(Some(true));
+            atomcode_capabilities::notify::set_terminal_focus_state(Some(true));
             None
         }
         Event::FocusLost => {
-            atomcode_core::notify::set_terminal_focus_state(Some(false));
+            atomcode_capabilities::notify::set_terminal_focus_state(Some(false));
             None
         }
     }
@@ -669,8 +675,7 @@ mod tests {
             Event::Paste("d\ne\n".to_string()),
         ]
         .into_iter();
-        let (out, trailing) =
-            coalesce_paste("a\n".to_string(), 1 << 20, || chunks.next());
+        let (out, trailing) = coalesce_paste("a\n".to_string(), 1 << 20, || chunks.next());
         assert_eq!(out, "a\nb\nc\nd\ne\n");
         assert!(trailing.is_none());
     }
@@ -686,8 +691,7 @@ mod tests {
             Event::Paste("never".to_string()),
         ]
         .into_iter();
-        let (out, trailing) =
-            coalesce_paste("start".to_string(), 1 << 20, || evs.next());
+        let (out, trailing) = coalesce_paste("start".to_string(), 1 << 20, || evs.next());
         assert_eq!(out, "startmore");
         assert!(matches!(trailing, Some(Event::Key(_))));
     }
@@ -906,7 +910,9 @@ mod tests {
     fn text_with_newline_burst_is_paste() {
         assert!(is_paste_burst(&['h', 'i', '\n']));
         assert!(is_paste_burst(&['\n', 'h', 'i']));
-        assert!(is_paste_burst(&['l', 'i', 'n', 'e', '1', '\n', 'l', 'i', 'n', 'e', '2']));
+        assert!(is_paste_burst(&[
+            'l', 'i', 'n', 'e', '1', '\n', 'l', 'i', 'n', 'e', '2'
+        ]));
     }
 
     /// Bursts without any newline fall through to per-key handling
@@ -926,7 +932,9 @@ mod tests {
     fn ime_commit_storm_is_not_paste() {
         // Real-world reproduction from the user screenshot: typing
         // `首页中的` via IME emits `首 \n 页 \n 中 \n 的 \n`.
-        assert!(!is_paste_burst(&['首', '\n', '页', '\n', '中', '\n', '的', '\n']));
+        assert!(!is_paste_burst(&[
+            '首', '\n', '页', '\n', '中', '\n', '的', '\n'
+        ]));
         // Bare CJK without trailing newline — same shape, also rejected.
         assert!(!is_paste_burst(&['首', '\n', '页', '\n', '中']));
         // ASCII char-per-line bursts also caught (rare keyboard

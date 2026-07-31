@@ -2,6 +2,8 @@ package com.atomcode.jetbrains.services
 
 import com.atomcode.jetbrains.daemon.AtomCodeDaemonClient
 import com.atomcode.jetbrains.daemon.AtomCodeDaemonProcess
+import com.atomcode.jetbrains.daemon.ApprovalMode
+import com.atomcode.jetbrains.daemon.AuthStatusResponse
 import com.atomcode.jetbrains.daemon.ChatEvent
 import com.atomcode.jetbrains.daemon.ChatRequest
 import com.atomcode.jetbrains.daemon.ChatStreamListener
@@ -15,6 +17,7 @@ import com.atomcode.jetbrains.daemon.MessageInfo
 import com.atomcode.jetbrains.daemon.ModelInfo
 import com.atomcode.jetbrains.daemon.PatchProviderRequest
 import com.atomcode.jetbrains.daemon.PatchThinkingRequest
+import com.atomcode.jetbrains.daemon.ProviderInfo
 import com.atomcode.jetbrains.daemon.SessionDetail
 import com.atomcode.jetbrains.daemon.SessionMeta
 import com.atomcode.jetbrains.daemon.SetupSnapshot
@@ -44,6 +47,78 @@ private const val DAEMON_STARTUP_RETRY_DELAY_MS = 150L
 private const val BACKGROUND_HEALTH_INITIAL_DELAY_SECONDS = 5L
 private const val BACKGROUND_HEALTH_INTERVAL_SECONDS = 30L
 
+internal fun providerSetupRequired(
+    providers: List<ProviderInfo>,
+    defaultProvider: String,
+    auth: AuthStatusResponse?,
+): Boolean {
+    if (providers.isEmpty()) return true
+    val selected = providers.firstOrNull { it.name == defaultProvider }
+        ?: providers.firstOrNull { it.isDefault }
+    val authUnavailable = auth?.loggedIn != true || auth.expired
+    // Older daemons do not expose requires_login. Keep the previous
+    // fail-closed behaviour until both sides speak the new protocol.
+    return selected?.requiresLogin?.let { it && authUnavailable } ?: authUnavailable
+}
+
+internal class ApprovalModeRuntimeState(initialMode: ApprovalMode = ApprovalMode.Build) {
+    @Volatile
+    var confirmedMode: ApprovalMode = initialMode
+        private set
+
+    @Volatile
+    var displayMode: ApprovalMode = initialMode
+        private set
+
+    @Volatile
+    var pendingMode: ApprovalMode? = null
+        private set
+
+    @Synchronized
+    fun beginSwitch(mode: ApprovalMode): Boolean {
+        if (pendingMode != null || displayMode == mode) return false
+        displayMode = mode
+        pendingMode = mode
+        return true
+    }
+
+    @Synchronized
+    fun completeSwitch(requested: ApprovalMode, responseMode: String): ApprovalMode {
+        if (pendingMode != requested) return displayMode
+        val applied = parseApprovalMode(responseMode, confirmedMode)
+        confirmedMode = applied
+        displayMode = applied
+        pendingMode = null
+        return displayMode
+    }
+
+    @Synchronized
+    fun failSwitch(requested: ApprovalMode): ApprovalMode {
+        if (pendingMode != requested) return displayMode
+        displayMode = confirmedMode
+        pendingMode = null
+        return displayMode
+    }
+
+    @Synchronized
+    fun refreshFromDaemon(responseMode: String): ApprovalMode {
+        if (pendingMode != null) return displayMode
+        val applied = parseApprovalMode(responseMode, confirmedMode)
+        confirmedMode = applied
+        displayMode = applied
+        return displayMode
+    }
+
+    private fun parseApprovalMode(wire: String, fallback: ApprovalMode): ApprovalMode =
+        when (wire) {
+            ApprovalMode.AcceptEdits.wire -> ApprovalMode.AcceptEdits
+            ApprovalMode.Auto.wire -> ApprovalMode.Auto
+            ApprovalMode.Plan.wire -> ApprovalMode.Plan
+            ApprovalMode.Build.wire -> ApprovalMode.Build
+            else -> fallback
+        }
+}
+
 @Service(Service.Level.PROJECT)
 class AtomCodeProjectService(private val project: Project) : Disposable {
     private val changes = PropertyChangeSupport(this)
@@ -63,6 +138,17 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
 
     @Volatile
     private var activeSessionWorkingDir: String? = null
+
+    private val approvalModeState = ApprovalModeRuntimeState()
+
+    val approvalMode: ApprovalMode
+        get() = approvalModeState.displayMode
+
+    val confirmedApprovalMode: ApprovalMode
+        get() = approvalModeState.confirmedMode
+
+    val approvalModePending: Boolean
+        get() = approvalModeState.pendingMode != null
 
     val fileChangeService = FileChangeService(project)
 
@@ -253,12 +339,31 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
         }.thenApply { Unit }
     }
 
+    fun setApprovalMode(mode: ApprovalMode): CompletableFuture<ApprovalMode> {
+        if (!approvalModeState.beginSwitch(mode)) {
+            return CompletableFuture.completedFuture(approvalModeState.displayMode)
+        }
+        val client = activeClient
+        if (client == null) {
+            return CompletableFuture.completedFuture(approvalModeState.completeSwitch(mode, mode.wire))
+        }
+        return client.setApprovalMode(mode).handle { response, error ->
+            if (error == null) {
+                approvalModeState.completeSwitch(mode, response.mode)
+            } else {
+                approvalModeState.failSwitch(mode)
+            }
+            approvalModeState.displayMode
+        }
+    }
+
     fun sendPrompt(
         prompt: String,
         session: SessionRefView?,
         listener: ChatStreamListener,
         provider: String? = null,
         images: List<ImageInput> = emptyList(),
+        approvalMode: ApprovalMode? = null,
         onSessionReady: (SessionRefView) -> Unit,
     ): CompletableFuture<SessionRefView> {
         return saveDocumentsBeforePrompt().thenCompose {
@@ -267,7 +372,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
             if (state !is ConnectionState.Ready) {
                 CompletableFuture.failedFuture(IllegalStateException("AtomCode is not connected."))
             } else {
-                sendPromptWhenReady(prompt, state.projectPath, session, listener, onSessionReady, provider, images)
+                sendPromptWhenReady(prompt, state.projectPath, session, listener, onSessionReady, provider, images, approvalMode)
             }
         }.whenComplete { _, error ->
             if (error != null) {
@@ -451,7 +556,11 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
                         models = models,
                         defaultProvider = defaultProvider,
                         currentModel = currentModel,
-                        setupRequired = auth?.loggedIn != true || providers?.providers.isNullOrEmpty(),
+                        setupRequired = providerSetupRequired(
+                            providers = providers?.providers.orEmpty(),
+                            defaultProvider = defaultProvider,
+                            auth = auth,
+                        ),
                     )
                 }
             }
@@ -463,10 +572,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
                 CompletableFuture.failedFuture(IllegalStateException("AtomCode is not connected."))
             } else {
                 val client = getOrCreateClient()
-                client.startLogin(true).thenCompose { start ->
-                    onStatus("Opened browser for AtomGit sign-in.")
-                    pollLoginUntilAuthorized(client, start.loginId, start.expiresInSeconds, onStatus)
-                }.thenCompose {
+                AtomCodeLoginCoordinator.getInstance().login(client, onStatus).thenCompose {
                     loadSetupSnapshot()
                 }
             }
@@ -547,45 +653,14 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
             }
     }
 
-    private fun pollLoginUntilAuthorized(
-        client: AtomCodeDaemonClient,
-        loginId: String,
-        expiresInSeconds: Int,
-        onStatus: (String) -> Unit,
-    ): CompletableFuture<Unit> {
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(expiresInSeconds.coerceAtLeast(30).toLong())
-        fun poll(): CompletableFuture<Unit> {
-            return client.pollLogin(loginId).thenCompose { result ->
-                when (result.status) {
-                    "authorized" -> {
-                        onStatus("Signed in${result.userName?.let { " as $it" } ?: ""}.")
-                        CompletableFuture.completedFuture(Unit)
-                    }
-                    "pending" -> {
-                        if (System.nanoTime() >= deadline) {
-                            client.cancelLogin(loginId)
-                            CompletableFuture.failedFuture(IllegalStateException("Login timed out."))
-                        } else {
-                            onStatus("Waiting for browser authorization...")
-                            CompletableFuture.supplyAsync(
-                                { Unit },
-                                CompletableFuture.delayedExecutor(2, TimeUnit.SECONDS),
-                            ).thenCompose { poll() }
-                        }
-                    }
-                    else -> CompletableFuture.failedFuture(IllegalStateException("Unexpected login status: ${result.status}"))
-                }
-            }
-        }
-        return poll()
-    }
-
     private fun syncProjectDirectory(client: AtomCodeDaemonClient, version: String): CompletableFuture<ConnectionState> {
         val basePath = project.basePath
         if (basePath.isNullOrBlank()) {
             activeClient = client
-            setConnectionState(ConnectionState.Ready(version, ""))
-            return CompletableFuture.completedFuture(connectionState)
+            return refreshApprovalMode(client).thenApply {
+                setConnectionState(ConnectionState.Ready(version, ""))
+                connectionState
+            }
         }
 
         setConnectionState(ConnectionState.SyncingProject)
@@ -596,9 +671,22 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
                 }
                 activeClient = client
                 setConnectionState(ConnectionState.CheckingProvider)
-                setConnectionState(ConnectionState.Ready(version, response.currentDir))
-                connectionState
+                response.currentDir
             }
+            .thenCompose { currentDir ->
+                refreshApprovalMode(client).thenApply {
+                    setConnectionState(ConnectionState.Ready(version, currentDir))
+                    connectionState
+                }
+            }
+    }
+
+    private fun refreshApprovalMode(client: AtomCodeDaemonClient): CompletableFuture<Unit> {
+        return client.getApprovalMode().handle { response, _ ->
+            if (response == null) return@handle Unit
+            approvalModeState.refreshFromDaemon(response.mode)
+            Unit
+        }
     }
 
     private fun sendPromptWhenReady(
@@ -609,6 +697,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
         onSessionReady: (SessionRefView) -> Unit,
         provider: String?,
         images: List<ImageInput>,
+        approvalMode: ApprovalMode?,
     ): CompletableFuture<SessionRefView> {
         val client = getOrCreateClient()
         val workingDir = projectPath.ifBlank { project.basePath.orEmpty() }
@@ -626,6 +715,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
                 sessionId = sessionRef.id,
                 provider = provider,
                 images = images,
+                approvalMode = (approvalMode ?: this.confirmedApprovalMode).wire,
             )
 
             client.streamChat(request) { event ->

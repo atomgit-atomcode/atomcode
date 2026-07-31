@@ -18,7 +18,7 @@
 
 use std::time::Duration;
 
-use atomcode_core::config::Config;
+use atomcode_config::config::Config;
 
 /// Warnings the monitor can raise, displayed right-aligned on the
 /// status row below the input box.
@@ -59,27 +59,25 @@ impl CodingPlanWarning {
 ///   * slow enough that every user message doesn't burn an API round-trip
 pub const CHECK_COOLDOWN: Duration = Duration::from_secs(3600);
 
-/// Prefix that marks a provider as CodingPlan-managed (matches the
-/// wipe logic in `coding_plan::setup::is_codingplan_provider_name`).
-const PROVIDER_PREFIX: &str = "AtomGit";
-
-/// True iff the given provider key is owned by the CodingPlan flow.
-/// Matches `AtomGit` (single-model case) or `AtomGit-<anything>`
-/// (multi-model case); rejects `AtomGitPlus` / `atomgit` / etc.
+/// True iff the given selection id is owned by the CodingPlan flow. Delegates to
+/// the single source of truth in `atomcode-config` (matches `AtomGit` and
+/// `AtomGit-<anything>`; rejects `AtomGitPlus` / `atomgit` / etc.).
 pub fn is_codingplan_provider(name: &str) -> bool {
-    name == PROVIDER_PREFIX || name.starts_with(&format!("{}-", PROVIDER_PREFIX))
+    atomcode_config::config::is_codingplan_provider_name(name)
 }
 
-/// Collect the model names from every `AtomGit*` provider in the config.
-/// Order follows HashMap iteration (unstable), so the caller should
-/// never compare lists positionally — `decide_warning` sorts both
-/// sides.
+/// Collect the model names of every CodingPlan model in the config, via the
+/// unified catalog so it covers both the new `provider_accounts`+`models`
+/// schema (what `/login` now writes) and un-migrated legacy `[providers.*]`
+/// (which the projection folds under an `AtomGit*` account). Order follows
+/// HashMap iteration (unstable), so the caller must never compare lists
+/// positionally — `decide_warning` sorts both sides.
 pub fn local_atomgit_models(config: &Config) -> Vec<String> {
     config
-        .providers
-        .iter()
-        .filter(|(k, _)| is_codingplan_provider(k))
-        .map(|(_, p)| p.model.clone())
+        .logical_models()
+        .into_values()
+        .filter(|m| is_codingplan_provider(&m.account))
+        .map(|m| m.model)
         .collect()
 }
 
@@ -132,7 +130,7 @@ pub fn decide_warning(
 /// `is_codingplan_provider(default_provider)`; do that up front so
 /// non-CodingPlan users never trigger any network I/O.
 pub fn spawn_check(
-    config_snapshot: atomcode_core::config::Config,
+    config_snapshot: atomcode_config::config::Config,
     default_model: String,
     slot: std::sync::Arc<std::sync::Mutex<Option<CodingPlanWarning>>>,
     wake_tx: tokio::sync::mpsc::Sender<()>,
@@ -141,8 +139,7 @@ pub fn spawn_check(
         // Blocking HTTP client lives in a spawn_blocking thread so we
         // don't stall the tokio runtime's worker pool.
         let fetch: Result<Vec<String>, ()> = tokio::task::spawn_blocking(move || {
-            let client =
-                atomcode_core::coding_plan::client::Client::from_stored_auth().map_err(|_| ())?;
+            let client = atomcode_codingplan::client::Client::from_stored_auth().map_err(|_| ())?;
             // Query with the user's ACTUAL tier, not `Max`. `plan_available` is
             // computed relative to the requested `plan_type` (see `ModelEntry`
             // docs): a Lite user querying `Max` gets higher-tier models (e.g.
@@ -159,7 +156,7 @@ pub fn spawn_check(
                 .status_v2()
                 .ok()
                 .and_then(|s| s.codingplan_free)
-                .and_then(|p| atomcode_core::coding_plan::PlanType::from_plan_name(&p.plan_name))
+                .and_then(|p| atomcode_codingplan::PlanType::from_plan_name(&p.plan_name))
                 .ok_or(())?;
             let models = client.list_models_v2(plan_type).map_err(|_| ())?;
             Ok(models
@@ -214,6 +211,41 @@ mod tests {
         assert!(!is_codingplan_provider("AtomGitPlus"));
         assert!(!is_codingplan_provider("atomgit"));
         assert!(!is_codingplan_provider("claude"));
+    }
+
+    #[test]
+    fn local_atomgit_models_reads_new_schema_and_folded_legacy() {
+        use atomcode_config::config::Config;
+        // New schema (what /login now writes): models under an AtomGit account,
+        // plus one unrelated user model that must NOT be counted.
+        let new_cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "AtomGit": { "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1" },
+                "mine": { "provider": "openai", "base_url": "https://api.openai.com/v1" }
+            },
+            "models": {
+                "AtomGit-GLM-5.2": { "account": "AtomGit", "model": "GLM-5.2", "context_window": 64000 },
+                "AtomGit-Qwen": { "account": "AtomGit", "model": "Qwen", "context_window": 64000 },
+                "my/own": { "account": "mine", "model": "gpt-4", "context_window": 128000 }
+            }
+        }))
+        .unwrap();
+        let mut got = local_atomgit_models(&new_cfg);
+        got.sort();
+        assert_eq!(
+            got,
+            s(&["GLM-5.2", "Qwen"]),
+            "only AtomGit-account models, not the user's"
+        );
+
+        // Un-migrated legacy flat providers still work via the projection fold.
+        let legacy_cfg: Config = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "AtomGit-GLM-5.2": { "type": "openai", "base_url": "https://llm-api.atomgit.com/v1", "model": "GLM-5.2", "context_window": 64000 }
+            }
+        }))
+        .unwrap();
+        assert_eq!(local_atomgit_models(&legacy_cfg), s(&["GLM-5.2"]));
     }
 
     #[test]

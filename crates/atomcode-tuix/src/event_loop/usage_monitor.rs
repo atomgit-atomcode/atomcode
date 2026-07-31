@@ -18,7 +18,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use atomcode_core::coding_plan::types::UsageInfo;
+use atomcode_codingplan::types::UsageInfo;
 use tokio::sync::mpsc;
 
 use crate::render::HintSeverity;
@@ -44,8 +44,7 @@ pub fn spawn_check(slot: Arc<Mutex<Option<UsageInfo>>>, wake_tx: mpsc::Sender<()
         // Blocking client lives on a spawn_blocking thread so the tokio
         // runtime worker pool stays free. Mirrors `monitor::spawn_check`.
         let fetched: Result<UsageInfo, ()> = tokio::task::spawn_blocking(|| {
-            let client = atomcode_core::coding_plan::client::Client::from_stored_auth()
-                .map_err(|_| ())?;
+            let client = atomcode_codingplan::client::Client::from_stored_auth().map_err(|_| ())?;
             let resp = client.status_v2().map_err(|_| ())?;
             resp.current_usage.ok_or(())
         })

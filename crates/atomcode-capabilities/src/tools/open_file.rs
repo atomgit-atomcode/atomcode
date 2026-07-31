@@ -1,9 +1,10 @@
-//! `open_file` — launch a local file in the user's default GUI application (browser for
-//! HTML, viewer for PDF / image / SVG, …). A thin cross-platform wrapper that picks the
-//! right opener by OS + environment (`open` / `xdg-open` / `cmd start` / `wslview`).
-//! Headless / SSH / CI sessions can't show a window, so it REFUSES with a human-readable
-//! reason (and the file path) instead of pretending a window opened. Launching a GUI is a
-//! user-visible side effect ⇒ always `Risky`. Neutral port of the production tool.
+//! `open_file` — launch a local file **or URL** in the user's default GUI application
+//! (browser for HTML/URL, viewer for PDF / image / SVG, …). A thin cross-platform wrapper
+//! that picks the right opener by OS + environment (`open` / `xdg-open` / `cmd start` /
+//! `wslview`). Headless / SSH / CI sessions can't show a window, so it REFUSES with a
+//! human-readable reason (and the file path) instead of pretending a window opened.
+//! Launching a GUI is a user-visible side effect ⇒ always `Risky`. Neutral port of the
+//! production tool.
 
 use super::{err, ok, resolve_path};
 use async_trait::async_trait;
@@ -70,8 +71,12 @@ fn pick_open_strategy() -> OpenStrategy {
             // below fails with a clear message + the path for manual viewing.
             return OpenStrategy::Wslview;
         }
-        let has_display = std::env::var("DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
-            || std::env::var("WAYLAND_DISPLAY").map(|v| !v.is_empty()).unwrap_or(false);
+        let has_display = std::env::var("DISPLAY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+            || std::env::var("WAYLAND_DISPLAY")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
         if !has_display {
             return OpenStrategy::Headless(
                 "no graphical session ($DISPLAY and $WAYLAND_DISPLAY both empty — likely a \
@@ -105,7 +110,10 @@ fn ci_signal() -> Option<String> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn is_wsl() -> bool {
-    if std::env::var("WSL_DISTRO_NAME").map(|s| !s.is_empty()).unwrap_or(false) {
+    if std::env::var("WSL_DISTRO_NAME")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
         return true;
     }
     std::fs::read_to_string("/proc/version")
@@ -129,20 +137,21 @@ impl Tool for OpenFileTool {
         "open_file"
     }
     fn description(&self) -> &str {
-        "Open a local file or directory in the user's default GUI application — a browser \
-         for HTML, an image viewer for PNG/JPG, a PDF reader for PDF, or the OS file \
-         manager for directories. USE ONLY when the user asks to preview/open/view a file \
-         or directory, or when previewing is the obvious next step AND you have asked \
-         first — do NOT auto-open after every write_file/edit_file. Prefer this tool over \
-         shelling out to `open`, `xdg-open`, `start`, or `wslview`. Cross-platform \
-         dispatch is built in; headless / SSH / CI sessions refuse with a clear reason so \
-         you can give the user the path instead of pretending a window opened."
+        "Open a local file, directory, or URL in the user's default GUI application — a browser \
+         for HTML/URLs, an image viewer for PNG/JPG, a PDF reader for PDF, or the OS file \
+         manager for directories. Supports http:// and https:// URLs (opens in the default \
+         browser). USE ONLY when the user asks to preview/open/view a file or directory, or \
+         when previewing is the obvious next step AND you have asked first — do NOT auto-open \
+         after every write_file/edit_file. Prefer this tool over shelling out to `open`, \
+         `xdg-open`, `start`, or `wslview`. Cross-platform dispatch is built in; headless / SSH \
+         / CI sessions refuse with a clear reason so you can give the user the path instead of \
+         pretending a window opened."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "file_path": { "type": "string", "description": "File or directory path to open. Absolute, or relative to the working directory. Must exist." }
+                "file_path": { "type": "string", "description": "File or directory path to open, or an http:// / https:// URL. Absolute, or relative to the working directory. Must exist (for file paths)." }
             },
             "required": ["file_path"]
         })
@@ -153,12 +162,31 @@ impl Tool for OpenFileTool {
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let a: Args = match serde_json::from_str(args) {
             Ok(a) => a,
-            Err(e) => return err(format!("open_file: invalid arguments: {e}. Expected {{\"file_path\":\"<path>\"}}.")),
+            Err(e) => {
+                return err(format!(
+                    "open_file: invalid arguments: {e}. Expected {{\"file_path\":\"<path>\"}}."
+                ))
+            }
         };
-        let target = resolve_path(&a.file_path, &ctx.working_dir);
-        let target = std::fs::canonicalize(&target).unwrap_or(target);
+
+        // URL support: http:// / https:// URLs are opened directly in the browser,
+        // skipping path resolution and file existence checks.
+        // Scheme is case-insensitive per RFC 3986, so we check the lowercased form.
+        let fp = a.file_path.trim();
+        let lower = fp.to_ascii_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            return open_url(fp).await;
+        }
+
+        let target = resolve_path(fp, &ctx.working_dir);
+        // Strip the Windows `\\?\` verbatim prefix: `cmd /c start` / Explorer don't
+        // accept extended-length paths, and it would leak into the messages below.
+        let target = crate::pathnorm::canonicalize(&target).unwrap_or(target);
         if !target.exists() {
-            return err(format!("open_file: file not found: {}", target.display()));
+            return err(format!(
+                "open_file: file not found: {}",
+                crate::pathnorm::to_display(&target)
+            ));
         }
 
         let strategy = pick_open_strategy();
@@ -187,7 +215,7 @@ impl Tool for OpenFileTool {
             OpenStrategy::Headless(reason) => {
                 return err(format!(
                     "open_file: cannot open in GUI: {reason}.\n\nFile path for manual viewing:\n  {}",
-                    target.display()
+                    crate::pathnorm::to_display(&target)
                 ));
             }
         };
@@ -202,13 +230,67 @@ impl Tool for OpenFileTool {
         // spawned from a console-less daemon; the GUI app it hands off to is unaffected.
         crate::process_utils::suppress_console_window_sync(&mut cmd);
         match cmd.spawn() {
-            Ok(_child) => ok(format!("Opened {} via `{}`.", target.display(), strategy_command_name(&strategy))),
+            Ok(_child) => ok(format!(
+                "Opened {} via `{}`.",
+                crate::pathnorm::to_display(&target),
+                strategy_command_name(&strategy)
+            )),
             Err(e) => err(format!(
                 "open_file: failed to launch `{}`: {e}.\n\nFile path for manual viewing:\n  {}",
                 strategy_command_name(&strategy),
-                target.display()
+                crate::pathnorm::to_display(&target)
             )),
         }
+    }
+}
+
+/// Open a URL in the default browser. Skips file-path resolution entirely.
+async fn open_url(url: &str) -> ToolResult {
+    let strategy = pick_open_strategy();
+    let mut cmd = match &strategy {
+        OpenStrategy::MacOpen => {
+            let mut c = Command::new("open");
+            c.arg(url);
+            c
+        }
+        OpenStrategy::XdgOpen => {
+            let mut c = Command::new("xdg-open");
+            c.arg(url);
+            c
+        }
+        OpenStrategy::WindowsStart => {
+            // Use explorer.exe directly to avoid cmd.exe shell metacharacter issues.
+            // cmd /c start would interpret &, |, %, ^ in URLs as shell operators,
+            // causing truncation of query strings or potential command injection.
+            // explorer.exe uses ShellExecute internally and handles URLs safely.
+            let mut c = Command::new("explorer");
+            c.arg(url);
+            c
+        }
+        OpenStrategy::Wslview => {
+            let mut c = Command::new("wslview");
+            c.arg(url);
+            c
+        }
+        OpenStrategy::Headless(reason) => {
+            return err(format!(
+                "open_file: cannot open URL in GUI: {reason}.\n\nURL for manual access:\n  {url}",
+            ));
+        }
+    };
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    crate::process_utils::suppress_console_window_sync(&mut cmd);
+    match cmd.spawn() {
+        Ok(_child) => ok(format!(
+            "Opened URL `{url}` via `{}`.",
+            strategy_command_name(&strategy)
+        )),
+        Err(e) => err(format!(
+            "open_file: failed to launch `{}` to open URL: {e}.\n\nURL for manual access:\n  {url}",
+            strategy_command_name(&strategy),
+        )),
     }
 }
 
@@ -249,7 +331,9 @@ impl OpenFileWorkspaceGate {
     /// Gate over a FIXED workspace root — for assemblies that pin an immutable working dir
     /// (no shared cwd handle to follow).
     pub fn pinned(root: PathBuf) -> Self {
-        Self { cwd: Arc::new(RwLock::new(root)) }
+        Self {
+            cwd: Arc::new(RwLock::new(root)),
+        }
     }
 
     /// True iff `args` names an `open_file` target that canonicalizes to a path inside
@@ -260,6 +344,14 @@ impl OpenFileWorkspaceGate {
         let Ok(parsed) = serde_json::from_str::<Args>(args) else {
             return false;
         };
+        // URLs are always treated as "in workspace" so they get auto-approved
+        // (opening a URL is no more dangerous than opening an in-workspace file).
+        let fp = parsed.file_path.trim();
+        if fp.to_ascii_lowercase().starts_with("http://")
+            || fp.to_ascii_lowercase().starts_with("https://")
+        {
+            return true;
+        }
         let Ok(root) = std::fs::canonicalize(working_dir) else {
             return false;
         };
@@ -273,7 +365,12 @@ impl OpenFileWorkspaceGate {
 
 #[async_trait]
 impl ToolMiddleware for OpenFileWorkspaceGate {
-    async fn before(&self, call: &mut ToolCall, tool: &Arc<dyn Tool>, _rt: &RequestCtx) -> BeforeOutcome {
+    async fn before(
+        &self,
+        call: &mut ToolCall,
+        tool: &Arc<dyn Tool>,
+        _rt: &RequestCtx,
+    ) -> BeforeOutcome {
         if tool.name() != "open_file" {
             return BeforeOutcome::Proceed;
         }
@@ -296,7 +393,9 @@ impl ToolMiddleware for OpenFileWorkspaceGate {
             .await
         };
         if in_workspace {
-            BeforeOutcome::Allow { reason: Some("open_file target is inside the workspace".into()) }
+            BeforeOutcome::Allow {
+                reason: Some("open_file target is inside the workspace".into()),
+            }
         } else {
             BeforeOutcome::Proceed
         }
@@ -314,14 +413,17 @@ mod tests {
             working_dir: dir.to_path_buf(),
             cancel: CancellationToken::new(),
             progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
         }
     }
 
     #[test]
     fn args_accepts_legacy_path_alias() {
-        let legacy: Args = serde_json::from_str(r#"{"path":"/tmp/x.html"}"#).expect("legacy `path` parses");
+        let legacy: Args =
+            serde_json::from_str(r#"{"path":"/tmp/x.html"}"#).expect("legacy `path` parses");
         assert_eq!(legacy.file_path, "/tmp/x.html");
-        let canon: Args = serde_json::from_str(r#"{"file_path":"/tmp/x.html"}"#).expect("canonical parses");
+        let canon: Args =
+            serde_json::from_str(r#"{"file_path":"/tmp/x.html"}"#).expect("canonical parses");
         assert_eq!(canon.file_path, "/tmp/x.html");
     }
 
@@ -342,11 +444,15 @@ mod tests {
     fn ssh_and_ci_signal_clean_env_baseline() {
         // Env mutation is racy across parallel tests, so only assert the no-signal
         // baseline (skip when the runner itself is inside SSH/CI).
-        let in_ssh = ["SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY"].iter().any(|v| std::env::var(v).is_ok());
+        let in_ssh = ["SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY"]
+            .iter()
+            .any(|v| std::env::var(v).is_ok());
         if !in_ssh {
             assert!(ssh_signal().is_none());
         }
-        let in_ci = ["CI", "GITHUB_ACTIONS", "GITLAB_CI", "BUILDKITE"].iter().any(|v| std::env::var(v).is_ok());
+        let in_ci = ["CI", "GITHUB_ACTIONS", "GITLAB_CI", "BUILDKITE"]
+            .iter()
+            .any(|v| std::env::var(v).is_ok());
         if !in_ci {
             assert!(ci_signal().is_none());
         }
@@ -360,7 +466,9 @@ mod tests {
     #[tokio::test]
     async fn missing_file_errors() {
         let d = tempfile::tempdir().unwrap();
-        let r = OpenFileTool.execute(r#"{"file_path":"nope.html"}"#, &ctx(d.path())).await;
+        let r = OpenFileTool
+            .execute(r#"{"file_path":"nope.html"}"#, &ctx(d.path()))
+            .await;
         assert!(r.is_error);
         assert!(r.content.contains("not found"), "{}", r.content);
     }
@@ -378,12 +486,17 @@ mod tests {
         // Force the headless path deterministically (no env mutation): an SSH signal makes
         // pick_open_strategy return Headless regardless of OS, so an existing file yields a
         // refusal carrying the path — never a real window in tests.
-        if !["SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY"].iter().any(|v| std::env::var(v).is_ok()) {
+        if !["SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY"]
+            .iter()
+            .any(|v| std::env::var(v).is_ok())
+        {
             return; // not under SSH → would actually try to launch a GUI; skip.
         }
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("x.html"), "<h1>hi</h1>").unwrap();
-        let r = OpenFileTool.execute(r#"{"file_path":"x.html"}"#, &ctx(d.path())).await;
+        let r = OpenFileTool
+            .execute(r#"{"file_path":"x.html"}"#, &ctx(d.path()))
+            .await;
         assert!(r.is_error);
         assert!(r.content.contains("cannot open in GUI"), "{}", r.content);
         assert!(r.content.contains("x.html"), "{}", r.content);
@@ -445,7 +558,10 @@ mod gate_tests {
         let tool: Arc<dyn Tool> = Arc::new(OpenFileTool);
         let mut call = open_call(abs.to_str().unwrap()); // absolute, but still under cwd
         let outcome = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(matches!(outcome, BeforeOutcome::Allow { .. }), "got {outcome:?}");
+        assert!(
+            matches!(outcome, BeforeOutcome::Allow { .. }),
+            "got {outcome:?}"
+        );
     }
 
     #[tokio::test]
@@ -454,11 +570,16 @@ mod gate_tests {
         let other = tempfile::tempdir().unwrap();
         let other = std::fs::canonicalize(other.path()).unwrap();
         std::fs::write(other.join("x.html"), "x").unwrap();
-        let gate = OpenFileWorkspaceGate::new(cwd_handle(&std::fs::canonicalize(ws.path()).unwrap()));
+        let gate =
+            OpenFileWorkspaceGate::new(cwd_handle(&std::fs::canonicalize(ws.path()).unwrap()));
         let tool: Arc<dyn Tool> = Arc::new(OpenFileTool);
         let mut call = open_call(other.join("x.html").to_str().unwrap());
         let outcome = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert_eq!(outcome, BeforeOutcome::Proceed, "out-of-workspace open_file must still prompt");
+        assert_eq!(
+            outcome,
+            BeforeOutcome::Proceed,
+            "out-of-workspace open_file must still prompt"
+        );
     }
 
     #[tokio::test]
@@ -473,7 +594,11 @@ mod gate_tests {
         let tool: Arc<dyn Tool> = Arc::new(OpenFileTool);
         let mut call = open_call("../secret.html");
         let outcome = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert_eq!(outcome, BeforeOutcome::Proceed, "a ../ escape must NOT auto-approve");
+        assert_eq!(
+            outcome,
+            BeforeOutcome::Proceed,
+            "a ../ escape must NOT auto-approve"
+        );
     }
 
     #[tokio::test]
@@ -489,7 +614,11 @@ mod gate_tests {
             arguments: r#"{"file_path":"a.txt","content":"x"}"#.into(),
         };
         let outcome = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert_eq!(outcome, BeforeOutcome::Proceed, "the gate must only touch open_file");
+        assert_eq!(
+            outcome,
+            BeforeOutcome::Proceed,
+            "the gate must only touch open_file"
+        );
     }
 
     #[tokio::test]
@@ -498,10 +627,17 @@ mod gate_tests {
         let cwd = std::fs::canonicalize(d.path()).unwrap();
         let gate = OpenFileWorkspaceGate::new(cwd_handle(&cwd));
         let tool: Arc<dyn Tool> = Arc::new(OpenFileTool);
-        let mut call =
-            ToolCall { id: "1".into(), name: "open_file".into(), arguments: r#"{"wrong":1}"#.into() };
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "open_file".into(),
+            arguments: r#"{"wrong":1}"#.into(),
+        };
         let outcome = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert_eq!(outcome, BeforeOutcome::Proceed, "bad args must fall through (conservative)");
+        assert_eq!(
+            outcome,
+            BeforeOutcome::Proceed,
+            "bad args must fall through (conservative)"
+        );
     }
 
     #[tokio::test]
@@ -511,9 +647,15 @@ mod gate_tests {
         std::fs::write(cwd.join("p.html"), "x").unwrap();
         let gate = OpenFileWorkspaceGate::new(cwd_handle(&cwd));
         let tool: Arc<dyn Tool> = Arc::new(OpenFileTool);
-        let mut call =
-            ToolCall { id: "1".into(), name: "open_file".into(), arguments: r#"{"path":"p.html"}"#.into() };
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "open_file".into(),
+            arguments: r#"{"path":"p.html"}"#.into(),
+        };
         let outcome = gate.before(&mut call, &tool, &silent_rt()).await;
-        assert!(matches!(outcome, BeforeOutcome::Allow { .. }), "legacy `path` alias, got {outcome:?}");
+        assert!(
+            matches!(outcome, BeforeOutcome::Allow { .. }),
+            "legacy `path` alias, got {outcome:?}"
+        );
     }
 }

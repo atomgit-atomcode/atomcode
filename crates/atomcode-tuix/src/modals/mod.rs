@@ -19,28 +19,82 @@ use crate::event_loop::{Buffer, LoopCtx};
 use crate::render::Renderer;
 use crate::state::UiState;
 
+pub mod diff_viewer;
 pub mod dir_picker;
 pub mod file_viewer;
-pub mod issue_wizard;
 pub mod language_picker;
 pub mod model_picker;
 pub mod onboarding_wizard;
-pub mod plugin_manager;
 pub mod password;
-pub mod provider_wizard;
+pub mod plugin_manager;
+pub mod provider_panel;
 pub mod proxy_picker;
 mod qr;
+pub mod rewind;
 pub mod session_picker;
+pub mod usage;
+pub mod usage_render;
+pub use diff_viewer::DiffViewer;
 pub use dir_picker::DirPicker;
 pub use file_viewer::FileViewer;
-pub use issue_wizard::IssueWizard;
 pub use language_picker::LanguagePicker;
 pub use model_picker::ModelPicker;
 pub use onboarding_wizard::OnboardingWizard;
 pub use plugin_manager::PluginManager;
-pub use provider_wizard::ProviderWizard;
+pub use provider_panel::ProviderPanel;
 pub use proxy_picker::ProxyPicker;
+pub use rewind::RewindModal;
 pub use session_picker::SessionPicker;
+
+/// Render one tab-bar chip with palette-independent styling, shared by every
+/// tabbed modal (`/usage`, `/plugin`, …) so the active/inactive contrast is
+/// consistent and correct on any terminal theme.
+///
+/// The active chip is bold + a FIXED near-white (dark) / near-black (light)
+/// 256-colour — the brightest/most prominent; inactive chips are a fixed
+/// mid-grey (245), always dimmer than active. FIXED 256-colours (16-255) are
+/// never remapped by the terminal's ANSI palette, unlike SGR 30-37/90-97 and
+/// the default foreground. That matters on unusual palettes such as **Solarized
+/// Dark**, whose default foreground is a muted grey (so relying on it left the
+/// active tab no brighter than inactive), whose SGR-37 "white" is a bright cream
+/// (so inactive tabs looked brighter than active), and whose SGR-90 ≈ the
+/// background (invisible). The returned string includes the surrounding
+/// `"  …  "` padding; join chips with a separator.
+pub(crate) fn tab_chip(label: &str, active: bool) -> String {
+    if active {
+        let fg: u8 = if crate::highlight::theme::is_light_for_render() {
+            16 // near-black on light backgrounds
+        } else {
+            231 // near-white on dark backgrounds
+        };
+        format!("  \x1b[1;38;5;{fg}m{label}\x1b[22;39m  ")
+    } else {
+        format!("  \x1b[38;5;245m{label}\x1b[39m  ")
+    }
+}
+
+/// The "N more files" indicator row shared by the `/diff` and `/view` panels:
+/// shown below a scrolled file window when the list is longer than the visible
+/// cap. `above`/`below` are the hidden-file counts on each side; the arrow hints
+/// which way ↑/↓ scrolls to reach them.
+pub(crate) fn more_files_row(above: usize, below: usize) -> crate::render::DiffPanelRow {
+    use crate::render::{DiffPanelRow, DiffPanelSpan, DiffPanelTone};
+    let hidden = above + below;
+    let arrow = match (above > 0, below > 0) {
+        (true, true) => "↕",
+        (true, false) => "↑",
+        (false, true) => "↓",
+        (false, false) => "",
+    };
+    let text = match crate::i18n::current_locale() {
+        crate::i18n::Locale::ZhCn => format!("{arrow} 还有 {hidden} 个文件 (↑/↓ 滚动)"),
+        _ => format!("{arrow} {hidden} more files (↑/↓ to scroll)"),
+    };
+    DiffPanelRow::new(vec![DiffPanelSpan::new(
+        text.trim().to_string(),
+        DiffPanelTone::Muted,
+    )])
+}
 
 /// Result of a modal consuming one key event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,5 +164,17 @@ pub trait Modal: Send {
     /// any cached lists it is displaying. Default: ignore. Only the
     /// interactive `/plugin` manager overrides this. The event loop calls it
     /// before rendering the job result and before redrawing the modal.
-    fn on_plugin_event(&mut self, _ev: &atomcode_core::plugin::PluginJobEvent) {}
+    fn on_plugin_event(&mut self, _ev: &atomcode_capabilities::plugin::PluginJobEvent) {}
+
+    /// Poll modal-owned background work after the shared wake channel fires.
+    /// Returns true when visible state changed and the modal should be redrawn.
+    fn poll_background(&mut self) -> bool {
+        false
+    }
+
+    /// Whether this modal has requested to close. The event loop checks this
+    /// to clean up the modal asynchronously.
+    fn close_requested(&self) -> bool {
+        false
+    }
 }

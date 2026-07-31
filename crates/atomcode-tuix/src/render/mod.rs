@@ -1,10 +1,13 @@
 // crates/atomcode-tuix/src/render/mod.rs
 pub mod cell;
+pub(crate) mod diff;
+pub mod mascot;
 pub mod plain;
 pub mod qr;
 pub mod retained;
 pub mod screen;
 pub mod theme;
+pub mod welcome_tips;
 pub mod worker;
 
 use std::time::Duration;
@@ -65,6 +68,12 @@ pub enum UiLine {
         id: String,
         name: String,
         detail: String,
+        /// Optional ephemeral hint rendered as part of the inflight strip
+        /// (e.g. the bash "Press Ctrl+o …" line). Kept INSIDE the strip so
+        /// the spinner tick / commit erase cover it atomically — emitting it
+        /// as a separate body row breaks the "inflight strip = body tail"
+        /// invariant and orphans the spinner glyph on commit.
+        hint: Option<String>,
     },
     /// Freeze the most recent `ToolCallInFlight` row to its final
     /// static `▸` icon. Emitted right before `ToolResult` so the
@@ -106,6 +115,9 @@ pub enum UiLine {
     ToolResult {
         success: bool,
         summary: String,
+        /// Optional edit statistics appended to the first summary row.
+        /// Renderers color additions/removals with the active diff theme.
+        diff_stats: Option<(usize, usize)>,
     },
     DiffLine {
         added: bool,
@@ -119,10 +131,9 @@ pub enum UiLine {
     /// event loop long enough to freeze the spinner. `DiffBlock` does
     /// one erase + N writes + one redraw.
     DiffBlock(Vec<DiffEntry>),
-    ApprovalPrompt {
-        tool: String,
-        detail: String,
-    },
+    /// Edit-tool diff rows whose statistics are already shown inline in
+    /// the preceding `ToolResult`; avoids a duplicate standalone summary.
+    EditDiffBlock(Vec<DiffEntry>),
     Error(String),
     /// Non-fatal advisory line (yellow). Visually distinct from `Error`
     /// so the user can tell "we saw something fishy and want you to
@@ -208,8 +219,10 @@ pub enum UiLine {
     ImageAttachment(usize),
     /// One-line success notice for vision-preprocessor OCR. Renders as
     /// `{msg}  {model}` where `msg` uses the default text style and
-    /// `model` uses the Muted (gray) role — visually distinct from
-    /// failure (yellow `! ...`) and from arbitrary command output.
+    /// `model` is bold only (no themed colour) so the VL model identity
+    /// stands out from the notice text without a loud accent hue — just
+    /// emphasis, per user request. `model` is the bare model name
+    /// (vendor prefix stripped), not the `config.providers` key.
     /// The actual VL description is intentionally NOT shown in the UI;
     /// it still rides into conversation history for the main model.
     VisionPreprocessSuccess {
@@ -220,18 +233,64 @@ pub enum UiLine {
     TurnSeparator {
         label: String,
     },
-    /// Overlay modal: a floating window drawn on top of body+footer.
-    /// RetainedRenderer paints this after the normal frame; PlainRenderer ignores it.
-    ModalOverlay {
-        title: String,
-        lines: Vec<String>,
-        scroll: usize,
-        total: usize,
+    /// Semantic `/diff` overlay. Spans carry theme roles instead of embedded
+    /// ANSI so retained rendering can clip safely and plain rendering can
+    /// ignore the transient panel.
+    DiffPanel {
+        title: DiffPanelRow,
+        rows: Vec<DiffPanelRow>,
+        footer: String,
         win_width: u16,
         win_height: u16,
     },
     /// Clear the overlay modal and restore the underlying frame.
     ModalOverlayClear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffPanelTone {
+    Default,
+    Muted,
+    Brand,
+    Add,
+    Remove,
+    Warning,
+    /// The `/resume`-picker selection colour: theme-aware bold foreground (cyan
+    /// on dark, magenta on light), no reverse-video and no background.
+    Highlight,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiffPanelSpan {
+    pub text: String,
+    pub tone: DiffPanelTone,
+    pub bold: bool,
+}
+
+impl DiffPanelSpan {
+    pub fn new(text: impl Into<String>, tone: DiffPanelTone) -> Self {
+        Self {
+            text: text.into(),
+            tone,
+            bold: false,
+        }
+    }
+
+    pub fn bold(mut self) -> Self {
+        self.bold = true;
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DiffPanelRow {
+    pub spans: Vec<DiffPanelSpan>,
+}
+
+impl DiffPanelRow {
+    pub fn new(spans: Vec<DiffPanelSpan>) -> Self {
+        Self { spans }
+    }
 }
 
 pub trait Renderer: Send {
@@ -324,13 +383,6 @@ pub trait Renderer: Send {
         false
     }
 
-    /// Remove the most recent `ApprovalPrompt` body row, if the tail
-    /// row is one. Called by the event loop after the user responds
-    /// Y/A/N so the prompt stops sitting in the body above the footer.
-    /// Default: no-op — implementations that stream body lines to
-    /// stdout (plain/pipe mode) can't retract them.
-    fn pop_approval_prompt(&mut self) {}
-
     /// Terminal window was resized to `(cols, rows)`. The retained
     /// backend uses this to re-flow body width and reposition the
     /// pinned footer; non-geometry-sensitive backends (Plain, tests)
@@ -385,16 +437,26 @@ pub enum MenuKind {
     /// `$`-trigger skills picker. Rows show the bare skill name + description,
     /// no `/`, `/skills`, or `$` prefix; selection marked with `▸`.
     Skill,
-    /// Two-column list: name left-aligned, desc right-aligned,
-    /// selected row uses reverse-video (no prefix, no arrow).
-    /// Used by session picker.
-    /// `row_prefix` is prepended before the name (e.g. `/`).
-    /// `selected_marker` is shown before the prefix for the selected row;
-    /// unselected rows get `display_width(marker)` spaces.
+    /// Modal action picker. Rows show a bare action label + description,
+    /// with no slash-command prefix; selection is marked with `▸`.
+    Action,
     TwoColumn {
         row_prefix: &'static str,
         selected_marker: &'static str,
     },
+    /// Plugin manager list: 2-line rendering per item.
+    /// Row 1: Plugin Name + Marketplace + Installation Status
+    /// Row 2: Description
+    Plugin,
+    /// Marketplace list tab screen: 3-line rendering + 1 blank line separator per item
+    Marketplace,
+    /// Plugin manager details / scope selection screens: 1-line rendering per item, input box hidden
+    PluginInfo,
+    /// `/resume` session picker: same chrome as `Plugin` (bordered search box,
+    /// hidden composer, title + bottom hint), but each session row is 2 lines —
+    /// row 1 = bright session title, row 2 = gray metadata. Mirrors `Plugin`
+    /// throughout the render loop EXCEPT the per-item leaf builder.
+    SessionList,
 }
 
 impl MenuKind {
@@ -403,14 +465,23 @@ impl MenuKind {
     /// rendering.
     pub fn max_visible_rows(&self, screen_height: usize, item_count: usize) -> usize {
         match self {
-            MenuKind::SlashCommand | MenuKind::AtMention | MenuKind::Skill => item_count.min(4),
-            // Window cap is `max(h/2, 4)`, but never reserve more rows than
-            // there are items — `paint_footer` only paints `item_count`
-            // rows when there are fewer than the cap, so `.max(4)` MUST
-            // apply to the cap, not the final value, or `current_footer_rows`
-            // over-estimates the footer height for short lists (< 4 items)
-            // and desyncs from the actual paint.
-            MenuKind::TwoColumn { .. } => item_count.min((screen_height / 2).max(4)),
+            MenuKind::SlashCommand | MenuKind::AtMention => item_count.min(4),
+            MenuKind::Skill | MenuKind::Action | MenuKind::TwoColumn { .. } => {
+                item_count.min((screen_height / 2).max(4))
+            }
+            MenuKind::Plugin | MenuKind::SessionList => {
+                let plugin_count = item_count.saturating_sub(3);
+                let max_plugins = (screen_height / 4).max(2);
+                let visible_plugins = plugin_count.min(max_plugins);
+                3 + visible_plugins * 2
+            }
+            MenuKind::Marketplace => {
+                let mp_count = (item_count.saturating_sub(4)) / 2;
+                let max_mps = (screen_height / 6).max(1);
+                let visible_mps = mp_count.min(max_mps);
+                5 + visible_mps * 4
+            }
+            MenuKind::PluginInfo => item_count,
         }
     }
 }
@@ -435,6 +506,9 @@ pub enum HintSeverity {
     #[default]
     Warning,
     Info,
+    /// `!` shell-mode affordance — renders in atomcode brand purple
+    /// (`Role::Shell`), matching the shell-mode box / badge.
+    Shell,
 }
 
 /// "model · cwd · ctx_used / ctx_window" chrome. Visible in both Idle
@@ -444,12 +518,49 @@ pub enum HintSeverity {
 /// don't tell the user whether the next turn is at risk of overflow.
 /// `ctx_used` answers "what does the model see right now"; `ctx_window`
 /// is the cap. Together they answer "how close are we to compaction".
+/// Colour slot for a left-aligned mode badge. Each variant maps to a
+/// concrete `CellStyle` in the renderer, so the badge's colour is decided
+/// at construction time (in `build_status`) rather than hard-coded in the
+/// rendering `if/else if` chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BadgeColour {
+    /// AcceptEdits — periwinkle `Role::Mode`.
+    #[default]
+    Mode,
+    /// Plan — orange `Role::Plan`.
+    Plan,
+    /// Build — faint secondary (blends into the status row).
+    Secondary,
+}
+
+/// Left-aligned mode badge: a label string plus the colour slot it
+/// renders in. Replaces the previous trio of `Option<String>` fields
+/// (`mode_indicator` / `plan_indicator` / `build_indicator`) so adding
+/// a new mode only needs a new `BadgeColour` variant + one `match` arm
+/// in `build_status`, not a fresh `StatusLine` field and a parallel
+/// `if/else if` branch in the renderer.
+#[derive(Debug, Clone)]
+pub struct ModeBadge {
+    pub label: String,
+    pub colour: BadgeColour,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StatusLine {
     pub model: String,
     pub cwd: String, // HOME replaced with "~"
+    /// Messages submitted during the active turn but not yet accepted at a
+    /// model/tool boundary. Rendered as a transient panel above the composer.
+    pub pending_messages: Vec<String>,
+    /// Current recalled input-history position, shown on the input box's
+    /// top rule only while Up/Down navigation is active.
+    pub history: Option<HistoryPosition>,
+    /// Optional read-only command report rendered as a transient multi-line
+    /// footer panel directly below the input box. It never enters scrollback.
+    pub command_output: Option<String>,
     /// Tokens currently in the model's context (last turn's `sent_tokens`).
-    /// Pre-first-turn this is 0; the renderer hides the field then.
+    /// Pre-first-turn this is 0; when `ctx_window` is known the renderer shows
+    /// zero usage against that window.
     pub ctx_used: usize,
     /// Provider's context window (cap). 0 when not yet known — renderer
     /// falls back to a bare "12.3k tok" display in that case.
@@ -458,21 +569,19 @@ pub struct StatusLine {
     /// (no-provider nudge, CodingPlan model-missing); `Info` renders
     /// muted (upgrade banner, CodingPlan drift notice). None → no hint.
     pub hint: Option<(String, HintSeverity)>,
-    /// Left-aligned mode indicator, prepended before `model`. Present
-    /// only when the user explicitly switched to a non-default agent
-    /// mode (Plan today; conceivably others later). `None` for the
-    /// default Build mode so the status row doesn't gain noise for
-    /// the common case. Renders in brand color (Role::Brand) to draw
-    /// the eye — switching modes changes whether file edits and shell
-    /// run, so the user wants this prominent.
-    pub mode_indicator: Option<String>,
+    /// Left-aligned mode badge (`ModeBadge`), prepended before `model`.
+    /// `None` for the default Build startup so the status row stays clean.
+    /// The badge carries both its label and its colour slot, so the
+    /// renderer no longer needs a separate field per mode.
+    pub mode_indicator: Option<ModeBadge>,
     /// Right-aligned bypass indicator, appended after `hint` on the
-    /// right side of the status row. Shown when
-    /// `--dangerously-skip-permissions / -y` is active, rendering a
-    /// yellow warning badge so the user is always aware that all tool
-    /// calls are auto-approved. Kept separate from `mode_indicator`
-    /// (left-aligned PLAN/Build badge) so BYPASS does not displace
-    /// the mode indicator.
+    /// right side of the status row. Shown whenever the execution mode is
+    /// `Auto` (auto-approve all tools) — whether entered via
+    /// `--dangerously-skip-permissions / -y` at startup or the `/auto` /
+    /// Tab cycle at runtime — rendering a yellow warning badge so the user
+    /// is always aware that all tool calls are auto-approved. Kept separate
+    /// from `mode_indicator` (left-aligned PLAN badge) so it does not
+    /// displace the mode indicator.
     pub bypass_indicator: Option<String>,
     /// Current session display name, shown as a right-aligned cyan
     /// pill overlaid on the input box's top rule. `Some` only after
@@ -483,6 +592,32 @@ pub struct StatusLine {
     /// Current reasoning_effort for the active provider's model.
     /// None = not set (API uses its own default). Cycled via Ctrl+T.
     pub reasoning_effort: Option<String>,
+    /// Active todo list progress, rendered on a DEDICATED footer row above the
+    /// status line (like the goal/loop row) so multi-step progress — including
+    /// which task is running — is visible without the inline todowrite block
+    /// (which scrolls away). `None` ⇒ no todo list, row omitted (no noise for
+    /// conversations that never used todowrite). Carries raw fields; the
+    /// renderer owns glyph/width/terminal-safety (mirrors GoalStatus).
+    pub todo: Option<TodoProgress>,
+    /// Active `task` fan-out, rendered as a fixed panel above the input. While
+    /// present it takes the expanded top-panel slot and TodoWrite collapses.
+    pub subtasks: Option<SubtaskProgress>,
+    /// When the approval panel is active (user must confirm/deny a tool call),
+    /// this carries its current state for the dedicated footer approval panel
+    /// (rendered above the todo panel). `None` ⇒ no approval pending, panel
+    /// omitted. Mirrors `todo` — the renderer owns glyph/width/terminal-safety.
+    pub approval: Option<ApprovalPanelView>,
+    /// When a `request_user_input` question is active, this carries its state for
+    /// the dedicated footer panel (rendered in the same slot as `approval` — the
+    /// two are mutually exclusive). `None` ⇒ no question pending, panel omitted.
+    /// Mirrors `approval` — the renderer owns glyph/width/terminal-safety.
+    pub user_input: Option<UserInputPanelView>,
+    /// When the round-cap checkpoint is active (the agent reached its configured
+    /// max-rounds limit and is asking the user whether to continue), this carries
+    /// the panel view for the dedicated footer picker. Rendered in the same slot
+    /// as `approval` / `user_input` (all three are mutually exclusive; the priority
+    /// order is: approval > user_input > round_cap_panel). `None` ⇒ no checkpoint.
+    pub round_cap_panel: Option<UserInputPanelView>,
     /// When an autonomous `/goal` loop is active, this carries its live status
     /// for the DEDICATED footer goal row (its own full-width line above the
     /// status row). `None` ⇒ no goal running, row omitted. Previously this was
@@ -491,6 +626,166 @@ pub struct StatusLine {
     /// condition text — so users couldn't reliably see the goal while tool
     /// output scrolled. Its own row fixes that.
     pub goal: Option<GoalStatus>,
+    /// When a `/loop` is active, this carries its live status for the dedicated
+    /// footer loop row (its own full-width line, shown instead of the goal row
+    /// — only one of goal/loop is active at a time). `None` ⇒ no loop running.
+    pub loop_status: Option<LoopStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryPosition {
+    pub current: usize,
+    pub total: usize,
+}
+
+/// Renderer-facing snapshot of the approval panel (mirrors how `TodoProgress`
+/// feeds the todo panel). Header + option labels + selected index.
+#[derive(Debug, Clone)]
+pub struct ApprovalPanelView {
+    pub tool: String,
+    pub detail: String,
+    pub options: Vec<String>,
+    pub selected: usize,
+}
+
+/// Renderer-facing snapshot of the `request_user_input` panel (mirrors
+/// `ApprovalPanelView`). Header + question + the mode-specific body: a
+/// reverse-highlight option list (single), `[x]`/`[ ]` checkboxes (multiple),
+/// or a `> {buffer}` input row (text).
+#[derive(Debug, Clone)]
+pub struct UserInputPanelView {
+    pub header: String,
+    pub question: String,
+    pub mode: atomcode_capabilities::tools::request_user_input::UserInputMode,
+    /// Concrete options: label + optional description (faint second line).
+    /// Does NOT include the always-appended "Other" free-text row.
+    pub options: Vec<(String, Option<String>)>,
+    /// Highlighted row. For single/multiple this ranges over the concrete
+    /// option rows (`0..options.len()`), then the always-appended "Other" row
+    /// (`options.len()`). For multiple mode the cursor also reaches
+    /// `options.len()+1` (the Submit row); single mode's last row is the
+    /// custom-answer row at `options.len()`.
+    pub cursor: usize,
+    /// Per-row checked flags (multiple mode). Length `options.len() + 1` — one
+    /// per concrete option plus the trailing "Other" row.
+    pub checked: Vec<bool>,
+    /// Standalone text-mode input buffer.
+    pub text: String,
+    /// "Other" free-text row buffer for single/multiple mode.
+    pub custom_text: String,
+    /// Whether to render the "Other" free-text row (mirrors `UserInputPanel.custom`).
+    pub custom: bool,
+    /// Batch navigator context. `None` = a standalone single question (rendered
+    /// byte-identically to before, no chrome). `Some` = this is one question inside
+    /// a multi-question batch, so the renderer adds a `Question i/N` navigator and a
+    /// Tab hint (or a Submit screen when `on_submit`).
+    pub batch: Option<UserInputBatchMeta>,
+}
+
+/// Navigator context for a question rendered as part of a multi-question batch.
+#[derive(Debug, Clone)]
+pub struct UserInputBatchMeta {
+    /// Total questions in the batch.
+    pub total: usize,
+    /// 1-based index of the current question (for the `Question i/N` navigator).
+    pub index: usize,
+    /// Per-question answered flags (for the ✓/○ markers), length `total`.
+    pub answered: Vec<bool>,
+    /// The cursor is on the Submit stop (render the submit screen, not a question).
+    pub on_submit: bool,
+}
+
+/// Build a [`UserInputPanelView`] for the round-cap checkpoint panel (style B:
+/// Single picker, two options with descriptions, no free-text "Other" row).
+///
+/// `cap` is the configured round limit (displayed in both the question and the
+/// continue option description). `cursor` is the currently highlighted row
+/// (0 = "继续", 1 = "停止"). `stats` is a pre-formatted elapsed/token string
+/// (e.g. "2h0m0s · 305.00K tokens") — appended to the question when non-empty.
+pub fn round_cap_view(cap: u32, base: u32, cursor: usize, stats: &str) -> UserInputPanelView {
+    use atomcode_capabilities::tools::request_user_input::UserInputMode;
+    let question = if stats.is_empty() {
+        format!("已运行 {cap} 轮，继续吗？")
+    } else {
+        format!("已运行 {cap} 轮（{stats}），继续吗？")
+    };
+    UserInputPanelView {
+        header: "轮次上限".to_string(),
+        question,
+        mode: UserInputMode::Single,
+        options: vec![
+            // `base` (the re-arm step), not `cap`: after a continuation `cap` has
+            // grown but only `base` more rounds are granted before the next prompt.
+            (
+                "继续".to_string(),
+                Some(format!("再跑 {base} 轮后重新确认")),
+            ),
+            ("停止".to_string(), Some("结束本回合".to_string())),
+        ],
+        cursor,
+        checked: vec![],
+        text: String::new(),
+        custom_text: String::new(),
+        custom: false,
+        batch: None,
+    }
+}
+
+/// Progress of the active todo list, rendered as the multi-line footer todo
+/// panel. The renderer collapses the list to fit (`todo_panel_rows`) and
+/// width-truncates item content; the `completed`/`in_progress`/`total` counts
+/// show in the panel header.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TodoProgress {
+    /// The description of the task currently `in_progress` (todowrite enforces
+    /// at most one). `None` when no task is in progress (all pending / all done).
+    pub current: Option<String>,
+    /// Number of tasks marked `completed`.
+    pub completed: usize,
+    /// Number of tasks currently `in_progress` (todowrite enforces at most one,
+    /// so this is 0 or 1). Pre-computed by the caller so the renderer doesn't
+    /// have to scan `items` — keeps the three header counts (`completed`,
+    /// `in_progress`, `total`) single-sourced and in sync.
+    pub in_progress: usize,
+    /// Total number of tasks in the list.
+    pub total: usize,
+    /// The full ordered list (status + content) — drives the multi-line footer
+    /// todo panel. `current`/`completed`/`in_progress`/`total` are retained as
+    /// pre-computed conveniences for the header + hide-when-all-done filter.
+    pub items: Vec<(atomcode_capabilities::tools::todo::TodoStatus, String)>,
+}
+
+/// Fixed footer projection for one in-flight `task` fan-out. This is a TUI
+/// presentation type: the kernel continues to expose generic tool-progress
+/// strings, while the event loop folds the known Task contract into these
+/// stable child rows.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SubtaskProgress {
+    /// Parent tool call whose terminal event owns removal of this panel.
+    pub call_id: String,
+    pub completed: usize,
+    pub total: usize,
+    pub items: Vec<SubtaskItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtaskItem {
+    pub label: String,
+    pub description: String,
+    pub model: String,
+    pub activity: String,
+    pub started_at: Option<std::time::Instant>,
+    pub output_tokens: u64,
+    pub status: SubtaskStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubtaskStatus {
+    #[default]
+    Pending,
+    Running,
+    Completed,
+    Failed,
 }
 
 /// Live status of an active autonomous `/goal` loop, rendered on the dedicated
@@ -507,10 +802,39 @@ pub struct GoalStatus {
     pub elapsed_secs: u64,
 }
 
-/// One line in a diff batch. `added = true` renders as `+`, false as `-`.
+/// Live status of an active `/loop`, rendered on the dedicated footer loop row.
+/// Mirrors `GoalStatus` exactly: the renderer width-truncates `label` to fit,
+/// while `round` and elapsed always survive.
+#[derive(Debug, Clone)]
+pub struct LoopStatus {
+    /// The loop label text (truncated with `…` to fit the row width).
+    pub label: String,
+    /// Round number AS DISPLAYED — 1-based (the first attempt reads `round 1`).
+    /// The caller adds 1 to the engine's 0-based internal round.
+    pub round: u32,
+    /// Wall-clock seconds since the loop was started.
+    pub elapsed_secs: u64,
+}
+
+/// The role of a diff line: an addition (`+`), a deletion (`-`), or unchanged
+/// context (` `). Drives the sign + color in the renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffKind {
+    Add,
+    Del,
+    Context,
+    /// A gap between two hunks — rendered as a dim `⋮` so far-apart edits in one
+    /// file read as one block without showing the unchanged run between them.
+    Separator,
+}
+
+/// One line of a rendered diff, with the file line number for its side.
+/// `old_lineno` is set for Del + Context, `new_lineno` for Add + Context.
 #[derive(Debug, Clone)]
 pub struct DiffEntry {
-    pub added: bool,
+    pub kind: DiffKind,
+    pub old_lineno: Option<usize>,
+    pub new_lineno: Option<usize>,
     pub text: String,
 }
 
@@ -523,6 +847,17 @@ pub struct DiffEntry {
 pub struct ToolGroupChild {
     pub call_id: String,
     pub text: String,
+}
+
+/// True when the live input buffer puts the user in `!` shell mode: a `!` leads
+/// the (left-trimmed) buffer, INCLUDING a bare `!`. Drives the shell-mode visual
+/// treatment (purple input box / chevron / status badge / `! for shell mode`
+/// hint). Pure fn of the buffer, so the treatment is transient — it arms the
+/// instant `!` is typed and reverts the instant it's gone (submit / clear /
+/// delete), no persistent mode state (unlike `/plan` `/auto`). Distinct from
+/// `bash_input_hint`, which needs a runnable command (non-empty after `!`).
+pub fn input_shell_mode(buf: &str) -> bool {
+    buf.trim_start().starts_with('!')
 }
 
 /// Wrap a compaction marker label in a dash rule: `─── {label} ───` (unicode)
@@ -562,8 +897,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shell_mode_is_a_leading_bang_including_bare() {
+        // Drives the shell-mode visual treatment (purple box / chevron / badge /
+        // `! for shell mode` hint). Active the instant `!` leads the buffer —
+        // INCLUDING a bare `!` (the affordance shows before a command is typed),
+        // unlike `bash_input_hint` which needs a runnable command.
+        assert!(input_shell_mode("!"), "bare ! already arms shell mode");
+        assert!(input_shell_mode("!ls -la"));
+        assert!(
+            input_shell_mode("  !git status"),
+            "leading whitespace tolerated"
+        );
+        // Reverts the instant the `!` is gone — pure fn of the live buffer, so a
+        // submit/clear/delete flips it back with no persistent state.
+        assert!(!input_shell_mode(""), "empty buffer is not shell mode");
+        assert!(!input_shell_mode("   "), "blank buffer is not shell mode");
+        assert!(!input_shell_mode("ls"), "no leading bang");
+        assert!(!input_shell_mode("echo !x"), "bang not at the start");
+    }
+
+    #[test]
     fn compaction_rule_wraps_label_unicode() {
-        assert_eq!(compaction_rule("已压缩 · 摘要 2 条", true), "─── 已压缩 · 摘要 2 条 ───");
+        assert_eq!(
+            compaction_rule("已压缩 · 摘要 2 条", true),
+            "─── 已压缩 · 摘要 2 条 ───"
+        );
     }
 
     #[test]
@@ -628,7 +986,7 @@ mod tests {
 
     #[test]
     fn fixed_kinds_cap_at_four() {
-        for k in [MenuKind::SlashCommand, MenuKind::AtMention, MenuKind::Skill] {
+        for k in [MenuKind::SlashCommand, MenuKind::AtMention] {
             assert_eq!(k.max_visible_rows(40, 2), 2);
             assert_eq!(k.max_visible_rows(40, 10), 4);
         }

@@ -136,7 +136,10 @@ impl HttpClient {
 
         // Echo the captured Streamable-HTTP session id (unless the user pinned one) so a
         // stateful server accepts this request as part of the established session.
-        let user_has_session = self.headers.keys().any(|k| k.eq_ignore_ascii_case("mcp-session-id"));
+        let user_has_session = self
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("mcp-session-id"));
         if !user_has_session {
             if let Some(sid) = self.session_id().await {
                 req = req.header("Mcp-Session-Id", sid);
@@ -255,12 +258,18 @@ impl HttpClient {
 
         let mut req = self.client.post(&self.url).json(&request);
 
-        let user_has_accept = self.headers.keys().any(|k| k.eq_ignore_ascii_case("accept"));
+        let user_has_accept = self
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("accept"));
         if !user_has_accept {
             req = req.header("Accept", MCP_HTTP_ACCEPT);
         }
 
-        let user_has_authorization = self.headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"));
+        let user_has_authorization = self
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("authorization"));
         for (key, value) in &self.headers {
             req = req.header(key, value);
         }
@@ -271,7 +280,10 @@ impl HttpClient {
             }
         }
 
-        let user_has_session = self.headers.keys().any(|k| k.eq_ignore_ascii_case("mcp-session-id"));
+        let user_has_session = self
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("mcp-session-id"));
         if !user_has_session {
             if let Some(sid) = self.session_id().await {
                 req = req.header("Mcp-Session-Id", sid);
@@ -322,7 +334,9 @@ async fn delete_http_session(
     headers: BTreeMap<String, String>,
     session: String,
 ) {
-    let user_has_session = headers.keys().any(|k| k.eq_ignore_ascii_case("mcp-session-id"));
+    let user_has_session = headers
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("mcp-session-id"));
     let mut req = client.delete(&url);
     for (key, value) in &headers {
         req = req.header(key, value);
@@ -562,17 +576,30 @@ mod session_tests {
     use reqwest::header::HeaderMap;
 
     fn client() -> HttpClient {
-        HttpClient::new("t".into(), "http://localhost/mcp".into(), BTreeMap::new(), None, Some(1000))
+        HttpClient::new(
+            "t".into(),
+            "http://localhost/mcp".into(),
+            BTreeMap::new(),
+            None,
+            Some(1000),
+        )
     }
 
     #[tokio::test]
     async fn captures_session_id_from_response_headers() {
         let c = client();
-        assert!(c.session_id().await.is_none(), "no session before any response");
+        assert!(
+            c.session_id().await.is_none(),
+            "no session before any response"
+        );
         let mut h = HeaderMap::new();
         h.insert("mcp-session-id", "abc-123".parse().unwrap());
         c.capture_session_id(&h).await;
-        assert_eq!(c.session_id().await.as_deref(), Some("abc-123"), "captured + replayable");
+        assert_eq!(
+            c.session_id().await.as_deref(),
+            Some("abc-123"),
+            "captured + replayable"
+        );
     }
 
     #[tokio::test]
@@ -583,6 +610,9 @@ mod session_tests {
         let mut h = HeaderMap::new();
         h.insert("mcp-session-id", "".parse().unwrap());
         c.capture_session_id(&h).await; // header present but empty
-        assert!(c.session_id().await.is_none(), "empty value must not overwrite");
+        assert!(
+            c.session_id().await.is_none(),
+            "empty value must not overwrite"
+        );
     }
 }

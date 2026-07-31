@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { useChatContext } from '../state/ChatProvider';
 import { groupSessionsByDate, formatTimeAgo } from '../utils/format';
+import { filterSessionsForQuery, sessionIdentity } from '../lib/sessionGroups';
 import type { SessionMeta } from '../state/types';
 import { MsgKey, useT } from '../i18n';
 
@@ -26,13 +27,7 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
   const isOverlay = variant === 'overlay';
 
   const filteredSessions = useMemo(() => {
-    if (!search.trim()) return state.sessions;
-    const q = search.toLowerCase();
-    return state.sessions.filter(
-      (s) =>
-        (s.name ?? '').toLowerCase().includes(q) ||
-        (s.title ?? '').toLowerCase().includes(q),
-    );
+    return filterSessionsForQuery(state.sessions, search);
   }, [state.sessions, search]);
 
   const groups = useMemo(() => groupSessionsByDate(filteredSessions), [filteredSessions]);
@@ -58,10 +53,11 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
   function toggleSelect(session: SessionMeta) {
     setSelectedIds((prev) => {
       const next = new Set(prev);
-      if (next.has(session.id)) {
-        next.delete(session.id);
+      const key = sessionIdentity(session);
+      if (next.has(key)) {
+        next.delete(key);
       } else {
-        next.add(session.id);
+        next.add(key);
       }
       return next;
     });
@@ -97,7 +93,7 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
   }
 
   function handleDeleteSelected() {
-    const toDelete = state.sessions.filter((s) => selectedIds.has(s.id));
+    const toDelete = state.sessions.filter((s) => selectedIds.has(sessionIdentity(s)));
     if (toDelete.length === 0) return;
     deleteSessions(
       toDelete.map((s) => ({
@@ -208,8 +204,9 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
               <div key={label}>
                 <div className="session-group-label">{t(DATE_LABEL_KEYS[label])}</div>
                 {items.map((s) => {
-                  const isActive = s.id === state.activeSessionId;
-                  const isChecked = selectedIds.has(s.id);
+                  const isActive = s.id === state.activeSessionId
+                    && (!state.activeProjectHash || s.project_hash === state.activeProjectHash);
+                  const isChecked = selectedIds.has(sessionIdentity(s));
                   let dotClass = '';
                   if (!isActive) {
                     if (s.isGenerating) {
@@ -220,11 +217,11 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
                   }
                   return (
                     <button
-                      key={`${s.project_hash ?? 'current'}:${s.id}`}
+                      key={sessionIdentity(s)}
                       className={`session-item${isActive ? ' active' : ''}${selectMode && isChecked ? ' selected' : ''}`}
                       onClick={() => handleSelect(s)}
                       onContextMenu={(e) => handleContextMenu(e, s)}
-                      title={selectMode ? undefined : (s.name || s.title || t('session.untitled'))}
+                      title={selectMode ? undefined : `${s.name || s.title || t('session.untitled')}\n${s.working_dir || ''}`}
                     >
                       <span
                         className={`session-item-checkbox${isChecked ? ' checked' : ''}`}

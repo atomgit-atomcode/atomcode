@@ -24,8 +24,8 @@ const RULES: &str = r#"Your task: find the real problems introduced by this diff
 
 - Review every changed file, including tests, configuration, dependency manifests, CI scripts, and example code. Do not skip a file because it looks "non-core" — supply-chain tampering, broken tests, and config errors often appear in such places.
 - Report only problems introduced by added or modified lines in this diff.
-- Do not report pre-existing problems in unmodified code, unless this change turns a previously non-triggerable old problem into something actually triggerable.
-- If a problem is only found in unmodified code, but this diff adds no new reachable path, changes no call contract, and changes no input boundary, do not report it.
+- Do not report pre-existing problems in unmodified code, unless this change turns a previously non-triggerable old problem into something actually triggerable, OR this diff introduces a NEW inconsistency with that unmodified code. A diff that changes a convention/contract/parameter-form on its lines (e.g. switches `sizeof(buf)-1` to `sizeof(buf)` on the Windows branch, renames a symbol, changes an error-handling shape) creates a real correctness/maintainability defect if sibling unmodified code (the Linux branch in the same function, parallel call sites, other files implementing the same contract) keeps the OLD form — the two paths now diverge. Report such divergence at the changed line (P2–P3 by impact), citing the unmodified sibling location as the evidence of the inconsistency. This is NOT "reporting pre-existing problems"; it is reporting a regression INTRODUCED by this diff's one-sided change.
+- If a problem is only found in unmodified code, but this diff adds no new reachable path, changes no call contract, changes no input boundary, AND introduces no new inconsistency with that code, do not report it.
 - Classify every candidate issue into one of three tiers and handle each differently:
     - Real problems (correctness, security, reliability, breaking changes): report at P0–P2 by severity.
     - Actionable suggestions (e.g. a removable no-op/redundant cast, dead code safe to delete, a concrete optional simplification): NOT prohibited — report them, but you MUST set priority P3 with low confidence and state in the body that this is an optional improvement, not a required fix. Never raise such an item above P3.
@@ -170,21 +170,41 @@ mod tests {
     #[test]
     fn persona_carries_model_and_anchors() {
         let p = review_persona("deepseek-v4");
-        assert!(p.contains("model: deepseek-v4"), "identity must carry the model");
-        assert!(p.starts_with("You are AtomCode Reviewer"), "identity line first");
+        assert!(
+            p.contains("model: deepseek-v4"),
+            "identity must carry the model"
+        );
+        assert!(
+            p.starts_with("You are AtomCode Reviewer"),
+            "identity line first"
+        );
         assert!(p.contains("read-only"), "must state read-only");
-        assert!(p.contains("report_finding"), "must instruct the report tool");
+        assert!(
+            p.contains("report_finding"),
+            "must instruct the report tool"
+        );
         // Required reporting fields, including the fix-suggestion protocol.
         for field in ["suggestion", "suggested_code", "confidence", "line_start"] {
-            assert!(p.contains(field), "persona must describe the `{field}` field");
+            assert!(
+                p.contains(field),
+                "persona must describe the `{field}` field"
+            );
         }
         // Named read-only tools (code-intelligence tools are described by category).
         for tool in ["read_file", "grep", "ast_grep", "web_search"] {
             assert!(p.contains(tool), "persona must advertise the tool `{tool}`");
         }
         // Core review-discipline anchors.
-        for anchor in ["Review Scope", "Priority Criteria", "Noise-Reduction", "Line Anchoring"] {
-            assert!(p.contains(anchor), "persona must keep the `{anchor}` section");
+        for anchor in [
+            "Review Scope",
+            "Priority Criteria",
+            "Noise-Reduction",
+            "Line Anchoring",
+        ] {
+            assert!(
+                p.contains(anchor),
+                "persona must keep the `{anchor}` section"
+            );
         }
     }
 
@@ -193,7 +213,10 @@ mod tests {
         let p = review_persona("m");
         // The reviewer must not advertise write/edit/bash — it is read-only.
         for forbidden in ["write_file", "edit_file", "`bash`"] {
-            assert!(!p.contains(forbidden), "reviewer persona must not advertise `{forbidden}`");
+            assert!(
+                !p.contains(forbidden),
+                "reviewer persona must not advertise `{forbidden}`"
+            );
         }
     }
 }

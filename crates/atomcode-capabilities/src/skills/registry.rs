@@ -16,7 +16,9 @@ pub struct SkillRegistry {
 
 impl SkillRegistry {
     pub fn new() -> Self {
-        Self { skills: BTreeMap::new() }
+        Self {
+            skills: BTreeMap::new(),
+        }
     }
 
     /// Load from `dirs` in LOW→HIGH priority order (a later dir's same-named skill wins).
@@ -71,8 +73,56 @@ impl SkillRegistry {
         }
     }
 
+    /// Resolve a skill by its registry key, falling back to bare-name lookup.
+    ///
+    /// File skills are keyed by their namespaced identity
+    /// (`skills:atomcode-smoke-test`), but the `$` trigger and the `/skills`
+    /// sub-menu display and submit the *unqualified* name for skills whose
+    /// bare name is unique (see `build_skill_menu_items`). Without this
+    /// fallback, `get("atomcode-smoke-test")` misses the `skills:`-prefixed
+    /// key — so every user invocation of a file skill either errors with a
+    /// bogus "unknown skill" (menu path) or is silently sent to the model as
+    /// plain `$name` text (typed path). The model path is unaffected because
+    /// the injected catalog carries the fully-qualified name.
+    ///
+    /// A bare name that maps to more than one namespace is disambiguated the
+    /// way the menu is: `build_skill_menu_items` lists only user-invocable
+    /// skills and shows the bare name when it is unique among THEM, so a lone
+    /// user-invocable match wins even if a hidden (`user-invocable: false`)
+    /// skill shares the bare name. Only a genuinely ambiguous bare name — zero
+    /// or several user-invocable matches — returns `None`; the menu shows the
+    /// qualified form there, which resolves via the exact-match branch.
     pub fn get(&self, name: &str) -> Option<Arc<Skill>> {
-        self.skills.get(name).cloned()
+        if let Some(skill) = self.skills.get(name) {
+            return Some(skill.clone());
+        }
+        if name.contains(':') {
+            return None;
+        }
+        let suffix = format!(":{}", name.to_ascii_lowercase());
+        let mut n_all = 0usize;
+        let mut last_all: Option<&Arc<Skill>> = None;
+        let mut n_invocable = 0usize;
+        let mut last_invocable: Option<&Arc<Skill>> = None;
+        for skill in self.skills.values() {
+            if skill.name.ends_with(&suffix) {
+                n_all += 1;
+                last_all = Some(skill);
+                if skill.user_invocable {
+                    n_invocable += 1;
+                    last_invocable = Some(skill);
+                }
+            }
+        }
+        if n_all == 1 {
+            return last_all.cloned();
+        }
+        // Multiple namespaces share this bare name: resolve to the sole
+        // user-invocable one (mirrors the menu). Zero or several ⇒ ambiguous.
+        if n_invocable == 1 {
+            return last_invocable.cloned();
+        }
+        None
     }
     pub fn len(&self) -> usize {
         self.skills.len()
@@ -82,7 +132,64 @@ impl SkillRegistry {
     }
     /// `(name, description)` for every skill, sorted by name.
     pub fn list(&self) -> Vec<(String, String)> {
-        self.skills.values().map(|s| (s.name.clone(), s.description.clone())).collect()
+        self.skills
+            .values()
+            .map(|s| (s.name.clone(), s.description.clone()))
+            .collect()
+    }
+
+    /// Clear and reload from the standard home+project skill dirs (the `/skills`
+    /// slash-menu source), under the `skills:` namespace — matching the driver's
+    /// slash-command convention. Mirrors core `SkillRegistry::reload`.
+    ///
+    /// Returns per-skill load warnings for signature compatibility with core's
+    /// `reload` (driver call sites surface them). Currently always empty: this loader
+    /// silently skips unparseable skills — the SAME behavior the runtime skill path
+    /// uses — so no parse warnings are collected.
+    pub fn reload(&mut self, working_dir: &Path) -> Vec<String> {
+        self.skills.clear();
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        for dir in standard_skill_dirs(&home, working_dir) {
+            self.load_dir(&dir, Some("skills"));
+        }
+        Vec::new()
+    }
+
+    /// Skills a user can invoke from the `/` menu (frontmatter `user-invocable` not
+    /// `false`), sorted by name.
+    pub fn user_invocable(&self) -> impl Iterator<Item = &Skill> {
+        self.skills
+            .values()
+            .map(|s| s.as_ref())
+            .filter(|s| s.user_invocable)
+    }
+
+    /// Insert a skill programmatically (same-name replaces). Mirrors core
+    /// `SkillRegistry::register`; used by drivers injecting non-file skills and by tests.
+    pub fn register(&mut self, skill: Skill) {
+        self.skills.insert(skill.name.clone(), Arc::new(skill));
+    }
+
+    /// Every loaded skill, sorted by name.
+    pub fn all(&self) -> impl Iterator<Item = &Skill> {
+        self.skills.values().map(|s| s.as_ref())
+    }
+
+    /// Render the `=== AVAILABLE SKILLS ===` system-prompt section (budget-gated,
+    /// source-ranked), or `None` when no skills are installed. See
+    /// [`super::render`].
+    pub fn render_catalog(&self) -> Option<String> {
+        let entries: Vec<super::render::CatalogEntry> = self
+            .skills
+            .values()
+            .map(|s| super::render::CatalogEntry {
+                name: s.name.clone(),
+                hint: None, // capabilities skills carry no argument hint
+                description: s.description.clone(),
+                source_rank: super::render::source_rank(&s.source_path),
+            })
+            .collect();
+        super::render::render_skill_catalog(&entries)
     }
 }
 
@@ -100,10 +207,14 @@ pub fn standard_skill_dirs(home: &Path, project: &Path) -> Vec<PathBuf> {
         home.join(".claude/commands"),
         home.join(".atomcode/commands"),
         home.join(".claude/skills"),
+        // `.agents/skills` — cross-agent shared convention (opencode et al.). Between
+        // `.claude` and `.atomcode` so atomcode-native skills win a same-name collision.
+        home.join(".agents/skills"),
         home.join(".atomcode/skills"),
         project.join(".claude/commands"),
         project.join(".atomcode/commands"),
         project.join(".claude/skills"),
+        project.join(".agents/skills"),
         project.join(".atomcode/skills"),
     ]
 }
@@ -132,6 +243,96 @@ mod tests {
         assert_eq!(review.description, "review code");
     }
 
+    /// A namespaced file skill (`skills:atomcode-smoke-test`) must resolve by
+    /// its bare name — the exact spelling the `$` trigger and `/skills` menu
+    /// submit. Regression for the reported "first `$atomcode-smoke-test` errors
+    /// with 未知技能, second runs it as plain text" bug.
+    #[test]
+    fn get_resolves_namespaced_skill_by_bare_name() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("atomcode-smoke-test")).unwrap();
+        std::fs::write(
+            d.path().join("atomcode-smoke-test/SKILL.md"),
+            "---\nname: atomcode-smoke-test\ndescription: probe\n---\nbody\n",
+        )
+        .unwrap();
+        let mut reg = SkillRegistry::new();
+        reg.load_dir(d.path(), Some("skills"));
+
+        // Stored under the namespaced key…
+        assert!(reg.get("skills:atomcode-smoke-test").is_some());
+        // …but the bare name the menu submits must resolve too.
+        assert_eq!(
+            reg.get("atomcode-smoke-test").map(|s| s.name.clone()),
+            Some("skills:atomcode-smoke-test".to_string())
+        );
+        // Case-insensitive on the bare fallback (menu names are lowercased,
+        // but a typed capitalisation should still land).
+        assert!(reg.get("Atomcode-Smoke-Test").is_some());
+    }
+
+    /// When two namespaces own the same bare name the reference is ambiguous:
+    /// the bare fallback must decline (the menu shows the qualified form, which
+    /// still resolves via exact match).
+    #[test]
+    fn get_bare_name_is_ambiguous_across_namespaces() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Skill {
+            name: "skills:dup".into(),
+            description: "a".into(),
+            template: "A".into(),
+            allowed_tools: Vec::new(),
+            user_invocable: true,
+            skill_dir: PathBuf::from("a"),
+            source_path: PathBuf::from("a"),
+        });
+        reg.register(Skill {
+            name: "plugin:dup".into(),
+            description: "b".into(),
+            template: "B".into(),
+            allowed_tools: Vec::new(),
+            user_invocable: true,
+            skill_dir: PathBuf::from("b"),
+            source_path: PathBuf::from("b"),
+        });
+        assert!(reg.get("dup").is_none(), "ambiguous bare name must decline");
+        // Qualified names still resolve exactly.
+        assert!(reg.get("skills:dup").is_some());
+        assert!(reg.get("plugin:dup").is_some());
+    }
+
+    /// The `$`/`/skills` menu lists only user-invocable skills and shows a bare
+    /// name when unique AMONG THEM. So a hidden (`user-invocable: false`) skill
+    /// sharing the bare name must NOT make the menu-shown bare name ambiguous —
+    /// otherwise the "menu shows it but resolve fails → 未知技能" bug returns.
+    #[test]
+    fn get_bare_name_prefers_sole_user_invocable_over_hidden() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Skill {
+            name: "skills:review".into(),
+            description: "visible".into(),
+            template: "V".into(),
+            allowed_tools: Vec::new(),
+            user_invocable: true,
+            skill_dir: PathBuf::from("v"),
+            source_path: PathBuf::from("v"),
+        });
+        reg.register(Skill {
+            name: "plugin:review".into(),
+            description: "hidden".into(),
+            template: "H".into(),
+            allowed_tools: Vec::new(),
+            user_invocable: false,
+            skill_dir: PathBuf::from("h"),
+            source_path: PathBuf::from("h"),
+        });
+        assert_eq!(
+            reg.get("review").map(|s| s.name.clone()),
+            Some("skills:review".to_string()),
+            "bare name must resolve to the sole user-invocable skill"
+        );
+    }
+
     #[test]
     fn later_dir_overrides_same_name() {
         let a = tempfile::tempdir().unwrap();
@@ -139,13 +340,40 @@ mod tests {
         std::fs::write(a.path().join("x.md"), "from A\n").unwrap();
         std::fs::write(b.path().join("x.md"), "from B\n").unwrap();
         let reg = SkillRegistry::load(&[a.path().to_path_buf(), b.path().to_path_buf()]);
-        assert!(reg.get("x").unwrap().template.contains("from B"), "later dir wins");
+        assert!(
+            reg.get("x").unwrap().template.contains("from B"),
+            "later dir wins"
+        );
     }
 
     #[test]
     fn missing_dir_is_skipped() {
         let reg = SkillRegistry::load(&[PathBuf::from("/no/such/skills/dir")]);
         assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn standard_dirs_include_agents_skills_between_claude_and_atomcode() {
+        let home = Path::new("/home/u");
+        let project = Path::new("/proj");
+        let dirs = standard_skill_dirs(home, project);
+        // `.agents/skills` is the cross-agent shared convention (opencode et al.) —
+        // scanned at BOTH user and project level so shared skills load directly.
+        assert!(
+            dirs.contains(&home.join(".agents/skills")),
+            "user-level ~/.agents/skills"
+        );
+        assert!(
+            dirs.contains(&project.join(".agents/skills")),
+            "project-level .agents/skills"
+        );
+        // Precedence (last-wins): .claude < .agents < .atomcode at each level, so a
+        // user's atomcode-native skill still overrides a same-named shared one.
+        let pos = |p: PathBuf| dirs.iter().position(|d| *d == p).expect("dir present");
+        assert!(pos(home.join(".claude/skills")) < pos(home.join(".agents/skills")));
+        assert!(pos(home.join(".agents/skills")) < pos(home.join(".atomcode/skills")));
+        assert!(pos(project.join(".claude/skills")) < pos(project.join(".agents/skills")));
+        assert!(pos(project.join(".agents/skills")) < pos(project.join(".atomcode/skills")));
     }
 
     #[test]
@@ -160,13 +388,27 @@ mod tests {
         .unwrap();
         // A skill dir's OWN nested *.md must NOT be mis-loaded as a separate skill.
         std::fs::create_dir_all(d.path().join("top")).unwrap();
-        std::fs::write(d.path().join("top/SKILL.md"), "---\ndescription: top\n---\nTop.\n").unwrap();
-        std::fs::write(d.path().join("top/resource.md"), "internal resource, not a command\n").unwrap();
+        std::fs::write(
+            d.path().join("top/SKILL.md"),
+            "---\ndescription: top\n---\nTop.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.path().join("top/resource.md"),
+            "internal resource, not a command\n",
+        )
+        .unwrap();
 
         let reg = SkillRegistry::load(&[d.path().to_path_buf()]);
-        assert!(reg.get("sub").is_some(), "nested GROUP/sub/SKILL.md must be discovered");
+        assert!(
+            reg.get("sub").is_some(),
+            "nested GROUP/sub/SKILL.md must be discovered"
+        );
         assert_eq!(reg.get("sub").unwrap().description, "nested skill");
         assert!(reg.get("top").is_some(), "top-level skill dir loaded");
-        assert!(reg.get("resource").is_none(), "a skill's own resource .md is not a command");
+        assert!(
+            reg.get("resource").is_none(),
+            "a skill's own resource .md is not a command"
+        );
     }
 }

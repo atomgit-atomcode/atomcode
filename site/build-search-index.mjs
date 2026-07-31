@@ -20,8 +20,8 @@ const LANGS     = ['zh', 'en'];
 const GROUPS = [
   { name: '概览',   slugs: ['index'] },
   { name: '开始',   slugs: ['getting-started', 'login', 'configuration'] },
-  { name: '使用',   slugs: ['basic-usage', 'slash-commands', 'keybindings', 'sessions'] },
-  { name: '进阶',   slugs: ['tools', 'approvals', 'skills', 'mcp', 'plugins', 'memory', 'project-instructions', 'webui', 'webui-remote-access'] },
+  { name: '使用',   slugs: ['basic-usage', 'slash-commands', 'keybindings', 'sessions', 'interactive-questions'] },
+  { name: '进阶',   slugs: ['tools', 'subagents', 'approvals', 'skills', 'mcp', 'plugins', 'memory', 'project-instructions', 'webui', 'webui-remote-access'] },
   { name: '运维',   slugs: ['faq'] },
 ];
 

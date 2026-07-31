@@ -8,13 +8,83 @@
 // Renders as a MenuPayload above the input box.
 
 use anyhow::Result;
-use atomcode_core::config::Config;
+use atomcode_config::config::Config;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
-use crate::event_loop::{build_status, save_and_reload, Buffer, LoopCtx};
+use crate::event_loop::{build_status, set_default_provider_and_reload, Buffer, LoopCtx};
 use crate::render::{MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelCycleDirection {
+    Next,
+    Previous,
+}
+
+/// Map the global model-cycle shortcuts without stealing other modified
+/// function keys from the host terminal or future bindings.
+pub(crate) fn model_cycle_direction(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> Option<ModelCycleDirection> {
+    match (code, modifiers) {
+        (KeyCode::F(2), KeyModifiers::NONE) => Some(ModelCycleDirection::Next),
+        (KeyCode::F(2), KeyModifiers::SHIFT) => Some(ModelCycleDirection::Previous),
+        _ => None,
+    }
+}
+
+/// Pick the adjacent model profile in stable id order and wrap at both ends.
+/// `/model` exposes the unified model catalog (legacy providers project to one
+/// model each), so the shortcut follows that same source of truth.
+/// Selection ids ordered so models from the same account are adjacent (sort by
+/// `(account, wire model)`), matching the `/model` list order (design §8).
+fn grouped_selection_ids(config: &Config) -> Vec<String> {
+    let models = config.logical_models();
+    let mut ids: Vec<String> = models.keys().cloned().collect();
+    ids.sort_by(|a, b| {
+        let key = |id: &String| {
+            models
+                .get(id)
+                .map(|m| (m.account.clone(), m.model.clone()))
+                .unwrap_or_else(|| (id.clone(), String::new()))
+        };
+        key(a).cmp(&key(b))
+    });
+    ids
+}
+
+pub(crate) fn adjacent_provider(config: &Config, direction: ModelCycleDirection) -> Option<String> {
+    let ids = grouped_selection_ids(config);
+    if ids.len() < 2 {
+        return None;
+    }
+
+    let current = config.effective_model_selection().unwrap_or_default();
+    let pos = ids
+        .iter()
+        .position(|id| *id == current)
+        .unwrap_or(match direction {
+            ModelCycleDirection::Next => ids.len() - 1,
+            ModelCycleDirection::Previous => 0,
+        });
+    let target = match direction {
+        ModelCycleDirection::Next => (pos + 1) % ids.len(),
+        ModelCycleDirection::Previous => (pos + ids.len() - 1) % ids.len(),
+    };
+    Some(ids[target].clone())
+}
+
+/// Whether `/model` has anything selectable in either supported config schema.
+///
+/// `config.providers` only covers the legacy schema. The picker itself is built
+/// from `logical_models()`, so its open guard must use that same unified
+/// catalog or native `provider_accounts + models` configurations are rejected
+/// before the picker can render them.
+pub(crate) fn has_selectable_models(config: &Config) -> bool {
+    !config.logical_models().is_empty()
+}
 
 pub struct ModelPicker {
     /// All provider names, sorted alphabetically with the current default first.
@@ -30,13 +100,27 @@ pub struct ModelPicker {
 
 impl ModelPicker {
     pub fn open(config: &Config) -> Self {
-        let mut providers: Vec<String> = config.providers.keys().cloned().collect();
-        providers.sort();
-        // Put the current default at top for quick re-confirmation.
-        let cur = config.default_provider.clone();
-        if let Some(idx) = providers.iter().position(|p| *p == cur) {
-            providers.swap(0, idx);
-        }
+        // Group models from the same account together (design §8). Bring the
+        // current selection's WHOLE account group to the top (current first
+        // within it) so switching between siblings is easy and the group stays
+        // intact — never split the default out of its group.
+        let grouped = grouped_selection_ids(config);
+        let cur = config.effective_model_selection().unwrap_or_default();
+        let models = config.logical_models();
+        let account_of = |id: &str| models.get(id).map(|m| m.account.clone());
+        let providers = if let Some(cur_account) = account_of(&cur) {
+            let (mut group, rest): (Vec<String>, Vec<String>) = grouped
+                .into_iter()
+                .partition(|id| account_of(id).as_deref() == Some(cur_account.as_str()));
+            if let Some(i) = group.iter().position(|x| *x == cur) {
+                let current = group.remove(i);
+                group.insert(0, current);
+            }
+            group.extend(rest);
+            group
+        } else {
+            grouped
+        };
         let filtered: Vec<usize> = (0..providers.len()).collect();
         Self {
             providers,
@@ -46,29 +130,41 @@ impl ModelPicker {
         }
     }
 
-    /// Recompute `filtered` from `query`, matching against provider name,
-    /// provider_type, and model (all case-insensitive substring).
+    /// Recompute `filtered` from `query`, matching against the selection id,
+    /// account, wire model name, and display name (all case-insensitive).
     pub fn update_filter(&mut self, config: &Config) {
         let q = self.query.to_lowercase();
+        let models = config.logical_models();
+        let accounts = config.logical_accounts();
         self.filtered = self
             .providers
             .iter()
             .enumerate()
-            .filter(|(_, name)| {
+            .filter(|(_, id)| {
                 if q.is_empty() {
                     return true;
                 }
-                // Match provider name
-                if name.to_lowercase().contains(&q) {
+                if id.to_lowercase().contains(&q) {
                     return true;
                 }
-                // Match provider_type and model from config
-                if let Some(c) = config.providers.get(*name) {
-                    if c.provider_type.to_lowercase().contains(&q) {
+                if let Some(m) = models.get(*id) {
+                    if m.model.to_lowercase().contains(&q) {
                         return true;
                     }
-                    if c.model.to_lowercase().contains(&q) {
+                    if m.account.to_lowercase().contains(&q) {
                         return true;
+                    }
+                    if m.display_name
+                        .as_deref()
+                        .is_some_and(|d| d.to_lowercase().contains(&q))
+                    {
+                        return true;
+                    }
+                    // Vendor / protocol (the account's preset id).
+                    if let Some(a) = accounts.get(&m.account) {
+                        if a.provider.to_lowercase().contains(&q) {
+                            return true;
+                        }
                     }
                 }
                 false
@@ -142,81 +238,48 @@ impl Modal for ModelPicker {
                     Some(p) => p.to_string(),
                     None => return Ok(ModalAction::Close),
                 };
-                let display = ctx
-                    .config
-                    .providers
-                    .get(&chosen)
-                    .map(|p| p.model.clone())
-                    .unwrap_or_else(|| chosen.clone());
-                ctx.config.default_provider = chosen.clone();
-                ctx.model_name = display.clone();
-                // Refresh the footer's context window NOW. The `used/window`
-                // pair comes from the cached ContextStats snapshot, which is
-                // only updated during a turn — switching models fires none, so
-                // without this the denominator stays pinned to the previous
-                // model's window (e.g. 10.1k/200k after switching to a 128k
-                // model). `default_provider` was just set above, so the lookup
-                // returns the new model's window.
-                state.on_model_window_changed(ctx.config.default_context_window());
-                // Persist to config.toml + notify agent. Without this,
-                // the switch lives only in memory and the next startup
-                // reverts to whatever was last saved.
-                save_and_reload(ctx, renderer);
-                // Live-sync: broadcast this switch so an attached webui's model
-                // dropdown follows. No-op when no live session exists (it just
-                // updates the process-level selection, which is harmless).
-                atomcode_daemon::live_set_provider(chosen.clone());
-                // Clear any stale drift warning tied to the PREVIOUS
-                // active provider — if the new provider is also CodingPlan,
-                // the re-fire below will repopulate the slot with a
-                // correct warning (or leave it clean).
-                if let Ok(mut g) = ctx.monitor_warning.lock() {
-                    *g = None;
+                if set_default_provider_and_reload(ctx, &chosen, renderer) {
+                    Ok(ModalAction::Close)
+                } else {
+                    self.draw(buf, state, ctx, renderer);
+                    Ok(ModalAction::Continue)
                 }
-                // Same treatment for the usage slot: switching providers
-                // invalidates the previous CodingPlan's quota snapshot.
-                // Clearing here makes `build_usage_hint` short-circuit to
-                // None until a fresh fetch lands; otherwise the user would
-                // briefly see the OLD plan's percent on the new provider.
-                if let Ok(mut g) = ctx.usage_slot.lock() {
-                    *g = None;
-                }
-                // Re-fire the drift check if the new provider is also
-                // CodingPlan-managed. Bypasses the 15-min cooldown on
-                // purpose — explicit user action deserves a fresh read.
-                if crate::event_loop::monitor::is_codingplan_provider(&chosen) {
-                    ctx.monitor_last_check_at = Some(std::time::Instant::now());
-                    crate::event_loop::monitor::spawn_check(
-                        ctx.config.clone(),
-                        ctx.model_name.clone(),
-                        ctx.monitor_warning.clone(),
-                        ctx.wake_tx.clone(),
-                    );
-                    // Mirror: re-fire usage check too. 30s cooldown is
-                    // bypassed because the user just made an explicit
-                    // switch — they want fresh data, not stale 30s data.
-                    ctx.usage_last_check_at = Some(std::time::Instant::now());
-                    crate::event_loop::usage_monitor::spawn_check(
-                        ctx.usage_slot.clone(),
-                        ctx.wake_tx.clone(),
-                    );
-                }
-                renderer.render(UiLine::CommandOutput(
-                    crate::i18n::t(crate::i18n::Msg::ModelSwitched { provider: &chosen, model: &display }).into_owned(),
-                ));
-                renderer.flush();
-                Ok(ModalAction::Close)
             }
             KeyCode::Esc => Ok(ModalAction::Close),
             _ => Ok(ModalAction::Continue),
         }
     }
 
-    fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    fn handle_paste(
+        &mut self,
+        text: &str,
+        buf: &mut Buffer,
+        state: &mut UiState,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<ModalAction> {
+        // Paste goes into the query, not the main buffer
+        for c in text.chars() {
+            if c.is_control() {
+                continue; // skip newlines/control characters
+            }
+            self.query.push(c);
+        }
+        self.update_filter(&ctx.config);
+        self.selected = 0;
+        self.draw(buf, state, ctx, renderer);
+        Ok(ModalAction::Continue)
+    }
+
+    fn draw(&self, _buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
         let payload = build_menu_payload(self, ctx);
+        // Show the typed filter query as the editable input line (not the main
+        // buffer, which stays untouched while the modal is open). Typing routes
+        // into `self.query`; rendering `buf.text` here would leave the input box
+        // blank even though filtering works. Mirrors `dir_picker`.
         renderer.render(UiLine::InputPrompt {
-            buf: buf.text.clone(),
-            cursor_byte: buf.cursor,
+            buf: self.query.clone(),
+            cursor_byte: self.query.len(),
             menu: Some(payload),
             status: build_status(state, ctx),
             attachments: Vec::new(),
@@ -231,47 +294,52 @@ fn build_menu_payload(p: &ModelPicker, ctx: &LoopCtx) -> MenuPayload {
     // renders as blank space and looks like the modal hung).
     if p.filtered.is_empty() {
         let label = if p.providers.is_empty() {
-            "(no providers configured — use /provider add)".to_string()
+            "(no models configured — use /provider add)".to_string()
         } else if p.query.is_empty() {
-            "(no providers match)".to_string()
+            "(no models match)".to_string()
         } else {
-            format!(
-                "(no providers match \"{}\" — Backspace to clear)",
-                p.query
-            )
+            format!("(no models match \"{}\" — Backspace to clear)", p.query)
         };
         return MenuPayload {
             items: vec![(label, String::new())],
             selected: 0,
-            kind: crate::render::MenuKind::TwoColumn { row_prefix: "", selected_marker: "▸" },
+            kind: crate::render::MenuKind::TwoColumn {
+                row_prefix: "",
+                selected_marker: "▸",
+            },
         };
     }
+    let models = ctx.config.logical_models();
     let items: Vec<(String, String)> = p
         .filtered
         .iter()
         .map(|&idx| {
-            let name = &p.providers[idx];
-            let desc = ctx
-                .config
-                .providers
-                .get(name)
-                .map(|c| format!("{} · {}", c.provider_type, c.model))
+            let id = &p.providers[idx];
+            let desc = models
+                .get(id)
+                .map(|m| {
+                    let name = m.display_name.as_deref().unwrap_or(&m.model);
+                    format!("{} · {}", m.account, name)
+                })
                 .unwrap_or_default();
-            (name.clone(), desc)
+            (id.clone(), desc)
         })
         .collect();
     MenuPayload {
         items,
         selected: p.selected,
-        kind: crate::render::MenuKind::TwoColumn { row_prefix: "", selected_marker: "▸" },
+        kind: crate::render::MenuKind::TwoColumn {
+            row_prefix: "",
+            selected_marker: "▸",
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomcode_core::config::provider::ProviderConfig;
-    use atomcode_core::config::Config;
+    use atomcode_config::config::provider::ProviderConfig;
+    use atomcode_config::config::Config;
     fn make_config(providers: Vec<(&str, &str, &str)>, default: &str) -> Config {
         use std::collections::HashMap;
         let mut map: HashMap<String, ProviderConfig> = HashMap::new();
@@ -295,6 +363,8 @@ mod tests {
                     thinking_budget: None,
                     skip_tls_verify: false,
                     ephemeral: false,
+                    capable_model: None,
+                    pricing: None,
                 },
             );
         }
@@ -307,7 +377,10 @@ mod tests {
     #[test]
     fn open_shows_all_providers_initially() {
         let config = make_config(
-            vec![("alpha", "openai", "gpt-4"), ("beta", "anthropic", "claude-3")],
+            vec![
+                ("alpha", "openai", "gpt-4"),
+                ("beta", "anthropic", "claude-3"),
+            ],
             "alpha",
         );
         let p = ModelPicker::open(&config);
@@ -318,9 +391,83 @@ mod tests {
     }
 
     #[test]
+    fn open_groups_same_account_models_together() {
+        // Two models on one account must stay adjacent even when a legacy
+        // provider's id sorts between them; and the current selection's group
+        // leads without splitting the sibling out.
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "aaa",
+            "providers": { "mmm": { "type": "openai", "base_url": "https://x/v1", "model": "m", "context_window": 8000 } },
+            "provider_accounts": { "openrouter": { "provider": "openrouter" } },
+            "models": {
+                "aaa": { "account": "openrouter", "model": "model-a", "context_window": 8000 },
+                "zzz": { "account": "openrouter", "model": "model-z", "context_window": 8000 }
+            }
+        }))
+        .unwrap();
+        let p = ModelPicker::open(&config);
+        assert_eq!(p.providers[0], "aaa"); // current selection leads
+        let pos = |id: &str| p.providers.iter().position(|x| x == id).unwrap();
+        let (a, z, m) = (pos("aaa"), pos("zzz"), pos("mmm"));
+        assert!(
+            !(m > a.min(z) && m < a.max(z)),
+            "legacy provider split the account group: {:?}",
+            p.providers
+        );
+    }
+
+    #[test]
+    fn open_lists_new_schema_model_profiles() {
+        // One account, two model profiles — the picker lists them by selection
+        // id, current default first, and filters by wire model name.
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "acc/coder",
+            "provider_accounts": { "acc": { "provider": "deepseek" } },
+            "models": {
+                "acc/coder": { "account": "acc", "model": "deepseek-coder", "context_window": 131072 },
+                "acc/chat":  { "account": "acc", "model": "deepseek-chat",   "context_window": 131072 }
+            }
+        }))
+        .unwrap();
+        let p = ModelPicker::open(&config);
+        assert_eq!(p.filtered.len(), 2);
+        assert_eq!(p.providers[0], "acc/coder"); // default selection first
+        assert!(p.providers.contains(&"acc/chat".to_string()));
+
+        let mut p2 = ModelPicker::open(&config);
+        p2.query = "chat".into();
+        p2.update_filter(&config);
+        assert_eq!(p2.filtered.len(), 1);
+        assert_eq!(p2.providers[p2.filtered[0]], "acc/chat");
+    }
+
+    #[test]
+    fn model_command_accepts_new_schema_model_profiles() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "acc/coder",
+            "provider_accounts": { "acc": { "provider": "deepseek" } },
+            "models": {
+                "acc/coder": {
+                    "account": "acc",
+                    "model": "deepseek-coder",
+                    "context_window": 131072
+                }
+            }
+        }))
+        .unwrap();
+
+        assert!(config.providers.is_empty(), "legacy table stays empty");
+        assert!(has_selectable_models(&config));
+        assert!(!has_selectable_models(&Config::default()));
+    }
+
+    #[test]
     fn update_filter_matches_by_name_case_insensitive() {
         let config = make_config(
-            vec![("Alpha", "openai", "gpt-4"), ("Beta", "anthropic", "claude-3")],
+            vec![
+                ("Alpha", "openai", "gpt-4"),
+                ("Beta", "anthropic", "claude-3"),
+            ],
             "Alpha",
         );
         let mut p = ModelPicker::open(&config);
@@ -333,7 +480,10 @@ mod tests {
     #[test]
     fn update_filter_matches_by_provider_type() {
         let config = make_config(
-            vec![("alpha", "openai", "gpt-4"), ("beta", "anthropic", "claude-3")],
+            vec![
+                ("alpha", "openai", "gpt-4"),
+                ("beta", "anthropic", "claude-3"),
+            ],
             "alpha",
         );
         let mut p = ModelPicker::open(&config);
@@ -346,7 +496,10 @@ mod tests {
     #[test]
     fn update_filter_matches_by_model() {
         let config = make_config(
-            vec![("alpha", "openai", "gpt-4"), ("beta", "anthropic", "claude-3")],
+            vec![
+                ("alpha", "openai", "gpt-4"),
+                ("beta", "anthropic", "claude-3"),
+            ],
             "alpha",
         );
         let mut p = ModelPicker::open(&config);
@@ -359,7 +512,10 @@ mod tests {
     #[test]
     fn update_filter_empty_query_shows_all() {
         let config = make_config(
-            vec![("alpha", "openai", "gpt-4"), ("beta", "anthropic", "claude-3")],
+            vec![
+                ("alpha", "openai", "gpt-4"),
+                ("beta", "anthropic", "claude-3"),
+            ],
             "alpha",
         );
         let mut p = ModelPicker::open(&config);
@@ -374,7 +530,10 @@ mod tests {
     #[test]
     fn update_filter_resets_selection_to_zero() {
         let config = make_config(
-            vec![("alpha", "openai", "gpt-4"), ("beta", "anthropic", "claude-3")],
+            vec![
+                ("alpha", "openai", "gpt-4"),
+                ("beta", "anthropic", "claude-3"),
+            ],
             "alpha",
         );
         let mut p = ModelPicker::open(&config);
@@ -387,7 +546,11 @@ mod tests {
     #[test]
     fn down_and_up_stay_within_filtered_bounds() {
         let config = make_config(
-            vec![("a", "openai", "gpt-4"), ("b", "anthropic", "claude-3"), ("c", "openai", "gpt-3.5")],
+            vec![
+                ("a", "openai", "gpt-4"),
+                ("b", "anthropic", "claude-3"),
+                ("c", "openai", "gpt-3.5"),
+            ],
             "a",
         );
         let mut p = ModelPicker::open(&config);
@@ -408,7 +571,10 @@ mod tests {
     #[test]
     fn chosen_returns_provider_at_selected() {
         let config = make_config(
-            vec![("alpha", "openai", "gpt-4"), ("beta", "anthropic", "claude-3")],
+            vec![
+                ("alpha", "openai", "gpt-4"),
+                ("beta", "anthropic", "claude-3"),
+            ],
             "alpha",
         );
         let p = ModelPicker::open(&config);
@@ -416,11 +582,79 @@ mod tests {
     }
 
     #[test]
-    fn chosen_returns_none_when_filter_empty() {
+    fn f2_shortcuts_map_to_cycle_directions() {
+        assert_eq!(
+            model_cycle_direction(KeyCode::F(2), KeyModifiers::NONE),
+            Some(ModelCycleDirection::Next)
+        );
+        assert_eq!(
+            model_cycle_direction(KeyCode::F(2), KeyModifiers::SHIFT),
+            Some(ModelCycleDirection::Previous)
+        );
+        assert_eq!(
+            model_cycle_direction(KeyCode::F(2), KeyModifiers::CONTROL),
+            None
+        );
+        assert_eq!(
+            model_cycle_direction(KeyCode::F(3), KeyModifiers::NONE),
+            None
+        );
+    }
+
+    #[test]
+    fn adjacent_provider_cycles_in_stable_sorted_order() {
         let config = make_config(
-            vec![("alpha", "openai", "gpt-4")],
+            vec![
+                ("charlie", "openai", "gpt-4"),
+                ("alpha", "anthropic", "claude-3"),
+                ("bravo", "ollama", "qwen"),
+            ],
+            "bravo",
+        );
+
+        assert_eq!(
+            adjacent_provider(&config, ModelCycleDirection::Next).as_deref(),
+            Some("charlie")
+        );
+        assert_eq!(
+            adjacent_provider(&config, ModelCycleDirection::Previous).as_deref(),
+            Some("alpha")
+        );
+    }
+
+    #[test]
+    fn adjacent_provider_wraps_and_ignores_single_provider() {
+        let first = make_config(
+            vec![
+                ("charlie", "openai", "gpt-4"),
+                ("alpha", "anthropic", "claude-3"),
+            ],
             "alpha",
         );
+        assert_eq!(
+            adjacent_provider(&first, ModelCycleDirection::Previous).as_deref(),
+            Some("charlie")
+        );
+
+        let last = make_config(
+            vec![
+                ("charlie", "openai", "gpt-4"),
+                ("alpha", "anthropic", "claude-3"),
+            ],
+            "charlie",
+        );
+        assert_eq!(
+            adjacent_provider(&last, ModelCycleDirection::Next).as_deref(),
+            Some("alpha")
+        );
+
+        let only = make_config(vec![("alpha", "openai", "gpt-4")], "alpha");
+        assert_eq!(adjacent_provider(&only, ModelCycleDirection::Next), None);
+    }
+
+    #[test]
+    fn chosen_returns_none_when_filter_empty() {
+        let config = make_config(vec![("alpha", "openai", "gpt-4")], "alpha");
         let mut p = ModelPicker::open(&config);
         p.query = "zzz".to_string();
         p.update_filter(&config);

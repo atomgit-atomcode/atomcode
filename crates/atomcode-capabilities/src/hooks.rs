@@ -35,7 +35,10 @@ pub struct WireLogHooks {
 impl WireLogHooks {
     /// Log to stderr as pretty JSON.
     pub fn stderr() -> Self {
-        Self { sink: Arc::new(|s| eprintln!("{s}")), pretty: true }
+        Self {
+            sink: Arc::new(|s| eprintln!("{s}")),
+            pretty: true,
+        }
     }
 
     /// Log via a custom sink (file writer / tracing bridge / test buffer / …).
@@ -54,7 +57,10 @@ impl WireLogHooks {
     /// just `with_sink` wired to a file handle — the injectable-sink design means a new
     /// destination costs a few lines, no change to the hook itself.
     pub fn to_file(path: impl Into<PathBuf>) -> std::io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path.into())?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.into())?;
         let file = Arc::new(Mutex::new(file));
         Ok(Self::with_sink(Arc::new(move |s: &str| {
             if let Ok(mut f) = file.lock() {
@@ -146,11 +152,17 @@ mod tests {
             cache_epoch: 7,
             ..Default::default()
         };
-        hooks.on_request(&msgs, &tools, &ChatOptions::default(), &ctx).await;
+        hooks
+            .on_request(&msgs, &tools, &ChatOptions::default(), &ctx)
+            .await;
 
         let mut resp = Message::assistant(
             "calling tool",
-            vec![ToolCall { id: "c1".into(), name: "get_time".into(), arguments: "{}".into() }],
+            vec![ToolCall {
+                id: "c1".into(),
+                name: "get_time".into(),
+                arguments: "{}".into(),
+            }],
         );
         hooks.on_model_response(&mut resp).await;
 
@@ -158,21 +170,42 @@ mod tests {
         // request side
         assert!(log.contains("[wire] request"), "log: {log}");
         assert!(log.contains("sess-x"), "request must include session_id");
-        assert!(log.contains("\"turn_id\": 3"), "request must include turn_id");
-        assert!(log.contains("\"request_id\": 9"), "request must include request_id");
-        assert!(log.contains("\"hi there\""), "request must include the user message");
-        assert!(log.contains("\"get_time\""), "request must include the tool name");
-        assert!(log.contains("\"cache_epoch\": 7"), "request must include the epoch");
+        assert!(
+            log.contains("\"turn_id\": 3"),
+            "request must include turn_id"
+        );
+        assert!(
+            log.contains("\"request_id\": 9"),
+            "request must include request_id"
+        );
+        assert!(
+            log.contains("\"hi there\""),
+            "request must include the user message"
+        );
+        assert!(
+            log.contains("\"get_time\""),
+            "request must include the tool name"
+        );
+        assert!(
+            log.contains("\"cache_epoch\": 7"),
+            "request must include the epoch"
+        );
         // response side
         assert!(log.contains("response"));
-        assert!(log.contains("\"calling tool\""), "response must include assistant text");
-        assert!(log.contains("\"c1\""), "response must include the tool call");
+        assert!(
+            log.contains("\"calling tool\""),
+            "response must include assistant text"
+        );
+        assert!(
+            log.contains("\"c1\""),
+            "response must include the tool call"
+        );
     }
 
     #[tokio::test]
     async fn to_file_appends_entries() {
-        let path = std::env::temp_dir()
-            .join(format!("atomcode_wirelog_test_{}.log", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("atomcode_wirelog_test_{}.log", std::process::id()));
         let _ = std::fs::remove_file(&path);
         {
             let hooks = WireLogHooks::to_file(&path).expect("open temp log file");
@@ -186,11 +219,19 @@ mod tests {
                 ..Default::default()
             };
             hooks
-                .on_request(&[Message::user("file-test-msg")], &[], &ChatOptions::default(), &ctx)
+                .on_request(
+                    &[Message::user("file-test-msg")],
+                    &[],
+                    &ChatOptions::default(),
+                    &ctx,
+                )
                 .await;
         }
         let contents = std::fs::read_to_string(&path).expect("read log file");
-        assert!(contents.contains("file-test-msg"), "log must contain request: {contents}");
+        assert!(
+            contents.contains("file-test-msg"),
+            "log must contain request: {contents}"
+        );
         assert!(contents.contains("[wire] request"));
         let _ = std::fs::remove_file(&path);
     }
@@ -199,11 +240,18 @@ mod tests {
     async fn logs_errors_to_sink() {
         let buf = Arc::new(Mutex::new(Vec::<String>::new()));
         let captured = buf.clone();
-        let hooks = WireLogHooks::with_sink(Arc::new(move |s: &str| captured.lock().unwrap().push(s.to_string())));
-        hooks.on_error("HTTP 400: [invalid_request_error/model_not_found] no such model").await;
+        let hooks = WireLogHooks::with_sink(Arc::new(move |s: &str| {
+            captured.lock().unwrap().push(s.to_string())
+        }));
+        hooks
+            .on_error("HTTP 400: [invalid_request_error/model_not_found] no such model")
+            .await;
         let log = buf.lock().unwrap().join("\n");
         assert!(log.contains("[wire] error"), "log: {log}");
-        assert!(log.contains("model_not_found"), "error code+reason must be logged: {log}");
+        assert!(
+            log.contains("model_not_found"),
+            "error code+reason must be logged: {log}"
+        );
     }
 
     #[tokio::test]

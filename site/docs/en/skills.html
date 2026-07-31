@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.25.9</span>
+    <span class="dhdr-ver">v5.0.3</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -51,11 +51,13 @@
     <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
     <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
     <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
   </div>
 
   <div class="dside-group">
     <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
     <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
     <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
     <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
     <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
@@ -138,6 +140,7 @@ When the user says "ship a new version", "cut a release", or "tag it".
 
       <h3>Via the <code>$</code> menu</h3>
       <p>Type a <code>$</code> at the start of the input box to pop up a skills menu (the same set of invocable skills that <code>/skills</code> lists); keep typing to filter, press <code>Tab</code> to complete the highlighted name, and submit <code>$&lt;name&gt; [args]</code> to invoke that skill. It's a parallel entry point to slash commands: <code>/</code> drives slash-command completion, while <code>$</code> is dedicated to picking a skill and can carry arguments inline, e.g. <code>$brainstorming help me design login</code>.</p>
+      <p>In v5.0.3, <code>/skills</code> can match several skill names or fragments in one request and echoes the skills that were actually loaded. Newly installed skills are refreshed automatically, so a restart is normally unnecessary.</p>
 
       <h3>Model-driven invocation</h3>
       <p>The model can call the <code>use_skill</code> tool itself to run a relevant skill as a sub-flow. If you say "publish a new version", the model may pick this skill on its own without you typing <code>/release</code>.</p>

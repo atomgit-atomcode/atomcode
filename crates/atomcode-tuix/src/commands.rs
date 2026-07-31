@@ -10,6 +10,11 @@ pub struct Command {
     /// Commands that do something sensible with no arg (e.g. `/cd` opens the
     /// recent-dirs picker, `/help` prints help) leave this `false`.
     pub needs_args: bool,
+    /// Hidden commands are still dispatchable but are excluded from the `/`
+    /// slash-menu, Tab completion, and `/help` output. Use this for deprecated
+    /// aliases that must keep working for muscle memory / scripting without
+    /// cluttering the discovery surfaces.
+    pub hidden: bool,
 }
 
 pub struct CommandRegistry {
@@ -31,10 +36,12 @@ impl CommandRegistry {
         // Built-in command names are all ASCII, so an ASCII
         // case-insensitive match is equivalent to a Unicode-correct
         // one here. `/SESSION` resolves to the same `session` entry
-        // as `/session`.
+        // as `/session`. Aliases resolve to their canonical command first,
+        // so `find("new")` returns the `session` entry (and its `needs_args`).
+        let canonical = canonical_command_name(name);
         self.commands
             .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .find(|c| c.name.eq_ignore_ascii_case(canonical))
             .copied()
     }
 
@@ -42,7 +49,7 @@ impl CommandRegistry {
         let prefix_lower = prefix.to_ascii_lowercase();
         self.commands
             .iter()
-            .filter(|c| c.name.starts_with(prefix_lower.as_str()))
+            .filter(|c| !c.hidden && command_name_or_alias_has_prefix(c.name, &prefix_lower))
             .copied()
             .collect()
     }
@@ -52,11 +59,12 @@ impl CommandRegistry {
         let max_name = self
             .commands
             .iter()
+            .filter(|c| !c.hidden)
             .map(|c| c.name.len())
             .max()
             .unwrap_or(6);
         let mut out = t(Msg::HelpAvailableCommands).into_owned();
-        for c in self.commands {
+        for c in self.commands.iter().filter(|c| !c.hidden) {
             let desc = cmd_desc_i18n(c.name).unwrap_or_else(|| c.desc.into());
             out.push_str(&format!(
                 "    /{:<width$}  {}\n",
@@ -69,101 +77,131 @@ impl CommandRegistry {
     }
 }
 
-/// Whether the `/app` mobile-remote command is exposed. Hidden by default until
-/// the AtomCode mobile app launches: the full implementation (dispatch arm +
-/// relay plumbing) is kept intact, but the command is off the palette /
-/// completion / `/help` and reads as an unknown command when typed.
+/// Alias → canonical built-in command name.
 ///
-/// Internal testing (联调) can re-enable it WITHOUT a rebuild by setting
-/// `ATOMCODE_ENABLE_APP=1` (any non-empty value) — mirrors the existing
-/// `ATOMCODE_APP_RELAY` internal-override convention. Normal users never set
-/// this, so the feature stays invisible to the public.
-///
-/// At launch: delete this gate, uncomment the `/app` entry in `BUILTIN_COMMANDS`,
-/// and remove the guard in the dispatch `"app"` arm. (A `fn`, not a `const`, so
-/// the call site doesn't const-fold into an `unreachable_code` warning.)
-pub(crate) fn app_remote_enabled() -> bool {
-    std::env::var("ATOMCODE_ENABLE_APP")
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false)
+/// Unlike a hidden duplicate `Command` entry (the old `exit`/`quit` style), an
+/// alias is NOT a separate registry row: it shares the canonical command's
+/// single entry, is searchable by its own prefix in the slash menu, resolves to
+/// the canonical name on dispatch, and renders as `canonical (alias)` — one
+/// annotated row, not two. Add a pair here to give any command an alias.
+const COMMAND_ALIASES: &[(&str, &str)] = &[
+    // `/new` is a memorable alias for `/session` (start a fresh session).
+    ("new", "session"),
+];
+
+/// Resolve an alias to its canonical command name (ASCII case-insensitive).
+/// Returns the input unchanged when it is not a known alias — so it is safe to
+/// call on every command name before dispatch.
+pub fn canonical_command_name(name: &str) -> &str {
+    COMMAND_ALIASES
+        .iter()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(name))
+        .map(|(_, canonical)| *canonical)
+        .unwrap_or(name)
+}
+
+/// The aliases that resolve to `canonical`, in table order.
+fn aliases_for(canonical: &str) -> impl Iterator<Item = &'static str> + '_ {
+    COMMAND_ALIASES
+        .iter()
+        .filter(move |(_, c)| c.eq_ignore_ascii_case(canonical))
+        .map(|(alias, _)| *alias)
+}
+
+/// True when `prefix_lower` (already lowercased) is a prefix of the command
+/// name OR of any of its aliases. Lets `/ne` surface the `session` command
+/// while `session` stays a single entry.
+fn command_name_or_alias_has_prefix(name: &str, prefix_lower: &str) -> bool {
+    name.starts_with(prefix_lower) || aliases_for(name).any(|a| a.starts_with(prefix_lower))
+}
+
+/// Slash-menu display label for a command: `session (new)` when it has
+/// aliases, else just the name. The renderer uses this so an alias shows as one
+/// annotated row; the stored item name stays canonical for insert/dispatch.
+pub fn command_display_name(canonical: &str) -> String {
+    let joined = aliases_for(canonical).collect::<Vec<_>>().join(", ");
+    if joined.is_empty() {
+        canonical.to_string()
+    } else {
+        format!("{canonical} ({joined})")
+    }
 }
 
 const BUILTIN_COMMANDS: &[Command] = &[
-    Command { name: "login",   desc: "Sign in with AtomGit OAuth and claim CodingPlan models", needs_args: false },
+    Command { name: "login",   desc: "Sign in with AtomGit OAuth and claim CodingPlan models", needs_args: false, hidden: false },
     // needs_args=true so selecting it only completes to `/webui ` (does NOT
     // launch) — lets the user append a subcommand (stop / lan / --host <addr>)
     // before Enter. A bare `/webui ` + Enter still launches on 127.0.0.1.
-    Command { name: "webui",   desc: "Launch the browser webui (subcommands: stop, lan, --host <addr>)", needs_args: true },
-    Command { name: "sync",    desc: "Attach to live webui session (/sync off to detach)", needs_args: false },
-    // HIDDEN until the mobile app launches — kept off the palette / completion /
-    // /help. Internal testing can still run /app by typing it with
-    // ATOMCODE_ENABLE_APP=1 set (see `app_remote_enabled()`); at launch, uncomment
-    // this entry and remove that gate.
-    // needs_args=true：补全只到 `/app `，让用户可追加中继地址或 `stop` 再回车。
-    // 裸 `/app ` + 回车则用环境变量 ATOMCODE_APP_RELAY。
-    // Command { name: "app",     desc: "Expose this session to the mobile App via relay (QR pairing; /app stop to detach)", needs_args: true },
-    Command { name: "setup",      desc: "First run: install recommender skill + run it. Extra text forwarded as a steering hint", needs_args: true },
-    Command { name: "resume",  desc: "Resume a previous session", needs_args: false },
-    Command { name: "rename",  desc: "Rename current session", needs_args: true },
-    Command { name: "logout",  desc: "Sign out of AtomGit", needs_args: false },
-    Command { name: "whoami",  desc: "Show current logged-in user", needs_args: false },
-    Command { name: "model",   desc: "Switch provider / model", needs_args: false },
-    Command { name: "provider", desc: "Manage providers (add / edit / delete)", needs_args: false },
-    Command { name: "proxy",   desc: "Switch outbound proxy mode", needs_args: false },
-    Command { name: "status",  desc: "Show session status", needs_args: false },
-    Command { name: "config",  desc: "Show config path", needs_args: false },
-    Command { name: "reload",  desc: "Reload ~/.atomcode/config.toml from disk", needs_args: false },
-    Command { name: "cd",      desc: "Change working directory", needs_args: false },
-    Command { name: "init",    desc: "Generate .atomcode.md project instructions from the working directory", needs_args: false },
-    Command { name: "bg",      desc: "Background sessions: /bg, /bg list, /bg <N>, /bg drop <N>", needs_args: false },
-    Command { name: "background", desc: "Compatibility alias: start a one-shot task in a /bg slot", needs_args: true },
-    Command { name: "diff",    desc: "Show git diff", needs_args: false },
-    Command { name: "clear",   desc: "Start a new conversation (clears context + screen)", needs_args: false },
-    Command { name: "session", desc: "Start a new session (clears conversation)", needs_args: false },
-    Command { name: "cost",    desc: "Show token cost", needs_args: false },
-    Command { name: "context", desc: "Show context budget breakdown", needs_args: false },
-    Command { name: "compact", desc: "Compact conversation history", needs_args: false },
-    Command { name: "remember", desc: "Save a fact to memory (/remember --global for global)", needs_args: true },
-    Command { name: "forget", desc: "Remove matching memories", needs_args: true },
-    Command { name: "memory", desc: "Show all saved memories", needs_args: false },
-    Command { name: "mcp",     desc: "Show MCP server status (subcommands: reload, tools, login, logout)", needs_args: false },
-    Command { name: "undo",    desc: "Undo a turn (memory rollback): /undo or /undo N", needs_args: true },
-    Command { name: "worktree", desc: "Git worktree isolation (create/list/done/cleanup)", needs_args: true },
-    Command { name: "upgrade", desc: "Upgrade atomcode to latest (subcommand: rollback)", needs_args: false },
-    Command { name: "issue",   desc: "Report a bug / request a feature for AtomCode itself (interactive wizard)", needs_args: false },
-    Command { name: "plan",    desc: "Switch to Plan mode (read-only exploration)", needs_args: false },
-    Command { name: "build",   desc: "Switch to Build mode (full execution)", needs_args: false },
-    Command { name: "review",  desc: "Code review the current changes (/review · /review staged · /review <base>)", needs_args: false },
-    Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false },
+    Command { name: "webui",   desc: "Launch the browser webui (subcommands: stop, lan, --host <addr>)", needs_args: true, hidden: false },
+    Command { name: "sync",    desc: "Attach to live webui session (/sync off to detach)", needs_args: false, hidden: false },
+    Command { name: "app", desc: "Expose this session to the mobile App via relay (QR pairing; /app stop to detach)", needs_args: true, hidden: false },
+    Command { name: "setup",      desc: "First run: install recommender skill + run it. Extra text forwarded as a steering hint", needs_args: true, hidden: false },
+    Command { name: "resume",  desc: "Resume a previous session", needs_args: false, hidden: false },
+    Command { name: "rename",  desc: "Rename current session", needs_args: true, hidden: false },
+    Command { name: "logout",  desc: "Sign out of AtomGit", needs_args: false, hidden: false },
+    Command { name: "whoami",  desc: "Show current logged-in user", needs_args: false, hidden: false },
+    Command { name: "model",   desc: "Switch provider / model", needs_args: false, hidden: false },
+    Command { name: "provider", desc: "Manage providers (add / edit / delete)", needs_args: false, hidden: false },
+    Command { name: "proxy",   desc: "Switch outbound proxy mode", needs_args: false, hidden: false },
+    Command { name: "status",  desc: "Show session status", needs_args: false, hidden: false },
+    Command { name: "config",  desc: "Show config path", needs_args: false, hidden: false },
+    Command { name: "reload",  desc: "Reload ~/.atomcode/config.toml from disk", needs_args: false, hidden: false },
+    Command { name: "cd",      desc: "Change working directory and start a new session", needs_args: false, hidden: false },
+    Command { name: "init",    desc: "Analyze the project and generate AGENTS.md", needs_args: false, hidden: false },
+    Command { name: "bg",      desc: "Background sessions: /bg, /bg list, /bg <N>, /bg drop <N>", needs_args: false, hidden: false },
+    Command { name: "background", desc: "Compatibility alias: start a one-shot task in a /bg slot", needs_args: true, hidden: false },
+    Command { name: "diff",    desc: "Show git diff", needs_args: false, hidden: false },
+    Command { name: "clear",   desc: "Start a new conversation (clears context + screen)", needs_args: false, hidden: false },
+    Command { name: "session", desc: "Start a new session (clears conversation)", needs_args: false, hidden: false },
+    Command { name: "usage",   desc: "Show CodingPlan usage (tabs: current / overview / models)", needs_args: false, hidden: false },
+    // `/cost` reports THIS SESSION's token cost from local accounting × the model
+    // price table — works for ANY model, including self-integrated ones the
+    // gateway-only `/usage` modal can't see.
+    Command { name: "cost",    desc: "Show this session's token cost (any model)", needs_args: false, hidden: false },
+    Command { name: "context", desc: "Show context budget breakdown", needs_args: false, hidden: false },
+    Command { name: "compact", desc: "Compact conversation history", needs_args: false, hidden: false },
+    Command { name: "remember", desc: "Save a fact to memory (/remember --global for global)", needs_args: true, hidden: false },
+    Command { name: "forget", desc: "Remove matching memories", needs_args: true, hidden: false },
+    Command { name: "memory", desc: "Show all saved memories", needs_args: false, hidden: false },
+    Command { name: "mcp",     desc: "Show MCP server status (subcommands: reload, tools, login, logout, trust, untrust)", needs_args: false, hidden: false },
+    Command { name: "undo",    desc: "Undo a turn (memory rollback): /undo or /undo N", needs_args: true, hidden: false },
+    Command { name: "worktree", desc: "Git worktree isolation (create/list/done/cleanup)", needs_args: true, hidden: false },
+    Command { name: "upgrade", desc: "Upgrade atomcode to latest (subcommand: rollback)", needs_args: false, hidden: false },
+    Command { name: "plan",    desc: "Switch to Plan mode (read-only exploration)", needs_args: false, hidden: false },
+    Command { name: "build",   desc: "Switch to Build mode (full execution)", needs_args: false, hidden: false },
+    Command { name: "auto",    desc: "Switch to Auto mode (auto-approve all tools)", needs_args: false, hidden: false },
+    Command { name: "review",  desc: "Code review the current changes (/review · /review staged · /review <base>)", needs_args: false, hidden: false },
+    Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false, hidden: false },
     // Gateway entry: opens a second-level palette (high / max / off).
     // needs_args=true so Enter rewrites the buffer to `/effort ` and the
     // sub-mode menu renders the three choices. Selecting one commits as
     // `/effort <choice>` → dispatched by the `effort` arm.
-    Command { name: "effort",  desc: "DeepSeek reasoning effort control (high / max / off)", needs_args: true },
+    Command { name: "effort",  desc: "DeepSeek reasoning effort control (high / max / off)", needs_args: true, hidden: false },
     // needs_args=true so selecting `/goal` from the palette only completes to
     // `/goal ` and waits for the user to type the goal — it must NOT execute
     // immediately (a bare `/goal` would just print status). Setting a goal
     // requires the condition text; `/goal status` / `/goal clear` still work by
     // typing the sub-command + Enter.
-    Command { name: "goal",    desc: "Set a completion goal (autonomous loop until met)", needs_args: true },
-    Command { name: "help",    desc: "Show this help", needs_args: false },
-    Command { name: "guide",   desc: "Ask atomcode-guide how to use", needs_args: true },
-    Command { name: "keys",    desc: "Show keyboard shortcuts", needs_args: false },
-    Command { name: "language", desc: "Switch display language", needs_args: false },
-    Command { name: "welcome", desc: "Re-run the onboarding wizard", needs_args: false },
-    Command { name: "quit",    desc: "Exit AtomCode", needs_args: false },
-    Command { name: "exit",    desc: "Exit AtomCode", needs_args: false },
+    Command { name: "goal",    desc: "Set a completion goal (autonomous loop until met)", needs_args: true, hidden: false },
+    Command { name: "loop",    desc: "Repeat a prompt/command on an interval, or let the model self-pace", needs_args: true, hidden: false },
+    Command { name: "help",    desc: "Show this help", needs_args: false, hidden: false },
+    Command { name: "guide",   desc: "Ask atomcode-guide how to use", needs_args: true, hidden: false },
+    Command { name: "keys",    desc: "Show keyboard shortcuts", needs_args: false, hidden: false },
+    Command { name: "language", desc: "Switch display and commit language", needs_args: false, hidden: false },
+    Command { name: "welcome", desc: "Re-run the onboarding wizard", needs_args: false, hidden: false },
+    Command { name: "quit",    desc: "Exit AtomCode", needs_args: false, hidden: false },
+    Command { name: "exit",    desc: "Exit AtomCode", needs_args: false, hidden: false },
     // Gateway entry that opens a second-level palette listing all
     // user-invocable skills. needs_args=true so Enter rewrites the
     // buffer to `/skills ` and lets the sub-mode menu render the
     // skill list. Selecting a skill commits as `/skills <name>` →
     // dispatched by the `skills` arm in execute_slash_command.
-    Command { name: "skills",  desc: "Browse loaded skills", needs_args: true },
+    Command { name: "skills",  desc: "Browse loaded skills", needs_args: true, hidden: false },
     // needs_args=false so selecting `/plugin` opens the manager modal on the
     // first Enter (like /model, /provider, /session). Subcommands
     // (`/plugin install x@mp`, `uninstall`, `marketplace`, `list`) still work
     // by typing the full line — needs_args only changes the menu-Enter behavior.
-    Command { name: "plugin",  desc: "Plugin marketplace (subcommands: marketplace, install, uninstall, list)", needs_args: false },
+    Command { name: "plugin",  desc: "Plugin marketplace (subcommands: marketplace, install, uninstall, list)", needs_args: false, hidden: false },
     // Windows fallback for Ctrl+V: Windows Terminal / conhost
     // intercept Ctrl+V as their own `paste` action (which forwards
     // only `CF_UNICODETEXT`) before the keystroke reaches atomcode,
@@ -171,9 +209,12 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // `/paste` calls the same `try_paste_clipboard_image` →
     // `attach_image_to_input` pipeline directly so the user has a
     // terminal-agnostic way to attach an image. Works on every OS.
-    Command { name: "paste",   desc: "Attach an image from the clipboard (Windows fallback for Ctrl+V)", needs_args: false },
-    Command { name: "copy",    desc: "Copy a code block from the last reply to the clipboard (/copy, /copy N, /copy all)", needs_args: false },
-    Command { name: "view",    desc: "View file content in an overlay modal", needs_args: true },
+    Command { name: "paste",   desc: "Attach an image from the clipboard (Windows fallback for Ctrl+V)", needs_args: false, hidden: false },
+    Command { name: "copy",    desc: "Copy a code block from the last reply to the clipboard (/copy, /copy N, /copy all, /copy msg)", needs_args: false, hidden: false },
+    Command { name: "save",    desc: "Save the current conversation to a markdown file (/save, /save [filename])", needs_args: false, hidden: false },
+    Command { name: "view",    desc: "View file content in an overlay modal", needs_args: true, hidden: false },
+    Command { name: "todo",    desc: "Show the todo list; /todo add <task> appends one, /todo clear wipes it", needs_args: false, hidden: false },
+    Command { name: "desktop", desc: "Open the AtomCode desktop app (or show the download link)", needs_args: false, hidden: false },
 ];
 
 /// Look up the i18n translation for a built-in command description.
@@ -202,6 +243,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "clear" => Msg::CmdDescClear,
         "session" => Msg::CmdDescSession,
         "cost" => Msg::CmdDescCost,
+        "usage" => Msg::CmdDescUsage,
         "context" => Msg::CmdDescContext,
         "compact" => Msg::CmdDescCompact,
         "remember" => Msg::CmdDescRemember,
@@ -211,9 +253,9 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "undo" => Msg::CmdDescUndo,
         "worktree" => Msg::CmdDescWorktree,
         "upgrade" => Msg::CmdDescUpgrade,
-        "issue" => Msg::CmdDescIssue,
         "plan" => Msg::CmdDescPlan,
         "build" => Msg::CmdDescBuild,
+        "auto" => Msg::CmdDescAuto,
         "think" => Msg::CmdDescThink,
         "effort" => Msg::CmdDescEffort,
         "help" => Msg::CmdDescHelp,
@@ -227,12 +269,16 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "plugin" => Msg::CmdDescPlugin,
         "paste" => Msg::CmdDescPaste,
         "copy" => Msg::CmdDescCopy,
+        "save" => Msg::CmdDescSave,
         "view" => Msg::CmdDescView,
         "app" => Msg::CmdDescApp,
         "sync" => Msg::CmdDescSync,
         "review" => Msg::CmdDescReview,
         "goal" => Msg::CmdDescGoal,
         "proxy" => Msg::CmdDescProxy,
+        "todo" => Msg::CmdDescTodo,
+        "loop" => Msg::CmdDescLoop,
+        "desktop" => Msg::CmdDescDesktop,
         _ => return None,
     };
     Some(t(msg))
@@ -258,7 +304,7 @@ pub fn complete_commands(
     let prefix = prefix.strip_prefix('/').unwrap_or(prefix);
     let mut candidates = Vec::new();
     for cmd in BUILTIN_COMMANDS {
-        if cmd.name.starts_with(prefix) {
+        if !cmd.hidden && cmd.name.starts_with(prefix) {
             candidates.push(CompletionCandidate {
                 name: cmd.name.to_string(),
                 description: cmd_desc_i18n(cmd.name)
@@ -358,6 +404,61 @@ mod tests {
     }
 
     #[test]
+    fn canonical_name_resolves_aliases_case_insensitively() {
+        assert_eq!(canonical_command_name("new"), "session");
+        assert_eq!(canonical_command_name("NEW"), "session");
+        // Non-alias names pass through unchanged.
+        assert_eq!(canonical_command_name("session"), "session");
+        assert_eq!(canonical_command_name("model"), "model");
+        assert_eq!(canonical_command_name("nonexistent"), "nonexistent");
+    }
+
+    #[test]
+    fn display_name_annotates_aliased_commands_only() {
+        assert_eq!(command_display_name("session"), "session (new)");
+        // Commands without aliases render as their bare name.
+        assert_eq!(command_display_name("model"), "model");
+        assert_eq!(command_display_name("resume"), "resume");
+    }
+
+    #[test]
+    fn find_resolves_alias_to_canonical_command() {
+        let reg = CommandRegistry::builtin();
+        let via_alias = reg.find("new").expect("/new must resolve to /session");
+        assert_eq!(via_alias.name, "session");
+        // The alias inherits the canonical command's args behavior.
+        assert_eq!(
+            via_alias.needs_args,
+            reg.find("session").unwrap().needs_args
+        );
+    }
+
+    #[test]
+    fn matching_prefix_finds_command_by_alias_prefix_as_single_row() {
+        let reg = CommandRegistry::builtin();
+        // Typing the alias prefix surfaces the canonical command...
+        for prefix in ["n", "ne", "new"] {
+            let hits = reg.matching_prefix(prefix);
+            let sessions: Vec<_> = hits.iter().filter(|c| c.name == "session").collect();
+            assert_eq!(
+                sessions.len(),
+                1,
+                "prefix {prefix:?} must surface `session` exactly once (no duplicate row)"
+            );
+        }
+        // ...and typing the canonical prefix still works.
+        assert!(reg
+            .matching_prefix("sess")
+            .iter()
+            .any(|c| c.name == "session"));
+        // A prefix matching neither name nor alias yields nothing for session.
+        assert!(!reg
+            .matching_prefix("zzz")
+            .iter()
+            .any(|c| c.name == "session"));
+    }
+
+    #[test]
     fn builtin_contains_bg_command() {
         let registry = CommandRegistry::builtin();
         let cmd = registry.find("bg").unwrap();
@@ -379,11 +480,15 @@ mod tests {
         // print status). The needs_args flag drives that menu behaviour.
         let reg = CommandRegistry::builtin();
         let goal = reg.find("goal").expect("/goal must be a built-in command");
-        assert!(goal.needs_args, "/goal selection must wait for the goal text");
+        assert!(
+            goal.needs_args,
+            "/goal selection must wait for the goal text"
+        );
     }
 
     #[test]
     fn keys_command_is_registered_with_i18n_description_in_both_locales() {
+        let _locale = crate::i18n::test_lock();
         // `/keys` should appear in the built-in completion list and
         // resolve a non-empty description in every shipped locale —
         // if a translator misses one, the slash menu shows the bare
@@ -434,6 +539,7 @@ mod tests {
 
     #[test]
     fn every_builtin_command_has_an_i18n_description_in_both_locales() {
+        let _locale = crate::i18n::test_lock();
         // A built-in without a cmd_desc_i18n arm silently falls back to the
         // English static `desc` even under zh_CN — the /app regression, which
         // also affected /sync, /review, /goal. Guard the WHOLE table so a
@@ -540,7 +646,16 @@ mod tests {
         let reg = CommandRegistry::builtin();
         let help = reg.help_text();
         for c in reg.all() {
-            assert!(help.contains(c.name), "help missing {}", c.name);
+            if c.hidden {
+                // Hidden commands are intentionally excluded from /help output.
+                assert!(
+                    !help.contains(&format!("/{} ", c.name)),
+                    "hidden command /{} must not appear in help",
+                    c.name
+                );
+            } else {
+                assert!(help.contains(c.name), "help missing {}", c.name);
+            }
         }
     }
 
@@ -573,7 +688,9 @@ mod tests {
     fn review_is_a_builtin_command() {
         let candidates = complete_commands("rev", &[]);
         assert!(
-            candidates.iter().any(|c| c.name == "review" && !c.is_custom),
+            candidates
+                .iter()
+                .any(|c| c.name == "review" && !c.is_custom),
             "/review must be a built-in command"
         );
     }

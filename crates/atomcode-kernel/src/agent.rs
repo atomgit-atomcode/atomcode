@@ -1,6 +1,9 @@
+use crate::checkpoint::{CompactionCheckpoint, CompactionCheckpointError};
 use crate::clock::{Clock, SystemClock};
 use crate::event::{AgentCommand, AgentEvent, StopReason, ToolBatchCall};
-use crate::hook::{HookChain, LifecycleHooks, TurnCtx};
+use crate::hook::{
+    Continuation, ContinuationKind, ContinuationVisibility, HookChain, LifecycleHooks, TurnCtx,
+};
 use crate::message::{
     CompactTrigger, CompactionStrategy, CompactionView, Conversation, ImageContent, Message,
     MessageMeta, NoCompaction, SessionSnapshot, SNAPSHOT_VERSION,
@@ -9,9 +12,9 @@ use crate::middleware::{AfterOutcome, BeforeOutcome, ToolMiddleware};
 use crate::provider::{ChatOptions, LlmProvider};
 use crate::request::RequestCtx;
 use crate::stream::{StreamEvent, TokenUsage};
-use crate::tool::{MountedTools, ProgressSink, ToolContext, ToolResult};
+use crate::tool::{MountedTools, ProgressSink, ToolCall, ToolContext, ToolResult};
 use futures::StreamExt;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,14 +22,89 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 /// Default kernel cap on a single tool result's `content` byte length.
 ///
-/// 256 KiB, matched to production's per-tool-response byte budget
-/// (`atomcode-core` `crates/atomcode-core/src/tool/read.rs` `MAX_BYTES_PER_RESPONSE
-/// = 256 * 1024`), which is explicitly sized for AtomCode's bigger-context models.
-/// A mounted third-party tool may not self-cap, so the kernel applies this
-/// CENTRAL backstop regardless of any per-tool limit. `0` disables the cap
-/// (UNBOUNDED) — see `AgentBuilder::max_tool_result_bytes` — but the default is
-/// bounded.
-pub const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
+/// 64 KiB (~16K tokens). A single tool output rarely needs more, and an
+/// uncapped-or-generously-capped output is the dominant cause of context bloat in
+/// long sessions: several 256 KiB outputs (~64K tokens each) alone can fill a 200K
+/// window and survive compaction (which keeps recent turns verbatim). Bounding each
+/// output tightly at INGESTION keeps the retained window small. A mounted
+/// third-party tool may not self-cap, so the kernel applies this CENTRAL backstop
+/// regardless of any per-tool limit. `0` disables the cap (UNBOUNDED) — see
+/// `AgentBuilder::max_tool_result_bytes` — but the default is bounded.
+pub const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 64 * 1024;
+
+/// Opt-in policy for exact, no-progress tool-loop detection.
+///
+/// The default policy warns after three consecutive executions of the same call
+/// (or all-read-only batch) return the same model-visible result(s) and success
+/// state, then stops after the fourth. Products may choose higher thresholds for
+/// intentional polling/repetition, or leave the policy disabled. The kernel default
+/// is OFF — a runtime opts in explicitly through [`AgentBuilder::tool_loop_policy`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToolLoopPolicy {
+    warning_threshold: u32,
+    stop_threshold: u32,
+}
+
+impl ToolLoopPolicy {
+    /// Build an exact-loop policy. The warning must leave the model at least one
+    /// real chance to change course before the stop threshold, and the first
+    /// repeat is never enough evidence to warn.
+    pub fn new(warning_threshold: u32, stop_threshold: u32) -> Result<Self, &'static str> {
+        if warning_threshold < 2 {
+            return Err("tool-loop warning threshold must be at least 2");
+        }
+        if warning_threshold >= stop_threshold {
+            return Err("tool-loop warning threshold must be lower than stop threshold");
+        }
+        Ok(Self {
+            warning_threshold,
+            stop_threshold,
+        })
+    }
+
+    pub fn warning_threshold(self) -> u32 {
+        self.warning_threshold
+    }
+
+    pub fn stop_threshold(self) -> u32 {
+        self.stop_threshold
+    }
+}
+
+impl Default for ToolLoopPolicy {
+    fn default() -> Self {
+        Self {
+            warning_threshold: 3,
+            stop_threshold: 4,
+        }
+    }
+}
+
+fn tool_loop_course_correction(policy: ToolLoopPolicy) -> String {
+    format!(
+        "[Tool-loop guard] The same tool call or read-only batch has returned the same \
+         result(s) {} times. Do not repeat it unchanged. Reassess the task, use a different \
+         action, or explain why no further progress is possible. If repetition is intentional, \
+         make the progress observable instead of issuing the identical call again.",
+        policy.warning_threshold()
+    )
+}
+
+fn tool_loop_warning(policy: ToolLoopPolicy) -> String {
+    format!(
+        "possible tool loop: the same call or read-only batch returned the same result(s) {} \
+         times; asking the model to change course",
+        policy.warning_threshold()
+    )
+}
+
+fn tool_loop_terminal_warning(policy: ToolLoopPolicy) -> String {
+    format!(
+        "tool loop detected: the same call or read-only batch returned the same result(s) {} \
+         times; stopping before another model request",
+        policy.stop_threshold()
+    )
+}
 
 /// Bounded overflow-recovery retries per round (covers ladder tiers 0..=2). After this
 /// many failed compact-and-retry attempts the kernel surfaces the overflow error rather
@@ -41,6 +119,11 @@ const MAX_OVERFLOW_ATTEMPTS: u8 = 3;
 /// a real chance to recover (the stale keep-alive class). NON-retryable errors
 /// (auth / 400 / balance) never enter this path — they fail fast.
 const MAX_PROVIDER_RETRIES: u32 = 3;
+/// Max mid-stream RECONNECTS after a stream idle-timeout before failing the turn
+/// (codex parity: 5). Each reconnect re-issues the SAME round from history
+/// (partial output discarded), with exponential backoff. Distinct from
+/// `MAX_PROVIDER_RETRIES` (which covers failures at OPEN, before any token).
+const MAX_STREAM_RETRIES: u32 = 5;
 
 /// Safety fuse: maximum consecutive `WaitAndRetry` rate-limit sleeps within a
 /// single turn before the kernel forces a `Pause` stop (RateLimited), regardless
@@ -75,6 +158,55 @@ const EMPTY_RESPONSE_MAX_RETRIES: u32 = 5;
 /// many) so a model that truncates every round cannot livelock the loop.
 const MAX_TRUNCATION_CONTINUATIONS: u32 = 2;
 
+/// Always-on, coarse cross-round repetition fuse. The opt-in exact guard below
+/// compares the executed call, effective cwd, result and success state; this fuse
+/// covers the broader failure mode where the model keeps choosing the same action
+/// even while results change, or when a product has disabled exact detection.
+const MAX_REPEAT_ROUNDS: u32 = 6;
+const REPEAT_NUDGE_AT: u32 = 3;
+const REPEAT_LOOP_NUDGE: &str =
+    "You have issued the SAME tool call with the SAME arguments several rounds in a row. \
+     Stop repeating it and change your approach. If you are trying to ask the user something, \
+     do not print it with a shell command; end your turn with a plain-text question, or use a \
+     request-user-input tool when available. If the task is done, reply with a short summary \
+     and no tool calls. If you are blocked, explain what you need.";
+
+/// Order-independent signature of the model-emitted calls in one round. Call ids
+/// are deliberately excluded because providers commonly mint a new id for every
+/// otherwise-identical retry.
+fn round_tool_signature(calls: &[ToolCall]) -> String {
+    let mut parts: Vec<String> = calls
+        .iter()
+        .map(|call| format!("{}\u{0}{}", call.name, call.arguments))
+        .collect();
+    parts.sort();
+    parts.join("\u{1}")
+}
+
+/// Maximum number of `parallel_safe` (read-only) tools that run CONCURRENTLY in
+/// Phase ② of the tool loop. Read from `ATOMCODE_MAX_PARALLEL_TOOLS` (a positive
+/// integer); anything unset, unparseable, or `< 1` falls back to the default 4.
+/// A cap of 1 makes Phase ② effectively serial (one permit) without disabling the
+/// gate. Side-effecting tools always take the exclusive write-lock regardless of
+/// this cap, so it bounds only read-only overlap.
+///
+/// Returns the RAW env value (or default). The caller is responsible for clamping
+/// with [`MAX_PARALLEL_TOOLS_CEILING`] before passing to `Semaphore::new`.
+fn env_max_parallel_tools() -> usize {
+    std::env::var("ATOMCODE_MAX_PARALLEL_TOOLS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(4)
+}
+
+/// Hard upper bound applied to the parallel-tools cap (both the env path and the
+/// injectable `AgentBuilder::max_parallel_tools` path) before the value reaches
+/// `tokio::sync::Semaphore::new`. `Semaphore::new` panics if `permits >
+/// usize::MAX >> 3` (≈ `MAX_PERMITS`); 256 is far below that limit and is a sane
+/// practical ceiling — no real workload needs more than 256 concurrent tool calls.
+const MAX_PARALLEL_TOOLS_CEILING: usize = 256;
+
 /// Synthetic user message injected after an output-limit truncation. Mirrors v1's
 /// wording but steers toward INCREMENTAL file writes (the durable fix for output
 /// that exceeds a single response's token budget) instead of re-emitting it all.
@@ -84,10 +216,8 @@ const TRUNCATION_RESUME_NUDGE: &str =
      where you left off, writing the remaining content INCREMENTALLY to a file (append the \
      next section with edit_file) rather than re-emitting it all in one response.";
 
-// "·" here mirrors atomcode-core's `provider::REASONING_PLACEHOLDER`. kernel is a
-// standalone crate with no dependency on atomcode-core (deliberate: core is the
-// retiring v1 stack), so the value is duplicated rather than imported. If that
-// placeholder ever changes, update this literal too.
+// Provider adapters can emit these placeholder strings when no usable reasoning
+// was captured. Keep the neutral kernel cleanup list aligned with adapter output.
 const REASONING_FILLER_MARKERS: &[&str] = &[
     "·",
     "(no reasoning detected)",
@@ -96,10 +226,8 @@ const REASONING_FILLER_MARKERS: &[&str] = &[
     "no reasoning recorded",
 ];
 
-// KEEP IN SYNC WITH crates/atomcode-core/src/turn/runner.rs `strip_reasoning_filler`
-// (and its `strip_dsml_parameter_fragments` / `strip_leading_parameter_tail` helpers).
-// These are intentionally duplicated because kernel takes no dependency on core;
-// any bugfix here must be applied to the core copy as well.
+// Keep the DSML cleanup helpers below together: they form the kernel's single
+// normalization path for provider reasoning filler.
 fn strip_reasoning_filler(reasoning: &str) -> String {
     let (mut cleaned, mut changed) = strip_dsml_parameter_fragments(reasoning);
     for marker in REASONING_FILLER_MARKERS {
@@ -212,6 +340,52 @@ fn effective_retry_after(e: &crate::stream::ProviderError) -> Option<u64> {
         .or_else(|| parse_retry_after_secs(&e.message))
 }
 
+/// The provider's OWN 429 body, with the `HTTP <status>: ` prefix that the
+/// capabilities provider prepends stripped off, so a driver can surface the
+/// actionable reason (e.g. an external model's `余额不足…请充值`) on a generic
+/// pause instead of a bare "HTTP 429". `None` when the body is empty / only the
+/// prefix. Kept prefix-exact (the known status) rather than a loose match, and
+/// falls back to the whole message if the prefix isn't present (other providers).
+fn rate_limit_server_message(e: &crate::stream::ProviderError) -> Option<String> {
+    let status = e.http_status.unwrap_or(429);
+    let prefix = format!("HTTP {status}: ");
+    let detail = e
+        .message
+        .strip_prefix(&prefix)
+        .unwrap_or(e.message.as_str())
+        .trim();
+    (!detail.is_empty()).then(|| detail.to_string())
+}
+
+/// Distinguish account/billing exhaustion from transient RPM/TPM throttling.
+/// Keep this allow-list narrow: unknown 429s remain retryable.
+fn is_terminal_rate_limit(e: &crate::stream::ProviderError) -> bool {
+    let code = e.code.as_deref().unwrap_or_default().to_ascii_lowercase();
+    if matches!(
+        code.as_str(),
+        "insufficient_quota"
+            | "billing_hard_limit_reached"
+            | "payment_required"
+            | "insufficient_balance"
+            | "1113"
+    ) {
+        return true;
+    }
+    let message = e.message.to_ascii_lowercase();
+    [
+        "insufficient quota",
+        "insufficient balance",
+        "billing hard limit",
+        "payment required",
+        "credit balance",
+        "余额不足",
+        "无可用资源包",
+        "请充值",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
 /// Build the user-facing message shown when the empty-response retry budget is
 /// exhausted. Honest about cause: a content-free 200 from some OpenAI-compatible
 /// gateways is a LIKELY symptom of an over-/near-window request, so when the
@@ -255,23 +429,208 @@ fn empty_exhaustion_message(
     }
 }
 
-/// Pre-send advisory: when the estimated OUTGOING request already meets or
-/// exceeds the model's context window, warn the user BEFORE the (likely-doomed)
-/// request. Some OpenAI-compatible gateways answer an over-window prompt with a
-/// content-free 200 instead of a 4xx, which would otherwise silently burn the
-/// empty-response retry budget. Compaction can't shrink the live user message
-/// being asked about, so the actionable advice is to trim input / `/compact` /
-/// use a larger-window model. Returns `None` within the window or when the
-/// window is unknown (`ctx_window == 0`).
-fn over_window_advisory(est_prompt_tokens: u32, ctx_window: u32) -> Option<String> {
-    if ctx_window == 0 || (est_prompt_tokens as u64) < (ctx_window as u64) {
+/// The mid-turn input budget: the window minus a reservation for the completion
+/// (`max_tokens`) and a margin covering the byte-based token estimate's undercount.
+/// Used only by the pre-send compaction guard and the over-window advisory — the
+/// DISPLAYED window (`context_window()`) is unchanged, so users still see the model's
+/// full window while the guard keeps the real request (messages + completion) under
+/// the model's usable limit.
+fn effective_input_limit(window: u32, max_tokens: Option<u32>) -> u32 {
+    let output_reserve = max_tokens.unwrap_or(16_384);
+    let margin = (window / 8).clamp(16_000, 128_000);
+    let reserve = output_reserve.saturating_add(margin);
+    // If the reserve can't fit inside the window (unrealistically small windows,
+    // e.g. test fixtures), don't reserve — fall back to the raw window so the guard
+    // keeps its old `est >= window` behavior. Real model windows (>= 128K) always
+    // leave room, so this only affects tiny windows.
+    if reserve >= window {
+        window
+    } else {
+        window - reserve
+    }
+}
+
+/// The pre-send over-window advisory. Fires when the estimate reaches `trigger_limit`
+/// (the effective input budget — window minus output reserve minus margin), so it
+/// warns BEFORE the real request crosses the model's usable limit. The user-facing
+/// text still references the full `ctx_window` — the reserve is internal.
+fn over_window_advisory(
+    est_prompt_tokens: u32,
+    ctx_window: u32,
+    trigger_limit: u32,
+) -> Option<String> {
+    if ctx_window == 0 || (est_prompt_tokens as u64) < (trigger_limit as u64) {
         return None;
     }
     Some(format!(
-        "本次请求约 {}K tokens，已达到或超过当前模型的上下文窗口（约 {}K），模型可能直接返回空响应。建议先用 /compact 压缩历史；若仍超限（单条输入本身过大），请精简输入或改用更大窗口的模型。",
+        "请求约 {}K tokens 接近当前模型可用上限（窗口约 {}K，需为回复预留空间）：请精简输入或换用更大窗口的模型。",
         est_prompt_tokens / 1000,
         ctx_window / 1000,
     ))
+}
+
+/// Auto-compaction pressure verdict: `used_tokens / ctx_window >= threshold`.
+/// Recomputed against the LIVE window (not a stored ratio) so a model switch is
+/// re-evaluated each turn — switch to a smaller window ⇒ pressure rises ⇒ compact
+/// proactively; switch to a larger window ⇒ pressure drops ⇒ no needless compaction.
+/// `None` when the window is unknown (`ctx_window == 0`) — can't gauge, so don't act.
+fn auto_compact_trigger(
+    used_tokens: u32,
+    ctx_window: u32,
+    threshold: f32,
+) -> Option<CompactTrigger> {
+    if ctx_window == 0 {
+        return None;
+    }
+    let utilization = used_tokens as f32 / ctx_window as f32;
+    (utilization >= threshold).then_some(CompactTrigger::Auto { utilization })
+}
+
+/// Classification of a single tool call for the three-phase tool loop.
+///
+/// Phase ① CLASSIFY maps every `pending_call` (in order) to a `CallPlan`;
+/// Phase ② EXECUTE runs the `Execute` variants; Phase ③ APPLY walks the plans
+/// in order and applies each produced result. Task 3 replaces ONLY the serial
+/// Phase ② body with a concurrent one — this shape is its contract.
+enum CallPlan {
+    /// Mode-A duplicate (same call_id already resulted this batch) — produces NO
+    /// result row: nothing is emitted, pushed, or executed for it.
+    Skip,
+    /// A ready-to-apply result: mode-B stub, middleware `blocked:` error, or an
+    /// unknown/unmounted-tool error. Applied verbatim in Phase ③ (no execute).
+    Result(ToolResult),
+    /// Run this tool in Phase ②. `parallel_safe` is captured at classification
+    /// time (Task 3 uses it to decide concurrency).
+    Execute {
+        tool: std::sync::Arc<dyn crate::tool::Tool>,
+        call: crate::tool::ToolCall,
+        /// Captured from `Tool::parallel_safe()` at classification time; Phase ②
+        /// uses it to pick a read-lock (concurrent) vs write-lock (barrier).
+        parallel_safe: bool,
+    },
+}
+
+/// A Phase ② result plus the exact working directory supplied to the tool. Ready
+/// `CallPlan::Result` values have no execution context and therefore can never be
+/// candidates for exact-loop detection.
+struct ExecutedCallResult {
+    result: ToolResult,
+    effective_cwd: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ToolLoopCallFingerprint {
+    tool_name: String,
+    canonical_arguments: String,
+    effective_cwd: std::path::PathBuf,
+    result_content: String,
+    is_error: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ToolLoopFingerprint {
+    /// Multi-call candidates are all parallel-safe, so emission order is not
+    /// semantic progress. A single side-effecting call is unaffected by sorting.
+    calls: Vec<ToolLoopCallFingerprint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolLoopDecision {
+    Continue,
+    Warn,
+    Stop,
+}
+
+/// Session-owned, ephemeral streak state. It is deliberately not stored in a
+/// snapshot: replacing/resuming an Agent starts fresh, while synthetic turns on
+/// the same live session retain the streak.
+struct ToolLoopState {
+    policy: ToolLoopPolicy,
+    last: Option<ToolLoopFingerprint>,
+    consecutive: u32,
+}
+
+impl ToolLoopState {
+    fn new(policy: ToolLoopPolicy) -> Self {
+        Self {
+            policy,
+            last: None,
+            consecutive: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.last = None;
+        self.consecutive = 0;
+    }
+
+    fn observe(&mut self, fingerprint: ToolLoopFingerprint) -> ToolLoopDecision {
+        if self.last.as_ref() == Some(&fingerprint) {
+            self.consecutive = self.consecutive.saturating_add(1);
+        } else {
+            self.last = Some(fingerprint);
+            self.consecutive = 1;
+        }
+
+        if self.consecutive >= self.policy.stop_threshold {
+            ToolLoopDecision::Stop
+        } else if self.consecutive == self.policy.warning_threshold {
+            ToolLoopDecision::Warn
+        } else {
+            ToolLoopDecision::Continue
+        }
+    }
+}
+
+/// Build the equality key for calls emitted by the model before middleware
+/// rewrites their arguments. Object-key order and insignificant whitespace do
+/// not change call identity; array order and malformed input still do.
+fn tool_call_dedup_key(call: &ToolCall) -> (String, String) {
+    (call.name.clone(), canonicalize_tool_args(&call.arguments))
+}
+
+/// Number of DISTINCT tool calls in `calls` by kernel identity (`name` +
+/// canonicalized arguments) — the exact count the tool loop uses to decide
+/// whether a step ran as a parallel batch (`>= 2` ⇒ a batch is emitted).
+///
+/// Exposed so the TUI's `/resume` replay groups exactly the steps that were
+/// batched live: gating on the raw `tool_calls.len()` would over-group a step
+/// whose duplicate calls the kernel collapsed to one (no batch was ever shown).
+pub fn distinct_tool_call_count(calls: &[ToolCall]) -> usize {
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    calls
+        .iter()
+        .filter(|c| seen.insert(tool_call_dedup_key(c)))
+        .count()
+}
+
+// Canonicalization is owned by the kernel tool loop so every assembled agent uses
+// the same tool-call identity rules.
+fn canonicalize_tool_args(arguments: &str) -> String {
+    match serde_json::from_str(arguments) {
+        Ok(value) => serde_json::to_string(&sort_json_object_keys(value))
+            .unwrap_or_else(|_| arguments.to_string()),
+        Err(_) => arguments.to_string(),
+    }
+}
+
+fn sort_json_object_keys(value: Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut entries: Vec<_> = object.into_iter().collect();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+
+            let mut sorted = Map::new();
+            for (key, value) in entries {
+                sorted.insert(key, sort_json_object_keys(value));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(sort_json_object_keys).collect())
+        }
+        scalar => scalar,
+    }
 }
 
 /// Enforce the kernel's tool-result size cap on `result.content`, IN PLACE.
@@ -279,13 +638,15 @@ fn over_window_advisory(est_prompt_tokens: u32, ctx_window: u32) -> Option<Strin
 /// Contract:
 /// * `max == 0` → UNBOUNDED: returns without touching the content.
 /// * `content.len() <= max` (byte length) → untouched, no marker.
-/// * `content.len() > max` → TRUNCATE the body to the largest UTF-8 char
-///   boundary `<= max` (never splits a multi-byte char → never panics), then
-///   APPEND a neutral marker `\n…[truncated: N of M bytes elided by kernel cap]`
-///   where `M` is the original byte length and `N = M - kept` is the elided
-///   count. The marker counts ON TOP of the cap, so the final stored length is
-///   `kept (<= max) + marker.len()` — i.e. it may slightly exceed `max` by the
-///   marker; this is intentional and keeps the math reported in the marker exact.
+/// * `content.len() > max` → HEAD+TAIL truncate: keep the first `max/2` and the
+///   last `max/2` bytes (each backed off to a UTF-8 char boundary → never splits a
+///   multi-byte char → never panics), dropping the MIDDLE, and splice a neutral
+///   marker `…[truncated: N of M bytes elided by kernel cap]…` between them. The
+///   middle is dropped rather than the tail because a tool output's signal usually
+///   lives at BOTH ends — a read's opening + a command's final result / error — so
+///   head-only truncation (the old behavior) silently lost the conclusion. The
+///   marker counts ON TOP of the ~`max` kept bytes; the model sees it was elided
+///   and can re-run the tool with a narrower query to see the middle.
 ///
 /// DETERMINISTIC: same content + same cap → byte-identical output, so the cap
 /// never breaks the append-only wire-prefix (prefix-cache) invariant.
@@ -297,18 +658,47 @@ fn cap_tool_result(result: &mut ToolResult, max: usize) {
     if total <= max {
         return; // under cap: untouched
     }
-    // Back off to the largest UTF-8 char boundary <= max so we never split a
-    // multi-byte char. `is_char_boundary(0)` is always true, so this terminates.
-    let mut keep = max;
-    while keep > 0 && !result.content.is_char_boundary(keep) {
-        keep -= 1;
+    // Head: largest char boundary <= max/2. Tail: smallest char boundary >= total-max/2.
+    // `is_char_boundary(0)` / `(total)` are always true, so both loops terminate.
+    let half = max / 2;
+    let mut head = half;
+    while head > 0 && !result.content.is_char_boundary(head) {
+        head -= 1;
     }
-    let elided = total - keep;
-    result.content.truncate(keep);
-    result.content.push_str(&format!(
-        "\n…[truncated: {elided} of {total} bytes elided by kernel cap]"
-    ));
+    let mut tail_start = total.saturating_sub(half);
+    while tail_start < total && !result.content.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    // If the boundary walks collapsed the window (tiny cap / wide chars) so nothing
+    // would be elided, fall back to the old head-only truncation for determinism.
+    if tail_start <= head {
+        result.content.truncate(head);
+        result.content.push_str(&format!(
+            "\n…[truncated: {} of {total} bytes elided by kernel cap]",
+            total - head
+        ));
+        return;
+    }
+    let elided = tail_start - head;
+    let head_str = &result.content[..head];
+    let tail_str = &result.content[tail_start..];
+    result.content = format!(
+        "{head_str}\n…[truncated: {elided} of {total} bytes elided by kernel cap]…\n{tail_str}"
+    );
 }
+
+/// A user prompt folded into the CURRENTLY-running turn (steer), rather than
+/// queued to run as a separate turn afterward. Drained at each round boundary
+/// of `run_turn` and appended as a real `user` message before the next request.
+pub(crate) struct SteerInput {
+    pub text: String,
+    pub images: Vec<ImageContent>,
+}
+
+/// Shared, per-turn steer buffer. `process_send_message` pushes; `run_turn`
+/// drains. `Arc<Mutex>` (not a channel) so `run_turn` can both DRAIN it and
+/// PEEK `is_empty()` at the terminal boundary without consuming.
+pub(crate) type SteerBuf = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<SteerInput>>>;
 
 /// Bidirectional session handle: send AgentCommand, receive AgentEvent.
 pub struct AgentHandle {
@@ -366,6 +756,8 @@ pub struct Agent {
     middlewares: Vec<Arc<dyn ToolMiddleware>>,
     hooks: Arc<dyn LifecycleHooks>,
     max_rounds: Option<u32>,
+    /// Opt-in exact tool-loop policy. `None` keeps the neutral kernel behavior.
+    tool_loop_policy: Option<ToolLoopPolicy>,
     /// SAFETY FUSE (FAILURE PERCEPTION): max times a `offer_continuation` hook may CONTINUE a
     /// single turn (inject a synthetic user message and loop again) before the
     /// kernel forcibly stops with `StopReason::MaxContinuations`. `None` = unlimited
@@ -381,6 +773,12 @@ pub struct Agent {
     /// Byte cap on a single tool result's `content` (the kernel's only built-in
     /// safety at this altitude; see `cap_tool_result`). `0` = unbounded.
     max_tool_result_bytes: usize,
+    /// Injectable override for the parallel-tools concurrency cap (Phase ②).
+    /// `None` = read `ATOMCODE_MAX_PARALLEL_TOOLS` env (default 4). `Some(n)` wins
+    /// over the env var. Either path is clamped to `[1, MAX_PARALLEL_TOOLS_CEILING]`
+    /// at the `Semaphore::new` call site so the semaphore can never panic.
+    /// See `AgentBuilder::max_parallel_tools`.
+    max_parallel_tools: Option<usize>,
     /// The REPLACEABLE compaction policy. Default `NoCompaction` (always plans a
     /// noop) → a neutral kernel never compacts. Swap it per scenario via
     /// `AgentBuilder::compaction`.
@@ -390,6 +788,9 @@ pub struct Agent {
     /// thresholds (5K/13K, coding-mode, etc.) are policy, NOT a kernel default —
     /// the neutral default is OFF.
     compact_threshold: Option<f32>,
+    /// Optional durable writer for committed manual compactions. `None` is an
+    /// explicitly ephemeral agent; session-bound production assembly injects one.
+    compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
     /// LIVENESS: max time to wait for the NEXT stream event (bounds both
     /// first-token and inter-token latency). `None` (default) = unbounded. See
     /// `AgentBuilder::stream_timeout`.
@@ -443,6 +844,8 @@ pub struct Agent {
     /// history (backfilled to stay API-valid) instead of rolling back. Default
     /// `false` = CANCEL = UNDO. See `AgentBuilder::keep_interrupted_context`.
     keep_interrupted_context: bool,
+    /// See `AgentBuilder::round_cap_checkpoint`.
+    round_cap_checkpoint: bool,
 }
 
 impl Agent {
@@ -487,11 +890,14 @@ impl Agent {
             hooks: self.hooks,
             rt: RequestCtx::new(ev_tx, self.request_timeout),
             max_rounds: self.max_rounds,
+            tool_loop_policy: self.tool_loop_policy,
             max_continuations: self.max_continuations,
             resume: self.resume,
             max_tool_result_bytes: self.max_tool_result_bytes,
+            max_parallel_tools: self.max_parallel_tools,
             compaction: self.compaction,
             compact_threshold: self.compact_threshold,
+            compaction_checkpoint: self.compaction_checkpoint,
             stream_timeout: self.stream_timeout,
             chat_options: self.chat_options,
             // Resolve the effective working dir into a single shared handle: an explicit
@@ -508,6 +914,7 @@ impl Agent {
             request_counter: AtomicU64::new(request_seed),
             clock: self.clock,
             keep_interrupted_context: self.keep_interrupted_context,
+            round_cap_checkpoint: self.round_cap_checkpoint,
         };
         let task = tokio::spawn(running.session_loop(cmd_rx));
         AgentHandle {
@@ -570,6 +977,13 @@ impl Agent {
     }
 }
 
+/// Which constructor a submitted prompt is pushed with. Internal to the session loop.
+#[derive(Clone, Copy, PartialEq)]
+enum PromptKind {
+    User,
+    Synthetic,
+}
+
 struct RunningAgent {
     provider: Arc<dyn LlmProvider>,
     tools: MountedTools,
@@ -578,13 +992,19 @@ struct RunningAgent {
     hooks: Arc<dyn LifecycleHooks>,
     rt: RequestCtx,
     max_rounds: Option<u32>,
+    /// Opt-in exact tool-loop policy. State derived from this policy is owned by
+    /// `session_loop`, not by the immutable runtime configuration.
+    tool_loop_policy: Option<ToolLoopPolicy>,
     /// SAFETY FUSE: bound on `offer_continuation` continuations per turn (see `Agent`). `None`
     /// = unlimited. Default `Some(50)`.
     max_continuations: Option<u32>,
     resume: Option<SessionSnapshot>,
     max_tool_result_bytes: usize,
+    /// Injectable parallel-tools cap (see `Agent::max_parallel_tools`). `None` = env/default.
+    max_parallel_tools: Option<usize>,
     compaction: Arc<dyn CompactionStrategy>,
     compact_threshold: Option<f32>,
+    compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
     /// LIVENESS: per-stream-event wait bound. `None` = unbounded (no timer arm).
     stream_timeout: Option<std::time::Duration>,
     /// NEUTRAL per-call provider request knobs forwarded to `chat_stream` every
@@ -610,6 +1030,8 @@ struct RunningAgent {
     clock: Arc<dyn Clock>,
     /// See `Agent::keep_interrupted_context`.
     keep_interrupted_context: bool,
+    /// See `AgentBuilder::round_cap_checkpoint`.
+    round_cap_checkpoint: bool,
 }
 
 impl RunningAgent {
@@ -626,25 +1048,30 @@ impl RunningAgent {
     }
     /// Decide whether the AUTO task-boundary trigger should fire for the CURRENT
     /// stored history. Returns `Some(CompactTrigger::Auto{utilization})` iff a
-    /// `compact_threshold` is configured AND the LAST stored assistant message's
-    /// recorded `meta.utilization` (the prior turn's pressure) is `>= threshold`.
-    /// `None` if no threshold (default → never), or no assistant message yet (no
-    /// pressure fact to gauge), or pressure below the threshold. Pure read — never
-    /// mutates the conversation.
+    /// `compact_threshold` is configured AND the last stored assistant turn's raw
+    /// prompt tokens (`meta.used_tokens`) recomputed against the CURRENT model window
+    /// are `>= threshold`. Reads `used_tokens` — NOT the stored `meta.utilization`
+    /// ratio, which baked in whatever window was active when that turn was recorded;
+    /// switching to a smaller-window model must re-evaluate (the stored ratio, e.g.
+    /// 0.23 against a 1M window, stays below the threshold, so the first send would
+    /// otherwise overflow the new small window instead of compacting to fit first).
+    /// `None` if no threshold (default → never), no assistant turn yet, or below the
+    /// threshold. Pure read — never mutates the conversation.
     fn should_compact(&self, convo: &Conversation) -> Option<CompactTrigger> {
         let thresh = self.compact_threshold?;
-        let utilization = convo
+        let (recorded_window, used) = convo
             .messages
             .iter()
             .rev()
             .find(|m| m.role == crate::message::Role::Assistant)
             .and_then(|m| m.meta.as_ref())
-            .map(|meta| meta.utilization)?;
-        if utilization >= thresh {
-            Some(CompactTrigger::Auto { utilization })
-        } else {
-            None
-        }
+            .map(|meta| (meta.ctx_window, meta.used_tokens))?;
+        // Prefer the live window; fall back to the recorded one only when the live
+        // window is unknown (0) — mirrors `run_compaction`, and reproduces the old
+        // stored-ratio behavior for the unknown-window case (no regression there).
+        let live = self.provider.context_window();
+        let window = if live > 0 { live } else { recorded_window };
+        auto_compact_trigger(used, window, thresh)
     }
 
     /// Run one compaction: build a read-only `CompactionView` over the current
@@ -660,16 +1087,30 @@ impl RunningAgent {
     async fn run_compaction(&self, convo: &mut Conversation, trigger: CompactTrigger) {
         let trigger_for_event = trigger.clone(); // `trigger` is moved into the view below
         let floor = convo.sacred_floor();
-        // Pull the small pressure facts from the most recent assistant meta (default
-        // 0 if none recorded yet).
-        let (ctx_window, used_tokens, utilization) = convo
+        // Raw prompt tokens from the most recent assistant meta (default 0 if none yet).
+        let (recorded_window, used_tokens) = convo
             .messages
             .iter()
             .rev()
             .find(|m| m.role == crate::message::Role::Assistant)
             .and_then(|m| m.meta.as_ref())
-            .map(|meta| (meta.ctx_window, meta.used_tokens, meta.utilization))
-            .unwrap_or((0, 0, 0.0));
+            .map(|meta| (meta.ctx_window, meta.used_tokens))
+            .unwrap_or((0, 0));
+        // Size this compaction to the CURRENT model window (fall back to the recorded
+        // one only when the live window is unknown), and recompute pressure against it.
+        // A compaction running after a model switch must use the NEW window — otherwise
+        // the keep-budget / drain math would be sized to the previous model's window.
+        let live_window = self.provider.context_window();
+        let ctx_window = if live_window > 0 {
+            live_window
+        } else {
+            recorded_window
+        };
+        let utilization = if ctx_window > 0 {
+            used_tokens as f32 / ctx_window as f32
+        } else {
+            0.0
+        };
         // The view borrows `&convo.messages`; confine that borrow to this block so
         // it is released before the &mut apply below.
         let plan = {
@@ -693,7 +1134,38 @@ impl RunningAgent {
             }
             self.compaction.plan(&view).await
         };
-        let report = convo.apply_plan(plan, floor);
+        // Prepare the complete next conversation without changing the live state.
+        // A committed MANUAL compaction is checkpointed while this session loop
+        // still has exclusive ownership; only a successful save unlocks the final,
+        // infallible ownership move below. Auto/overflow compaction keeps its
+        // existing turn-owned persistence path.
+        let prepared = convo.prepare_plan(plan, floor);
+        let report = prepared.report();
+        let mut snapshot = None;
+        if report.committed && matches!(trigger_for_event, CompactTrigger::Manual { .. }) {
+            let Some(candidate) = prepared.candidate() else {
+                self.rt.emit(AgentEvent::CompactionFailed {
+                    trigger: trigger_for_event,
+                    error: CompactionCheckpointError::new(
+                        "committed compaction did not produce a candidate",
+                    ),
+                });
+                return;
+            };
+            let candidate_snapshot = self.capture_snapshot(candidate);
+            if let Some(checkpoint) = &self.compaction_checkpoint {
+                if let Err(error) = checkpoint.save(&candidate_snapshot) {
+                    self.rt.emit(AgentEvent::CompactionFailed {
+                        trigger: trigger_for_event,
+                        error,
+                    });
+                    return;
+                }
+            }
+            snapshot = Some(candidate_snapshot);
+        }
+
+        let report = convo.commit_prepared(prepared);
         self.rt.emit(AgentEvent::Compacted {
             trigger: trigger_for_event,
             epoch: report.epoch_after,
@@ -701,6 +1173,7 @@ impl RunningAgent {
             bytes_before: report.bytes_before,
             bytes_after: report.bytes_after,
             committed: report.committed,
+            snapshot,
         });
     }
     async fn session_loop(self, mut cmd_rx: UnboundedReceiver<AgentCommand>) {
@@ -768,6 +1241,9 @@ impl RunningAgent {
             .map(|s| s.version == SNAPSHOT_VERSION)
             .unwrap_or(false);
         self.hooks.session_start(&mut convo, resumed).await;
+        // Exact-loop evidence belongs to this live session. It is intentionally
+        // neither shared outside the session loop nor restored from snapshots.
+        let mut tool_loop_state = self.tool_loop_policy.map(ToolLoopState::new);
         // FIFO queue for commands that arrive MID-TURN and must NOT be dropped: a
         // `Snapshot` (a driver waiting on its reply would otherwise hang) and a
         // `SendMessage` (the user's next prompt would otherwise vanish). They are
@@ -805,49 +1281,51 @@ impl RunningAgent {
                 }
                 AgentCommand::SendMessage { text, images } => {
                     let shutdown = self
-                        .process_send_message(&mut convo, &mut cmd_rx, &mut pending, text, images)
+                        .process_send_message(
+                            &mut convo,
+                            &mut cmd_rx,
+                            &mut pending,
+                            &mut tool_loop_state,
+                            PromptKind::User,
+                            text,
+                            images,
+                        )
                         .await;
                     if shutdown {
                         break;
                     }
-                    // DRAIN queued mid-turn commands (FIFO) now that the turn is
-                    // done and `convo` is free. A queued Snapshot replies from the
-                    // now-current convo; a queued SendMessage runs a full turn (which
-                    // may itself enqueue more — hence the while-not-empty loop).
-                    let mut drained_shutdown = false;
-                    while let Some(queued) = pending.pop_front() {
-                        match queued {
-                            AgentCommand::Snapshot => {
-                                self.rt.emit(AgentEvent::Snapshot {
-                                    snapshot: self.capture_snapshot(&convo),
-                                });
-                            }
-                            AgentCommand::SendMessage { text, images } => {
-                                if self
-                                    .process_send_message(
-                                        &mut convo,
-                                        &mut cmd_rx,
-                                        &mut pending,
-                                        text,
-                                        images,
-                                    )
-                                    .await
-                                {
-                                    drained_shutdown = true;
-                                    break;
-                                }
-                            }
-                            // A mid-turn /compact runs HERE — the turn boundary, the
-                            // documented cache-safe trigger point.
-                            AgentCommand::Compact { focus } => {
-                                self.run_compaction(&mut convo, CompactTrigger::Manual { focus })
-                                    .await;
-                            }
-                            // Only Snapshot/SendMessage/Compact are ever enqueued.
-                            _ => {}
-                        }
+                    // DRAIN queued mid-turn commands (FIFO) now that the turn is done
+                    // and `convo` is free (see `drain_pending`).
+                    if self
+                        .drain_pending(&mut convo, &mut cmd_rx, &mut pending, &mut tool_loop_state)
+                        .await
+                    {
+                        break;
                     }
-                    if drained_shutdown {
+                }
+                // Host-injected synthetic prompt (goal-mode continuation). SAME path as
+                // SendMessage — user_prompt_submit hook, task-boundary compaction, turn,
+                // then FIFO drain — differing only in `PromptKind::Synthetic` (pushed via
+                // `Message::synthetic_user`) and always-empty images.
+                AgentCommand::SendSyntheticMessage { text } => {
+                    let shutdown = self
+                        .process_send_message(
+                            &mut convo,
+                            &mut cmd_rx,
+                            &mut pending,
+                            &mut tool_loop_state,
+                            PromptKind::Synthetic,
+                            text,
+                            Vec::new(),
+                        )
+                        .await;
+                    if shutdown {
+                        break;
+                    }
+                    if self
+                        .drain_pending(&mut convo, &mut cmd_rx, &mut pending, &mut tool_loop_state)
+                        .await
+                    {
                         break;
                     }
                 }
@@ -867,6 +1345,8 @@ impl RunningAgent {
         convo: &mut Conversation,
         cmd_rx: &mut UnboundedReceiver<AgentCommand>,
         pending: &mut std::collections::VecDeque<AgentCommand>,
+        tool_loop_state: &mut Option<ToolLoopState>,
+        kind: PromptKind,
         mut text: String,
         images: Vec<ImageContent>,
     ) -> bool {
@@ -880,6 +1360,14 @@ impl RunningAgent {
                 reason: StopReason::PromptRejected,
             });
             return false;
+        }
+        // A real user submission starts a new intent scope. A synthetic prompt is
+        // host-driven continuation of the same accepted operation and therefore
+        // deliberately keeps the evidence accumulated by previous turns.
+        if kind == PromptKind::User {
+            if let Some(state) = tool_loop_state.as_mut() {
+                state.reset();
+            }
         }
         // ── TASK BOUNDARY auto-compaction ──
         // After the prompt is accepted but BEFORE the new user message enters
@@ -897,7 +1385,10 @@ impl RunningAgent {
         // separately restores the prompt to the input box for edit-and-resend).
         // Captured AFTER the pre-turn compaction above so it indexes current history.
         let rollback_len = convo.messages.len();
-        convo.push(Message::user_with_images(text, images));
+        convo.push(match kind {
+            PromptKind::User => Message::user_with_images(text, images),
+            PromptKind::Synthetic => Message::synthetic_user(text),
+        });
         // Per-turn cancellation token: Cancel fires it; run_turn polls it at the
         // stream, between tools, and inside execute. A CLONE also rides into each
         // ToolContext so cooperative tools can bail. SEAM 2: derived from the
@@ -908,7 +1399,15 @@ impl RunningAgent {
         let turn_token = self.new_turn_token();
         // Drive the turn while STILL servicing commands (Respond/Cancel/Shutdown)
         // so a middleware blocked on approval can be answered out-of-band.
-        let mut turn = Box::pin(self.run_turn(convo, turn_token.clone(), rollback_len));
+        let steer: SteerBuf =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let mut turn = Box::pin(self.run_turn(
+            convo,
+            turn_token.clone(),
+            rollback_len,
+            steer.clone(),
+            tool_loop_state.as_mut(),
+        ));
         let mut shutdown = false;
         loop {
             tokio::select! {
@@ -925,12 +1424,30 @@ impl RunningAgent {
                         // request_timeout.
                         turn_token.cancel();
                         self.rt.cancel_pending();
+                        steer.lock().unwrap_or_else(|e| e.into_inner()).clear();
                     }
-                    // QUEUE a mid-turn Snapshot/SendMessage rather than dropping it:
-                    // a Snapshot reply (driver may be blocking on it) and the user's
-                    // next prompt must survive. Drained after the turn completes.
-                    Some(c @ AgentCommand::Snapshot) | Some(c @ AgentCommand::SendMessage { .. }) => {
+                    // QUEUE a mid-turn Snapshot rather than dropping it:
+                    // a Snapshot reply (driver may be blocking on it) must survive.
+                    // Drained after the turn completes.
+                    Some(c @ AgentCommand::Snapshot) => {
                         pending.push_back(c);
+                    }
+                    // A mid-turn synthetic prompt is QUEUED (FIFO) to run as its OWN
+                    // turn after this one — NOT folded into the current turn's steer
+                    // buffer (a goal-mode continuation is a distinct turn, and must
+                    // reach the model marked synthetic). Drained after the turn.
+                    Some(c @ AgentCommand::SendSyntheticMessage { .. }) => {
+                        pending.push_back(c);
+                    }
+                    // Route a mid-turn SendMessage into the per-turn steer buffer
+                    // instead of the pending deque: Task 2 drains it at each round
+                    // boundary to fold the prompt into the CURRENT turn's next request
+                    // (rather than running it as a separate turn afterward).
+                    Some(AgentCommand::SendMessage { text, images }) => {
+                        steer.lock().unwrap_or_else(|e| e.into_inner()).push_back(SteerInput {
+                            text,
+                            images,
+                        });
                     }
                     // A Compact mid-turn is QUEUED, not executed: compacting inside a
                     // running turn would reopen the within-turn cache break (and
@@ -945,7 +1462,83 @@ impl RunningAgent {
                 }
             }
         }
+        // Leftover steer buffer: any steer that arrived too late to be drained by
+        // run_turn (e.g. Task 2 not yet implemented, or a very late arrival) falls
+        // back to the pending deque so the user's prompt is NOT silently lost.
+        for s in steer.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+            pending.push_back(AgentCommand::SendMessage {
+                text: s.text,
+                images: s.images,
+            });
+        }
         shutdown
+    }
+
+    /// DRAIN the FIFO of commands that arrived MID-TURN (queued by the mid-turn
+    /// select in `process_send_message`) now that the turn is done and `convo` is
+    /// free. A queued `Snapshot` replies from the now-current convo; a queued
+    /// `SendMessage`/`SendSyntheticMessage` runs a full turn (which may itself
+    /// enqueue more — hence the while-not-empty loop); a queued `Compact` runs at
+    /// this turn boundary (the documented cache-safe trigger point). Returns `true`
+    /// iff a drained prompt observed a `Shutdown`/closed channel, so the caller must
+    /// tear down without draining further.
+    async fn drain_pending(
+        &self,
+        convo: &mut Conversation,
+        cmd_rx: &mut UnboundedReceiver<AgentCommand>,
+        pending: &mut std::collections::VecDeque<AgentCommand>,
+        tool_loop_state: &mut Option<ToolLoopState>,
+    ) -> bool {
+        while let Some(queued) = pending.pop_front() {
+            match queued {
+                AgentCommand::Snapshot => {
+                    self.rt.emit(AgentEvent::Snapshot {
+                        snapshot: self.capture_snapshot(convo),
+                    });
+                }
+                AgentCommand::SendMessage { text, images } => {
+                    if self
+                        .process_send_message(
+                            convo,
+                            cmd_rx,
+                            pending,
+                            tool_loop_state,
+                            PromptKind::User,
+                            text,
+                            images,
+                        )
+                        .await
+                    {
+                        return true;
+                    }
+                }
+                AgentCommand::SendSyntheticMessage { text } => {
+                    if self
+                        .process_send_message(
+                            convo,
+                            cmd_rx,
+                            pending,
+                            tool_loop_state,
+                            PromptKind::Synthetic,
+                            text,
+                            Vec::new(),
+                        )
+                        .await
+                    {
+                        return true;
+                    }
+                }
+                // A mid-turn /compact runs HERE — the turn boundary, the documented
+                // cache-safe trigger point.
+                AgentCommand::Compact { focus } => {
+                    self.run_compaction(convo, CompactTrigger::Manual { focus })
+                        .await;
+                }
+                // Only Snapshot/SendMessage/SendSyntheticMessage/Compact are ever enqueued.
+                _ => {}
+            }
+        }
+        false
     }
 
     /// The single funnel for a turn's END: fire the `turn_complete` terminal hook
@@ -994,7 +1587,7 @@ impl RunningAgent {
             // cleanly into the next user prompt on Anthropic and is valid consecutive-user
             // on openai-compat.
             // `synthetic_user` (not `user`) so the marker is excluded from prompt
-            // counting: `compute_undo` in the bridge skips `synthetic = true` messages
+            // counting: `compute_runtime_undo` skips `synthetic = true` messages
             // when locating the /undo target, and compaction's `active_turn_start`
             // skip synthetic messages when computing keep-recent-turns boundaries.
             convo.push(Message::synthetic_user(
@@ -1031,10 +1624,15 @@ impl RunningAgent {
         convo: &mut Conversation,
         cancel: tokio_util::sync::CancellationToken,
         rollback_len: usize,
+        steer: SteerBuf,
+        mut tool_loop_state: Option<&mut ToolLoopState>,
     ) {
         self.hooks.turn_start(convo).await;
         self.rt.emit(AgentEvent::TurnStarted);
-        let defs = self.tools.defs();
+        // A turn must execute against the exact same tool set advertised to the
+        // provider. Runtime catalog updates become visible on the next turn.
+        let turn_tools = self.tools.snapshot();
+        let defs = turn_tools.defs();
         // Mint this turn's id ONCE — constant across all rounds (incl. offer_continuation
         // continuations) of this turn. Monotonic counter ⇒ deterministic.
         let turn_id = self.turn_counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1045,6 +1643,8 @@ impl RunningAgent {
         // `max_rounds` is None — the model never regains agency to stop. Bounded by
         // `max_continuations` (default Some(50)).
         let mut continuations: u32 = 0;
+        let mut active_internal_continuation: Option<(ContinuationKind, ContinuationVisibility)> =
+            None;
         // SAFETY FUSE counter: how many times THIS turn auto-continued after an
         // output-limit truncation (`finish_reason=length`). Bounded by
         // `MAX_TRUNCATION_CONTINUATIONS` so endless truncation cannot livelock.
@@ -1056,6 +1656,14 @@ impl RunningAgent {
         // visible re-open after a retryable provider error; reset to 0 on a successful
         // open so every round gets its own fresh budget.
         let mut provider_retry: u32 = 0;
+        // MID-STREAM reconnect counter. Lives across the whole turn (declared
+        // here, outside the round loop) but the BUDGET is PER model-request /
+        // round: incremented on each idle-timeout reconnect, and reset to 0 once a
+        // round's stream completes normally — so each round independently gets up
+        // to MAX_STREAM_RETRIES reconnects (codex's per-request semantics). It is
+        // deliberately NOT reset on `open` (a re-open must not refill it mid-round,
+        // else a permanently-stalling stream would retry forever within one round).
+        let mut stream_retry: u32 = 0;
         // RATE-LIMIT WaitAndRetry counter for the WHOLE turn: incremented on each
         // WaitAndRetry sleep (OPEN or mid-stream); reset to 0 on a successful open
         // (the window has reopened). Capped at MAX_RATE_LIMIT_WAITS to prevent a
@@ -1072,6 +1680,15 @@ impl RunningAgent {
         // decrements that reset `round` to 1) AND tells the empty-exhaustion
         // terminal not to repeat the same size-blame.
         let mut over_window_warned = false;
+        // Per-turn state for the always-on coarse fuse. Unlike the exact guard's
+        // session-owned streak, this only describes consecutive rounds of this
+        // running turn.
+        let mut last_round_sig: Option<String> = None;
+        let mut repeat_rounds: u32 = 0;
+        let mut repeat_nudged = false;
+        // Re-armable round cap: on each checkpoint "continue" this grows by the base
+        // `max_rounds`, giving a CONSTANT interval between confirmations.
+        let mut round_cap = self.max_rounds;
         loop {
             round += 1;
             // Mint this request's id AND build this round's TurnCtx UP FRONT — before
@@ -1092,32 +1709,146 @@ impl RunningAgent {
                 context_window: ctx_window,
                 used_tokens,
             };
-            // Hard cap (safety fuse): stop before exceeding max_rounds.
-            if let Some(max) = self.max_rounds {
-                if round > max {
-                    self.rt.emit(AgentEvent::Error {
-                        message: format!("max rounds ({max}) reached"),
-                        http_status: None,
-                        code: None,
-                    });
-                    self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
-                        .await;
-                    return;
+            // Hard cap (safety fuse). With `round_cap_checkpoint`, this becomes an
+            // interactive checkpoint instead of a hard error.
+            if let Some(cap) = round_cap {
+                if round > cap {
+                    if self.round_cap_checkpoint {
+                        let resp = self
+                            .rt
+                            .request(
+                                crate::event::ROUND_CAP_CHECKPOINT_KIND,
+                                serde_json::json!({
+                                    "round": round - 1,
+                                    "cap": cap,
+                                    // Re-arm increment, so the driver can say "N more
+                                    // rounds" accurately after a continuation (cap grows
+                                    // but the granted step stays this base).
+                                    "base": self.max_rounds.unwrap_or(cap),
+                                }),
+                            )
+                            .await;
+                        let cont = resp
+                            .get("continue")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        if cont {
+                            // Re-arm by the configured base (guaranteed Some here).
+                            let base = self.max_rounds.unwrap_or(cap);
+                            round_cap = Some(cap.saturating_add(base));
+                            // fall through: this round (== cap+1 <= new cap) proceeds.
+                        } else if cancel.is_cancelled() {
+                            // The `false` came from a Cancel that resolved the
+                            // pending Request to Null (not an explicit "stop").
+                            // Terminate through the canonical cancel funnel so the
+                            // turn ends as Cancelled — matching every other
+                            // mid-turn cancel arm — not MaxRounds.
+                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                            return;
+                        } else {
+                            // Explicit stop (Esc / picker) OR fail-closed default
+                            // (no requester / timeout): the round cap is the reason.
+                            self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
+                                .await;
+                            return;
+                        }
+                    } else {
+                        self.rt.emit(AgentEvent::Error {
+                            message: format!("max rounds ({cap}) reached"),
+                            http_status: None,
+                            code: None,
+                        });
+                        self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
+                            .await;
+                        return;
+                    }
                 }
             }
             let start = self.clock.now_millis();
+            // STEER: fold any prompts the user submitted mid-turn into THIS turn before
+            // building the next request. Real user messages (count toward prompt/undo),
+            // appended append-only (prefix-cache safe).
+            let steered: Vec<SteerInput> = {
+                let mut b = steer.lock().unwrap_or_else(|e| e.into_inner());
+                b.drain(..).collect()
+            };
+            if !steered.is_empty() {
+                // A real user steer changes the intent of the currently-running
+                // turn. Evidence collected before that intervention must not be
+                // compared with calls made in response to the new instruction.
+                if let Some(state) = tool_loop_state.as_deref_mut() {
+                    state.reset();
+                }
+                last_round_sig = None;
+                repeat_rounds = 0;
+                repeat_nudged = false;
+                let n = steered.len();
+                let mut inputs = Vec::with_capacity(n);
+                for input in steered {
+                    convo.push(Message::user_with_images(
+                        input.text.clone(),
+                        input.images.clone(),
+                    ));
+                    inputs.push(crate::event::SteeredInput {
+                        text: input.text,
+                        images: input.images,
+                    });
+                }
+                self.rt.emit(AgentEvent::Steered { count: n, inputs });
+            }
             let mut messages = convo.messages.clone();
             self.hooks.pre_request(&mut messages, &turn_ctx).await;
+            // PRE-SEND EMERGENCY COMPACTION: if the estimated outgoing request already
+            // meets/exceeds the model window, COMPACT before sending rather than firing a
+            // doomed over-window request. This is the case the between-turn `should_compact`
+            // (evaluated only at turn boundaries) misses: a mid-turn burst of large tool
+            // outputs can outgrow the window WITHIN one agentic turn, and a gateway that
+            // answers over-window with a content-free 200 never returns the overflow error
+            // that would otherwise trigger the hard-overflow recovery below. Bounded by
+            // MAX_OVERFLOW_ATTEMPTS; re-projects (clone + pre_request) after each pass and
+            // stops early when a pass drains nothing (single oversized input at the sacred
+            // floor — unrecoverable, so fall through to the advisory).
+            {
+                let window = self.provider.context_window();
+                let limit = effective_input_limit(window, self.chat_options.max_tokens);
+                let est = |msgs: &[Message]| -> u64 {
+                    msgs.iter().map(|m| m.estimate_tokens() as u64).sum()
+                };
+                // Only worth compacting if a COMPLETED exchange exists to drain. On the
+                // very first request an over-window prompt is a single oversized input that
+                // compaction can't shrink (it IS the active turn) — skip to the advisory.
+                let has_drainable = convo
+                    .messages
+                    .iter()
+                    .any(|m| m.role == crate::message::Role::Assistant);
+                let mut attempts: u8 = 0;
+                while has_drainable
+                    && window > 0
+                    && est(&messages) >= limit as u64
+                    && attempts < MAX_OVERFLOW_ATTEMPTS
+                {
+                    let before = est(&convo.messages);
+                    self.run_compaction(convo, CompactTrigger::Overflow { attempt: attempts })
+                        .await;
+                    attempts += 1;
+                    if est(&convo.messages) >= before {
+                        break; // nothing drained (sacred floor / single huge input) — warn below
+                    }
+                    messages = convo.messages.clone();
+                    self.hooks.pre_request(&mut messages, &turn_ctx).await;
+                }
+            }
             // PRE-SEND over-window advisory (at most ONCE per turn — the
             // `over_window_warned` latch survives the empty-retry / provider-retry
             // `round -= 1` decrements that would otherwise re-trip a round-based
-            // guard). If the outgoing request already meets/exceeds the model
-            // window, warn BEFORE the (likely-doomed) request rather than after
-            // burning the empty-retry budget on a gateway that answers over-window
-            // with a content-free 200.
+            // guard). Fires only when emergency compaction above could NOT bring the
+            // request under the window (single input too large), so the user gets the
+            // actionable advice instead of a silent doomed request.
             if !over_window_warned {
                 let est: u32 = messages.iter().map(|m| m.estimate_tokens()).sum();
-                if let Some(advisory) = over_window_advisory(est, self.provider.context_window()) {
+                let window = self.provider.context_window();
+                let limit = effective_input_limit(window, self.chat_options.max_tokens);
+                if let Some(advisory) = over_window_advisory(est, window, limit) {
                     over_window_warned = true;
                     self.rt.emit(AgentEvent::Warning(advisory));
                 }
@@ -1145,8 +1876,10 @@ impl RunningAgent {
             // pre_request projection, pre chat_stream): telemetry/datalog/cache-RCA
             // sees the exact bytes about to hit the provider. It gets `&` — it
             // cannot mutate the wire (mutation is pre_request's job above).
+            let mut request_options = self.chat_options.clone();
+            request_options.rate_limit_retry_owner = crate::provider::RateLimitRetryOwner::Kernel;
             self.hooks
-                .on_request(&messages, &defs, &self.chat_options, &turn_ctx)
+                .on_request(&messages, &defs, &request_options, &turn_ctx)
                 .await;
             // A failed OPEN cleanly fails the turn — no bogus assistant message,
             // no empty-success illusion. The session-level `chat_options` (the
@@ -1167,13 +1900,12 @@ impl RunningAgent {
                     self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
                     return;
                 }
-                opened = self.provider.chat_stream(&messages, &defs, &self.chat_options) => opened,
+                opened = self.provider.chat_stream(&messages, &defs, &request_options) => opened,
             };
             let mut stream = match opened {
                 Ok(s) => {
                     overflow_attempt = 0; // a successful open resets the per-round counter
                     provider_retry = 0; // ditto for the transient-failure budget
-                    rate_limit_waits = 0; // window reopened — reset the livelock fuse
                     s
                 }
                 // HARD OVERFLOW recovery (OFF the normal path): the prompt exceeded the
@@ -1209,12 +1941,18 @@ impl RunningAgent {
                     let hint = crate::hook::RateLimitHint {
                         http_status: e.http_status,
                         retry_after_secs: effective_retry_after(&e),
+                        terminal: is_terminal_rate_limit(&e),
+                        attempt: rate_limit_waits.saturating_add(1),
                     };
-                    let decision = self
-                        .hooks
-                        .on_rate_limit(&hint)
-                        .await
-                        .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint));
+                    let server_message = rate_limit_server_message(&e);
+                    let decision = if hint.terminal {
+                        crate::hook::RateLimitDecision::from_hint(&hint)
+                    } else {
+                        self.hooks
+                            .on_rate_limit(&hint)
+                            .await
+                            .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint))
+                    };
                     match decision {
                         crate::hook::RateLimitDecision::WaitAndRetry { secs } => {
                             rate_limit_waits += 1;
@@ -1228,6 +1966,7 @@ impl RunningAgent {
                                     reset_label: String::new(),
                                     secs_until_reset: None,
                                     auto_resuming: false,
+                                    server_message,
                                 });
                                 self.finish_turn(convo, StopReason::RateLimited, &turn_ctx)
                                     .await;
@@ -1238,6 +1977,7 @@ impl RunningAgent {
                                 reset_label: String::new(),
                                 secs_until_reset: Some(secs),
                                 auto_resuming: true,
+                                server_message: None, // auto-retrying: no user-facing reason line
                             });
                             tokio::select! {
                                 biased;
@@ -1261,6 +2001,7 @@ impl RunningAgent {
                                 reset_label,
                                 secs_until_reset,
                                 auto_resuming: false,
+                                server_message,
                             });
                             self.finish_turn(convo, StopReason::RateLimited, &turn_ctx)
                                 .await;
@@ -1312,6 +2053,12 @@ impl RunningAgent {
                 }
             };
             let mut assistant_text = String::new();
+            let suppress_internal_stream = matches!(
+                active_internal_continuation.as_ref(),
+                Some((_, ContinuationVisibility::InternalControl))
+            );
+            let mut reasoning_started_at: Option<u64> = None;
+            let mut reasoning_elapsed_ms: u64 = 0;
             // ACCUMULATE the model's reasoning/thinking across the stream alongside
             // the visible text. It is STORED on the assistant Message (the live
             // `AgentEvent::Reasoning` channel below is kept too) so a provider
@@ -1330,6 +2077,7 @@ impl RunningAgent {
             let mut usage = TokenUsage::default();
             let mut truncated = false;
             let mut response_id: Option<String> = None;
+            let mut response_model: Option<String> = None;
             // Did the provider STREAM any model output this round (text / reasoning /
             // tool call), BEFORE any hook transform? This — not the post-hook
             // accumulated text — is the empty-200 discriminator: a hook that redacts
@@ -1369,6 +2117,35 @@ impl RunningAgent {
                         return;
                     }
                     _ = async { tokio::time::sleep(self.stream_timeout.unwrap()).await }, if self.stream_timeout.is_some() => {
+                        // STREAM IDLE TIMEOUT: no event for `stream_timeout`. Rather than
+                        // fail the turn outright, RECONNECT up to MAX_STREAM_RETRIES times
+                        // (codex parity) — re-issue the SAME round from history (the
+                        // per-round accumulators reset on `continue`, so partial output is
+                        // discarded and never pushed), with exponential backoff. Only after
+                        // the budget is spent do we take the clean-fail path.
+                        if stream_retry < MAX_STREAM_RETRIES {
+                            stream_retry += 1;
+                            self.rt.emit(AgentEvent::Warning(format!(
+                                "stream idle timeout — reconnecting ({stream_retry}/{MAX_STREAM_RETRIES})"
+                            )));
+                            // Exponential backoff: 200ms, 400, 800, 1600, 3200 (cap 8s).
+                            let backoff = std::time::Duration::from_millis(
+                                // `.min(31)` on the shift keeps it well-defined if
+                                // MAX_STREAM_RETRIES is ever raised past 32 (the cap
+                                // clamps the value regardless).
+                                (200u64 << (stream_retry - 1).min(31)).min(8_000),
+                            );
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => {
+                                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                    return;
+                                }
+                                _ = tokio::time::sleep(backoff) => {}
+                            }
+                            retry_this_round = true;
+                            break;
+                        }
                         let msg = "stream timeout".to_string();
                         self.hooks.on_error(&msg).await;
                         self.rt.emit(AgentEvent::Error { message: msg, http_status: None, code: None });
@@ -1380,6 +2157,21 @@ impl RunningAgent {
                         None => break,
                     },
                 };
+                match &ev {
+                    StreamEvent::Reasoning(_) | StreamEvent::ReasoningSignature { .. } => {
+                        if reasoning_started_at.is_none() {
+                            reasoning_started_at = Some(self.clock.now_millis());
+                        }
+                    }
+                    StreamEvent::TextDelta(_)
+                    | StreamEvent::ToolCall(_)
+                    | StreamEvent::ToolCallDelta { .. } => {
+                        if let Some(start) = reasoning_started_at.take() {
+                            reasoning_elapsed_ms = self.clock.now_millis().saturating_sub(start);
+                        }
+                    }
+                    _ => {}
+                }
                 match ev {
                     StreamEvent::TextDelta(mut t) => {
                         // STREAMED-OUTPUT transform seam: run the hook on EACH chunk
@@ -1397,6 +2189,9 @@ impl RunningAgent {
                         saw_stream_content = true;
                         self.hooks.on_text_delta(&mut t).await;
                         if !t.is_empty() {
+                            if suppress_internal_stream {
+                                continue;
+                            }
                             assistant_text.push_str(&t);
                             self.rt.emit(AgentEvent::TextDelta(t));
                         }
@@ -1420,6 +2215,9 @@ impl RunningAgent {
                                 saw_suppressed_reasoning_filler = true;
                                 continue;
                             }
+                            if suppress_internal_stream {
+                                continue;
+                            }
                             reasoning.push_str(&t);
                             // Also buffer for the CURRENT signed block (finalized on the
                             // next ReasoningSignature). Uses the POST-hook bytes so a
@@ -1435,6 +2233,9 @@ impl RunningAgent {
                     // — no live event (the text already streamed via Reasoning above).
                     StreamEvent::ReasoningSignature { opaque, provider } => {
                         saw_stream_content = true; // provider streamed a (signed) reasoning block
+                        if suppress_internal_stream {
+                            continue;
+                        }
                         reasoning_blocks.push(crate::message::ReasoningBlock {
                             text: std::mem::take(&mut reasoning_block_text),
                             opaque: Some(opaque),
@@ -1467,6 +2268,7 @@ impl RunningAgent {
                     // output later) does not lose the earlier fields to last-wins.
                     StreamEvent::Usage(u) => usage.merge_max(u),
                     StreamEvent::ResponseId(id) => response_id = Some(id),
+                    StreamEvent::ResponseModel(model) => response_model = Some(model),
                     // A mid-stream error CLEANLY FAILS the turn: surface it and end —
                     // do NOT fall through to a fake empty-success completion.
                     // 429 mid-stream: consult the host hook before emitting an Error.
@@ -1474,11 +2276,71 @@ impl RunningAgent {
                         let hint = crate::hook::RateLimitHint {
                             http_status: e.http_status,
                             retry_after_secs: effective_retry_after(&e),
+                            terminal: is_terminal_rate_limit(&e),
+                            attempt: rate_limit_waits.saturating_add(1),
                         };
-                        let decision =
-                            self.hooks.on_rate_limit(&hint).await.unwrap_or_else(|| {
-                                crate::hook::RateLimitDecision::from_hint(&hint)
+                        let server_message = rate_limit_server_message(&e);
+                        let decision = if hint.terminal {
+                            crate::hook::RateLimitDecision::from_hint(&hint)
+                        } else {
+                            self.hooks
+                                .on_rate_limit(&hint)
+                                .await
+                                .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint))
+                        };
+                        // Once any model content has reached the driver, replaying the
+                        // request can duplicate text/reasoning/tool calls that cannot be
+                        // retracted from the live UI. Keep the clean RateLimited terminal,
+                        // but do not auto-retry this partially-consumed stream. A 429 before
+                        // the first content event remains safe to retry below.
+                        if saw_stream_content {
+                            // Persist exactly what the driver has already rendered;
+                            // otherwise snapshot/resume would lose visible output.
+                            let partial_reasoning = strip_reasoning_filler(&reasoning);
+                            if !assistant_text.is_empty()
+                                || !partial_reasoning.is_empty()
+                                || !pending_calls.is_empty()
+                            {
+                                let mut partial = crate::message::Message::assistant(
+                                    assistant_text.clone(),
+                                    pending_calls.clone(),
+                                );
+                                if suppress_internal_stream {
+                                    partial.internal_origin = Some("verify_cadence".to_string());
+                                    partial.text.clear();
+                                    partial.reasoning = None;
+                                    partial.reasoning_blocks.clear();
+                                } else {
+                                    partial.reasoning = if partial_reasoning.is_empty() {
+                                        None
+                                    } else {
+                                        Some(partial_reasoning)
+                                    };
+                                    partial.reasoning_blocks = reasoning_blocks.clone();
+                                }
+                                convo.push(partial);
+                            }
+                            let (reset_at_display, reset_label, secs_until_reset) = match decision {
+                                crate::hook::RateLimitDecision::WaitAndRetry { secs } => {
+                                    (String::new(), String::new(), Some(secs))
+                                }
+                                crate::hook::RateLimitDecision::Pause {
+                                    reset_at_display,
+                                    reset_label,
+                                    secs_until_reset,
+                                } => (reset_at_display, reset_label, secs_until_reset),
+                            };
+                            self.rt.emit(AgentEvent::RateLimited {
+                                reset_at_display,
+                                reset_label,
+                                secs_until_reset,
+                                auto_resuming: false,
+                                server_message,
                             });
+                            self.finish_turn(convo, StopReason::RateLimited, &turn_ctx)
+                                .await;
+                            return;
+                        }
                         match decision {
                             crate::hook::RateLimitDecision::WaitAndRetry { secs } => {
                                 rate_limit_waits += 1;
@@ -1490,6 +2352,7 @@ impl RunningAgent {
                                         reset_label: String::new(),
                                         secs_until_reset: None,
                                         auto_resuming: false,
+                                        server_message,
                                     });
                                     self.finish_turn(convo, StopReason::RateLimited, &turn_ctx)
                                         .await;
@@ -1500,6 +2363,7 @@ impl RunningAgent {
                                     reset_label: String::new(),
                                     secs_until_reset: Some(secs),
                                     auto_resuming: true,
+                                    server_message: None,
                                 });
                                 tokio::select! {
                                     biased;
@@ -1508,36 +2372,6 @@ impl RunningAgent {
                                         return;
                                     }
                                     _ = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {}
-                                }
-                                // I-1: Commit any accumulated partial content (text, reasoning,
-                                // tool calls) to the conversation BEFORE re-issuing the round.
-                                // Without this the re-issued round presents the same bare user
-                                // prompt to the model, which then re-generates from scratch and
-                                // emits duplicate TextDelta events (the partial stream already
-                                // in the UI is irrecoverable — gateways usually reject at the
-                                // header layer so true mid-stream 429s are rare). With the
-                                // partial message committed, a well-behaved model continues from
-                                // the committed text rather than restarting. Known residual
-                                // limitation: already-emitted TextDelta events cannot be
-                                // recalled from the UI — if the model re-generates identical
-                                // content the user will see it twice. Full rollback would
-                                // require a streaming-rewind mechanism beyond this scope.
-                                let partial_reasoning = strip_reasoning_filler(&reasoning);
-                                if !assistant_text.is_empty()
-                                    || !partial_reasoning.is_empty()
-                                    || !pending_calls.is_empty()
-                                {
-                                    let mut partial = crate::message::Message::assistant(
-                                        assistant_text.clone(),
-                                        pending_calls.clone(),
-                                    );
-                                    partial.reasoning = if partial_reasoning.is_empty() {
-                                        None
-                                    } else {
-                                        Some(partial_reasoning)
-                                    };
-                                    partial.reasoning_blocks = reasoning_blocks.clone();
-                                    convo.push(partial);
                                 }
                                 provider_retry = 0; // 429 must not consume the generic transient-retry budget
                                 retry_this_round = true;
@@ -1553,6 +2387,7 @@ impl RunningAgent {
                                     reset_label,
                                     secs_until_reset,
                                     auto_resuming: false,
+                                    server_message,
                                 });
                                 self.finish_turn(convo, StopReason::RateLimited, &turn_ctx)
                                     .await;
@@ -1582,6 +2417,9 @@ impl RunningAgent {
                     }
                 }
             }
+            if let Some(start) = reasoning_started_at.take() {
+                reasoning_elapsed_ms = self.clock.now_millis().saturating_sub(start);
+            }
             // MID-STREAM 429 WaitAndRetry: the stream loop set retry_this_round and
             // broke out. Re-issue the same logical round (round was already
             // incremented at the top of the outer loop, so decrement to neutralize).
@@ -1589,6 +2427,15 @@ impl RunningAgent {
                 round -= 1;
                 continue;
             }
+            // The stream reached a natural end rather than another 429, so this
+            // rate-limit incident has recovered. Do not reset merely because HTTP
+            // OPEN returned 200: some gateways report throttling as the first SSE
+            // error event, and resetting there would disable the five-wait fuse.
+            rate_limit_waits = 0;
+            // The stream reached its natural end this round (no timeout, no 429
+            // retry) — refill the reconnect budget so a LATER round's stall gets a
+            // fresh MAX_STREAM_RETRIES.
+            stream_retry = 0;
             // EMPTY-RESPONSE FAST RETRY (parity with v1 agent/mod.rs:3027): some
             // OpenAI-compatible gateways (notably the atomgit→DeepSeek path) sometimes
             // return a 200 with a COMPLETELY empty completion — the stream opened fine
@@ -1709,6 +2556,7 @@ impl RunningAgent {
             let meta = MessageMeta {
                 tokens: usage,
                 elapsed_ms: self.clock.now_millis().saturating_sub(start),
+                reasoning_elapsed_ms,
                 ctx_window,
                 used_tokens,
                 utilization,
@@ -1716,6 +2564,7 @@ impl RunningAgent {
                 turn_id,
                 request_id,
                 provider_response_id: response_id,
+                provider_model: response_model,
                 session_id: self.session_id.as_deref().map(str::to_string),
                 finish_reason,
             };
@@ -1752,11 +2601,21 @@ impl RunningAgent {
                 if !promoted.is_empty() {
                     assistant_text = promoted;
                     cleaned_reasoning.clear(); // now the body; do not also store it as reasoning
-                    self.rt.emit(AgentEvent::TextDelta(assistant_text.clone()));
+                    if !suppress_internal_stream {
+                        self.rt.emit(AgentEvent::TextDelta(assistant_text.clone()));
+                    }
                 }
             }
+            let current_internal_continuation = active_internal_continuation.take();
             let mut assistant_msg =
                 Message::assistant(assistant_text.clone(), pending_calls.clone());
+            if matches!(
+                current_internal_continuation.as_ref(),
+                Some((ContinuationKind::VerifyCadence, _))
+            ) {
+                assistant_msg.internal_origin = Some("verify_cadence".to_string());
+                assistant_msg.text.clear();
+            }
             assistant_msg.meta = Some(meta);
             // STORE the accumulated reasoning losslessly: Some(..) iff the model
             // streamed any thinking this round, else None. It rides on the Message
@@ -1780,8 +2639,26 @@ impl RunningAgent {
             // call) — re-derive the calls to execute from the (possibly edited) message
             // so a dropped call is NOT executed.
             let pending_calls = assistant_msg.tool_calls.clone();
+            // Capture before `pending_calls` is consumed by execution. The coarse
+            // fuse compares what the model chose, independent of tool results.
+            let round_sig = round_tool_signature(&pending_calls);
             convo.push(assistant_msg);
             if pending_calls.is_empty() {
+                // Exact-loop evidence is consecutive across tool rounds only. A
+                // no-tool assistant reply is an observable break in that sequence,
+                // even if a host later opens a synthetic follow-up turn.
+                if let Some(state) = tool_loop_state.as_deref_mut() {
+                    state.reset();
+                }
+                last_round_sig = None;
+                repeat_rounds = 0;
+                repeat_nudged = false;
+                // A prompt steered in during this round keeps the turn going: loop back so the
+                // top-of-loop drain folds it in and the model responds to it in-turn.
+                // (needs_follow_up = model produced tool calls OR a steer is pending.)
+                if !steer.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                    continue;
+                }
                 // TRUNCATION auto-continuation (v1 parity). The response was cut off at
                 // the OUTPUT-token limit with no tool call ⇒ almost certainly unfinished.
                 // Nudge the model to resume (or to summarize+stop if it is actually done)
@@ -1790,10 +2667,10 @@ impl RunningAgent {
                 // does not pre-empt finishing the truncated content.
                 if truncated && truncation_continuations < MAX_TRUNCATION_CONTINUATIONS {
                     truncation_continuations += 1;
-                    convo.push(Message::user(TRUNCATION_RESUME_NUDGE.to_string()));
+                    convo.push(Message::synthetic_user(TRUNCATION_RESUME_NUDGE.to_string()));
                     continue;
                 }
-                if let Some(reminder) = self.hooks.offer_continuation(convo).await {
+                if let Some(continuation) = self.hooks.offer_typed_continuation(convo).await {
                     // SAFETY FUSE: a `offer_continuation` that always continues is an infinite
                     // kernel-driven loop with no model agency to stop. Before
                     // continuing, check the cap. `None` = unlimited (opt-out).
@@ -1812,7 +2689,13 @@ impl RunningAgent {
                         }
                     }
                     continuations += 1;
-                    convo.push(Message::user(reminder));
+                    let Continuation {
+                        text,
+                        kind,
+                        visibility,
+                    } = continuation;
+                    active_internal_continuation = Some((kind, visibility));
+                    convo.push(Message::synthetic_user(text));
                     continue;
                 }
                 // The turn is ENDING. If it ends because the output was truncated and
@@ -1830,8 +2713,8 @@ impl RunningAgent {
             }
             // ── Batch detection (pre-scan) ──
             // Count NON-DUPLICATE tool calls using the SAME dedup key as the
-            // execution loop below — `(name, raw_arguments)` — captured BEFORE
-            // any middleware rewrite, matching the loop's `dedup_key` (L1019).
+            // execution loop below — `(name, canonical_arguments)` — captured
+            // BEFORE any middleware rewrite, matching the loop's `dedup_key`.
             // If ≥ 2 non-dup calls, emit ToolBatchStarted so the UI can render
             // a single grouped block instead of N independent rows. The count
             // (`total_non_dup`) reflects the REAL calls that will actually
@@ -1842,7 +2725,7 @@ impl RunningAgent {
                     std::collections::HashSet::new();
                 let mut non_dup = 0usize;
                 for c in &pending_calls {
-                    let key = (c.name.clone(), c.arguments.clone());
+                    let key = tool_call_dedup_key(c);
                     if dedup_set.insert(key) {
                         non_dup += 1;
                     }
@@ -1861,6 +2744,11 @@ impl RunningAgent {
                         id: c.id.clone(),
                         name: c.name.clone(),
                         arguments: c.arguments.clone(),
+                        parallel_safe: self
+                            .tools
+                            .get(&c.name)
+                            .map(|t| t.parallel_safe(&c.arguments))
+                            .unwrap_or(false),
                     })
                     .collect();
                 self.rt.emit(AgentEvent::ToolBatchStarted {
@@ -1888,26 +2776,37 @@ impl RunningAgent {
             // collected to attach to ONE follow-up user message AFTER every tool_result
             // is in — see the injection at the loop's end for why this is deferred.
             let mut turn_images: Vec<crate::message::ImageContent> = vec![];
-            for mut call in pending_calls {
-                // BETWEEN-TOOLS cancel checkpoint: do not dispatch any remaining
-                // tool_call once cancelled. Under "cancel = undo" the whole turn is
-                // rolled back below, so the skipped calls vanish with it — no
-                // "(cancelled)" backfill needed (nothing dangles when the turn's
-                // messages are gone).
-                if cancel.is_cancelled() {
-                    // Close any active batch so the UI doesn't have a dangling group.
-                    if let Some((batch_id, started_at)) = &batch_start {
-                        self.rt.emit(AgentEvent::ToolBatchCompleted {
-                            batch_id: batch_id.clone(),
-                            ok: batch_ok,
-                            total: total_non_dup,
-                            elapsed_ms: started_at.elapsed().as_millis() as u64,
-                        });
-                    }
-                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
-                    return;
-                }
 
+            // ══ THREE-PHASE TOOL EXECUTION ══
+            // ① CLASSIFY (in order): dedup gates, tool lookup, `before`-chain →
+            //    a `CallPlan` per call. ② EXECUTE (SERIAL for now — Task 3 makes
+            //    this concurrent): run each `Execute` plan. ③ APPLY (in order):
+            //    after-chain, cap, hooks, image harvest, emit, push, record.
+            // Behavior is IDENTICAL to the old single-pass loop: every plan's
+            // side effects fire in `pending_calls` order, so results land in
+            // emission order and the dedup/cancel invariants are preserved.
+
+            // ── Phase ① CLASSIFY ──
+            // Cancel is re-checked at the TOP of classification (the old
+            // between-tools checkpoint moved here) AND again before each execute
+            // in Phase ② — the classification pass touches no external state
+            // (only local dedup sets), so a cancel discovered mid-classify simply
+            // means Phase ② never runs.
+            if cancel.is_cancelled() {
+                // Close any active batch so the UI doesn't have a dangling group.
+                if let Some((batch_id, started_at)) = &batch_start {
+                    self.rt.emit(AgentEvent::ToolBatchCompleted {
+                        batch_id: batch_id.clone(),
+                        ok: batch_ok,
+                        total: total_non_dup,
+                        elapsed_ms: started_at.elapsed().as_millis() as u64,
+                    });
+                }
+                self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                return;
+            }
+            let mut plans: Vec<CallPlan> = Vec::with_capacity(pending_calls.len());
+            for mut call in pending_calls {
                 // ── DUPLICATE TOOL-CALL DEDUP GATE ──
                 // Some (esp. thinking-mode / weak) models emit the SAME tool_call
                 // multiple times in ONE assistant message. The dedup KEY is the
@@ -1918,7 +2817,7 @@ impl RunningAgent {
                 // post-middleware args could spuriously merge two model-distinct
                 // calls (if a rewrite collapses them) or fail to catch a true dup
                 // (if a rewrite is non-deterministic).
-                let dedup_key = (call.name.clone(), call.arguments.clone());
+                let dedup_key = tool_call_dedup_key(&call);
 
                 // (1) SAME call_id (mode A — the load-bearing API-validity fix):
                 // a second result for an already-resulted id would push TWO
@@ -1926,15 +2825,19 @@ impl RunningAgent {
                 // the next request (each tool_use id must map to EXACTLY ONE
                 // tool_result). SKIP it ENTIRELY: no execute, no push, no events.
                 // The first occurrence's result already covers this id, so there is
-                // nothing dangling for backfill to repair either.
+                // nothing dangling for backfill to repair either. IN-BATCH update:
+                // `result_ids` is updated as plans are built, so a second identical
+                // call in THIS batch classifies as Skip here.
                 if result_ids.contains(&call.id) {
+                    plans.push(CallPlan::Skip);
                     continue;
                 }
 
                 // (2) SAME (name, arguments) with a NEW id (mode B — carry
                 // production runner.rs:933-942): do NOT re-execute. Push a stub
                 // result so this distinct id STILL gets exactly one result (parity
-                // → API-valid), emit its ToolResult, record the id, and continue.
+                // → API-valid). The stub is a ready result applied in Phase ③;
+                // record the id NOW so a later same-id call classifies as Skip.
                 if seen_calls.contains(&dedup_key) {
                     let result = ToolResult {
                         call_id: call.id.clone(),
@@ -1945,28 +2848,23 @@ impl RunningAgent {
                         images: vec![],
                     };
                     result_ids.insert(call.id.clone());
-                    self.rt.emit(AgentEvent::ToolResult {
-                        result: result.clone(),
-                    });
-                    convo.push(Message::tool_result(
-                        &result.call_id,
-                        &result.content,
-                        result.is_error,
-                    ));
+                    plans.push(CallPlan::Result(result));
                     continue;
                 }
 
-                // Whether the tool's `execute` ACTUALLY ran (not unknown-tool, not
-                // blocked-by-middleware). Gates whether we record `(name,args)` into
-                // the seen-executed set for mode-B dedup (see record block below).
-                let mut executed = false;
-                let mut result = match self.tools.get(&call.name) {
-                    None => ToolResult {
-                        call_id: call.id.clone(),
-                        content: format!("unknown or unmounted tool: {}", call.name),
-                        is_error: true,
-                        images: vec![],
-                    },
+                match turn_tools.get(&call.name) {
+                    None => {
+                        // Unknown / unmounted tool: a ready error result. Record the
+                        // id (mode A) but NOT the (name,args) key — a later distinct
+                        // id may legitimately retry once the tool is mounted.
+                        result_ids.insert(call.id.clone());
+                        plans.push(CallPlan::Result(ToolResult {
+                            call_id: call.id.clone(),
+                            content: format!("unknown or unmounted tool: {}", call.name),
+                            is_error: true,
+                            images: vec![],
+                        }));
+                    }
                     Some(tool) => {
                         // ToolMiddleware before-chain: may rewrite the call (&mut),
                         // round-trip via rt (approval), and returns a BeforeOutcome
@@ -1976,11 +2874,17 @@ impl RunningAgent {
                         for mw in &self.middlewares {
                             match mw.before(&mut call, &tool, &self.rt).await {
                                 BeforeOutcome::Proceed => {}
-                                // `ask` has no kernel-independent prompt yet (the
-                                // approval gate — also a middleware in this chain —
-                                // owns the round-trip), so it defers to the normal
-                                // approval flow. Full force-ask lands with the CC
-                                // bridge producer (M2).
+                                // `ask` has no kernel-owned prompt: the approval
+                                // round-trip is L1 policy (see the injected approval
+                                // middleware), NOT L0. So the kernel defers — a
+                                // middleware that wants to FORCE a prompt for a call
+                                // that would otherwise auto-approve resolves the
+                                // round-trip ITSELF and returns Allow/Deny (as the CC
+                                // external-hooks `permissionDecision:"ask"` producer
+                                // does). A bare `Ask` reaching here therefore falls
+                                // through to the normal approval flow — i.e. to a
+                                // downstream approval middleware if one is wired; with
+                                // none, it simply proceeds.
                                 BeforeOutcome::Ask { .. } => {}
                                 // `allow` force-approves: stop the remaining `before`
                                 // gates and execute (CC `permissionDecision: "allow"`
@@ -1993,67 +2897,219 @@ impl RunningAgent {
                             }
                         }
                         if let Some(reason) = blocked {
-                            ToolResult {
+                            // Middleware-blocked: a ready error result. Record the id
+                            // (mode A) but NOT the (name,args) key — a later distinct
+                            // id may legitimately RETRY a previously blocked call.
+                            result_ids.insert(call.id.clone());
+                            plans.push(CallPlan::Result(ToolResult {
                                 call_id: call.id.clone(),
                                 content: format!("blocked: {reason}"),
                                 is_error: true,
                                 images: vec![],
-                            }
+                            }));
                         } else {
-                            executed = true;
-                            self.rt.emit(AgentEvent::ToolStarted { call: call.clone() });
-                            // SEAM 1/1b: a per-agent working dir (when set) PINS the tool
-                            // context's dir instead of reading the process-global
-                            // `current_dir()`. SNAPSHOT the shared `cwd` here so a tool
-                            // (e.g. change_dir) that mutated it on a prior call is
-                            // reflected this call. Unset = prior process-cwd behavior.
-                            let ctx = ToolContext {
-                                working_dir: match &self.cwd {
-                                    Some(c) => c.read().map(|g| g.clone()).unwrap_or_else(|_| {
-                                        std::env::current_dir().unwrap_or_default()
-                                    }),
-                                    None => std::env::current_dir().unwrap_or_default(),
-                                },
-                                cancel: cancel.clone(),
-                                // Live progress seam: a tool MAY report mid-execution status,
-                                // tagged with THIS call's id, straight to the driver (e.g. a
-                                // sub-agent tool's per-task progress). noop unless used.
-                                progress: {
-                                    let events = self.rt.events.clone();
-                                    let call_id = call.id.clone();
-                                    ProgressSink::new(std::sync::Arc::new(move |message| {
-                                        let _ = events.send(AgentEvent::ToolProgress {
-                                            call_id: call_id.clone(),
-                                            message,
-                                        });
-                                    }))
-                                },
-                            };
-                            // INSIDE-EXECUTE backstop: poll cancel while the tool
-                            // future runs so a long tool is interrupted mid-flight.
-                            // DEVIATES from production runner.rs:1431 (a FAIR select)
-                            // by being `biased` execute-first: a tool that already
-                            // completed deterministically keeps its real result,
-                            // rather than losing a coin-flip to the cancel branch.
-                            // Cooperative tools that poll ctx.cancel win this race and
-                            // clean up properly. A tool still PENDING when cancel fires
-                            // is dropped as a backstop — its side effects (if any) are
-                            // unknown, so the synthetic result says so (see ToolContext
-                            // doc: drop stops polling, it is NOT resource cleanup).
-                            let mut r = tokio::select! {
-                                biased;
-                                r = tool.execute(&call.arguments, &ctx) => r,
-                                _ = cancel.cancelled() => ToolResult {
-                                    call_id: call.id.clone(),
-                                    content: "(cancelled — side effects unknown)".into(),
-                                    is_error: true,
-                                    images: vec![],
-                                },
-                            };
-                            r.call_id = call.id.clone();
-                            r
+                            // Executes in Phase ②. Record BOTH dedup keys NOW so a
+                            // later call in THIS batch that repeats the id classifies as
+                            // Skip (mode A) and one that repeats (name,args) with a new
+                            // id classifies as the mode-B stub — mirroring the old loop's
+                            // incremental update, which happened as calls ran in order.
+                            let parallel_safe = tool.parallel_safe(&call.arguments);
+                            result_ids.insert(call.id.clone());
+                            seen_calls.insert(dedup_key);
+                            plans.push(CallPlan::Execute {
+                                tool: tool.clone(),
+                                call,
+                                parallel_safe,
+                            });
                         }
                     }
+                }
+            }
+
+            // ── Phase ② EXECUTE (CONCURRENT — Task 3) ──
+            // `Execute` plans run concurrently, gated by an RwLock: `parallel_safe`
+            // (read-only) tools take a READ-lock (they overlap), side-effecting
+            // tools take a WRITE-lock (an exclusive barrier — no read or write runs
+            // alongside them, so a mutation is never observed mid-flight by a
+            // concurrent read). A `Semaphore` bounds how many run at once
+            // (`ATOMCODE_MAX_PARALLEL_TOOLS`, default 4). Futures are polled on the
+            // CURRENT task via `FuturesOrdered` (NOT `tokio::spawn`) so no `Send`
+            // bound is imposed and each future owns cloned handles — it holds NO
+            // borrow of `&self` across an await. Results are collected in EMISSION
+            // order (FuturesOrdered yields by push order), so Phase ③ still applies
+            // side effects in `pending_calls` order exactly as the serial loop did.
+            use futures::stream::FuturesOrdered;
+            let gate = std::sync::Arc::new(tokio::sync::RwLock::new(()));
+            // Resolve the cap from the injectable override or the env/default, then
+            // clamp to [1, MAX_PARALLEL_TOOLS_CEILING] to guard Semaphore::new's
+            // internal assert (panics when permits > usize::MAX >> 3 ≈ MAX_PERMITS).
+            let cap = self
+                .max_parallel_tools
+                .unwrap_or_else(env_max_parallel_tools)
+                .clamp(1, MAX_PARALLEL_TOOLS_CEILING);
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(cap));
+
+            // Results aligned to `plans`: `None` for Skip / not-executed slots; the
+            // ready `Result(r)` payloads are moved into place so Phase ③ has a
+            // single uniform view. Execute slots are filled by the drain below.
+            let mut results: Vec<Option<ExecutedCallResult>> =
+                (0..plans.len()).map(|_| None).collect();
+            for (i, plan) in plans.iter().enumerate() {
+                if let CallPlan::Result(r) = plan {
+                    results[i] = Some(ExecutedCallResult {
+                        result: r.clone(),
+                        effective_cwd: None,
+                    });
+                }
+            }
+
+            let mut ordered: FuturesOrdered<_> = FuturesOrdered::new();
+            for (idx, plan) in plans.iter().enumerate() {
+                let CallPlan::Execute {
+                    tool,
+                    call,
+                    parallel_safe,
+                } = plan
+                else {
+                    continue;
+                };
+                // Capture OWNED clones BEFORE the `async move` so the future is
+                // self-contained — no `&self` borrow is held across an await while
+                // it is polled inside `FuturesOrdered`.
+                let gate = gate.clone();
+                let sem = sem.clone();
+                let cancel = cancel.clone();
+                // SEAM 1/1b: a per-agent working dir (when set) PINS the tool
+                // context's dir instead of the process-global `current_dir()`.
+                let cwd = self.cwd.clone();
+                // Same mpsc sender `ProgressSink`/`self.rt.emit` uses today. Emitting
+                // via `events.send` directly (rather than `self.rt.emit`) keeps the
+                // future free of any `&self` borrow.
+                let events = self.rt.events.clone();
+                let parallel_safe = *parallel_safe;
+                let tool = tool.clone();
+                let call = call.clone();
+                ordered.push_back(async move {
+                    let _permit = sem.acquire().await.expect("semaphore not closed");
+                    // Read-lock ⇒ concurrent; write-lock ⇒ exclusive barrier.
+                    let _guard = if parallel_safe {
+                        futures::future::Either::Left(gate.read().await)
+                    } else {
+                        futures::future::Either::Right(gate.write().await)
+                    };
+                    // CANCEL CHECKPOINT (concurrent analogue of the serial
+                    // between-tools checkpoint): if the turn was already cancelled by
+                    // the time this future acquired its lock (e.g. an EARLIER future
+                    // self-cancelled from inside its own execute, or an out-of-band
+                    // Cancel landed), this tool is NOT reached — it does not start,
+                    // emits no ToolStarted, and yields `None` so Phase ③ leaves its
+                    // tool_call dangling (rolled back under cancel=undo, backfilled
+                    // with `(cancelled)` under keep_interrupted_context) — exactly the
+                    // serial loop's skip-the-rest behavior.
+                    if cancel.is_cancelled() {
+                        return (idx, None);
+                    }
+                    // SNAPSHOT cwd AFTER acquiring the lock so a prior write-locked
+                    // `change_dir` (which held the exclusive barrier) is visible here.
+                    let effective_cwd = match &cwd {
+                        Some(c) => c
+                            .read()
+                            .map(|g| g.clone())
+                            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default()),
+                        None => std::env::current_dir().unwrap_or_default(),
+                    };
+                    let ctx = ToolContext {
+                        working_dir: effective_cwd.clone(),
+                        cancel: cancel.clone(),
+                        // Live progress seam: a tool MAY report mid-execution status,
+                        // tagged with THIS call's id, straight to the driver.
+                        progress: {
+                            let events = events.clone();
+                            let call_id = call.id.clone();
+                            ProgressSink::new(std::sync::Arc::new(move |message| {
+                                let _ = events.send(AgentEvent::ToolProgress {
+                                    call_id: call_id.clone(),
+                                    message,
+                                });
+                            }))
+                        },
+                        requester: Some(self.rt.requester()),
+                    };
+                    // Emit ToolStarted as THIS tool actually starts (inside the
+                    // future, once it holds its lock) via `events.send` — NOT
+                    // `self.rt.emit`, to avoid borrowing self across the await.
+                    let _ = events.send(AgentEvent::ToolStarted { call: call.clone() });
+                    // INSIDE-EXECUTE backstop: poll cancel while the tool future
+                    // runs so a long tool is interrupted mid-flight. `biased`
+                    // execute-first: a tool that already completed deterministically
+                    // keeps its real result rather than losing a coin-flip to cancel.
+                    // A tool still PENDING when cancel fires is dropped as a backstop
+                    // (side effects unknown → the synthetic result says so).
+                    let mut r = tokio::select! {
+                        biased;
+                        r = tool.execute(&call.arguments, &ctx) => r,
+                        _ = cancel.cancelled() => ToolResult {
+                            call_id: call.id.clone(),
+                            content: "(cancelled — side effects unknown)".into(),
+                            is_error: true,
+                            images: vec![],
+                        },
+                    };
+                    r.call_id = call.id.clone();
+                    (
+                        idx,
+                        Some(ExecutedCallResult {
+                            result: r,
+                            effective_cwd: Some(effective_cwd),
+                        }),
+                    )
+                });
+            }
+            // Drain in emission order. A future may yield `None` (cancel-skipped);
+            // that slot stays `None`, so Phase ③ applies nothing for it.
+            while let Some((idx, r)) = ordered.next().await {
+                results[idx] = r;
+            }
+            // If a cancel was observed during the concurrent batch, Phase ③ still
+            // applies every result that DID complete (their ToolResult events fire
+            // before Cancelled — preserving the emit-then-finalize order), then the
+            // between-tools cancel tail closes the batch and finishes the cancelled
+            // turn. Cancel-skipped slots are already `None` and apply nothing.
+            let cancelled_during_batch = cancel.is_cancelled();
+
+            // ── Phase ③ APPLY (in order) ──
+            // For each produced result (Skip / cancel-skipped contributes nothing):
+            // after-chain, cap, hooks, image harvest, emit, push, dedup record —
+            // IDENTICAL to the old single-pass tail, run in `plans` order so ordering
+            // and all side-effect sequencing are preserved. On a cancel during the
+            // batch, the cancel-skipped Execute slots are already `None`, so a tool
+            // that never started applies nothing (its tool_call is left dangling for
+            // the roll-back / backfill tail below) — the concurrent analogue of the
+            // serial `cancel_boundary` cut.
+            // The exact guard accepts either one REAL execution (including Bash /
+            // writes, which must not repeat indefinitely) or an all-read-only batch.
+            // Mixed/multi-mutating batches, stubs, unknown/blocked calls, and
+            // duplicates remain ineligible and break the streak.
+            let mut loop_candidate = tool_loop_state.is_some()
+                && !plans.is_empty()
+                && (matches!(plans.as_slice(), [CallPlan::Execute { .. }])
+                    || plans.iter().all(|plan| {
+                        matches!(
+                            plan,
+                            CallPlan::Execute {
+                                parallel_safe: true,
+                                ..
+                            }
+                        )
+                    }));
+            let mut loop_calls = Vec::with_capacity(plans.len());
+            for (plan, result_slot) in plans.iter().zip(results.iter_mut()) {
+                let Some(ExecutedCallResult {
+                    mut result,
+                    effective_cwd,
+                }) = result_slot.take()
+                else {
+                    continue; // Skip plan (no result to apply)
                 };
                 // ToolMiddleware after-chain: transform / observe the result and
                 // collect any CONTINUATION decision. Middleware sees the RAW
@@ -2072,6 +3128,29 @@ impl RunningAgent {
                 // (deterministic → prefix-cache safe). The tiny `(cancelled)`/error
                 // stubs never reach the cap, so they pass through untouched.
                 cap_tool_result(&mut result, self.max_tool_result_bytes);
+
+                // Build the fingerprint from what ACTUALLY executed and what the
+                // model will ACTUALLY see: middleware-final args, execution-time
+                // cwd, and the post-middleware, size-capped result. Success/failure
+                // is part of the identity: the same failed Bash call is also no
+                // progress. Image and post-blocked calls remain excluded.
+                if loop_candidate && result.images.is_empty() && post_block.is_none() {
+                    if let (CallPlan::Execute { tool, call, .. }, Some(effective_cwd)) =
+                        (plan, effective_cwd)
+                    {
+                        loop_calls.push(ToolLoopCallFingerprint {
+                            tool_name: tool.name().to_string(),
+                            canonical_arguments: canonicalize_tool_args(&call.arguments),
+                            effective_cwd,
+                            result_content: result.content.clone(),
+                            is_error: result.is_error,
+                        });
+                    } else {
+                        loop_candidate = false;
+                    }
+                } else {
+                    loop_candidate = false;
+                }
                 if result.is_error {
                     self.hooks.on_error(&result.content).await;
                 } else if batch_start.is_some() {
@@ -2103,23 +3182,38 @@ impl RunningAgent {
                 // CC-bridge producer (M2); no middleware emits `Block` yet, so this is
                 // currently inert.
                 if let Some(reason) = post_block {
-                    convo.push(Message::user(reason));
+                    convo.push(Message::synthetic_user(reason));
                 }
 
-                // (3) Record this id as "resulted" so a later SAME-id call (mode A)
-                // is skipped. Recorded for EVERY path that produces a result —
-                // including an unknown-tool error and a middleware-`blocked:` error
-                // (each still pushed exactly one tool_result for `call.id`, so a
-                // later same-id call would create the API-invalid duplicate we must
-                // skip). Record `(name, arguments)` (the ORIGINAL key captured at
-                // the top, before any middleware rewrite) only when the tool
-                // ACTUALLY ran — i.e. not for unknown-tool / blocked cases — so a
-                // later distinct id that the model intends to RETRY a previously
-                // failed/blocked call is not mistaken for a no-op duplicate.
-                result_ids.insert(call.id.clone());
-                if executed {
-                    seen_calls.insert(dedup_key);
+                // (3) Dedup RECORD is HOISTED to Phase ① classification: the old
+                // loop recorded `result_ids` (mode A) and `seen_calls` (mode B,
+                // executed only) at the END of each iteration, but the keys must be
+                // visible to later calls in the SAME batch — and in the phase split
+                // every call is classified before ANY apply runs — so both keys are
+                // now inserted during classification. The record semantics are
+                // identical, just moved earlier; nothing to record here.
+            }
+            let loop_fingerprint = loop_candidate.then(|| {
+                loop_calls.sort();
+                ToolLoopFingerprint { calls: loop_calls }
+            });
+            // ── Cancel during the batch: close batch + roll back the turn ──
+            // Reached only when Phase ② observed a cancel. The results that DID
+            // complete were applied above so their ToolResult events fired; the
+            // cancel-skipped Execute slots applied nothing (dangling tool_calls now
+            // rolled back / backfilled by finish_cancelled). Close any batch and
+            // finish the cancelled turn — exactly the old loop's checkpoint path.
+            if cancelled_during_batch || cancel.is_cancelled() {
+                if let Some((batch_id, started_at)) = &batch_start {
+                    self.rt.emit(AgentEvent::ToolBatchCompleted {
+                        batch_id: batch_id.clone(),
+                        ok: batch_ok,
+                        total: total_non_dup,
+                        elapsed_ms: started_at.elapsed().as_millis() as u64,
+                    });
                 }
+                self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                return;
             }
             // ── Close batch (if one was opened) ──
             if let Some((batch_id, started_at)) = batch_start {
@@ -2142,6 +3236,77 @@ impl RunningAgent {
                     std::mem::take(&mut turn_images),
                 ));
             }
+            // Enforce only after every ToolResult has been emitted/stored and any
+            // batch has been closed. This preserves provider pairing and UI event
+            // ordering; there is never a pre-execution fake result. Cancel was
+            // checked above and therefore wins over this terminal.
+            let real_steer_pending = !steer.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+            let mut exact_streak_active = false;
+            if let Some(state) = tool_loop_state.as_deref_mut() {
+                // A steer can arrive while the provider streams or the tool runs.
+                // Honor that real user intent before warning/stopping; the next
+                // round's normal drain will append the prompt to the conversation.
+                let policy = state.policy;
+                let exact_loop_decision = match (real_steer_pending, loop_fingerprint) {
+                    (false, Some(fingerprint)) => state.observe(fingerprint),
+                    _ => {
+                        state.reset();
+                        ToolLoopDecision::Continue
+                    }
+                };
+                exact_streak_active = state.consecutive > 1;
+                match exact_loop_decision {
+                    ToolLoopDecision::Continue => {}
+                    ToolLoopDecision::Warn => {
+                        self.rt.emit(AgentEvent::Warning(tool_loop_warning(policy)));
+                        convo.push(Message::synthetic_user(tool_loop_course_correction(policy)));
+                    }
+                    ToolLoopDecision::Stop => {
+                        self.rt
+                            .emit(AgentEvent::Warning(tool_loop_terminal_warning(policy)));
+                        self.finish_turn(convo, StopReason::ToolLoopDetected, &turn_ctx)
+                            .await;
+                        return;
+                    }
+                }
+            }
+
+            if real_steer_pending {
+                last_round_sig = None;
+                repeat_rounds = 0;
+                repeat_nudged = false;
+                continue;
+            }
+
+            if last_round_sig.as_deref() == Some(round_sig.as_str()) {
+                repeat_rounds = repeat_rounds.saturating_add(1);
+            } else {
+                last_round_sig = Some(round_sig);
+                repeat_rounds = 1;
+                repeat_nudged = false;
+            }
+
+            // A configured exact guard owns a stable-result streak so its custom
+            // thresholds remain meaningful. The coarse fuse still tracks those
+            // rounds and becomes active whenever exact evidence is absent (changing
+            // results, ineligible batches, or no exact policy).
+            if !exact_streak_active && repeat_rounds >= MAX_REPEAT_ROUNDS {
+                self.rt.emit(AgentEvent::Error {
+                    message: format!(
+                        "stopped: the model repeated the same tool-call pattern for \
+                         {repeat_rounds} consecutive rounds"
+                    ),
+                    http_status: None,
+                    code: None,
+                });
+                self.finish_turn(convo, StopReason::RepeatLoop, &turn_ctx)
+                    .await;
+                return;
+            }
+            if !exact_streak_active && repeat_rounds >= REPEAT_NUDGE_AT && !repeat_nudged {
+                repeat_nudged = true;
+                convo.push(Message::synthetic_user(REPEAT_LOOP_NUDGE.to_string()));
+            }
         }
     }
 }
@@ -2156,11 +3321,16 @@ pub struct AgentBuilder {
     /// an empty Vec yields an empty `HookChain` that behaves exactly like `NoopHooks`.
     hooks: Vec<Arc<dyn LifecycleHooks>>,
     max_rounds: Option<u32>,
+    tool_loop_policy: Option<ToolLoopPolicy>,
     max_continuations: Option<u32>,
     resume: Option<SessionSnapshot>,
     max_tool_result_bytes: usize,
+    /// Injectable override for the Phase ② concurrency cap. `None` = env/default.
+    /// See `Agent::max_parallel_tools` and `AgentBuilder::max_parallel_tools`.
+    max_parallel_tools: Option<usize>,
     compaction: Arc<dyn CompactionStrategy>,
     compact_threshold: Option<f32>,
+    compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
     stream_timeout: Option<std::time::Duration>,
     request_timeout: Option<std::time::Duration>,
     chat_options: ChatOptions,
@@ -2176,6 +3346,12 @@ pub struct AgentBuilder {
     clock: Arc<dyn Clock>,
     /// See `Agent::keep_interrupted_context`. Default `false`.
     keep_interrupted_context: bool,
+    /// When true, the `max_rounds` fuse becomes an interactive CHECKPOINT: instead
+    /// of `emit(Error)+MaxRounds`, it round-trips the driver (kind
+    /// `ROUND_CAP_CHECKPOINT_KIND`) and only stops on a non-continue answer. Default
+    /// `false` → today's hard-stop (so a driver that doesn't implement the kind can
+    /// never park). Only a driver that renders the checkpoint sets this true.
+    round_cap_checkpoint: bool,
 }
 
 impl Default for AgentBuilder {
@@ -2187,6 +3363,9 @@ impl Default for AgentBuilder {
             middlewares: Vec::new(),
             hooks: Vec::new(),
             max_rounds: None,
+            // Neutral default: exact loop detection is product policy and must be
+            // enabled explicitly by the runtime assembling this agent.
+            tool_loop_policy: None,
             // SAFETY FUSE DEFAULTS ON (Some(50)). This DIFFERS from `max_rounds` /
             // timeouts (which default None/OFF because they are perf/latency POLICY):
             // an unbounded `offer_continuation` continuation loop is a BUG class — the kernel
@@ -2197,10 +3376,14 @@ impl Default for AgentBuilder {
             // BOUNDED by default — a mounted tool's content cannot blow the
             // context window / OOM the host unless the embedder opts into `0`.
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            // NEUTRAL default: `None` → read ATOMCODE_MAX_PARALLEL_TOOLS env (or
+            // fall back to 4). An embedder opts in via `AgentBuilder::max_parallel_tools`.
+            max_parallel_tools: None,
             // NEUTRAL default: no strategy injected → NoCompaction (always noop) and
             // no threshold → the kernel NEVER auto-compacts unless an embedder opts in.
             compaction: Arc::new(NoCompaction),
             compact_threshold: None,
+            compaction_checkpoint: None,
             // NEUTRAL default: no liveness timeout → the kernel never adds a timer.
             // Production SHOULD set both (see the builder methods) so a turn can
             // never park forever on a stalled provider or a silent driver.
@@ -2222,6 +3405,7 @@ impl Default for AgentBuilder {
             clock: Arc::new(SystemClock::new()),
             // NEUTRAL default: preserve OFF → CANCEL = UNDO (current behavior).
             keep_interrupted_context: false,
+            round_cap_checkpoint: false,
         }
     }
 }
@@ -2266,6 +3450,21 @@ impl AgentBuilder {
         self.max_rounds = Some(n);
         self
     }
+    /// See `AgentBuilder.round_cap_checkpoint`. Default false.
+    pub fn round_cap_checkpoint(mut self, on: bool) -> Self {
+        self.round_cap_checkpoint = on;
+        self
+    }
+    /// Enable conservative exact tool-loop detection for this live session.
+    ///
+    /// The kernel default is OFF. When enabled, state stays local to the session
+    /// loop: a real user prompt/steer resets it, while a host-injected synthetic
+    /// continuation preserves it so an automated goal cannot evade the guard by
+    /// repeatedly opening fresh turns.
+    pub fn tool_loop_policy(mut self, policy: ToolLoopPolicy) -> Self {
+        self.tool_loop_policy = Some(policy);
+        self
+    }
     /// SAFETY FUSE: max times a `offer_continuation` hook may CONTINUE a single turn (inject a
     /// synthetic user message and loop again) before the kernel forcibly stops the
     /// turn with `StopReason::MaxContinuations` (and an `AgentEvent::Error`). `n = 0`
@@ -2295,10 +3494,20 @@ impl AgentBuilder {
     /// trust-model contract on `crate::tool`). A result whose content exceeds `n`
     /// bytes is truncated on a UTF-8 char boundary with a marker before it reaches
     /// the model, the stored history, or the driver — bounding context growth.
-    /// Defaults to [`DEFAULT_MAX_TOOL_RESULT_BYTES`] (256 KiB). `0` DISABLES the
+    /// Defaults to [`DEFAULT_MAX_TOOL_RESULT_BYTES`] (64 KiB). `0` DISABLES the
     /// cap (UNBOUNDED) — only do this if every mounted tool self-caps.
     pub fn max_tool_result_bytes(mut self, n: usize) -> Self {
         self.max_tool_result_bytes = n;
+        self
+    }
+    /// Override the Phase ② parallel-tools concurrency cap. `n` controls how many
+    /// `parallel_safe` (read-only) tools may execute simultaneously; it is clamped
+    /// to `[1, MAX_PARALLEL_TOOLS_CEILING]` at the `Semaphore::new` call site.
+    /// When not set, the cap is read from `ATOMCODE_MAX_PARALLEL_TOOLS` env (default
+    /// 4). Use this in tests and embedders that need a deterministic, process-global-
+    /// env-free cap (avoids the env-var race between parallel test threads).
+    pub fn max_parallel_tools(mut self, n: usize) -> Self {
+        self.max_parallel_tools = Some(n);
         self
     }
     /// RESUME a persisted session: SEED the conversation from `snapshot.messages`
@@ -2319,6 +3528,12 @@ impl AgentBuilder {
     /// default is [`NoCompaction`] (always noop).
     pub fn compaction(mut self, s: Arc<dyn CompactionStrategy>) -> Self {
         self.compaction = s;
+        self
+    }
+    /// Inject the durable writer that gates committed manual compactions.
+    /// Sessionless agents omit it and retain ephemeral in-memory behavior.
+    pub fn compaction_checkpoint(mut self, checkpoint: Arc<dyn CompactionCheckpoint>) -> Self {
+        self.compaction_checkpoint = Some(checkpoint);
         self
     }
     /// Set the AUTO task-boundary compaction threshold: a utilization fraction
@@ -2453,11 +3668,14 @@ impl AgentBuilder {
             // run-loop call sites are unchanged — they still call one hook object.
             hooks: Arc::new(HookChain::new(self.hooks)),
             max_rounds: self.max_rounds,
+            tool_loop_policy: self.tool_loop_policy,
             max_continuations: self.max_continuations,
             resume: self.resume,
             max_tool_result_bytes: self.max_tool_result_bytes,
+            max_parallel_tools: self.max_parallel_tools,
             compaction: self.compaction,
             compact_threshold: self.compact_threshold,
+            compaction_checkpoint: self.compaction_checkpoint,
             stream_timeout: self.stream_timeout,
             request_timeout: self.request_timeout,
             chat_options: self.chat_options,
@@ -2467,13 +3685,14 @@ impl AgentBuilder {
             session_id: self.session_id,
             clock: self.clock,
             keep_interrupted_context: self.keep_interrupted_context,
+            round_cap_checkpoint: self.round_cap_checkpoint,
         }
     }
 }
 
 #[cfg(test)]
 mod effective_retry_after_tests {
-    use super::effective_retry_after;
+    use super::{effective_retry_after, is_terminal_rate_limit};
     use crate::stream::ProviderError;
 
     fn err(message: &str, retry_after_secs: Option<u64>) -> ProviderError {
@@ -2518,6 +3737,23 @@ mod effective_retry_after_tests {
             effective_retry_after(&err("429 Too Many Requests", None)),
             None
         );
+    }
+
+    #[test]
+    fn billing_and_balance_429s_are_terminal_but_rpm_is_not() {
+        for (code, message) in [
+            (Some("insufficient_quota"), "quota unavailable"),
+            (None, "账户余额不足，请充值"),
+            (Some("billing_hard_limit_reached"), "limit"),
+        ] {
+            let mut e = err(message, None);
+            e.code = code.map(str::to_string);
+            assert!(is_terminal_rate_limit(&e), "{e:?}");
+        }
+
+        let mut rpm = err("requests per minute exceeded; retry later", None);
+        rpm.code = Some("rate_limit_exceeded".into());
+        assert!(!is_terminal_rate_limit(&rpm));
     }
 }
 
@@ -2592,33 +3828,148 @@ mod over_window_advisory_tests {
     #[test]
     fn fires_at_or_over_window() {
         assert!(
-            over_window_advisory(200_000, 200_000).is_some(),
+            over_window_advisory(200_000, 200_000, 200_000).is_some(),
             "exactly at window must warn"
         );
         assert!(
-            over_window_advisory(339_000, 200_000).is_some(),
+            over_window_advisory(339_000, 200_000, 200_000).is_some(),
             "over window must warn"
         );
     }
 
     #[test]
     fn silent_within_window() {
-        assert!(over_window_advisory(150_000, 200_000).is_none());
+        assert!(over_window_advisory(150_000, 200_000, 200_000).is_none());
     }
 
     #[test]
     fn silent_when_window_unknown() {
-        assert!(over_window_advisory(999_999, 0).is_none());
+        assert!(over_window_advisory(999_999, 0, 0).is_none());
     }
 
     #[test]
-    fn advisory_is_actionable() {
-        let m = over_window_advisory(339_000, 200_000).expect("over-window must warn");
-        assert!(m.contains("/compact"), "must suggest /compact: {m}");
+    fn advisory_is_actionable_and_one_line() {
+        let m = over_window_advisory(339_000, 200_000, 200_000).expect("over-window must warn");
+        assert!(!m.contains('\n'), "must be a single line: {m}");
+        assert!(m.contains("窗口"), "must name the window: {m}");
         assert!(
-            m.contains("上下文窗口"),
-            "must name the context window: {m}"
+            m.contains("精简") || m.contains("更大窗口"),
+            "must give actionable advice (trim / larger window): {m}"
         );
+        assert!(
+            !m.contains("/compact"),
+            "must NOT suggest /compact (already ran): {m}"
+        );
+    }
+
+    #[test]
+    fn fires_at_effective_limit_below_window() {
+        // window 1_000_000, effective limit 858_616 (16_384 output + 125_000 margin).
+        // An estimate of 900_000 is UNDER the window but OVER the effective limit —
+        // the old `est >= window` gate would stay silent; the reserve makes it warn.
+        assert!(super::over_window_advisory(900_000, 1_000_000, 858_616).is_some());
+        // Just under the effective limit → still silent.
+        assert!(super::over_window_advisory(800_000, 1_000_000, 858_616).is_none());
+    }
+}
+
+#[cfg(test)]
+mod cap_tool_result_tests {
+    use super::cap_tool_result;
+    use crate::tool::ToolResult;
+
+    fn res(content: String) -> ToolResult {
+        ToolResult {
+            call_id: String::new(),
+            content,
+            is_error: false,
+            images: vec![],
+        }
+    }
+
+    #[test]
+    fn head_and_tail_survive_middle_elided() {
+        // HEAD + 100k filler + TAIL, cap 1000 → both ends survive, middle dropped.
+        let mut r = res(format!("HEADHEAD{}TAILTAIL", "x".repeat(100_000)));
+        cap_tool_result(&mut r, 1000);
+        assert!(
+            r.content.starts_with("HEADHEAD"),
+            "head preserved: {:?}",
+            &r.content[..16]
+        );
+        assert!(r.content.ends_with("TAILTAIL"), "tail preserved");
+        assert!(r.content.contains("[truncated:") && r.content.contains("by kernel cap]"));
+        assert!(
+            r.content.len() < 1300,
+            "≈ cap + marker, not 100k; got {}",
+            r.content.len()
+        );
+    }
+
+    #[test]
+    fn under_cap_untouched_and_zero_unbounded() {
+        let mut small = res("small".into());
+        cap_tool_result(&mut small, 1000);
+        assert_eq!(small.content, "small");
+        let big = "a".repeat(10_000);
+        let mut r = res(big.clone());
+        cap_tool_result(&mut r, 0); // 0 = unbounded
+        assert_eq!(r.content, big);
+    }
+}
+
+#[cfg(test)]
+mod auto_compact_trigger_tests {
+    use super::{auto_compact_trigger, CompactTrigger};
+
+    fn fires(used: u32, window: u32, thresh: f32) -> bool {
+        matches!(
+            auto_compact_trigger(used, window, thresh),
+            Some(CompactTrigger::Auto { .. })
+        )
+    }
+
+    #[test]
+    fn switch_to_smaller_window_recomputes_and_fires() {
+        // 229K tokens sat at 23% of a 1M window (no compaction there)…
+        assert!(
+            !fires(229_000, 1_000_000, 0.7),
+            "under a 1M window: no compaction"
+        );
+        // …but switching to a 64K window recomputes to 3.6× over → must compact.
+        assert!(
+            fires(229_000, 64_000, 0.7),
+            "switch to 64K window: must compact"
+        );
+    }
+
+    #[test]
+    fn switch_to_larger_window_does_not_fire() {
+        // Pressure drops when the window grows — no needless compaction.
+        assert!(
+            !fires(60_000, 1_000_000, 0.7),
+            "60K in a 1M window: no compaction"
+        );
+    }
+
+    #[test]
+    fn threshold_boundary_and_unknown_window() {
+        assert!(fires(7_000, 10_000, 0.7), "exactly at threshold fires");
+        assert!(!fires(6_999, 10_000, 0.7), "just below threshold does not");
+        assert!(!fires(999_999, 0, 0.7), "unknown window (0) never fires");
+    }
+
+    #[test]
+    fn carries_the_recomputed_utilization() {
+        match auto_compact_trigger(229_000, 64_000, 0.7) {
+            Some(CompactTrigger::Auto { utilization }) => {
+                assert!(
+                    (utilization - 229_000.0 / 64_000.0).abs() < 1e-4,
+                    "utilization vs CURRENT window"
+                );
+            }
+            other => panic!("expected Auto, got {other:?}"),
+        }
     }
 }
 
@@ -2816,5 +4167,544 @@ mod session_affinity_tests {
             seen.lock().unwrap().is_none(),
             "without a session id the provider must stay unbound so the affinity header is omitted"
         );
+    }
+}
+
+#[cfg(test)]
+mod parallel_tools_cap_clamp_tests {
+    use super::{env_max_parallel_tools, MAX_PARALLEL_TOOLS_CEILING};
+
+    /// A huge env value must clamp to the ceiling — not reach `Semaphore::new`
+    /// and panic. We test the clamp expression directly (no env mutation needed).
+    #[test]
+    fn huge_value_clamps_to_ceiling() {
+        assert_eq!(
+            usize::MAX.clamp(1, MAX_PARALLEL_TOOLS_CEILING),
+            MAX_PARALLEL_TOOLS_CEILING,
+            "usize::MAX must clamp to MAX_PARALLEL_TOOLS_CEILING before Semaphore::new"
+        );
+    }
+
+    /// The ceiling constant must itself be safely below tokio's MAX_PERMITS
+    /// (usize::MAX >> 3). If this assertion ever fails, raise the guard.
+    #[test]
+    fn ceiling_is_below_tokio_max_permits() {
+        let tokio_max_permits = usize::MAX >> 3;
+        assert!(
+            MAX_PARALLEL_TOOLS_CEILING < tokio_max_permits,
+            "MAX_PARALLEL_TOOLS_CEILING ({}) must be below tokio MAX_PERMITS ({})",
+            MAX_PARALLEL_TOOLS_CEILING,
+            tokio_max_permits
+        );
+    }
+
+    /// The default (no env set) must be a valid, clamped value.
+    #[test]
+    fn default_cap_is_within_bounds() {
+        // env_max_parallel_tools() reads the env; in a test context with no env var set
+        // it returns 4. We only care that the value survives the clamp unchanged.
+        let raw = env_max_parallel_tools();
+        let clamped = raw.clamp(1, MAX_PARALLEL_TOOLS_CEILING);
+        assert_eq!(
+            raw, clamped,
+            "the default cap ({raw}) must already be within [1, {MAX_PARALLEL_TOOLS_CEILING}]"
+        );
+    }
+}
+
+// ── STEER BUFFER TESTS (Task 1: route mid-turn SendMessage into steer buffer) ─
+//
+// Task 1 only ROUTES the steer into the buffer; the DRAIN that makes round 2 see
+// the steered text is Task 2. The full end-to-end test is marked
+// `#[ignore = "drain lands in Task 2"]` so Task 1 stays green. A separate active
+// test asserts the Task-1-visible invariant: a mid-turn SendMessage must NOT open
+// a second TurnStarted (it was routed into the steer buffer, not queued as a new
+// pending turn). Choice: SPLIT — active test for Task 1, ignored full test for Task 2.
+#[cfg(test)]
+mod steer_buffer_tests {
+    use super::*;
+    use crate::stream::StreamEvent;
+    use crate::testkit::{MockProvider, NoopTool};
+    use crate::tool::{ToolCall, ToolRegistry};
+    use std::sync::{Arc, Mutex};
+
+    /// Task-1 assertion only: a mid-turn SendMessage is routed into the steer buffer,
+    /// NOT pushed into `pending` — so it does NOT open a second TurnStarted event.
+    /// The full fold (seeing "STEER-ME" in round 2's request) is Task 2.
+    #[tokio::test]
+    async fn midturn_send_does_not_open_a_second_turn() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "c1".into(),
+                    name: "noop".into(),
+                    arguments: "{}".into(),
+                }),
+                StreamEvent::Done { truncated: false },
+            ],
+            vec![
+                StreamEvent::TextDelta("done".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+        ]));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(NoopTool));
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(reg.mount(&["noop"]))
+            .build()
+            .spawn();
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "start".into(),
+                images: vec![],
+            })
+            .unwrap();
+        let mut turn_started = 0u32;
+        let steer_tx = handle.commands.clone();
+        let mut steered = false;
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::TurnStarted => turn_started += 1,
+                AgentEvent::ToolResult { .. } if !steered => {
+                    steer_tx
+                        .send(AgentCommand::SendMessage {
+                            text: "STEER-ME".into(),
+                            images: vec![],
+                        })
+                        .unwrap();
+                    steered = true;
+                }
+                AgentEvent::TurnComplete { .. } => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(turn_started, 1, "steer must NOT open a second turn");
+    }
+
+    /// Full end-to-end steer test: steered prompt is folded into the same turn's
+    /// next request.
+    ///
+    /// Injection is via DeferredSteerProvider (deterministic): the steer is sent to
+    /// cmd_tx during the FIRST chat_stream call, and the stream yields once before
+    /// emitting events. This guarantees the driver's select-loop processes the steer
+    /// into steer.lock() before the round-2 drain runs — no task-scheduler timing
+    /// dependency.
+    #[tokio::test]
+    async fn midturn_send_steers_into_same_turn_not_a_new_turn() {
+        // Use Arc<Mutex<Option<Sender>>> so the provider can be created before the
+        // agent handle exists (the handle gives us the command sender).
+        let deferred_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentCommand>>>> =
+            Arc::new(Mutex::new(None));
+        let deferred_tx_clone = deferred_tx.clone();
+        // Build provider that sends on first call.
+        let provider = Arc::new(crate::testkit::DeferredSteerProvider::new(
+            vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "c1".into(),
+                        name: "noop".into(),
+                        arguments: "{}".into(),
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ],
+                vec![
+                    StreamEvent::TextDelta("done".into()),
+                    StreamEvent::Done { truncated: false },
+                ],
+            ],
+            1, // inject on first chat_stream call
+            "STEER-ME",
+            deferred_tx_clone,
+        ));
+        let received = provider.received();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(NoopTool));
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(reg.mount(&["noop"]))
+            .build()
+            .spawn();
+        // Fill the deferred sender NOW that we have the handle.
+        *deferred_tx.lock().unwrap() = Some(handle.commands.clone());
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "start".into(),
+                images: vec![],
+            })
+            .unwrap();
+        let mut turn_started = 0u32;
+        let mut turn_complete = 0u32;
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::TurnStarted => turn_started += 1,
+                AgentEvent::TurnComplete { .. } => {
+                    turn_complete += 1;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(turn_started, 1, "steer must NOT open a second turn");
+        assert_eq!(turn_complete, 1);
+        let calls = received.lock().unwrap();
+        let round2 = calls.last().expect("a second model request happened");
+        assert!(
+            round2.iter().any(|(_, text)| text.contains("STEER-ME")),
+            "the steered prompt must be folded into the same turn's next request; got {round2:?}"
+        );
+    }
+
+    /// A pure-text turn (no tool calls) where the user steers mid-stream must
+    /// CONTINUE in the same turn rather than ending.
+    ///
+    /// Injection is via DeferredSteerProvider (deterministic): steer sent on call 1,
+    /// provider's stream yields once before events, giving the driver time to put
+    /// the steer into steer.lock() before the terminal-boundary steer check runs.
+    #[tokio::test]
+    async fn steer_continues_a_pure_text_turn_instead_of_ending() {
+        let deferred_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentCommand>>>> =
+            Arc::new(Mutex::new(None));
+        let deferred_tx_clone = deferred_tx.clone();
+        let provider = Arc::new(crate::testkit::DeferredSteerProvider::new(
+            vec![
+                vec![
+                    StreamEvent::TextDelta("first".into()),
+                    StreamEvent::Done { truncated: false },
+                ],
+                vec![
+                    StreamEvent::TextDelta("second".into()),
+                    StreamEvent::Done { truncated: false },
+                ],
+            ],
+            1, // inject on first call
+            "STEER-TEXT",
+            deferred_tx_clone,
+        ));
+        let received = provider.received();
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(ToolRegistry::new().mount(&[]))
+            .build()
+            .spawn();
+        *deferred_tx.lock().unwrap() = Some(handle.commands.clone());
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "hello".into(),
+                images: vec![],
+            })
+            .unwrap();
+        let mut turn_started = 0u32;
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::TurnStarted => turn_started += 1,
+                AgentEvent::TurnComplete { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            turn_started, 1,
+            "the steered text response stays in ONE turn"
+        );
+        let calls = received.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|req| req.iter().any(|(_, t)| t.contains("STEER-TEXT"))),
+            "a pure-text turn must continue and send the steered prompt; got {calls:?}"
+        );
+    }
+
+    /// Injecting one steer during round 1 must emit exactly one
+    /// `AgentEvent::Steered { count: 1, .. }` before the turn completes.
+    #[tokio::test]
+    async fn steer_emits_a_steered_event_with_count() {
+        let deferred_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentCommand>>>> =
+            Arc::new(Mutex::new(None));
+        let deferred_tx_clone = deferred_tx.clone();
+        // Round 1: a tool call so the turn continues into round 2 (where the drain runs).
+        // Round 2: plain text so the turn ends cleanly.
+        let provider = Arc::new(crate::testkit::DeferredSteerProvider::new(
+            vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "c1".into(),
+                        name: "noop".into(),
+                        arguments: "{}".into(),
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ],
+                vec![
+                    StreamEvent::TextDelta("done".into()),
+                    StreamEvent::Done { truncated: false },
+                ],
+            ],
+            1, // inject steer on first chat_stream call
+            "STEER-COUNT",
+            deferred_tx_clone,
+        ));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(NoopTool));
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(reg.mount(&["noop"]))
+            .build()
+            .spawn();
+        *deferred_tx.lock().unwrap() = Some(handle.commands.clone());
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "start".into(),
+                images: vec![],
+            })
+            .unwrap();
+        let mut steered_inputs = Vec::new();
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::Steered { count, inputs } => {
+                    assert_eq!(count, inputs.len());
+                    steered_inputs.extend(inputs);
+                }
+                AgentEvent::TurnComplete { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            steered_inputs,
+            vec![crate::event::SteeredInput {
+                text: "STEER-COUNT".into(),
+                images: Vec::new(),
+            }],
+            "one folded prompt → Steered {{ count: 1 }}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod effective_input_limit_tests {
+    use super::effective_input_limit;
+
+    #[test]
+    fn reserves_output_plus_margin() {
+        // deepseek-v4-flash: 1M window, 16,384 max_tokens.
+        // margin = 1_000_000/8 = 125_000; reserve = 16_384 + 125_000 = 141_384.
+        assert_eq!(effective_input_limit(1_000_000, Some(16_384)), 858_616);
+        // GLM: 200K window, 16,384 max_tokens.
+        // margin = 200_000/8 = 25_000; reserve = 16_384 + 25_000 = 41_384.
+        assert_eq!(effective_input_limit(200_000, Some(16_384)), 158_616);
+    }
+
+    #[test]
+    fn none_max_tokens_uses_default_16384() {
+        assert_eq!(effective_input_limit(1_000_000, None), 858_616);
+    }
+
+    #[test]
+    fn margin_clamps_floor_and_ceiling() {
+        // Small window: 64_000/8 = 8_000 → clamped UP to 16_000.
+        // reserve = 16_384 + 16_000 = 32_384; effective = 31_616.
+        assert_eq!(effective_input_limit(64_000, Some(16_384)), 31_616);
+        // Large window: 2_000_000/8 = 250_000 → clamped DOWN to 128_000.
+        // reserve = 16_384 + 128_000 = 144_384; effective = 1_855_616.
+        assert_eq!(effective_input_limit(2_000_000, Some(16_384)), 1_855_616);
+    }
+
+    #[test]
+    fn tiny_window_falls_back_to_raw_window() {
+        // reserve (~32_384) exceeds a tiny window → no reservation possible, so it
+        // falls back to the raw window (old `est >= window` behavior). Never panics.
+        assert_eq!(effective_input_limit(1_000, Some(16_384)), 1_000);
+        assert_eq!(effective_input_limit(100, Some(16_384)), 100);
+    }
+}
+
+#[cfg(test)]
+mod synthetic_send_tests {
+    //! `AgentCommand::SendSyntheticMessage` — the host-injected (goal-mode)
+    //! continuation primitive. It shares SendMessage's WHOLE path (user_prompt_submit
+    //! hook, task-boundary compaction, mid-turn FIFO queueing); the ONLY difference is
+    //! the conversation message is pushed via `Message::synthetic_user`, so it never
+    //! anchors `sacred_floor` and a host can hide it from user-facing projections.
+    use super::*;
+    use crate::message::Role;
+    use crate::testkit::{
+        DeferredCommands, EchoTool, InjectCommandTool, MockProvider, RecordingProvider,
+        RewritePromptHook,
+    };
+    use crate::tool::{ToolCall, ToolRegistry};
+    use std::sync::Mutex;
+
+    // (1) A synthetic prompt runs the user_prompt_submit hook (rewrite applied) and is
+    //     stored as a SYNTHETIC user message.
+    #[tokio::test]
+    async fn synthetic_prompt_pushes_synthetic_user_and_runs_hook() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(MockProvider::new(vec![vec![
+            StreamEvent::TextDelta("ok".into()),
+            StreamEvent::Done { truncated: false },
+        ]]));
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(ToolRegistry::new().mount(&[]))
+            .hooks(Arc::new(RewritePromptHook::new(
+                "rewrite",
+                "!!",
+                log.clone(),
+            )))
+            .build()
+            .spawn();
+
+        handle
+            .commands
+            .send(AgentCommand::SendSyntheticMessage {
+                text: "continue".into(),
+            })
+            .unwrap();
+        while let Some(ev) = handle.events.recv().await {
+            if matches!(ev, AgentEvent::TurnComplete { .. }) {
+                break;
+            }
+        }
+
+        // Inspect the stored conversation via Snapshot.
+        handle.commands.send(AgentCommand::Snapshot).unwrap();
+        let mut messages = Vec::new();
+        while let Some(ev) = handle.events.recv().await {
+            if let AgentEvent::Snapshot { snapshot } = ev {
+                messages = snapshot.messages;
+                break;
+            }
+        }
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
+
+        // The hook OBSERVED the synthetic prompt (same path as SendMessage).
+        assert!(
+            log.lock().unwrap().iter().any(|n| n == "rewrite"),
+            "user_prompt_submit must run for a synthetic prompt"
+        );
+        // The stored prompt is a SYNTHETIC user message carrying the hook's rewrite.
+        let user = messages
+            .iter()
+            .find(|m| m.role == Role::User)
+            .expect("a user message must be stored");
+        assert!(
+            user.synthetic,
+            "a synthetic prompt must be stored as synthetic"
+        );
+        assert_eq!(
+            user.text, "continue!!",
+            "the hook's rewrite must land in storage"
+        );
+    }
+
+    // (2) A synthetic user message never anchors `sacred_floor`: only the FIRST REAL
+    //     user message does, so the floor extends THROUGH the real prompt.
+    #[test]
+    fn synthetic_prompt_never_becomes_sacred_anchor() {
+        let mut c = Conversation::new();
+        c.push(Message::system("persona")); // index 0
+        c.push(Message::synthetic_user("[goal-mode continuation]")); // index 1 — NOT anchor
+        c.push(Message::user("the real task")); // index 2 — the real anchor
+                                                // Floor = system + through the first REAL user (index 2) → count 3; the
+                                                // synthetic at index 1 does not pull the floor up short.
+        assert_eq!(c.sacred_floor(), 3);
+    }
+
+    // (3) A synthetic prompt injected MID-TURN is QUEUED (FIFO) and runs as its OWN
+    //     turn after the current one — its message reaches the provider, marked
+    //     synthetic. Mirrors the SendMessage mid-turn-queue proof.
+    #[tokio::test]
+    async fn synthetic_mid_turn_is_queued_fifo() {
+        let deferred: DeferredCommands = Arc::new(Mutex::new(None));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        reg.register(Arc::new(InjectCommandTool::new(
+            deferred.clone(),
+            AgentCommand::SendSyntheticMessage {
+                text: "SECOND-SYNTHETIC".into(),
+            },
+        )));
+
+        let provider = Arc::new(
+            RecordingProvider::new(vec![
+                // Turn 1, round 1: call `inject` (sends a mid-turn synthetic), end round.
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "i1".into(),
+                        name: "inject".into(),
+                        arguments: "{}".into(),
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ],
+                // Turn 1, round 2: final answer → turn 1 completes.
+                vec![
+                    StreamEvent::TextDelta("first done".into()),
+                    StreamEvent::Done { truncated: false },
+                ],
+                // Turn 2 (the QUEUED synthetic): final answer → completes.
+                vec![
+                    StreamEvent::TextDelta("second done".into()),
+                    StreamEvent::Done { truncated: false },
+                ],
+            ])
+            .with_ctx_window(1000),
+        );
+        let calls = provider.calls();
+
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(reg.mount(&["echo", "inject"]))
+            .persona("neutral test agent")
+            .build()
+            .spawn();
+        *deferred.lock().unwrap() = Some(handle.commands.clone());
+
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "FIRST-PROMPT".into(),
+                images: vec![],
+            })
+            .unwrap();
+
+        // TWO TurnComplete events: turn 1, then the drained mid-turn synthetic's turn 2.
+        let mut completes = 0;
+        while let Some(ev) = handle.events.recv().await {
+            if matches!(ev, AgentEvent::TurnComplete { .. }) {
+                completes += 1;
+                if completes == 2 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            completes, 2,
+            "the queued mid-turn synthetic must run its own turn"
+        );
+
+        // The queued synthetic entered history as a SYNTHETIC user message and reached
+        // the provider on turn 2 — proof it was not lost and kept its synthetic marker.
+        let reached_as_synthetic = {
+            let recorded = calls.lock().unwrap();
+            recorded
+                .last()
+                .unwrap()
+                .0
+                .iter()
+                .any(|m| m.role == Role::User && m.text == "SECOND-SYNTHETIC" && m.synthetic)
+        };
+        assert!(
+            reached_as_synthetic,
+            "the mid-turn-queued synthetic prompt must reach the provider in turn 2, marked synthetic"
+        );
+
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
     }
 }

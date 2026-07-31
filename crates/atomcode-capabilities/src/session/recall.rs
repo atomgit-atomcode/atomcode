@@ -16,7 +16,8 @@ use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
 use chrono::{Local, TimeZone};
 use serde::Deserialize;
 
-use super::{SessionManager, TurnRecord};
+use super::manager::{for_each_jsonl_line, regular_file_len, MAX_JSONL_BYTES, MAX_JSONL_LINES};
+use super::{SessionManager, SessionResult, SessionStoreError, TurnRecord};
 
 /// A parsed recall query: lowercased keyword terms + a result cap.
 pub struct RecallQuery {
@@ -61,7 +62,10 @@ fn score_record(r: &TurnRecord, terms: &[String]) -> usize {
         hay.push(' ');
         hay.push_str(&t.result.to_lowercase());
     }
-    terms.iter().map(|term| hay.matches(term.as_str()).count()).sum()
+    terms
+        .iter()
+        .map(|term| hay.matches(term.as_str()).count())
+        .sum()
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,7 +94,10 @@ pub struct RecallTool {
 
 impl Default for RecallTool {
     fn default() -> Self {
-        Self { index: Arc::new(KeywordIndex), sessions_dir: None }
+        Self {
+            index: Arc::new(KeywordIndex),
+            sessions_dir: None,
+        }
     }
 }
 
@@ -101,7 +108,10 @@ impl RecallTool {
 
     /// Use a custom ranking backend (e.g. a future embedding index).
     pub fn with_index(index: Arc<dyn RecallIndex>) -> Self {
-        Self { index, sessions_dir: None }
+        Self {
+            index,
+            sessions_dir: None,
+        }
     }
 
     /// Pin the sessions dir this tool searches (an assembly passes its
@@ -122,11 +132,11 @@ impl RecallTool {
         after: Option<&str>,
         before: Option<&str>,
         limit: usize,
-    ) -> String {
+    ) -> SessionResult<String> {
         let after_ms = after.and_then(parse_date_bound);
         let before_ms = before.and_then(parse_date_bound);
 
-        let records: Vec<TurnRecord> = load_records(sessions_dir)
+        let records: Vec<TurnRecord> = load_records(sessions_dir)?
             .into_iter()
             .filter(|r| after_ms.is_none_or(|a| r.ts >= a))
             .filter(|r| before_ms.is_none_or(|b| r.ts < b))
@@ -153,7 +163,7 @@ impl RecallTool {
              it finishes.)",
             sessions_dir.display()
         ));
-        out
+        Ok(out)
     }
 }
 
@@ -205,45 +215,131 @@ impl Tool for RecallTool {
         };
         let sessions_dir = match &self.sessions_dir {
             Some(d) => d.clone(),
-            None => SessionManager::for_project(&ctx.working_dir).root().to_path_buf(),
+            None => SessionManager::for_project(&ctx.working_dir)
+                .root()
+                .to_path_buf(),
         };
-        let content = self.search_dir(
+        let content = match self.search_dir(
             &sessions_dir,
             &a.query,
             a.after.as_deref(),
             a.before.as_deref(),
             a.limit.unwrap_or(DEFAULT_LIMIT),
-        );
-        ToolResult { call_id: String::new(), content, is_error: false, images: vec![] }
+        ) {
+            Ok(content) => content,
+            Err(error) => {
+                return ToolResult {
+                    call_id: String::new(),
+                    content: format!("failed to read session transcripts: {error}"),
+                    is_error: true,
+                    images: vec![],
+                }
+            }
+        };
+        ToolResult {
+            call_id: String::new(),
+            content,
+            is_error: false,
+            images: vec![],
+        }
     }
 }
 
-/// Load and parse every `*.jsonl` line under `dir` into `TurnRecord`s. Missing dir → empty;
-/// a malformed line is skipped (never fatal).
-fn load_records(dir: &Path) -> Vec<TurnRecord> {
+/// Load every transcript incrementally. Missing dir remains an empty history; a present
+/// but corrupt/unsafe/future-schema file is explicit because silently omitting history
+/// would make recall report a false success.
+fn load_records(dir: &Path) -> SessionResult<Vec<TurnRecord>> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return out;
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(source) => {
+            return Err(SessionStoreError::Io {
+                path: dir.to_path_buf(),
+                source,
+            });
+        }
     };
-    for entry in rd.flatten() {
+    let mut total_bytes = 0usize;
+    let mut total_lines = 0usize;
+    for entry in rd {
+        let entry = entry.map_err(|source| SessionStoreError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        for line in content.lines() {
-            if let Ok(rec) = serde_json::from_str::<TurnRecord>(line) {
-                // Reader-enforced version bound: a future-schema record that still
-                // deserializes under this layout is skipped, not misread.
-                if rec.v <= crate::session::transcript::RECORD_VERSION {
-                    out.push(rec);
-                }
+        let file_bytes = regular_file_len(&path)?;
+        let projected_bytes =
+            total_bytes
+                .checked_add(file_bytes)
+                .ok_or(SessionStoreError::TooLarge {
+                    kind: "recall transcripts",
+                    limit: MAX_JSONL_BYTES,
+                    actual: usize::MAX,
+                })?;
+        if projected_bytes > MAX_JSONL_BYTES {
+            return Err(SessionStoreError::TooLarge {
+                kind: "recall transcripts",
+                limit: MAX_JSONL_BYTES,
+                actual: projected_bytes,
+            });
+        }
+        let (bytes, lines) = for_each_jsonl_line(&path, |line| {
+            if out.len() >= MAX_JSONL_LINES {
+                return Err(SessionStoreError::TooLarge {
+                    kind: "recall transcript lines",
+                    limit: MAX_JSONL_LINES,
+                    actual: out.len() + 1,
+                });
             }
+            let rec: TurnRecord =
+                serde_json::from_slice(line).map_err(|error| SessionStoreError::Corrupt {
+                    kind: "transcript record",
+                    message: format!("{}: {error}", path.display()),
+                })?;
+            if rec.v > crate::session::transcript::RECORD_VERSION {
+                return Err(SessionStoreError::FutureSchema {
+                    kind: "transcript record",
+                    found: rec.v,
+                    supported: crate::session::transcript::RECORD_VERSION,
+                });
+            }
+            out.push(rec);
+            Ok(())
+        })?;
+        total_bytes = total_bytes
+            .checked_add(bytes)
+            .ok_or(SessionStoreError::TooLarge {
+                kind: "recall transcripts",
+                limit: MAX_JSONL_BYTES,
+                actual: usize::MAX,
+            })?;
+        total_lines = total_lines
+            .checked_add(lines)
+            .ok_or(SessionStoreError::TooLarge {
+                kind: "recall transcript lines",
+                limit: MAX_JSONL_LINES,
+                actual: usize::MAX,
+            })?;
+        if total_bytes > MAX_JSONL_BYTES {
+            return Err(SessionStoreError::TooLarge {
+                kind: "recall transcripts",
+                limit: MAX_JSONL_BYTES,
+                actual: total_bytes,
+            });
+        }
+        if total_lines > MAX_JSONL_LINES {
+            return Err(SessionStoreError::TooLarge {
+                kind: "recall transcript lines",
+                limit: MAX_JSONL_LINES,
+                actual: total_lines,
+            });
         }
     }
-    out
+    Ok(out)
 }
 
 /// Parse a bound as RFC-3339 datetime first, else `YYYY-MM-DD` at LOCAL midnight; return
@@ -272,7 +368,10 @@ fn format_hits(hits: &[&TurnRecord]) -> String {
     if hits.is_empty() {
         return "No matching turns found in this project's history.".to_string();
     }
-    let mut out = format!("Recalled {} matching turn(s) (project-local):\n", hits.len());
+    let mut out = format!(
+        "Recalled {} matching turn(s) (project-local):\n",
+        hits.len()
+    );
     for h in hits {
         // CHAR-safe truncation (mirrors `truncate` below): a byte slice `[..8]` would
         // PANIC if the id has a multi-byte char straddling byte 8 — and session_id is an
@@ -339,22 +438,35 @@ mod tests {
             dir.path(),
             "a.jsonl",
             &[
-                rec("aaaa1111", 1000, "fix the OAuth token refresh bug", "traced it to SystemTime::now().unwrap()"),
+                rec(
+                    "aaaa1111",
+                    1000,
+                    "fix the OAuth token refresh bug",
+                    "traced it to SystemTime::now().unwrap()",
+                ),
                 rec("aaaa1111", 2000, "unrelated thing", "about formatting"),
             ],
         );
         write_jsonl(
             dir.path(),
             "b.jsonl",
-            &[rec("bbbb2222", 3000, "another oauth question", "oauth oauth scopes")],
+            &[rec(
+                "bbbb2222",
+                3000,
+                "another oauth question",
+                "oauth oauth scopes",
+            )],
         );
 
         let tool = RecallTool::new();
-        let out = tool.search_dir(dir.path(), "oauth", None, None, 8);
+        let out = tool.search_dir(dir.path(), "oauth", None, None, 8).unwrap();
         // Both oauth turns matched; the one with more "oauth" occurrences ranks first.
         assert!(out.contains("Recalled 2 matching"), "got: {out}");
         let first = out.lines().nth(1).unwrap();
-        assert!(first.contains("bbbb2222"), "higher keyword count ranks first: {out}");
+        assert!(
+            first.contains("bbbb2222"),
+            "higher keyword count ranks first: {out}"
+        );
         assert!(!out.contains("unrelated thing"));
     }
 
@@ -374,9 +486,15 @@ mod tests {
         );
         let tool = RecallTool::new();
         // after = 2*day (inclusive lower), before = 5*day (exclusive upper) → only the 3*day turn.
-        let after = chrono::DateTime::from_timestamp_millis(2 * day).unwrap().to_rfc3339();
-        let before = chrono::DateTime::from_timestamp_millis(5 * day).unwrap().to_rfc3339();
-        let out = tool.search_dir(dir.path(), "alpha", Some(&after), Some(&before), 8);
+        let after = chrono::DateTime::from_timestamp_millis(2 * day)
+            .unwrap()
+            .to_rfc3339();
+        let before = chrono::DateTime::from_timestamp_millis(5 * day)
+            .unwrap()
+            .to_rfc3339();
+        let out = tool
+            .search_dir(dir.path(), "alpha", Some(&after), Some(&before), 8)
+            .unwrap();
         assert!(out.contains("Recalled 1 matching"), "got: {out}");
         assert!(out.contains("alpha mid"));
     }
@@ -385,7 +503,9 @@ mod tests {
     fn no_match_is_a_clear_message_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
         write_jsonl(dir.path(), "a.jsonl", &[rec("s", 1, "hello", "world")]);
-        let out = RecallTool::new().search_dir(dir.path(), "nonexistent", None, None, 8);
+        let out = RecallTool::new()
+            .search_dir(dir.path(), "nonexistent", None, None, 8)
+            .unwrap();
         assert!(out.contains("No matching turns"));
     }
 
@@ -396,23 +516,34 @@ mod tests {
         let want_dir = dir.path().display().to_string();
 
         // On a hit: footer shows the REAL dir + restates the freshness boundary.
-        let hit = RecallTool::new().search_dir(dir.path(), "hello", None, None, 8);
+        let hit = RecallTool::new()
+            .search_dir(dir.path(), "hello", None, None, 8)
+            .unwrap();
         assert!(hit.contains(&want_dir), "footer shows the real dir: {hit}");
-        assert!(hit.contains("in-progress turn"), "footer restates freshness: {hit}");
+        assert!(
+            hit.contains("in-progress turn"),
+            "footer restates freshness: {hit}"
+        );
 
         // On a no-match (where the "why is nothing here?" confusion lands): footer too.
-        let miss = RecallTool::new().search_dir(dir.path(), "nonexistent", None, None, 8);
+        let miss = RecallTool::new()
+            .search_dir(dir.path(), "nonexistent", None, None, 8)
+            .unwrap();
         assert!(miss.contains("No matching turns"));
-        assert!(miss.contains(&want_dir), "footer shows dir even on no-match: {miss}");
+        assert!(
+            miss.contains(&want_dir),
+            "footer shows dir even on no-match: {miss}"
+        );
     }
 
     #[test]
     fn limit_caps_results() {
         let dir = tempfile::tempdir().unwrap();
-        let records: Vec<TurnRecord> =
-            (0..10).map(|i| rec("s", i, "match me", "yes")).collect();
+        let records: Vec<TurnRecord> = (0..10).map(|i| rec("s", i, "match me", "yes")).collect();
         write_jsonl(dir.path(), "a.jsonl", &records);
-        let out = RecallTool::new().search_dir(dir.path(), "match", None, None, 3);
+        let out = RecallTool::new()
+            .search_dir(dir.path(), "match", None, None, 3)
+            .unwrap();
         assert!(out.contains("Recalled 3 matching"), "got: {out}");
     }
 
@@ -421,10 +552,22 @@ mod tests {
         // session_id read back from on-disk jsonl is unvalidated; a multi-byte id whose
         // byte 8 is mid-codepoint would panic a byte slice — format must be char-safe.
         let dir = tempfile::tempdir().unwrap();
-        write_jsonl(dir.path(), "a.jsonl", &[rec("日本語のセッションid", 1, "match me", "yes")]);
-        let out = RecallTool::new().search_dir(dir.path(), "match", None, None, 8);
-        assert!(out.contains("Recalled 1 matching"), "a non-ASCII id must not panic: {out}");
-        assert!(out.contains("日本語"), "short id is char-truncated, not byte-sliced: {out}");
+        write_jsonl(
+            dir.path(),
+            "a.jsonl",
+            &[rec("日本語のセッションid", 1, "match me", "yes")],
+        );
+        let out = RecallTool::new()
+            .search_dir(dir.path(), "match", None, None, 8)
+            .unwrap();
+        assert!(
+            out.contains("Recalled 1 matching"),
+            "a non-ASCII id must not panic: {out}"
+        );
+        assert!(
+            out.contains("日本語"),
+            "short id is char-truncated, not byte-sliced: {out}"
+        );
     }
 
     #[test]
@@ -439,7 +582,58 @@ mod tests {
         });
         write_jsonl(dir.path(), "a.jsonl", &[r]);
         // A term only present in the tool args/result still matches.
-        let out = RecallTool::new().search_dir(dir.path(), "refresh_token", None, None, 8);
-        assert!(out.contains("Recalled 1 matching"), "tool text is searchable: {out}");
+        let out = RecallTool::new()
+            .search_dir(dir.path(), "refresh_token", None, None, 8)
+            .unwrap();
+        assert!(
+            out.contains("Recalled 1 matching"),
+            "tool text is searchable: {out}"
+        );
+    }
+
+    #[test]
+    fn corrupt_transcript_is_an_explicit_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("broken.jsonl"), b"not-json\n").unwrap();
+
+        assert!(matches!(
+            RecallTool::new().search_dir(dir.path(), "anything", None, None, 8),
+            Err(SessionStoreError::Corrupt {
+                kind: "transcript record",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn future_transcript_schema_is_an_explicit_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut future = rec("s", 1, "hello", "world");
+        future.v = crate::session::transcript::RECORD_VERSION + 1;
+        write_jsonl(dir.path(), "future.jsonl", &[future]);
+
+        assert!(matches!(
+            RecallTool::new().search_dir(dir.path(), "hello", None, None, 8),
+            Err(SessionStoreError::FutureSchema {
+                kind: "transcript record",
+                ..
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_transcript_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        write_jsonl(dir.path(), "target.txt", &[rec("s", 1, "hello", "world")]);
+        symlink(&target, dir.path().join("linked.jsonl")).unwrap();
+
+        assert!(matches!(
+            RecallTool::new().search_dir(dir.path(), "hello", None, None, 8),
+            Err(SessionStoreError::UnsafeFile { .. })
+        ));
     }
 }

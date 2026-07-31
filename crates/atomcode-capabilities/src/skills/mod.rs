@@ -12,11 +12,15 @@
 use atomcode_kernel::tool::{ToolRegistry, ToolResult};
 use std::sync::Arc;
 
+pub mod catalog_hook;
 pub mod registry;
+pub mod render;
 pub mod skill;
 pub mod use_skill;
 
+pub use catalog_hook::SkillCatalogHook;
 pub use registry::{standard_skill_dirs, SkillRegistry};
+pub use render::{render_skill_catalog, CatalogEntry};
 pub use skill::Skill;
 pub use use_skill::{ListSkillsTool, UseSkillTool};
 
@@ -32,8 +36,18 @@ pub fn register_skill_tools(reg: &mut ToolRegistry, registry: Arc<SkillRegistry>
 }
 
 pub(crate) fn ok(content: impl Into<String>) -> ToolResult {
-    ToolResult { call_id: String::new(), content: content.into(), is_error: false, images: vec![] }
+    ToolResult {
+        call_id: String::new(),
+        content: content.into(),
+        is_error: false,
+        images: vec![],
+    }
 }
 pub(crate) fn err(content: impl Into<String>) -> ToolResult {
-    ToolResult { call_id: String::new(), content: content.into(), is_error: true, images: vec![] }
+    ToolResult {
+        call_id: String::new(),
+        content: content.into(),
+        is_error: true,
+        images: vec![],
+    }
 }

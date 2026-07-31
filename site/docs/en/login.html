@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.25.9</span>
+    <span class="dhdr-ver">v5.0.3</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -51,11 +51,13 @@
     <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
     <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
     <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
   </div>
 
   <div class="dside-group">
     <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
     <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
     <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
     <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
     <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
@@ -91,6 +93,20 @@
       <h2>AtomGit CodingPlan (recommended)</h2>
       <p>AtomGit is the open-source code-hosting platform run by CSDN / OpenAtom Open Source Foundation, and AtomCode natively integrates its OAuth and CodingPlan. <code>/login</code> is the lowest-friction entry point for new users: a single action logs you in → claims free token quota → auto-generates a provider config from the granted model list. After that one command you can start chatting immediately. Re-running it after you're already signed in idempotently re-syncs the model list — no double-claim.</p>
 
+      <h3>CodingPlan tier system</h3>
+      <p>CodingPlan currently offers three tiers. The system automatically grants the highest tier you're eligible for. Quota is measured on a rolling 5-hour window:</p>
+      <table>
+        <thead>
+          <tr><th>Tier</th><th>Duration</th><th>How to get</th><th>Models</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>Lite</strong></td><td>30 days</td><td>Free claim, 1,000 slots/day</td><td>deepseek-v4-flash, Qwen/Qwen3-VL-8B-Instruct</td></tr>
+          <tr><td><strong>Pro Trial</strong></td><td>7 days</td><td>Free claim, 100 slots/day at 10:00</td><td>Adds <strong>GLM-5.2</strong></td></tr>
+          <tr><td><strong>Pro</strong></td><td>30 days</td><td>Free claim, requires a merged PR in the activity repository</td><td>Adds <strong>GLM-5.2</strong></td></tr>
+        </tbody>
+      </table>
+      <p>After claiming Pro or above, run <code>/login</code> in AtomCode to sync the updated model list. For details, visit the <a href="https://ai.atomgit.com/serverless-api" target="_blank" rel="noopener">CodingPlan page</a>.</p>
+
       <h3>From the first-run wizard</h3>
       <ol>
         <li>The first time you run <code>atomcode</code>, the 3-step wizard pops up automatically.</li>
@@ -120,7 +136,7 @@ atomcode logout     # or /logout in the TUI — clears the OAuth token</code></p
       <h3>Option A: <code>/provider</code> in the TUI</h3>
       <ol>
         <li>Type <code>/provider</code> in the TUI.</li>
-        <li>Pick "Add a new provider" and follow the prompts to enter type, base URL, API key, model, etc.</li>
+        <li>Choose a vendor preset or a custom account, enter its API key, then add one or more models under that account.</li>
         <li>The configuration is written back to <code>~/.atomcode/config.toml</code>.</li>
       </ol>
 
@@ -134,7 +150,7 @@ atomcode logout     # or /logout in the TUI — clears the OAuth token</code></p
       <h2>Which one should I pick?</h2>
       <ul>
         <li>First-time user &rarr; <strong>CodingPlan</strong> (<code>/login</code>) — free tokens, just use it.</li>
-        <li>Already have your own API key &rarr; skip <code>/login</code> and use the <strong>API key</strong> path (<code>/provider</code> or hand-edit config). If you also need AtomGit integrations (<code>/issue</code>, etc.), running <code>/login</code> later will claim CodingPlan and register <code>AtomGit-*</code> providers as a side effect.</li>
+        <li>Already have your own API key &rarr; skip <code>/login</code> and use the <strong>API key</strong> path (<code>/provider</code> or hand-edit config). If you later need the built-in AtomGit repository, PR, or Issue tools, run <code>/login</code> to authorize them; this also claims CodingPlan and registers <code>AtomGit-*</code> providers.</li>
         <li>Running in CI / scripts &rarr; <strong>API key</strong> via config file or env vars.</li>
         <li>Fully offline &rarr; configure an <strong>Ollama</strong> provider — no login required.</li>
       </ul>

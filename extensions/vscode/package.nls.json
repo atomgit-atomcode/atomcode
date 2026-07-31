@@ -20,6 +20,7 @@
   "atomcode.configuration.daemon.autoStart.description": "Auto-start daemon if not running",
   "atomcode.configuration.daemon.binaryPath.description": "Path to atomcode binary (auto-detected if empty)",
   "atomcode.configuration.preferredLocation.description": "Where to open the chat panel",
+  "atomcode.configuration.chat.fontFamily.description": "Font family for the chat's code blocks, tool output and input box. Leave empty to follow the editor font (editor.fontFamily). Accepts a CSS font-family list, e.g. 'Cascadia Code', 'JetBrains Mono', monospace.",
   "atomcode.configuration.autoSave.description": "Auto-save files before AI reads them",
   "atomcode.configuration.sendWithCtrlEnter.description": "Use Ctrl+Enter instead of Enter to send messages",
   "atomcode.configuration.fontSize.description": "Font size in chat panel",

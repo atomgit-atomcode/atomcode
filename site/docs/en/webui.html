@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.25.9</span>
+    <span class="dhdr-ver">v5.0.3</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -51,11 +51,13 @@
     <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
     <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
     <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
   </div>
 
   <div class="dside-group">
     <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
     <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
     <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
     <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
     <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
@@ -99,7 +101,7 @@
         <tbody>
           <tr><td>Sidebar</td><td>Session history grouped by project, search sessions, start a new chat, rename / delete sessions; collapses to an icon rail (a drawer on mobile).</td></tr>
           <tr><td>Model selector</td><td>Switch provider / model right under the input box; same-named models are disambiguated with a provider tag.</td></tr>
-          <tr><td>Model config</td><td>Add / edit / delete providers in settings: name, type (openai / claude / ollama), model, Base URL, API key, context window, and set-as-default.</td></tr>
+          <tr><td>Model config</td><td>Manage provider accounts and multiple models under each account, including protocol, base URL, API key, context window, and the default model.</td></tr>
           <tr><td>Settings</td><td>Theme (light / dark), language (中 / EN), model config, and the remote-access entry.</td></tr>
           <tr><td>Image attachments</td><td>Paste or pick images to send with a message (2&nbsp;MB each); non-vision models fall back to VL; thumbnails show in history.</td></tr>
           <tr><td>Tool execution</td><td>Tool calls show their arguments and output inline, expandable line by line, both live and in history.</td></tr>
@@ -114,8 +116,24 @@
         <li>When you run <code>/webui</code>, the current TUI session is <strong>attached automatically</strong> — messages you send in the terminal appear in the browser, and vice versa.</li>
         <li>In <strong>another</strong> TUI, run <code>/sync</code> to attach to the running webui session (a <code>/webui</code> must already be running).</li>
         <li><code>/sync off</code> — leave sync and return to a standalone session.</li>
+        <li>Sync mode supports <code>/compact</code>. Model changes follow runtime confirmation and are not applied halfway through an active turn.</li>
+        <li>Uploaded images, the current working directory, and active sessions survive refreshes and view switches.</li>
       </ul>
       <p>This makes "start in the terminal, watch progress on a phone / tablet" — or several people watching the same agent session — possible.</p>
+
+      <h2>Approval modes</h2>
+      <p>A pill in the bottom bar sets how the agent's actions are gated — the browser mirror of the terminal's approval modes. The default is <strong>Build</strong>.</p>
+      <table>
+        <thead><tr><th>Mode</th><th>Behaviour</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Build</strong> (default)</td><td>Interactive — every file edit and command asks for approval before it runs.</td></tr>
+          <tr><td><strong>Accept Edits</strong></td><td>File edits are auto-approved; commands still ask.</td></tr>
+          <tr><td><strong>Plan</strong></td><td>Read-only exploration — write and execute tools are blocked so the agent proposes a plan first.</td></tr>
+          <tr><td><strong>Bypass</strong> (免审批)</td><td>⚠ Auto-approves everything, including edits and commands. Use with care.</td></tr>
+        </tbody>
+      </table>
+      <p>The mode is process-wide and broadcast over the live channel, so switching it in one tab updates every connected view. It is not written to your config — it resets to <strong>Build</strong> on restart.</p>
+      <p>When the agent needs a decision from you mid-task, an <strong>interactive question</strong> card appears (single choice, multiple choice, or free text) and the turn pauses until you answer. See <a href="./interactive-questions.html">Interactive Questions</a> for the full behaviour.</p>
 
       <h2>Remote access</h2>
       <p>Want to open the webui from a phone without exposing it publicly? Use a 蒲公英 (Oray PGY) virtual LAN: bind the server to the virtual IP with <code>/webui --host &lt;virtual IP&gt;</code>, then scan the QR in the Remote Access panel. Full walkthrough in <a href="./webui-remote-access.html">Remote Access</a>.</p>

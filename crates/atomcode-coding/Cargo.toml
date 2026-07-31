@@ -1,14 +1,18 @@
 [package]
 name = "atomcode-coding"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 description = "L2 coding specialization: assembles the neutral kernel + capabilities into a runnable, self-correcting coding agent."
 
+[features]
+# Forward the AtomGit REST tool feature to the capabilities layer so the
+# CLI can enable it on the coding dep without reaching into capabilities directly.
+atomgit = ["atomcode-capabilities/atomgit"]
+
 [dependencies]
 atomcode-kernel = { path = "../atomcode-kernel" }
-# CodingPlan REST client + types for the RateLimitHook (rate_limit.rs).
-# L2 is allowed to depend on core (core does not depend on kernel/capabilities/coding).
-atomcode-core = { path = "../atomcode-core" }
+# Config system leaf consumed directly by the coding assembly.
+atomcode-config = { path = "../atomcode-config" }
 # The FULL capability set: L2 is the opinionated assembly — a coding agent ships
 # with web/skills/mcp/session/memory wired (the leaner features exist for other
 # embedders, not for this crate).
@@ -18,11 +22,15 @@ atomcode-capabilities = { path = "../atomcode-capabilities", features = [
     # core engine, which always ran them. Zero overhead when no hooks.json exists
     # (prepare skips registration — see CCExternalHooks::is_empty).
     "cc-hooks",
+    # Wire web_search transport failures into the offline_mode="auto" verdict so the
+    # native coding runtime self-detects and flips offline on a connection failure.
+    "offline",
 ] }
 # The review specialization, mounted as a `code_review` sub-agent TOOL so the coding
 # agent can review the current changes in-session (L2 composing a sibling L2).
 atomcode-review = { path = "../atomcode-review" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7"
 async-trait = "0.1"
 # Stream proxying for the compaction-summary telemetry provider decorator (folds
 # StreamEvent::Usage, emits one LlmChat at stream end). Also used by tests.
@@ -36,11 +44,16 @@ dirs = "6"
 # Day-granular date anchor frozen into the persona (system prompt) so the model
 # has a current-date reference on every round — v1 prompt.rs parity.
 chrono = "0.4"
+# Parse the bash tool-call `arguments` JSON in the VerifyCadenceHook to tell a real
+# check from a read-only `ls`/`git diff` dodge (discipline/verify.rs).
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-serde_json = "1"
 # in-memory capturing Telemetry for the TelemetryHook test.
 atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] }
+# Enable reset_offline_verdict_for_test() for offline-gate tests.
+atomcode-config = { path = "../atomcode-config", features = ["test-util"] }
 # atomcode-kernel::testkit (MockProvider, scripted StreamEvents) is ungated — no extra dep.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tempfile = "3"
@@ -48,3 +61,7 @@ async-trait = "0.1"
 # Serialize tests that mutate the process-global ATOMCODE_HOME env var so they
 # don't race (cache_prefix asserts byte-identical system prompt across assemblies).
 serial_test = "3"
+# Redirect ATOMCODE_HOME to a temp dir once per test binary (via a #[ctor]) so tests
+# never persist into the developer's real ~/.atomcode.
+atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
+ctor = "0.2"

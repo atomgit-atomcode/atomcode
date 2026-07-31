@@ -157,6 +157,12 @@
   white-space: normal;
 }
 
+.user-message-plain-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .user-message-text.is-collapsed {
   max-height: min(260px, 34vh);
   overflow: hidden;
@@ -280,6 +286,39 @@
   min-width: 0;
 }
 
+.assistant-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  max-width: 100%;
+  padding: 5px 8px;
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  background: color-mix(in srgb, var(--app-secondary-background), transparent 35%);
+  color: var(--app-secondary-foreground);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.assistant-status-warning,
+.assistant-status-rate_limited,
+.assistant-status-idle {
+  border-color: color-mix(in srgb, #e1c08d, var(--app-input-border) 45%);
+  color: var(--app-primary-foreground);
+}
+
+.assistant-status-message {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.assistant-status-meta {
+  flex-shrink: 0;
+  color: var(--app-secondary-foreground);
+  font-size: 11px;
+}
+
 .msg-copy-btn {
   display: inline-flex;
   align-items: center;
@@ -316,8 +355,24 @@
 }
 
 /* === Search Dimmed === */
-.messages-container.dimmed > .timeline-message:not(.highlighted) { opacity: 0.4; }
-.timeline-message.highlighted { opacity: 1; z-index: 10; }
+.messages-container.dimmed > .timeline-message:not(.highlighted),
+.messages-container.dimmed > .user-message-wrapper:not(.highlighted) { opacity: 0.4; }
+
+.timeline-message.highlighted,
+.user-message-wrapper.highlighted {
+  opacity: 1;
+  z-index: 10;
+  position: relative;
+}
+
+.timeline-message.highlighted {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--app-brand), transparent 70%);
+}
+
+.user-message-wrapper.highlighted .user-message-bubble {
+  border-color: color-mix(in srgb, var(--app-brand), var(--app-input-border) 40%);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--app-brand), transparent 75%);
+}
 
 /* === Markdown Root === */
 .markdown-root {
@@ -742,6 +797,16 @@
 .tool-header:hover .tool-name-secondary { color: var(--app-primary-foreground); }
 .tool-header:active { opacity: 0.65; }
 
+.tool-progress {
+  margin: 1px 0 4px;
+  color: var(--app-secondary-foreground);
+  font-family: var(--app-monospace-font-family);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .tool-name {
   font-weight: 700;
   color: var(--app-primary-foreground);
@@ -849,12 +914,20 @@
 }
 
 /* === Search Highlight === */
-.search-highlight {
-  background: color-mix(in srgb, var(--app-brand), transparent 80%);
+mark.search-highlight {
+  background: color-mix(in srgb, var(--app-brand), transparent 75%);
+  color: inherit;
   border-radius: 2px;
   padding: 0 1px;
 }
 
-.search-highlight.active {
-  background: color-mix(in srgb, var(--app-brand), transparent 60%);
+/* The CURRENT match message (nav is per-message: `{current}/{total}` counts
+   messages, Enter/Shift+Enter cycle them). Brighten its keyword marks so the
+   focused hit is visually distinct from other matched-but-not-current messages
+   — otherwise the only cue is scroll position. `.active` on an individual mark
+   was dead code (never applied); the `.search-current` ancestor is the live seam. */
+.search-current mark.search-highlight,
+mark.search-highlight.active {
+  background: color-mix(in srgb, var(--app-brand), transparent 45%);
+  outline: 1px solid color-mix(in srgb, var(--app-brand), transparent 30%);
 }

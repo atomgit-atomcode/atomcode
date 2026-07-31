@@ -143,13 +143,16 @@ impl Modal for DirPicker {
                         ctx.previous_dir.as_deref(),
                     ) {
                         Ok(path) => {
-                            if path != ctx.working_dir {
-                                apply_cd(ctx, path.clone());
-                                let p = path.display().to_string();
-                                renderer.render(UiLine::CommandOutput(
-                                    crate::i18n::t(crate::i18n::Msg::DirChanged { path: &p })
+                            if !crate::event_loop::commands::paths_same(&path, &ctx.working_dir) {
+                                match apply_cd(ctx, path) {
+                                    Ok(_) => renderer.render(UiLine::CommandOutput(
+                                        crate::i18n::t(
+                                            crate::i18n::Msg::CmdSessionTransitionPending,
+                                        )
                                         .into_owned(),
-                                ));
+                                    )),
+                                    Err(error) => renderer.render(UiLine::Error(error)),
+                                }
                             }
                             renderer.flush();
                             Ok(ModalAction::Close)
@@ -167,7 +170,7 @@ impl Modal for DirPicker {
                 let Some(path) = filt.get(self.selected).cloned() else {
                     return Ok(ModalAction::Continue);
                 };
-                if path == ctx.working_dir {
+                if crate::event_loop::commands::paths_same(&path, &ctx.working_dir) {
                     // No-op cd: skip the agent round-trip but still close
                     // the picker so the user isn't stuck inside it.
                     return Ok(ModalAction::Close);
@@ -180,20 +183,38 @@ impl Modal for DirPicker {
                     renderer.flush();
                     return Ok(ModalAction::Close);
                 }
-                apply_cd(ctx, path.clone());
-                // Render from the normalized `working_dir` (apply_cd strips the Windows
-                // `\\?\` verbatim prefix) rather than the raw recent-dirs entry, which may
-                // be a persisted `\\?\C:\…` from before the fix.
-                let p = ctx.working_dir.display().to_string();
-                renderer.render(UiLine::CommandOutput(
-                    crate::i18n::t(crate::i18n::Msg::DirChanged { path: &p }).into_owned(),
-                ));
+                match apply_cd(ctx, path) {
+                    Ok(_) => renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned(),
+                    )),
+                    Err(error) => renderer.render(UiLine::Error(error)),
+                }
                 renderer.flush();
                 Ok(ModalAction::Close)
             }
             KeyCode::Esc => Ok(ModalAction::Close),
             _ => Ok(ModalAction::Continue),
         }
+    }
+
+    fn handle_paste(
+        &mut self,
+        text: &str,
+        buf: &mut Buffer,
+        state: &mut UiState,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<ModalAction> {
+        // Paste goes into the query, not the main buffer
+        for c in text.chars() {
+            if c.is_control() {
+                continue; // skip newlines/control characters
+            }
+            self.query.push(c);
+        }
+        self.selected = 0;
+        self.draw(buf, state, ctx, renderer);
+        Ok(ModalAction::Continue)
     }
 
     fn draw(&self, _buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
@@ -228,7 +249,10 @@ fn build_menu_payload(p: &DirPicker) -> MenuPayload {
     MenuPayload {
         items,
         selected: p.selected,
-            kind: crate::render::MenuKind::TwoColumn { row_prefix: "", selected_marker: "▸" },
+        kind: crate::render::MenuKind::TwoColumn {
+            row_prefix: "",
+            selected_marker: "▸",
+        },
     }
 }
 
@@ -279,7 +303,10 @@ mod tests {
         p.down();
         assert_eq!(p.selected, 1);
         p.down();
-        assert_eq!(p.selected, 1, "clamps to the 2 filtered results, not all 3 dirs");
+        assert_eq!(
+            p.selected, 1,
+            "clamps to the 2 filtered results, not all 3 dirs"
+        );
     }
 
     #[test]
@@ -303,7 +330,10 @@ mod tests {
         p.on_char('/');
         p.on_char('x');
         assert_eq!(p.query, "~/x");
-        assert_eq!(p.selected, 0, "typing re-focuses the typed path, not a recent dir");
+        assert_eq!(
+            p.selected, 0,
+            "typing re-focuses the typed path, not a recent dir"
+        );
         p.on_backspace();
         assert_eq!(p.query, "~/");
     }
@@ -332,6 +362,8 @@ mod tests {
 
     #[test]
     fn menu_payload_marks_current_dir() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let p = DirPicker::open(vec![pb("/a"), pb("/b")], pb("/b"));
         let payload = build_menu_payload(&p);
         assert_eq!(payload.items[0].1, "");

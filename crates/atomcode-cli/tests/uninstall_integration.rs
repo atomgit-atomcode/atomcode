@@ -2,6 +2,14 @@ use assert_cmd::Command;
 use std::fs;
 use tempfile::TempDir;
 
+// Redirect ATOMCODE_HOME to a throwaway temp dir before any test in this binary
+// runs, so tests never persist into the developer's real home. isolate_home is a
+// no-op when the var is already set.
+#[ctor::ctor]
+fn _isolate_atomcode_home() {
+    atomcode_kernel::test_support::isolate_home();
+}
+
 /// Build a fake atomcode data dir so the CLI sees something to scan.
 ///
 /// Under unified semantics, `ATOMCODE_HOME` IS the data root (equivalent to
@@ -67,5 +75,5 @@ fn purge_and_keep_data_conflict_exit_2() {
 // NOTE: We intentionally don't run --purge / --keep-data as full integration tests
 // against a real install — the binary path resolves to the test runner exe (cargo's
 // target/debug/atomcode), and deleting it would break subsequent tests in the same
-// run. Coverage for end-to-end deletion is in atomcode-core's execute_tests via
-// NoopSelfDelete (see crates/atomcode-core/src/uninstall/actions.rs).
+// run. The lower-level deletion paths are covered by the CLI uninstall action tests
+// with a no-op self-delete implementation.

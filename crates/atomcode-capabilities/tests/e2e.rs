@@ -13,7 +13,10 @@
 //! run by default — those are NOT e2e.)
 #![cfg(feature = "e2e")]
 
-use atomcode_capabilities::provider::{AnthropicConfig, AnthropicProvider, OllamaConfig, OllamaProvider, OpenAiCompatConfig, OpenAiCompatProvider};
+use atomcode_capabilities::provider::{
+    AnthropicConfig, AnthropicProvider, OllamaConfig, OllamaProvider, OpenAiCompatConfig,
+    OpenAiCompatProvider,
+};
 use atomcode_kernel::message::Message;
 use atomcode_kernel::provider::{ChatOptions, LlmProvider};
 use atomcode_kernel::stream::StreamEvent;
@@ -65,10 +68,16 @@ async fn live_smoke_streams_text_and_done() {
         eprintln!("[live] reasoning_len={}", reasoning.len());
     }
     if let Some(u) = usage {
-        eprintln!("[live] usage prompt={} completion={} cached={}", u.prompt, u.completion, u.cached);
+        eprintln!(
+            "[live] usage prompt={} completion={} cached={}",
+            u.prompt, u.completion, u.cached
+        );
     }
     assert!(saw_done, "stream must reach Done");
-    assert!(!text.trim().is_empty(), "expected some text content, got empty");
+    assert!(
+        !text.trim().is_empty(),
+        "expected some text content, got empty"
+    );
 }
 
 /// Open a REAL Anthropic Messages stream, consume it, assert text + clean Done. Run:
@@ -113,10 +122,16 @@ async fn live_anthropic_smoke_streams_text_and_done() {
     }
     eprintln!("[live-anthropic] text={text:?}");
     if let Some(u) = usage {
-        eprintln!("[live-anthropic] usage prompt={} completion={} cached={}", u.prompt, u.completion, u.cached);
+        eprintln!(
+            "[live-anthropic] usage prompt={} completion={} cached={}",
+            u.prompt, u.completion, u.cached
+        );
     }
     assert!(saw_done, "stream must reach Done");
-    assert!(!text.trim().is_empty(), "expected some text content, got empty");
+    assert!(
+        !text.trim().is_empty(),
+        "expected some text content, got empty"
+    );
 }
 
 /// Open a REAL Ollama `/api/chat` stream against a LOCAL daemon, assert text + Done. Run:
@@ -157,10 +172,16 @@ async fn live_ollama_smoke_streams_text_and_done() {
     }
     eprintln!("[live-ollama] text={text:?}");
     if let Some(u) = usage {
-        eprintln!("[live-ollama] usage prompt={} completion={}", u.prompt, u.completion);
+        eprintln!(
+            "[live-ollama] usage prompt={} completion={}",
+            u.prompt, u.completion
+        );
     }
     assert!(saw_done, "stream must reach Done");
-    assert!(!text.trim().is_empty(), "expected some text content, got empty");
+    assert!(
+        !text.trim().is_empty(),
+        "expected some text content, got empty"
+    );
 }
 
 /// Run a real Agent turn-loop with the provider-agnostic `WireLogHooks` attached —
@@ -197,15 +218,25 @@ async fn live_agent_turn_loop_logs_via_hook() {
         .hook(log_hook) // general, provider-agnostic wire log
         .max_rounds(3)
         .build()
-        .run_to_completion("Reply with exactly the single word: pong", AutoRespond::AllowAll)
+        .run_to_completion(
+            "Reply with exactly the single word: pong",
+            AutoRespond::AllowAll,
+        )
         .await;
 
     eprintln!(
         "[live] outcome: stop={:?} error={:?} text={:?}",
         outcome.stop, outcome.error, outcome.text
     );
-    assert!(outcome.error.is_none(), "unexpected error: {:?}", outcome.error);
-    assert!(!outcome.text.trim().is_empty(), "expected assistant text from the turn loop");
+    assert!(
+        outcome.error.is_none(),
+        "unexpected error: {:?}",
+        outcome.error
+    );
+    assert!(
+        !outcome.text.trim().is_empty(),
+        "expected assistant text from the turn loop"
+    );
 }
 
 /// Open a real stream WITH a tool and assert a whole ToolCall assembles.
@@ -285,7 +316,12 @@ async fn e2e_multi_round_reasoning_roundtrip_does_not_400() {
             })
         }
         async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
-            ToolResult { call_id: String::new(), content: "12:00 (noon)".into(), is_error: false, images: vec![] }
+            ToolResult {
+                call_id: String::new(),
+                content: "12:00 (noon)".into(),
+                is_error: false,
+                images: vec![],
+            }
         }
     }
 
@@ -303,7 +339,11 @@ async fn e2e_multi_round_reasoning_roundtrip_does_not_400() {
     let log_file = std::env::var("ATOMCODE_WIRE_LOG_FILE").ok().map(|p| {
         eprintln!("[e2e] wire log → file: {p}");
         Arc::new(Mutex::new(
-            std::fs::OpenOptions::new().create(true).append(true).open(p).expect("open wire log file"),
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .expect("open wire log file"),
         ))
     });
     let lf = log_file.clone();
@@ -343,7 +383,11 @@ async fn e2e_multi_round_reasoning_roundtrip_does_not_400() {
 
     // CORE invariants (ALWAYS): no 400/error — including the echoed reasoning_content
     // NOT being rejected in round 2 — and a real final answer.
-    assert!(outcome.error.is_none(), "reasoning round-trip likely 400'd in round 2: {:?}", outcome.error);
+    assert!(
+        outcome.error.is_none(),
+        "reasoning round-trip likely 400'd in round 2: {:?}",
+        outcome.error
+    );
     assert!(!outcome.text.trim().is_empty(), "expected a final answer");
 
     // Going multi-round is MODEL-DEPENDENT (V4 may answer directly without the tool),

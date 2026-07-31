@@ -1,13 +1,13 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 
-use atomcode_core::auth;
-use atomcode_core::coding_plan;
+use atomcode_auth as auth;
+use atomcode_codingplan as coding_plan;
 use atomcode_telemetry::{CodingplanErrorKind, CodingplanResult, Event};
 
 use crate::{
     api_auth::{pending_invite_for_login, poll_login_session, LoginPollStep},
-    api_config::{cleanup_expired_sessions, config_response, load_config, save_config},
+    api_config::{config_response, load_config, update_config},
     daemon_scope, json_error, AppState,
 };
 
@@ -56,11 +56,10 @@ pub(crate) async fn codingplan_setup(
     let state_clone = state.clone();
     daemon_scope(&state, None, client_mode, || async move {
         let state = state_clone;
-        // Clean up expired sessions
-        cleanup_expired_sessions(&state.login_sessions).await;
-
         // Check if already logged in
-        let is_logged_in = auth::get_stored_auth().is_some();
+        let is_logged_in = tokio::task::spawn_blocking(|| auth::get_valid_token().is_ok())
+            .await
+            .unwrap_or(false);
 
         if !is_logged_in {
             // Not logged in — check if a login_id was provided
@@ -82,43 +81,68 @@ pub(crate) async fn codingplan_setup(
                 }
                 Some(login_id) => {
                     match poll_login_session(&state, &login_id).await {
-                        Ok(LoginPollStep::Pending) => {
-                            state.telemetry.track(Event::TakeCodingplan {
-                                type_: CodingplanResult::Fail,
-                                error_kind: Some(CodingplanErrorKind::AuthError),
-                                error_data: Some(serde_json::json!({
-                                    "step": "login",
-                                    "message": "Login still pending",
-                                }).to_string()),
-                            });
-                            return (
-                                StatusCode::CONFLICT,
-                                Json(serde_json::json!({
-                                    "success": false,
-                                    "status": "login_pending",
-                                    "error": "Login still pending. Poll /auth/login/:login_id/poll until authorized."
-                                })),
-                            )
-                                .into_response();
-                        }
-                        Ok(LoginPollStep::Authorized(user)) => {
-                            state
-                                .telemetry
-                                .set_account_id(Some(user.id.clone()));
-                            let (invite_code, install_uuid) = pending_invite_for_login();
-                            let event = Event::LoginSuccess {
-                                invite_code,
-                                install_uuid,
-                            };
-                            if let Err(e) = state.telemetry.track_durable(event.clone()).await {
-                                tracing::warn!(
-                                    ?e,
-                                    "login_success durable enqueue failed; falling back to async telemetry"
-                                );
-                                state.telemetry.track(event);
+                        Ok(result) => match result.step {
+                            LoginPollStep::Authorized {
+                                user,
+                                newly_authorized,
+                            } => {
+                                state.telemetry.set_account_id(Some(user.id.clone()));
+                                if newly_authorized {
+                                    let (invite_code, install_uuid) = pending_invite_for_login();
+                                    let event = Event::LoginSuccess {
+                                        invite_code,
+                                        install_uuid,
+                                    };
+                                    if let Err(e) =
+                                        state.telemetry.track_durable(event.clone()).await
+                                    {
+                                        tracing::warn!(
+                                            ?e,
+                                            "login_success durable enqueue failed; falling back to async telemetry"
+                                        );
+                                        state.telemetry.track(event);
+                                    }
+                                }
                             }
-                        }
-                        Err((status, message)) => {
+                            step => {
+                                let (status, message) = match step {
+                                    LoginPollStep::Pending => (
+                                        StatusCode::CONFLICT,
+                                        "Login still pending. Poll the login endpoint until authorized."
+                                            .to_string(),
+                                    ),
+                                    LoginPollStep::Expired => (
+                                        StatusCode::GONE,
+                                        "Login session expired".to_string(),
+                                    ),
+                                    LoginPollStep::Cancelled => (
+                                        StatusCode::GONE,
+                                        "Login session was cancelled".to_string(),
+                                    ),
+                                    LoginPollStep::Failed { message, .. } => {
+                                        (StatusCode::INTERNAL_SERVER_ERROR, message)
+                                    }
+                                    LoginPollStep::Retryable { message, .. } => {
+                                        (StatusCode::SERVICE_UNAVAILABLE, message)
+                                    }
+                                    LoginPollStep::Authorized { .. } => unreachable!(),
+                                };
+                                state.telemetry.track(Event::TakeCodingplan {
+                                    type_: CodingplanResult::Fail,
+                                    error_kind: Some(CodingplanErrorKind::AuthError),
+                                    error_data: Some(
+                                        serde_json::json!({
+                                            "step": "login",
+                                            "message": message,
+                                        })
+                                        .to_string(),
+                                    ),
+                                });
+                                return json_error(status, message).into_response();
+                            }
+                        },
+                        Err(error) => {
+                            let message = error.message;
                             state.telemetry.track(Event::TakeCodingplan {
                                 type_: CodingplanResult::Fail,
                                 error_kind: Some(CodingplanErrorKind::AuthError),
@@ -127,7 +151,7 @@ pub(crate) async fn codingplan_setup(
                                     "message": message,
                                 }).to_string()),
                             });
-                            return json_error(status, message).into_response();
+                            return json_error(error.status, message).into_response();
                         }
                     }
                 }
@@ -160,7 +184,7 @@ pub(crate) async fn codingplan_setup(
         })
         .await;
 
-        let (config, report) = match setup_result {
+        let (mut config, report) = match setup_result {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 state.telemetry.track(Event::TakeCodingplan {
@@ -203,17 +227,22 @@ pub(crate) async fn codingplan_setup(
 
         // Persist config if setup succeeded
         if report.should_persist_config() {
-            if let Err(e) = save_config(&config) {
-                state.telemetry.track(Event::TakeCodingplan {
-                    type_: result_type,
-                    error_kind: Some(CodingplanErrorKind::ExecutionFailed),
-                    error_data: Some(serde_json::json!({
-                        "step": "config_save",
-                        "message": e,
-                    }).to_string()),
-                });
-                return json_error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-            }
+            config = match update_config(|latest| {
+                coding_plan::merge_successful_config(latest, &config, &report)
+            }) {
+                Ok(config) => config,
+                Err(e) => {
+                    state.telemetry.track(Event::TakeCodingplan {
+                        type_: result_type,
+                        error_kind: Some(CodingplanErrorKind::ExecutionFailed),
+                        error_data: Some(serde_json::json!({
+                            "step": "config_save",
+                            "message": e,
+                        }).to_string()),
+                    });
+                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+                }
+            };
             if let Err(e) = coding_plan::write_last_sync_now() {
                 state.telemetry.track(Event::TakeCodingplan {
                     type_: result_type,

@@ -44,7 +44,6 @@ cargo run -p atomcode-daemon -- --host 0.0.0.0 --port 8080
 | 环境变量 | 说明 |
 |----------|------|
 | `ATOMCODE_DAEMON_ENABLE_DANGEROUS_TOOLS` | 设为 `1` 启用 bash 和写文件的 daemon 工具 |
-| `ATOMCODE_DISABLE_TOOLS` | 逗号分隔的工具名列表，禁用指定工具（如 `bash,write_file`） |
 
 ## API 接口
 
@@ -61,7 +60,7 @@ cargo run -p atomcode-daemon -- --host 0.0.0.0 --port 8080
 ```json
 {
   "status": "ok",
-  "version": "4.23.3",
+  "version": "5.0.3",
   "service": "atomcode-daemon"
 }
 ```
@@ -291,6 +290,7 @@ cargo run -p atomcode-daemon -- --host 0.0.0.0 --port 8080
 | `reasoning` | LLM 推理/思考内容 |
 | `tool_start` | 工具调用开始（含 `name`、`arguments`） |
 | `tool_output` | 工具实时输出片段 |
+| `tool_progress` | 长时间工具的临时进度（含 `id`、`progress`，客户端应原位替换） |
 | `tool_result` | 工具调用完成（含 `name`、`output`、`success`、`duration_ms`） |
 | `tokens` | Token 用量更新（含 `prompt`、`completion`、`total`） |
 | `artifact_start` | 检测到代码/HTML/SVG 等制品开始 |
@@ -503,7 +503,8 @@ curl -N -X POST http://127.0.0.1:13456/chat \
 ```json
 {
   "logged_in": true,
-  "auth_path": "/home/user/.atomcode/auth.json",
+  "expired": false,
+  "auth_path": "/home/user/.atomcode/auth.toml",
   "user": {
     "username": "example_user",
     "email": "user@example.com"
@@ -537,7 +538,8 @@ curl -N -X POST http://127.0.0.1:13456/chat \
 {
   "login_id": "uuid-of-login-session",
   "url": "https://auth.example.com/login?code=xxx",
-  "expires_in_seconds": 600
+  "expires_in_seconds": 600,
+  "daemon_instance_id": "uuid-of-daemon-process"
 }
 ```
 
@@ -550,9 +552,15 @@ curl -N -X POST http://127.0.0.1:13456/chat \
 ```json
 {
   "status": "pending",
-  "user": null
+  "user": null,
+  "retry_after_ms": 2000
 }
 ```
+
+`pending`、`authorized` 使用 HTTP 200。`expired`、`cancelled` 使用 HTTP 410，
+`failed` 使用 HTTP 500；这些终态附带稳定的 `code`/`error` 和 `retryable: false`。
+可重试的临时错误使用 HTTP 503 和 `retryable: true`。登录会话只属于创建它的 daemon
+实例，实例重启后客户端必须重新发起登录，不能重放旧 `login_id`。
 
 **响应示例（已授权）：**
 
@@ -567,7 +575,7 @@ curl -N -X POST http://127.0.0.1:13456/chat \
 
 #### `DELETE /auth/login/:login_id`
 
-取消并移除进行中的登录会话。
+幂等取消登录会话。终态会短暂保留，保证并发请求和响应重试能读取一致结果。
 
 #### `POST /auth/logout`
 
@@ -664,7 +672,7 @@ daemon 默认仅允许来自 loopback 地址的跨域请求：
 
 ## 可用工具
 
-daemon 聊天模式下注册的工具（可通过 `ATOMCODE_DISABLE_TOOLS` 环境变量禁用）：
+daemon 聊天模式下可用的工具：
 
 | 工具名 | 说明 |
 |--------|------|
@@ -703,5 +711,5 @@ daemon 使用以下配置文件（位于 `~/.atomcode/` 目录）：
 |------|------|
 | `config.toml` | 主配置（Provider、默认工作目录等） |
 | `mcp.json` | MCP 服务器配置 |
-| `auth.json` | 认证信息（OAuth token） |
+| `auth.toml` | 认证信息（OAuth token） |
 | `sessions/` | 会话数据存储目录 |

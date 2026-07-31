@@ -13,9 +13,11 @@ export interface ToolRow {
   id: string;
   name: string;
   args: string;
-  status: 'pending' | 'done' | 'error' | 'waiting_approval';
+  status: 'pending' | 'done' | 'error' | 'incomplete' | 'waiting_approval';
   duration_ms?: number;
   output?: string;
+  /** Ephemeral latest activity for a long-running tool. Replaced in place, never persisted. */
+  progress?: string;
 }
 
 /** One ordered conversation segment: a run of assistant text, one tool call, or a
@@ -40,4 +42,21 @@ export function upsertToolPart(parts: MsgPart[], tool: ToolRow): MsgPart[] {
   const next = parts.slice();
   next[idx] = { kind: 'tool', tool: { ...existing, ...tool } };
   return next;
+}
+
+export function updateToolProgress(
+  parts: MsgPart[],
+  id: string,
+  progress: string,
+): MsgPart[] {
+  return parts.map((part) =>
+    part.kind === 'tool' && part.tool.id === id
+      ? { kind: 'tool' as const, tool: { ...part.tool, progress } }
+      : part,
+  );
+}
+
+export function toolResultStatus(success: boolean, output: string): ToolRow['status'] {
+  if (success) return 'done';
+  return output.startsWith('Code review incomplete') ? 'incomplete' : 'error';
 }

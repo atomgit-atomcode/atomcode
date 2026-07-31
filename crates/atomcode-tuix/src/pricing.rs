@@ -12,35 +12,66 @@
 pub fn cost_per_million(model: &str) -> (f64, f64) {
     let m = model.to_lowercase();
     // Claude
-    if m.contains("opus") { (15.0, 75.0) }
-    else if m.contains("sonnet") { (3.0, 15.0) }
-    else if m.contains("haiku") { (0.25, 1.25) }
+    if m.contains("opus") {
+        (15.0, 75.0)
+    } else if m.contains("sonnet") {
+        (3.0, 15.0)
+    } else if m.contains("haiku") {
+        (0.25, 1.25)
+    }
     // OpenAI (gpt-4o-mini must come before gpt-4o to avoid premature match)
-    else if m.contains("gpt-4o-mini") { (0.15, 0.6) }
-    else if m.contains("gpt-4o") { (2.5, 10.0) }
-    else if m.contains("gpt-4.1") { (2.0, 8.0) }
+    else if m.contains("gpt-4o-mini") {
+        (0.15, 0.6)
+    } else if m.contains("gpt-4o") {
+        (2.5, 10.0)
+    } else if m.contains("gpt-4.1") {
+        (2.0, 8.0)
+    }
     // o1/o3 mini must come before o1/o3 to avoid premature match
-    else if m.contains("o1-mini") || m.contains("o3-mini") { (3.0, 12.0) }
-    else if m.contains("o1") { (15.0, 60.0) }
-    else if m.contains("o3") { (10.0, 40.0) }
+    else if m.contains("o1-mini") || m.contains("o3-mini") {
+        (3.0, 12.0)
+    } else if m.contains("o1") {
+        (15.0, 60.0)
+    } else if m.contains("o3") {
+        (10.0, 40.0)
+    }
     // DeepSeek
-    else if m.contains("deepseek") { (0.27, 1.1) }
+    else if m.contains("deepseek") {
+        (0.27, 1.1)
+    }
     // Qwen
-    else if m.contains("qwen") { (0.5, 2.0) }
+    else if m.contains("qwen") {
+        (0.5, 2.0)
+    }
     // GLM / Zhipu
-    else if m.contains("glm") { (0.5, 2.0) }
+    else if m.contains("glm") {
+        (0.5, 2.0)
+    }
     // SiliconFlow / open models
-    else if m.contains("llama") || m.contains("mistral") { (0.3, 0.6) }
+    else if m.contains("llama") || m.contains("mistral") {
+        (0.3, 0.6)
+    }
     // MiniMax
-    else if m.contains("minimax") || m.contains("m2.7") { (0.5, 2.0) }
+    else if m.contains("minimax") || m.contains("m2.7") {
+        (0.5, 2.0)
+    }
     // Local / Ollama — free
-    else if m.contains("ollama") { (0.0, 0.0) }
+    else if m.contains("ollama") {
+        (0.0, 0.0)
+    }
     // Unknown — conservative estimate
-    else { (1.0, 3.0) }
+    else {
+        (1.0, 3.0)
+    }
 }
 
 /// Calculate cost in USD from token counts and model name.
-pub fn calculate_cost(model: &str, prompt_tokens: usize, completion_tokens: usize, cached_tokens: usize) -> f64 {
+pub fn calculate_cost(
+    model: &str,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    cached_tokens: usize,
+) -> f64 {
     let (input_price, output_price) = cost_per_million(model);
     // Cached tokens are typically 90% cheaper (Anthropic) or free (OpenAI)
     let cached_price = input_price * 0.1;
@@ -114,5 +145,18 @@ mod tests {
         assert_eq!(format_cost(0.42), "$0.42");
         assert_eq!(format_cost(0.001), "$0.0010");
         assert_eq!(format_cost(12.5), "$12.50");
+    }
+
+    #[test]
+    fn self_integrated_unknown_model_gets_nonzero_cost() {
+        // The whole reason `/cost` exists alongside the gateway-only `/usage`:
+        // it prices ANY model from local token accounting. An unknown /
+        // self-integrated model must fall back to the conservative estimate,
+        // never silently $0. (1.0 in / 3.0 out per M → 100k*1.0 + 50k*3.0.)
+        let cost = calculate_cost("my-company-internal-llm-v2", 100_000, 50_000, 0);
+        assert!(
+            cost > 0.0,
+            "self-integrated model must get the fallback price, not $0"
+        );
     }
 }

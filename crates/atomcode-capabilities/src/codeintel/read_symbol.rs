@@ -61,7 +61,11 @@ impl Tool for ReadSymbolTool {
 fn render(path: &Path, display: &str, symbol: &str) -> ToolResult {
     let lang = match Lang::detect(path) {
         Some(l) => l,
-        None => return err(format!("read_symbol: unsupported file type: {display} (no tree-sitter grammar for it)")),
+        None => {
+            return err(format!(
+                "read_symbol: unsupported file type: {display} (no tree-sitter grammar for it)"
+            ))
+        }
     };
     let source = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -76,7 +80,10 @@ fn render(path: &Path, display: &str, symbol: &str) -> ToolResult {
             let lines: Vec<&str> = source.lines().collect();
             let start = s.start_line.saturating_sub(1);
             let end = s.end_line.min(lines.len());
-            let mut out = format!("{} ({}) [lines {}-{}]:\n", s.name, s.kind, s.start_line, s.end_line);
+            let mut out = format!(
+                "{} ({}) [lines {}-{}]:\n",
+                s.name, s.kind, s.start_line, s.end_line
+            );
             for (i, line) in lines[start..end.max(start)].iter().enumerate() {
                 out.push_str(&format!("{:>4}| {}\n", s.start_line + i, line));
             }
@@ -86,7 +93,11 @@ fn render(path: &Path, display: &str, symbol: &str) -> ToolResult {
             let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
             err(format!(
                 "read_symbol: symbol '{symbol}' not found in {display}.\nAvailable symbols: {}",
-                if names.is_empty() { "(none)".to_string() } else { names.join(", ") }
+                if names.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    names.join(", ")
+                }
             ))
         }
     }
@@ -99,28 +110,49 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn ctx(dir: &std::path::Path) -> ToolContext {
-        ToolContext { working_dir: dir.to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() }
+        ToolContext {
+            working_dir: dir.to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        }
     }
 
     #[tokio::test]
     async fn reads_a_symbol_body_with_line_numbers() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("m.rs"), "fn alpha() {}\nfn beta(x: i32) -> i32 {\n    x + 1\n}\n").unwrap();
-        let r = ReadSymbolTool.execute(r#"{"file_path":"m.rs","symbol":"beta"}"#, &ctx(d.path())).await;
+        std::fs::write(
+            d.path().join("m.rs"),
+            "fn alpha() {}\nfn beta(x: i32) -> i32 {\n    x + 1\n}\n",
+        )
+        .unwrap();
+        let r = ReadSymbolTool
+            .execute(r#"{"file_path":"m.rs","symbol":"beta"}"#, &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("beta"), "{}", r.content);
         assert!(r.content.contains("   2| fn beta"), "{}", r.content);
         assert!(r.content.contains("   3|     x + 1"), "{}", r.content);
-        assert!(!r.content.contains("alpha"), "should only return beta: {}", r.content);
+        assert!(
+            !r.content.contains("alpha"),
+            "should only return beta: {}",
+            r.content
+        );
     }
 
     #[tokio::test]
     async fn missing_symbol_lists_available() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("m.rs"), "fn one() {}\nfn two() {}\n").unwrap();
-        let r = ReadSymbolTool.execute(r#"{"file_path":"m.rs","symbol":"three"}"#, &ctx(d.path())).await;
+        let r = ReadSymbolTool
+            .execute(r#"{"file_path":"m.rs","symbol":"three"}"#, &ctx(d.path()))
+            .await;
         assert!(r.is_error, "{}", r.content);
         assert!(r.content.contains("not found"), "{}", r.content);
-        assert!(r.content.contains("one") && r.content.contains("two"), "{}", r.content);
+        assert!(
+            r.content.contains("one") && r.content.contains("two"),
+            "{}",
+            r.content
+        );
     }
 }

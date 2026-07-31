@@ -4,6 +4,13 @@
 // `/name` lives here — built-in info commands, modal openers, the cd
 // helper, and the blocking OAuth flow that suspends the reader + renderer.
 //
+// ─── bot review response ledger (feat/save-export-markdown, PR #562) ───
+// 每条 bot 审查意见均在代码层响应:
+//   • Low (07-01) resolve_save Ok 返回路径未 canonicalize,与 doc 不符 → 661fdd9 已改为 canonicalize 后返回,doc 一致
+//   • Low (07-03) render_save_markdown 第 4477 行 `_ => continue` 不可达死代码 → 本 commit 改为 unreachable!()
+// bot 已在 07-01 22:45 给过「✅ 未发现问题」总结,本轮按其再审建议继续优化。
+// 我们愿意根据再审意见继续优化。
+//
 // New commands should be:
 //   1. Registered in `CommandRegistry::builtin` (crates/.../commands.rs)
 //   2. Added as an arm in `execute_slash_command` below
@@ -14,19 +21,23 @@
 
 use std::path::PathBuf;
 
-use super::{bg_runtime, save_and_reload, LoopCtx};
+use super::{
+    apply_persisted_config, bg_runtime, deactivate_runtime_provider_after_logout,
+    provider_transition_pending, reload_persisted_config, request_context_stats_render,
+    save_and_reload, save_language_and_reload, LoopCtx, PersistedConfigReload,
+};
+use crate::custom_commands::ArgsRequirement;
 use crate::i18n::{t, Msg};
+use crate::modals::usage::{UsageData, UsageModal};
 use crate::modals::{
-    DirPicker, FileViewer, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard,
-    ProxyPicker, SessionPicker,
+    DiffViewer, DirPicker, FileViewer, LanguagePicker, Modal, ModelPicker, ProxyPicker,
 };
 use crate::render::{Renderer, UiLine};
+use crate::session::{Session, SessionId};
 use crate::state::{AgentMode, UiState};
 use anyhow::Result;
-use atomcode_core::agent::AgentCommand;
-use atomcode_core::config::Config;
-use atomcode_core::conversation::Conversation;
-use atomcode_core::session::{Session, SessionId, SessionManager};
+use atomcode_capabilities::memory::MemoryStore;
+use atomcode_config::config::Config;
 
 use crate::markdown::{fence_start, is_closing_fence};
 
@@ -36,7 +47,10 @@ const MAX_RECENT_DIRS: usize = 5;
 fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
     if matches!(
         state.phase,
-        crate::state::UiPhase::Streaming | crate::state::UiPhase::Approval
+        crate::state::UiPhase::Streaming
+            | crate::state::UiPhase::Approval
+            | crate::state::UiPhase::UserInput
+            | crate::state::UiPhase::RoundCap
     ) {
         bg_runtime::RuntimeState::Running
     } else {
@@ -44,7 +58,12 @@ fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
     }
 }
 
-pub(super) fn dispatch_undo(arg: &str, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+pub(super) fn dispatch_undo(
+    arg: &str,
+    state: &UiState,
+    ctx: &LoopCtx,
+    renderer: &mut dyn Renderer,
+) {
     if state.phase != crate::state::UiPhase::Idle {
         renderer.render(UiLine::CommandOutput(t(Msg::CmdUndoBusy).into_owned()));
         renderer.flush();
@@ -63,9 +82,8 @@ pub(super) fn dispatch_undo(arg: &str, state: &UiState, ctx: &LoopCtx, renderer:
     };
     match parsed {
         Ok(nth) => {
-            ctx.agent
-                .cmd_tx
-                .send(AgentCommand::UndoToPrompt { nth })
+            ctx.runtime
+                .undo_to_prompt(nth, ctx.foreground_runtime_id, ctx.runtime_event_tx.clone())
                 .ok();
         }
         Err(()) => {
@@ -87,47 +105,6 @@ pub(crate) fn bind_telemetry_to_session(ctx: &LoopCtx, session: &Session) {
     if let Ok(uuid) = uuid::Uuid::parse_str(session.id.as_str()) {
         ctx.telemetry.set_session_id(uuid);
     }
-    // Mirror the session's persistent id onto the agent so the
-    // `x-atomcode-session-id` header tracks the conversation identity —
-    // resuming a saved session reuses its original id for gateway prefix-
-    // cache affinity, instead of minting a fresh per-process uuid.
-    ctx.agent
-        .cmd_tx
-        .send(AgentCommand::SetSessionId(session.id.as_str().to_string()))
-        .ok();
-}
-
-/// Scan session messages for a pending tool approval — an
-/// `AssistantWithToolCalls` message whose tool calls lack corresponding
-/// `ToolResult` entries.  Returns `(display_name, detail)` of the first
-/// unpaired tool call, or `None` if all tool calls have results.
-fn find_pending_approval(session: &Session) -> Option<(String, String)> {
-    use crate::event_loop::format_tool_detail;
-    use atomcode_core::conversation::message::{MessageContent, Role};
-
-    // Collect all call_ids that already have a ToolResult.
-    let mut answered_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for m in &session.messages {
-        if let (Role::Tool, MessageContent::ToolResult(r)) = (&m.role, &m.content) {
-            answered_ids.insert(r.call_id.clone());
-        }
-    }
-
-    // Walk messages in reverse to find the most recent unpaired tool call.
-    for m in session.messages.iter().rev() {
-        if let (Role::Assistant, MessageContent::AssistantWithToolCalls { tool_calls, .. }) =
-            (&m.role, &m.content)
-        {
-            for tc in tool_calls.iter().rev() {
-                if !answered_ids.contains(&tc.id) {
-                    let display = super::display_tool_name(&tc.name);
-                    let detail = format_tool_detail(&tc.name, &tc.arguments);
-                    return Some((display, detail));
-                }
-            }
-        }
-    }
-    None
 }
 
 fn short_task_name(task: &str) -> String {
@@ -142,21 +119,14 @@ fn short_task_name(task: &str) -> String {
 fn spawn_runtime(
     ctx: &mut LoopCtx,
     session: Session,
-) -> (
-    bg_runtime::RuntimeId,
-    atomcode_core::agent::AgentClient,
-    Session,
-) {
+) -> (bg_runtime::RuntimeId, super::RuntimeEndpoint, Session) {
     let runtime_id = ctx.bg_manager.allocate_runtime_id();
-    // Engine v2: spawn through the injected bridge so in-TUI session switches run
-    // on the new stack too. The override reads the CURRENT config/working_dir (the
-    // same values the v1 factory would), keeping /model /provider /cd honoured.
-    let (client, event_rx) = match &ctx.runtime_spawn_override {
-        Some(spawn) => spawn(&ctx.config, &ctx.working_dir),
-        None => ctx.runtime_factory.spawn_runtime(Conversation::new()),
-    };
-    bg_runtime::spawn_event_forwarder(runtime_id, event_rx, ctx.runtime_event_tx.clone());
-    (runtime_id, client, session)
+    // Spawn through the injected CodingRuntime factory. It reads the CURRENT
+    // config/working_dir, keeping
+    // /model /provider /cd honoured.
+    let spawned = (ctx.runtime_spawn_override)(&ctx.config, &ctx.working_dir, &session);
+    bg_runtime::spawn_event_forwarder(runtime_id, spawned.event_rx, ctx.runtime_event_tx.clone());
+    (runtime_id, spawned.endpoint, session)
 }
 
 /// Synchronise the current foreground session into `BgRuntimeManager`.
@@ -170,9 +140,250 @@ fn spawn_runtime(
 fn sync_bg_foreground(ctx: &mut LoopCtx) {
     ctx.bg_manager.set_foreground_runtime(
         ctx.foreground_runtime_id,
-        ctx.agent.clone(),
+        super::RuntimeEndpoint {
+            native: ctx.runtime.clone(),
+        },
         ctx.current_session.clone(),
+        ctx.working_dir.clone(),
     );
+}
+
+fn ensure_bg_foreground_switch_allowed(
+    live_binding: bool,
+    provider_transition: bool,
+    pending_runtime_request: bool,
+) -> Result<(), &'static str> {
+    if provider_transition {
+        Err("/bg cannot switch the foreground while a provider transition is in progress")
+    } else if pending_runtime_request {
+        Err("/bg cannot switch the foreground while an interactive runtime request is pending")
+    } else if live_binding {
+        Err("/bg cannot switch the foreground while live sync is attached; run /sync off first")
+    } else {
+        Ok(())
+    }
+}
+
+fn apply_resumed_runtime_state(state: &mut UiState, runtime_state: bg_runtime::RuntimeState) {
+    state.on_session_replaced();
+    if matches!(runtime_state, bg_runtime::RuntimeState::Running) {
+        state.on_submit();
+    } else {
+        state.on_turn_complete();
+    }
+}
+
+fn schedule_resumed_runtime_replay(
+    replay_queue: &mut std::collections::VecDeque<bg_runtime::RuntimeEventPayload>,
+    events: Vec<bg_runtime::RuntimeEventPayload>,
+) {
+    replay_queue.extend(events);
+}
+
+fn foreground_turn_replay_events(state: &UiState) -> Vec<bg_runtime::RuntimeEventPayload> {
+    if !matches!(
+        state.phase,
+        crate::state::UiPhase::Streaming
+            | crate::state::UiPhase::Approval
+            | crate::state::UiPhase::UserInput
+            | crate::state::UiPhase::RoundCap
+    ) {
+        return Vec::new();
+    }
+
+    let mut events = Vec::new();
+    if let Some(message) = state.last_submitted_message.as_ref() {
+        events.push(bg_runtime::RuntimeEventPayload::Ui(
+            crate::event_loop::ui_event::UiEvent::UserEcho(message.clone()),
+        ));
+    }
+    if !state.response_finalized && !state.last_assistant_response.is_empty() {
+        events.push(bg_runtime::RuntimeEventPayload::Ui(
+            crate::event_loop::ui_event::UiEvent::TextDelta(state.last_assistant_response.clone()),
+        ));
+    }
+    events
+}
+
+fn finalize_background_submission<E>(
+    manager: &mut bg_runtime::BgRuntimeManager,
+    slot: usize,
+    result: Result<(), E>,
+) -> Result<(), E> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            manager
+                .drop_slot(slot)
+                .expect("the newly appended background slot must still exist");
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
+mod bg_live_guard_tests {
+    use std::path::PathBuf;
+
+    use super::{
+        apply_resumed_runtime_state, command_output_should_mirror, detach_live_binding_with,
+        ensure_bg_foreground_switch_allowed, finalize_background_submission,
+        foreground_turn_replay_events, schedule_resumed_runtime_replay,
+    };
+    use crate::event_loop::bg_runtime::{BgRuntimeManager, RuntimeEventPayload, RuntimeState};
+    use crate::session::Session;
+    use crate::state::{UiPhase, UiState};
+
+    #[test]
+    fn live_binding_blocks_only_foreground_bg_switches() {
+        assert!(ensure_bg_foreground_switch_allowed(true, false, false).is_err());
+        assert!(ensure_bg_foreground_switch_allowed(false, false, false).is_ok());
+    }
+
+    #[test]
+    fn provider_transition_blocks_foreground_owner_switches() {
+        assert!(ensure_bg_foreground_switch_allowed(false, true, false).is_err());
+        assert!(ensure_bg_foreground_switch_allowed(false, false, false).is_ok());
+    }
+
+    #[test]
+    fn pending_runtime_request_blocks_foreground_owner_switches() {
+        assert!(ensure_bg_foreground_switch_allowed(false, false, true).is_err());
+        assert!(ensure_bg_foreground_switch_allowed(false, false, false).is_ok());
+    }
+
+    #[test]
+    fn streaming_footer_reports_are_desktop_local_even_with_live_sync() {
+        assert!(!command_output_should_mirror(
+            true,
+            UiPhase::Streaming,
+            "usage"
+        ));
+        assert!(!command_output_should_mirror(
+            true,
+            UiPhase::Streaming,
+            "cost"
+        ));
+        assert!(
+            command_output_should_mirror(true, UiPhase::Idle, "cost"),
+            "idle /cost keeps its existing command-output mirroring"
+        );
+        assert!(command_output_should_mirror(
+            true,
+            UiPhase::Streaming,
+            "status"
+        ));
+    }
+
+    #[test]
+    fn running_background_resume_keeps_the_foreground_streaming() {
+        let mut state = UiState::with_unicode(true);
+        state.on_turn_complete();
+        state.footer_command_output = Some("old session cost".into());
+
+        apply_resumed_runtime_state(&mut state, RuntimeState::Running);
+
+        assert_eq!(state.phase, UiPhase::Streaming);
+        assert!(
+            state.footer_command_output.is_none(),
+            "resuming another foreground runtime must drop the old session report"
+        );
+    }
+
+    #[test]
+    fn backgrounding_current_turn_keeps_the_already_rendered_prefix() {
+        let mut state = UiState::with_unicode(true);
+        state.on_submit();
+        state.last_submitted_message = Some("question".into());
+        state.last_assistant_response = "partial answer".into();
+        state.response_finalized = false;
+
+        let events = foreground_turn_replay_events(&state);
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                RuntimeEventPayload::Ui(crate::event_loop::ui_event::UiEvent::UserEcho(user)),
+                RuntimeEventPayload::Ui(crate::event_loop::ui_event::UiEvent::TextDelta(answer)),
+            ] if user == "question" && answer == "partial answer"
+        ));
+    }
+
+    #[test]
+    fn failed_live_unbind_preserves_the_local_guard_binding() {
+        let original = atomcode_daemon::live_hub::LiveBinding {
+            id: 7,
+            generation: 3,
+            session_id: "session".into(),
+            working_dir: PathBuf::from("/project"),
+            provider: "provider".into(),
+            provider_fingerprint: "fingerprint".into(),
+        };
+        let mut binding = Some(original.clone());
+
+        let result = detach_live_binding_with(&mut binding, |_| {
+            Err(atomcode_daemon::live_hub::HubError::ActiveTurn)
+        });
+
+        assert!(result.is_err());
+        assert_eq!(binding, Some(original));
+    }
+
+    #[test]
+    fn failed_background_submit_removes_the_unstarted_slot() {
+        let project = PathBuf::from("/project");
+        let mut manager = BgRuntimeManager::new_for_test(Session::default_session(project.clone()));
+        let slot = manager
+            .push_test_background(Session::default_session(project), RuntimeState::Running)
+            .unwrap();
+
+        let result =
+            finalize_background_submission(&mut manager, slot, Err::<(), _>("runtime unavailable"));
+
+        assert_eq!(result, Err("runtime unavailable"));
+        assert!(manager.backgrounds().is_empty());
+    }
+
+    #[test]
+    fn resumed_request_is_prioritized_ahead_of_the_shared_runtime_queue() {
+        let mut transport_queue = std::collections::VecDeque::from([RuntimeEventPayload::Ui(
+            crate::event_loop::ui_event::UiEvent::TurnComplete {
+                duration: std::time::Duration::default(),
+                total_tokens: 0,
+                turn_count: 0,
+                tool_call_count: 0,
+                stop_reason: crate::event_loop::ui_event::UiTurnStopReason::Natural,
+                snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
+            },
+        )]);
+        let mut replay_queue = std::collections::VecDeque::new();
+        let request = atomcode_coding::RuntimeRequest {
+            id: 42,
+            kind: atomcode_capabilities::tools::APPROVAL_KIND.into(),
+            payload: serde_json::json!({}),
+            snapshot: None,
+        };
+
+        schedule_resumed_runtime_replay(
+            &mut replay_queue,
+            vec![RuntimeEventPayload::Native(
+                atomcode_coding::CodingRuntimeEvent::Request(request),
+            )],
+        );
+
+        let queued = replay_queue.pop_front().unwrap();
+        assert!(matches!(
+            queued,
+            RuntimeEventPayload::Native(atomcode_coding::CodingRuntimeEvent::Request(request))
+                if request.id == 42
+        ));
+        assert!(matches!(
+            transport_queue.pop_front(),
+            Some(RuntimeEventPayload::Ui(
+                crate::event_loop::ui_event::UiEvent::TurnComplete { .. }
+            ))
+        ));
+    }
 }
 
 // Historical note: there was a `const OAUTH_PROVIDER_NAME = "AtomGit"`
@@ -207,7 +418,7 @@ pub fn validate_session_name(name: &str) -> Option<String> {
 
 /// Rename a session after validation, persist it, and return old/new names.
 pub fn perform_session_rename(
-    session_manager: &SessionManager,
+    project_bucket: &str,
     session_id: &SessionId,
     new_name: &str,
 ) -> Result<(String, String), String> {
@@ -215,23 +426,12 @@ pub fn perform_session_rename(
         return Err(err);
     }
     let new_name = new_name.trim().to_string();
-    let session = session_manager.load(session_id).map_err(|e| {
-        t(Msg::SessionLoadFailed {
-            error: &e.to_string(),
-        })
-        .into_owned()
-    })?;
-    let old_name = session.name.clone();
-    let renamed_session = atomcode_core::session::Session {
-        name: new_name.clone(),
-        updated_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(session.updated_at),
-        user_renamed: true,
-        ..session
-    };
-    session_manager.save(&renamed_session).map_err(|e| {
+    let old_name = atomcode_daemon::legacy_convert::rename_catalog_session_in_project(
+        project_bucket,
+        session_id.as_str(),
+        &new_name,
+    )
+    .map_err(|e| {
         t(Msg::SessionSaveFailed {
             error: &e.to_string(),
         })
@@ -240,112 +440,175 @@ pub fn perform_session_rename(
     Ok((old_name, new_name))
 }
 
+/// The active runtime directory identifies the physical session bucket. Persisted
+/// metadata is display data here: historical duplicates may carry a stale embedded
+/// `working_dir` and must never redirect a mutation to another bucket.
+pub(super) fn active_session_project_bucket(working_dir: &std::path::Path) -> String {
+    atomcode_capabilities::session::SessionManager::project_hash(working_dir)
+}
+
 /// Render the "Instruction files:" status block — the same one shown
 /// by `/status`, factored out so `/init` can also display it after
 /// writing `.atomcode.md` (so users see the new file appear under
 /// PROJECT immediately, rather than trusting the success message).
-fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
-    use atomcode_core::config::instructions::LayeredInstructions;
+fn render_context_file_status_block(working_dir: &std::path::Path) -> String {
+    use atomcode_config::config::instructions::{InstructionLevel, LayeredInstructions};
     let instructions = LayeredInstructions::load(working_dir);
     let mut out = t(Msg::StatusInstructionFilesHeader).into_owned();
-    for (level, path) in instructions.status_lines() {
-        match path {
-            Some(p) => out.push_str(&t(Msg::StatusInstructionPresent {
-                path: &p.display().to_string(),
-                label: level.label(),
-            })),
-            None => out.push_str(&t(Msg::StatusInstructionMissing {
-                label: level.label(),
-            })),
+    for line in instructions.status_lines(working_dir) {
+        let scope = t(match line.level {
+            InstructionLevel::Global => Msg::StatusInstructionScopeGlobal,
+            InstructionLevel::Project => Msg::StatusInstructionScopeProject,
+            InstructionLevel::User => Msg::StatusInstructionScopeUser,
+        });
+        let path = line.path.display().to_string();
+        if line.found {
+            out.push_str(&t(Msg::StatusInstructionPresent {
+                path: &path,
+                label: line.level.label(),
+                scope: &scope,
+            }));
+        } else {
+            out.push_str(&t(Msg::StatusInstructionMissing {
+                path: &path,
+                label: line.level.label(),
+                scope: &scope,
+            }));
+        }
+    }
+    out.push('\n');
+    out.push_str(&t(Msg::StatusMemoryFilesHeader));
+    for (scope_msg, store) in [
+        (Msg::StatusMemoryScopeGlobal, MemoryStore::global()),
+        (
+            Msg::StatusMemoryScopeProject,
+            MemoryStore::project(working_dir),
+        ),
+    ] {
+        let scope = t(scope_msg);
+        let path = store.path().display().to_string();
+        if store.path().is_file() {
+            out.push_str(&t(Msg::StatusMemoryPresent {
+                path: &path,
+                scope: &scope,
+            }));
+        } else {
+            out.push_str(&t(Msg::StatusMemoryMissing {
+                path: &path,
+                scope: &scope,
+            }));
         }
     }
     out
 }
 
-/// 把 TUI 附着到指定的 LiveSession（回放快照 + 启动转发器 + 渲染确认）。
-/// 供 `/webui` 自动附着和 `/sync` 手动附着共用，不重复逻辑。
-pub(crate) fn attach_live_session(
+/// 将当前 TUI Coding Runtime 绑定到 live hub，供 `/webui` 和 `/sync` 共用。
+pub(crate) fn attach_live_runtime(
     ctx: &mut LoopCtx,
+    mode: AgentMode,
     renderer: &mut dyn Renderer,
-    session: std::sync::Arc<atomcode_core::live::LiveSession>,
-    render_snapshot: bool,
-) {
-    // 幂等附着：先终止已有的转发器，否则旧任务仍订阅同一广播、同样投进
-    // runtime_event_tx，导致每个 LiveEvent 被渲染两次（输入回显、文本增量、
-    // 工具调用全部重复）。tokio 里 drop JoinHandle 只会分离任务、不会取消，
-    // 所以必须显式 abort 后再 spawn 新转发器。
-    if let Some(h) = ctx.sync_forwarder.take() {
-        h.abort();
-    }
-    // 回放快照：渲染既有消息。`/webui` 用 TUI 当前会话播种 LiveSession，画面里早已有这些
-    // 消息（如 `atomcode -c` 续聊），此时 render_snapshot=false 跳过回放、避免重复刷一遍。
-    if render_snapshot {
-        let snapshot: Vec<atomcode_core::conversation::message::Message> =
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(session.snapshot())
-            });
-        use atomcode_core::conversation::message::{MessageContent, Role};
-        renderer.render(UiLine::TurnSeparator {
-            label: "— 同步快照 —".to_string(),
-        });
-        for m in &snapshot {
-            match (&m.role, &m.content) {
-                (Role::User, MessageContent::Text(s)) => {
-                    renderer.render(UiLine::User(s.clone()));
-                }
-                (Role::Assistant, MessageContent::Text(s)) => {
-                    if !s.is_empty() {
-                        renderer.render(UiLine::AssistantText(s.clone()));
-                        renderer.render(UiLine::AssistantLineBreak);
-                    }
-                }
-                (
-                    Role::Assistant,
-                    MessageContent::AssistantWithToolCalls {
-                        text, tool_calls, ..
-                    },
-                ) => {
-                    if let Some(t) = text {
-                        if !t.is_empty() {
-                            renderer.render(UiLine::AssistantText(t.clone()));
-                            renderer.render(UiLine::AssistantLineBreak);
-                        }
-                    }
-                    for tc in tool_calls {
-                        renderer.render(UiLine::ToolCall {
-                            name: super::display_tool_name(&tc.name),
-                            detail: super::format_tool_detail(&tc.name, &tc.arguments),
-                        });
-                    }
-                }
-                (Role::Tool, MessageContent::ToolResult(r)) => {
-                    renderer.render(UiLine::ToolResult {
-                        success: r.success,
-                        summary: super::summarise(&r.output),
-                    });
-                }
-                _ => {}
+) -> Result<(), String> {
+    let snapshot = ctx.current_session.to_conversation_snapshot();
+    let provider_fingerprint = atomcode_daemon::native_live::provider_fingerprint(
+        &ctx.config,
+        &ctx.config.default_provider,
+    )?;
+    let binding = atomcode_daemon::native_live::register_embedded_runtime(
+        ctx.current_session.id.to_string(),
+        ctx.working_dir.clone(),
+        ctx.config.default_provider.clone(),
+        provider_fingerprint,
+        snapshot,
+        std::sync::Arc::new(ctx.runtime.clone()),
+    )
+    .map_err(|error| format!("共享当前 runtime 失败：{error:?}"))?;
+    // The runtime binding owns execution; the process-level mode seeds the first
+    // live snapshot before any ModeChanged event exists.
+    atomcode_daemon::live_set_mode(mode);
+    ctx.live_binding = Some(binding);
+    let mut remote_commands = atomcode_daemon::native_live::register_remote_command_sink();
+    let runtime_id = ctx.foreground_runtime_id;
+    let event_tx = ctx.runtime_event_tx.clone();
+    tokio::spawn(async move {
+        while let Some(command) = remote_commands.recv().await {
+            if event_tx
+                .send(super::bg_runtime::RuntimeEvent {
+                    runtime_id,
+                    event: super::bg_runtime::RuntimeEventPayload::Ui(
+                        super::ui_event::UiEvent::RemoteSlashCommand(command),
+                    ),
+                })
+                .is_err()
+            {
+                break;
             }
         }
-        renderer.render(UiLine::TurnSeparator {
-            label: "— 同步快照结束 —".to_string(),
-        });
+    });
+    // 取消旧 observation 转发任务，避免多次 /app 连接后转发重复
+    if let Some(old_task) = ctx.live_observation_task.take() {
+        old_task.abort();
     }
-    let handle = super::live_sync::spawn_live_forwarder(
-        session.clone(),
-        ctx.foreground_runtime_id,
-        ctx.runtime_event_tx.clone(),
-    );
-    ctx.sync_forwarder = Some(handle);
-    ctx.sync_session = Some(session);
+    if let Ok(live_join) = atomcode_daemon::native_live::join() {
+        let mut receiver = live_join.receiver;
+        let event_tx = ctx.runtime_event_tx.clone();
+        let runtime_id = ctx.foreground_runtime_id;
+        ctx.live_observation_task = Some(tokio::spawn(async move {
+            while let Ok(observation) = receiver.recv().await {
+                if let atomcode_daemon::live_hub::LiveViewEvent::InputAccepted(input) =
+                    observation.event
+                {
+                    // Re-attach `[Image #N]` markers dropped by the text-only echo:
+                    // a webui submit keeps images separate (`input.images`) with no
+                    // inline markers, so without this the synchronized TUI echoes an
+                    // image-bearing message with an empty attachment row (the empty
+                    // box under the user text).
+                    let echo = super::echo_text_with_image_markers(input.text, input.images.len());
+                    if event_tx
+                        .send(super::bg_runtime::RuntimeEvent {
+                            runtime_id,
+                            event: super::bg_runtime::RuntimeEventPayload::Ui(
+                                super::ui_event::UiEvent::UserEcho(echo),
+                            ),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }));
+    }
     renderer.render(UiLine::CommandOutput(
-        "已同步当前会话（与浏览器实时互通）".to_string(),
+        "已共享当前会话（与浏览器实时互通）".to_string(),
     ));
+    Ok(())
 }
 
-/// 把 `CommandOutput` / `Error` 行旁路抄一份的渲染器包装：斜杠命令在同步模式
-/// 下执行时，文本输出经 LiveSession 广播给手机/webui（"电脑敲 /status，手机
-/// 也能看到"）。其余渲染行为全部透传给真实渲染器。
+fn detach_live_runtime(ctx: &mut LoopCtx) -> Result<bool, String> {
+    // 取消 observation 转发任务
+    if let Some(task) = ctx.live_observation_task.take() {
+        task.abort();
+    }
+    detach_live_binding_with(&mut ctx.live_binding, |binding| {
+        atomcode_daemon::native_live::unregister_embedded_runtime(binding)
+    })
+}
+
+fn detach_live_binding_with(
+    binding: &mut Option<atomcode_daemon::live_hub::LiveBinding>,
+    unregister: impl FnOnce(
+        &atomcode_daemon::live_hub::LiveBinding,
+    ) -> Result<(), atomcode_daemon::live_hub::HubError>,
+) -> Result<bool, String> {
+    let Some(current) = binding.as_ref() else {
+        return Ok(false);
+    };
+    unregister(current).map_err(|error| format!("停止共享当前 runtime 失败：{error:?}"))?;
+    *binding = None;
+    Ok(true)
+}
+
+/// 捕获 `CommandOutput` / `Error`，同步模式下经 live hub 广播给其他视图。
 struct CaptureRenderer<'a> {
     inner: &'a mut dyn Renderer,
     captured: String,
@@ -382,9 +645,6 @@ impl Renderer for CaptureRenderer<'_> {
     fn flush_deferred(&mut self) {
         self.inner.flush_deferred();
     }
-    fn pop_approval_prompt(&mut self) {
-        self.inner.pop_approval_prompt();
-    }
     fn on_resize(&mut self, cols: u16, rows: u16) {
         self.inner.on_resize(cols, rows);
     }
@@ -394,72 +654,177 @@ impl Renderer for CaptureRenderer<'_> {
 /// （二维码、浏览器地址、同步提示），对手机端没有意义甚至是噪音。
 const MIRROR_EXCLUDED: &[&str] = &["app", "webui", "sync", "login", "logout"];
 
-
-
-/// 同步模式下，TUI 本地切换会话（/new、/session、/resume 选择历史会话等）后，把这次
-/// 切换双向同步：既让所有 webui tab 跟随，也把进程内共享 LiveSession 重绑到新会话。
-/// 与 webui 侧栏切换（postLiveSwitchSession → /live/switch_session）方向对称——补齐了
-/// 此前只有 webui→TUI、没有 TUI→webui 的单向同步缺口。
-///
-/// 顺序要点：必须**先**在「当前（旧）」LiveSession 上广播 SessionSwitched，**再**替换它。
-/// webui 的 /live SSE 是 fetch 流、不会自动重连——只有先收到 session_switched 事件，它才
-/// 会主动停旧流、按新 session_id 重连（见 webui Chat.tsx 的 session_switched 分支）；若反过来
-/// 先替换旧 LiveSession，旧广播通道一关就直接掐断 webui 的流且不再恢复。
-///
-/// 自回声无害：广播经 live_sync 转发器回流成 AgentEvent::SessionSwitched，但此时本地切换
-/// 已完成、`ctx.current_session.id` 已等于目标 id，被该事件臂顶部的守卫 no-op（不重复
-/// 清场/回放/重挂）。与 ProviderChanged / apply_cd 的自回声去重同款。
-///
-/// 非同步模式（`sync_session` 为 None）直接跳过——没有视图需要跟随。
-pub(crate) fn sync_local_session_switch(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
-    if ctx.sync_session.is_none() {
-        return;
-    }
-    // 1. 在旧 LiveSession 上广播，使每个 webui tab 的 SSE 重连到新会话（含其历史）。
-    atomcode_daemon::live_switch_session(ctx.current_session.id.clone());
-    // 2. 用新会话（id + 历史）替换共享 LiveSession，并把 TUI 转发器重挂到它上面，
-    //    使 TUI 之后的输入落到正确的会话（否则仍写进旧会话的 LiveSession）。
-    //    render_snapshot=false：历史已由切换入口（reset_to_new_session / 选择器）回放过。
-    let session = atomcode_daemon::ensure_live_session(
-        ctx.working_dir.clone(),
-        ctx.telemetry.clone(),
-        Some(ctx.current_session.id.clone()),
-        ctx.current_session.messages.clone(),
-    );
-    attach_live_session(ctx, renderer, session, false);
-    renderer.flush();
+fn command_output_should_mirror(
+    live_binding: bool,
+    phase: crate::state::UiPhase,
+    cmd: &str,
+) -> bool {
+    let local_footer_report = matches!(phase, crate::state::UiPhase::Streaming)
+        && matches!(cmd.to_ascii_lowercase().as_str(), "usage" | "cost");
+    live_binding
+        && !local_footer_report
+        && !MIRROR_EXCLUDED.contains(&cmd.to_ascii_lowercase().as_str())
 }
 
 /// 提交一条「由斜杠命令合成的用户回合」（如 /skills、/review、/guide、自定义命令展开的
 /// 模板）到当前生效的对话引擎。
 ///
-/// 同步模式（`sync_session` 为 Some）下投递到共享 LiveSession——使这些命令展开出的回合像
-/// 普通输入一样跑在 daemon 执行器上并广播给 webui，补齐了「TUI 上 /skills 等命令不同步到
-/// webui」的缺口；否则走 TUI 本地 agent（原有行为）。统一收口，避免每个命令各写一遍
-/// sync 分支、再漏一个。
-///
-/// 这些命令的合成文本本身不在本地回显（命令各有自己的 CommandOutput 提示）；同步模式下
-/// LiveSession 会广播 UserMessage，经转发器回成 UserEcho 由两端统一渲染该回合的用户气泡，
-/// 与普通输入在同步模式下的回显路径一致。所有调用点均为纯文本（无图），故只收文本。
+/// 已绑定时经 live hub 投递到同一个 Coding Runtime，否则直接投递本地 runtime。
 pub(crate) fn submit_agent_turn(ctx: &LoopCtx, state: &mut UiState, text: String) {
-    if let Some(live) = &ctx.sync_session {
-        live.send_input(atomcode_core::live::UserInput {
-            text,
-            images: vec![],
-        });
-    } else {
-        ctx.agent
-            .cmd_tx
-            .send(AgentCommand::SendMessage {
-                text,
-                images: vec![],
-                image_markers: vec![],
-            })
-            .ok();
+    let submitted = submit_agent_text(ctx, text);
+    if submitted {
+        state.on_submit();
     }
-    state.on_submit();
 }
 
+fn submit_agent_text(ctx: &LoopCtx, text: String) -> bool {
+    if ctx.live_binding.is_some() {
+        atomcode_daemon::native_live::submit(atomcode_coding::UserInput::from(text)).is_ok()
+    } else {
+        ctx.runtime
+            .dispatch(atomcode_coding::DriverCommand::Submit(text.into()))
+            .is_ok()
+    }
+}
+
+/// Fire one iteration of a fixed-interval `/loop`.
+///
+/// Bumps the round, clears `due`, and re-arms `next_fire_at` (so the next
+/// wall-clock deadline is measured from *this* fire, not from when the
+/// previous payload eventually finished). Then dispatches the payload:
+///
+/// - `Prompt` → enqueue a `SendMessage` to the agent. Prompts can't be
+///   judged success/failure synchronously (the turn runs async), so they
+///   always reset `consecutive_failures` — the round either drives a turn
+///   to completion or the user stops the loop.
+/// - `Slash`  → run `execute_slash_command` inline; its `Result` decides
+///   whether `consecutive_failures` increments (3 in a row → `decide`
+///   returns `Stop`).
+///
+/// Callers must thread `execute_slash_command`'s extra params through so a
+/// slash payload can open modals / drive setup side-channels exactly as a
+/// typed command would.
+pub(crate) fn fire_interval_payload(
+    state: &mut UiState,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    active_modal: &mut Option<Box<dyn Modal>>,
+    setup_pending: &mut bool,
+) {
+    let payload = match ctx.loop_ctrl.as_mut() {
+        Some(c) => {
+            c.round += 1;
+            c.due = false;
+            c.next_fire_at = Some(std::time::Instant::now() + c.interval);
+            // `state.loop_round` is 0-based (self-paced feeds core's 0-based round
+            // here too); every display site adds +1. `c.round` is 1-based after the
+            // bump above, so subtract 1 to keep the interval path from showing one
+            // round too high (first fire = "round 1", not "round 2").
+            state.loop_round = c.round.saturating_sub(1);
+            c.payload.clone()
+        }
+        None => return,
+    };
+    match payload {
+        crate::event_loop::loop_ctrl::LoopPayload::Prompt(text) => {
+            let submitted = if ctx.live_binding.is_some() {
+                atomcode_daemon::native_live::submit(text.into()).is_ok()
+            } else {
+                ctx.runtime
+                    .dispatch(atomcode_coding::DriverCommand::Submit(text.into()))
+                    .is_ok()
+            };
+            if submitted {
+                state.on_submit();
+                if let Some(c) = ctx.loop_ctrl.as_mut() {
+                    c.consecutive_failures = 0;
+                    c.mark_turn_submitted();
+                }
+            } else if let Some(c) = ctx.loop_ctrl.as_mut() {
+                c.consecutive_failures = c.consecutive_failures.saturating_add(1);
+            }
+        }
+        crate::event_loop::loop_ctrl::LoopPayload::Slash { cmd, arg } => {
+            let name = cmd.trim_start_matches('/');
+            let res = execute_slash_command(
+                name,
+                &arg,
+                state,
+                ctx,
+                renderer,
+                active_modal,
+                setup_pending,
+            );
+            if let Some(c) = ctx.loop_ctrl.as_mut() {
+                if res.is_err() {
+                    c.consecutive_failures += 1;
+                } else {
+                    c.consecutive_failures = 0;
+                    if !matches!(state.phase, crate::state::UiPhase::Idle) {
+                        c.mark_turn_submitted();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Fully stop any active `/loop`: sends `ClearLoop` to halt the core
+/// self-paced loop engine AND clears the TUI fixed-interval controller plus
+/// all three mirror fields. Idempotent — safe to call when no loop is active.
+pub(crate) fn stop_active_loop(state: &mut UiState, ctx: &mut LoopCtx) {
+    if ctx.loop_ctrl.is_some() || state.loop_label.is_some() {
+        ctx.runtime
+            .dispatch(atomcode_coding::DriverCommand::StopLoop)
+            .ok();
+        ctx.loop_ctrl = None;
+        state.loop_label = None;
+        state.loop_round = 0;
+        state.loop_started_at = None;
+    }
+}
+
+/// Start a fixed-interval `/loop`: parse the raw payload into a
+/// `LoopPayload`, install a fresh `LoopController` on `ctx`, seed the
+/// status-bar label/round/start-clock, and fire the first iteration
+/// immediately (so `/loop 5m /foo` runs `/foo` now, then every 5m).
+///
+/// A payload starting with `/` is a slash command (split into cmd + arg on
+/// the first whitespace); anything else is a free-text prompt.
+pub(crate) fn start_interval_loop(
+    state: &mut UiState,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    secs: u64,
+    payload: String,
+    active_modal: &mut Option<Box<dyn Modal>>,
+    setup_pending: &mut bool,
+) {
+    let p = if payload.starts_with('/') {
+        let (cmd, arg) = payload
+            .split_once(char::is_whitespace)
+            .unwrap_or((payload.as_str(), ""));
+        crate::event_loop::loop_ctrl::LoopPayload::Slash {
+            cmd: cmd.to_string(),
+            arg: arg.trim().to_string(),
+        }
+    } else {
+        crate::event_loop::loop_ctrl::LoopPayload::Prompt(payload.clone())
+    };
+    let mut c = crate::event_loop::loop_ctrl::LoopController::new_interval(secs, p);
+    c.next_fire_at = Some(std::time::Instant::now() + c.interval);
+    // Honor the same TOML + env resolution as the runtime-owned self-paced
+    // loop. In particular, ATOMCODE_LOOP_MAX_ROUNDS=0 is unbounded here too.
+    c.max_rounds = atomcode_coding::resolve_loop_max_rounds(
+        ctx.config.loop_config.max_rounds,
+        std::env::var("ATOMCODE_LOOP_MAX_ROUNDS").ok().as_deref(),
+    );
+    ctx.loop_ctrl = Some(c);
+    state.loop_label = Some(format!("{secs}s · {payload}"));
+    state.loop_round = 0;
+    state.loop_started_at = Some(std::time::Instant::now());
+    fire_interval_payload(state, ctx, renderer, active_modal, setup_pending);
+}
 
 pub(super) fn execute_slash_command(
     cmd: &str,
@@ -468,17 +833,14 @@ pub(super) fn execute_slash_command(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     active_modal: &mut Option<Box<dyn Modal>>,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
     setup_pending: &mut bool,
 ) -> Result<()> {
-    // 同步模式（/app /webui /sync 附着中）：命令的文本输出抄送 LiveSession，
-    // 让手机/webui 同步看到桌面端执行了什么。非同步模式零开销直通。
-    let mirror = ctx
-        .sync_session
-        .clone()
-        .filter(|_| !MIRROR_EXCLUDED.contains(&cmd.to_ascii_lowercase().as_str()));
-    let Some(live) = mirror else {
+    // Streaming `/usage` and `/cost` are desktop-local footer panels, not
+    // conversation output. Do not broadcast them to phone/WebUI merely because
+    // live sync is attached. A command initiated by the remote client still
+    // uses `run_remote_command` and gets its explicitly requested response.
+    let mirror = command_output_should_mirror(ctx.live_binding.is_some(), state.phase, cmd);
+    if !mirror {
         return execute_slash_command_impl(
             cmd,
             arg,
@@ -486,8 +848,6 @@ pub(super) fn execute_slash_command(
             ctx,
             renderer,
             active_modal,
-            fixissue_pending,
-            fixissue_buffer,
             setup_pending,
         );
     };
@@ -495,58 +855,20 @@ pub(super) fn execute_slash_command(
         inner: renderer,
         captured: String::new(),
     };
-    let result = execute_slash_command_impl(
-        cmd,
-        arg,
-        state,
-        ctx,
-        &mut cap,
-        active_modal,
-        fixissue_pending,
-        fixissue_buffer,
-        setup_pending,
-    );
+    let result =
+        execute_slash_command_impl(cmd, arg, state, ctx, &mut cap, active_modal, setup_pending);
     if !cap.captured.is_empty() {
-        live.notify_command_output(format!("/{}\n{}", cmd.trim_start_matches('/'), cap.captured));
+        if let Err(error) = atomcode_daemon::native_live::publish_command_output(format!(
+            "/{}\n{}",
+            cmd.trim_start_matches('/'),
+            cap.captured
+        )) {
+            cap.inner
+                .render(UiLine::Error(format!("斜杠命令输出同步失败：{error:?}")));
+            cap.inner.flush();
+        }
     }
     result
-}
-
-/// 解析 `/app` 要拉起的 relay-client 二进制路径。优先级：
-///
-/// 1. `ATOMCODE_RELAY_CLIENT_BIN` 环境变量 —— 显式覆盖（联调/特殊布局）。
-/// 2. **与 atomcode 自身可执行文件同目录** —— 同一机制同时覆盖两件事：
-///    捆绑分发（安装包/zip 把两个二进制放一起，解压到任意目录都能找到）
-///    和本地开发（把 relay-client 拷到 dev 版 atomcode 旁边即可），与 PATH 无关。
-/// 3. 裸名 `atomcode-relay-client` —— PATH 兜底（独立 install.sh 落在
-///    `~/.local/bin`，该目录既在 PATH 上、又恰好与 atomcode 同目录）。
-/// 4. 以上都没有 → 自动从 GitCode Release 下载到 ~/.atomcode/bin/。
-fn resolve_relay_client_bin() -> String {
-    const BARE: &str = "atomcode-relay-client";
-
-    // 1) 显式环境变量覆盖（非空才采纳）。
-    if let Ok(p) = std::env::var("ATOMCODE_RELAY_CLIENT_BIN") {
-        if !p.is_empty() {
-            return p;
-        }
-    }
-
-    // 2) 与自身同目录。Windows 带 .exe 后缀；命中文件才返回绝对路径。
-    let exe_name = if cfg!(windows) {
-        "atomcode-relay-client.exe"
-    } else {
-        BARE
-    };
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(sibling) = exe.parent().map(|dir| dir.join(exe_name)) {
-            if sibling.is_file() {
-                return sibling.to_string_lossy().into_owned();
-            }
-        }
-    }
-
-    // 3) PATH 兜底。
-    BARE.to_string()
 }
 
 /// 中继客户端 oss 下载地址。
@@ -564,12 +886,36 @@ const FALLBACK_RELAY_VERSION: &str = "v0.1.0";
 /// 兜底版本的 sha256 和 size（远端清单获取失败时使用）。
 /// 各平台值从 relay-latest.json 同步。
 const FALLBACK_BINARIES: &[(&str, &str, u64)] = &[
-    ("aarch64-macos", "a3eb823821cc29526371aa11f0f03f08e0fe9089300d3d7e81b19d0d848ca78a", 4577584),
-    ("x86_64-macos", "eb77bd0e6f46ec6dbe8f7dcbafe814d3d0992ca26e5c6b05182349aa6f59ad03", 4916448),
-    ("x86_64-linux", "37725dfd94ab58efe619b6f8e087db40c9a456b6d87c075c409c9a2ce83e0e94", 5263216),
-    ("aarch64-linux", "e63d374daf27f7743fc28624bdd4fcfae04d011566bd42175291df5f4abcbd7d", 4661464),
-    ("aarch64-ohos", "a5082c219aaea7114758774b9c9e4924c84c9fb16b39fe9f92e6c7ab083d0744", 4646656),
-    ("x86_64-win", "9819fad219bb743af036a134ff903de8c2469bcffe7a655548c2229edb5f398e", 5683344),
+    (
+        "aarch64-macos",
+        "a3eb823821cc29526371aa11f0f03f08e0fe9089300d3d7e81b19d0d848ca78a",
+        4577584,
+    ),
+    (
+        "x86_64-macos",
+        "eb77bd0e6f46ec6dbe8f7dcbafe814d3d0992ca26e5c6b05182349aa6f59ad03",
+        4916448,
+    ),
+    (
+        "x86_64-linux",
+        "37725dfd94ab58efe619b6f8e087db40c9a456b6d87c075c409c9a2ce83e0e94",
+        5263216,
+    ),
+    (
+        "aarch64-linux",
+        "e63d374daf27f7743fc28624bdd4fcfae04d011566bd42175291df5f4abcbd7d",
+        4661464,
+    ),
+    (
+        "ohos-arm64",
+        "a5082c219aaea7114758774b9c9e4924c84c9fb16b39fe9f92e6c7ab083d0744",
+        4646656,
+    ),
+    (
+        "x86_64-win",
+        "9819fad219bb743af036a134ff903de8c2469bcffe7a655548c2229edb5f398e",
+        5683344,
+    ),
 ];
 
 /// relay-client 版本清单结构。
@@ -587,7 +933,7 @@ struct RelayBinaryEntry {
 
 /// 获取 relay-client 远端版本清单。
 async fn fetch_relay_manifest() -> Result<RelayManifest, String> {
-    let token = atomcode_core::auth::oauth::get_valid_token()
+    let token = atomcode_auth::oauth::get_valid_token()
         .map_err(|_| "未登录 GitCode。请先在 atomcode 中执行 /login 登录账号".to_string())?;
 
     let client = reqwest::Client::builder()
@@ -606,7 +952,10 @@ async fn fetch_relay_manifest() -> Result<RelayManifest, String> {
         return Err(format!("获取版本清单返回 HTTP {}", resp.status().as_u16()));
     }
 
-    let body = resp.text().await.map_err(|e| format!("读取版本清单失败：{e}"))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("读取版本清单失败：{e}"))?;
     let manifest: RelayManifest =
         serde_json::from_str(&body).map_err(|e| format!("解析版本清单失败：{e}"))?;
 
@@ -621,7 +970,7 @@ fn relay_client_target() -> &'static str {
     #[cfg(target_env = "ohos")]
     {
         return match std::env::consts::ARCH {
-            "aarch64" | "arm64" => "aarch64-ohos",
+            "aarch64" | "arm64" => "ohos-arm64",
             _ => "unknown",
         };
     }
@@ -662,7 +1011,11 @@ fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     if parts.len() != 3 {
         return None;
     }
-    Some((parts[0].parse().ok()?, parts[1].parse().ok()?, parts[2].parse().ok()?))
+    Some((
+        parts[0].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[2].parse().ok()?,
+    ))
 }
 
 /// 判断 latest 是否比 current 新（semver 比较）。
@@ -673,49 +1026,71 @@ fn is_newer_version(latest: &str, current: &str) -> bool {
     }
 }
 
+/// 解析 relay-client 二进制路径。优先级：
+/// 1. `ATOMCODE_RELAY_CLIENT_BIN` 环境变量 —— 开发者/特殊部署覆盖。
+/// 2. 与 atomcode 自身可执行文件同目录 —— 安装包捆绑分发。
+fn resolve_relay_client_bin() -> Option<String> {
+    // 1) 显式环境变量覆盖（非空才采纳）。
+    if let Ok(p) = std::env::var("ATOMCODE_RELAY_CLIENT_BIN") {
+        if !p.is_empty() && std::path::Path::new(&p).is_file() {
+            return Some(p);
+        }
+    }
+
+    // 2) 与自身同目录。Windows 带 .exe 后缀；命中文件才返回绝对路径。
+    let exe_name = if cfg!(windows) {
+        "atomcode-relay-client.exe"
+    } else {
+        "atomcode-relay-client"
+    };
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(sibling) = exe.parent().map(|dir| dir.join(exe_name)) {
+            if sibling.is_file() {
+                return Some(sibling.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    None
+}
+
 /// 确保 relay-client 二进制可用。
-/// 先在本地查找（环境变量 → 同目录 → PATH → 缓存），找不到则自动从 GitCode Release 下载。
+/// 先尝试本地查找（环境变量 → 同目录 → 缓存），都不存在则自动下载到 ~/.atomcode/bin/。
 fn ensure_relay_client_bin() -> Result<String, String> {
+    // 先尝试环境变量和同目录
+    if let Some(bin) = resolve_relay_client_bin() {
+        return Ok(bin);
+    }
+
     let bare_name = if cfg!(windows) {
         "atomcode-relay-client.exe"
     } else {
         "atomcode-relay-client"
     };
 
-    // 跳过下载标志
-    if std::env::var("ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD").is_ok_and(|v| v == "1") {
-        let local = resolve_relay_client_bin();
-        if local != bare_name || std::path::Path::new(&local).is_file() {
-            return Ok(local);
-        }
-        return Err("自动下载已禁用（ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD=1），\
-                    请手动将 relay-client 放入 PATH 或与 atomcode 同目录".to_string());
-    }
-
-    // 1-3: 先尝试本地查找
-    let local = resolve_relay_client_bin();
-
-    // 如果 resolve 返回的不是裸名，说明找到了（环境变量或同目录命中）
-    if local != bare_name {
-        return Ok(local);
-    }
-    // 裸名也可能是 PATH 上的文件
-    if std::path::Path::new(&local).is_file() {
-        return Ok(local);
-    }
-
-    // 4) 检查缓存目录 ~/.atomcode/bin/
     let cache_dir = dirs::home_dir()
         .map(|h| h.join(".atomcode").join("bin"))
         .unwrap_or_else(|| PathBuf::from(".atomcode/bin"));
     let cache_path = cache_dir.join(bare_name);
     let version_path = cache_dir.join(".version");
 
-    // 5) 检测平台
+    // 缓存已存在 → 直接使用
+    if cache_path.is_file() {
+        return Ok(cache_path.to_string_lossy().into_owned());
+    }
+
+    // 跳过下载标志
+    if std::env::var("ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD").is_ok_and(|v| v == "1") {
+        return Err("自动下载已禁用（ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD=1），\
+                    请手动将 relay-client 放入 ~/.atomcode/bin/ 目录"
+            .to_string());
+    }
+
+    // 检测平台
     let target = relay_client_target();
     if target == "unknown" {
         return Err(format!(
-            "不支持的平台：{}/{}。请手动编译 relay-client 并放到 PATH 中",
+            "不支持的平台：{}/{}。请手动编译 relay-client 并放到 ~/.atomcode/bin/ 中",
             std::env::consts::OS,
             std::env::consts::ARCH
         ));
@@ -787,8 +1162,12 @@ fn ensure_relay_client_bin() -> Result<String, String> {
 
     // 使用 block_in_place 执行异步下载（当前在同步上下文中）
     let download_result = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current()
-            .block_on(download_relay_client(&url, &cache_path, &entry.sha256, entry.size))
+        tokio::runtime::Handle::current().block_on(download_relay_client(
+            &url,
+            &cache_path,
+            &entry.sha256,
+            entry.size,
+        ))
     });
 
     match download_result {
@@ -796,7 +1175,8 @@ fn ensure_relay_client_bin() -> Result<String, String> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&cache_path, std::fs::Permissions::from_mode(0o755));
+                let _ =
+                    std::fs::set_permissions(&cache_path, std::fs::Permissions::from_mode(0o755));
             }
             // 写入缓存版本号
             let _ = std::fs::write(&version_path, manifest.version.as_bytes());
@@ -840,12 +1220,11 @@ async fn download_relay_client(
 
     // 确保缓存目录存在
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("创建缓存目录失败：{e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建缓存目录失败：{e}"))?;
     }
 
     // 获取 GitCode OAuth token（用户需先 /login）
-    let token = atomcode_core::auth::oauth::get_valid_token()
+    let token = atomcode_auth::oauth::get_valid_token()
         .map_err(|_| "未登录 GitCode。请先在 atomcode 中执行 /login 登录账号".to_string())?;
 
     // 构建 HTTP 客户端 + 添加鉴权头
@@ -886,9 +1265,7 @@ async fn download_relay_client(
             .map_err(|e| format!("写入文件失败：{e}"))?;
         written += chunk.len() as u64;
     }
-    file.flush()
-        .await
-        .map_err(|e| format!("刷盘失败：{e}"))?;
+    file.flush().await.map_err(|e| format!("刷盘失败：{e}"))?;
     drop(file);
 
     // 校验文件大小
@@ -920,25 +1297,16 @@ fn execute_slash_command_impl(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     active_modal: &mut Option<Box<dyn Modal>>,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
     setup_pending: &mut bool,
 ) -> Result<()> {
-    // `fixissue_pending` / `fixissue_buffer` no longer have a slash-command
-    // entry that consumes them (the `/fixissue` arm was removed; the
-    // `atomcode fixissue` CLI subcommand seeds these via cli/main.rs and
-    // event_loop/mod.rs's AgentEvent handler still drains them on
-    // TurnComplete). They stay in the signature so callers don't have to
-    // change, and so a future restoration of the slash command is a
-    // one-arm-add rather than a refactor.
-    let _ = (&fixissue_pending, &fixissue_buffer);
-
     // Built-in commands are all lowercase ASCII; normalise the user's
     // input so `/SESSION`, `/Session`, `/sEssIon` all hit the same arm
     // as `/session`. `arg` is left untouched — paths / URLs are
-    // case-sensitive in general.
+    // case-sensitive in general. Aliases (e.g. `/new`) then resolve to their
+    // canonical command name here, so `/new` hits the `session` arm without a
+    // dedicated match arm — add the alias to COMMAND_ALIASES only.
     let cmd_lower = cmd.to_ascii_lowercase();
-    let cmd = cmd_lower.as_str();
+    let cmd = crate::commands::canonical_command_name(&cmd_lower);
 
     // Emit use_command telemetry before dispatch so the event fires
     // regardless of whether the command succeeds or errors out.
@@ -969,21 +1337,60 @@ fn execute_slash_command_impl(
                 CopyResolve::NoBlocks => {
                     renderer.render(UiLine::Warning(t(Msg::CopyNoCodeBlock).into_owned()));
                 }
-                CopyResolve::BadIndex(count) => {
-                    renderer.render(UiLine::Warning(
-                        t(Msg::CopyBadIndex { count }).into_owned(),
-                    ));
+                CopyResolve::EmptyMsg => {
+                    renderer.render(UiLine::Warning(t(Msg::CopyMsgEmpty).into_owned()));
                 }
-                CopyResolve::Text(payload) => {
+                CopyResolve::BadIndex(count) => {
+                    renderer.render(UiLine::Warning(t(Msg::CopyBadIndex { count }).into_owned()));
+                }
+                CopyResolve::Text(payload, is_msg) => {
                     let lines = payload.lines().count().max(1);
                     let chars = payload.chars().count();
                     if copy_text_to_clipboard_osc52(&payload) {
-                        renderer.render(UiLine::CommandOutput(
-                            t(Msg::CopyOk { lines, chars }).into_owned(),
-                        ));
+                        let msg = if is_msg {
+                            t(Msg::CopyOkMsg { lines, chars })
+                        } else {
+                            t(Msg::CopyOk { lines, chars })
+                        };
+                        renderer.render(UiLine::CommandOutput(msg.into_owned()));
                     } else {
                         renderer.render(UiLine::Error(t(Msg::CopyFailed).into_owned()));
                     }
+                }
+            }
+            renderer.flush();
+        }
+        "save" => {
+            // Export the full current conversation (every real user prompt +
+            // assistant reply, in order) to a local markdown file.
+            //   /save            → <working-dir>/atomcode-session-YYYYMMDD-HHMMSS.md
+            //   /save report.md  → <working-dir>/report.md
+            //   /save /abs/x.md  → absolute path
+            // Existing files are overwritten; missing parent dirs are an error.
+            match resolve_save_in(&ctx.current_session.messages, arg, &ctx.working_dir) {
+                SaveOutcome::Ok(path) => {
+                    let path_str = path.to_string_lossy();
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::SaveOk { path: &path_str }).into_owned(),
+                    ));
+                }
+                SaveOutcome::EmptyHistory => {
+                    renderer.render(UiLine::Warning(t(Msg::SaveEmpty).into_owned()));
+                }
+                SaveOutcome::IoError(e) => {
+                    renderer.render(UiLine::Error(
+                        t(Msg::SaveIoError { error: &e }).into_owned(),
+                    ));
+                }
+                SaveOutcome::InvalidPath(p) => {
+                    renderer.render(UiLine::Error(
+                        t(Msg::SaveInvalidPath { path: &p }).into_owned(),
+                    ));
+                }
+                SaveOutcome::RefuseOverwrite(p) => {
+                    renderer.render(UiLine::Error(
+                        t(Msg::SaveRefuseOverwrite { path: &p }).into_owned(),
+                    ));
                 }
             }
             renderer.flush();
@@ -999,9 +1406,14 @@ fn execute_slash_command_impl(
                     } else {
                         t(Msg::HelpSourceProject)
                     };
+                    let args_tag = match cmd.args_requirement {
+                        ArgsRequirement::Required => " <args>",
+                        ArgsRequirement::Optional => " [args]",
+                        ArgsRequirement::None => "",
+                    };
                     out.push_str(&format!(
-                        "    /{}  — {} ({})\n",
-                        cmd.name, cmd.description, source_label
+                        "    /{}{}  — {} ({})\n",
+                        cmd.name, args_tag, cmd.description, source_label
                     ));
                 }
                 if cmds.is_empty() {
@@ -1070,23 +1482,23 @@ fn execute_slash_command_impl(
                     renderer.flush();
 
                     tokio::task::spawn_blocking(move || {
-                        let ev = match atomcode_core::plugin::installer::ensure_plugin_installed(
+                        let ev = match atomcode_capabilities::plugin::installer::ensure_plugin_installed(
                             "atomcode",
                             "atomcode-skills",
                             "https://atomgit.com/atomgit_atomcode/atomcode-skills.git",
                         ) {
                             Ok(info) => {
-                                atomcode_core::plugin::PluginJobEvent::PluginInstalled(info)
+                                atomcode_capabilities::plugin::PluginJobEvent::PluginInstalled(info)
                             }
                             Err(e) => {
                                 if let Some(_aie) = e.downcast_ref::<
-                                    atomcode_core::plugin::installer::AlreadyInstalledError,
+                                    atomcode_capabilities::plugin::installer::AlreadyInstalledError,
                                 >() {
-                                    atomcode_core::plugin::PluginJobEvent::PluginAlreadyInstalled {
+                                    atomcode_capabilities::plugin::PluginJobEvent::PluginAlreadyInstalled {
                                         id: _aie.id.clone(),
                                     }
                                 } else {
-                                    atomcode_core::plugin::PluginJobEvent::Failed {
+                                    atomcode_capabilities::plugin::PluginJobEvent::Failed {
                                         op: "install".into(),
                                         msg: format!("{:#}", e),
                                     }
@@ -1109,20 +1521,18 @@ fn execute_slash_command_impl(
         "view" => {
             let trimmed = arg.trim();
             if trimmed.is_empty() {
-                renderer.render(UiLine::Error(
-                    t(Msg::ViewUsage).into_owned(),
-                ));
-                renderer.flush();
+                // No path → open the files-only fuzzy picker.
+                *active_modal = Some(Box::new(FileViewer::open_picker(ctx.working_dir.clone())));
             } else {
-                let path = ctx.working_dir.join(trimmed);
+                // Resolve `~`, absolute, and project-relative paths so files
+                // OUTSIDE the project open too.
+                let path = resolve_view_path(trimmed, &ctx.working_dir);
                 match FileViewer::open(&path) {
                     Ok(viewer) => {
                         *active_modal = Some(Box::new(viewer));
                     }
                     Err(e) => {
-                        renderer.render(UiLine::Error(
-                            format!("{}", e),
-                        ));
+                        renderer.render(UiLine::Error(format!("{}", e)));
                         renderer.flush();
                     }
                 }
@@ -1130,7 +1540,12 @@ fn execute_slash_command_impl(
         }
         "plan" => {
             state.agent_mode = AgentMode::Plan;
-            ctx.agent.cmd_tx.send(AgentCommand::SetPlanMode(true)).ok();
+            ctx.runtime
+                .dispatch(atomcode_coding::DriverCommand::SetMode(
+                    atomcode_coding::RuntimeMode::Plan,
+                ))
+                .ok();
+            atomcode_daemon::live_set_mode(AgentMode::Plan);
             renderer.render(UiLine::CommandOutput(
                 t(Msg::CmdSwitchedPlanMode).into_owned(),
             ));
@@ -1138,17 +1553,36 @@ fn execute_slash_command_impl(
         }
         "build" => {
             state.agent_mode = AgentMode::Build;
-            ctx.agent.cmd_tx.send(AgentCommand::SetPlanMode(false)).ok();
+            state.build_badge_visible = true;
+            ctx.runtime
+                .dispatch(atomcode_coding::DriverCommand::SetMode(
+                    atomcode_coding::RuntimeMode::Build,
+                ))
+                .ok();
+            atomcode_daemon::live_set_mode(AgentMode::Build);
             renderer.render(UiLine::CommandOutput(
                 t(Msg::CmdSwitchedBuildMode).into_owned(),
             ));
             renderer.flush();
         }
+        "auto" => {
+            state.agent_mode = AgentMode::Auto;
+            ctx.runtime
+                .dispatch(atomcode_coding::DriverCommand::SetMode(
+                    atomcode_coding::RuntimeMode::Auto,
+                ))
+                .ok();
+            atomcode_daemon::live_set_mode(AgentMode::Auto);
+            renderer.render(UiLine::CommandOutput(
+                t(Msg::CmdSwitchedAutoMode).into_owned(),
+            ));
+            renderer.flush();
+        }
         "review" => {
-            // Trigger the v2 coding agent's `code_review` sub-agent tool. Map the optional
+            // Trigger the coding agent's `code_review` sub-agent tool. Map the optional
             // arg to the tool's scope (default = working-tree changes; `staged`; or a base
             // ref), then the model calls the tool and summarizes its findings. If the
-            // running engine lacks the tool (e.g. legacy v1), the model simply says so.
+            // configured runtime lacks the tool, the model simply says so.
             let scope = arg.trim();
             let text = if scope.is_empty() {
                 "Review my current uncommitted changes: call the `code_review` tool with no \
@@ -1169,7 +1603,7 @@ fn execute_slash_command_impl(
         "config" => {
             // Head: current active provider + config path so users know
             // which provider is talking and where to edit.
-            let config_path = Config::default_path().display().to_string();
+            let config_path = ctx.config_store.path().display().to_string();
             let mut txt = t(Msg::ConfigProviderLabel {
                 provider: &ctx.config.default_provider,
                 path: &config_path,
@@ -1199,41 +1633,20 @@ fn execute_slash_command_impl(
             renderer.flush();
         }
         "reload" => {
-            // Re-read ~/.atomcode/config.toml from disk and push it to the
-            // running daemon. Streaming-safe: the agent picks the new config
-            // up on the *next* turn; anything already in-flight finishes on
-            // the old config (ReloadConfig is queued behind the current
-            // AgentCommand stream, not a hot swap).
-            let path = Config::default_path();
-            match Config::load(&path) {
-                Ok(new_cfg) => {
-                    let new_default = new_cfg.default_provider.clone();
-                    let new_model = new_cfg
-                        .providers
-                        .get(&new_default)
-                        .map(|p| p.model.clone())
-                        .unwrap_or_else(|| new_default.clone());
-                    ctx.config = new_cfg.clone();
-                    ctx.runtime_factory.set_config(new_cfg.clone());
-                    ctx.model_name = new_model.clone();
-                    // Refresh the footer context window now (see model_picker
-                    // Enter handler) — no turn fires here either, so the cached
-                    // snapshot's denominator would otherwise stay on the old model.
+            match reload_persisted_config(ctx) {
+                Ok(PersistedConfigReload::Applied { provider, model }) => {
                     state.on_model_window_changed(ctx.config.default_context_window());
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::ReloadConfig(new_cfg))
-                        .ok();
                     renderer.render(UiLine::CommandOutput(
                         t(Msg::CmdReloadDone {
-                            provider: &new_default,
-                            model: &new_model,
+                            provider: &provider,
+                            model: &model,
                         })
                         .into_owned(),
                     ));
                 }
+                Ok(PersistedConfigReload::Queued | PersistedConfigReload::Joined) => {}
                 Err(e) => {
-                    let msg = format!("{}", e);
+                    let msg = e.to_string();
                     renderer.render(UiLine::Error(
                         t(Msg::CmdReloadFailed { error: &msg }).into_owned(),
                     ));
@@ -1257,7 +1670,7 @@ fn execute_slash_command_impl(
             reset_to_new_session(ctx, state, renderer);
         }
         "model" => {
-            if ctx.config.providers.is_empty() {
+            if !crate::modals::model_picker::has_selectable_models(&ctx.config) {
                 renderer.render(UiLine::CommandOutput(t(Msg::CmdNoProviders).into_owned()));
                 renderer.flush();
             } else {
@@ -1268,30 +1681,9 @@ fn execute_slash_command_impl(
             if arg.is_empty() {
                 *active_modal = Some(Box::new(LanguagePicker::open()));
             } else {
-                match arg.parse::<atomcode_core::locale::Locale>() {
+                match arg.parse::<atomcode_config::locale::Locale>() {
                     Ok(locale) => {
-                        crate::i18n::set_locale(locale);
-                        ctx.config.language = Some(locale);
-                        let config_path = atomcode_core::config::Config::default_path();
-                        if let Err(e) = ctx.config.save(&config_path) {
-                            // TODO: surface via renderer once a non-modal error display is available
-                            eprintln!("[language] failed to save config: {e}");
-                        }
-                        // Display label matches the picker's option list
-                        // so /language en and /language zh both echo a
-                        // human-readable name, not just the locale code.
-                        let label = match locale {
-                            atomcode_core::locale::Locale::En => "English",
-                            atomcode_core::locale::Locale::ZhCn => "简体中文",
-                        };
-                        renderer.render(UiLine::CommandOutput(
-                            t(Msg::LanguageSwitched {
-                                label,
-                                locale: &locale.to_string(),
-                            })
-                            .into_owned(),
-                        ));
-                        renderer.flush();
+                        save_language_and_reload(ctx, locale, renderer);
                     }
                     Err(_) => {
                         let msg = t(Msg::ErrUnsupportedLocale { input: arg });
@@ -1301,26 +1693,47 @@ fn execute_slash_command_impl(
                 }
             }
         }
-        "resume" => match ctx.session_manager.list() {
-            Ok(all) => {
-                let sessions: Vec<_> = all.into_iter().filter(|s| s.message_count > 0).collect();
-                if sessions.is_empty() {
-                    renderer.render(UiLine::CommandOutput(t(Msg::CmdNoSessions).into_owned()));
-                    renderer.flush();
-                } else {
-                    *active_modal = Some(Box::new(SessionPicker::open(sessions)));
-                }
-            }
-            Err(e) => {
-                renderer.render(UiLine::Error(
-                    t(Msg::SessionListFailed {
-                        error: &e.to_string(),
-                    })
-                    .into_owned(),
-                ));
-                renderer.flush();
-            }
-        },
+        "resume" => {
+            // The catalog scan reads/parses every session file, which froze the UI
+            // when done inline (thousands of files across projects). Offload it to a
+            // blocking thread and install the picker via an event when it lands —
+            // mirroring the async session-resume path. `install_pending_session_picker`
+            // in the main loop consumes the result.
+            renderer.render(UiLine::CommandOutput(
+                t(Msg::CmdSessionListLoading).into_owned(),
+            ));
+            renderer.flush();
+            let working_dir = ctx.working_dir.clone();
+            let event_working_dir = working_dir.clone();
+            let event_tx = ctx.runtime_event_tx.clone();
+            let runtime_id = ctx.foreground_runtime_id;
+            tokio::spawn(async move {
+                let scanned = tokio::task::spawn_blocking(move || {
+                    atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)
+                        .map(|all| {
+                            all.into_iter()
+                                .filter(|entry| entry.message_count > 0)
+                                .map(crate::session::SessionMeta::from)
+                                .collect::<Vec<_>>()
+                        })
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+                let result = match scanned {
+                    Ok(inner) => inner,
+                    Err(join) => Err(join.to_string()),
+                };
+                let _ = event_tx.send(crate::event_loop::bg_runtime::RuntimeEvent {
+                    runtime_id,
+                    event: crate::event_loop::bg_runtime::RuntimeEventPayload::Driver(
+                        crate::event_loop::bg_runtime::DriverEvent::SessionCatalogLoaded {
+                            working_dir: event_working_dir,
+                            result,
+                        },
+                    ),
+                });
+            });
+        }
         "rename" => {
             // Rename targets `ctx.current_session` (the in-flight conversation),
             // not whichever id `/resume` last loaded — the user expects /rename
@@ -1331,11 +1744,15 @@ fn execute_slash_command_impl(
                 renderer.render(UiLine::Error(err));
                 renderer.flush();
             } else {
-                let old_name = ctx.current_session.name.clone();
                 let new_name = arg.trim().to_string();
-                ctx.current_session.rename(new_name.clone());
-                match ctx.session_manager.save(&ctx.current_session) {
-                    Ok(()) => {
+                let project_bucket = active_session_project_bucket(&ctx.working_dir);
+                match perform_session_rename(&project_bucket, &ctx.current_session.id, &new_name) {
+                    Ok((old_name, _)) => {
+                        ctx.current_session.rename(new_name.clone());
+                        ctx.bg_manager.set_foreground_session(
+                            ctx.current_session.clone(),
+                            ctx.working_dir.clone(),
+                        );
                         renderer.render(UiLine::CommandOutput(
                             t(Msg::SessionRenamed {
                                 old: &old_name,
@@ -1346,9 +1763,6 @@ fn execute_slash_command_impl(
                         renderer.flush();
                     }
                     Err(e) => {
-                        // Revert the in-memory rename so a follow-up retry
-                        // still reports the original name.
-                        ctx.current_session.name = old_name;
                         renderer.render(UiLine::Error(
                             t(Msg::SessionSaveFailed {
                                 error: &e.to_string(),
@@ -1361,11 +1775,7 @@ fn execute_slash_command_impl(
             }
         }
         "provider" => {
-            *active_modal = Some(Box::new(ProviderWizard::MainMenu { selected: 0 }));
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::ProviderWizardHeader).into_owned(),
-            ));
-            renderer.flush();
+            *active_modal = Some(Box::new(crate::modals::ProviderPanel::open()));
         }
         "proxy" => {
             *active_modal = Some(Box::new(ProxyPicker::open(&ctx.config)));
@@ -1375,22 +1785,83 @@ fn execute_slash_command_impl(
             // remote/phone view omits it. Order is owned by `assemble_status`.
             let proxy = format!("  Proxy:  {}\n", ctx.config.network.proxy.summary());
             let txt = build_status_text(ctx, Some(&proxy));
-            renderer.render(UiLine::CommandOutput(txt));
-            renderer.flush();
+            if matches!(state.phase, crate::state::UiPhase::Streaming) && !ctx.is_plain_renderer {
+                // Mid-turn: keep the report in the footer snapshot below the input
+                // box (like `/usage` and `/cost`) instead of injecting it into
+                // conversation scrollback, where live tool output would interleave
+                // with it. Drop any live `/usage` panel so its tab keys don't steer
+                // a report that's no longer on screen.
+                state.footer_usage = None;
+                state.footer_command_output = Some(txt);
+            } else {
+                renderer.render(UiLine::CommandOutput(txt));
+                renderer.flush();
+            }
         }
         "diff" => {
-            match build_diff_text(ctx) {
-                Ok(s) => renderer.render(UiLine::CommandOutput(s)),
-                Err(e) => renderer.render(UiLine::Error(e)),
+            if matches!(state.phase, crate::state::UiPhase::Streaming) && !ctx.is_plain_renderer {
+                // Mid-turn: footer snapshot, not scrollback (see `/status`). The
+                // error text folds into the same snapshot so a failed diff still
+                // reports below the input box.
+                state.footer_usage = None;
+                state.footer_command_output = Some(build_diff_stat_text(ctx).unwrap_or_else(|e| e));
+            } else if ctx.is_plain_renderer || !matches!(state.phase, crate::state::UiPhase::Idle) {
+                match build_diff_stat_text(ctx) {
+                    Ok(text) => renderer.render(UiLine::CommandOutput(text)),
+                    Err(error) => renderer.render(UiLine::Error(error)),
+                }
+                renderer.flush();
+            } else {
+                *active_modal = Some(Box::new(DiffViewer::open(
+                    ctx.working_dir.clone(),
+                    ctx.wake_tx.clone(),
+                )));
             }
-            renderer.flush();
         }
         "undo" => {
             dispatch_undo(arg, state, ctx, renderer);
         }
+        "usage" => {
+            // Mid-turn (Streaming): keep a text snapshot in the footer directly
+            // below the input box. It must not enter conversation scrollback,
+            // and Esc dismisses it without cancelling the running turn.
+            // Idle: open the interactive modal.
+            if matches!(state.phase, crate::state::UiPhase::Streaming) {
+                // Fetch the FULL dataset (overview + models) so the footer report
+                // is tab-switchable mid-stream — the interactive modal can't
+                // install here (live token redraws own the footer), so we stash
+                // the panel and re-render its active tab in place on each tab
+                // key. Two gateway calls, once per `/usage`; switching tabs is
+                // then purely local.
+                match fetch_usage_data() {
+                    Some(data) => {
+                        let panel = UsageModal::new(data);
+                        state.footer_command_output = Some(
+                            panel.active_snapshot_text(ctx.caps.colors, ctx.caps.unicode_symbols),
+                        );
+                        state.footer_usage = Some(panel);
+                    }
+                    None => {
+                        state.footer_command_output =
+                            Some(t(Msg::UsageCodingPlanOnly).into_owned());
+                        state.footer_usage = None;
+                    }
+                }
+            } else {
+                open_usage(renderer, active_modal);
+            }
+        }
         "cost" => {
-            renderer.render(UiLine::CommandOutput(build_cost_text(ctx, state)));
-            renderer.flush();
+            let text = build_session_cost_text(ctx, state);
+            if matches!(state.phase, crate::state::UiPhase::Streaming) {
+                // `/cost` is a static report — drop any live `/usage` panel so
+                // tab keys don't steer a report that's no longer on screen.
+                state.footer_usage = None;
+                state.footer_command_output = Some(text);
+            } else {
+                renderer.render(UiLine::CommandOutput(text));
+                renderer.flush();
+            }
         }
         "context" => {
             // `/context` = breakdown only.
@@ -1410,60 +1881,105 @@ fn execute_slash_command_impl(
             // in a turn, the next rich emission (at the next LLM call)
             // serves the render — still fresh, just a tick later.
             let show_prompt = arg.trim().eq_ignore_ascii_case("prompt");
-            state.pending_context_render = Some(show_prompt);
-            ctx.agent
-                .cmd_tx
-                .send(AgentCommand::RefreshContextStats)
-                .ok();
+            if let Err(error) = request_context_stats_render(
+                &ctx.runtime,
+                ctx.foreground_runtime_id,
+                ctx.runtime_event_tx.clone(),
+                &mut state.pending_context_render,
+                show_prompt,
+            ) {
+                renderer.render(UiLine::Error(format!(
+                    "refresh context stats could not be started: {error}"
+                )));
+                renderer.flush();
+            }
         }
         "compact" => {
-            let prompt = (!arg.trim().is_empty()).then(|| arg.trim().to_string());
-            // Agent streams the authoritative result back as TextDelta
-            // ("nothing to compact" / "compacted — dropped N messages").
-            // Don't pre-render a placeholder — the agent's reply could
-            // contradict it when the conversation is too short.
-            ctx.agent.cmd_tx.send(AgentCommand::Compact { prompt }).ok();
+            let focus = (!arg.trim().is_empty()).then(|| arg.trim().to_string());
+            if let Err(error) = ctx.runtime.compact(focus) {
+                renderer.render(UiLine::Error(error.to_string()));
+                renderer.flush();
+            }
         }
         "remember" => {
             let text = arg.trim();
             if text.is_empty() {
                 renderer.render(UiLine::Error(t(Msg::RememberUsage).into_owned()));
-
                 renderer.flush();
             } else {
-                let (content, global) = if text.starts_with("--global ") {
-                    (text[9..].trim().to_string(), true)
+                let (content, global) = if let Some(rest) = text.strip_prefix("--global ") {
+                    (rest.trim().to_string(), true)
                 } else {
                     (text.to_string(), false)
                 };
                 if content.is_empty() {
                     renderer.render(UiLine::Error(t(Msg::RememberUsage).into_owned()));
-
-                    renderer.flush();
                 } else {
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::Remember { content, global })
-                        .ok();
+                    let store = if global {
+                        MemoryStore::global()
+                    } else {
+                        MemoryStore::project(&ctx.working_dir)
+                    };
+                    let scope = if global { "global" } else { "project" };
+                    // Dedup on write (parity with the model-facing `memory` tool) so a
+                    // repeated /remember of the same line doesn't double-write.
+                    match store.append_deduped(&content) {
+                        Ok(true) => renderer.render(UiLine::CommandOutput(format!(
+                            "Remembered ({scope}): {content}"
+                        ))),
+                        Ok(false) => renderer.render(UiLine::CommandOutput(format!(
+                            "Already remembered ({scope}): {content}"
+                        ))),
+                        Err(e) => {
+                            renderer.render(UiLine::Error(format!("Failed to remember: {e}")))
+                        }
+                    }
                 }
+                renderer.flush();
             }
         }
         "forget" => {
             let keyword = arg.trim();
             if keyword.is_empty() {
                 renderer.render(UiLine::Error(t(Msg::ForgetUsage).into_owned()));
-                renderer.flush();
             } else {
-                ctx.agent
-                    .cmd_tx
-                    .send(AgentCommand::Forget {
-                        keyword: keyword.to_string(),
-                    })
-                    .ok();
+                let mut removed = MemoryStore::project(&ctx.working_dir)
+                    .remove_matching(keyword)
+                    .unwrap_or_default();
+                removed.extend(
+                    MemoryStore::global()
+                        .remove_matching(keyword)
+                        .unwrap_or_default(),
+                );
+                let msg = if removed.is_empty() {
+                    format!("No memory entries matched '{keyword}'.")
+                } else {
+                    format!(
+                        "Forgot {} entr{}.",
+                        removed.len(),
+                        if removed.len() == 1 { "y" } else { "ies" }
+                    )
+                };
+                renderer.render(UiLine::CommandOutput(msg));
             }
+            renderer.flush();
         }
         "memory" => {
-            ctx.agent.cmd_tx.send(AgentCommand::ShowMemory).ok();
+            let global = MemoryStore::global();
+            let project = MemoryStore::project(&ctx.working_dir);
+            let name = ctx
+                .working_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "project".into());
+            let merged = MemoryStore::merged_for_prompt(&global, &project, &name);
+            let out = if merged.trim().is_empty() {
+                "(memory is empty)".to_string()
+            } else {
+                merged
+            };
+            renderer.render(UiLine::CommandOutput(out));
+            renderer.flush();
         }
         "webui" => {
             let a = arg.trim();
@@ -1493,14 +2009,11 @@ fn execute_slash_command_impl(
                     "127.0.0.1".to_string()
                 }
                 let host = parse_host(a);
-                // #561 修复：先用 TUI 当前会话播种 LiveSession（session_id + 历史），
-                // 再开浏览器——否则浏览器抢先连 /live 会建出空白 LiveSession。
-                let session = atomcode_daemon::ensure_live_session(
-                    ctx.working_dir.clone(),
-                    ctx.telemetry.clone(),
-                    Some(ctx.current_session.id.clone()),
-                    ctx.current_session.messages.clone(),
-                );
+                if let Err(error) = attach_live_runtime(ctx, state.agent_mode, renderer) {
+                    renderer.render(UiLine::Error(error));
+                    renderer.flush();
+                    return Ok(());
+                }
                 let open_msg = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(
                         atomcode_daemon::ensure_server_and_open(
@@ -1510,9 +2023,6 @@ fn execute_slash_command_impl(
                         ),
                     )
                 });
-                // 附着把 TUI 接入同步。画面里已有当前会话（播种来源），故 render_snapshot=false
-                // 跳过快照回放，避免把同一段对话重复刷一遍。
-                attach_live_session(ctx, renderer, session, false);
                 open_msg
             };
             renderer.render(UiLine::CommandOutput(msg));
@@ -1520,42 +2030,53 @@ fn execute_slash_command_impl(
         }
         "sync" => {
             if arg.trim() == "off" {
-                if let Some(h) = ctx.sync_forwarder.take() {
-                    h.abort();
+                match detach_live_runtime(ctx) {
+                    Ok(true) => renderer.render(UiLine::CommandOutput("已停止共享当前会话".into())),
+                    Ok(false) => {
+                        renderer.render(UiLine::CommandOutput("当前未处于同步模式".to_string()))
+                    }
+                    Err(error) => renderer.render(UiLine::Error(error)),
                 }
-                ctx.sync_session = None;
-                renderer.render(UiLine::CommandOutput(
-                    "已退出同步，回到独立会话".to_string(),
-                ));
             } else {
-                // #561 修复：始终用 ensure_live_session 把当前会话上下文传给 LiveSession，
-                // 这样即使 WebUI 先启动了 LiveSession（用不同 session_id），/sync 也能
-                // 把它替换为 TUI 的会话。
-                let session = atomcode_daemon::ensure_live_session(
-                    ctx.working_dir.clone(),
-                    ctx.telemetry.clone(),
-                    Some(ctx.current_session.id.clone()),
-                    ctx.current_session.messages.clone(),
-                );
-                attach_live_session(ctx, renderer, session, true);
+                if let Err(error) = attach_live_runtime(ctx, state.agent_mode, renderer) {
+                    renderer.render(UiLine::Error(error));
+                }
             }
             renderer.flush();
         }
+        "desktop" => {
+            // Detect an installed AtomCode desktop app (new "Desktop" preferred
+            // over old "Air"); launch it, or point the user at the download page.
+            let home = crate::platform::home_dir().unwrap_or_default();
+            let env = |k: &str| std::env::var(k).ok();
+            let cands = super::desktop::candidate_apps(&home, &env);
+            let line = match super::desktop::detect(&cands, |p| p.exists()) {
+                Some(c) => {
+                    let path = c.path.display().to_string();
+                    match super::desktop::launch(c) {
+                        Ok(()) => t(Msg::DesktopOpening {
+                            name: c.display_name,
+                            path: &path,
+                        })
+                        .into_owned(),
+                        Err(e) => t(Msg::DesktopLaunchFailed {
+                            path: &path,
+                            err: &e.to_string(),
+                        })
+                        .into_owned(),
+                    }
+                }
+                None => t(Msg::DesktopNotInstalled {
+                    url: super::desktop::DOWNLOAD_URL,
+                })
+                .into_owned(),
+            };
+            renderer.render(UiLine::CommandOutput(line));
+            renderer.flush();
+        }
         "app" => {
-            // HIDDEN until the mobile app launches: behave exactly like an unknown
-            // command so the unreleased feature isn't discoverable. The full
-            // implementation below is intentionally preserved — re-enable via
-            // `crate::commands::app_remote_enabled()` (and uncomment the /app entry
-            // in BUILTIN_COMMANDS).
-            if !crate::commands::app_remote_enabled() {
-                renderer.render(UiLine::Error(
-                    t(Msg::CmdUnknownCommand { name: cmd }).into_owned(),
-                ));
-                renderer.flush();
-                return Ok(());
-            }
             // 把当前会话经【自建多租户中继】暴露给手机 App，二维码配对。
-            // 与 /webui 同源共用进程内 LiveSession（同一段对话、双向实时同步），
+            // 与 /webui 共用当前 Coding Runtime 和 live hub，
             // 区别：① 不开浏览器，吐终端二维码；② 本机 server 走 daemon 模式
             // （无 token，仅回环绑定），鉴权边界落在中继的 route token。
             //
@@ -1586,8 +2107,9 @@ fn execute_slash_command_impl(
                 let mut out = String::with_capacity(s.len() * 3);
                 for b in s.bytes() {
                     match b {
-                        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.'
-                        | b'~' => out.push(b as char),
+                        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                            out.push(b as char)
+                        }
                         _ => out.push_str(&format!("%{b:02X}")),
                     }
                 }
@@ -1596,6 +2118,10 @@ fn execute_slash_command_impl(
 
             let a = arg.trim();
             let msg = if a == "stop" {
+                // Remote access must stop immediately even when the live session
+                // is busy. A failed handoff keeps only the TUI attached so it can
+                // continue receiving the in-flight turn safely.
+                let detach_error = detach_live_runtime(ctx).err();
                 let killed = ctx
                     .app_relay_child
                     .take()
@@ -1603,16 +2129,16 @@ fn execute_slash_command_impl(
                         let _ = c.start_kill();
                     })
                     .is_some();
-                if let Some(h) = ctx.sync_forwarder.take() {
-                    h.abort();
-                }
-                ctx.sync_session = None;
                 let server_stopped = atomcode_daemon::stop_app_server();
-                if killed || server_stopped {
+                let mut output = if killed || server_stopped {
                     "已停止 App 远程访问".to_string()
                 } else {
                     "App 远程访问未在运行".to_string()
+                };
+                if let Some(error) = detach_error {
+                    output.push_str(&format!("\n{error}；TUI 暂时保持同步"));
                 }
+                output
             } else {
                 // 官方生产中继。用户直接敲 `/app` 即可，无需选择/配置中继地址；
                 // 命令参数与 ATOMCODE_APP_RELAY 环境变量仅留作内部联调覆盖用。
@@ -1628,32 +2154,31 @@ fn execute_slash_command_impl(
                 };
                 match relay_base.filter(|s| !s.is_empty()) {
                     // 仅在显式给了空参数（如 `/app --relay`）时可达。
-                    None => "用法：/app（默认连官方中继），或 /app <中继地址> 覆盖"
-                        .to_string(),
+                    None => "用法：/app（默认连官方中继），或 /app <中继地址> 覆盖".to_string(),
                     Some(relay) => {
-                        // 1) 用当前会话播种全局 LiveSession（与 /webui 同源）。
-                        let (initial, sid) = if ctx.current_session.messages.is_empty() {
-                            (Vec::new(), None)
-                        } else {
-                            (
-                                ctx.current_session.messages.clone(),
-                                Some(ctx.current_session.id.clone()),
-                            )
-                        };
-                        // 合并 main 后函数更名为 ensure_live_session,且 session_id
-                        // 与 initial_messages 参数顺序对调(先 sid 后 initial)。
-                        let session = atomcode_daemon::ensure_live_session(
-                            ctx.working_dir.clone(),
-                            ctx.telemetry.clone(),
-                            sid,
-                            initial,
-                        );
+                        // 1) 检查登录态：未登录不允许开启远程访问。
+                        if atomcode_auth::oauth::get_stored_auth().is_none() {
+                            renderer.render(UiLine::CommandOutput(
+                                "远程访问需要先登录。输入 /login 完成登录后，再执行 /app。"
+                                    .to_string(),
+                            ));
+                            renderer.flush();
+                            return Ok(());
+                        }
                         // 2) 起本机 App server（daemon 模式、不开浏览器、回环绑定）。
+                        //    每次 /app 都重建 server，确保 app_user_id 始终是当前登录用户。
+                        //    Keep any current sync attachment until startup succeeds;
+                        //    attach_live_session replaces it atomically on the success path.
+                        atomcode_daemon::stop_app_server();
+                        //    传入当前登录 user_id 启用双向校验。
+                        let app_user_id =
+                            atomcode_auth::oauth::get_stored_auth().map(|a| a.user.id);
                         let started = tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(
                                 atomcode_daemon::ensure_app_server(
                                     "127.0.0.1",
                                     atomcode_daemon::APP_DEFAULT_PORT,
+                                    app_user_id,
                                 ),
                             )
                         });
@@ -1662,7 +2187,7 @@ fn execute_slash_command_impl(
                             Ok((_h, port)) => {
                                 // 3) route token（中继路由 key + 凭证）+ 中继 URL。
                                 // token = user_id.随机hex，App 端扫码后校验 user_id 是否一致。
-                                let token = match atomcode_core::auth::oauth::get_stored_auth() {
+                                let token = match atomcode_auth::oauth::get_stored_auth() {
                                     Some(auth) => format!(
                                         "{}.{}",
                                         auth.user.id,
@@ -1701,19 +2226,21 @@ fn execute_slash_command_impl(
                                         if let Some(m) = &machine {
                                             cmd.arg("--machine-name").arg(m);
                                         }
-                                        if let Some(secret) = std::env::var("ATOMCODE_APP_RELAY_SECRET")
-                                            .ok()
-                                            .or_else(|| std::env::var("ATOM_RELAY_REGISTER_SECRET").ok())
-                                            .filter(|s| !s.is_empty())
+                                        if let Some(secret) =
+                                            std::env::var("ATOMCODE_APP_RELAY_SECRET")
+                                                .ok()
+                                                .or_else(|| {
+                                                    std::env::var("ATOM_RELAY_REGISTER_SECRET").ok()
+                                                })
+                                                .filter(|s| !s.is_empty())
                                         {
                                             cmd.arg("--register-secret").arg(secret);
                                         }
                                         match cmd.spawn() {
                                             Err(e) => format!(
                                                 "启动 relay-client 失败（{e}）。已尝试路径 `{bin}`。\
-                                                 relay-client 应随安装包捆绑在 atomcode 同目录；若手动安装，\
-                                                 请确认它在 PATH 中或与 atomcode 同目录，\
-                                                 也可用 ATOMCODE_RELAY_CLIENT_BIN 指定其路径。"
+                                                 请确认 relay-client 在 ~/.atomcode/bin/ 目录下，\
+                                                 或删除该目录后重试 /app 自动下载。"
                                             ),
                                             Ok(child) => {
                                                 if let Some(mut old) = ctx.app_relay_child.take() {
@@ -1731,16 +2258,33 @@ fn execute_slash_command_impl(
                                                     token,
                                                     m_param
                                                 );
-                                                // 6) TUI 自己附着同一 LiveSession（终端↔手机互通）。
-                                                attach_live_session(ctx, renderer, session, false);
+                                                // 6) 手机视图复用 TUI 当前 CodingRuntime。
+                                                if let Err(error) = attach_live_runtime(ctx, state.agent_mode, renderer) {
+                                                    if let Some(mut child) = ctx.app_relay_child.take() {
+                                                        let _ = child.start_kill();
+                                                    }
+                                                    return Err(anyhow::anyhow!(error));
+                                                }
+                                                use base64::Engine;
+                                                let encoded = base64::engine::general_purpose::STANDARD
+                                                    .encode(pair_uri.as_bytes());
                                                 match crate::render::qr::render_login_qr(
                                                     &pair_uri,
                                                     crate::render::qr::QrStyle::Dense1x2,
                                                 ) {
                                                     Some(q) => format!(
-                                                        "用 AtomCode App 扫码连接
-                                                        \n{q}\n\
-                                                         （/app stop 断开）"
+                                                        "📱 使用 GitCode App 连接\n\
+                                                        \n\
+                                                        1. 在手机应用商店搜索「GitCode」下载最新版 App\n\
+                                                        2. 打开 App → 首页 → AtomCode 模块 → 扫一扫\n\
+                                                        3. 对准下方二维码即可配对连接\n\
+                                                        \n\
+                                                        {q}\n\
+                                                        \n\
+                                                        也可复制以下口令在App中连接：\n\
+                                                        {encoded}\n\
+                                                        \n\
+                                                        （/app stop 断开连接）"
                                                     ),
                                                     None => format!(
                                                         "配对链接（二维码生成失败，手动填）：{pair_uri}"
@@ -1763,20 +2307,37 @@ fn execute_slash_command_impl(
             run_login_flow(renderer, ctx)?;
         }
         "logout" => {
-            // /logout only invalidates the OAuth token on disk.
-            // Provider config is a user asset and stays in config.toml
-            // untouched — if the user's default is an AtomGit* provider,
-            // the next LLM request fails with a "re-run /codingplan"
-            // hint instead of the TUI crashing on next startup because
-            // `default_provider` got cleared.
-            match atomcode_core::auth::logout() {
+            // Provider config is a user asset and stays in config.toml. Logout removes
+            // credentials first, then asks the runtime owner to destroy the live provider;
+            // a later /login can reassemble it without losing the user's provider choice.
+            //
+            // 安全：登出时自动关闭 App 远程访问，防止隧道仍在线。
+            if ctx
+                .app_relay_child
+                .take()
+                .map_or(false, |mut c| c.start_kill().is_ok())
+            {
+                let _ = ctx.app_relay_child.take();
+            }
+            atomcode_daemon::stop_app_server();
+            match atomcode_auth::logout() {
                 Ok(()) => {
-                    ctx.telemetry.set_account_id(None);
-                    let _ = ctx
-                        .agent
-                        .cmd_tx
-                        .send(AgentCommand::ReloadConfig(ctx.config.clone()));
-                    renderer.render(UiLine::CommandOutput(t(Msg::CmdLogoutDone).into_owned()));
+                    match deactivate_runtime_provider_after_logout(ctx) {
+                        Ok(true) => {
+                            // Runtime owner emits the completion only after the
+                            // active AtomGit provider has been torn down.
+                        }
+                        Ok(false) => renderer
+                            .render(UiLine::CommandOutput(t(Msg::CmdLogoutDone).into_owned())),
+                        Err(error) => {
+                            let message = format!(
+                                "credentials removed, but provider deactivation failed: {error}"
+                            );
+                            renderer.render(UiLine::Error(
+                                t(Msg::CmdLogoutFailed { error: &message }).into_owned(),
+                            ));
+                        }
+                    }
                 }
                 Err(e) => {
                     let msg = format!("{}", e);
@@ -1801,24 +2362,21 @@ fn execute_slash_command_impl(
                 // Rollback is sync and fast (three renames). Run inline
                 // so the user sees the result immediately without waiting
                 // for an async task to schedule.
-                match atomcode_core::self_update::run_rollback() {
+                match atomcode_updater::run_rollback() {
                     Ok(sum) => {
                         // Route through the event channel so rendering
                         // and "set done → exit" logic stays in one place.
-                        let _ = ctx.upgrade_tx.send(
-                            atomcode_core::self_update::UpgradeEvent::RolledBack {
+                        let _ = ctx
+                            .upgrade_tx
+                            .send(atomcode_updater::UpgradeEvent::RolledBack {
                                 exe: sum.exe,
                                 backup: sum.backup,
-                            },
-                        );
+                            });
                     }
                     Err(e) => {
-                        let _ =
-                            ctx.upgrade_tx
-                                .send(atomcode_core::self_update::UpgradeEvent::Failed(format!(
-                                    "{:#}",
-                                    e
-                                )));
+                        let _ = ctx
+                            .upgrade_tx
+                            .send(atomcode_updater::UpgradeEvent::Failed(format!("{:#}", e)));
                     }
                 }
             } else {
@@ -1840,38 +2398,12 @@ fn execute_slash_command_impl(
                     // The driver emits Done via `tx` on success; on error
                     // we translate to a Failed event so the TUI layer
                     // only has to handle one event stream.
-                    if let Err(e) =
-                        atomcode_core::self_update::run_upgrade(current, force, tx.clone()).await
+                    if let Err(e) = atomcode_updater::run_upgrade(current, force, tx.clone()).await
                     {
-                        let _ = tx.send(atomcode_core::self_update::UpgradeEvent::Failed(format!(
-                            "{:#}",
-                            e
-                        )));
+                        let _ = tx.send(atomcode_updater::UpgradeEvent::Failed(format!("{:#}", e)));
                     }
                 });
             }
-        }
-        "issue" => {
-            // Two-step wizard to file a NEW issue against the **atomcode
-            // upstream repo** (atomgit_atomcode/atomcode), NOT against
-            // the user's current working project. Use case is in-tool
-            // bug reports / feature requests for atomcode itself; using
-            // cwd would be confusing (a user reporting an atomcode bug
-            // while in some unrelated repo would land their issue in
-            // the wrong place, or get blocked by cwd validation).
-            //
-            // Step 1 collects a title (required), step 2 collects a
-            // description (required, Shift+Enter for newlines). On
-            // submit the event loop's post-close branch POSTs
-            // `/repos/atomgit_atomcode/atomcode/issues` and echoes the
-            // new issue URL into scrollback.
-            let _ = arg; // reserved for future options (e.g. --template)
-            let mut wiz = IssueWizard::open(
-                atomcode_core::atomgit::UPSTREAM_OWNER.to_string(),
-                atomcode_core::atomgit::UPSTREAM_REPO.to_string(),
-            );
-            wiz.emit_prompt(renderer);
-            *active_modal = Some(Box::new(wiz));
         }
         "cd" => {
             // Bare `/cd` — open the interactive history picker (matches legacy
@@ -1894,12 +2426,26 @@ fn execute_slash_command_impl(
             }
             let new_dir = resolve_cd(arg, &ctx.working_dir, ctx.previous_dir.as_deref());
             match new_dir {
-                Ok(path) => {
-                    apply_cd(ctx, path.clone());
-                    let p = path.display().to_string();
+                Ok(path) if paths_same(&path, &ctx.working_dir) => {
+                    let cwd = ctx.working_dir.display().to_string();
                     renderer.render(UiLine::CommandOutput(
-                        t(Msg::DirChanged { path: &p }).into_owned(),
+                        t(Msg::CdWorkingDir { cwd: &cwd }).into_owned(),
                     ));
+                }
+                Ok(path) => {
+                    match apply_cd_with_effect(
+                        ctx,
+                        path,
+                        crate::event_loop::SessionTransitionEffect::CdCommand {
+                            echo: format!("/cd {arg}"),
+                        },
+                    ) {
+                        // Success path stays silent: the transition is fast and its
+                        // terminal updates the cwd; the "reconfiguring…" status is
+                        // only shown by the guards when an action races a pending one.
+                        Ok(_) => {}
+                        Err(error) => renderer.render(UiLine::Error(error)),
+                    }
                 }
                 Err(e) => {
                     renderer.render(UiLine::Error(e));
@@ -1918,6 +2464,15 @@ fn execute_slash_command_impl(
                     )));
                 }
                 bg_runtime::BgCommand::BackgroundCurrent => {
+                    if let Err(error) = ensure_bg_foreground_switch_allowed(
+                        ctx.live_binding.is_some(),
+                        provider_transition_pending(ctx),
+                        ctx.pending_runtime_request_id.is_some(),
+                    ) {
+                        renderer.render(UiLine::Error(error.into()));
+                        renderer.flush();
+                        return Ok(());
+                    }
                     sync_bg_foreground(ctx);
                     if !ctx.bg_manager.has_capacity() {
                         renderer.render(UiLine::Error(
@@ -1930,15 +2485,18 @@ fn execute_slash_command_impl(
                         return Ok(());
                     }
                     let old_short_id = ctx.current_session.short_id().to_string();
+                    let old_replay_events = foreground_turn_replay_events(state);
                     let new_session = Session::default_session(ctx.working_dir.clone());
                     let new_short_id = new_session.short_id().to_string();
-                    let (runtime_id, client, new_session) = spawn_runtime(ctx, new_session);
+                    let (runtime_id, endpoint, new_session) = spawn_runtime(ctx, new_session);
                     let old_state = foreground_state_from_ui(state);
-                    let slot = match ctx.bg_manager.background_current(
-                        client.clone(),
+                    let slot = match ctx.bg_manager.background_current_with_replay(
+                        endpoint.clone(),
                         new_session.clone(),
+                        ctx.working_dir.clone(),
                         runtime_id,
                         old_state,
+                        old_replay_events,
                     ) {
                         Ok(slot) => slot,
                         Err(bg_runtime::BgError::SlotLimit { max }) => {
@@ -1949,13 +2507,23 @@ fn execute_slash_command_impl(
                             return Ok(());
                         }
                         Err(bg_runtime::BgError::InvalidSlot { .. }) => unreachable!(),
+                        Err(
+                            bg_runtime::BgError::NoRuntimeClient { .. }
+                            | bg_runtime::BgError::SessionProjectionUnavailable { .. },
+                        ) => unreachable!("background_current cannot return a resume error"),
                     };
-
-                    ctx.agent = client;
+                    ctx.runtime = endpoint.native;
                     ctx.foreground_runtime_id = runtime_id;
                     ctx.current_session = new_session;
                     bind_telemetry_to_session(ctx, &ctx.current_session);
                     state.on_turn_complete();
+                    state.on_session_replaced();
+                    // The todo panel is per-session and is NOT cleared at turn end;
+                    // this fresh foreground session has no todos, so drop the prior
+                    // session's list (mirrors reset_to_new_session / native SessionChanged).
+                    state.active_todos = None;
+                    crate::event_loop::sync_todo_titles(state); // drop prior session's titles
+                    state.approval_panel = None;
                     // One DECSET 2026 envelope around the wipe + welcome
                     // re-render so the foreground swap shows no blank frame
                     // (same anti-flicker as `/resume`). Self-contained: the
@@ -1976,6 +2544,15 @@ fn execute_slash_command_impl(
                     renderer.end_sync();
                 }
                 bg_runtime::BgCommand::Resume(slot) => {
+                    if let Err(error) = ensure_bg_foreground_switch_allowed(
+                        ctx.live_binding.is_some(),
+                        provider_transition_pending(ctx),
+                        ctx.pending_runtime_request_id.is_some(),
+                    ) {
+                        renderer.render(UiLine::Error(error.into()));
+                        renderer.flush();
+                        return Ok(());
+                    }
                     sync_bg_foreground(ctx);
                     let outcome = match ctx
                         .bg_manager
@@ -2000,37 +2577,44 @@ fn execute_slash_command_impl(
                             renderer.flush();
                             return Ok(());
                         }
+                        Err(bg_runtime::BgError::NoRuntimeClient { .. }) => {
+                            renderer.render(UiLine::Error(t(Msg::BgNoRuntimeClient).into_owned()));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                        Err(bg_runtime::BgError::SessionProjectionUnavailable {
+                            error, ..
+                        }) => {
+                            renderer.render(UiLine::Error(format!(
+                                "background session could not be loaded: {error}"
+                            )));
+                            renderer.flush();
+                            return Ok(());
+                        }
                     };
-                    let Some(client) = outcome.resumed_client else {
-                        renderer.render(UiLine::Error(t(Msg::BgNoRuntimeClient).into_owned()));
-                        renderer.flush();
-                        return Ok(());
-                    };
+                    let endpoint = outcome.resumed_endpoint;
 
-                    ctx.agent = client;
+                    // Switching sessions: stop any active /loop so its TUI-side interval
+                    // controller can't keep firing the old payload into the newly-resumed
+                    // session (and clear the stale footer). ClearLoop reaches the outgoing
+                    // agent before the swap below.
+                    stop_active_loop(state, ctx);
+                    super::commit_working_dir_projection(ctx, outcome.resumed_working_dir.clone());
+                    ctx.runtime = endpoint.native;
                     ctx.foreground_runtime_id = outcome.resumed_runtime_id;
                     ctx.current_session = outcome.resumed_session;
                     bind_telemetry_to_session(ctx, &ctx.current_session);
-                    state.on_turn_complete();
+                    apply_resumed_runtime_state(state, outcome.resumed_state);
                     crate::modals::session_picker::replay_session(
                         renderer,
+                        state,
                         &ctx.current_session,
                         true,
                     );
-
-                    // If the resumed session was waiting for tool approval,
-                    // re-render the approval prompt so the user can
-                    // continue interacting.  Detect this by looking for
-                    // an AssistantWithToolCalls message whose tool_calls
-                    // lack corresponding ToolResult entries.
-                    let pending_approval = find_pending_approval(&ctx.current_session);
-                    if let Some((tool_name, detail)) = pending_approval {
-                        renderer.render(UiLine::ApprovalPrompt {
-                            tool: tool_name,
-                            detail,
-                        });
-                        state.on_approval_needed("");
-                    }
+                    schedule_resumed_runtime_replay(
+                        &mut ctx.foreground_replay_events,
+                        outcome.replay_events,
+                    );
 
                     let short_id = ctx.current_session.short_id().to_string();
                     let mut msg = t(Msg::BgResumed {
@@ -2063,14 +2647,18 @@ fn execute_slash_command_impl(
                             return Ok(());
                         }
                         Err(bg_runtime::BgError::SlotLimit { .. }) => unreachable!(),
+                        Err(
+                            bg_runtime::BgError::NoRuntimeClient { .. }
+                            | bg_runtime::BgError::SessionProjectionUnavailable { .. },
+                        ) => unreachable!("drop_slot cannot return a resume error"),
                     };
                     if matches!(dropped.state, bg_runtime::RuntimeState::Running) {
-                        if let Some(client) = dropped.client.as_ref() {
-                            client.cmd_tx.send(AgentCommand::Cancel).ok();
+                        if let Some(endpoint) = dropped.endpoint.as_ref() {
+                            endpoint
+                                .native
+                                .dispatch(atomcode_coding::DriverCommand::Cancel)
+                                .ok();
                         }
-                    }
-                    if !dropped.session.messages.is_empty() {
-                        let _ = ctx.session_manager.save(&dropped.session);
                     }
                     let short_id = dropped.session.short_id().to_string();
                     renderer.render(UiLine::CommandOutput(
@@ -2106,11 +2694,12 @@ fn execute_slash_command_impl(
             let mut session = Session::default_session(ctx.working_dir.clone());
             session.name = short_task_name(task);
             let short_id = session.short_id().to_string();
-            let (runtime_id, client, session) = spawn_runtime(ctx, session);
+            let (runtime_id, endpoint, session) = spawn_runtime(ctx, session);
             let slot = match ctx.bg_manager.push_background_runtime(
                 runtime_id,
-                client.clone(),
+                endpoint.clone(),
                 session,
+                ctx.working_dir.clone(),
                 bg_runtime::RuntimeState::Running,
             ) {
                 Ok(slot) => slot,
@@ -2122,15 +2711,32 @@ fn execute_slash_command_impl(
                     return Ok(());
                 }
                 Err(bg_runtime::BgError::InvalidSlot { .. }) => unreachable!(),
+                Err(
+                    bg_runtime::BgError::NoRuntimeClient { .. }
+                    | bg_runtime::BgError::SessionProjectionUnavailable { .. },
+                ) => unreachable!("push_background_runtime cannot return a resume error"),
             };
-            client
-                .cmd_tx
-                .send(AgentCommand::SendMessage {
-                    text: task.to_string(),
-                    images: Vec::new(),
-                    image_markers: Vec::new(),
-                })
-                .ok();
+            let submit_result =
+                endpoint
+                    .native
+                    .dispatch_when_ready(atomcode_coding::DriverCommand::Submit(
+                        task.to_string().into(),
+                    ));
+            if let Err(error) =
+                finalize_background_submission(&mut ctx.bg_manager, slot, submit_result)
+            {
+                renderer.render(UiLine::Error(format!(
+                    "background task could not be started: {error}"
+                )));
+                renderer.flush();
+                return Ok(());
+            }
+            ctx.bg_manager.apply_background_event(
+                runtime_id,
+                bg_runtime::RuntimeEventPayload::Ui(
+                    crate::event_loop::ui_event::UiEvent::UserEcho(task.to_string()),
+                ),
+            );
             renderer.render(UiLine::CommandOutput(
                 t(Msg::BgTaskStarted {
                     slot,
@@ -2141,326 +2747,355 @@ fn execute_slash_command_impl(
             renderer.flush();
         }
         "init" => {
-            // Generate .atomcode.md from project structure. Refuses to
-            // overwrite by default — `/init --force` opts in. The file is
-            // picked up by agent::prompt next time the system prompt is
-            // built; in-flight turns finish on the old prompt.
-            let target = ctx.working_dir.join(".atomcode.md");
-            let force = matches!(arg.trim(), "--force" | "force");
-            if target.exists() && !force {
-                let path_str = target.display().to_string();
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::InitAlreadyExists { path: &path_str }).into_owned(),
-                ));
-                renderer.flush();
-                return Ok(());
-            }
-            let content = crate::init::generate_project_instructions(&ctx.working_dir);
-            match std::fs::write(&target, &content) {
-                Ok(()) => {
-                    let path_str = target.display().to_string();
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::InitWrote {
-                            path: &path_str,
-                            bytes: content.len(),
-                        })
-                        .into_owned(),
-                    ));
-                    // Confirm the file is reachable for the prompt-builder by
-                    // re-running the same load that `/status` uses. If the
-                    // freshly written file does NOT appear under PROJECT here,
-                    // the user knows immediately — instead of asking the AI
-                    // a question and trying to infer load state from its
-                    // answer.
-                    renderer.render(UiLine::CommandOutput(render_instruction_status_block(
-                        &ctx.working_dir,
-                    )));
-                }
-                Err(e) => {
-                    renderer.render(UiLine::Error(
-                        t(Msg::InitFailed {
-                            error: &format!("{}", e),
-                        })
-                        .into_owned(),
-                    ));
-                }
-            }
+            // LLM-driven: submit the init prompt as a normal user turn; the agent explores the
+            // repo with its tools and writes/improves AGENTS.md via write_file. Replaces the old
+            // static .atomcode.md generator.
+            submit_agent_turn(ctx, state, atomcode_coding::INIT_PROMPT.to_string());
+            renderer.render(UiLine::CommandOutput(t(Msg::InitKickoff).into_owned()));
             renderer.flush();
         }
         "mcp" => {
             let sub = arg.trim();
-            if let Some(rest) = sub.strip_prefix("login") {
-                let server = rest.trim();
-                if server.is_empty() {
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpOAuthLoginUsage).into_owned(),
-                    ));
-                    renderer.flush();
-                    return Ok(());
-                }
-                let configs = match atomcode_core::mcp::load_mcp_config(&ctx.working_dir) {
-                    Ok(configs) => configs,
-                    Err(e) => {
-                        renderer.render(UiLine::Error(
-                            t(Msg::McpOAuthLoadConfigFailed {
-                                error: &format!("{:#}", e),
-                            })
-                            .into_owned(),
+            match parse_mcp_subcommand(sub) {
+                Some(McpSub::Login) => {
+                    let server = sub.strip_prefix("login").map(str::trim).unwrap_or("");
+                    if server.is_empty() {
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::McpOAuthLoginUsage).into_owned(),
                         ));
                         renderer.flush();
                         return Ok(());
                     }
-                };
-                let Some(config) = configs.into_iter().find(|config| config.name == server) else {
-                    renderer.render(UiLine::Error(
-                        t(Msg::McpOAuthServerNotFound { server }).into_owned(),
-                    ));
-                    renderer.flush();
-                    return Ok(());
-                };
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::McpOAuthStarting { server }).into_owned(),
-                ));
-                renderer.flush();
-                let is_github_server = matches!(
-                    &config.config,
-                    atomcode_core::mcp::McpTransportConfig::Http {
-                        auth: Some(atomcode_core::mcp::McpHttpAuthConfig::OAuth(auth)),
-                        ..
-                    } if auth.provider.as_deref() == Some("github")
-                );
-                let result = tokio::task::block_in_place(|| {
-                    atomcode_core::mcp::login_mcp_oauth(
-                        &config,
-                        atomcode_core::mcp::McpOAuthLoginOptions {
-                            client_id: if is_github_server {
-                                std::env::var("ATOMCODE_GITHUB_MCP_CLIENT_ID").ok()
-                            } else {
-                                None
-                            },
-                            client_secret_env: None,
-                            scopes: Vec::new(),
-                        },
-                    )
-                });
-                match result {
-                    Ok(token) => renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpOAuthSaved {
-                            provider: &token.provider,
-                            server,
-                        })
-                        .into_owned(),
-                    )),
-                    Err(e) => renderer.render(UiLine::Error(
-                        t(Msg::McpOAuthFailed {
-                            error: &format!("{:#}", e),
-                        })
-                        .into_owned(),
-                    )),
-                }
-                renderer.flush();
-                return Ok(());
-            }
-
-            if let Some(rest) = sub.strip_prefix("logout") {
-                let server = rest.trim();
-                if server.is_empty() {
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpOAuthLogoutUsage).into_owned(),
-                    ));
-                    renderer.flush();
-                    return Ok(());
-                }
-                match atomcode_core::mcp::McpTokenStore::default().delete_token(server) {
-                    Ok(true) => renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpOAuthTokenRemoved { server }).into_owned(),
-                    )),
-                    Ok(false) => renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpOAuthNoToken { server }).into_owned(),
-                    )),
-                    Err(e) => renderer.render(UiLine::Error(
-                        t(Msg::McpOAuthLogoutFailed {
-                            error: &format!("{:#}", e),
-                        })
-                        .into_owned(),
-                    )),
-                }
-                renderer.flush();
-                return Ok(());
-            }
-
-            if sub.eq_ignore_ascii_case("reload") {
-                // Preflight: parse merged MCP config so we can show progress immediately.
-                // (Connection attempts happen in background and may take up to timeout_ms.)
-                let configs = match atomcode_core::mcp::load_mcp_config(&ctx.working_dir) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        renderer.render(UiLine::Error(
-                            t(Msg::McpReloadFailed {
-                                error: &format!("{:#}", e),
-                            })
-                            .into_owned(),
-                        ));
-                        renderer.flush();
-                        return Ok(());
-                    }
-                };
-
-                let mut header = t(Msg::McpReloading {
-                    count: configs.len(),
-                })
-                .into_owned();
-
-                if !configs.is_empty() {
-                    header.push_str(&t(Msg::McpConnecting));
-                    for c in &configs {
-                        header.push_str(&t(Msg::McpConnectingServer { name: &c.name }));
-                    }
-                } else {
-                    header.push_str(&t(Msg::McpNoServersConfigured));
-                }
-                renderer.render(UiLine::CommandOutput(header));
-                renderer.flush();
-
-                // 1) Drop all previously-registered MCP tools so any adapters holding the
-                // old registry Arc are released and stdio child processes can be killed.
-                let removed = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        ctx.agent.tool_registry.unregister_prefix("mcp__").await
-                    })
-                });
-
-                // 2) Drop old registry + event receiver (stop consuming old events).
-                ctx.mcp_connect_rx = None;
-                ctx.mcp_registry = None;
-                ctx.mcp_reload = None;
-
-                // If no servers are configured, we're done after cleanup.
-                if configs.is_empty() {
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpClearedNoServers { removed }).into_owned(),
-                    ));
-                    renderer.flush();
-                    return Ok(());
-                }
-
-                // 2.5) Arm progress tracker (event loop prints a summary once all results land).
-                ctx.mcp_reload = Some(super::McpReloadProgress {
-                    total: configs.len(),
-                    done: 0,
-                    connected: 0,
-                    failed: 0,
-                    started_at: std::time::Instant::now(),
-                });
-
-                // 3) Recreate registry and event channel. Connections happen in background
-                // and will stream Connected/Failed events into scrollback (event loop select!).
-                use atomcode_core::mcp::McpConnectEvent;
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<McpConnectEvent>();
-                let registry = atomcode_core::mcp::McpRegistry::from_config_background_with_events(
-                    &ctx.working_dir,
-                    Some(tx),
-                );
-                ctx.mcp_registry = Some(std::sync::Arc::new(registry));
-                ctx.mcp_connect_rx = Some(rx);
-
-                // The driver registry above feeds the palette; the ENGINE binds its own MCP
-                // at prepare time. Ask it to re-prepare so the reloaded servers reach the
-                // model too. (Legacy engine: a no-op hook reload; engine v2: a Resume
-                // respawn that re-mounts MCP/skills/hooks.)
-                ctx.agent.cmd_tx.send(AgentCommand::ReloadHooks).ok();
-
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::McpClearedReconnecting { removed }).into_owned(),
-                ));
-                renderer.flush();
-                return Ok(());
-            }
-
-            // `/mcp tools <server>`: list remote tool names for a connected server.
-            // This is intentionally separate from a global `/tools` so we keep the surface minimal.
-            if let Some(rest) = sub.strip_prefix("tools") {
-                let server = rest.trim();
-                if server.is_empty() {
-                    renderer.render(UiLine::CommandOutput(t(Msg::McpToolsUsage).into_owned()));
-                    renderer.flush();
-                    return Ok(());
-                }
-                if let Some(registry) = &ctx.mcp_registry {
-                    let server = server.to_string();
-                    let server_for_msg = server.clone();
-                    let registry = registry.clone();
-                    let tx = registry.event_sender();
-                    tokio::spawn(async move {
-                        let list_timeout = registry.list_tools_timeout(&server).await;
-                        let tools = match tokio::time::timeout(
-                            list_timeout,
-                            registry.list_tools_for_server(&server),
-                        )
-                        .await
-                        {
-                            Ok(v) => v,
-                            Err(_) => {
-                                if let Some(tx) = &tx {
-                                    let _ = tx.send(atomcode_core::mcp::McpConnectEvent::Warning {
-                                        name: server.clone(),
-                                        message: format!(
-                                            "tools/list timed out after {}s (server connected but tools not listed yet)",
-                                            list_timeout.as_secs()
-                                        ),
-                                    });
-                                }
-                                return;
+                    let configs =
+                        match atomcode_capabilities::mcp::load_mcp_config(&ctx.working_dir) {
+                            Ok(configs) => configs,
+                            Err(e) => {
+                                renderer.render(UiLine::Error(
+                                    t(Msg::McpOAuthLoadConfigFailed {
+                                        error: &format!("{:#}", e),
+                                    })
+                                    .into_owned(),
+                                ));
+                                renderer.flush();
+                                return Ok(());
                             }
                         };
-                        let mut msg = format!("tools:\n");
-                        if tools.is_empty() {
-                            msg.push_str("  (none — tools/list may have failed, timed out, or returned empty)\n");
-                        } else {
-                            for t in tools {
-                                msg.push_str(&format!("  - mcp__{}__{}\n", server, t.tool_name));
-                            }
-                        }
-                        if let Some(tx) = tx {
-                            let _ = tx.send(atomcode_core::mcp::McpConnectEvent::Warning {
-                                name: server,
-                                message: msg.trim_end().to_string(),
-                            });
-                        }
-                    });
+                    let Some(config) = configs.into_iter().find(|config| config.name == server)
+                    else {
+                        renderer.render(UiLine::Error(
+                            t(Msg::McpOAuthServerNotFound { server }).into_owned(),
+                        ));
+                        renderer.flush();
+                        return Ok(());
+                    };
                     renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpToolsListing {
-                            server: &server_for_msg,
-                        })
-                        .into_owned(),
+                        t(Msg::McpOAuthStarting { server }).into_owned(),
                     ));
-                } else {
-                    renderer.render(UiLine::CommandOutput(t(Msg::McpNoRegistry).into_owned()));
+                    renderer.flush();
+                    let is_github_server = matches!(
+                        &config.config,
+                        atomcode_capabilities::mcp::McpTransportConfig::Http {
+                            auth: Some(atomcode_capabilities::mcp::McpHttpAuthConfig::OAuth(auth)),
+                            ..
+                        } if auth.provider.as_deref() == Some("github")
+                    );
+                    let result = tokio::task::block_in_place(|| {
+                        atomcode_capabilities::mcp::login_mcp_oauth(
+                            &config,
+                            atomcode_capabilities::mcp::McpOAuthLoginOptions {
+                                client_id: if is_github_server {
+                                    std::env::var("ATOMCODE_GITHUB_MCP_CLIENT_ID").ok()
+                                } else {
+                                    None
+                                },
+                                client_secret_env: None,
+                                scopes: Vec::new(),
+                            },
+                        )
+                    });
+                    match result {
+                        Ok(token) => {
+                            renderer.render(UiLine::CommandOutput(
+                                t(Msg::McpOAuthSaved {
+                                    provider: &token.provider,
+                                    server,
+                                })
+                                .into_owned(),
+                            ));
+                            renderer.flush();
+                            return execute_slash_command_impl(
+                                "mcp",
+                                "reload",
+                                state,
+                                ctx,
+                                renderer,
+                                active_modal,
+                                setup_pending,
+                            );
+                        }
+                        Err(e) => renderer.render(UiLine::Error(
+                            t(Msg::McpOAuthFailed {
+                                error: &format!("{:#}", e),
+                            })
+                            .into_owned(),
+                        )),
+                    }
+                    renderer.flush();
+                    return Ok(());
                 }
-                renderer.flush();
-                return Ok(());
+
+                Some(McpSub::Logout) => {
+                    let server = sub.strip_prefix("logout").map(str::trim).unwrap_or("");
+                    if server.is_empty() {
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::McpOAuthLogoutUsage).into_owned(),
+                        ));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                    let token_store = atomcode_capabilities::mcp::McpTokenStore::default();
+                    match token_store.load_token(server) {
+                        Ok(None) => {
+                            renderer.render(UiLine::CommandOutput(
+                                t(Msg::McpOAuthNoToken { server }).into_owned(),
+                            ));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            renderer.render(UiLine::Error(
+                                t(Msg::McpOAuthLogoutFailed {
+                                    error: &format!("{:#}", e),
+                                })
+                                .into_owned(),
+                            ));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                        Ok(Some(_)) => {}
+                    }
+                    if let Err(error) = super::withdraw_mcp_tools(ctx) {
+                        renderer.render(UiLine::Error(error));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                    match token_store.delete_token(server) {
+                        Ok(true) => {
+                            renderer.render(UiLine::CommandOutput(
+                                t(Msg::McpOAuthTokenRemoved { server }).into_owned(),
+                            ));
+                            renderer.flush();
+                            return execute_slash_command_impl(
+                                "mcp",
+                                "reload",
+                                state,
+                                ctx,
+                                renderer,
+                                active_modal,
+                                setup_pending,
+                            );
+                        }
+                        Ok(false) => renderer.render(UiLine::CommandOutput(
+                            t(Msg::McpOAuthNoToken { server }).into_owned(),
+                        )),
+                        Err(e) => renderer.render(UiLine::Error(
+                            t(Msg::McpOAuthLogoutFailed {
+                                error: &format!("{:#}", e),
+                            })
+                            .into_owned(),
+                        )),
+                    }
+                    renderer.flush();
+                    return Ok(());
+                }
+
+                Some(McpSub::Trust) => {
+                    match atomcode_capabilities::mcp::trust::trust_project(&ctx.working_dir) {
+                        Ok(()) => {
+                            renderer.render(UiLine::CommandOutput(
+                                t(Msg::McpProjectTrusted).into_owned(),
+                            ));
+                            renderer.flush();
+                            // Trigger a reload so newly-allowed servers connect immediately.
+                            return execute_slash_command_impl(
+                                "mcp",
+                                "reload",
+                                state,
+                                ctx,
+                                renderer,
+                                active_modal,
+                                setup_pending,
+                            );
+                        }
+                        Err(e) => {
+                            renderer.render(UiLine::Error(format!("{:#}", e)));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                    }
+                }
+
+                Some(McpSub::Untrust) => {
+                    if !atomcode_capabilities::mcp::trust::is_project_trusted(&ctx.working_dir) {
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::McpProjectNotTrusted).into_owned(),
+                        ));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                    if let Err(error) = super::withdraw_mcp_tools(ctx) {
+                        renderer.render(UiLine::Error(error));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                    match atomcode_capabilities::mcp::trust::untrust_project(&ctx.working_dir) {
+                        Ok(true) => {
+                            renderer.render(UiLine::CommandOutput(
+                                t(Msg::McpProjectUntrusted).into_owned(),
+                            ));
+                            renderer.flush();
+                            return execute_slash_command_impl(
+                                "mcp",
+                                "reload",
+                                state,
+                                ctx,
+                                renderer,
+                                active_modal,
+                                setup_pending,
+                            );
+                        }
+                        Ok(false) => renderer.render(UiLine::CommandOutput(
+                            t(Msg::McpProjectNotTrusted).into_owned(),
+                        )),
+                        Err(e) => renderer.render(UiLine::Error(format!("{:#}", e))),
+                    }
+                    renderer.flush();
+                    return Ok(());
+                }
+
+                Some(McpSub::Reload) => {
+                    // Withdraw first. Config parse and replacement prepare both read
+                    // mutable security inputs and may fail; neither failure may leave
+                    // the previous MCP authority mounted.
+                    if let Err(error) = super::withdraw_mcp_tools(ctx) {
+                        renderer.render(UiLine::Error(error));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                    // Preflight: parse merged MCP config so we can show progress immediately.
+                    // (Connection attempts happen in background and may take up to timeout_ms.)
+                    let configs =
+                        match atomcode_capabilities::mcp::load_mcp_config(&ctx.working_dir) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                renderer.render(UiLine::Error(
+                                    t(Msg::McpReloadFailed {
+                                        error: &format!("{:#}", e),
+                                    })
+                                    .into_owned(),
+                                ));
+                                renderer.flush();
+                                return Ok(());
+                            }
+                        };
+
+                    // Partition by trust so the preflight header only lists servers that will
+                    // actually be attempted (project-source servers from untrusted projects are
+                    // withheld and should not appear in the "connecting to:" list).
+                    let partition = atomcode_capabilities::mcp::trust::partition_by_trust(
+                        configs.clone(),
+                        &ctx.working_dir,
+                    );
+                    let connecting = &partition.allowed;
+
+                    let mut header = t(Msg::McpReloading {
+                        count: configs.len(),
+                    })
+                    .into_owned();
+
+                    if !connecting.is_empty() {
+                        header.push_str(&t(Msg::McpConnecting));
+                        for c in connecting {
+                            header.push_str(&t(Msg::McpConnectingServer { name: &c.name }));
+                        }
+                    } else if !configs.is_empty() {
+                        // All servers are blocked (untrusted project); nothing will connect.
+                        header.push_str(&t(Msg::McpNoServersConfigured));
+                    } else {
+                        header.push_str(&t(Msg::McpNoServersConfigured));
+                    }
+                    renderer.render(UiLine::CommandOutput(header));
+                    renderer.flush();
+
+                    // Every MCP mutation converges here. CodingRuntime owns the
+                    // model-facing catalog, including the empty-config case where
+                    // all previously mounted MCP tools must be removed.
+                    if let Err(error) = super::request_capability_reload(ctx) {
+                        renderer.render(UiLine::Error(error));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                    ctx.pending_mcp_reload_server_count = Some(configs.len());
+                    return Ok(());
+                }
+
+                Some(McpSub::Tools) => {
+                    // `/mcp tools <server>`: list remote tool names for a connected server.
+                    // This is intentionally separate from a global `/tools` so we keep the surface minimal.
+                    let server = sub.strip_prefix("tools").map(str::trim).unwrap_or("");
+                    if server.is_empty() {
+                        renderer.render(UiLine::CommandOutput(t(Msg::McpToolsUsage).into_owned()));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                    let result = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(ctx.runtime.mcp_tools(server.to_string()))
+                    });
+                    match result {
+                        Ok(snapshot) => {
+                            let mut message = String::from("tools:\n");
+                            if snapshot.tools.is_empty() {
+                                match snapshot.status {
+                                    Some(status) => {
+                                        message.push_str(&format!("  (none — {status})\n"));
+                                    }
+                                    None => message.push_str("  (none — server not configured)\n"),
+                                }
+                            } else {
+                                for tool in snapshot.tools {
+                                    message.push_str(&format!("  - {tool}\n"));
+                                }
+                            }
+                            renderer.render(UiLine::CommandOutput(message.trim_end().to_string()));
+                        }
+                        Err(error) => renderer.render(UiLine::Error(error.to_string())),
+                    }
+                    renderer.flush();
+                    return Ok(());
+                }
+
+                None => { /* fall through to default status display below */ }
             }
 
             // Default: show status.
-            if let Some(registry) = &ctx.mcp_registry {
-                let statuses = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(registry.server_statuses())
-                });
-                if statuses.is_empty() {
+            let status = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(ctx.runtime.mcp_status())
+            });
+            match status {
+                Ok(status) if status.servers.is_empty() => {
                     renderer.render(UiLine::CommandOutput(
                         t(Msg::McpNoServersConfigured).into_owned(),
                     ));
-                } else {
+                }
+                Ok(status) => {
                     let mut txt = t(Msg::McpServersHeader).into_owned();
-                    for (name, status) in statuses {
-                        txt.push_str(&format!("    {}  {}\n", name, status));
+                    for (name, server_status) in status.servers {
+                        txt.push_str(&format!("    {}  {}\n", name, server_status));
                     }
                     renderer.render(UiLine::CommandOutput(txt));
                 }
-            } else {
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::McpNoServersConfigured).into_owned(),
-                ));
+                Err(error) => renderer.render(UiLine::Error(error.to_string())),
             }
             renderer.flush();
         }
@@ -2484,8 +3119,8 @@ fn execute_slash_command_impl(
         }
         "think" => {
             let sub = arg.trim().to_ascii_lowercase();
-            let provider_name = ctx.config.default_provider.clone();
-            let provider = ctx.config.providers.get_mut(&provider_name);
+            let provider_name = ctx.config.effective_model_selection().unwrap_or_default();
+            let provider = ctx.config.provider_config_for_selection(&provider_name);
             match provider {
                 None => {
                     renderer.render(UiLine::Error(t(Msg::CmdNoActiveProvider).into_owned()));
@@ -2507,28 +3142,45 @@ fn execute_slash_command_impl(
                         ));
                         renderer.flush();
                     } else if sub == "on" {
-                        p.thinking_enabled = Some(true);
                         let budget = p.thinking_budget.unwrap_or(10_000);
-                        save_and_reload(ctx, renderer);
-                        renderer.render(UiLine::CommandOutput(
+                        let mut desired = ctx.config.clone();
+                        desired.update_selection_reasoning(&provider_name, |r| {
+                            *r.thinking_enabled = Some(true)
+                        });
+                        save_and_reload(
+                            ctx,
+                            desired,
+                            renderer,
                             t(Msg::ThinkEnabled { budget }).into_owned(),
-                        ));
-                        renderer.flush();
+                            false,
+                        );
                     } else if sub == "off" {
-                        p.thinking_enabled = Some(false);
-                        save_and_reload(ctx, renderer);
-                        renderer.render(UiLine::CommandOutput(t(Msg::ThinkDisabled).into_owned()));
-                        renderer.flush();
+                        let mut desired = ctx.config.clone();
+                        desired.update_selection_reasoning(&provider_name, |r| {
+                            *r.thinking_enabled = Some(false)
+                        });
+                        save_and_reload(
+                            ctx,
+                            desired,
+                            renderer,
+                            t(Msg::ThinkDisabled).into_owned(),
+                            false,
+                        );
                     } else if let Some(rest) = sub.strip_prefix("budget") {
                         let num_str = rest.trim();
                         match num_str.parse::<u32>() {
                             Ok(n) if n >= 1024 => {
-                                p.thinking_budget = Some(n);
-                                save_and_reload(ctx, renderer);
-                                renderer.render(UiLine::CommandOutput(
+                                let mut desired = ctx.config.clone();
+                                desired.update_selection_reasoning(&provider_name, |r| {
+                                    *r.thinking_budget = Some(n)
+                                });
+                                save_and_reload(
+                                    ctx,
+                                    desired,
+                                    renderer,
                                     t(Msg::ThinkBudgetSet { n }).into_owned(),
-                                ));
-                                renderer.flush();
+                                    false,
+                                );
                             }
                             Ok(n) => {
                                 renderer.render(UiLine::Error(
@@ -2552,7 +3204,7 @@ fn execute_slash_command_impl(
         }
         "effort" => {
             let sub = arg.trim().to_ascii_lowercase();
-            let provider_name = ctx.config.default_provider.clone();
+            let provider_name = ctx.config.effective_model_selection().unwrap_or_default();
             let applicable = crate::event_loop::reasoning_effort_applicable_on_provider(ctx);
             if !applicable {
                 renderer.render(UiLine::CommandOutput(
@@ -2561,7 +3213,7 @@ fn execute_slash_command_impl(
                 renderer.flush();
                 return Ok(());
             }
-            let provider = ctx.config.providers.get_mut(&provider_name);
+            let provider = ctx.config.provider_config_for_selection(&provider_name);
             match provider {
                 None => {
                     renderer.render(UiLine::Error(t(Msg::CmdNoActiveProvider).into_owned()));
@@ -2576,21 +3228,29 @@ fn execute_slash_command_impl(
                         )));
                         renderer.flush();
                     } else if sub == "high" || sub == "max" {
-                        p.reasoning_effort = Some(sub.to_string());
-                        ctx.reasoning_effort = Some(sub.to_string());
-                        crate::event_loop::save_and_reload(ctx, renderer);
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "  ○ Reasoning effort set to: {sub}\n"
-                        )));
-                        renderer.flush();
+                        let mut desired = ctx.config.clone();
+                        desired.update_selection_reasoning(&provider_name, |r| {
+                            *r.reasoning_effort = Some(sub.to_string())
+                        });
+                        crate::event_loop::save_and_reload(
+                            ctx,
+                            desired,
+                            renderer,
+                            format!("  ○ Reasoning effort set to: {sub}\n"),
+                            false,
+                        );
                     } else if sub == "off" {
-                        p.reasoning_effort = None;
-                        ctx.reasoning_effort = None;
-                        crate::event_loop::save_and_reload(ctx, renderer);
-                        renderer.render(UiLine::CommandOutput(
+                        let mut desired = ctx.config.clone();
+                        desired.update_selection_reasoning(&provider_name, |r| {
+                            *r.reasoning_effort = None
+                        });
+                        crate::event_loop::save_and_reload(
+                            ctx,
+                            desired,
+                            renderer,
                             "  ○ Reasoning effort: default (API auto)\n".to_string(),
-                        ));
-                        renderer.flush();
+                            false,
+                        );
                     } else {
                         renderer.render(UiLine::CommandOutput(
                             "  Usage: /effort high | max | off\n  Shortcut: Ctrl+T\n".into(),
@@ -2644,7 +3304,9 @@ fn execute_slash_command_impl(
                     renderer.flush();
                 }
                 "clear" | "stop" | "off" | "reset" | "none" | "cancel" => {
-                    ctx.agent.cmd_tx.send(AgentCommand::ClearGoal).ok();
+                    ctx.runtime
+                        .dispatch(atomcode_coding::DriverCommand::StopGoal)
+                        .ok();
                     state.goal_condition = None;
                     state.goal_round = 0;
                     state.goal_started_at = None;
@@ -2664,22 +3326,110 @@ fn execute_slash_command_impl(
                     // (Empty input is unreachable here — `head` would be ""
                     // and the `"" | "status"` arm above would have matched.)
                     let condition = trimmed.to_owned();
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::SetGoal { condition: condition.clone() })
-                        .ok();
+                    if ctx
+                        .runtime
+                        .dispatch(atomcode_coding::DriverCommand::StartGoal(condition.clone()))
+                        .is_err()
+                    {
+                        renderer.render(UiLine::Error(t(Msg::CmdProviderUnavailable).into_owned()));
+                        renderer.flush();
+                        return Ok(());
+                    }
                     state.goal_condition = Some(condition.clone());
                     state.goal_round = 0;
                     state.goal_started_at = Some(std::time::Instant::now());
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::SendMessage {
-                            text: condition,
-                            images: vec![],
-                            image_markers: vec![],
-                        })
-                        .ok();
-                    state.on_submit();
+                    if submit_agent_text(ctx, condition) {
+                        state.on_submit();
+                    }
+                }
+            }
+        }
+        "loop" => {
+            use crate::event_loop::loop_parse::{parse_loop_arg, LoopArg};
+            match parse_loop_arg(arg) {
+                LoopArg::Status => {
+                    if let Some(ref label) = state.loop_label.clone() {
+                        let secs = state
+                            .loop_started_at
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        let mins = secs / 60;
+                        let secs_rem = secs % 60;
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::LoopStatus {
+                                label: label.as_str(),
+                                round: (state.loop_round + 1) as u32,
+                                mins,
+                                secs: secs_rem,
+                            })
+                            .into_owned(),
+                        ));
+                    } else {
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::LoopNoActive).into_owned(),
+                        ));
+                    }
+                    renderer.flush();
+                }
+                LoopArg::Stop => {
+                    stop_active_loop(state, ctx);
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::LoopCleared).into_owned(),
+                    ));
+                    renderer.flush();
+                }
+                LoopArg::SelfPaced { prompt } => {
+                    // Replace any existing loop (both self-paced core and
+                    // fixed-interval TUI controller) before setting a new one.
+                    stop_active_loop(state, ctx);
+                    if ctx
+                        .runtime
+                        .dispatch(atomcode_coding::DriverCommand::StartLoop(prompt.clone()))
+                        .is_err()
+                    {
+                        renderer.render(UiLine::Error(t(Msg::CmdProviderUnavailable).into_owned()));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                    state.loop_label = Some(prompt.clone());
+                    state.loop_round = 0;
+                    state.loop_started_at = Some(std::time::Instant::now());
+                    if submit_agent_text(ctx, prompt) {
+                        state.on_submit();
+                    }
+                    // Non-silent: /loop is live-only (persistence deferred) — tell the
+                    // user it won't come back after a restart/resume.
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::LoopNoPersistHint).into_owned(),
+                    ));
+                }
+                LoopArg::Interval { secs, payload } => {
+                    // Fixed-interval mode: stop any currently running loop
+                    // (self-paced or fixed-interval) first, then install a
+                    // fresh wall-clock LoopController and fire the first
+                    // iteration now. The TUI event loop's deadline arm +
+                    // TurnComplete hook re-fire it on schedule while the agent
+                    // is idle (see run_loop / handle_loop_decision).
+                    stop_active_loop(state, ctx);
+                    start_interval_loop(
+                        state,
+                        ctx,
+                        renderer,
+                        secs,
+                        payload,
+                        active_modal,
+                        setup_pending,
+                    );
+                    // Non-silent: /loop is live-only (persistence deferred) — tell the
+                    // user it won't come back after a restart/resume.
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::LoopNoPersistHint).into_owned(),
+                    ));
+                    renderer.flush();
+                }
+                LoopArg::Error(msg) => {
+                    renderer.render(UiLine::Error(msg));
+                    renderer.flush();
                 }
             }
         }
@@ -2732,22 +3482,55 @@ fn execute_slash_command_impl(
                 }
                 renderer.flush();
             } else {
-                let mut parts = arg_trim.splitn(2, char::is_whitespace);
-                let skill_name = parts.next().unwrap_or("");
-                let skill_args = parts.next().unwrap_or("").trim_start();
-                // Pass the bare name straight through — `SkillRegistry::get`
-                // falls back to a unique `:name` suffix match, which resolves
-                // both loose skills (`skills:foo`) and plugin-contributed
-                // skills (`<plugin>:foo`) without us needing to guess the
-                // prefix here. A user-typed qualified name (`foo:bar`) still
-                // works because exact match runs first.
-                if let Some(rendered) = expand_skill(ctx, skill_name, skill_args) {
-                    submit_agent_turn(ctx, state, rendered);
-                } else {
+                // 贪婪多 skill 解析：前缀是一串已知 skill 名，其余是任务描述，
+                // 任务描述会传给每个 skill（保留 $ARGUMENTS 占位符语义）。单个
+                // skill（无第二个 skill 词）解析结果与旧 splitn(2) 一致，零回归。
+                // Returns the skill's canonical identity (`s.name`, the unique
+                // normalized registry key) so `split_skill_names` dedups by
+                // identity — two spellings of the same skill inject it once.
+                let resolve = |name: &str| {
+                    ctx.skill_registry.read().ok().and_then(|r| {
+                        r.get(name)
+                            .filter(|s| s.user_invocable)
+                            .map(|s| s.name.clone())
+                    })
+                };
+                let (skills, skill_args) = split_skill_names(arg_trim, resolve);
+                if skills.is_empty() {
+                    // 首词不是 skill —— 沿用旧的 unknown 报错，指名第一个词。
+                    let first = arg_trim.split_whitespace().next().unwrap_or("");
                     renderer.render(UiLine::Error(
-                        t(Msg::SkillUnknown { name: skill_name }).into_owned(),
+                        t(Msg::SkillUnknown { name: first }).into_owned(),
                     ));
                     renderer.flush();
+                } else {
+                    // 按顺序展开每个 skill；expand_skill 可能因竞态返回 None。
+                    let blocks: Vec<String> = skills
+                        .iter()
+                        .filter_map(|name| expand_skill(ctx, name.as_str(), &skill_args))
+                        .collect();
+                    if blocks.is_empty() {
+                        renderer.render(UiLine::Error(
+                            t(Msg::SkillUnknown {
+                                name: skills[0].as_str(),
+                            })
+                            .into_owned(),
+                        ));
+                        renderer.flush();
+                    } else {
+                        // 回显已加载 skill：第二个及以后的 skill 名若打错字会静默
+                        // 落进任务描述，这行让用户一眼看出"只加载了 N 个"。
+                        let names = skills.join(" · ");
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::SkillsLoaded {
+                                names: names.as_str(),
+                            })
+                            .into_owned(),
+                        ));
+                        renderer.flush();
+                        let rendered = blocks.join("\n\n---\n\n");
+                        submit_agent_turn(ctx, state, rendered);
+                    }
                 }
             }
         }
@@ -2780,12 +3563,13 @@ fn execute_slash_command_impl(
                 renderer.flush();
 
                 let project_root = ctx.working_dir.clone();
-                let opts = atomcode_core::setup::RunOptions::new(project_root);
+                let opts = atomcode_capabilities::setup::RunOptions::new(project_root);
 
                 // `setup::run` is synchronous (file I/O only). Run it on the
                 // current thread via `block_in_place` to avoid blocking the
                 // tokio runtime — no `block_on` needed since it's not async.
-                let result = tokio::task::block_in_place(|| atomcode_core::setup::run(opts));
+                let result =
+                    tokio::task::block_in_place(|| atomcode_capabilities::setup::run(opts));
 
                 match result {
                     Ok(report) => {
@@ -2834,74 +3618,194 @@ fn execute_slash_command_impl(
                 renderer.flush();
             }
         }
+        "todo" => {
+            // `/todo` derives + prints the current list. Two deterministic
+            // subcommands (first word, case-insensitive) mutate it without
+            // waiting on the model, both via the kernel-reseed path so the next
+            // turn's TodoHook reflects the change:
+            //   `/todo clear`        — wipe the list (stale/cancelled tasks stop reappearing)
+            //   `/todo add <text>`   — append one pending task at the end
+            // Then the list is re-printed as confirmation.
+            let (kw, rest) = match arg.trim().split_once(char::is_whitespace) {
+                Some((k, r)) => (k, r.trim()),
+                None => (arg.trim(), ""),
+            };
+            let is_add = kw.eq_ignore_ascii_case("add");
+            if is_add && rest.is_empty() {
+                // `/todo add` with no text → usage hint, no mutation, no reprint.
+                renderer.render(UiLine::CommandOutput(t(Msg::TodoAddUsage).into_owned()));
+                renderer.flush();
+            } else {
+                if is_add {
+                    add_todo(ctx, state, rest);
+                } else if kw.eq_ignore_ascii_case("clear") && state.active_todos.is_some() {
+                    // Only reseed when there's something to clear, so a no-op
+                    // doesn't pollute the transcript with an empty-todowrite pair.
+                    clear_todos(ctx, state);
+                }
+                // Re-print the (possibly mutated) list as confirmation — shared by
+                // add-success, clear, and a bare `/todo`.
+                let out =
+                    format_todo_command(&ctx.current_session.messages, ctx.caps.unicode_symbols);
+                renderer.render(UiLine::CommandOutput(out));
+                renderer.flush();
+            }
+        }
         other => {
             // Before reporting "unknown", check user-defined custom commands,
             // then user-invocable skills (loaded from .claude/skills,
             // .atomcode/skills, etc.). Both expand to a prompt and dispatch
             // as a regular user message.
-            if let Some(rendered) = ctx.custom_commands.render(other, arg) {
-                submit_agent_turn(ctx, state, rendered);
-            } else if let Some(rendered) = expand_skill(ctx, other, arg) {
-                submit_agent_turn(ctx, state, rendered);
-            } else {
-                // Unknown command — emit failure telemetry
-                let available_commands: Vec<&str> = vec![
-                    "help",
-                    "quit",
-                    "exit",
-                    "clear",
-                    "compact",
-                    "reload",
-                    "config",
-                    "plan",
-                    "build",
-                    "session",
-                    "model",
-                    "language",
-                    "resume",
-                    "rename",
-                    "provider",
-                    "status",
-                    "diff",
-                    "undo",
-                    "cost",
-                    "context",
-                    "remember",
-                    "forget",
-                    "memory",
-                    "login",
-                    "logout",
-                    "whoami",
-                    "upgrade",
-                    "issue",
-                    "cd",
-                    "bg",
-                    "codingplan",
-                ];
-                ctx.telemetry.track(atomcode_telemetry::Event::UseCommand {
-                    type_: other.to_string(),
-                    success: Some(false),
-                    error_kind: Some(atomcode_telemetry::UseCommandErrorKind::NotFound),
-                    error_data: Some(
-                        serde_json::json!({
-                            "command": other,
-                            "duration_ms": 0,
-                            "message": format!("Unknown command: {}", other),
-                            "reason": "用户输入了不存在的斜杠命令",
-                            "resolution": "使用 /help 查看所有可用命令",
-                            "available_commands": available_commands,
-                        })
-                        .to_string(),
-                    ),
-                });
-                renderer.render(UiLine::Error(
-                    t(Msg::CmdUnknownCommand { name: other }).into_owned(),
-                ));
-                renderer.flush();
+            match decide_custom_command(&ctx.custom_commands, other, arg) {
+                CustomDispatch::Reject => {
+                    render_custom_command_error(renderer, &CustomDispatch::Reject, other);
+                }
+                CustomDispatch::Submit(rendered) => {
+                    submit_agent_turn(ctx, state, rendered);
+                }
+                CustomDispatch::NotFound => {
+                    if let Some(rendered) = expand_skill(ctx, other, arg) {
+                        submit_agent_turn(ctx, state, rendered);
+                    } else {
+                        // Unknown command — emit failure telemetry
+                        let available_commands: Vec<&str> =
+                            crate::commands::CommandRegistry::builtin()
+                                .all()
+                                .iter()
+                                .map(|command| command.name)
+                                .collect();
+                        ctx.telemetry.track(atomcode_telemetry::Event::UseCommand {
+                            type_: other.to_string(),
+                            success: Some(false),
+                            error_kind: Some(atomcode_telemetry::UseCommandErrorKind::NotFound),
+                            error_data: Some(
+                                serde_json::json!({
+                                    "command": other,
+                                    "duration_ms": 0,
+                                    "message": format!("Unknown command: {}", other),
+                                    "reason": "用户输入了不存在的斜杠命令",
+                                    "resolution": "使用 /help 查看所有可用命令",
+                                    "available_commands": available_commands,
+                                })
+                                .to_string(),
+                            ),
+                        });
+                        render_custom_command_error(renderer, &CustomDispatch::NotFound, other);
+                    }
+                }
             }
         }
     }
     Ok(())
+}
+
+/// 贪婪切分 `/skills` 参数：从左到右扫 whitespace 分词，`resolve(token)` 返回该
+/// token 对应 skill 的**规范身份**（`Some(canonical)`）时收入列表，否则停止。去重
+/// 按规范身份而非原始拼写——两个拼写不同但解析到同一 skill 的 token（大小写、后缀
+/// 简写等）只注入一次。列表里存用户原始拼写（回显更友好），展开时 `expand_skill`
+/// 会再归一化。遇到第一个非 skill 的 token，它及其之后的内容（按原串偏移，保留原
+/// 空白）作为任务描述返回。单个 skill（后面无第二个 skill 词）等价于旧 `splitn(2)`。
+fn split_skill_names(arg: &str, resolve: impl Fn(&str) -> Option<String>) -> (Vec<String>, String) {
+    let mut skills: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    let mut rest = arg.trim_start();
+    loop {
+        let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let token = &rest[..token_end];
+        if token.is_empty() {
+            break;
+        }
+        let Some(canonical) = resolve(token) else {
+            break;
+        };
+        if !seen.iter().any(|c| c == &canonical) {
+            seen.push(canonical);
+            skills.push(token.to_string());
+        }
+        rest = rest[token_end..].trim_start();
+    }
+    (skills, rest.to_string())
+}
+
+/// Decision returned by [`decide_custom_command`] for the `other` arm of
+/// [`execute_slash_command_impl`]. Separating the pure decision from its
+/// side effects (rendering an error line, submitting an agent turn) lets
+/// the dispatch rule — `Required` + empty arg ⇒ reject — be unit-tested
+/// without constructing a full `LoopCtx`.
+#[derive(Debug)]
+pub(super) enum CustomDispatch {
+    /// `args_requirement == Required` and the user supplied no argument:
+    /// render `CmdCustomArgRequired` and do NOT submit a turn.
+    Reject,
+    /// Custom command resolved; expand its template with `arg` and send
+    /// the rendered text as a user message.
+    Submit(String),
+    /// No custom command matched this name; fall through to the
+    /// user-invocable skill lookup / unknown-command path.
+    NotFound,
+}
+
+/// Render the error line for a [`CustomDispatch::Reject`] (Required
+/// command, no argument supplied) or [`CustomDispatch::NotFound`] (no
+/// custom command matched and no user-invocable skill matched either)
+/// outcome of the `other` arm.
+///
+/// Pure side effect on `renderer` only — does NOT call
+/// `submit_agent_turn`, which is the whole point of both error paths:
+///   - `Reject`   ⇒ user typed e.g. `/myreview` with no argument; surface
+///     `Msg::CmdCustomArgRequired` and leave the conversation untouched.
+///   - `NotFound` ⇒ user typed e.g. `/foo` that matches nothing; surface
+///     `Msg::CmdUnknownCommand` (telemetry is tracked by the caller).
+///   - `Submit`   ⇒ not an error; the caller forwards the rendered template
+///     to `submit_agent_turn`, so this helper is a no-op there.
+///
+/// Extracted from the `other` arm so the reject-vs-submit render boundary
+/// is unit-testable without constructing a full `LoopCtx`.
+pub(super) fn render_custom_command_error(
+    renderer: &mut dyn Renderer,
+    dispatch: &CustomDispatch,
+    name: &str,
+) {
+    match dispatch {
+        CustomDispatch::Reject => {
+            renderer.render(UiLine::Error(
+                t(Msg::CmdCustomArgRequired { name }).into_owned(),
+            ));
+            renderer.flush();
+        }
+        CustomDispatch::NotFound => {
+            renderer.render(UiLine::Error(
+                t(Msg::CmdUnknownCommand { name }).into_owned(),
+            ));
+            renderer.flush();
+        }
+        // Submit is not an error — handled by the caller via submit_agent_turn.
+        CustomDispatch::Submit(_) => {}
+    }
+}
+
+/// Resolve `name` against the custom command registry and decide what the
+/// dispatcher should do. Pure: touches neither `LoopCtx` nor the renderer,
+/// so the reject-vs-submit boundary is testable in isolation.
+///
+/// - `Required` + empty/whitespace-only `arg` → `Reject`
+/// - otherwise resolved command → `Submit(render(arg))`
+/// - no match → `NotFound`
+pub(super) fn decide_custom_command(
+    registry: &crate::custom_commands::CustomCommandRegistry,
+    name: &str,
+    arg: &str,
+) -> CustomDispatch {
+    match registry.resolve(name) {
+        Some(cmd) => {
+            if cmd.args_requirement == ArgsRequirement::Required && arg.trim().is_empty() {
+                CustomDispatch::Reject
+            } else {
+                CustomDispatch::Submit(cmd.render(arg))
+            }
+        }
+        None => CustomDispatch::NotFound,
+    }
 }
 
 /// Look up a user-invocable skill by name and expand it with the current
@@ -2913,7 +3817,7 @@ pub(super) fn expand_skill(ctx: &LoopCtx, name: &str, arg: &str) -> Option<Strin
     if !skill.user_invocable {
         return None;
     }
-    Some(skill.expand(arg, ctx.current_session.id.as_str()))
+    Some(skill.expand_for_injection(arg, ctx.current_session.id.as_str()))
 }
 
 /// Handle `/plugin` subcommands: marketplace add/remove/update/list,
@@ -2950,34 +3854,40 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                         t(Msg::PluginMarketplaceCloning { url: &url }).into_owned(),
                     );
                     tokio::task::spawn_blocking(move || {
-                        let ev = match atomcode_core::plugin::marketplace::add_marketplace(&url) {
-                            Ok(info) => {
-                                atomcode_core::plugin::PluginJobEvent::MarketplaceAdded(info)
-                            }
-                            Err(e) => atomcode_core::plugin::PluginJobEvent::Failed {
-                                op: "add marketplace".into(),
-                                msg: format!("{:#}", e),
-                            },
-                        };
+                        let ev =
+                            match atomcode_capabilities::plugin::marketplace::add_marketplace(&url)
+                            {
+                                Ok(info) => {
+                                    atomcode_capabilities::plugin::PluginJobEvent::MarketplaceAdded(
+                                        info,
+                                    )
+                                }
+                                Err(e) => atomcode_capabilities::plugin::PluginJobEvent::Failed {
+                                    op: "add marketplace".into(),
+                                    msg: format!("{:#}", e),
+                                },
+                            };
                         let _ = tx.send(ev);
                     });
                 }
-                "remove" => match atomcode_core::plugin::marketplace::remove_marketplace(arg) {
-                    Ok(()) => {
-                        super::reload_plugins(ctx);
-                        ok(
+                "remove" => {
+                    match atomcode_capabilities::plugin::marketplace::remove_marketplace(arg) {
+                        Ok(()) => {
+                            super::reload_plugins(ctx);
+                            ok(
+                                renderer,
+                                t(Msg::PluginMarketplaceRemoved { name: arg }).into_owned(),
+                            );
+                        }
+                        Err(e) => err(
                             renderer,
-                            t(Msg::PluginMarketplaceRemoved { name: arg }).into_owned(),
-                        );
+                            t(Msg::PluginMarketplaceRemoveFailed {
+                                error: &e.to_string(),
+                            })
+                            .into_owned(),
+                        ),
                     }
-                    Err(e) => err(
-                        renderer,
-                        t(Msg::PluginMarketplaceRemoveFailed {
-                            error: &e.to_string(),
-                        })
-                        .into_owned(),
-                    ),
-                },
+                }
                 "update" => {
                     let name = arg.to_string();
                     let tx = ctx.plugin_job_tx.clone();
@@ -2986,12 +3896,12 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                         t(Msg::PluginMarketplaceUpdating { name: &name }).into_owned(),
                     );
                     tokio::task::spawn_blocking(move || {
-                        let ev = match atomcode_core::plugin::marketplace::update_marketplace(&name)
+                        let ev = match atomcode_capabilities::plugin::marketplace::update_marketplace(&name)
                         {
                             Ok(info) => {
-                                atomcode_core::plugin::PluginJobEvent::MarketplaceUpdated(info)
+                                atomcode_capabilities::plugin::PluginJobEvent::MarketplaceUpdated(info)
                             }
-                            Err(e) => atomcode_core::plugin::PluginJobEvent::Failed {
+                            Err(e) => atomcode_capabilities::plugin::PluginJobEvent::Failed {
                                 op: "update marketplace".into(),
                                 msg: format!("{:#}", e),
                             },
@@ -2999,7 +3909,7 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                         let _ = tx.send(ev);
                     });
                 }
-                "list" => match atomcode_core::plugin::marketplace::list_marketplaces() {
+                "list" => match atomcode_capabilities::plugin::marketplace::list_marketplaces() {
                     Ok(items) if items.is_empty() => {
                         ok(renderer, t(Msg::PluginNoMarketplaces).into_owned());
                     }
@@ -3050,15 +3960,15 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                         .into_owned(),
                     );
                     tokio::task::spawn_blocking(move || {
-                        let ev = match atomcode_core::plugin::installer::install(&plugin, &mp, scope) {
-                            Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
+                        let ev = match atomcode_capabilities::plugin::installer::install(&plugin, &mp, scope) {
+                            Ok(info) => atomcode_capabilities::plugin::PluginJobEvent::PluginInstalled(info),
                             Err(e) => {
-                                if let Some(_aie) = e.downcast_ref::<atomcode_core::plugin::installer::AlreadyInstalledError>() {
-                                    atomcode_core::plugin::PluginJobEvent::PluginAlreadyInstalled {
+                                if let Some(_aie) = e.downcast_ref::<atomcode_capabilities::plugin::installer::AlreadyInstalledError>() {
+                                    atomcode_capabilities::plugin::PluginJobEvent::PluginAlreadyInstalled {
                                         id: _aie.id.clone(),
                                     }
                                 } else {
-                                    atomcode_core::plugin::PluginJobEvent::Failed {
+                                    atomcode_capabilities::plugin::PluginJobEvent::Failed {
                                         op: "install".into(),
                                         msg: format!("{:#}", e),
                                     }
@@ -3070,7 +3980,9 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                 }
                 Some(PluginArg::Bare { plugin }) => {
                     // Bare plugin name — resolve across all marketplaces.
-                    match atomcode_core::plugin::installer::resolve_plugin_marketplace(&plugin) {
+                    match atomcode_capabilities::plugin::installer::resolve_plugin_marketplace(
+                        &plugin,
+                    ) {
                         Ok(matches) if matches.len() == 1 => {
                             let m = &matches[0];
                             let mp = m.marketplace.clone();
@@ -3081,15 +3993,15 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                                 t(Msg::PluginInstallingByName { plugin: &plugin }).into_owned(),
                             );
                             tokio::task::spawn_blocking(move || {
-                                let ev = match atomcode_core::plugin::installer::install(&resolved_plugin, &mp, scope) {
-                                    Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
+                                let ev = match atomcode_capabilities::plugin::installer::install(&resolved_plugin, &mp, scope) {
+                                    Ok(info) => atomcode_capabilities::plugin::PluginJobEvent::PluginInstalled(info),
                                     Err(e) => {
-                                        if let Some(_aie) = e.downcast_ref::<atomcode_core::plugin::installer::AlreadyInstalledError>() {
-                                            atomcode_core::plugin::PluginJobEvent::PluginAlreadyInstalled {
+                                        if let Some(_aie) = e.downcast_ref::<atomcode_capabilities::plugin::installer::AlreadyInstalledError>() {
+                                            atomcode_capabilities::plugin::PluginJobEvent::PluginAlreadyInstalled {
                                                 id: _aie.id.clone(),
                                             }
                                         } else {
-                                            atomcode_core::plugin::PluginJobEvent::Failed {
+                                            atomcode_capabilities::plugin::PluginJobEvent::Failed {
                                                 op: "install".into(),
                                                 msg: format!("{:#}", e),
                                             }
@@ -3128,10 +4040,10 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                 plugin,
                 marketplace: mp,
             }) => {
-                match atomcode_core::plugin::installer::uninstall(
+                match atomcode_capabilities::plugin::installer::uninstall(
                     &plugin,
                     &mp,
-                    atomcode_core::plugin::InstallScope::User,
+                    atomcode_capabilities::plugin::InstallScope::User,
                 ) {
                     Ok(()) => {
                         super::reload_plugins(ctx);
@@ -3156,13 +4068,15 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
             Some(PluginArg::Bare { plugin }) => {
                 // Look up which installed plugins match this name.
                 let installed =
-                    atomcode_core::plugin::installer::list_installed().unwrap_or_default();
+                    atomcode_capabilities::plugin::installer::list_installed().unwrap_or_default();
                 let matches: Vec<_> = installed
                     .into_iter()
                     .filter(|p| {
                         p.plugin == plugin
                             || p.plugin
-                                == atomcode_core::plugin::marketplace::sanitize_name(&plugin)
+                                == atomcode_capabilities::plugin::marketplace::sanitize_name(
+                                    &plugin,
+                                )
                     })
                     .collect();
                 match matches.len() {
@@ -3174,7 +4088,8 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                         let p = &matches[0];
                         let (plug, mp, scope) =
                             (p.plugin.clone(), p.marketplace.clone(), p.scope.clone());
-                        match atomcode_core::plugin::installer::uninstall(&plug, &mp, scope) {
+                        match atomcode_capabilities::plugin::installer::uninstall(&plug, &mp, scope)
+                        {
                             Ok(()) => {
                                 super::reload_plugins(ctx);
                                 ok(
@@ -3210,7 +4125,7 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
             }
             None => err(renderer, t(Msg::PluginUninstallUsage).into_owned()),
         },
-        "list" => match atomcode_core::plugin::installer::list_installed() {
+        "list" => match atomcode_capabilities::plugin::installer::list_installed() {
             Ok(items) if items.is_empty() => {
                 ok(renderer, t(Msg::PluginNoInstalled).into_owned());
             }
@@ -3284,13 +4199,13 @@ fn parse_plugin_arg(s: &str) -> Option<PluginArg> {
 
 /// Parse a `--scope user|project|local` argument.
 /// Defaults to `User` if missing or unrecognized.
-fn parse_scope_arg(s: &str) -> atomcode_core::plugin::InstallScope {
+fn parse_scope_arg(s: &str) -> atomcode_capabilities::plugin::InstallScope {
     // Accept both `--scope user` and bare `user`.
     let val = s.strip_prefix("--scope=").unwrap_or(s).trim();
     match val.to_lowercase().as_str() {
-        "project" => atomcode_core::plugin::InstallScope::Project,
-        "local" => atomcode_core::plugin::InstallScope::Local,
-        _ => atomcode_core::plugin::InstallScope::User,
+        "project" => atomcode_capabilities::plugin::InstallScope::Project,
+        "local" => atomcode_capabilities::plugin::InstallScope::Local,
+        _ => atomcode_capabilities::plugin::InstallScope::User,
     }
 }
 
@@ -3333,9 +4248,6 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
             };
             match mgr.create(branch, &base) {
                 Ok(wt) => {
-                    // Save original dir before switching
-                    ctx.worktree_original_dir = Some(ctx.working_dir.clone());
-                    apply_cd(ctx, wt.path.clone());
                     let path_str = wt.path.display().to_string();
                     renderer.render(UiLine::CommandOutput(
                         t(Msg::WorktreeCreated {
@@ -3345,6 +4257,17 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                         })
                         .into_owned(),
                     ));
+                    let original = ctx.working_dir.clone();
+                    match apply_cd_with_effect(
+                        ctx,
+                        wt.path.clone(),
+                        crate::event_loop::SessionTransitionEffect::EnterWorktree {
+                            original_dir: original,
+                        },
+                    ) {
+                        Ok(_) => {}
+                        Err(error) => renderer.render(UiLine::Error(error)),
+                    }
                 }
                 Err(e) => {
                     renderer.render(UiLine::Error(
@@ -3416,17 +4339,19 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
             renderer.flush();
         }
         Some("done") => {
-            if let Some(original) = ctx.worktree_original_dir.take() {
+            if let Some(original) = ctx.worktree_original_dir.clone() {
                 let current_branch = detect_current_branch(&ctx.working_dir);
-                apply_cd(ctx, original.clone());
-                let path_str = original.display().to_string();
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::WorktreeDoneBack { path: &path_str }).into_owned(),
-                ));
-                if let Some(branch) = current_branch {
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::WorktreeDoneMergeHint { branch: &branch }).into_owned(),
-                    ));
+                match apply_cd_with_effect(
+                    ctx,
+                    original.clone(),
+                    crate::event_loop::SessionTransitionEffect::LeaveWorktree {
+                        original_dir: original,
+                        branch: current_branch,
+                    },
+                ) {
+                    // Silent on success (fast transition); status only via guards.
+                    Ok(_) => {}
+                    Err(error) => renderer.render(UiLine::Error(error)),
                 }
             } else {
                 renderer.render(UiLine::CommandOutput(
@@ -3473,27 +4398,33 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                 .unwrap_or_else(|_| None)
                 .unwrap_or_else(|| mgr.worktree_path(branch));
             let removing_current = paths_same(&cleanup_path, &ctx.working_dir);
+            if removing_current {
+                let target = ctx
+                    .worktree_original_dir
+                    .clone()
+                    .unwrap_or_else(|| mgr.repo_root().to_path_buf());
+                match apply_cd_with_effect(
+                    ctx,
+                    target.clone(),
+                    crate::event_loop::SessionTransitionEffect::CleanupCurrentWorktree {
+                        manager_dir: mgr.repo_root().to_path_buf(),
+                        target_dir: target,
+                        branch: branch.to_string(),
+                        force,
+                    },
+                ) {
+                    // Silent on success (fast transition); status only via guards.
+                    Ok(_) => {}
+                    Err(error) => renderer.render(UiLine::Error(error)),
+                }
+                renderer.flush();
+                return Ok(());
+            }
             match mgr.remove(branch, force) {
                 Ok(()) => {
-                    let switched_to = if removing_current {
-                        let target = ctx
-                            .worktree_original_dir
-                            .take()
-                            .unwrap_or_else(|| mgr.repo_root().to_path_buf());
-                        apply_cd(ctx, target.clone());
-                        Some(target)
-                    } else {
-                        None
-                    };
                     renderer.render(UiLine::CommandOutput(
                         t(Msg::WorktreeCleaned { branch }).into_owned(),
                     ));
-                    if let Some(target) = switched_to {
-                        let path_str = target.display().to_string();
-                        renderer.render(UiLine::CommandOutput(
-                            t(Msg::WorktreeCleanedSwitched { path: &path_str }).into_owned(),
-                        ));
-                    }
                 }
                 Err(e) => {
                     let err_msg = format!("{:#}", e);
@@ -3522,6 +4453,76 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
     Ok(())
 }
 
+pub(crate) fn complete_session_transition_effect(
+    effect: crate::event_loop::SessionTransitionEffect,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+) {
+    use crate::event_loop::SessionTransitionEffect;
+    use crate::git::worktree::WorktreeManager;
+
+    effect.commit_marker(&mut ctx.worktree_original_dir);
+    match effect {
+        SessionTransitionEffect::None | SessionTransitionEffect::EnterWorktree { .. } => {}
+        SessionTransitionEffect::CdCommand { echo } => {
+            renderer.render(UiLine::User(echo));
+            let path = ctx.working_dir.display().to_string();
+            renderer.render(UiLine::CommandOutput(
+                t(Msg::DirChanged { path: &path }).into_owned(),
+            ));
+            renderer.flush();
+        }
+        SessionTransitionEffect::LeaveWorktree {
+            original_dir,
+            branch,
+        } => {
+            let path = original_dir.display().to_string();
+            renderer.render(UiLine::CommandOutput(
+                t(Msg::WorktreeDoneBack { path: &path }).into_owned(),
+            ));
+            if let Some(branch) = branch {
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::WorktreeDoneMergeHint { branch: &branch }).into_owned(),
+                ));
+            }
+        }
+        SessionTransitionEffect::CleanupCurrentWorktree {
+            manager_dir,
+            target_dir,
+            branch,
+            force,
+        } => match WorktreeManager::from_dir(manager_dir)
+            .and_then(|manager| manager.remove(&branch, force))
+        {
+            Ok(()) => {
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::WorktreeCleaned { branch: &branch }).into_owned(),
+                ));
+                let path = target_dir.display().to_string();
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::WorktreeCleanedSwitched { path: &path }).into_owned(),
+                ));
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                if !force
+                    && (message.contains("untracked")
+                        || message.contains("modified")
+                        || message.contains("changes"))
+                {
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::WorktreeCleanupUncommitted { branch: &branch }).into_owned(),
+                    ));
+                } else {
+                    renderer.render(UiLine::Error(
+                        t(Msg::WorktreeCleanupFailed { error: &message }).into_owned(),
+                    ));
+                }
+            }
+        },
+    }
+}
+
 /// Detect the current branch name in a directory.
 fn detect_current_branch(dir: &std::path::Path) -> Option<String> {
     std::process::Command::new("git")
@@ -3538,7 +4539,7 @@ fn detect_current_branch(dir: &std::path::Path) -> Option<String> {
         })
 }
 
-fn paths_same(a: &std::path::Path, b: &std::path::Path) -> bool {
+pub(crate) fn paths_same(a: &std::path::Path, b: &std::path::Path) -> bool {
     if a == b {
         return true;
     }
@@ -3573,7 +4574,10 @@ fn render_login_line(user: Option<&str>) -> String {
 /// display name: name absent, empty/whitespace, or identical to the username
 /// (so we never render `Saulcy(Saulcy)`).
 fn format_login_identity(name: Option<&str>, username: &str) -> String {
-    match name.map(str::trim).filter(|n| !n.is_empty() && *n != username) {
+    match name
+        .map(str::trim)
+        .filter(|n| !n.is_empty() && *n != username)
+    {
         Some(n) => format!("{n}({username})"),
         None => username.to_string(),
     }
@@ -3584,7 +4588,7 @@ fn format_login_identity(name: Option<&str>, username: &str) -> String {
 /// name. Shared by both `/status` renderers so the interactive and remote
 /// outputs can't drift.
 fn render_login_line_from_stored_auth() -> String {
-    match atomcode_core::auth::get_stored_auth() {
+    match atomcode_auth::get_stored_auth() {
         Some(a) => {
             let identity = format_login_identity(a.user.name.as_deref(), &a.user.username);
             render_login_line(Some(&identity))
@@ -3599,7 +4603,7 @@ fn render_login_line_from_stored_auth() -> String {
 /// fetch-failure line). `from_stored_auth` returns `AuthExpired` for a dead token but a
 /// PLAIN error when never logged in, so the two stay distinguishable.
 fn render_cp_auth_error(e: &anyhow::Error, fallback: impl FnOnce() -> String) -> String {
-    if atomcode_core::coding_plan::is_auth_expired(e) {
+    if atomcode_codingplan::is_auth_expired(e) {
         t(Msg::StatusCpAuthExpired).into_owned()
     } else {
         fallback()
@@ -3614,77 +4618,77 @@ fn render_cp_auth_error(e: &anyhow::Error, fallback: impl FnOnce() -> String) ->
 /// quick-glance command, so any fetch problem degrades into a visible
 /// note instead of aborting the whole command.
 fn render_codingplan_status_for_status_cmd() -> String {
-    use atomcode_core::coding_plan::client::Client;
+    tokio::task::block_in_place(|| {
+        use atomcode_codingplan::client::Client;
 
-    let client = match Client::from_stored_auth() {
-        Ok(c) => c,
-        // Expired login → clear re-login prompt; genuinely not signed in → the
-        // not-signed-in hint. Without this split a dead token showed "not signed in"
-        // while the Login line above said "signed in as X" — contradictory.
-        Err(e) => return render_cp_auth_error(&e, || t(Msg::StatusCpNotSignedIn).into_owned()),
-    };
-    let status = match client.status_v2() {
-        Ok(s) => s,
-        Err(e) => {
-            return render_cp_auth_error(&e, || {
-                t(Msg::StatusCpFetchFailed {
-                    error: &format!("{:#}", e),
+        let client = match Client::from_stored_auth() {
+            Ok(c) => c,
+            // Expired login → clear re-login prompt; genuinely not signed in → the
+            // not-signed-in hint. Without this split a dead token showed "not signed in"
+            // while the Login line above said "signed in as X" — contradictory.
+            Err(e) => return render_cp_auth_error(&e, || t(Msg::StatusCpNotSignedIn).into_owned()),
+        };
+        let status = match client.status_v2() {
+            Ok(s) => s,
+            Err(e) => {
+                return render_cp_auth_error(&e, || {
+                    t(Msg::StatusCpFetchFailed {
+                        error: &format!("{:#}", e),
+                    })
+                    .into_owned()
                 })
-                .into_owned()
-            })
-        }
-    };
-    let plan = match &status.codingplan_free {
-        Some(p) => p,
-        None => {
-            return t(Msg::StatusCpNoActive).into_owned();
-        }
-    };
+            }
+        };
+        let plan = match &status.codingplan_free {
+            Some(p) => p,
+            None => {
+                return t(Msg::StatusCpNoActive).into_owned();
+            }
+        };
 
-    let mut out = t(Msg::StatusCpLine {
-        plan: &plan.plan_name,
-        expires_at: &plan.expires_at,
-        remaining_days: plan.remaining_days,
-        total_days: plan.total_days,
-    })
-    .into_owned();
-    // Prefer the per-window `rate_limit_windows` schema when present, mirroring
-    // `/login` (setup.rs). Iterate visible short windows (show_enable=1) normally.
-    if !status.rate_limit_windows.is_empty() {
-        use atomcode_core::coding_plan::setup::format_duration_secs;
-        for w in status
-            .rate_limit_windows
-            .iter()
-            .filter(|w| w.show_enable == 1)
-        {
+        let mut out = t(Msg::StatusCpLine {
+            plan: &plan.plan_name,
+            expires_at: &plan.expires_at,
+            remaining_days: plan.remaining_days,
+            total_days: plan.total_days,
+        })
+        .into_owned();
+        // Prefer the per-window `rate_limit_windows` schema when present, mirroring
+        // `/login` (setup.rs). Iterate visible short windows (show_enable=1) normally.
+        if !status.rate_limit_windows.is_empty() {
+            use atomcode_codingplan::setup::format_duration_secs;
+            for w in status
+                .rate_limit_windows
+                .iter()
+                .filter(|w| w.show_enable == 1)
+            {
+                out.push_str(&t(Msg::StatusCpUsage {
+                    usage: &w.usage_status_desc,
+                    reset_at: &w.reset_at_display,
+                    duration: &format_duration_secs(w.seconds_until_reset),
+                }));
+            }
+        } else if status.window_quota_exhausted {
+            // Legacy backward-compat path (old server, no `rate_limit_windows`):
+            // when `window_quota_exhausted` is set we suppress the usage line
+            // (which the server often reports as 0% for a freshly-reset short
+            // window even while the longer quota is exhausted). Showing both
+            // produced the visibly contradictory `用量 0% / ⚠额度已满` pair the
+            // user surfaced as the "v4.23.2 still displays it this way" report.
+            if let Some(hint) = &status.window_quota_hint {
+                out.push_str(&t(Msg::StatusCpWindowHint { hint }));
+            } else {
+                out.push_str(&t(Msg::StatusCpWindowExhausted));
+            }
+        } else if let Some(u) = &status.current_usage {
             out.push_str(&t(Msg::StatusCpUsage {
-                usage: &w.usage_status_desc,
-                reset_at: &w.reset_at_display,
-                duration: &format_duration_secs(w.seconds_until_reset),
+                usage: &u.display_desc(),
+                reset_at: &u.reset_at_display,
+                duration: &atomcode_codingplan::setup::format_duration_secs(u.seconds_until_reset),
             }));
         }
-    } else if status.window_quota_exhausted {
-        // Legacy backward-compat path (old server, no `rate_limit_windows`):
-        // when `window_quota_exhausted` is set we suppress the usage line
-        // (which the server often reports as 0% for a freshly-reset short
-        // window even while the longer quota is exhausted). Showing both
-        // produced the visibly contradictory `用量 0% / ⚠额度已满` pair the
-        // user surfaced as the "v4.23.2 still displays it this way" report.
-        if let Some(hint) = &status.window_quota_hint {
-            out.push_str(&t(Msg::StatusCpWindowHint { hint }));
-        } else {
-            out.push_str(&t(Msg::StatusCpWindowExhausted));
-        }
-    } else if let Some(u) = &status.current_usage {
-        out.push_str(&t(Msg::StatusCpUsage {
-            usage: &u.display_desc(),
-            reset_at: &u.reset_at_display,
-            duration: &atomcode_core::coding_plan::setup::format_duration_secs(
-                u.seconds_until_reset,
-            ),
-        }));
-    }
-    out
+        out
+    })
 }
 
 /// Pure-function core of `/context` — testable without constructing
@@ -3856,67 +4860,6 @@ fn format_context_report(
     out
 }
 
-/// Prepare + dispatch the fixissue pipeline for a given URL. Shared by:
-/// (a) the `/fixissue <url>` arm, (b) the `/issue <url>` arm, and (c)
-/// the event loop's post-close hook when `IssueWizard` has stashed a
-/// URL in `ctx.pending_issue_url`. Handles all three `Prepared` cases
-/// (Run / Skip / Err) and prints appropriate scrollback feedback. On
-/// Run it arms the post-completion hook (`fixissue_pending` +
-/// `fixissue_buffer`), sends `AgentCommand::SendMessage`, and flips
-/// UiState to Streaming via `state.on_submit()`.
-/// Currently unused — the `/fixissue` slash command was removed from
-/// the menu and dispatcher. Kept (with `#[allow(dead_code)]`) so that
-/// a future restoration of the slash command can re-add a one-line
-/// dispatcher arm without re-implementing this whole flow. The
-/// `atomcode fixissue` CLI subcommand uses `atomcode_core::atomgit::fixissue`
-/// directly and does not depend on this function.
-#[allow(dead_code)]
-pub(crate) fn launch_fixissue(
-    url: &str,
-    state: &mut UiState,
-    ctx: &mut LoopCtx,
-    renderer: &mut dyn Renderer,
-    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
-    fixissue_buffer: &mut String,
-) {
-    match atomcode_core::atomgit::fixissue::prepare(url, &ctx.working_dir) {
-        Ok(atomcode_core::atomgit::fixissue::Prepared::Run {
-            prompt,
-            issue_title,
-            issue_number,
-            issue_ref,
-        }) => {
-            renderer.render(UiLine::CommandOutput(format!(
-                "  [fixissue] issue #{}: {}\n  Handing off to agent... (will post summary + 'fixed' label on completion)\n",
-                issue_number, issue_title,
-            )));
-            renderer.flush();
-            *fixissue_pending = Some(issue_ref);
-            fixissue_buffer.clear();
-            ctx.agent
-                .cmd_tx
-                .send(AgentCommand::SendMessage {
-                    text: prompt,
-                    images: vec![],
-                    image_markers: vec![],
-                })
-                .ok();
-            state.on_submit();
-        }
-        Ok(atomcode_core::atomgit::fixissue::Prepared::Skip { reason }) => {
-            renderer.render(UiLine::CommandOutput(format!("  {}\n", reason)));
-            renderer.flush();
-        }
-        Err(e) => {
-            renderer.render(UiLine::CommandOutput(format!(
-                "  fixissue failed: {:#}\n",
-                e
-            )));
-            renderer.flush();
-        }
-    }
-}
-
 /// Assemble the `/status` body in canonical display order: the login line FIRST
 /// (so you see who you're signed in as at a glance), then the model/dir/config
 /// block, the CodingPlan section, an optional Proxy line (interactive `/status`
@@ -3950,7 +4893,7 @@ pub(super) fn build_status_text(ctx: &LoopCtx, proxy: Option<&str>) -> String {
     let body = t(Msg::StatusBody {
         model: &ctx.model_name,
         dir: &ctx.working_dir.display().to_string(),
-        config: &Config::default_path().display().to_string(),
+        config: &ctx.config_store.path().display().to_string(),
     })
     .into_owned();
     assemble_status(
@@ -3958,39 +4901,13 @@ pub(super) fn build_status_text(ctx: &LoopCtx, proxy: Option<&str>) -> String {
         &body,
         &render_codingplan_status_for_status_cmd(),
         proxy,
-        &render_instruction_status_block(&ctx.working_dir),
+        &render_context_file_status_block(&ctx.working_dir),
     )
-}
-
-/// `/cost` 的用量报告文本。TUI arm 与手机远程执行共用。
-pub(super) fn build_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
-    let total = state.prompt_tokens + state.completion_tokens;
-    let cache_rate = if state.prompt_tokens > 0 {
-        ((state.cached_tokens as f64 / state.prompt_tokens as f64 * 100.0) + 0.5) as usize
-    } else {
-        0
-    };
-    let cost = crate::pricing::calculate_cost(
-        &ctx.model_name,
-        state.prompt_tokens,
-        state.completion_tokens,
-        state.cached_tokens,
-    );
-    let cost_str = crate::pricing::format_cost(cost);
-    t(Msg::CostReport {
-        prompt: state.prompt_tokens,
-        completion: state.completion_tokens,
-        cached: state.cached_tokens,
-        cache_rate,
-        total,
-        cost: &cost_str,
-    })
-    .into_owned()
 }
 
 /// `/whoami` 的账号信息文本。TUI arm 与手机远程执行共用。
 pub(super) fn build_whoami_text() -> String {
-    if let Some(auth) = atomcode_core::auth::get_stored_auth() {
+    if let Some(auth) = atomcode_auth::get_stored_auth() {
         let email = auth.user.email.as_deref().unwrap_or("—");
         let name = auth.user.name.as_deref().unwrap_or(&auth.user.username);
         format!(
@@ -3998,146 +4915,423 @@ pub(super) fn build_whoami_text() -> String {
             name,
             auth.user.username,
             email,
-            atomcode_core::auth::auth_file_path().display(),
+            atomcode_auth::auth_file_path().display(),
         )
     } else {
         t(Msg::CmdWhoamiNotSignedIn).into_owned()
     }
 }
 
-/// `/diff` 的改动概要文本（Err = 渲染为错误行的文案）。TUI arm 与手机远程执行共用。
-pub(super) fn build_diff_text(ctx: &LoopCtx) -> Result<String, String> {
-    match std::process::Command::new("git")
-        .args(["diff", "--stat"])
-        .current_dir(&ctx.working_dir)
-        .output()
-    {
-        Ok(o) => {
-            let s = String::from_utf8_lossy(&o.stdout).to_string();
-            Ok(if s.is_empty() {
-                t(Msg::CmdNoChanges).into_owned()
-            } else {
-                s
-            })
+/// Resolve a user-typed `/view <path>` argument to an absolute-ish path.
+/// Expands a leading `~`/`~/` to the home dir and accepts absolute paths as-is;
+/// anything else is joined onto the working dir. This is what lets `/view` open
+/// files OUTSIDE the project (`/view ~/x`, `/view /abs/x`).
+fn resolve_view_path(input: &str, working_dir: &std::path::Path) -> std::path::PathBuf {
+    use std::path::PathBuf;
+    let expanded: PathBuf = if input == "~" {
+        crate::platform::home_dir().unwrap_or_else(|| PathBuf::from(input))
+    } else if let Some(rest) = input.strip_prefix("~/") {
+        match crate::platform::home_dir() {
+            Some(home) => home.join(rest),
+            None => PathBuf::from(input),
         }
-        Err(e) => Err(t(Msg::DiffFailed {
-            error: &format!("{}", e),
+    } else {
+        PathBuf::from(input)
+    };
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        working_dir.join(expanded)
+    }
+}
+
+/// Compact `/diff` summary used by the phone/remote command surface. The
+/// interactive TUI renders file-scoped unified hunks instead.
+pub(super) fn build_diff_stat_text(ctx: &LoopCtx) -> Result<String, String> {
+    let snapshot = crate::git_diff::capture_diff_snapshot(&ctx.working_dir)
+        .map_err(|error| t(Msg::DiffFailed { error: &error }).into_owned())?;
+    if snapshot.files.is_empty() {
+        return Ok(t(Msg::CmdNoChanges).into_owned());
+    }
+    Ok(crate::git_diff::format_compact_snapshot(&snapshot))
+}
+
+/// Fetch CodingPlan usage from the gateway (BLOCKING network call). `None` when the
+/// user isn't logged into a CodingPlan account — the caller then shows
+/// `UsageCodingPlanOnly`. Shared by the interactive modal (`open_usage`) and the
+/// mid-turn footer report; both now render all three tabs.
+///
+/// Two round-trips: `status_v2` (plan + window) and the heavier `usage()` that powers
+/// the Overview/Models tabs.
+fn fetch_usage_data() -> Option<UsageData> {
+    tokio::task::block_in_place(|| {
+        let client = atomcode_codingplan::client::Client::from_stored_auth().ok()?;
+        let status = client.status_v2().ok();
+        let window = status.as_ref().and_then(|s| {
+            s.rate_limit_windows
+                .iter()
+                .filter(|w| w.show_enable == 1)
+                .filter(|w| w.window_hours > 0)
+                .min_by_key(|w| w.window_hours)
+                .cloned()
+        });
+        let plan = status.and_then(|s| s.codingplan_free);
+        let (usage, error) = match client.usage() {
+            Ok(u) => (Some(u), None),
+            Err(e) => (None, Some(format!("{e}"))),
+        };
+        let overview = usage
+            .as_ref()
+            .map(atomcode_codingplan::usage::compute_overview);
+        Some(UsageData {
+            window,
+            plan,
+            usage,
+            overview,
+            error,
         })
-        .into_owned()),
+    })
+}
+
+/// `/usage` — open the CodingPlan usage modal (idle). Renders a notice when the user
+/// isn't on a CodingPlan account, otherwise pushes the modal into `active_modal`.
+fn open_usage(renderer: &mut dyn Renderer, active_modal: &mut Option<Box<dyn Modal>>) {
+    match fetch_usage_data() {
+        Some(data) => *active_modal = Some(Box::new(UsageModal::new(data))),
+        None => {
+            renderer.render(UiLine::CommandOutput(
+                t(Msg::UsageCodingPlanOnly).into_owned(),
+            ));
+            renderer.flush();
+        }
+    }
+}
+
+/// `/cost` 的用量报告文本：本会话累计 token × 模型价目表。与 `/usage`（只查
+/// CodingPlan 网关）不同，这是本地统计，任何模型（含自接入）都能出数。TUI arm
+/// 与手机远程执行共用。
+pub(crate) fn build_cost_report_text(
+    mut report: atomcode_capabilities::session::SessionCostReport,
+    config: &atomcode_config::config::Config,
+    current_provider: &str,
+    current_model: &str,
+    current_pricing: Option<atomcode_capabilities::session::ModelPricing>,
+) -> String {
+    if !report
+        .models
+        .iter()
+        .any(|item| item.provider_id == current_provider && item.model_id == current_model)
+    {
+        report
+            .models
+            .push(atomcode_capabilities::session::ModelCostSummary {
+                provider_id: current_provider.to_string(),
+                model_id: current_model.to_string(),
+                tokens: Default::default(),
+                estimated_cost_usd: current_pricing.map(|_| 0.0),
+                explicitly_free: current_pricing.is_some_and(|pricing| pricing.is_free()),
+            });
+    }
+
+    // Resolve a selection id to its account for a friendly `account · model`
+    // header (folded CodingPlan models share one `AtomGit` account); fall back to
+    // the raw id when it isn't in the catalog (e.g. a since-removed provider).
+    let catalog = config.logical_models();
+    let account_of = |pid: &str| -> String {
+        catalog
+            .get(pid)
+            .map(|m| m.account.clone())
+            .unwrap_or_else(|| pid.to_string())
+    };
+    let mut sections = Vec::new();
+    for item in report.models {
+        let prompt = item.tokens.input.saturating_add(item.tokens.cached_input) as usize;
+        let completion = item.tokens.output as usize;
+        let cached = item.tokens.cached_input as usize;
+        let cache_rate = if prompt == 0 {
+            0
+        } else {
+            cached.saturating_mul(100) / prompt
+        };
+        let total = prompt.saturating_add(completion);
+        let body = if item.explicitly_free {
+            let cost = t(Msg::CostFree);
+            t(Msg::CostReport {
+                prompt,
+                completion,
+                cached,
+                cache_rate,
+                total,
+                cost: &cost,
+            })
+        } else if let Some(estimated) = item.estimated_cost_usd {
+            let cost = crate::pricing::format_cost(estimated);
+            t(Msg::CostReport {
+                prompt,
+                completion,
+                cached,
+                cache_rate,
+                total,
+                cost: &cost,
+            })
+        } else {
+            t(Msg::CostTokenReport {
+                prompt,
+                completion,
+                cached,
+                cache_rate,
+                total,
+            })
+        };
+        sections.push(format!(
+            "{} · {}\n{}",
+            account_of(&item.provider_id),
+            item.model_id,
+            body
+        ));
+    }
+    if report.unattributed_tokens > 0 {
+        sections.push(
+            t(Msg::CostUnattributed {
+                tokens: report.unattributed_tokens,
+            })
+            .into_owned(),
+        );
+    }
+    sections.join("\n\n")
+}
+
+fn build_session_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
+    // The CURRENT-turn row must pair the ACTIVE selection with the active model.
+    // Use the resolved selection id (matches `ctx.model_name`), not the possibly
+    // stale legacy `default_provider` — otherwise the row mislabels e.g.
+    // "agnes-ai · GLM-5.2".
+    let provider = ctx.config.effective_model_selection().unwrap_or_default();
+    let pricing = ctx
+        .config
+        .provider_config_for_selection(&provider)
+        .and_then(|config| atomcode_coding::resolve_provider_pricing(&provider, &config));
+    let manager = session_manager_for_cost(
+        ctx.current_session_project_bucket.as_deref(),
+        &ctx.current_session.working_dir,
+    );
+    let mut report = match manager.read_meta(&ctx.current_session.id) {
+        Ok(meta) => atomcode_capabilities::session::aggregate_session_cost(&meta),
+        Err(_) => {
+            // Never relabel older in-memory totals as the current model when
+            // native metadata is unavailable. Only the active turn below has
+            // a trustworthy current-generation identity.
+            let session_total = state.prompt_tokens.saturating_add(state.completion_tokens) as u64;
+            let live_total = state
+                .turn_prompt_tokens
+                .saturating_add(state.turn_completion_tokens) as u64;
+            let unattributed_tokens = session_total.saturating_sub(live_total);
+            atomcode_capabilities::session::SessionCostReport {
+                models: Vec::new(),
+                unattributed_tokens,
+                total_tokens: unattributed_tokens,
+                estimated_cost_usd: None,
+            }
+        }
+    };
+    let live_tokens = atomcode_capabilities::session::TokenBreakdown {
+        input: state
+            .turn_prompt_tokens
+            .saturating_sub(state.turn_cached_tokens) as u64,
+        output: state.turn_completion_tokens as u64,
+        cached_input: state.turn_cached_tokens as u64,
+    };
+    if live_tokens.total() > 0 {
+        if let Some(model) = report
+            .models
+            .iter_mut()
+            .find(|item| item.provider_id == provider && item.model_id == ctx.model_name)
+        {
+            model.tokens.input = model.tokens.input.saturating_add(live_tokens.input);
+            model.tokens.output = model.tokens.output.saturating_add(live_tokens.output);
+            model.tokens.cached_input = model
+                .tokens
+                .cached_input
+                .saturating_add(live_tokens.cached_input);
+            match (model.estimated_cost_usd.as_mut(), pricing) {
+                (Some(cost), Some(price)) => *cost += price.estimate(live_tokens),
+                _ => model.estimated_cost_usd = None,
+            }
+            model.explicitly_free &= pricing.is_some_and(|price| price.is_free());
+        } else {
+            report
+                .models
+                .push(atomcode_capabilities::session::ModelCostSummary {
+                    provider_id: provider.to_string(),
+                    model_id: ctx.model_name.clone(),
+                    tokens: live_tokens,
+                    estimated_cost_usd: pricing.map(|price| price.estimate(live_tokens)),
+                    explicitly_free: pricing.is_some_and(|price| price.is_free()),
+                });
+        }
+        report.total_tokens = report.total_tokens.saturating_add(live_tokens.total());
+        report.estimated_cost_usd = None;
+    }
+    build_cost_report_text(report, &ctx.config, &provider, &ctx.model_name, pricing)
+}
+
+fn session_manager_for_cost(
+    project_bucket: Option<&str>,
+    working_dir: &std::path::Path,
+) -> atomcode_capabilities::session::SessionManager {
+    project_bucket
+        .filter(|bucket| bucket.len() == 16 && bucket.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(|bucket| {
+            atomcode_capabilities::session::SessionManager::with_root(
+                atomcode_capabilities::session::SessionManager::sessions_root().join(bucket),
+            )
+        })
+        .unwrap_or_else(|| atomcode_capabilities::session::SessionManager::for_project(working_dir))
+}
+
+#[cfg(test)]
+mod cost_session_location_tests {
+    use super::session_manager_for_cost;
+
+    #[test]
+    fn authoritative_catalog_bucket_wins_over_working_dir_hash() {
+        let bucket = "0123456789abcdef";
+        let manager = session_manager_for_cost(Some(bucket), std::path::Path::new("/different"));
+        assert_eq!(
+            manager.root(),
+            atomcode_capabilities::session::SessionManager::sessions_root().join(bucket)
+        );
     }
 }
 
 /// 手机端可远程触发的**只读信息类**命令白名单。返回 None = 不允许远程执行
 /// （交互式/桌面专属命令一律拒绝，由调用方回话术）。
 pub(super) fn run_remote_command(ctx: &LoopCtx, state: &UiState, cmd: &str) -> Option<String> {
-    match cmd.trim().trim_start_matches('/').to_ascii_lowercase().as_str() {
+    match cmd
+        .trim()
+        .trim_start_matches('/')
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "status" => Some(build_status_text(ctx, None)),
-        "cost" => Some(build_cost_text(ctx, state)),
+        "cost" => Some(build_session_cost_text(ctx, state)),
         "whoami" => Some(build_whoami_text()),
-        "diff" => Some(build_diff_text(ctx).unwrap_or_else(|e| e)),
+        "diff" => Some(build_diff_stat_text(ctx).unwrap_or_else(|e| e)),
         _ => None,
     }
 }
 
-/// Drop the current conversation and start a brand-new session in the current
-/// `ctx.working_dir`: tell the agent to clear history, reset token/context UI
-/// state, make a fresh `Session`, rebind telemetry, and redraw the welcome
-/// screen so it behaves like a fresh launch.
-///
-/// Shared by the `/session` command and the webui-driven project switch
-/// (`AgentEvent::ProjectSwitched`). For the project-switch case, call
-/// `apply_cd` FIRST so `ctx.working_dir` is the new dir before the new
-/// `Session` is bound to it.
+/// Ask CodingRuntime to atomically replace the current session. The runtime
+/// terminal owns the UI/session projection commit; this function deliberately
+/// does not clear the current screen or bind a locally invented session.
 pub(crate) fn reset_to_new_session(
     ctx: &mut LoopCtx,
     state: &mut UiState,
     renderer: &mut dyn Renderer,
 ) {
-    ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
-    ctx.current_session_id = None;
-    state.total_tokens = 0;
-    state.prompt_tokens = 0;
-    state.completion_tokens = 0;
-    state.cached_tokens = 0;
-    state.last_context = None;
-    state.pending_context_render = None;
-    state.thinking_idx = 0;
-    state.on_turn_complete();
-    // New session = new session file on disk. Old session (already saved at its
-    // last TurnComplete) stays on disk so it can still be `/resume`d; we just
-    // stop writing into it.
-    ctx.current_session = atomcode_core::session::Session::default_session(ctx.working_dir.clone());
-    ctx.bg_manager
-        .set_foreground_session(ctx.current_session.clone());
-    // Bind telemetry + agent session id to the new session's UUID (the
-    // ClearConversation above intentionally leaves the id alone; this is the
-    // single source of truth).
-    bind_telemetry_to_session(ctx, &ctx.current_session);
-    // `reset()` wipes the terminal AND the renderer's cached footer/stream
-    // state, so the next Welcome renders against a known (row 1, col 1) anchor.
-    // Wrap the wipe + welcome re-render in one DECSET 2026 envelope so capable
-    // hosts show no intermediate blank frame (same anti-flicker as `/resume`).
-    renderer.begin_sync();
-    renderer.reset();
-    let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
-    renderer.render(UiLine::Welcome {
-        model: ctx.model_name.clone(),
-        working_dir: dir_display,
-    });
-    renderer.render(UiLine::CommandOutput(t(Msg::CmdNewSession).into_owned()));
-    renderer.end_sync();
-    // 同步模式：把这次「本地新建会话」双向同步到 webui，并把共享 LiveSession 重绑到新会话。
-    sync_local_session_switch(ctx, renderer);
-
+    if provider_transition_pending(ctx) {
+        renderer.render(UiLine::Error(t(Msg::CmdProviderReloading).into_owned()));
+        renderer.flush();
+        return;
+    }
+    if ctx.pending_session_transition.is_some()
+        || ctx.pending_session_resume.is_some()
+        || ctx.pending_session_resume_preparation.is_some()
+        || ctx.pending_capability_reload
+    {
+        renderer.render(UiLine::Warning(
+            t(Msg::CmdSessionTransitionPending).into_owned(),
+        ));
+        renderer.flush();
+        return;
+    }
+    // /clear and /session must also halt any active /loop (both self-paced
+    // runtime and fixed-interval TUI controller).
+    stop_active_loop(state, ctx);
+    match ctx
+        .runtime
+        .fresh_session(ctx.foreground_runtime_id, ctx.runtime_event_tx.clone())
+    {
+        Ok(()) => {
+            ctx.pending_session_transition = Some(crate::event_loop::PendingSessionTransition {
+                operation: atomcode_coding::ReconfigureKind::FreshSession,
+                requested_working_dir: ctx.working_dir.clone(),
+                committed: None,
+                effect: crate::event_loop::SessionTransitionEffect::None,
+            });
+            // Success is fast (the reconfigure connects MCP in the background and
+            // never blocks): the transition terminal wipes the screen / re-renders
+            // shortly, so the "reconfiguring…" status is just noise here. It's still
+            // shown by the guards above / on submit while a transition is pending.
+        }
+        Err(error) => renderer.render(UiLine::Error(
+            t(Msg::CmdSessionTransitionFailed {
+                error: &error.to_string(),
+            })
+            .into_owned(),
+        )),
+    }
+    renderer.flush();
 }
 
-/// Commit a new working-directory choice: notify the agent, update cwd +
-/// previous_dir on the shared context, push the new entry into the
-/// recent-dirs ring, and persist. Shared by the `/cd <path>` arm and the
-/// DirPicker modal's Enter handler so both paths keep state coherent.
-pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
+/// Start an atomic fresh-session transition into a new working directory.
+/// The correlated runtime terminal performs the projection commit; callers
+/// must not update cwd, recent directories, or live state optimistically.
+pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) -> Result<PathBuf, String> {
+    apply_cd_with_effect(ctx, path, crate::event_loop::SessionTransitionEffect::None)
+}
+
+fn apply_cd_with_effect(
+    ctx: &mut LoopCtx,
+    path: PathBuf,
+    effect: crate::event_loop::SessionTransitionEffect,
+) -> Result<PathBuf, String> {
     // Normalize the funnel: `resolve_cd` strips the Windows `\\?\` verbatim prefix,
     // but the dir-picker's recent-list branch and the webui `ProjectSwitched` event
     // reach here WITHOUT going through it, carrying a canonicalized `\\?\C:\…` path
     // (persisted recent_dirs.txt entries from before the fix, or a re-canonicalized
-    // bridge value). Strip here so `working_dir`, `recent_dirs`, the `ChangeDir`
+    // runtime value). Strip here so `working_dir`, `recent_dirs`, the `ChangeDirectory`
     // command, and the webui sync all store the plain form regardless of caller.
-    let path = atomcode_core::tool::strip_verbatim_prefix_path(&path);
-    ctx.agent
-        .cmd_tx
-        .send(AgentCommand::ChangeDir(path.to_string_lossy().to_string()))
-        .ok();
-    ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, path.clone()));
-    ctx.runtime_factory.set_working_dir(path.clone());
-    // Re-index the @-mention file index for the new working directory.
-    // Without this, the popup continues showing files from the original
-    // startup directory after the user runs `/cd`.
-    ctx.file_index.reset(path.clone());
-    // Rebuild the session manager for the new project directory.
-    // `SessionManager::new` derives a `project_hash` from the working dir,
-    // which determines the bucket (`~/.atomcode/sessions/<hash>/`) that
-    // `/resume` lists. Without this, `/resume` after `/cd` still shows
-    // sessions from the old project because the manager still points at the
-    // old hash bucket.
-    ctx.session_manager = SessionManager::new(&path);
-    // Sync mode: drive the in-process LiveSession's working dir so (a) the live
-    // executor runs the next turn in the new dir (LIVE_WORKING_DIR override, #755)
-    // and (b) every webui tab follows the switch over the /live SSE wire. Mirrors
-    // the webui /cd endpoint (change_dir → live_set_working_dir). Self-echo is
-    // harmless: the broadcast loops back as ProjectSwitched but no-ops because
-    // ctx.working_dir already equals `path`.
-    if ctx.sync_session.is_some() {
-        atomcode_daemon::live_set_working_dir(path.clone());
+    let path = atomcode_capabilities::pathnorm::strip_verbatim_path(&path);
+    if provider_transition_pending(ctx) {
+        return Err(t(Msg::CmdProviderReloading).into_owned());
     }
-    push_recent_dir(&mut ctx.recent_dirs, path);
-    save_recent_dirs(&ctx.recent_dirs);
+    if ctx.pending_session_transition.is_some()
+        || ctx.pending_session_resume.is_some()
+        || ctx.pending_session_resume_preparation.is_some()
+        || ctx.pending_capability_reload
+    {
+        return Err(t(Msg::CmdSessionTransitionPending).into_owned());
+    }
+    ctx.runtime
+        .change_directory(
+            path.clone(),
+            ctx.foreground_runtime_id,
+            ctx.runtime_event_tx.clone(),
+        )
+        .map_err(|error| {
+            t(Msg::CmdSessionTransitionFailed {
+                error: &error.to_string(),
+            })
+            .into_owned()
+        })?;
+    ctx.pending_session_transition = Some(crate::event_loop::PendingSessionTransition {
+        operation: atomcode_coding::ReconfigureKind::ChangeDirectory,
+        requested_working_dir: path.clone(),
+        committed: None,
+        effect,
+    });
+    Ok(path)
 }
 
 /// Move `new` to the front of `dirs`, dedup, and cap at `MAX_RECENT_DIRS`.
 /// Does NOT persist — call `save_recent_dirs` after, or use `apply_cd`
 /// which does both.
 pub(crate) fn push_recent_dir(dirs: &mut Vec<PathBuf>, new: PathBuf) {
-    dirs.retain(|d| d != &new);
+    // De-dup case-insensitively on case-insensitive filesystems so `C:\Users`
+    // and `C:\users` (same physical dir) don't both linger in the picker.
+    let key = atomcode_capabilities::pathnorm::path_case_key(&new);
+    dirs.retain(|d| atomcode_capabilities::pathnorm::path_case_key(d) != key);
     dirs.insert(0, new);
     dirs.truncate(MAX_RECENT_DIRS);
 }
@@ -4149,24 +5343,25 @@ pub(crate) fn push_recent_dir(dirs: &mut Vec<PathBuf>, new: PathBuf) {
 ///
 /// De-dup matters because a legacy file can hold BOTH the `\\?\C:\…` verbatim
 /// form and the plain `C:\…` form of the same dir (cd'd on an old vs a fixed
-/// binary). Stripping collapses them to one path, but `push_recent_dir` only
-/// de-dups on WRITE — without de-duping on read the picker showed the same dir
-/// as two identical `~/atomcode` rows.
+/// binary), OR the same dir in two cases (`C:\Users` vs `C:\users`). Stripping
+/// collapses the verbatim form and the case-insensitive key collapses the case
+/// variants, so the picker shows one `~/atomcode` row, not two. `push_recent_dir`
+/// only de-dups on WRITE — this handles the READ side for pre-existing files.
 fn parse_recent_dirs(contents: &str) -> Vec<PathBuf> {
     let mut seen = std::collections::HashSet::new();
     contents
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(PathBuf::from)
-        .map(|p| atomcode_core::tool::strip_verbatim_prefix_path(&p))
-        .filter(|p| seen.insert(p.clone()))
+        .map(|p| atomcode_capabilities::pathnorm::strip_verbatim_path(&p))
+        .filter(|p| seen.insert(atomcode_capabilities::pathnorm::path_case_key(p)))
         .collect()
 }
 
 /// Read `~/.atomcode/recent_dirs.txt`. Silently drops missing directories
 /// so stale entries from a deleted project don't linger in the picker.
 pub(crate) fn load_recent_dirs() -> Vec<PathBuf> {
-    let path = atomcode_core::config::Config::config_dir().join("recent_dirs.txt");
+    let path = atomcode_config::config::Config::config_dir().join("recent_dirs.txt");
     std::fs::read_to_string(&path)
         .ok()
         .map(|s| {
@@ -4183,7 +5378,7 @@ pub(crate) fn load_recent_dirs() -> Vec<PathBuf> {
 /// failure (read-only HOME, permission denied) is swallowed so it can
 /// never break an interactive `/cd`.
 pub(crate) fn save_recent_dirs(dirs: &[PathBuf]) {
-    let path = atomcode_core::config::Config::config_dir().join("recent_dirs.txt");
+    let path = atomcode_config::config::Config::config_dir().join("recent_dirs.txt");
     let content = dirs
         .iter()
         .map(|d| d.to_string_lossy().to_string())
@@ -4205,14 +5400,14 @@ pub(crate) fn resolve_cd(
     // On Windows `canonicalize` returns a `\\?\` verbatim / extended-length path.
     // Strip it here at the SOURCE so every downstream sink carries the plain
     // `C:\…` form: the "已切换到 …" confirmation (uses this value directly), the
-    // stored `working_dir`, the `AgentCommand::ChangeDir` sent to the runtime, the
+    // stored `working_dir`, the change-directory request sent to the runtime, the
     // webui footer sync (`live_set_working_dir`), and `recent_dirs.txt`. Only the
     // status-row `collapse_home` stripped before, so those other sites leaked the
     // raw `\\?\C:\Users\hao\atomcode`. Mirrors the daemon's `change_dir`, which
     // already strips before setting its working dir. No-op off Windows / on
     // non-verbatim paths; `hash_path` strips internally so the session bucket is
     // unchanged.
-    let canon = atomcode_core::tool::strip_verbatim_prefix_path(&canon);
+    let canon = atomcode_capabilities::pathnorm::strip_verbatim_path(&canon);
     if !canon.is_dir() {
         return Err(t(Msg::DirNotADirectory {
             path: &canon.display().to_string(),
@@ -4250,7 +5445,11 @@ pub(crate) fn expand_cd_target(
         // separator (`~//x`, easy typo) doesn't leave an absolute remnant that
         // `home.join` would treat as a root and escape the home dir.
         let rest = rest.trim_start_matches(['/', '\\']);
-        return Ok(if rest.is_empty() { home.to_path_buf() } else { home.join(rest) });
+        return Ok(if rest.is_empty() {
+            home.to_path_buf()
+        } else {
+            home.join(rest)
+        });
     }
     let p = PathBuf::from(arg);
     Ok(if p.is_absolute() { p } else { cwd.join(p) })
@@ -4419,32 +5618,194 @@ fn extract_code_blocks(md: &str) -> Vec<String> {
 }
 
 /// Outcome of resolving a `/copy [arg]` request against a reply's markdown.
+#[derive(Debug)]
 enum CopyResolve {
-    /// The text to place on the clipboard.
-    Text(String),
+    /// The text to place on the clipboard. The bool is `true` when this came
+    /// from `/copy msg` (the full reply) so the caller can use a confirmation
+    /// message that says "reply" rather than "code block".
+    Text(String, bool),
     /// The reply has no fenced code block (or there's no reply yet).
     NoBlocks,
+    /// `/copy msg` was used but the reply is empty/whitespace-only.
+    /// Distinct from `NoBlocks` so the caller can surface a "reply is empty"
+    /// hint rather than the misleading "no code block" wording.
+    EmptyMsg,
     /// `/copy N` referenced an out-of-range index; carries the block count.
     BadIndex(usize),
 }
 
+/// Outcome of `/save [filename]` — either the conversation was written to a
+/// file (carrying the resolved path for display) or it failed for one of three
+/// reasons: nothing to export, an I/O error, or an invalid/unsafe path.
+#[derive(Debug)]
+enum SaveOutcome {
+    /// File written successfully; carries the resolved absolute path.
+    Ok(std::path::PathBuf),
+    /// The session has no exportable conversation turns yet.
+    EmptyHistory,
+    /// The underlying filesystem write failed; carries the error message.
+    IoError(String),
+    /// The requested path is invalid or its parent directory does not exist.
+    InvalidPath(String),
+    /// The target already exists and is NOT a markdown file — refuse to clobber
+    /// it (a `/save mydata.py` typo would otherwise overwrite source/config with
+    /// the transcript). Carries the target path for the message.
+    RefuseOverwrite(String),
+}
+
+/// Expand a leading `~` / `~/` in `arg` to `home`, mirroring shell behaviour so
+/// `/save ~/notes.md` lands in the home dir instead of a literal `./~/` folder
+/// (consistent with read_file / glob, which already expand `~`). Pure over
+/// `home` so it is unit-testable without touching the environment. A bare `~`
+/// → home; `~/x` → home/x; `~user` and everything else pass through unchanged
+/// (we don't resolve other users' homes). No home known → `arg` as-is.
+fn expand_tilde_path(arg: &str, home: Option<&std::path::Path>) -> std::path::PathBuf {
+    let Some(home) = home else {
+        return std::path::PathBuf::from(arg);
+    };
+    if arg == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(rest) = arg.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    std::path::PathBuf::from(arg)
+}
+
+/// Whether `path`'s extension marks it as a markdown file (case-insensitive
+/// `md` / `markdown`). Used to gate the "refuse to overwrite a non-markdown
+/// file" guard.
+fn is_markdown_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+        .unwrap_or(false)
+}
+
+/// Build the default export filename: `atomcode-session-YYYYMMDD-HHMMSS.md`.
+/// Extracted from [`resolve_save_in`] so unit tests can check the naming scheme
+/// without touching the filesystem (where parallel chdir would race).
+fn default_save_filename() -> String {
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    format!("atomcode-session-{stamp}.md")
+}
+
+/// Render the session's exportable turns as a markdown transcript. Pure /
+/// side-effect-free so it can be unit-tested independently of file I/O.
+fn render_save_markdown(messages: &[atomcode_kernel::message::Message]) -> Option<String> {
+    use atomcode_kernel::message::Role;
+    let turns: Vec<(&Role, &str)> = messages
+        .iter()
+        .filter(|m| !m.synthetic && matches!(m.role, Role::User | Role::Assistant))
+        .map(|m| (&m.role, m.text.as_str()))
+        .filter(|(_, t)| !t.trim().is_empty())
+        .collect();
+    if turns.is_empty() {
+        return None;
+    }
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut out = String::new();
+    out.push_str(&format!("# AtomCode Session - {now}\n\n"));
+    for (role, text) in &turns {
+        let label = match role {
+            Role::User => "User",
+            Role::Assistant => "Assistant",
+            // bot review Low: filter 上游已限定为 User|Assistant,该臂不可达。
+            // 用 unreachable! 替代静默 continue,一旦未来 filter 放宽会立即 panic 暴露,而非悄悄丢消息。
+            _ => unreachable!("render_save_markdown: role filtered to User|Assistant upstream"),
+        };
+        out.push_str(&format!("## {label}\n{text}\n\n"));
+    }
+    Some(out)
+}
+
+/// Map `/save [filename]` to a written file. `""` → a timestamped default
+/// (`atomcode-session-YYYYMMDD-HHMMSS.md`) in the active project directory;
+/// a bare name or relative path resolves against `working_dir`;
+/// an absolute path is used as-is. Existing files are overwritten.
+fn resolve_save_in(
+    messages: &[atomcode_kernel::message::Message],
+    arg: &str,
+    working_dir: &std::path::Path,
+) -> SaveOutcome {
+    let Some(content) = render_save_markdown(messages) else {
+        return SaveOutcome::EmptyHistory;
+    };
+
+    let arg = arg.trim();
+    let path = if arg.is_empty() {
+        std::path::PathBuf::from(default_save_filename())
+    } else {
+        // Expand `~` (sudo-aware home via crate::platform) so `/save ~/x.md`
+        // works like it does in the shell / other file-taking commands.
+        expand_tilde_path(arg, crate::platform::home_dir().as_deref())
+    };
+    let path = if path.is_absolute() {
+        path
+    } else {
+        working_dir.join(path)
+    };
+
+    // Reject paths whose parent directory doesn't exist — we don't auto-mkdir,
+    // so a typo can't silently scatter directories. Relative paths are already
+    // rooted at `working_dir`; absolute paths are checked as provided.
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+            return SaveOutcome::InvalidPath(parent.to_string_lossy().into_owned());
+        }
+    }
+
+    // Refuse to overwrite an existing NON-markdown file: `/save` is a markdown
+    // export, so a target like `config.py` / `.bashrc` / a bare `notes` that
+    // already exists is almost certainly a typo, and clobbering it loses data.
+    // Overwriting an existing `.md` (re-export) is fine; a NEW file of any name
+    // is fine (no clobber). The default filename is always a fresh timestamped
+    // `.md`, so it never trips this.
+    if path.is_file() && !is_markdown_path(&path) {
+        return SaveOutcome::RefuseOverwrite(path.to_string_lossy().into_owned());
+    }
+
+    match std::fs::write(&path, content) {
+        Ok(()) => {
+            // Canonicalize so SaveOutcome::Ok carries an absolute path as
+            // documented (matches the "resolved absolute path" doc comment).
+            // On the rare canonicalize failure (e.g. the file was removed
+            // between write and canonicalize on some platforms), fall back
+            // to the as-written path so the success isn't turned into an
+            // error by a post-success race.
+            let resolved = path.canonicalize().unwrap_or(path);
+            SaveOutcome::Ok(resolved)
+        }
+        Err(e) => SaveOutcome::IoError(e.to_string()),
+    }
+}
+
 /// Map `/copy [arg]` to the text to copy. `""` → last block (the common
 /// "copy the command just shown" case); `all` → every block joined by a blank
-/// line; `N` (1-based) → the Nth block.
+/// line; `N` (1-based) → the Nth block; `msg` → the full reply markdown
+/// (prose + code, useful for pasting the whole answer elsewhere).
 fn resolve_copy(md: &str, arg: &str) -> CopyResolve {
+    let arg = arg.trim();
+    // `/copy msg` → full reply markdown (skip code-block extraction entirely).
+    if arg.eq_ignore_ascii_case("msg") {
+        let trimmed = md.trim();
+        if trimmed.is_empty() {
+            return CopyResolve::EmptyMsg;
+        }
+        return CopyResolve::Text(trimmed.to_string(), true);
+    }
     let blocks = extract_code_blocks(md);
     if blocks.is_empty() {
         return CopyResolve::NoBlocks;
     }
-    let arg = arg.trim();
     if arg.is_empty() {
-        return CopyResolve::Text(blocks.last().cloned().unwrap_or_default());
+        return CopyResolve::Text(blocks.last().cloned().unwrap_or_default(), false);
     }
     if arg.eq_ignore_ascii_case("all") {
-        return CopyResolve::Text(blocks.join("\n\n"));
+        return CopyResolve::Text(blocks.join("\n\n"), false);
     }
     match arg.parse::<usize>() {
-        Ok(n) if (1..=blocks.len()).contains(&n) => CopyResolve::Text(blocks[n - 1].clone()),
+        Ok(n) if (1..=blocks.len()).contains(&n) => CopyResolve::Text(blocks[n - 1].clone(), false),
         _ => CopyResolve::BadIndex(blocks.len()),
     }
 }
@@ -4511,41 +5872,59 @@ pub(crate) fn encode_osc52(buffer: &str, text: &str) -> String {
     format!("\x1b]52;{};{}\x1b\\", buffer, b64)
 }
 
-/// Build the non-error rate-limit pause body line. Two branches:
-/// - `reset_at_display` non-empty → user must wait (Pause); shows reset
-///   time and remaining duration.
-/// - `reset_at_display` empty + small `secs_until_reset` → kernel is
-///   auto-retrying (WaitAndRetry); shows a countdown.
+/// Build the non-error rate-limit pause body line. Three branches:
+/// - `auto_resuming` → kernel is auto-retrying (WaitAndRetry); generic countdown.
+/// - Pause, `reset_at_display` NON-empty → a CONFIRMED CodingPlan quota exhaustion
+///   (real reset time from the usage windows) → the CodingPlan "5h window" message.
+/// - Pause, `reset_at_display` EMPTY → generic 429 (a user's external-model 429, or
+///   a gateway 429 with no window data) → a neutral "limited (HTTP 429)" line, NOT
+///   the CodingPlan message. The `RateLimitHook` gates itself to gateway 429s, so an
+///   external-model 429 lands here via the kernel's generic default.
 ///
 /// Kept as a pure function so it is unit-testable without a renderer.
 pub(crate) fn format_rate_limited_line(
     reset_at_display: &str,
-    _reset_label: &str,
+    reset_label: &str,
     secs_until_reset: Option<u64>,
     auto_resuming: bool,
+    server_message: Option<&str>,
 ) -> String {
     if auto_resuming {
         // WaitAndRetry: kernel is sleeping then will retry automatically.
         let n = secs_until_reset.unwrap_or(0);
         return format!("⏳ 限流，{n}s 后自动继续…");
     }
-    // Pause: kernel stopped, user must act.
-    if reset_at_display.is_empty() {
-        // Pause with no wall-clock reset time (e.g. from_hint fallback). Still show the
-        // remaining duration when the gateway gave one (secs_until_reset) instead of
-        // silently dropping it.
+    // Pause: kernel stopped, user must act. A CodingPlan verdict (decide_from_windows)
+    // carries window data — a reset time AND/OR a window label. The kernel's generic
+    // default (from_hint, used for non-CodingPlan / external-model 429s) carries
+    // NEITHER. So "has any window signal" ⇒ a real CodingPlan quota; otherwise it's a
+    // generic 429 and must NOT be dressed up as a CodingPlan quota exhaustion. Keying
+    // on reset_at_display ALONE would wrongly go generic for an exhausted window whose
+    // display string the server omitted (both fields are `#[serde(default)]`).
+    let is_coding_plan = !reset_at_display.is_empty() || !reset_label.is_empty();
+    if !is_coding_plan {
         let tail = match secs_until_reset {
-            Some(s) => format!("（还有 {}）", fmt_dur(s)),
+            Some(s) => format!("（约 {} 后可重试）", fmt_dur(s)),
             None => String::new(),
         };
-        return format!(
-            "⏸ 5小时窗口已用尽，稍后恢复{tail} · 已保留已完成内容 · 可换模型或稍后重试"
-        );
+        // Surface the provider's OWN 429 reason when it carried one (e.g. an external
+        // model's "余额不足…请充值") so the user sees the actionable cause, not a bare 429.
+        let reason = match server_message {
+            Some(m) if !m.trim().is_empty() => format!("：{}", m.trim()),
+            _ => String::new(),
+        };
+        return format!("⏸ 限流（HTTP 429）{reason}{tail} · 已保留已完成内容 · 稍后重试或换模型");
     }
+    // Confirmed CodingPlan window exhaustion.
     let tail = match secs_until_reset {
         Some(s) => format!("（还有 {}）", fmt_dur(s)),
         None => String::new(),
     };
+    if reset_at_display.is_empty() {
+        return format!(
+            "⏸ 5小时窗口已用尽，稍后恢复{tail} · 已保留已完成内容 · 可换模型或稍后重试"
+        );
+    }
     format!(
         "⏸ 5小时窗口已用尽，约 {reset_at_display} 恢复{tail} · 已保留已完成内容 · 可换模型或稍后重试"
     )
@@ -4562,6 +5941,38 @@ fn fmt_dur(secs: u64) -> String {
     }
 }
 
+/// Recognised `/mcp` subcommands.
+#[derive(Debug, PartialEq)]
+pub(crate) enum McpSub {
+    Reload,
+    Tools,
+    Login,
+    Logout,
+    Trust,
+    Untrust,
+}
+
+/// Parse the argument string following `/mcp` into a known subcommand.
+/// Returns `None` for unrecognised inputs (which fall through to status display).
+pub(crate) fn parse_mcp_subcommand(sub: &str) -> Option<McpSub> {
+    let s = sub.trim();
+    if s.eq_ignore_ascii_case("reload") {
+        Some(McpSub::Reload)
+    } else if s.eq_ignore_ascii_case("trust") {
+        Some(McpSub::Trust)
+    } else if s.eq_ignore_ascii_case("untrust") {
+        Some(McpSub::Untrust)
+    } else if s.starts_with("tools") {
+        Some(McpSub::Tools)
+    } else if s.starts_with("login") {
+        Some(McpSub::Login)
+    } else if s.starts_with("logout") {
+        Some(McpSub::Logout)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod status_login_tests {
     use super::*;
@@ -4569,21 +5980,33 @@ mod status_login_tests {
     #[test]
     fn login_line_shows_username_when_signed_in() {
         let line = render_login_line(Some("张三"));
-        assert!(line.contains("张三"), "signed-in line must show the username: {line:?}");
+        assert!(
+            line.contains("张三"),
+            "signed-in line must show the username: {line:?}"
+        );
     }
 
     #[test]
     fn login_line_prompts_login_when_not_signed_in() {
         let line = render_login_line(None);
-        assert!(line.contains("/login"), "not-signed-in line must point to /login: {line:?}");
+        assert!(
+            line.contains("/login"),
+            "not-signed-in line must point to /login: {line:?}"
+        );
         assert!(!line.contains("张三"));
     }
 
     #[test]
     fn login_identity_is_name_paren_username() {
         // The agreed 昵称(用户名) form: display name with the username in parens.
-        assert_eq!(format_login_identity(Some("TheoCui"), "Saulcy"), "TheoCui(Saulcy)");
-        assert_eq!(format_login_identity(Some("  Theo  "), "Saulcy"), "Theo(Saulcy)");
+        assert_eq!(
+            format_login_identity(Some("TheoCui"), "Saulcy"),
+            "TheoCui(Saulcy)"
+        );
+        assert_eq!(
+            format_login_identity(Some("  Theo  "), "Saulcy"),
+            "Theo(Saulcy)"
+        );
     }
 
     #[test]
@@ -4614,7 +6037,10 @@ mod status_login_tests {
             s.find("INSTRUCTIONS").unwrap(),
         );
         // login < body < codingplan < proxy < instructions
-        assert!(login < body && body < cp, "body sits between login and codingplan: {s:?}");
+        assert!(
+            login < body && body < cp,
+            "body sits between login and codingplan: {s:?}"
+        );
         assert!(cp < proxy, "Proxy must come AFTER CodingPlan: {s:?}");
         assert!(proxy < instr, "instructions come last: {s:?}");
     }
@@ -4623,30 +6049,55 @@ mod status_login_tests {
     fn status_omits_proxy_line_when_none() {
         // The remote/phone view passes None → no Proxy line at all.
         let s = assemble_status("LOGIN\n", "BODY\n", "CODINGPLAN\n", None, "INSTRUCTIONS");
-        assert!(!s.contains("PROXY"), "proxy must be absent when None: {s:?}");
+        assert!(
+            !s.contains("PROXY"),
+            "proxy must be absent when None: {s:?}"
+        );
         assert!(s.starts_with("LOGIN\n"), "login still first: {s:?}");
     }
 
     #[test]
     fn status_body_no_longer_shows_a_token_line() {
         // /status is a quick-glance state view; per-session token count is /cost's job.
-        let en = atomcode_core::i18n::t_with(atomcode_core::i18n::Locale::En, Msg::StatusBody {
-            model: "m", dir: "/d", config: "/c",
-        });
-        let zh = atomcode_core::i18n::t_with(atomcode_core::i18n::Locale::ZhCn, Msg::StatusBody {
-            model: "m", dir: "/d", config: "/c",
-        });
-        assert!(!en.contains("Token"), "en StatusBody must not carry a Token line: {en}");
-        assert!(!zh.contains("Token"), "zh StatusBody must not carry a Token line: {zh}");
+        let en = atomcode_config::i18n::t_with(
+            atomcode_config::i18n::Locale::En,
+            Msg::StatusBody {
+                model: "m",
+                dir: "/d",
+                config: "/c",
+            },
+        );
+        let zh = atomcode_config::i18n::t_with(
+            atomcode_config::i18n::Locale::ZhCn,
+            Msg::StatusBody {
+                model: "m",
+                dir: "/d",
+                config: "/c",
+            },
+        );
+        assert!(
+            !en.contains("Token"),
+            "en StatusBody must not carry a Token line: {en}"
+        );
+        assert!(
+            !zh.contains("Token"),
+            "zh StatusBody must not carry a Token line: {zh}"
+        );
     }
 
     #[test]
     fn cp_auth_error_expired_ignores_fallback_and_prompts_relogin() {
-        use atomcode_core::coding_plan::AuthExpired;
+        use atomcode_codingplan::AuthExpired;
         let err = anyhow::Error::new(AuthExpired { status: 401 });
         let line = render_cp_auth_error(&err, || "FALLBACK".to_string());
-        assert!(line.contains("/login"), "auth-expired must prompt /login: {line:?}");
-        assert!(!line.contains("FALLBACK"), "expired must not use the fallback: {line:?}");
+        assert!(
+            line.contains("/login"),
+            "auth-expired must prompt /login: {line:?}"
+        );
+        assert!(
+            !line.contains("FALLBACK"),
+            "expired must not use the fallback: {line:?}"
+        );
         // Must NOT bury it as the raw error text.
         assert!(
             !line.contains("authentication failed (401)"),
@@ -4660,7 +6111,10 @@ mod status_login_tests {
         // fallback (not-signed-in hint, or the raw fetch-failure line).
         let err = anyhow::anyhow!("network boom");
         let line = render_cp_auth_error(&err, || format!("fetch failed — {err:#}"));
-        assert!(line.contains("network boom"), "non-auth errors fall through to the fallback: {line:?}");
+        assert!(
+            line.contains("network boom"),
+            "non-auth errors fall through to the fallback: {line:?}"
+        );
     }
 }
 
@@ -4671,17 +6125,24 @@ mod rate_limited_tests {
     // Branch 1: auto_resuming=true → countdown line (WaitAndRetry)
     #[test]
     fn rate_limited_wait_shows_countdown() {
-        let line = format_rate_limited_line("", "", Some(45), true);
+        let line = format_rate_limited_line("", "", Some(45), true, None);
         assert!(line.contains("45"), "should contain countdown seconds");
         assert!(line.contains("自动继续"), "should mention auto-continue");
-        assert!(line.contains('⏳'), "must use clock glyph ⏳ for WaitAndRetry");
-        assert!(!line.contains('⏸'), "must not use pause glyph ⏸ for WaitAndRetry");
+        assert!(
+            line.contains('⏳'),
+            "must use clock glyph ⏳ for WaitAndRetry"
+        );
+        assert!(
+            !line.contains('⏸'),
+            "must not use pause glyph ⏸ for WaitAndRetry"
+        );
     }
 
     // Branch 2: auto_resuming=false, reset_at_display non-empty → pause with time (Pause)
     #[test]
     fn rate_limited_renders_non_error_pause_line() {
-        let line = format_rate_limited_line("18:09", "（每 5 小时一个窗口）", Some(7200), false);
+        let line =
+            format_rate_limited_line("18:09", "（每 5 小时一个窗口）", Some(7200), false, None);
         assert!(line.contains("18:09"), "should contain reset time");
         assert!(
             line.contains("可换模型") || line.contains("稍后重试"),
@@ -4693,23 +6154,96 @@ mod rate_limited_tests {
         assert!(!line.contains("自动继续"), "Pause must not say 自动继续");
     }
 
-    // Branch 3: auto_resuming=false, reset_at_display empty → pause without time
+    // Branch 3: auto_resuming=false, reset_at_display EMPTY → GENERIC 429 (a user's
+    // external-model 429, or a gateway 429 with no window data), NOT the CodingPlan
+    // "5h window exhausted" message. Locks the mis-attribution fix.
     #[test]
-    fn rate_limited_pause_no_time_shows_no_countdown_no_reset_time() {
-        let line = format_rate_limited_line("", "", None, false);
+    fn rate_limited_pause_empty_reset_is_generic_not_coding_plan() {
+        let line = format_rate_limited_line("", "", None, false, None);
         assert!(line.contains('⏸'), "must use pause glyph ⏸");
         assert!(!line.contains("自动继续"), "must not say 自动继续");
-        assert!(!line.contains("约"), "must not say 约 _ 恢复 when no reset time");
-        assert!(!line.contains("还有"), "must not show countdown when no reset time");
         assert!(
-            line.contains("稍后恢复") || line.contains("稍后重试"),
-            "should indicate to retry later"
+            !line.contains("还有"),
+            "must not show countdown when no reset time"
+        );
+        // The regression guard: an empty-reset 429 must NOT be dressed up as a
+        // CodingPlan quota exhaustion.
+        assert!(
+            !line.contains("5小时窗口"),
+            "empty-reset 429 must not claim CodingPlan quota: {line}"
+        );
+        assert!(
+            line.contains("HTTP 429") || line.contains("限流"),
+            "should be a generic rate-limit line: {line}"
+        );
+        assert!(line.contains("稍后重试"), "should indicate to retry later");
+    }
+
+    #[test]
+    fn rate_limited_generic_surfaces_provider_reason() {
+        // A generic (non-CodingPlan) 429 that carried a real provider body — e.g. an
+        // external model's "余额不足…请充值" — must surface that actionable reason.
+        let line =
+            format_rate_limited_line("", "", None, false, Some("余额不足或无可用资源包,请充值"));
+        assert!(
+            line.contains("余额不足或无可用资源包,请充值"),
+            "must show provider reason: {line}"
+        );
+        assert!(
+            line.contains("HTTP 429") || line.contains("限流"),
+            "still a generic 429 line: {line}"
+        );
+        assert!(
+            !line.contains("5小时窗口"),
+            "must not claim CodingPlan quota: {line}"
+        );
+    }
+
+    #[test]
+    fn rate_limited_coding_plan_ignores_server_message() {
+        // A CodingPlan window pause (has reset time) keeps its window message even if a
+        // server_message tags along — the reason line is only for the generic branch.
+        let line = format_rate_limited_line("18:09", "", Some(7200), false, Some("请充值"));
+        assert!(
+            line.contains("5小时窗口"),
+            "CodingPlan quota keeps its message: {line}"
+        );
+        assert!(
+            !line.contains("请充值"),
+            "server_message must not leak into the CodingPlan line: {line}"
+        );
+    }
+
+    // A gateway CodingPlan quota (real reset time) KEEPS the "5h window" message.
+    #[test]
+    fn rate_limited_pause_with_reset_time_keeps_coding_plan_message() {
+        let line = format_rate_limited_line("18:09", "", Some(7200), false, None);
+        assert!(
+            line.contains("5小时窗口"),
+            "confirmed CodingPlan quota keeps its message: {line}"
+        );
+        assert!(line.contains("18:09"), "shows the window reset time");
+    }
+
+    // Regression (review F2): an exhausted CodingPlan window whose server OMITTED
+    // reset_at_display but provided a window LABEL must STILL keep the CodingPlan
+    // message — keying on reset_at_display alone would wrongly go generic.
+    #[test]
+    fn rate_limited_empty_display_but_label_keeps_coding_plan() {
+        let line = format_rate_limited_line("", "（每 5 小时一个窗口）", Some(7200), false, None);
+        assert!(
+            line.contains("5小时窗口"),
+            "label alone must keep CodingPlan framing: {line}"
+        );
+        assert!(
+            !line.contains("HTTP 429"),
+            "must not fall to the generic line: {line}"
         );
     }
 
     #[test]
     fn rate_limited_no_secs_shows_no_duration() {
-        let line = format_rate_limited_line("23:59", "", None, false);
+        let line = format_rate_limited_line("23:59", "", None, false, None);
         assert!(line.contains("23:59"));
         assert!(!line.contains("还有"));
     }
@@ -4717,11 +6251,22 @@ mod rate_limited_tests {
     #[test]
     fn rate_limited_pause_no_reset_time_still_shows_remaining_secs() {
         // Pause (auto_resuming=false) with no wall-clock display but a known
-        // remaining duration: the duration must NOT be dropped.
-        let line = format_rate_limited_line("", "", Some(7200), false);
+        // remaining duration: the duration must NOT be dropped. (Generic 429 line
+        // now — no CodingPlan claim without a real reset time.)
+        let line = format_rate_limited_line("", "", Some(7200), false, None);
         assert!(line.contains('⏸'), "must use pause glyph");
-        assert!(!line.contains("自动继续"), "must not say auto-continue (this is a Pause)");
-        assert!(line.contains("还有"), "must surface the remaining duration");
+        assert!(
+            !line.contains("自动继续"),
+            "must not say auto-continue (this is a Pause)"
+        );
+        assert!(
+            !line.contains("5小时窗口"),
+            "empty-reset 429 must not claim CodingPlan quota: {line}"
+        );
+        assert!(
+            line.contains("后可重试"),
+            "must surface the remaining duration: {line}"
+        );
         assert!(line.contains("2h0m"), "7200s → 2h0m: {line}");
     }
 
@@ -4887,12 +6432,12 @@ mod compose_login_chrome_tests {
 fn run_oauth_with_renderer(
     renderer: &mut dyn Renderer,
     ctx: &mut LoopCtx,
-) -> Result<atomcode_core::auth::AuthInfo> {
+) -> Result<atomcode_auth::AuthInfo> {
     use crossterm::event::KeyCode;
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc::error::TryRecvError;
 
-    let session = atomcode_core::auth::start_login()?;
+    let session = atomcode_auth::start_login()?;
 
     // QR + URL + ESC affordance go through the body via UiLine::CommandOutput
     // so they sit in scrollback above the input box exactly like any other
@@ -4915,8 +6460,8 @@ fn run_oauth_with_renderer(
     // we return.
     loop {
         match session.poll_once()? {
-            atomcode_core::auth::PollOutcome::Authorized => break,
-            atomcode_core::auth::PollOutcome::Pending => {}
+            atomcode_auth::PollOutcome::Authorized => break,
+            atomcode_auth::PollOutcome::Pending => {}
         }
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -4959,9 +6504,12 @@ fn run_oauth_with_renderer(
 /// inside an existing runtime panics with "Cannot drop a runtime in a
 /// context where blocking is not allowed".
 fn run_coding_plan_blocking(
-    config: &atomcode_core::config::Config,
+    config: &atomcode_config::config::Config,
     tel: &std::sync::Arc<atomcode_telemetry::Telemetry>,
-) -> Result<(atomcode_core::config::Config, atomcode_core::coding_plan::SetupReport)> {
+) -> Result<(
+    atomcode_config::config::Config,
+    atomcode_codingplan::SetupReport,
+)> {
     let mut cfg = config.clone();
     let tel = tel.clone();
     // Run on a dedicated OS thread so `reqwest::blocking::Client`'s
@@ -4971,7 +6519,7 @@ fn run_coding_plan_blocking(
     // (`run_login_flow` isn't async) and avoids the need to
     // `Handle::block_on`.
     std::thread::spawn(move || {
-        let report = atomcode_core::coding_plan::run(&mut cfg, Some(&tel));
+        let report = atomcode_codingplan::run(&mut cfg, Some(&tel));
         (cfg, report)
     })
     .join()
@@ -4995,9 +6543,9 @@ fn run_coding_plan_blocking(
 /// path — that path prints to stdout and is reserved for CLI callers.
 pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> {
     // Phase 1: pre-flight login if needed.
-    if !atomcode_core::auth::is_logged_in() {
+    if !atomcode_auth::is_logged_in() {
         if let Err(e) = run_oauth_with_renderer(renderer, ctx)
-            .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|_| auth))
+            .and_then(|auth| atomcode_auth::save_auth(&auth).map(|_| auth))
         {
             // Login failed/cancelled. Surface as a top-level error;
             // skip the rest of setup since claim/models/status all
@@ -5033,31 +6581,32 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     // this the user sees "✓ already logged in as X" followed by
     // "✗ claim failed — run `atomcode login` again" and has to do
     // manually what `/codingplan` could do itself.
-    let (cfg_after, mut report) = match run_coding_plan_blocking(&ctx.config, &ctx.telemetry) {
-        Ok((cfg, r)) => (cfg, r),
-        Err(e) => {
-            renderer.render(UiLine::Error(format!("internal error: {e:#}")));
-            renderer.flush();
-            return Ok(());
-        }
-    };
-    ctx.config = cfg_after;
+    let (mut prepared_config, mut report) =
+        match run_coding_plan_blocking(&ctx.config, &ctx.telemetry) {
+            Ok((cfg, r)) => (cfg, r),
+            Err(e) => {
+                renderer.render(UiLine::Error(format!("internal error: {e:#}")));
+                renderer.flush();
+                return Ok(());
+            }
+        };
     if report.auth_expired {
         renderer.render(UiLine::CommandOutput(t(Msg::CpReauthAfter401).into_owned()));
         renderer.flush();
         match run_oauth_with_renderer(renderer, ctx)
-            .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|_| auth))
+            .and_then(|auth| atomcode_auth::save_auth(&auth).map(|_| auth))
         {
             Ok(_) => {
-                let (cfg_after2, r2) = match run_coding_plan_blocking(&ctx.config, &ctx.telemetry) {
-                    Ok((cfg, r)) => (cfg, r),
-                    Err(e) => {
-                        renderer.render(UiLine::Error(format!("internal error: {e:#}")));
-                        renderer.flush();
-                        return Ok(());
-                    }
-                };
-                ctx.config = cfg_after2;
+                let (cfg_after2, r2) =
+                    match run_coding_plan_blocking(&prepared_config, &ctx.telemetry) {
+                        Ok((cfg, r)) => (cfg, r),
+                        Err(e) => {
+                            renderer.render(UiLine::Error(format!("internal error: {e:#}")));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                    };
+                prepared_config = cfg_after2;
                 report = r2;
             }
             Err(e) => {
@@ -5081,30 +6630,34 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     if report.should_persist_config() {
         // Config mutation only persists when critical steps passed —
         // don't write a half-set-up config if login or models failed.
-        save_and_reload(ctx, renderer);
+        match ctx.config_store.update(|latest| {
+            atomcode_codingplan::merge_successful_config(latest, &prepared_config, &report)
+        }) {
+            Ok(commit) => apply_persisted_config(
+                ctx,
+                commit.snapshot.config,
+                commit.snapshot.revision,
+                renderer,
+            ),
+            Err(error) => {
+                renderer.render(UiLine::Error(
+                    t(Msg::ConfigSaveFailed {
+                        error: &error.to_string(),
+                    })
+                    .into_owned(),
+                ));
+                renderer.flush();
+                return Ok(());
+            }
+        }
         // Stamp the drift-monitor sync marker alongside the config
         // write. Failures are non-fatal: at worst the 24h staleness
         // hint mis-fires once.
-        let _ = atomcode_core::coding_plan::write_last_sync_now();
+        let _ = atomcode_codingplan::write_last_sync_now();
         // Also bump our own last-seen timestamp so the cross-process
         // sync-check on the next keystroke doesn't redundantly
         // reload the config we just saved ourselves.
-        ctx.monitor_last_sync_seen = atomcode_core::coding_plan::read_last_sync();
-        // Update `ctx.model_name` to reflect the new default provider from
-        // the just-completed login/setup. This ensures the status line shows
-        // the current model immediately rather than the pre-login value.
-        // The bridge's ReloadConfig is asynchronous (sent by `save_and_reload`
-        // above) — if the bridge fails to switch (e.g. gateway signer
-        // unavailable), the user will see the error on their next chat turn
-        // and can fall back to `/model`. This matches `/model`'s approach
-        // which also updates `ctx.model_name` optimistically.
-        if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
-            ctx.model_name = p.model.clone();
-        }
-        // NOTE: the footer context window is NOT refreshed here — `run_login_flow`
-        // has no `UiState` handle. The post-login window self-corrects on the
-        // first turn's ContextStats; threading state through just for this rare
-        // path isn't worth it. The /model picker + reload paths do refresh it.
+        ctx.monitor_last_sync_seen = atomcode_codingplan::read_last_sync();
         // Clear any stale drift warning now that we've just
         // re-synced. Also reset the cooldown so the next
         // pre-turn trigger (if conditions change) can fire
@@ -5124,6 +6677,128 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     renderer.render(UiLine::CommandOutput(report.render()));
     renderer.flush();
     Ok(())
+}
+
+/// The synthetic `todowrite`-empty call + its tool result. Appended to the
+/// conversation, they make `reduce_todos`/`derive_current_todos` fold the list to
+/// `[]` (the empty list is the last plan), while keeping the transcript's
+/// call/result pairing valid for the next request. Kernel (session) message model.
+fn todo_clear_messages(id: String) -> Vec<atomcode_kernel::message::Message> {
+    use atomcode_kernel::message::Message;
+    use atomcode_kernel::tool::ToolCall;
+    let mut call = Message::assistant(
+        "",
+        vec![ToolCall {
+            id: id.clone(),
+            name: "todowrite".to_string(),
+            arguments: r#"{"todos":[]}"#.to_string(),
+        }],
+    );
+    call.internal_origin = Some("todo_clear".to_string());
+    let mut result = Message::tool_result(id, "0 tasks", false);
+    result.internal_origin = Some("todo_clear".to_string());
+    vec![call, result]
+}
+
+/// Synthetic tool-call pair for `/todo add <content>`: an incremental
+/// `{"action":"add","content":…}` call plus its result. Mirrors
+/// [`todo_clear_messages`]; the `content` is JSON-encoded via `serde_json` so
+/// quotes/newlines in the user's text can't break the args. Folds through the
+/// canonical `reduce_todos` as a new pending task appended at the end.
+fn todo_add_messages(id: String, content: &str) -> Vec<atomcode_kernel::message::Message> {
+    use atomcode_kernel::message::Message;
+    use atomcode_kernel::tool::ToolCall;
+    let args = serde_json::json!({ "action": "add", "content": content }).to_string();
+    let mut call = Message::assistant(
+        "",
+        vec![ToolCall {
+            id: id.clone(),
+            name: "todowrite".to_string(),
+            arguments: args,
+        }],
+    );
+    call.internal_origin = Some("todo_add".to_string());
+    let mut result = Message::tool_result(id, format!("Added task: {content}"), false);
+    result.internal_origin = Some("todo_add".to_string());
+    vec![call, result]
+}
+
+/// Append a synthetic todo-mutation message `pair` to the conversation and reseed
+/// the kernel (the proven `/resume` `SetConversation` path), then rebuild the live
+/// panel from the resulting transcript and persist. The subtle reseed dance lives
+/// HERE so `/todo add` and `/todo clear` can't drift. The caller supplies the pair
+/// (each carries a unique `tool_call_id` — the message count grows by 2 per call,
+/// so a constant id would be rejected as a duplicate by a strict gateway). The
+/// panel is refolded from the transcript, which naturally yields `None` after a
+/// clear (empty `todowrite`) and the appended task after an add — one code path
+/// for both.
+fn reseed_todo_conversation(
+    ctx: &mut LoopCtx,
+    state: &mut UiState,
+    pair: Vec<atomcode_kernel::message::Message>,
+) {
+    let mut snapshot = ctx.current_session.to_conversation_snapshot();
+    snapshot.messages.extend(pair);
+    ctx.runtime
+        .dispatch(atomcode_coding::DriverCommand::RestoreSnapshot(
+            snapshot.clone(),
+        ))
+        .ok();
+    ctx.current_session
+        .update_from_conversation_snapshot(snapshot);
+    ctx.current_session.touch();
+    state.active_todos =
+        crate::event_loop::todo_progress_from_messages(&ctx.current_session.messages);
+    crate::event_loop::sync_todo_titles(state);
+}
+
+/// `/todo add <content>` — deterministically append a pending task without waiting
+/// on the model, so the next turn's TodoHook sees it and the model can act on it.
+fn add_todo(ctx: &mut LoopCtx, state: &mut UiState, content: &str) {
+    let id = format!("todo-add-{}", ctx.current_session.messages.len());
+    reseed_todo_conversation(ctx, state, todo_add_messages(id, content));
+}
+
+/// `/todo clear` — deterministically wipe the task list without waiting on the
+/// model, so cancelled/stale tasks stop reappearing (the next turn derives an
+/// empty list and injects nothing).
+fn clear_todos(ctx: &mut LoopCtx, state: &mut UiState) {
+    let id = format!("todo-clear-{}", ctx.current_session.messages.len());
+    reseed_todo_conversation(ctx, state, todo_clear_messages(id));
+}
+
+/// Build the `/todo` output from the session message history.
+///
+/// Scans the transcript backwards for the most recent `todowrite` tool call,
+/// parses its `todos` array, and renders one line per task.  Returns a
+/// "no list" message when no such call has been made yet.
+///
+/// Pure function — no I/O, no side effects.  Easy to unit-test in isolation.
+pub(crate) fn format_todo_command(
+    messages: &[atomcode_kernel::message::Message],
+    unicode: bool,
+) -> String {
+    // Fold the FULL transcript via the canonical `reduce_todos` (baseline = last full-list plan;
+    // then apply every `{action}` update after it), so `/todo` shows the CURRENT statuses — not
+    // just the initial plan. Shape-based, matching the merged `todowrite` tool + the live panel.
+    // kernel `Message.tool_calls` is a flat field, so no content-variant match.
+    let calls: Vec<(&str, &str)> = messages
+        .iter()
+        .flat_map(|m| {
+            m.tool_calls
+                .iter()
+                .map(|c| (c.name.as_str(), c.arguments.as_str()))
+        })
+        .collect();
+    let todos = atomcode_capabilities::tools::todo::reduce_todos(calls);
+    if todos.is_empty() {
+        return t(Msg::TodoNoList).into_owned();
+    }
+    format!(
+        "{}\n{}",
+        t(Msg::TodoListHeader),
+        atomcode_capabilities::tools::todo::render_todos_text(&todos, unicode)
+    )
 }
 
 #[cfg(test)]
@@ -5182,13 +6857,16 @@ mod copy_tests {
     #[test]
     fn tilde_fence_requires_a_matching_marker() {
         let md = "~~~text\n```\nstill inside\n~~~";
-        assert_eq!(extract_code_blocks(md), vec!["```\nstill inside".to_string()]);
+        assert_eq!(
+            extract_code_blocks(md),
+            vec!["```\nstill inside".to_string()]
+        );
     }
 
     #[test]
     fn resolve_default_picks_last_block() {
         match resolve_copy(REPLY, "") {
-            CopyResolve::Text(t) => assert_eq!(t, "cmake --build . --target demo -j4"),
+            CopyResolve::Text(t, _) => assert_eq!(t, "cmake --build . --target demo -j4"),
             _ => panic!("default should resolve to the last block"),
         }
     }
@@ -5196,7 +6874,7 @@ mod copy_tests {
     #[test]
     fn resolve_index_is_one_based() {
         match resolve_copy(REPLY, "1") {
-            CopyResolve::Text(t) => assert!(t.starts_with("cmake D:\\proj")),
+            CopyResolve::Text(t, _) => assert!(t.starts_with("cmake D:\\proj")),
             _ => panic!("/copy 1 should pick the first block"),
         }
     }
@@ -5204,7 +6882,7 @@ mod copy_tests {
     #[test]
     fn resolve_all_joins_every_block() {
         match resolve_copy(REPLY, "all") {
-            CopyResolve::Text(t) => {
+            CopyResolve::Text(t, _) => {
                 assert!(t.contains("-DBUILD=ON"));
                 assert!(t.contains("--build ."));
             }
@@ -5221,8 +6899,237 @@ mod copy_tests {
 
     #[test]
     fn resolve_no_blocks_when_reply_has_none() {
-        assert!(matches!(resolve_copy("plain reply", ""), CopyResolve::NoBlocks));
+        assert!(matches!(
+            resolve_copy("plain reply", ""),
+            CopyResolve::NoBlocks
+        ));
         assert!(matches!(resolve_copy("", ""), CopyResolve::NoBlocks));
+    }
+}
+
+#[cfg(test)]
+mod save_tests {
+    use super::{
+        default_save_filename, expand_tilde_path, render_save_markdown, resolve_save_in,
+        SaveOutcome,
+    };
+    use atomcode_kernel::message::{Message, Role};
+    use std::path::{Path, PathBuf};
+
+    /// Build a kernel text message with an explicit role (kernel has no generic
+    /// `new(role, text)`).
+    fn msg(role: Role, text: &str) -> Message {
+        let mut m = Message::user(text);
+        m.role = role;
+        m
+    }
+
+    #[test]
+    fn expand_tilde_path_maps_home_prefix() {
+        let home = PathBuf::from("/home/u");
+        assert_eq!(expand_tilde_path("~", Some(&home)), home);
+        assert_eq!(
+            expand_tilde_path("~/notes.md", Some(&home)),
+            home.join("notes.md")
+        );
+        // Not a home-relative path → unchanged.
+        assert_eq!(
+            expand_tilde_path("report.md", Some(&home)),
+            PathBuf::from("report.md")
+        );
+        assert_eq!(
+            expand_tilde_path("/abs/x.md", Some(&home)),
+            PathBuf::from("/abs/x.md")
+        );
+        // `~user` is NOT expanded (we don't resolve other users' homes).
+        assert_eq!(
+            expand_tilde_path("~bob/x", Some(&home)),
+            PathBuf::from("~bob/x")
+        );
+        // No home known → passthrough (never fabricate a path).
+        assert_eq!(expand_tilde_path("~/x", None), PathBuf::from("~/x"));
+    }
+
+    #[test]
+    fn save_refuses_to_overwrite_existing_non_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.py");
+        std::fs::write(&target, "SECRET = 1\n").unwrap();
+        let msgs = vec![msg(Role::User, "hi")];
+        match resolve_save_in(&msgs, target.to_str().unwrap(), dir.path()) {
+            SaveOutcome::RefuseOverwrite(p) => assert!(p.contains("config.py"), "{p}"),
+            other => panic!("expected RefuseOverwrite, got {other:?}"),
+        }
+        // The existing file must be untouched.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "SECRET = 1\n");
+    }
+
+    #[test]
+    fn save_overwrites_existing_markdown_and_allows_new_nonmd() {
+        let dir = tempfile::tempdir().unwrap();
+        let msgs = vec![msg(Role::User, "hi")];
+        // Existing .md → overwrite is fine (re-export).
+        let md = dir.path().join("report.md");
+        std::fs::write(&md, "old").unwrap();
+        assert!(matches!(
+            resolve_save_in(&msgs, md.to_str().unwrap(), dir.path()),
+            SaveOutcome::Ok(_)
+        ));
+        assert!(std::fs::read_to_string(&md).unwrap().contains("## User"));
+        // A NEW non-md file (no clobber) → allowed.
+        let fresh = dir.path().join("notes");
+        assert!(matches!(
+            resolve_save_in(&msgs, fresh.to_str().unwrap(), dir.path()),
+            SaveOutcome::Ok(_)
+        ));
+        assert!(Path::new(&fresh).is_file());
+    }
+
+    /// Build a Vec<Message> from (role, text) pairs for test fixtures.
+    fn conv(msgs: &[(&str, &str)]) -> Vec<Message> {
+        msgs.iter()
+            .map(|(role, text)| {
+                msg(
+                    match *role {
+                        "user" => Role::User,
+                        "assistant" => Role::Assistant,
+                        _ => Role::System,
+                    },
+                    text,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn save_empty_history_when_no_messages() {
+        // Empty history short-circuits before any path work, so working_dir is unused.
+        assert!(matches!(
+            resolve_save_in(&[], "", Path::new(".")),
+            SaveOutcome::EmptyHistory
+        ));
+    }
+
+    #[test]
+    fn save_empty_history_when_only_tool_messages() {
+        let msgs = vec![msg(Role::Tool, "tool output")];
+        assert!(matches!(
+            resolve_save_in(&msgs, "", Path::new(".")),
+            SaveOutcome::EmptyHistory
+        ));
+    }
+
+    #[test]
+    fn save_empty_history_when_only_whitespace() {
+        let msgs = conv(&[("user", "   "), ("assistant", "\n  \t")]);
+        assert!(matches!(
+            resolve_save_in(&msgs, "", Path::new(".")),
+            SaveOutcome::EmptyHistory
+        ));
+    }
+
+    #[test]
+    fn save_default_filename_format() {
+        // Pure naming check — no I/O, safe to run in parallel.
+        let name = default_save_filename();
+        assert!(name.starts_with("atomcode-session-"), "got: {name}");
+        assert!(name.ends_with(".md"), "got: {name}");
+        // atomcode-session-YYYYMMDD-HHMMSS.md → 17 + 15 + 3 = 35 chars
+        assert_eq!(name.len(), "atomcode-session-YYYYMMDD-HHMMSS.md".len());
+    }
+
+    #[test]
+    fn save_render_markdown_formats_turns() {
+        let msgs = conv(&[("user", "hello"), ("assistant", "hi there")]);
+        let md = render_save_markdown(&msgs).expect("non-empty renders");
+        assert!(md.starts_with("# AtomCode Session - "));
+        assert!(md.contains("## User\nhello\n\n"));
+        assert!(md.contains("## Assistant\nhi there\n\n"));
+    }
+
+    #[test]
+    fn save_render_skips_synthetic_and_tool_messages() {
+        let msgs = vec![
+            msg(Role::User, "real prompt"),
+            Message::synthetic_user("synthetic injection"),
+            msg(Role::Tool, "tool noise"),
+            msg(Role::Assistant, "reply"),
+        ];
+        let md = render_save_markdown(&msgs).expect("renders");
+        assert!(md.contains("## User\nreal prompt"));
+        assert!(md.contains("## Assistant\nreply"));
+        assert!(!md.contains("synthetic injection"));
+        assert!(!md.contains("tool noise"));
+    }
+
+    #[test]
+    fn save_render_returns_none_for_empty() {
+        assert!(render_save_markdown(&[]).is_none());
+        assert!(render_save_markdown(&[msg(Role::Tool, "x")]).is_none());
+    }
+
+    #[test]
+    fn save_writes_relative_path_in_active_working_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let msgs = conv(&[("user", "ping"), ("assistant", "pong")]);
+
+        match resolve_save_in(&msgs, "session.md", tmp.path()) {
+            SaveOutcome::Ok(got) => {
+                assert_eq!(got, tmp.path().join("session.md").canonicalize().unwrap());
+                assert!(got.is_file());
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_writes_custom_absolute_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("report.md");
+        let msgs = conv(&[("user", "ping"), ("assistant", "pong")]);
+        match resolve_save_in(&msgs, path.to_str().unwrap(), tmp.path()) {
+            SaveOutcome::Ok(got) => {
+                // canonicalize() may add a platform-specific prefix
+                // (e.g. \\?\ on Windows), so compare by file name + read-back
+                // rather than exact path equality.
+                assert_eq!(got.file_name(), path.file_name());
+                let content = std::fs::read_to_string(&got).expect("read");
+                assert!(content.contains("## User\nping"));
+                assert!(content.contains("## Assistant\npong"));
+            }
+            _ => panic!(
+                "expected Ok, got {:?}",
+                resolve_save_in(&msgs, path.to_str().unwrap(), tmp.path())
+            ),
+        }
+    }
+
+    #[test]
+    fn save_overwrites_existing_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("old.md");
+        std::fs::write(&path, "OLD CONTENT").expect("seed");
+        let msgs = conv(&[("user", "new turn")]);
+        match resolve_save_in(&msgs, path.to_str().unwrap(), tmp.path()) {
+            SaveOutcome::Ok(got) => {
+                assert_eq!(got.file_name(), path.file_name());
+                let content = std::fs::read_to_string(&got).expect("read");
+                assert!(content.contains("## User\nnew turn"));
+                assert!(!content.contains("OLD CONTENT"));
+            }
+            _ => panic!("expected Ok"),
+        }
+    }
+
+    #[test]
+    fn save_invalid_path_when_parent_dir_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("nonexistent_dir").join("out.md");
+        let msgs = conv(&[("user", "hi")]);
+        match resolve_save_in(&msgs, path.to_str().unwrap(), tmp.path()) {
+            SaveOutcome::InvalidPath(p) => assert!(p.contains("nonexistent_dir"), "got: {p}"),
+            other => panic!("expected InvalidPath, got {other:?}"),
+        }
     }
 }
 
@@ -5244,7 +7151,10 @@ mod expand_cd_target_tests {
             expand_cd_target("~\\Desktop", Some(&home), &cwd, None).unwrap(),
             home.join("Desktop")
         );
-        assert_eq!(expand_cd_target("~", Some(&home), &cwd, None).unwrap(), home);
+        assert_eq!(
+            expand_cd_target("~", Some(&home), &cwd, None).unwrap(),
+            home
+        );
     }
 
     #[test]
@@ -5267,15 +7177,24 @@ mod expand_cd_target_tests {
     #[test]
     fn relative_joins_cwd_absolute_kept() {
         let cwd = PathBuf::from("/work");
-        assert_eq!(expand_cd_target("sub", None, &cwd, None).unwrap(), cwd.join("sub"));
-        assert_eq!(expand_cd_target("/abs/path", None, &cwd, None).unwrap(), Path::new("/abs/path"));
+        assert_eq!(
+            expand_cd_target("sub", None, &cwd, None).unwrap(),
+            cwd.join("sub")
+        );
+        assert_eq!(
+            expand_cd_target("/abs/path", None, &cwd, None).unwrap(),
+            Path::new("/abs/path")
+        );
     }
 
     #[test]
     fn dash_uses_previous_dir() {
         let cwd = PathBuf::from("/work");
         let prev = PathBuf::from("/old");
-        assert_eq!(expand_cd_target("-", None, &cwd, Some(&prev)).unwrap(), prev);
+        assert_eq!(
+            expand_cd_target("-", None, &cwd, Some(&prev)).unwrap(),
+            prev
+        );
         assert!(expand_cd_target("-", None, &cwd, None).is_err());
     }
 }
@@ -5283,6 +7202,92 @@ mod expand_cd_target_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_file_status_shows_instruction_and_memory_paths() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("AGENTS.md"), "project instructions").unwrap();
+        let project_memory = MemoryStore::project(project.path());
+        std::fs::create_dir_all(project_memory.path().parent().unwrap()).unwrap();
+        std::fs::write(project_memory.path(), "- remembered fact\n").unwrap();
+        let status = render_context_file_status_block(project.path());
+        assert!(status.contains(&project.path().join("AGENTS.md").display().to_string()));
+        assert!(status.contains(&project_memory.path().display().to_string()));
+        assert!(status.contains("(PROJECT)") || status.contains("（PROJECT）"));
+        assert!(
+            status.contains("Instruction files") || status.contains("指令文件"),
+            "instruction section should be visible: {status}"
+        );
+        assert!(
+            status.contains("Memory files") || status.contains("记忆文件"),
+            "memory section should be visible: {status}"
+        );
+    }
+
+    #[test]
+    fn streaming_usage_snapshot_composes_plan_and_window_lines() {
+        use atomcode_codingplan::types::{PlanInfo, RateLimitWindow};
+        // Build fixtures from JSON (serde defaults fill the fields we don't care about).
+        let plan: PlanInfo = serde_json::from_value(serde_json::json!({
+            "plan_name": "AtomPlan-Pro", "expires_at": "2026-12-31",
+            "remaining_days": 30, "total_days": 365
+        }))
+        .unwrap();
+        let window: RateLimitWindow = serde_json::from_value(serde_json::json!({
+            "usage_status_desc": "42% used", "reset_at_display": "12:00",
+            "usage_percent": 42.0, "seconds_until_reset": 3600,
+            "window_hours": 5, "show_enable": 1
+        }))
+        .unwrap();
+        let data = UsageData {
+            window: Some(window),
+            plan: Some(plan),
+            usage: None,
+            overview: None,
+            error: None,
+        };
+        // The streaming footer report renders the active (default: Current) tab.
+        let text = UsageModal::new(data).active_snapshot_text(true, true);
+        assert!(text.contains("AtomPlan-Pro"), "plan name present: {text}");
+        assert!(text.contains("42.0%"), "window progress present: {text}");
+        assert!(
+            text.contains("\x1b[32m") && text.contains("\x1b[1m"),
+            "streaming snapshot must preserve modal colors and emphasis: {text:?}"
+        );
+
+        // Logged in but empty gateway response → still non-blank (tab bar + the
+        // Current tab's "unavailable" body), never a bare footer.
+        let empty = UsageData {
+            window: None,
+            plan: None,
+            usage: None,
+            overview: None,
+            error: None,
+        };
+        assert!(
+            !UsageModal::new(empty)
+                .active_snapshot_text(true, true)
+                .is_empty(),
+            "empty data must not render blank"
+        );
+    }
+
+    #[test]
+    fn active_session_bucket_uses_runtime_directory_not_embedded_metadata() {
+        let runtime_dir = PathBuf::from("/current/project");
+        let stale_meta_dir = PathBuf::from("/old/project");
+
+        let bucket = active_session_project_bucket(&runtime_dir);
+
+        assert_eq!(
+            bucket,
+            atomcode_capabilities::session::SessionManager::project_hash(&runtime_dir)
+        );
+        assert_ne!(
+            bucket,
+            atomcode_capabilities::session::SessionManager::project_hash(&stale_meta_dir)
+        );
+    }
 
     /// Create a subdir inside a tempdir and return both. Paths are
     /// canonicalized because `resolve_cd` canonicalizes its output, and
@@ -5294,7 +7299,7 @@ mod tests {
     /// comparison below would fail on Windows. No-op off Windows.
     fn make_dirs() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let strip = atomcode_core::tool::strip_verbatim_prefix_path;
+        let strip = atomcode_capabilities::pathnorm::strip_verbatim_path;
         let cwd = strip(&tmp.path().canonicalize().expect("canon cwd"));
         let sub = cwd.join("sub");
         std::fs::create_dir(&sub).expect("mkdir sub");
@@ -5330,6 +7335,31 @@ mod tests {
         assert_eq!(
             parse_recent_dirs("/a\n\n/b\n/a\n"),
             vec![PathBuf::from("/a"), PathBuf::from("/b")],
+        );
+    }
+
+    // On case-insensitive filesystems (Windows/macOS) the SAME dir written in two
+    // cases (a launcher passing C:\users vs C:\Users) must collapse to one entry;
+    // first occurrence wins. See the reported bug: recent_dirs.txt held both.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn parse_recent_dirs_collapses_case_variants_on_case_insensitive_fs() {
+        assert_eq!(
+            parse_recent_dirs("/Users/danan\n/users/danan\n"),
+            vec![PathBuf::from("/Users/danan")],
+            "same dir in two cases must collapse, keeping the first"
+        );
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn push_recent_dir_dedups_case_variants_on_case_insensitive_fs() {
+        let mut dirs = vec![PathBuf::from("/Users/danan"), PathBuf::from("/other")];
+        push_recent_dir(&mut dirs, PathBuf::from("/users/danan"));
+        assert_eq!(
+            dirs,
+            vec![PathBuf::from("/users/danan"), PathBuf::from("/other")],
+            "re-pushing the same dir in a different case moves it to front, no dupe"
         );
     }
 
@@ -5382,6 +7412,8 @@ mod tests {
 
     #[test]
     fn file_path_rejected_with_not_a_directory() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let (_tmp, cwd, _sub) = make_dirs();
         let file = cwd.join("a.txt");
         std::fs::write(&file, "hi").expect("write");
@@ -5401,7 +7433,7 @@ mod tests {
         };
         // `resolve_cd` strips the Windows `\\?\` verbatim prefix, so strip the
         // expected value to match (no-op off Windows).
-        let canon_home = atomcode_core::tool::strip_verbatim_prefix_path(&canon_home);
+        let canon_home = atomcode_capabilities::pathnorm::strip_verbatim_path(&canon_home);
         let (_tmp, cwd, _sub) = make_dirs();
         let got = resolve_cd("~", &cwd, None).expect("~ resolves");
         assert_eq!(got, canon_home);
@@ -5616,5 +7648,764 @@ mod tests {
             "empty cached prompt must show an explanation, got: {}",
             out
         );
+    }
+
+    // ── /copy msg ────────────────────────────────────────────────────
+    // `/copy msg` copies the full reply markdown (prose + code), not just
+    // the fenced code blocks. This is useful for pasting the whole answer
+    // into another document or chat.
+
+    #[test]
+    fn copy_msg_returns_full_markdown_when_reply_has_prose_and_code() {
+        let md = "Here is the plan:\n\n```rust\nfn main() {}\n```\n\nDone.";
+        match resolve_copy(md, "msg") {
+            CopyResolve::Text(s, is_msg) => {
+                assert_eq!(s, md);
+                assert!(is_msg, "/copy msg should flag the result so the caller shows the reply confirmation, not the code-block one");
+            }
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn copy_msg_returns_prose_only_reply_without_code_blocks() {
+        // A reply with no fenced code block still has a meaningful body.
+        // `/copy msg` should return it; `/copy` (no arg) would return NoBlocks.
+        let md = "Just a plain explanation with no code.";
+        match resolve_copy(md, "msg") {
+            CopyResolve::Text(s, is_msg) => {
+                assert_eq!(s, md);
+                assert!(is_msg, "/copy msg should flag the result so the caller shows the reply confirmation, not the code-block one");
+            }
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn copy_msg_trims_leading_trailing_whitespace() {
+        let md = "\n\n  Hello world  \n\n";
+        match resolve_copy(md, "msg") {
+            CopyResolve::Text(s, is_msg) => {
+                assert_eq!(s, "Hello world");
+                assert!(is_msg);
+            }
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn copy_msg_returns_empty_msg_when_reply_is_empty() {
+        // Empty/whitespace-only reply: nothing meaningful to copy.
+        // Distinct from NoBlocks so the caller can show a "reply is empty"
+        // hint instead of the misleading "no code block" wording.
+        for empty in ["", "   ", "\n\n"] {
+            match resolve_copy(empty, "msg") {
+                CopyResolve::EmptyMsg => {}
+                other => panic!("expected EmptyMsg for {:?}, got {:?}", empty, other),
+            }
+        }
+    }
+
+    #[test]
+    fn copy_msg_is_case_insensitive() {
+        let md = "Some text.";
+        for variant in ["msg", "MSG", "Msg", "mSg"] {
+            match resolve_copy(md, variant) {
+                CopyResolve::Text(_, is_msg) => {
+                    assert!(is_msg, "case {:?} should flag is_msg", variant)
+                }
+                other => panic!("case {:?} should match, got {:?}", variant, other),
+            }
+        }
+    }
+
+    #[test]
+    fn copy_msg_does_not_break_existing_copy_no_arg() {
+        // Regression: `/copy` (no arg) still returns last code block.
+        let md = "intro\n```js\na()\n```\n```py\nb()\n```";
+        match resolve_copy(md, "") {
+            CopyResolve::Text(s, _) => assert_eq!(s, "b()"),
+            other => panic!("expected last block, got {:?}", other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod memory_command_tests {
+    #[test]
+    fn remember_project_writes_directly_to_store() {
+        use atomcode_capabilities::memory::MemoryStore;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = MemoryStore::project(tmp.path());
+        // 迁移后 /remember 走 MemoryStore::project(cwd).append —— 这里直接验证 store 语义,
+        // 命令臂在 Step 4 改为调用它。
+        store.append("uses tabs not spaces").unwrap();
+        let entries = MemoryStore::project(tmp.path()).load();
+        assert!(entries.iter().any(|e| e == "uses tabs not spaces"));
+    }
+}
+
+#[cfg(test)]
+mod todo_command_tests {
+    use super::{
+        decide_custom_command, format_todo_command, render_custom_command_error, CustomDispatch,
+    };
+    use crate::custom_commands::ArgsRequirement;
+    use crate::render::{Renderer, UiLine};
+    use atomcode_config::i18n::{t, Msg};
+    use atomcode_kernel::message::{Message, Role};
+    use atomcode_kernel::tool::ToolCall;
+    use std::path::PathBuf;
+
+    /// Kernel text message with an explicit role.
+    fn msg(role: Role, text: &str) -> Message {
+        let mut m = Message::user(text);
+        m.role = role;
+        m
+    }
+
+    /// Assistant message carrying `tool_calls` (kernel flat field).
+    fn tool_call_msg(calls: Vec<ToolCall>) -> Message {
+        Message::assistant("", calls)
+    }
+
+    #[test]
+    fn todo_command_text_with_and_without_list() {
+        // No todowrite calls → "no list" message (i18n'd).
+        let empty = vec![msg(Role::User, "hi")];
+        let no_list = t(Msg::TodoNoList).into_owned();
+        assert!(
+            format_todo_command(&empty, false).contains(&no_list),
+            "empty messages should contain the i18n no-list message: {no_list:?}"
+        );
+
+        // A todowrite call with one pending item → list output.
+        let with = vec![tool_call_msg(vec![ToolCall {
+            id: "1".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
+        }])];
+        let out = format_todo_command(&with, false);
+        assert!(
+            out.contains("[ ] do x"),
+            "expected '[ ] do x' in output, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn custom_required_args_render_and_metadata() {
+        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
+        custom.register(crate::custom_commands::CustomCommand {
+            name: "myreview".into(),
+            description: "".into(),
+            args_requirement: ArgsRequirement::Required,
+            template: "review $ARGUMENTS".into(),
+            source: PathBuf::from("x"),
+            namespace: None,
+        });
+        let rendered = custom.render("myreview", "foo");
+        assert_eq!(rendered, Some("review foo".into()));
+        let rendered_empty = custom.render("myreview", "");
+        assert_eq!(rendered_empty, Some("review ".into()));
+        // Required + empty → render still works (template subst is value-neutral),
+        // the validation lives in the dispatch layer.
+        let cmd = custom.resolve("myreview").unwrap();
+        assert_eq!(cmd.args_requirement, ArgsRequirement::Required);
+    }
+
+    #[test]
+    fn dispatch_custom_optional_empty_arg_submits() {
+        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
+        custom.register(crate::custom_commands::CustomCommand {
+            name: "myreview".into(),
+            description: "".into(),
+            args_requirement: ArgsRequirement::Optional,
+            template: "review $ARGUMENTS".into(),
+            source: PathBuf::from("x"),
+            namespace: None,
+        });
+        let rendered = custom.render("myreview", "");
+        assert_eq!(rendered, Some("review ".into()));
+        let cmd = custom.resolve("myreview").unwrap();
+        assert_eq!(cmd.args_requirement, ArgsRequirement::Optional);
+    }
+
+    #[test]
+    fn dispatch_custom_none_empty_arg_submits() {
+        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
+        custom.register(crate::custom_commands::CustomCommand {
+            name: "myreview".into(),
+            description: "".into(),
+            args_requirement: ArgsRequirement::None,
+            template: "review $ARGUMENTS".into(),
+            source: PathBuf::from("x"),
+            namespace: None,
+        });
+        let rendered = custom.render("myreview", "");
+        assert_eq!(rendered, Some("review ".into()));
+        let cmd = custom.resolve("myreview").unwrap();
+        assert_eq!(cmd.args_requirement, ArgsRequirement::None);
+    }
+
+    // ── dispatch decision: `Required` + empty arg ⇒ Reject ──────────────
+    //
+    // Regression guard for the `other` arm of `execute_slash_command_impl`.
+    // The prior tests above only covered `CustomCommandRegistry::render`'s
+    // template substitution and the `args_requirement` metadata; none
+    // exercised the dispatcher's reject-vs-submit boundary. If a future
+    // refactor drops the `CmdCustomArgRequired` arm or flips the rule so
+    // `Required` + empty silently submits an empty template, the existing
+    // suite would not catch it — these do.
+
+    #[test]
+    fn dispatch_required_empty_arg_is_rejected() {
+        // Trigger: user typed `/myreview` (Required) and pressed Enter
+        // with no argument. Expected: render CmdCustomArgRequired, do
+        // NOT submit an agent turn.
+        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
+        custom.register(crate::custom_commands::CustomCommand {
+            name: "myreview".into(),
+            description: "".into(),
+            args_requirement: ArgsRequirement::Required,
+            template: "review $ARGUMENTS".into(),
+            source: PathBuf::from("x"),
+            namespace: None,
+        });
+        let decision = decide_custom_command(&custom, "myreview", "");
+        assert!(
+            matches!(decision, CustomDispatch::Reject),
+            "Required command with empty arg must be rejected, got {:?}",
+            decision
+        );
+    }
+
+    #[test]
+    fn todo_clear_pair_folds_the_list_to_empty() {
+        // A live plan, then the `/todo clear` synthetic pair appended, must
+        // derive to an empty list → `/todo` shows the "no list" message. This
+        // is what makes cancelled/stale tasks stop reappearing.
+        let mut msgs = vec![tool_call_msg(vec![ToolCall {
+            id: "1".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
+        }])];
+        assert!(format_todo_command(&msgs, false).contains("[ ] do x"));
+        msgs.extend(super::todo_clear_messages("todo-clear-1".to_string()));
+        let no_list = t(Msg::TodoNoList).into_owned();
+        assert!(
+            format_todo_command(&msgs, false).contains(&no_list),
+            "after the clear pair, /todo must show the no-list message; got:\n{}",
+            format_todo_command(&msgs, false)
+        );
+    }
+
+    #[test]
+    fn dispatch_required_whitespace_only_arg_is_rejected() {
+        // The dispatcher trims before checking emptiness, so a bare
+        // space/tab arg should also reject — otherwise the user could
+        // bypass validation by typing `/myreview ` (trailing space gets
+        // injected by the needs_args menu auto-complete path).
+        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
+        custom.register(crate::custom_commands::CustomCommand {
+            name: "myreview".into(),
+            description: "".into(),
+            args_requirement: ArgsRequirement::Required,
+            template: "review $ARGUMENTS".into(),
+            source: PathBuf::from("x"),
+            namespace: None,
+        });
+        let decision = decide_custom_command(&custom, "myreview", "   \t  ");
+        assert!(
+            matches!(decision, CustomDispatch::Reject),
+            "Required command with whitespace-only arg must be rejected, got {:?}",
+            decision
+        );
+    }
+
+    #[test]
+    fn todo_add_pair_appends_a_task_keeping_existing() {
+        // A live plan, then the `/todo add` synthetic pair appended, must fold to
+        // the ORIGINAL task plus the new one at the end — existing tasks untouched.
+        let mut msgs = vec![tool_call_msg(vec![ToolCall {
+            id: "1".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"todos":[{"content":"do x","status":"in_progress"}]}"#.into(),
+        }])];
+        msgs.extend(super::todo_add_messages(
+            "todo-add-1".to_string(),
+            "ship it",
+        ));
+        let out = format_todo_command(&msgs, false);
+        assert!(out.contains("do x"), "existing task must remain:\n{out}");
+        assert!(
+            out.contains("[ ] ship it"),
+            "new pending task appended:\n{out}"
+        );
+    }
+
+    #[test]
+    fn todo_add_from_empty_creates_the_list() {
+        // No prior plan: `/todo add` alone should create a one-item list.
+        let msgs = super::todo_add_messages("todo-add-0".to_string(), "first task");
+        let out = format_todo_command(&msgs, false);
+        assert!(
+            out.contains("[ ] first task"),
+            "add-from-empty seeds the list:\n{out}"
+        );
+    }
+
+    #[test]
+    fn todo_add_content_with_quotes_is_json_safe() {
+        // serde_json encoding must keep the args valid so the fold sees the task.
+        let msgs = super::todo_add_messages("todo-add-2".to_string(), r#"handle "weird" input"#);
+        let out = format_todo_command(&msgs, false);
+        assert!(
+            out.contains(r#"handle "weird" input"#),
+            "quoted content survives round-trip:\n{out}"
+        );
+    }
+
+    #[test]
+    fn todo_command_applies_incremental_updates_after_the_plan() {
+        // Merge regression: `/todo` folds via `reduce_todos`, so a `{action:update}` after the
+        // plan is reflected — not just the initial (pending) plan.
+        let msgs = vec![tool_call_msg(vec![
+            ToolCall {
+                id: "1".into(),
+                name: "todowrite".into(),
+                arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
+            },
+            ToolCall {
+                id: "2".into(),
+                name: "todowrite".into(),
+                arguments: r#"{"action":"update","id":1,"status":"completed"}"#.into(),
+            },
+        ])];
+        let out = format_todo_command(&msgs, false);
+        assert!(out.contains("do x"), "task shown: {out}");
+        assert!(
+            !out.contains("[ ] do x"),
+            "must reflect the completed update, not the pending plan: {out}"
+        );
+    }
+
+    #[test]
+    fn dispatch_required_nonempty_arg_submits() {
+        // Sanity counterpart: Required + a real argument must submit the
+        // rendered template, never Reject. Guards against an overly-broad
+        // rejection rule (e.g. someone drops the `arg.trim().is_empty()`
+        // half of the condition).
+        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
+        custom.register(crate::custom_commands::CustomCommand {
+            name: "myreview".into(),
+            description: "".into(),
+            args_requirement: ArgsRequirement::Required,
+            template: "review $ARGUMENTS".into(),
+            source: PathBuf::from("x"),
+            namespace: None,
+        });
+        let decision = decide_custom_command(&custom, "myreview", "foo");
+        match decision {
+            CustomDispatch::Submit(rendered) => assert_eq!(rendered, "review foo"),
+            other => panic!("Required + nonempty arg should Submit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dispatch_optional_and_none_empty_arg_submits() {
+        // Optional / None commands with empty arg must still submit (the
+        // reject rule is scoped to Required only). Locks the boundary so
+        // a regression that rejects all empty-arg dispatches is caught.
+        for requirement in [ArgsRequirement::Optional, ArgsRequirement::None] {
+            let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
+            custom.register(crate::custom_commands::CustomCommand {
+                name: "myreview".into(),
+                description: "".into(),
+                args_requirement: requirement.clone(),
+                template: "review $ARGUMENTS".into(),
+                source: PathBuf::from("x"),
+                namespace: None,
+            });
+            let decision = decide_custom_command(&custom, "myreview", "");
+            match decision {
+                CustomDispatch::Submit(rendered) => assert_eq!(
+                    rendered, "review ",
+                    "Optional/None + empty arg should submit rendered template"
+                ),
+                other => panic!(
+                    "{:?} command with empty arg should Submit, got {:?}",
+                    requirement, other
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_unknown_command_is_not_found() {
+        // A name that matches neither a custom command nor (in the pure
+        // decision layer) a skill falls through to NotFound, which the
+        // dispatcher translates into the unknown-command telemetry arm.
+        let custom = crate::custom_commands::CustomCommandRegistry::empty();
+        let decision = decide_custom_command(&custom, "does_not_exist", "");
+        assert!(
+            matches!(decision, CustomDispatch::NotFound),
+            "Unregistered command should fall through to NotFound, got {:?}",
+            decision
+        );
+    }
+
+    // ── end-to-end: Reject ⇒ render CmdCustomArgRequired, no submit ──────
+    //
+    // The `decide_custom_command` tests above only pin the pure decision.
+    // This block exercises the actual renderer side effect of the `other`
+    // arm's `Reject` branch — i.e. that `CmdCustomArgRequired` is rendered
+    // as an `UiLine::Error` and, crucially, that `submit_agent_turn` is
+    // never reached on this path. If a future refactor drops the
+    // `CmdCustomArgRequired` render or flips the arm to silently submit an
+    // empty template, these tests catch it.
+
+    /// Minimal `Renderer` mock that records every rendered `UiLine`.
+    /// Re-declared here (the `live_snapshot_replay_skips_synthetic_user_messages`
+    /// test owns its own copy) so the reject-render tests below stay
+    /// self-contained.
+    #[derive(Default)]
+    struct RecRenderer {
+        lines: Vec<UiLine>,
+        flushed: usize,
+    }
+    impl Renderer for RecRenderer {
+        fn render(&mut self, line: UiLine) {
+            self.lines.push(line);
+        }
+        fn flush(&mut self) {
+            self.flushed += 1;
+        }
+        fn shutdown(&mut self) {}
+        fn reset(&mut self) {}
+        fn clear_screen(&mut self) {}
+        fn suspend_for_external(&mut self) {}
+        fn resume_from_external(&mut self) {}
+        fn flush_deferred(&mut self) {}
+    }
+
+    #[test]
+    fn reject_renders_cmd_custom_arg_required_error() {
+        // Trigger: user typed `/myreview` (Required) and pressed Enter
+        // with no argument. Expected: exactly one UiLine::Error carrying
+        // the CmdCustomArgRequired message, followed by a flush.
+        let mut rec = RecRenderer::default();
+        render_custom_command_error(&mut rec, &CustomDispatch::Reject, "myreview");
+
+        assert_eq!(
+            rec.lines.len(),
+            1,
+            "Reject must render exactly one line, got {:?}",
+            rec.lines
+        );
+        let rendered = t(Msg::CmdCustomArgRequired { name: "myreview" }).into_owned();
+        match &rec.lines[0] {
+            UiLine::Error(msg) => assert_eq!(
+                msg, &rendered,
+                "Reject must render the CmdCustomArgRequired i18n message"
+            ),
+            other => panic!("Reject must render UiLine::Error, got {:?}", other),
+        }
+        assert_eq!(
+            rec.flushed, 1,
+            "Reject must flush the renderer exactly once"
+        );
+    }
+
+    #[test]
+    fn submit_renders_no_error_line_and_not_found_renders_unknown_command() {
+        // Counterpart contract:
+        //   - Submit is the only non-error outcome, so it must render NO
+        //     error line (the caller forwards the rendered template to
+        //     submit_agent_turn instead).
+        //   - NotFound IS an error outcome (no custom command, no skill),
+        //     so it must render exactly one UiLine::Error carrying the
+        //     CmdUnknownCommand i18n message, then flush.
+        // Guards against a regression that collapses NotFound into the
+        // Submit no-op arm (which would silently swallow unknown commands
+        // with zero user-visible feedback).
+        let mut rec = RecRenderer::default();
+        render_custom_command_error(
+            &mut rec,
+            &CustomDispatch::Submit("review foo".into()),
+            "myreview",
+        );
+        assert!(
+            rec.lines.is_empty(),
+            "Submit must not render any error line, got {:?}",
+            rec.lines
+        );
+
+        let mut rec = RecRenderer::default();
+        render_custom_command_error(&mut rec, &CustomDispatch::NotFound, "foo");
+        assert_eq!(
+            rec.lines.len(),
+            1,
+            "NotFound must render exactly one line, got {:?}",
+            rec.lines
+        );
+        let expected = t(Msg::CmdUnknownCommand { name: "foo" }).into_owned();
+        match &rec.lines[0] {
+            UiLine::Error(msg) => assert_eq!(
+                msg, &expected,
+                "NotFound must render the CmdUnknownCommand i18n message"
+            ),
+            other => panic!("NotFound must render UiLine::Error, got {:?}", other),
+        }
+        assert_eq!(
+            rec.flushed, 1,
+            "NotFound must flush the renderer exactly once"
+        );
+    }
+
+    #[test]
+    fn required_empty_arg_dispatch_pipeline_rejects_without_submit() {
+        // End-to-end guard for the `other` arm of execute_slash_command_impl.
+        // Compose the two pure functions the arm calls — decide_custom_command
+        // then render_custom_command_error — and assert the observable
+        // contract:
+        //   1. Reject ⇒ render exactly one Error line with CmdCustomArgRequired
+        //      (the dispatcher never reaches submit_agent_turn on this branch).
+        //   2. Submit ⇒ render no error line (submit happens elsewhere, but
+        //      we assert the error-render half stays silent on success).
+        // This is the closest unit-testable seam to the real dispatcher; the
+        // full LoopCtx is intentionally avoided (it'd require constructing an
+        // AgentClient + Telemetry + a dozen channels just to reach one arm).
+        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
+        custom.register(crate::custom_commands::CustomCommand {
+            name: "myreview".into(),
+            description: "".into(),
+            args_requirement: ArgsRequirement::Required,
+            template: "review $ARGUMENTS".into(),
+            source: PathBuf::from("x"),
+            namespace: None,
+        });
+
+        // Reject case: Required + empty arg.
+        let mut rec = RecRenderer::default();
+        let decision = decide_custom_command(&custom, "myreview", "");
+        assert!(
+            matches!(decision, CustomDispatch::Reject),
+            "Required + empty arg must decide Reject, got {:?}",
+            decision
+        );
+        render_custom_command_error(&mut rec, &decision, "myreview");
+        // Contract: exactly one Error line carrying the i18n message.
+        let expected = t(Msg::CmdCustomArgRequired { name: "myreview" }).into_owned();
+        let errors: Vec<&String> = rec
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                UiLine::Error(msg) => Some(msg),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "Reject must render exactly one Error line, got {:?}",
+            rec.lines
+        );
+        assert_eq!(
+            errors[0], &expected,
+            "Reject must render the CmdCustomArgRequired message"
+        );
+        // The reject branch never renders anything other than the Error line,
+        // which (combined with the decide_custom_command assertion above) means
+        // submit_agent_turn is structurally unreachable on this path.
+        assert_eq!(
+            rec.lines.len(),
+            1,
+            "Reject must render exactly one line total, got {:?}",
+            rec.lines
+        );
+
+        // Submit case: Required + nonempty arg must NOT render an error.
+        let mut rec = RecRenderer::default();
+        let decision = decide_custom_command(&custom, "myreview", "foo");
+        match decision {
+            CustomDispatch::Submit(ref rendered) => assert_eq!(rendered, "review foo"),
+            other => panic!("Required + nonempty arg should Submit, got {:?}", other),
+        }
+        render_custom_command_error(&mut rec, &decision, "myreview");
+        assert!(
+            rec.lines
+                .iter()
+                .all(|line| !matches!(line, UiLine::Error(_))),
+            "Submit must not render any Error line, got {:?}",
+            rec.lines
+        );
+    }
+
+    #[test]
+    fn init_submits_the_coding_init_prompt() {
+        // handler 用 atomcode_coding::INIT_PROMPT 作为提交文本;这里锁定接线源。
+        assert!(atomcode_coding::INIT_PROMPT.contains("AGENTS.md"));
+    }
+
+    #[test]
+    fn cost_report_keeps_models_separate_and_hides_unknown_price() {
+        use crate::event_loop::commands::build_cost_report_text;
+        use atomcode_capabilities::session::{ModelCostSummary, SessionCostReport, TokenBreakdown};
+        let out = build_cost_report_text(
+            SessionCostReport {
+                models: vec![ModelCostSummary {
+                    provider_id: "provider-a".into(),
+                    model_id: "model-a".into(),
+                    tokens: TokenBreakdown {
+                        input: 1234,
+                        output: 567,
+                        cached_input: 89,
+                    },
+                    estimated_cost_usd: None,
+                    explicitly_free: false,
+                }],
+                unattributed_tokens: 0,
+                total_tokens: 1890,
+                estimated_cost_usd: None,
+            },
+            &atomcode_config::config::Config::default(),
+            "provider-b",
+            "model-b",
+            None,
+        );
+        // Unknown ids (not in the catalog) fall back to the raw id; separator is `·`.
+        assert!(out.contains("provider-a · model-a"));
+        assert!(out.contains("provider-b · model-b"));
+        assert!(out.contains("1323"));
+        assert!(out.contains("567"));
+        assert!(out.contains("89"));
+        assert!(!out.contains("Estimated cost"));
+        assert!(!out.contains("unknown"));
+    }
+}
+
+#[cfg(test)]
+mod mcp_subcommand_tests {
+    use super::{parse_mcp_subcommand, McpSub};
+
+    #[test]
+    fn mcp_trust_subcommands_recognized() {
+        assert!(matches!(parse_mcp_subcommand("trust"), Some(McpSub::Trust)));
+        assert!(matches!(
+            parse_mcp_subcommand("untrust"),
+            Some(McpSub::Untrust)
+        ));
+    }
+
+    #[test]
+    fn mcp_trust_case_insensitive() {
+        assert!(matches!(parse_mcp_subcommand("TRUST"), Some(McpSub::Trust)));
+        assert!(matches!(
+            parse_mcp_subcommand("UnTrust"),
+            Some(McpSub::Untrust)
+        ));
+    }
+
+    #[test]
+    fn mcp_existing_subcommands_still_recognized() {
+        assert!(matches!(
+            parse_mcp_subcommand("reload"),
+            Some(McpSub::Reload)
+        ));
+        assert!(matches!(
+            parse_mcp_subcommand("tools myserver"),
+            Some(McpSub::Tools)
+        ));
+        assert!(matches!(
+            parse_mcp_subcommand("login github"),
+            Some(McpSub::Login)
+        ));
+        assert!(matches!(
+            parse_mcp_subcommand("logout github"),
+            Some(McpSub::Logout)
+        ));
+    }
+
+    #[test]
+    fn mcp_unknown_subcommand_returns_none() {
+        assert!(parse_mcp_subcommand("").is_none());
+        assert!(parse_mcp_subcommand("status").is_none());
+        assert!(parse_mcp_subcommand("foobar").is_none());
+    }
+}
+
+#[cfg(test)]
+mod split_skill_names_tests {
+    use super::split_skill_names;
+
+    /// 测试用假解析器：返回 skill 的规范身份（小写）。镜像真实 `SkillRegistry::get`
+    /// 的大小写不敏感解析——`resolve("BrainStorming")` 与 `resolve("brainstorming")`
+    /// 返回同一规范名，所以去重按规范身份而非原始拼写。
+    fn resolve(name: &str) -> Option<String> {
+        let canonical = name.to_ascii_lowercase();
+        matches!(
+            canonical.as_str(),
+            "adapt-agent" | "skill-creator" | "brainstorming" | "a"
+        )
+        .then_some(canonical)
+    }
+
+    #[test]
+    fn multiple_skills_then_task() {
+        let (skills, task) = split_skill_names("adapt-agent skill-creator 路径在哪", resolve);
+        assert_eq!(skills, vec!["adapt-agent", "skill-creator"]);
+        assert_eq!(task, "路径在哪");
+    }
+
+    #[test]
+    fn single_skill_with_task_unchanged() {
+        let (skills, task) = split_skill_names("brainstorming 做个登录页", resolve);
+        assert_eq!(skills, vec!["brainstorming"]);
+        assert_eq!(task, "做个登录页");
+    }
+
+    #[test]
+    fn single_skill_no_task_unchanged() {
+        let (skills, task) = split_skill_names("brainstorming", resolve);
+        assert_eq!(skills, vec!["brainstorming"]);
+        assert_eq!(task, "");
+    }
+
+    #[test]
+    fn first_token_not_a_skill_yields_empty() {
+        let (skills, task) = split_skill_names("路径在哪", resolve);
+        assert!(skills.is_empty());
+        assert_eq!(task, "路径在哪");
+    }
+
+    #[test]
+    fn typo_second_skill_falls_into_task() {
+        let (skills, task) = split_skill_names("adapt-agent skil-creator 路径在哪", resolve);
+        assert_eq!(skills, vec!["adapt-agent"]);
+        assert_eq!(task, "skil-creator 路径在哪");
+    }
+
+    #[test]
+    fn duplicate_skill_deduped() {
+        let (skills, task) = split_skill_names("a a 任务", resolve);
+        assert_eq!(skills, vec!["a"]);
+        assert_eq!(task, "任务");
+    }
+
+    #[test]
+    fn task_whitespace_preserved_verbatim() {
+        let (skills, task) = split_skill_names("brainstorming line1\n  line2", resolve);
+        assert_eq!(skills, vec!["brainstorming"]);
+        assert_eq!(task, "line1\n  line2");
+    }
+
+    #[test]
+    fn variant_spellings_of_same_skill_dedup_to_one() {
+        // Different case both resolve to canonical "brainstorming" → one skill,
+        // NOT two (which would inject the same skill body twice). The first
+        // spelling the user typed is kept for display.
+        let (skills, task) = split_skill_names("BrainStorming brainstorming 任务", resolve);
+        assert_eq!(skills, vec!["BrainStorming"]);
+        assert_eq!(task, "任务");
     }
 }

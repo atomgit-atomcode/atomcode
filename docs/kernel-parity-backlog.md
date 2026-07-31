@@ -1,6 +1,13 @@
 # Kernel/Capabilities/Coding → cli/tuix Parity Backlog
 
-**Goal:** complete the new inverted stack (L0 `atomcode-kernel` + L1 `atomcode-capabilities` + L2 `atomcode-coding`) to **full functional parity** with what production `cli/tuix`需要, BEFORE wiring it into cli/tuix — so the eventual integration is parity, not degraded.
+> 状态：历史 backlog，已由
+> [`coding-runtime-native-migration-design.md`](coding-runtime-native-migration-design.md)
+> 的实施结果取代。下列未勾选项记录的是接线前的设计假设，不代表当前待办；当前
+> CLI、TUI、daemon、background、ACP 和 clix 已切到 `CodingRuntime`，core driver 协议与
+> `atomcode-bridge` 已退役。仍未完成的是北极星架构中的非引擎 core/foundation/protocol
+> 拆分，不应从本清单推导迁移状态。
+
+**Historical goal:** complete the new inverted stack (L0 `atomcode-kernel` + L1 `atomcode-capabilities` + L2 `atomcode-coding`) to **full functional parity** with what production `cli/tuix`需要, BEFORE wiring it into cli/tuix — so the eventual integration is parity, not degraded.
 
 **Hard rules (every item):**
 - **Zero `atomcode-core` change** — `cargo tree -p <crate>` shows 0 atomcode-core; `git status --short -- crates/atomcode-core` empty after every commit.
@@ -43,7 +50,7 @@ These few primitives unlock the bulk of Tier-3 driver features without per-featu
 ## Phase C — L2 `atomcode-coding` (assemble the completed capabilities)
 
 - ☐ **C1 [M] "Full" coding-agent assembly** — extend `build_coding_agent` (or a new `build_full_coding_agent`) to wire: memory hook (B4), plan-mode middleware (B5), MCP tools (B1), file-history (B6), skills (B8), session persistence handle (B3), provider factory (B2). Order load-bearing (approval middleware first). Acceptance: one assembled agent exposes every parity capability; assembly test asserts each is mounted/wired.
-- ☐ **C2 [L] Background + parallel sub-agent composition** — `/bg` (isolated child session) and `parallel_edit` as **L2 composition** over kernel `Agent` (kernel already proves subagent-by-composition + `ToolProgress` for nested progress). A small pool + per-task turn budget. **Closes**: `Background/BackgroundComplete`, `SubAgentDispatch*`, `parallel_edit_files`. Acceptance: a background task runs isolated and reports completion; parallel edits dispatch + report per-task.
+- ☐ **C2 [L] Background + parallel sub-agent composition** — `/bg` (isolated child session) and `parallel_edit` as **L2 composition** over kernel `Agent` (kernel already proves subagent-by-composition + `ToolProgress` for nested progress). A small pool + per-task turn budget. The dead core `Background/BackgroundComplete` protocol has been retired; remaining background work is to switch `/bg`'s runtime spawner from bridge `AgentClient` to a kernel-native runtime facade. **Closes**: `SubAgentDispatch*`, `parallel_edit_files`, and the `/bg` bridge runtime dependency. Acceptance: a background task runs isolated and reports completion; parallel edits dispatch + report per-task.
 - ☐ **C3 [S] Vision/image preprocessing middleware** — pre-process pasted images (optional VL describe) before `SendMessage` reaches the kernel (kernel just forwards `ImageContent`). **Closes**: `VisionPreprocessSuccess`/`RestorePendingImages` (as L2/driver concerns). Acceptance: an image send round-trips; preprocessing failure surfaces a re-attach path.
 
 ---

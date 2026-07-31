@@ -23,10 +23,16 @@ async fn send_message_images_reach_the_provider_on_the_user_message() {
         .build()
         .spawn();
 
-    let imgs = vec![ImageContent { media_type: "image/png".into(), data: "QUJD".into() }];
+    let imgs = vec![ImageContent {
+        media_type: "image/png".into(),
+        data: "QUJD".into(),
+    }];
     handle
         .commands
-        .send(AgentCommand::SendMessage { text: "what is this".into(), images: imgs.clone() })
+        .send(AgentCommand::SendMessage {
+            text: "what is this".into(),
+            images: imgs.clone(),
+        })
         .unwrap();
 
     while let Some(ev) = handle.events.recv().await {
@@ -44,7 +50,10 @@ async fn send_message_images_reach_the_provider_on_the_user_message() {
         .find(|m| m.role == Role::User)
         .expect("a user message reached the provider");
     assert_eq!(user.text, "what is this");
-    assert_eq!(user.images, imgs, "images must be threaded onto the user message, not dropped");
+    assert_eq!(
+        user.images, imgs,
+        "images must be threaded onto the user message, not dropped"
+    );
 }
 
 /// A tool that returns an inline image — stands in for `read_file` on a picture.
@@ -65,7 +74,10 @@ impl Tool for ImageTool {
             call_id: String::new(),
             content: "[Image: cover.jpg — attached below]".into(),
             is_error: false,
-            images: vec![ImageContent { media_type: "image/jpeg".into(), data: "QUJD".into() }],
+            images: vec![ImageContent {
+                media_type: "image/jpeg".into(),
+                data: "QUJD".into(),
+            }],
         }
     }
 }
@@ -78,10 +90,17 @@ async fn tool_returned_images_reach_the_model_as_a_following_user_message() {
     // this is what lets a vision model actually SEE a picture read by read_file.
     let provider = Arc::new(RecordingProvider::new(vec![
         vec![
-            StreamEvent::ToolCall(ToolCall { id: "c1".into(), name: "read_image".into(), arguments: "{}".into() }),
+            StreamEvent::ToolCall(ToolCall {
+                id: "c1".into(),
+                name: "read_image".into(),
+                arguments: "{}".into(),
+            }),
             StreamEvent::Done { truncated: false },
         ],
-        vec![StreamEvent::TextDelta("I can see it".into()), StreamEvent::Done { truncated: false }],
+        vec![
+            StreamEvent::TextDelta("I can see it".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
     let calls = provider.calls();
 
@@ -95,7 +114,10 @@ async fn tool_returned_images_reach_the_model_as_a_following_user_message() {
 
     handle
         .commands
-        .send(AgentCommand::SendMessage { text: "look at cover.jpg".into(), images: vec![] })
+        .send(AgentCommand::SendMessage {
+            text: "look at cover.jpg".into(),
+            images: vec![],
+        })
         .unwrap();
     while let Some(ev) = handle.events.recv().await {
         if matches!(ev, AgentEvent::TurnComplete { .. }) {
@@ -106,7 +128,10 @@ async fn tool_returned_images_reach_the_model_as_a_following_user_message() {
     let _ = handle.task.await;
 
     let recorded = calls.lock().unwrap();
-    assert!(recorded.len() >= 2, "provider must be called for a second round after the tool");
+    assert!(
+        recorded.len() >= 2,
+        "provider must be called for a second round after the tool"
+    );
     let round2 = &recorded[1].0;
     // The tool's image must appear on a USER message in round 2's context.
     let img_user = round2
@@ -115,12 +140,24 @@ async fn tool_returned_images_reach_the_model_as_a_following_user_message() {
         .expect("the tool's image must reach the model on a user message");
     assert_eq!(
         img_user.images,
-        vec![ImageContent { media_type: "image/jpeg".into(), data: "QUJD".into() }],
+        vec![ImageContent {
+            media_type: "image/jpeg".into(),
+            data: "QUJD".into()
+        }],
         "the exact image the tool returned must be forwarded"
     );
     // Ordering: the image user message must come AFTER the tool result (contiguous
     // tool_results, then the image) — never interleaved, which would be API-invalid.
-    let tool_idx = round2.iter().position(|m| m.role == Role::Tool).expect("a tool result");
-    let img_idx = round2.iter().position(|m| m.role == Role::User && !m.images.is_empty()).unwrap();
-    assert!(img_idx > tool_idx, "image user message must follow the tool result");
+    let tool_idx = round2
+        .iter()
+        .position(|m| m.role == Role::Tool)
+        .expect("a tool result");
+    let img_idx = round2
+        .iter()
+        .position(|m| m.role == Role::User && !m.images.is_empty())
+        .unwrap();
+    assert!(
+        img_idx > tool_idx,
+        "image user message must follow the tool result"
+    );
 }

@@ -27,10 +27,10 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.25.9-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-5.0.3-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
-  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS%20PC%20%7C%20Windows-lightgrey" alt="platform">
   <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank">
     <img src="https://atomgit.com/atomgit_atomcode/atomcode/star/badge.svg" alt="AtomGit Star"/>
   </a>
@@ -92,7 +92,7 @@ Connect to any LLM that supports OpenAI's function-calling API:
 | Claude (Anthropic) | Yes | Claude Sonnet 4.5/4.6, Opus 4.6 |
 | OpenAI | Yes | GPT-4o, GPT-4.1 |
 | DeepSeek | Yes | DeepSeek V3, DeepSeek R1, DeepSeek V4 |
-| Zhipu (GLM) | Yes | GLM-4, GLM-5 |
+| Zhipu (GLM) | Yes | GLM-4, GLM-5, GLM-5.2 |
 | Qwen (Alibaba) | Yes | Qwen-Plus, Qwen-Max |
 | SiliconFlow | Yes | Various open models |
 | Ollama (local) | Partial | Llama 3, Qwen2, etc. |
@@ -129,7 +129,6 @@ Connect to any LLM that supports OpenAI's function-calling API:
 - **`/app`** (in the TUI) enables mobile remote access — prints a QR code; scan it with the GitCode mobile app from any network to connect to your current session
 - **Any-network reachable** — your PC connects to a public relay via a reverse WSS tunnel; the phone reaches your PC through the relay. No public IP, DDNS, or port forwarding required
 - **Bidirectional real-time sync** — messages from either end appear on the other in real time (streaming replies, tool call cards, token usage)
-- **Tool approval** — when a restricted tool is about to run, an approval card appears on the phone; approve or deny with one tap
 - **Remote commands** — the phone can run `/status`, `/cost`, `/diff`, `/whoami` etc., which execute on the desktop and echo results back
 - **Switch projects / sessions** — switch projects or open a history session on the phone, and the desktop follows immediately
 - **Model sync** — switching models on either end keeps the other in sync
@@ -186,10 +185,57 @@ npm install -g @atomgit.com/atomcode
 brew install --cask atomcode
 ```
 
+### Shell Completion
+
+AtomCode can generate completion scripts for Bash, Zsh, Fish, PowerShell, and
+Elvish. For example:
+
+```bash
+# Bash (current session)
+source <(atomcode completion bash)
+
+# Zsh (persistent)
+mkdir -p ~/.zfunc
+atomcode completion zsh > ~/.zfunc/_atomcode
+# Also add `fpath=(~/.zfunc $fpath)` before `compinit` in ~/.zshrc.
+
+# Fish (persistent)
+mkdir -p ~/.config/fish/completions
+atomcode completion fish > ~/.config/fish/completions/atomcode.fish
+```
+
+For PowerShell, run `atomcode completion powershell | Out-String |
+Invoke-Expression`. Run `atomcode completion --help` for the complete shell
+list. This affects command-line completion only and does not change the TUI's
+`Tab` mode switching.
+
 ### Requirements
 
 - Rust 1.88+ (for building; older Cargo versions cannot parse the current lockfile)
 - An API key from any supported provider (or an AtomGit account for `/login`)
+
+### Permissions — don't run with `sudo`
+
+Run AtomCode as your **normal user**, never with `sudo`. AtomCode keeps its
+config, sessions, and logs under `~/.atomcode`; running once as root leaves
+root-owned files there, so every later non-root start fails at runtime init with:
+
+```
+coding runtime assemble failed: Permission denied (os error 13)
+```
+
+(the message may say `prepare` instead of `assemble` — same cause.) If you hit
+this, reclaim ownership and stop using `sudo`:
+
+```bash
+sudo chown -R "$(id -un):$(id -gn)" ~/.atomcode
+atomcode        # start WITHOUT sudo
+```
+
+On a Linux guest, a working directory on a VirtualBox shared folder
+(`/media/sf_*`, owned by `root:vboxsf`) can also trigger permission errors — add
+yourself to the group with `sudo usermod -aG vboxsf "$USER"` and re-login, rather
+than using `sudo`.
 
 ### Uninstall
 
@@ -301,7 +347,6 @@ Then just type what you want:
 | `Enter` | Send message |
 | `Shift+Enter` | New line (requires Kitty keyboard protocol) |
 | `Ctrl+Enter` | New line (requires Kitty keyboard protocol) |
-| `Ctrl+J` | New line (requires Kitty keyboard protocol) |
 | `Alt+Enter` | New line (most terminals; see compatibility note below) |
 | `\` + `Enter` | New line (works on all terminals — type a `\` and press Enter; the `\` is consumed) |
 | `Esc` | Clear input / Cancel stream |
@@ -314,7 +359,7 @@ Then just type what you want:
 | `Ctrl+V` | Paste image from clipboard (Windows: use `/paste`, see below) |
 
 > **Terminal compatibility for newline chords:**
-> - `Shift+Enter`, `Ctrl+Enter`, and `Ctrl+J` all need a terminal that speaks the Kitty keyboard protocol — kitty, WezTerm, Alacritty, iTerm2 ≥3.5, Windows Terminal ≥1.21. Older terminals collapse them to plain `Enter` (which sends the message).
+> - `Shift+Enter` and `Ctrl+Enter` need a terminal that speaks the Kitty keyboard protocol — kitty, WezTerm, Alacritty, iTerm2 ≥3.5, Windows Terminal ≥1.21. Older terminals (and Windows, where atomcode doesn't enable the protocol) collapse them to plain `Enter` (which sends the message) — use `\` + `Enter`, which works everywhere.
 > - `Alt+Enter` works at the byte level on most terminals, but **Windows Terminal binds it to "toggle full screen" by default** — remove that binding under Settings → Actions to free it up.
 > - Xshell does not support the Kitty protocol; in its keymap settings, map a free chord to send `ESC, Enter` (`\x1b\r`) to get the same effect, or paste multi-line text via the clipboard (bracketed paste is enabled).
 
@@ -349,7 +394,7 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | `/clear` | Start a new conversation (clears context + screen) |
 | `/bg` | Background current session; subcommands: `/bg list`, `/bg <N>`, `/bg drop <N>`, `/bg help` |
 | `/background <task>` | Compatibility alias: start a one-shot task in a `/bg` slot |
-| `/cd` | Change working directory |
+| `/cd` | Change working directory and start a new session |
 | `/worktree` | Git worktree isolation (`create` / `list` / `done` / `cleanup`) |
 | `/webui` | Launch the browser webui (subcommands: `stop`, `lan`, `--host <addr>`) |
 | `/sync` | Attach to the live webui session (`/sync off` to detach) |
@@ -371,7 +416,8 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 |---------|--------|
 | `/model` | Switch model / provider |
 | `/provider` | Manage providers (add / edit / delete) |
-| `/login` | Sign in with AtomGit OAuth |
+| `/proxy` | Switch outbound proxy mode |
+| `/login` | Sign in with AtomGit OAuth and claim CodingPlan free models |
 | `/logout` | Sign out of AtomGit |
 | `/whoami` | Show the current logged-in user |
 | `/status` | Show login status and model info |
@@ -384,6 +430,7 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | `/undo` | Undo a turn's file edits (`/undo` or `/undo N`) |
 | `/view <filepath>` | View file content in an overlay modal |
 | `/paste` | Attach an image from the clipboard (Windows fallback for Ctrl+V) |
+| `/copy` | Copy a code block from the last reply (`/copy`, `/copy N`, `/copy all`) |
 | `/cost` | Show token usage for this session |
 | `/context` | Show the context budget breakdown |
 | `/compact` | Compact conversation history |
@@ -414,13 +461,17 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | `/upgrade` | Upgrade atomcode to latest (subcommand: `rollback`) |
 | `/setup` | First run: install the recommended skill and run it |
 | `/welcome` | Re-run the onboarding wizard |
-| `/language` | Switch display language |
-| `/issue` | Report a bug / request a feature (interactive wizard) |
+| `/language` | Switch display and default Git commit-message language |
 | `/guide <question>` | Ask atomcode-guide how to use AtomCode |
 | `/keys` | Show keyboard shortcuts |
 | `/help` | Show commands & shortcuts |
 | `/quit`, `/exit` | Exit AtomCode (or Ctrl+C ×2) |
 
+> **AtomGit Issues.** `/issue` has been removed. After `/login`, ask in natural
+> language—for example, “Create an AtomGit issue for this bug”—and AtomCode uses
+> its built-in `atomgit_issue` tool. Reading issues is automatic; creating an
+> issue or adding, editing, or deleting comments still requires approval.
+>
 > **Plugin commands.** Beyond the built-ins above, plugins can register their own slash commands. For example, install the official channel plugin to get `/wechat` (shows the AtomCode WeChat community group QR code):
 >
 > ```text
@@ -428,44 +479,99 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 > /plugin install weixin@atomcode-channel
 > ```
 
+### Custom Commands
+
+Beyond built-ins and plugin commands, you can define your own slash commands as Markdown template files — perfect for prompt patterns you use frequently.
+
+**Locations** (lowest to highest priority):
+
+| Location | Scope |
+|---------|-------|
+| `$ATOMCODE_HOME/commands/` (default `~/.atomcode/commands/`) | Global — applies to every project |
+| `<project>/.atomcode/commands/` | Project-level — overrides same-named global commands |
+| `plugins/<name>/commands/` | Plugin-contributed — installed via `/plugin install` |
+
+**File format:**
+
+```markdown
+---
+name: explain
+description: Explain how a specific function or module works
+args: required
+---
+
+Explain the following code in detail:
+
+$ARGUMENTS
+
+Cover: function signature & parameters, core business logic, data flow & side effects.
+```
+
+- **`name`** — Required. The command name; `/explain` triggers it.
+- **`description`** — Optional. Shown in Tab completion.
+- **`args`** — Optional. Controls argument expectation and UX:
+
+  | Value | Menu Enter | Empty-arg submit |
+  |-------|-----------|------------------|
+  | `none` (default) | Execute immediately | Accepted (substitutes `""`) |
+  | `optional` | Complete to `/name `, wait for input | Accepted |
+  | `required` | Complete to `/name `, wait for input | Rejected with error message |
+
+  The template variable `$ARGUMENTS` / `${ARGUMENTS}` is always replaced with whatever the user types after the command name (empty string if nothing is typed).
+
+- **Template body** — The prompt sent to the AI when the command is invoked. `$ARGUMENTS` or `${ARGUMENTS}` is replaced with whatever the user types after the command name.
+
+**Example: create a code-review command**
+
+```bash
+mkdir -p .atomcode/commands
+
+cat > .atomcode/commands/codereview.md << 'EOF'
+---
+name: codereview
+description: Review the current git diff
+args: optional
+---
+
+Review all changes in the current git diff.
+If specific files are given, review only: $ARGUMENTS
+EOF
+```
+
+Run `/help commands` to list all loaded custom commands.
+
+> **Priority rule.** A custom command cannot shadow a built-in command with the same name. If a built-in `/review` already exists, a project-level `review.md` won't appear in completion or dispatch.
+
 ## Architecture
 
-AtomCode is a Rust workspace with four crates:
+AtomCode is a layered Rust workspace:
 
 ```
 atomcode/
   crates/
-    atomcode-core/     # Headless library — no TUI dependency
-      agent/           # AgentLoop: autonomous tool-use loop
-      turn/            # TurnRunner, datalog, permission decider
-      config/          # Config loading, provider configs
-      conversation/    # Message types, windowed context
-      provider/        # LlmProvider trait + OpenAI/Claude/Ollama
-      tool/            # Tool trait + built-in tool implementations
-      session/         # Persistent sessions
-      skill.rs         # User-defined skills
-
-    atomcode-tuix/     # Terminal UI — retained-mode renderer (CC-style normal mode)
-      event_loop/      # App state machine, command dispatch
-      render/          # Cell-based renderer, diff, retained-mode frame loop
-      modals/          # Picker UIs (dir, model, session, provider, issue)
-
-    atomcode-cli/      # Binary entry point (TUI + headless -p mode)
-      main.rs          # CLI args, first-run wizard, launch
-      auth/            # AtomGit OAuth client
-
-    atomcode-daemon/   # HTTP/SSE API server over atomcode-core
+    atomcode-kernel/        # Neutral agent loop and runtime traits
+    atomcode-capabilities/  # Providers, tools, MCP, skills, sessions, memory
+    atomcode-coding/        # Coding specialization and CodingRuntime lifecycle
+    atomcode-review/        # Review specialization
+    atomcode-tuix/          # Terminal UI
+    atomcode-cli/           # TUI and headless entry point
+    atomcode-daemon/        # HTTP/SSE/WebSocket transport + legacy session importer
 ```
+
+The coding path is `CLI/TUI/daemon → CodingRuntime → kernel`. The retired core
+agent protocol and `atomcode-bridge` are no longer part of the runtime path.
 
 ### Design Principles
 
 1. **Tech-stack agnostic** — never hardcodes language-specific logic. Detects project type dynamically from descriptor files (`package.json`, `Cargo.toml`, `pyproject.toml`, `pom.xml`, etc.).
 
-2. **Decoupled agent** — `AgentLoop` runs as an independent async task, communicating with the TUI via channels (`AgentCommand` / `AgentEvent`). The core library has zero TUI dependencies, which is also what makes the daemon possible.
+2. **Single runtime owner** — `CodingRuntime` owns the live coding agent, provider/session lifecycle, pending requests, snapshots, and controllers. Drivers handle input, presentation, and transport without rebuilding a second agent runtime.
 
 3. **Tool safety** — all destructive operations require explicit user approval. Tool failures become LLM observations, never panics.
 
 4. **Context-aware** — token-budget-aware conversation windowing, project file-tree injection, and per-turn system reminders keep the model focused without exceeding context limits.
+
+5. **Directed dependencies** — kernel stays neutral; capabilities and coding stay free of `atomcode-core`; legacy session data is handled at an explicit compatibility boundary rather than as a runtime fallback.
 
 ## Project Instruction File
 
@@ -528,11 +634,11 @@ cargo run -p atomcode-daemon
 cargo test
 
 # Run tests for a specific crate
-cargo test -p atomcode-core
+cargo test -p atomcode-capabilities
 cargo test -p atomcode-tuix
 
 # Run a specific test
-cargo test -p atomcode-core test_name
+cargo test -p atomcode-capabilities test_name
 ```
 
 ### Useful Commands
@@ -601,10 +707,23 @@ Contributions are welcome! AtomCode is in active development.
 
 ### Where to Start
 
-- **Add a new tool** — implement the `Tool` trait in `crates/atomcode-core/src/tool/`
-- **Add a new provider** — implement `LlmProvider` in `crates/atomcode-core/src/provider/`
+- **Add a new tool** — implement the `Tool` trait in `crates/atomcode-capabilities/src/tools/`
+- **Add a new provider** — implement `LlmProvider` in `crates/atomcode-capabilities/src/provider/`
 - **Improve the UI** — rendering lives in `crates/atomcode-tuix/src/render/`
 - **Fix bugs** — check [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) for open bugs
+
+### Non-Rust Contributions
+
+Don't know Rust? No problem! There are many ways to contribute without writing Rust code:
+
+- **📝 Documentation** — Improve the README, fix typos, enhance the [official docs site](https://atomcode.atomgit.com/docs/en/), or add examples. Docs live in the root `docs/` directory, `site/docs/`, and the main README files.
+- **🌐 Localization & Translation** — Help translate the docs site, README, or UI strings into more languages. Check `site/docs/` for existing translations.
+- **🧩 Skills & Plugins** — Create new [skills](https://gitcode.com/atomgit_atomcode/atomcode-skills) (Markdown + JSON, no Rust needed) that extend AtomCode's capabilities. Skills are loaded from `~/.atomcode/skills/`.
+- **🐛 Bug Reports** — Found a bug? Open an [Issue](https://atomgit.com/atomgit_atomcode/atomcode/issues) with clear reproduction steps, screenshots, and environment info. High-quality bug reports are invaluable.
+- **🧪 Test Cases & Examples** — Add test scenarios, example projects, or usage demos that help validate features and onboard new users.
+- **💬 Community Support** — Help answer questions in the community group, write tutorials, or create video guides.
+
+Every contribution, code or not, makes AtomCode better for everyone. When in doubt, open an Issue or start a Discussion!
 
 ## Community
 ---

@@ -9,12 +9,21 @@ async function main() {
   const tempDir = mkdtempSync(path.join(tmpdir(), 'atomcode-vscode-webview-tests-'));
   const tests = [
     'rendering-regression.test.ts',
+    'file-position.test.ts',
     'i18n-regression.test.ts',
     'quick-actions-regression.test.ts',
     'contextual-prompt-regression.test.ts',
     'at-mention.test.ts',
     'slash-picker-regression.test.ts',
     'daemon-client-error.test.ts',
+    'auth-status.test.ts',
+    'daemon-process-env.test.ts',
+    'provider-queue-regression.test.ts',
+    'mode-state.test.ts',
+    'mode-selector-style.test.ts',
+    'session-list-regression.test.ts',
+    'search.test.ts',
+    'todo-regression.test.ts',
   ];
 
   try {

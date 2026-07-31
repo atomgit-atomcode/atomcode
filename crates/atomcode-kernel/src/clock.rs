@@ -22,7 +22,9 @@ pub struct SystemClock {
 
 impl SystemClock {
     pub fn new() -> Self {
-        Self { origin: Instant::now() }
+        Self {
+            origin: Instant::now(),
+        }
     }
 }
 
@@ -57,7 +59,11 @@ mod tests {
         let c = FixedClock(42);
         let start = c.now_millis();
         let end = c.now_millis();
-        assert_eq!(end.saturating_sub(start), 0, "a fixed clock makes elapsed always 0");
+        assert_eq!(
+            end.saturating_sub(start),
+            0,
+            "a fixed clock makes elapsed always 0"
+        );
     }
 
     #[test]

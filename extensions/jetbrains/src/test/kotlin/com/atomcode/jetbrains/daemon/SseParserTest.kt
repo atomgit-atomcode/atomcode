@@ -6,6 +6,15 @@ import kotlin.test.assertTrue
 
 class SseParserTest {
     @Test
+    fun parsesRuntimeInfoEvent() {
+        val parser = SseParser()
+        val events = parser.feed(
+            """data: {"type":"runtime_info","provider":"main","model":"model-x"}${"\n\n"}""",
+        )
+        assertEquals(ChatEvent.RuntimeInfo("main", "model-x"), events.single())
+    }
+
+    @Test
     fun parsesTextEvent() {
         val parser = SseParser()
         val events = parser.feed("""data: {"type":"text","content":"hello"}${"\n\n"}""")
@@ -32,6 +41,19 @@ class SseParserTest {
         val events = parser.feed("""data: {"type":"warning","message":"current model does not support image input"}${"\n\n"}""")
         assertEquals(
             listOf(ChatEvent.Warning("current model does not support image input")),
+            events,
+        )
+    }
+
+    @Test
+    fun parsesToolProgressEvent() {
+        val parser = SseParser()
+        val events = parser.feed(
+            """data: {"type":"tool_progress","id":"call-1","progress":"review · round 2 · thinking"}${"\n\n"}""",
+        )
+
+        assertEquals(
+            listOf(ChatEvent.ToolProgress("call-1", "review · round 2 · thinking")),
             events,
         )
     }

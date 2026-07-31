@@ -48,7 +48,11 @@ impl Tool for BlastRadiusTool {
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let a: Args = match serde_json::from_str(args) {
             Ok(a) => a,
-            Err(e) => return err(format!("blast_radius: invalid arguments: {e}. Expected {{\"file\":\"<path>\"}}.")),
+            Err(e) => {
+                return err(format!(
+                    "blast_radius: invalid arguments: {e}. Expected {{\"file\":\"<path>\"}}."
+                ))
+            }
         };
         let index = self.index.clone();
         let root = ctx.working_dir.clone();
@@ -68,7 +72,11 @@ fn render(index: &CodeIndex, root: &Path, file: &Path, display: &str) -> ToolRes
     let file: &Path = &cfile;
     let symbols = match g.symbols_in_file(file) {
         Some(s) if !s.is_empty() => s.clone(),
-        _ => return err(format!("File '{display}' not found in the code graph (no indexed symbols).")),
+        _ => {
+            return err(format!(
+                "File '{display}' not found in the code graph (no indexed symbols)."
+            ))
+        }
     };
 
     // Direct dependents (depth 1): files whose symbols directly call this file's symbols.
@@ -85,14 +93,20 @@ fn render(index: &CodeIndex, root: &Path, file: &Path, display: &str) -> ToolRes
         }
     }
     // Indirect dependents (depth 2-3) = transitive dependents minus the direct ones.
-    let indirect: HashSet<std::path::PathBuf> =
-        g.file_dependents(file, 3).into_iter().filter(|f| !direct.contains(f)).collect();
+    let indirect: HashSet<std::path::PathBuf> = g
+        .file_dependents(file, 3)
+        .into_iter()
+        .filter(|f| !direct.contains(f))
+        .collect();
     let total = direct.len() + indirect.len();
 
     let mut out = format!("Blast radius for {}:\n\n", display_path(file, root));
     out.push_str(&format!("DIRECT DEPENDENTS ({} files):\n", direct.len()));
     out.push_str(&format_files(&direct, root));
-    out.push_str(&format!("\nINDIRECT DEPENDENTS ({} files):\n", indirect.len()));
+    out.push_str(&format!(
+        "\nINDIRECT DEPENDENTS ({} files):\n",
+        indirect.len()
+    ));
     out.push_str(&format_files(&indirect, root));
     out.push_str(&format!("\nTOTAL IMPACT: {total} files\n"));
     ok(out)
@@ -119,10 +133,19 @@ mod tests {
         std::fs::write(d.path().join("core.rs"), "pub fn core_fn() {}\n").unwrap();
         std::fs::write(d.path().join("user.rs"), "fn u() { core_fn(); }\n").unwrap();
         let tool = BlastRadiusTool::new(Arc::new(CodeIndex::new()));
-        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() };
+        let ctx = ToolContext {
+            working_dir: d.path().to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
         let r = tool.execute(r#"{"file":"core.rs"}"#, &ctx).await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("Blast radius for core.rs"), "{}", r.content);
+        assert!(
+            r.content.contains("Blast radius for core.rs"),
+            "{}",
+            r.content
+        );
         assert!(r.content.contains("user.rs"), "{}", r.content);
         assert!(r.content.contains("TOTAL IMPACT:"), "{}", r.content);
     }
@@ -132,9 +155,18 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "fn a() {}\n").unwrap();
         let tool = BlastRadiusTool::new(Arc::new(CodeIndex::new()));
-        let ctx = ToolContext { working_dir: d.path().to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() };
+        let ctx = ToolContext {
+            working_dir: d.path().to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
         let r = tool.execute(r#"{"file":"ghost.rs"}"#, &ctx).await;
         assert!(r.is_error);
-        assert!(r.content.contains("not found in the code graph"), "{}", r.content);
+        assert!(
+            r.content.contains("not found in the code graph"),
+            "{}",
+            r.content
+        );
     }
 }

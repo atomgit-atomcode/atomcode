@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.25.9</span>
+    <span class="dhdr-ver">v5.0.3</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -51,11 +51,13 @@
     <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
     <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
     <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
   </div>
 
   <div class="dside-group">
     <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
     <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
     <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
     <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
     <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
@@ -74,7 +76,7 @@
 
   <main class="dmain prose-docs">
 <h1>常见问题</h1>
-      <p class="lede">把用户群和 issue 里反复出现的问题整理到这里。如果你遇到的问题不在列表里，欢迎在终端内直接运行 <code>/issue</code> 反馈，或到 <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank">AtomGit 仓库</a> 提 issue。</p>
+      <p class="lede">把用户群和 issue 里反复出现的问题整理到这里。如果你遇到的问题不在列表里，执行 <code>/login</code> 后可直接让 AtomCode 使用内置 AtomGit 工具创建 Issue，也可以到 <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank">AtomGit 仓库</a> 提交。</p>
 
       <h2>安装与启动</h2>
 
@@ -82,7 +84,7 @@
       <p>一键安装脚本默认从 GitCode release 拉二进制。如果网络不通，可以：</p>
       <ul>
         <li>直接到 <a href="https://atomgit.com/atomgit_atomcode/atomcode/releases" target="_blank">releases 页面</a> 手动下载对应平台的压缩包，解压后把 <code>atomcode</code> 放进 <code>PATH</code>；</li>
-        <li>或者从源码构建：<code>cargo install --path crates/atomcode</code>（需要 Rust 1.80+）。</li>
+        <li>或者从源码构建：<code>cargo install --path crates/atomcode-cli --locked</code>（需要 Rust 1.88+）。</li>
       </ul>
 
       <h3>执行 <code>atomcode</code> 报 "command not found"</h3>
@@ -96,17 +98,18 @@
       <h2>登录与模型</h2>
 
       <h3>OAuth 登录时浏览器打不开</h3>
-      <p>检查是否在无 GUI 的远程服务器上。远程环境推荐改用 API Key 登录（参见 <a href="./login.html">登录方式</a>），或在本地完成 OAuth 后把 <code>~/.atomcode/auth.json</code> 拷贝到服务器同路径。</p>
+      <p>检查是否在无 GUI 的远程服务器上。远程环境推荐改用 API Key 登录（参见 <a href="./login.html">登录方式</a>），或在本地完成 OAuth 后把 <code>~/.atomcode/auth.toml</code> 拷贝到服务器同路径。</p>
 
       <h3>连不上模型 / 一直转圈 / 报 timeout</h3>
       <ul>
         <li>先确认 <code>~/.atomcode/config.toml</code> 里的 <code>base_url</code> 是否可达，<code>curl</code> 一下对应的 <code>/v1/models</code> 接口；</li>
         <li>企业网络里常见是代理问题，设置 <code>HTTPS_PROXY</code> 环境变量后重试；</li>
+        <li>Windows v5.0.3 默认使用系统 SChannel 证书库，可识别企业安装的根证书；若仍失败，请分别检查系统证书、代理和 <code>SSL_CERT_FILE</code> 等覆盖变量。</li>
         <li>国内访问境外模型需要确认出口网络；可以先用 <code>/model</code> 切换到 AtomGit 官方通道确认整体链路是通的。</li>
       </ul>
 
       <h3>怎么切换模型？</h3>
-      <p>会话内直接 <code>/model</code>，从菜单里选。如果想持久化，编辑 <code>~/.atomcode/config.toml</code> 里的 <code>model</code> 字段。详见 <a href="./configuration.html">配置文件</a>。</p>
+      <p>直接输入 <code>/model</code> 并从菜单选择。命令会切换当前会话，并把所选项保存为后续新会话的默认值；其他已经打开的会话保持原模型。详见 <a href="./configuration.html">配置文件</a>。</p>
 
       <h3>上下文超限 / "context length exceeded"</h3>
       <ul>

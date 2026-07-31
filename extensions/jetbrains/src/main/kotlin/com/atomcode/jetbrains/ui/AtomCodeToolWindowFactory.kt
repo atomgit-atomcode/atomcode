@@ -12,6 +12,9 @@ import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
 import com.intellij.openapi.wm.ex.ToolWindowManagerListener
 
+internal const val PRIMARY_TITLE_ACTION_TEXT = "Session History"
+internal const val PRIMARY_TITLE_ACTION_DESCRIPTION = "Open AtomCode session history"
+
 class AtomCodeToolWindowFactory : ToolWindowFactory {
     override fun createToolWindowContent(project: Project, toolWindow: ToolWindow) {
         installEmptyToolWindowActivationListener(project, toolWindow)
@@ -29,28 +32,7 @@ class AtomCodeToolWindowFactory : ToolWindowFactory {
             }
         }
 
-        toolWindow.setTitleActions(listOf(
-            object : AnAction("Home", "Open AtomCode welcome and quick start", null) {
-                override fun getActionUpdateThread() = ActionUpdateThread.BGT
-                override fun actionPerformed(e: AnActionEvent) {
-                    e.project?.let { openAtomCodeWelcomePage(it) }
-                }
-            },
-            object : AnAction("New Tab", "Open a new chat tab", AllIcons.General.Add) {
-                override fun getActionUpdateThread() = ActionUpdateThread.BGT
-                override fun actionPerformed(e: AnActionEvent) {
-                    e.project?.let { openAtomCodeChatTab(it, newTab = true) }
-                }
-            },
-            object : AnAction("Settings", "Open AtomCode settings", AllIcons.General.GearPlain) {
-                override fun getActionUpdateThread() = ActionUpdateThread.BGT
-                override fun actionPerformed(e: AnActionEvent) {
-                    e.project?.let { p ->
-                        selectedAtomCodeChatPanel(p)?.showGearMenu() ?: p.openAtomCodeSettings()
-                    }
-                }
-            },
-        ))
+        toolWindow.setTitleActions(createTitleActions())
     }
 
     private fun installEmptyToolWindowActivationListener(project: Project, toolWindow: ToolWindow) {
@@ -77,3 +59,30 @@ class AtomCodeToolWindowFactory : ToolWindowFactory {
         }
     }
 }
+
+internal fun createPrimaryTitleAction(): AnAction =
+    object : AnAction(PRIMARY_TITLE_ACTION_TEXT, PRIMARY_TITLE_ACTION_DESCRIPTION, AllIcons.General.History) {
+        override fun getActionUpdateThread() = ActionUpdateThread.BGT
+        override fun actionPerformed(e: AnActionEvent) {
+            e.project?.let { openAtomCodeSessionHistory(it) }
+        }
+    }
+
+internal fun createTitleActions(): List<AnAction> =
+    listOf(
+        object : AnAction("New Tab", "Open a new chat tab", AllIcons.General.Add) {
+            override fun getActionUpdateThread() = ActionUpdateThread.BGT
+            override fun actionPerformed(e: AnActionEvent) {
+                e.project?.let { openAtomCodeChatTab(it, newTab = true) }
+            }
+        },
+        createPrimaryTitleAction(),
+        object : AnAction("Settings", "Open AtomCode settings", AllIcons.General.GearPlain) {
+            override fun getActionUpdateThread() = ActionUpdateThread.BGT
+            override fun actionPerformed(e: AnActionEvent) {
+                e.project?.let { p ->
+                    selectedAtomCodeChatPanel(p)?.showGearMenu() ?: p.openAtomCodeSettings()
+                }
+            }
+        },
+    )

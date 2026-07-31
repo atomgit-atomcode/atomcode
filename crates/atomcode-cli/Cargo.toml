@@ -18,20 +18,34 @@ path = "src/lib.rs"
 
 [features]
 default = []
-distro-pm = ["atomcode-core/distro-pm", "atomcode-tuix/distro-pm"]
+distro-pm = ["atomcode-updater/distro-pm", "atomcode-tuix/distro-pm"]
+# Official-release signing is owned by the final binary. Keep the open-source
+# default unsigned while giving the release pipeline an explicit, core-free
+# feature entry point.
+codingplan-crypto = ["atomcode-auth/codingplan-crypto"]
 
 [dependencies]
-atomcode-core = { path = "../atomcode-core" }
-atomcode-askpass = { path = "../atomcode-askpass" }
-# Engine v2: the new stack presented through the legacy channel protocol.
-atomcode-bridge = { path = "../atomcode-bridge" }
-# ACP (Agent Client Protocol) stdio server mode.
-atomcode-acp = { path = "../atomcode-acp" }
+async-trait = "0.1"
+atomcode-codingplan = { path = "../atomcode-codingplan" }
+# Config system used directly by the final binary.
+atomcode-config = { path = "../atomcode-config" }
+# Self-update mechanics (leaf crate, extracted from core).
+atomcode-updater = { path = "../atomcode-updater" }
 atomcode-tuix = { path = "../atomcode-tuix" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 atomcode-daemon = { path = "../atomcode-daemon" }
+# ACP (Agent Client Protocol) stdio server — the `atomcode acp` subcommand's engine
+# lives in `src/acp/`. It composes the v2 stack directly, so cli pulls the layers acp
+# uses (kernel + coding + capabilities) + the protocol SDK. capabilities is all-platform
+# here (acp is cross-platform); it also covers the unix-only `::askpass` helper below.
+agent-client-protocol = { workspace = true }
+atomcode-kernel = { path = "../atomcode-kernel" }
+atomcode-coding = { path = "../atomcode-coding", features = ["atomgit"] }
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["notify", "setup", "plugin", "mcp", "atomgit", "cc-hooks"] }
+atomcode-auth = { path = "../atomcode-auth" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 crossterm = "0.29"
 tokio = { version = "1", features = ["full"] }
 url = "2"
@@ -43,6 +57,11 @@ serde_json = "1"
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }
 is-terminal = "0.4"
+# File-only tracing subscriber (see `init_file_logging`). The workspace emits 110+
+# `tracing::` diagnostics (e.g. `atomcode-label:` from the git-push label middleware)
+# but installed NO subscriber, so they all went to the no-op dispatcher. This wires
+# them to `<config_dir>/logs/atomcode.log`, filtered by RUST_LOG.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Process scan for the uninstall flow (detect running atomcode instances).
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
@@ -50,6 +69,9 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # uses CREATE_NO_WINDOW creation flags instead (see main.rs).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# NOTE: the `atomcode __askpass` helper (src/askpass.rs, unix-only) uses
+# atomcode-capabilities::askpass — now covered by the all-platform capabilities dep
+# in [dependencies] above (pulled in for ACP), so no unix-specific entry needed here.
 
 # Windows-only: default HeapAlloc is 3-5x slower than Linux glibc for the
 # small-string/Line-clone heavy render loop. mimalloc cuts per-frame alloc
@@ -68,6 +90,11 @@ winreg = "0.55"
 # Rust, so pulling it in unconditionally on the host side costs ~nothing.
 [dev-dependencies]
 assert_cmd = "2"
+# Redirect ATOMCODE_HOME to a throwaway temp dir before any test runs (via a
+# #[ctor] in main.rs's #[cfg(test)] module + every tests/*.rs binary) so tests
+# never persist into the developer's real ~/.atomcode.
+atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
+ctor = "0.2"
 predicates = "3"
 tempfile = "3"
 which = "7"

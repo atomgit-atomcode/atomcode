@@ -103,7 +103,10 @@ mod tests {
     }
 
     async fn run(round: u32, max_rounds: Option<u32>) -> Vec<Message> {
-        let mut msgs = vec![Message::user("Review this diff"), Message::assistant("", vec![])];
+        let mut msgs = vec![
+            Message::user("Review this diff"),
+            Message::assistant("", vec![]),
+        ];
         RoundBudgetHook::new()
             .pre_request(&mut msgs, &ctx(round, max_rounds))
             .await;
@@ -124,10 +127,21 @@ mod tests {
         assert_eq!(msgs.len(), 3, "one reminder appended");
         let last = msgs.last().unwrap();
         assert_eq!(last.role, Role::User, "reminder is a user-role turn");
-        assert!(last.synthetic, "reminder is synthetic (ephemeral, budget-injected)");
+        assert!(
+            last.synthetic,
+            "reminder is synthetic (ephemeral, budget-injected)"
+        );
         assert!(last.text.contains("report_finding"), "{}", last.text);
-        assert!(last.text.contains("28") && last.text.contains("40"), "{}", last.text);
-        assert!(!last.text.contains("FINAL"), "not the final nudge yet: {}", last.text);
+        assert!(
+            last.text.contains("28") && last.text.contains("40"),
+            "{}",
+            last.text
+        );
+        assert!(
+            !last.text.contains("FINAL"),
+            "not the final nudge yet: {}",
+            last.text
+        );
     }
 
     #[tokio::test]
@@ -136,7 +150,11 @@ mod tests {
         let msgs = run(40, Some(40)).await;
         assert_eq!(msgs.len(), 3, "one reminder appended");
         let last = msgs.last().unwrap();
-        assert!(last.text.contains("FINAL"), "final-round nudge: {}", last.text);
+        assert!(
+            last.text.contains("FINAL"),
+            "final-round nudge: {}",
+            last.text
+        );
         assert!(last.text.contains("report_finding"), "{}", last.text);
     }
 

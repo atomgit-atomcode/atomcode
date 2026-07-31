@@ -223,7 +223,7 @@ curl -sS http://127.0.0.1:13456/sessions
 curl -sS http://127.0.0.1:13456/config
 ```
 
-最新的本地后端冒烟测试返回了 `service=atomcode-daemon`、`version=4.25.0`，成功更改了项目目录，并返回了 auth/provider/model/session/config 的数据。这验证了 JetBrains 插件在完整的 IDE 安装冒烟测试之前所使用的 HTTP 端点。
+最新的本地后端冒烟测试返回了 `service=atomcode-daemon`、`version=4.26.0`，成功更改了项目目录，并返回了 auth/provider/model/session/config 的数据。这验证了 JetBrains 插件在完整的 IDE 安装冒烟测试之前所使用的 HTTP 端点。
 
 ## 安全说明
 

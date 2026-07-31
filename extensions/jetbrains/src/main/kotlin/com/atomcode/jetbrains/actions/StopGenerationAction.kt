@@ -1,6 +1,6 @@
 package com.atomcode.jetbrains.actions
 
-import com.atomcode.jetbrains.core.AtomCodeProjectController
+import com.atomcode.jetbrains.ui.selectedAtomCodeChatPanel
 import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
@@ -15,6 +15,6 @@ class StopGenerationAction : AnAction() {
 
     override fun actionPerformed(e: AnActionEvent) {
         val project = e.getData(CommonDataKeys.PROJECT) ?: return
-        AtomCodeProjectController.getInstance(project).activeChatStore?.stop()
+        selectedAtomCodeChatPanel(project)?.stopCurrentGeneration()
     }
 }

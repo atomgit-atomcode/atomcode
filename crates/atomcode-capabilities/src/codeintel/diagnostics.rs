@@ -64,7 +64,11 @@ impl Tool for DiagnosticsTool {
                 Ok(c) => c,
                 Err(e) => return err(format!("diagnostics: cannot read {}: {e}", path.display())),
             };
-            if !self.manager.notify_file_changed(&ctx.working_dir, &path, &content).await {
+            if !self
+                .manager
+                .notify_file_changed(&ctx.working_dir, &path, &content)
+                .await
+            {
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("?");
                 return ok(format!(
                     "LSP not available: no language server for .{ext} (not configured, or its binary is not installed)."
@@ -82,18 +86,37 @@ impl Tool for DiagnosticsTool {
 
         match severity {
             "error" => diags.retain(|d| d.severity == DiagnosticSeverity::Error),
-            "warning" => diags.retain(|d| matches!(d.severity, DiagnosticSeverity::Error | DiagnosticSeverity::Warning)),
+            "warning" => diags.retain(|d| {
+                matches!(
+                    d.severity,
+                    DiagnosticSeverity::Error | DiagnosticSeverity::Warning
+                )
+            }),
             _ => {} // "all"
         }
-        diags.sort_by(|a, b| a.severity.cmp(&b.severity).then(a.file.cmp(&b.file)).then(a.line.cmp(&b.line)));
+        diags.sort_by(|a, b| {
+            a.severity
+                .cmp(&b.severity)
+                .then(a.file.cmp(&b.file))
+                .then(a.line.cmp(&b.line))
+        });
 
         if diags.is_empty() {
-            let scope = a.file_path.as_deref().map(|f| format!(" in {f}")).unwrap_or_default();
+            let scope = a
+                .file_path
+                .as_deref()
+                .map(|f| format!(" in {f}"))
+                .unwrap_or_default();
             return ok(format!("No diagnostics found{scope} (filter: {severity})."));
         }
         let lines: Vec<String> = diags.iter().map(|d| d.display_line()).collect();
         let plural = if diags.len() == 1 { "" } else { "s" };
-        ok(format!("Found {} diagnostic{}:\n\n{}", diags.len(), plural, lines.join("\n")))
+        ok(format!(
+            "Found {} diagnostic{}:\n\n{}",
+            diags.len(),
+            plural,
+            lines.join("\n")
+        ))
     }
 }
 
@@ -106,11 +129,23 @@ mod tests {
 
     fn missing_binary_manager() -> Arc<LspManager> {
         let mut r = LspServerRegistry::empty();
-        r.insert("rs", LspServerConfig { command: "atomcode-no-such-lsp-xyz".into(), args: vec![], root_markers: vec![] });
+        r.insert(
+            "rs",
+            LspServerConfig {
+                command: "atomcode-no-such-lsp-xyz".into(),
+                args: vec![],
+                root_markers: vec![],
+            },
+        );
         Arc::new(LspManager::with_registry(r))
     }
     fn ctx(dir: &std::path::Path) -> ToolContext {
-        ToolContext { working_dir: dir.to_path_buf(), cancel: CancellationToken::new(), progress: atomcode_kernel::tool::ProgressSink::noop() }
+        ToolContext {
+            working_dir: dir.to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        }
     }
 
     #[tokio::test]
@@ -118,25 +153,35 @@ mod tests {
         let tool = DiagnosticsTool::new(missing_binary_manager());
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "fn main() {}\n").unwrap();
-        let r = tool.execute(r#"{"file_path":"a.rs"}"#, &ctx(d.path())).await;
+        let r = tool
+            .execute(r#"{"file_path":"a.rs"}"#, &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("LSP not available"), "{}", r.content);
     }
 
     #[tokio::test]
     async fn no_servers_no_filepath() {
-        let tool = DiagnosticsTool::new(Arc::new(LspManager::with_registry(LspServerRegistry::empty())));
+        let tool = DiagnosticsTool::new(Arc::new(LspManager::with_registry(
+            LspServerRegistry::empty(),
+        )));
         let d = tempfile::tempdir().unwrap();
         let r = tool.execute(r#"{}"#, &ctx(d.path())).await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("no language server is running"), "{}", r.content);
+        assert!(
+            r.content.contains("no language server is running"),
+            "{}",
+            r.content
+        );
     }
 
     #[tokio::test]
     async fn missing_file_errors() {
         let tool = DiagnosticsTool::new(missing_binary_manager());
         let d = tempfile::tempdir().unwrap();
-        let r = tool.execute(r#"{"file_path":"ghost.rs"}"#, &ctx(d.path())).await;
+        let r = tool
+            .execute(r#"{"file_path":"ghost.rs"}"#, &ctx(d.path()))
+            .await;
         assert!(r.is_error);
         assert!(r.content.contains("cannot read"), "{}", r.content);
     }

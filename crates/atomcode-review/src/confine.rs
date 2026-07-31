@@ -33,6 +33,12 @@ impl PathConfineMiddleware {
     /// already-canonicalized path (clix canonicalizes `--repo`); we normalize it
     /// lexically too so containment checks compare like-for-like.
     pub fn new(root: PathBuf) -> Self {
+        // Strip the Windows `\\?\` verbatim prefix that `canonicalize` adds (clix
+        // canonicalizes `--repo`). Without this, `root` carries a `VerbatimDisk("C:")`
+        // prefix while model-supplied absolute paths normalize to a plain
+        // `Disk("C:")` prefix, so `starts_with(root)` is ALWAYS false and every
+        // in-repo absolute path is wrongly rejected on Windows.
+        let root = atomcode_capabilities::pathnorm::strip_verbatim_path(&root);
         Self {
             root: normalize_lexical(&root),
         }

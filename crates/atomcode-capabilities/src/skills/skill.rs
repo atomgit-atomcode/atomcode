@@ -17,6 +17,9 @@ pub struct Skill {
     /// Tools the specialization MAY auto-approve while this skill is active (metadata;
     /// the L1 capability does not enforce it — that's an L2 approval-policy concern).
     pub allowed_tools: Vec<String>,
+    /// If false (`user-invocable: false` in frontmatter), hidden from the `/` menu;
+    /// the model can still auto-invoke it. Absent → true.
+    pub user_invocable: bool,
     /// Directory containing the skill file (for `${CLAUDE_SKILL_DIR}`).
     pub skill_dir: PathBuf,
     pub source_path: PathBuf,
@@ -37,7 +40,9 @@ impl Skill {
         let mut i = 0;
         while i < t.len() {
             let rest = &t[i..];
-            if let Some((value, len)) = match_substitution(rest, &positional, arguments, session_id, skill_dir.as_ref()) {
+            if let Some((value, len)) =
+                match_substitution(rest, &positional, arguments, session_id, skill_dir.as_ref())
+            {
                 result.push_str(value);
                 i += len;
             } else {
@@ -51,6 +56,51 @@ impl Skill {
             result = format!("{}\n\nARGUMENTS: {}", result.trim_end(), arguments);
         }
         expand_shell_injections(&result)
+    }
+
+    /// [`expand`](Self::expand) plus, for directory-style skills, a `<system-reminder>`
+    /// naming the skill's install directory (so bundled `scripts/`/`references/` resolve
+    /// correctly). Mirrors core `Skill::expand_for_injection`.
+    pub fn expand_for_injection(&self, arguments: &str, session_id: &str) -> String {
+        let body = self.expand(arguments, session_id);
+        match self.bundled_resource_note() {
+            Some(note) => format!("{note}\n\n{body}"),
+            None => body,
+        }
+    }
+
+    /// A `<system-reminder>` naming the skill's install directory, emitted only for
+    /// directory-style skills (source file literally `SKILL.md`) — those own a dedicated
+    /// folder that can bundle `scripts/`/`references/`. Single-file `.md` skills share a
+    /// skills folder, so the note would point at the wrong (shared) directory.
+    fn bundled_resource_note(&self) -> Option<String> {
+        if self.source_path.file_name().and_then(|n| n.to_str()) != Some("SKILL.md") {
+            return None;
+        }
+        let dir = display_skill_dir(&self.skill_dir.to_string_lossy(), cfg!(windows));
+        Some(format!(
+            "<system-reminder>\n\
+             This skill is installed at: {dir}\n\
+             Any files it references (e.g. `scripts/…`, `references/…`, templates) live \
+             UNDER that directory, NOT the current working directory. Resolve every \
+             relative path in this skill against the skill directory above — for a \
+             bundled script, run it by its absolute path under that directory. Do not \
+             search the project / working directory for these files.\n\
+             </system-reminder>"
+        ))
+    }
+}
+
+/// Format a skill directory for the base-dir note (see `bundled_resource_note`). On
+/// Windows, convert `\` → `/` so the path works uniformly across read_file/Python/Git
+/// Bash (a raw backslash path breaks when bash treats `\U`/`\s` as escapes). Windows
+/// separators are always `\` and filenames can't contain `\`, so the replace is lossless.
+/// On Unix, `\` is a legal filename char, so leave it. Note-text only — never used for IO.
+fn display_skill_dir(raw: &str, is_windows: bool) -> String {
+    if is_windows {
+        raw.replace('\\', "/")
+    } else {
+        raw.to_string()
     }
 }
 
@@ -120,6 +170,8 @@ fn expand_shell_injections(template: &str) -> String {
 fn run_shell_command(cmd: &str) -> String {
     let mut command = Command::new("sh");
     command.arg("-c").arg(cmd);
+    #[cfg(unix)]
+    crate::process_utils::apply_utf8_locale_env_sync(&mut command);
     // No console-window flash when run from a console-less daemon (mirrors core's
     // skill runner); no-op off Windows.
     crate::process_utils::suppress_console_window_sync(&mut command);
@@ -141,11 +193,24 @@ fn run_shell_command(cmd: &str) -> String {
 
 // ── Frontmatter + parsing ────────────────────────────────────────────────────
 
-#[derive(Default)]
 struct Frontmatter {
     name: Option<String>,
     description: String,
     allowed_tools: Vec<String>,
+    /// If false (`user-invocable: false`), hidden from the `/` menu — the model can
+    /// still auto-invoke. Absent → true.
+    user_invocable: bool,
+}
+
+impl Default for Frontmatter {
+    fn default() -> Self {
+        Self {
+            name: None,
+            description: String::new(),
+            allowed_tools: Vec::new(),
+            user_invocable: true,
+        }
+    }
 }
 
 fn fm_value(s: &str) -> String {
@@ -174,7 +239,14 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
             fm.description = fm_value(v);
         } else if let Some(v) = line.strip_prefix("allowed-tools:") {
             // AgentSkills spec is space-delimited; also accept commas (Claude Code compat).
-            fm.allowed_tools = v.split([' ', ',']).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            fm.allowed_tools = v
+                .split([' ', ','])
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        } else if let Some(v) = line.strip_prefix("user-invocable:") {
+            // Mirror core: only the literal `false` hides it; anything else stays true.
+            fm.user_invocable = v.trim() != "false";
         }
     }
     (fm, body.to_string())
@@ -226,11 +298,20 @@ fn validate_skill_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.len() > 64 {
         return Err(format!("skill name '{name}' must be 1-64 characters"));
     }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/')
+    {
         return Err(format!("skill name '{name}' has invalid characters"));
     }
-    if name.starts_with(['/', '-']) || name.ends_with(['/', '-']) || name.contains("//") || name.contains("--") {
-        return Err(format!("skill name '{name}' has a bad slash/hyphen position"));
+    if name.starts_with(['/', '-'])
+        || name.ends_with(['/', '-'])
+        || name.contains("//")
+        || name.contains("--")
+    {
+        return Err(format!(
+            "skill name '{name}' has a bad slash/hyphen position"
+        ));
     }
     Ok(())
 }
@@ -246,28 +327,55 @@ fn make_name(base: &str, namespace: Option<&str>) -> String {
 /// Parse a flat `name.md` skill (name = file stem unless overridden in frontmatter).
 pub(crate) fn parse_skill_file(path: &Path, namespace: Option<&str>) -> Result<Skill, String> {
     let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let stem = path.file_stem().and_then(|s| s.to_str()).ok_or("invalid file name")?;
-    build_skill(&content, stem, path.parent().unwrap_or(Path::new(".")), path, namespace)
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or("invalid file name")?;
+    build_skill(
+        &content,
+        stem,
+        path.parent().unwrap_or(Path::new(".")),
+        path,
+        namespace,
+    )
 }
 
 /// Parse a directory-style `<dir>/SKILL.md` (name = directory name unless overridden).
-pub(crate) fn parse_skill_dir(skill_dir: &Path, skill_md: &Path, namespace: Option<&str>) -> Result<Skill, String> {
+pub(crate) fn parse_skill_dir(
+    skill_dir: &Path,
+    skill_md: &Path,
+    namespace: Option<&str>,
+) -> Result<Skill, String> {
     let content = std::fs::read_to_string(skill_md).map_err(|e| e.to_string())?;
-    let dir_name = skill_dir.file_name().and_then(|s| s.to_str()).ok_or("invalid directory name")?;
+    let dir_name = skill_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("invalid directory name")?;
     build_skill(&content, dir_name, skill_dir, skill_md, namespace)
 }
 
-fn build_skill(content: &str, default_name: &str, skill_dir: &Path, source: &Path, namespace: Option<&str>) -> Result<Skill, String> {
+fn build_skill(
+    content: &str,
+    default_name: &str,
+    skill_dir: &Path,
+    source: &Path,
+    namespace: Option<&str>,
+) -> Result<Skill, String> {
     let (fm, template) = parse_frontmatter(content);
     let base = fm.name.as_deref().unwrap_or(default_name);
     validate_skill_name(base)?;
     let name = make_name(base, namespace);
-    let description = if fm.description.is_empty() { first_paragraph(&template) } else { fm.description };
+    let description = if fm.description.is_empty() {
+        first_paragraph(&template)
+    } else {
+        fm.description
+    };
     Ok(Skill {
         name,
         description,
         template,
         allowed_tools: fm.allowed_tools,
+        user_invocable: fm.user_invocable,
         skill_dir: skill_dir.to_path_buf(),
         source_path: source.to_path_buf(),
     })
@@ -283,17 +391,38 @@ mod tests {
             description: String::new(),
             template: template.into(),
             allowed_tools: vec![],
+            user_invocable: true,
             skill_dir: PathBuf::from("/sk"),
             source_path: PathBuf::from("/sk/SKILL.md"),
         }
     }
 
     #[test]
+    fn frontmatter_parses_user_invocable() {
+        // `user-invocable: false` hides a skill from the `/` menu; anything else
+        // (incl. absent) defaults to true. Mirrors core skill.rs parsing.
+        let (fm, _) = parse_frontmatter("---\nname: x\nuser-invocable: false\n---\nbody");
+        assert!(!fm.user_invocable);
+        let (fm2, _) = parse_frontmatter("---\nname: x\n---\nbody");
+        assert!(fm2.user_invocable, "absent → default true");
+    }
+
+    #[test]
     fn expand_arguments_full_and_positional() {
         // $ARGUMENTS = all args; positional $N / $ARGUMENTS[N] are 0-based ($0 = first).
         // A template WITHOUT $ARGUMENTS still gets the full args appended (production behavior).
-        assert_eq!(skill("do $ARGUMENTS now").expand("a b c", ""), "do a b c now");
-        assert_eq!(skill("first=$0 second=$1").expand("a b", "").lines().next().unwrap(), "first=a second=b");
+        assert_eq!(
+            skill("do $ARGUMENTS now").expand("a b c", ""),
+            "do a b c now"
+        );
+        assert_eq!(
+            skill("first=$0 second=$1")
+                .expand("a b", "")
+                .lines()
+                .next()
+                .unwrap(),
+            "first=a second=b"
+        );
         assert_eq!(skill("idx=$ARGUMENTS[1]").expand("a b", ""), "idx=b");
     }
 
@@ -328,7 +457,10 @@ mod tests {
         let (fm, body) = parse_frontmatter("---\nname: my-skill\ndescription: \"does X\"\nallowed-tools: read_file, bash\n---\nbody here\n");
         assert_eq!(fm.name.as_deref(), Some("my-skill"));
         assert_eq!(fm.description, "does X");
-        assert_eq!(fm.allowed_tools, vec!["read_file".to_string(), "bash".to_string()]);
+        assert_eq!(
+            fm.allowed_tools,
+            vec!["read_file".to_string(), "bash".to_string()]
+        );
         assert_eq!(body.trim(), "body here");
     }
 
@@ -354,9 +486,18 @@ mod tests {
 
     #[test]
     fn frontmatter_single_quotes_and_space_tools() {
-        let (fm, _) = parse_frontmatter("---\nname: 'my-skill'\nallowed-tools: read_file bash grep\n---\nbody\n");
+        let (fm, _) = parse_frontmatter(
+            "---\nname: 'my-skill'\nallowed-tools: read_file bash grep\n---\nbody\n",
+        );
         assert_eq!(fm.name.as_deref(), Some("my-skill"));
-        assert_eq!(fm.allowed_tools, vec!["read_file".to_string(), "bash".to_string(), "grep".to_string()]);
+        assert_eq!(
+            fm.allowed_tools,
+            vec![
+                "read_file".to_string(),
+                "bash".to_string(),
+                "grep".to_string()
+            ]
+        );
     }
 
     #[test]

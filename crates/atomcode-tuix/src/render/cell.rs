@@ -20,7 +20,7 @@
 // output) keeps the pure-append path — body lines enter scrollback and
 // never need a diff cycle.
 
-use crossterm::style::{Color, SetForegroundColor};
+use crossterm::style::Color;
 use std::io::Write as _;
 
 /// Visual attributes that can vary per cell in our footer. Kept minimal
@@ -34,6 +34,9 @@ pub struct CellStyle {
     /// Foreground colour via crossterm SGR. `None` = terminal default
     /// foreground (emitted as `\x1b[39m` by the serialiser).
     pub fg: Option<Color>,
+    /// Background colour via crossterm SGR. `None` = terminal default
+    /// background (emitted as `\x1b[49m` by the serialiser).
+    pub bg: Option<Color>,
     /// SGR bold (`\x1b[1m` / `\x1b[22m`).
     pub bold: bool,
     /// SGR reverse video (`\x1b[7m` / `\x1b[27m`). Used for the
@@ -208,11 +211,7 @@ pub fn push_str_cells(row: &mut Vec<Cell>, s: &str, style: &CellStyle) {
 /// Non-SGR CSI sequences (cursor moves, DSR, etc.) are silently
 /// dropped — they should have been scrubbed upstream; this is
 /// belt-and-suspenders.
-pub fn push_str_cells_sgr(
-    row: &mut Vec<Cell>,
-    s: &str,
-    mut working_style: CellStyle,
-) -> CellStyle {
+pub fn push_str_cells_sgr(row: &mut Vec<Cell>, s: &str, mut working_style: CellStyle) -> CellStyle {
     let mut chars = s.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '\x1b' {
@@ -270,25 +269,36 @@ pub fn push_str_cells_sgr(
 /// to `\x1b[31m…` on output, and the terminal's theme palette gets to
 /// pick the actual shade rather than us hard-coding RGB.
 ///
-/// Unknown / unsupported codes (256-colour `38;5;N`, RGB `38;2;R;G;B`,
-/// background colours, italic, underline) are silently skipped —
-/// they're outside the cosmetic surface `CellStyle` currently
-/// represents, so picking up an LLM-emitted underline would just be
-/// lost on the retained path. Adding fields to `CellStyle` is the
-/// trigger for extending this match.
+/// Extended colour codes are decoded into crossterm colour variants:
+/// 256-colour `38;5;N` / `48;5;N` → `AnsiValue(N)`, and truecolor
+/// `38;2;R;G;B` / `48;2;R;G;B` → `Rgb`. These reach the retained path
+/// from the modal menu overlay (the `/usage` heatmap and per-model
+/// chart paint cells with `\x1b[38;5;Nm█`), so dropping them rendered
+/// those cells at the terminal default (white).
+///
+/// Italic / underline and other codes outside `CellStyle`'s cosmetic
+/// surface are still silently skipped — adding a field to `CellStyle`
+/// is the trigger for extending this match.
 fn apply_sgr_params(params: &str, style: &mut CellStyle) {
     // `\x1b[m` (empty params) means "reset" — same as `\x1b[0m`.
     if params.is_empty() {
         *style = CellStyle::default();
         return;
     }
-    for code in params.split(';') {
+    let parts: Vec<&str> = params.split(';').collect();
+    let mut i = 0;
+    while i < parts.len() {
+        let code = parts[i];
         // `\x1b[;31m` (leading empty) also resets before applying.
         if code.is_empty() {
             *style = CellStyle::default();
+            i += 1;
             continue;
         }
-        let Ok(n) = code.parse::<u16>() else { continue };
+        let Ok(n) = code.parse::<u16>() else {
+            i += 1;
+            continue;
+        };
         match n {
             0 => *style = CellStyle::default(),
             1 => style.bold = true,
@@ -308,7 +318,20 @@ fn apply_sgr_params(params: &str, style: &mut CellStyle) {
             35 => style.fg = Some(Color::DarkMagenta),
             36 => style.fg = Some(Color::DarkCyan),
             37 => style.fg = Some(Color::Grey),
+            38 => {
+                if let Some((c, consumed)) = parse_extended_colour(&parts[i + 1..]) {
+                    style.fg = Some(c);
+                    i += consumed;
+                }
+            }
             39 => style.fg = None,
+            48 => {
+                if let Some((c, consumed)) = parse_extended_colour(&parts[i + 1..]) {
+                    style.bg = Some(c);
+                    i += consumed;
+                }
+            }
+            49 => style.bg = None,
             90 => style.fg = Some(Color::DarkGrey),
             91 => style.fg = Some(Color::Red),
             92 => style.fg = Some(Color::Green),
@@ -319,6 +342,28 @@ fn apply_sgr_params(params: &str, style: &mut CellStyle) {
             97 => style.fg = Some(Color::White),
             _ => {}
         }
+        i += 1;
+    }
+}
+
+/// Decode the sub-parameters that follow an SGR `38` / `48` introducer.
+/// `rest` is the slice of params after the introducer. Returns the
+/// resolved colour and how many of those sub-parameters were consumed
+/// (so the caller can advance past them): `5;N` → 2, `2;R;G;B` → 4.
+/// Malformed sequences consume nothing and yield `None`.
+fn parse_extended_colour(rest: &[&str]) -> Option<(Color, usize)> {
+    match rest.first().copied() {
+        Some("5") => {
+            let n = rest.get(1)?.parse::<u8>().ok()?;
+            Some((Color::AnsiValue(n), 2))
+        }
+        Some("2") => {
+            let r = rest.get(1)?.parse::<u8>().ok()?;
+            let g = rest.get(2)?.parse::<u8>().ok()?;
+            let b = rest.get(3)?.parse::<u8>().ok()?;
+            Some((Color::Rgb { r, g, b }, 4))
+        }
+        _ => None,
     }
 }
 
@@ -503,7 +548,8 @@ pub fn serialize_frames_tight(prev: &[Vec<Cell>], next: &[Vec<Cell>]) -> Vec<u8>
         let p = prev.get(r).map(Vec::as_slice).unwrap_or(&[]);
         let n = next.get(r).map(Vec::as_slice).unwrap_or(&[]);
         let max_cols = p.len().max(n.len());
-        let changed = (0..max_cols).any(|c| p.get(c).unwrap_or(&blank) != n.get(c).unwrap_or(&blank));
+        let changed =
+            (0..max_cols).any(|c| p.get(c).unwrap_or(&blank) != n.get(c).unwrap_or(&blank));
         if !changed {
             continue;
         }
@@ -611,11 +657,13 @@ fn emit_sgr_transition(out: &mut Vec<u8>, from: Option<&CellStyle>, to: &CellSty
     // always goes through full reset to avoid clobbering bold state.
     let faint_off = from.faint && !to.faint;
     let fg_change = from.fg != to.fg;
+    let bg_change = from.bg != to.bg;
 
     let needs_reset = bold_off
         || reverse_off
         || faint_off
-        || (from.fg.is_some() && to.fg.is_none());
+        || (from.fg.is_some() && to.fg.is_none())
+        || (from.bg.is_some() && to.bg.is_none());
 
     if needs_reset {
         out.extend_from_slice(b"\x1b[0m");
@@ -630,7 +678,10 @@ fn emit_sgr_transition(out: &mut Vec<u8>, from: Option<&CellStyle>, to: &CellSty
             out.extend_from_slice(b"\x1b[7m");
         }
         if let Some(c) = to.fg {
-            let _ = write!(out, "{}", SetForegroundColor(c));
+            emit_ansi_color(out, 38, c);
+        }
+        if let Some(c) = to.bg {
+            emit_ansi_color(out, 48, c);
         }
     } else {
         // Additive path — current attributes stay, just flip on whatever
@@ -646,13 +697,57 @@ fn emit_sgr_transition(out: &mut Vec<u8>, from: Option<&CellStyle>, to: &CellSty
         }
         if fg_change {
             if let Some(c) = to.fg {
-                let _ = write!(out, "{}", SetForegroundColor(c));
+                emit_ansi_color(out, 38, c);
             } else {
                 // Should have been caught by needs_reset, but defensive.
                 out.extend_from_slice(b"\x1b[39m");
             }
         }
+        if bg_change {
+            if let Some(c) = to.bg {
+                emit_ansi_color(out, 48, c);
+            } else {
+                out.extend_from_slice(b"\x1b[49m");
+            }
+        }
     }
+}
+
+/// Serialize a concrete cell color without consulting crossterm's process-global
+/// `NO_COLOR` cache. Color enablement has already been resolved into `TerminalCaps`
+/// before a `CellStyle` is built; a second ambient-env check here can otherwise turn
+/// an explicitly colored cell into `ESC[m` and silently discard its attributes.
+fn emit_ansi_color(out: &mut Vec<u8>, channel: u8, color: Color) {
+    let reset = if channel == 38 { 39 } else { 49 };
+    match color {
+        Color::Reset => {
+            let _ = write!(out, "\x1b[{reset}m");
+        }
+        Color::Black => emit_ansi_index(out, channel, 0),
+        Color::DarkGrey => emit_ansi_index(out, channel, 8),
+        Color::Red => emit_ansi_index(out, channel, 9),
+        Color::DarkRed => emit_ansi_index(out, channel, 1),
+        Color::Green => emit_ansi_index(out, channel, 10),
+        Color::DarkGreen => emit_ansi_index(out, channel, 2),
+        Color::Yellow => emit_ansi_index(out, channel, 11),
+        Color::DarkYellow => emit_ansi_index(out, channel, 3),
+        Color::Blue => emit_ansi_index(out, channel, 12),
+        Color::DarkBlue => emit_ansi_index(out, channel, 4),
+        Color::Magenta => emit_ansi_index(out, channel, 13),
+        Color::DarkMagenta => emit_ansi_index(out, channel, 5),
+        Color::Cyan => emit_ansi_index(out, channel, 14),
+        Color::DarkCyan => emit_ansi_index(out, channel, 6),
+        Color::White => emit_ansi_index(out, channel, 15),
+        Color::Grey => emit_ansi_index(out, channel, 7),
+        Color::Rgb { r, g, b } => {
+            let _ = write!(out, "\x1b[{channel};2;{r};{g};{b}m");
+        }
+        Color::AnsiValue(value) => emit_ansi_index(out, channel, value),
+    }
+}
+
+fn emit_ansi_index(out: &mut Vec<u8>, channel: u8, value: u8) {
+    let _ = write!(out, "\x1b[{channel};5;{value}m");
 }
 
 #[cfg(test)]
@@ -669,7 +764,42 @@ mod tests {
             bold: true,
             reverse: false,
             faint: false,
+            bg: None,
         }
+    }
+
+    #[test]
+    fn push_str_cells_sgr_handles_256_colour_fg_and_bg() {
+        // The modal menu overlay (heatmap, per-model chart) emits
+        // `\x1b[38;5;Nm█\x1b[39m`. The parser must decode the extended
+        // `38;5;N` / `48;5;N` forms into AnsiValue, not drop them (which
+        // left heatmap cells rendering as default-white).
+        let mut row: Vec<Cell> = Vec::new();
+        push_str_cells_sgr(&mut row, "\x1b[38;5;40m█\x1b[39m", CellStyle::default());
+        assert_eq!(row.len(), 1);
+        assert_eq!(row[0].style.fg, Some(Color::AnsiValue(40)));
+
+        let mut row2: Vec<Cell> = Vec::new();
+        push_str_cells_sgr(&mut row2, "\x1b[48;5;22mX\x1b[49m", CellStyle::default());
+        assert_eq!(row2.len(), 1);
+        assert_eq!(row2[0].style.bg, Some(Color::AnsiValue(22)));
+
+        // Truecolor `38;2;R;G;B` should also resolve to Rgb.
+        let mut row3: Vec<Cell> = Vec::new();
+        push_str_cells_sgr(
+            &mut row3,
+            "\x1b[38;2;10;20;30mY\x1b[0m",
+            CellStyle::default(),
+        );
+        assert_eq!(row3.len(), 1);
+        assert_eq!(
+            row3[0].style.fg,
+            Some(Color::Rgb {
+                r: 10,
+                g: 20,
+                b: 30
+            })
+        );
     }
 
     #[test]
@@ -856,6 +986,7 @@ mod tests {
                     bold: true,
                     reverse: false,
                     faint: false,
+                    bg: None,
                 },
                 width: 1,
             },
@@ -880,6 +1011,7 @@ mod tests {
                     bold: false,
                     reverse: false,
                     faint: true,
+                    bg: None,
                 },
                 width: 1,
             },
@@ -907,6 +1039,7 @@ mod tests {
                     bold: false,
                     reverse: false,
                     faint: true,
+                    bg: None,
                 },
                 width: 1,
             },
@@ -1203,7 +1336,11 @@ mod tests {
         let prev = vec![vec![Cell::blank(); 5]];
         let next = vec![rule];
         let s = String::from_utf8(serialize_frames_tight(&prev, &next)).unwrap();
-        assert!(s.starts_with("\x1b[1;1H\x1b[K"), "row opens with CUP+EL: {:?}", s);
+        assert!(
+            s.starts_with("\x1b[1;1H\x1b[K"),
+            "row opens with CUP+EL: {:?}",
+            s
+        );
         // 'H' is the final byte of a CUP; exactly one for the whole row.
         assert_eq!(s.matches('H').count(), 1, "exactly one CUP, got: {:?}", s);
         assert!(s.contains("─────"), "dashes must be contiguous: {:?}", s);
@@ -1224,16 +1361,33 @@ mod tests {
         // re-stream only "he" (never re-emit the stale tail).
         let prev_row: Vec<Cell> = "hello"
             .chars()
-            .map(|ch| Cell { ch, style: CellStyle::default(), width: 1 })
+            .map(|ch| Cell {
+                ch,
+                style: CellStyle::default(),
+                width: 1,
+            })
             .collect();
         let next_row: Vec<Cell> = "he"
             .chars()
-            .map(|ch| Cell { ch, style: CellStyle::default(), width: 1 })
+            .map(|ch| Cell {
+                ch,
+                style: CellStyle::default(),
+                width: 1,
+            })
             .collect();
-        let s = String::from_utf8(serialize_frames_tight(&vec![prev_row], &vec![next_row])).unwrap();
-        assert!(s.contains("\x1b[1;1H\x1b[K"), "row cleared with EL: {:?}", s);
+        let s =
+            String::from_utf8(serialize_frames_tight(&vec![prev_row], &vec![next_row])).unwrap();
+        assert!(
+            s.contains("\x1b[1;1H\x1b[K"),
+            "row cleared with EL: {:?}",
+            s
+        );
         assert!(s.contains("he"));
-        assert!(!s.contains("llo"), "stale tail must not be re-emitted: {:?}", s);
+        assert!(
+            !s.contains("llo"),
+            "stale tail must not be re-emitted: {:?}",
+            s
+        );
     }
 
     #[test]
@@ -1245,7 +1399,11 @@ mod tests {
         let prev = vec![vec![Cell::blank(); row.len()]];
         let next = vec![row];
         let s = String::from_utf8(serialize_frames_tight(&prev, &next)).unwrap();
-        assert!(s.contains("a你b"), "glyph emitted once, no phantom cont: {:?}", s);
+        assert!(
+            s.contains("a你b"),
+            "glyph emitted once, no phantom cont: {:?}",
+            s
+        );
         assert_eq!(s.matches('H').count(), 1, "single CUP for the row: {:?}", s);
     }
 
@@ -1254,11 +1412,19 @@ mod tests {
         // Row went from content to all-blank → only CUP+EL, nothing streamed.
         let prev_row: Vec<Cell> = "xy"
             .chars()
-            .map(|ch| Cell { ch, style: CellStyle::default(), width: 1 })
+            .map(|ch| Cell {
+                ch,
+                style: CellStyle::default(),
+                width: 1,
+            })
             .collect();
         let next = vec![vec![Cell::blank(); 2]];
         let s = String::from_utf8(serialize_frames_tight(&vec![prev_row], &next)).unwrap();
-        assert_eq!(s, "\x1b[1;1H\x1b[K", "blank row emits only the clear: {:?}", s);
+        assert_eq!(
+            s, "\x1b[1;1H\x1b[K",
+            "blank row emits only the clear: {:?}",
+            s
+        );
     }
 
     /// Reverse: wide→narrow at same cell index. The wide char's

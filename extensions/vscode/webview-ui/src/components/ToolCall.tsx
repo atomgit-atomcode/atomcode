@@ -1,6 +1,6 @@
 import React, { useState, useCallback } from 'react';
 import { ToolCallData } from '../state/types';
-import { formatToolArgs } from '../utils/format';
+import { formatToolArgs, formatToolDuration } from '../utils/format';
 import { DiffView } from './DiffView';
 import { useT } from '../i18n';
 
@@ -41,15 +41,19 @@ export function ToolCall({ tool }: ToolCallProps) {
 
   const annotationClass =
     tool.status === 'error' ? 'error' :
+    tool.status === 'incomplete' ? 'error' :
     tool.status === 'done' ? 'success' :
-    tool.status === 'queued' ? 'queued' : '';
+    tool.status === 'queued' ? 'queued' :
+    tool.status === 'waiting_approval' ? 'queued' : '';
 
   const annotationText =
     tool.status === 'queued' ? t('tool.waiting') :
+    tool.status === 'waiting_approval' ? t('tool.waitingApproval') :
     tool.status === 'running' ? undefined :
     tool.status === 'error' ? t('tool.error') :
+    tool.status === 'incomplete' ? t('tool.incomplete') :
     isEditTool && tool.status === 'done' ? t('tool.applied') :
-    tool.durationMs !== undefined ? `${(tool.durationMs / 1000).toFixed(1)}s` : t('tool.done');
+    tool.durationMs !== undefined ? formatToolDuration(tool.durationMs) : t('tool.done');
 
   return (
     <div className="tool-body">
@@ -66,6 +70,9 @@ export function ToolCall({ tool }: ToolCallProps) {
         )}
         <span className={`tool-chevron${expanded ? ' expanded' : ''}`}>▾</span>
       </div>
+      {tool.status === 'running' && tool.progress && (
+        <div className="tool-progress" title={tool.progress}>{tool.progress}</div>
+      )}
       {expanded && (
         <div className="tool-body-grid">
           <div className="tool-body-row">
