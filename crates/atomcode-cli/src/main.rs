@@ -13,6 +13,7 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 
+mod schedule_cmd;
 mod telemetry_cmd;
 mod vision;
 use atomcode::uninstall;
@@ -771,6 +772,9 @@ enum Commands {
     /// Manage hooks (list, test, enable/disable)
     #[command(subcommand)]
     Hooks(HookCommands),
+    /// Manage local scheduled tasks (add/list/remove/enable/disable).
+    #[command(subcommand)]
+    Schedule(schedule_cmd::ScheduleCli),
     /// Generate a shell completion script on stdout.
     Completion(CompletionCommand),
     /// Internal: askpass helper invoked by sudo/ssh via SUDO_ASKPASS / SSH_ASKPASS.
@@ -2826,6 +2830,9 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             unreachable!("completion is handled before runtime startup")
         }
         Commands::Hooks(subcmd) => handle_hooks(subcmd).await,
+        Commands::Schedule(sub) => {
+            schedule_cmd::handle_schedule(sub).await.map(|_| ())
+        }
         Commands::Askpass { .. } => {
             unreachable!("__askpass is handled early in run() before handle_command")
         }
