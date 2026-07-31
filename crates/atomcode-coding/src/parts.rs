@@ -31,7 +31,7 @@ use atomcode_capabilities::session::{
     SnapshotHook, StatusReminderHook, StorageOwner, TranscriptHook,
 };
 use atomcode_capabilities::skills::{
-    register_skill_tools, standard_skill_dirs, SkillCatalogHook, SkillRegistry,
+    register_skill_tools, runtime_skill_dirs, SkillCatalogHook, SkillRegistry,
 };
 use atomcode_capabilities::tools::{
     register_coding_tools_with_vision, ApprovalMiddleware, ArtifactMiddleware, ArtifactStore,
@@ -439,7 +439,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // Skills: standard home+project precedence unless the caller supplied dirs.
     let skill_dirs = opts.skill_dirs.clone().unwrap_or_else(|| {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        standard_skill_dirs(&home, &cfg.working_dir)
+        runtime_skill_dirs(&home, &cfg.working_dir)
     });
     // Plugin-contributed skills: each (dir, namespace) pair registered as
     // `<namespace>:<skill-name>`, matching the slash-menu's core registry
