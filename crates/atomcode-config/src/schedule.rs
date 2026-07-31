@@ -40,25 +40,24 @@ pub fn schedules_root() -> PathBuf {
     crate::config::Config::config_dir().join("schedules")
 }
 
-fn task_path(id: &str) -> PathBuf { schedules_root().join(format!("{id}.json")) }
+fn task_path_in(root: &std::path::Path, id: &str) -> PathBuf { root.join(format!("{id}.json")) }
 
-pub fn save(task: &ScheduleTask) -> std::io::Result<()> {
-    let root = schedules_root();
-    std::fs::create_dir_all(&root)?;
+fn save_in(root: &std::path::Path, task: &ScheduleTask) -> std::io::Result<()> {
+    std::fs::create_dir_all(root)?;
     let bytes = serde_json::to_vec_pretty(task)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(task_path(&task.id), bytes)
+    std::fs::write(task_path_in(root, &task.id), bytes)
 }
 
-pub fn load(id: &str) -> std::io::Result<ScheduleTask> {
-    let bytes = std::fs::read(task_path(id))?;
+fn load_in(root: &std::path::Path, id: &str) -> std::io::Result<ScheduleTask> {
+    let bytes = std::fs::read(task_path_in(root, id))?;
     serde_json::from_slice(&bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-pub fn list() -> Vec<ScheduleTask> {
+fn list_in(root: &std::path::Path) -> Vec<ScheduleTask> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(schedules_root()) else { return out };
+    let Ok(rd) = std::fs::read_dir(root) else { return out };
     for entry in rd.flatten() {
         let p = entry.path();
         if p.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
@@ -72,13 +71,18 @@ pub fn list() -> Vec<ScheduleTask> {
     out
 }
 
-pub fn remove(id: &str) -> std::io::Result<()> {
-    match std::fs::remove_file(task_path(id)) {
+fn remove_in(root: &std::path::Path, id: &str) -> std::io::Result<()> {
+    match std::fs::remove_file(task_path_in(root, id)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
 }
+
+pub fn save(task: &ScheduleTask) -> std::io::Result<()> { save_in(&schedules_root(), task) }
+pub fn load(id: &str) -> std::io::Result<ScheduleTask> { load_in(&schedules_root(), id) }
+pub fn list() -> Vec<ScheduleTask> { list_in(&schedules_root()) }
+pub fn remove(id: &str) -> std::io::Result<()> { remove_in(&schedules_root(), id) }
 
 /// Next fire time (epoch secs) for simple frequencies. `Cron` returns None in
 /// phase 1 (its real firing is the phase-2 OS scheduler). Uses naive local-less
@@ -90,8 +94,8 @@ pub fn next_run(schedule: &Schedule, now_epoch_secs: i64) -> Option<i64> {
         Some((h.parse().ok()?, m.parse().ok()?))
     }
     match schedule {
-        Schedule::Interval { every_minutes } if *every_minutes > 0 =>
-            Some(now_epoch_secs + (*every_minutes as i64) * 60),
+        Schedule::Interval { every_minutes } =>
+            (*every_minutes > 0).then(|| now_epoch_secs + (*every_minutes as i64) * 60),
         Schedule::Hourly => {
             let secs_into_hour = now_epoch_secs.rem_euclid(3600);
             Some(now_epoch_secs + (3600 - secs_into_hour))
@@ -111,7 +115,6 @@ pub fn next_run(schedule: &Schedule, now_epoch_secs: i64) -> Option<i64> {
             Some(if target > now_epoch_secs { target } else { target + 86400 })
         }
         Schedule::Cron { .. } => None,
-        Schedule::Interval { .. } => None,
     }
 }
 
@@ -141,14 +144,12 @@ mod tests {
     #[test]
     fn store_save_load_list_remove_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("ATOMCODE_HOME", tmp.path());   // isolate config_dir
-        let t = sample();
-        save(&t).unwrap();
-        assert_eq!(load("t1").unwrap().title, "Daily brief");
-        assert_eq!(list().len(), 1);
-        remove("t1").unwrap();
-        assert!(list().is_empty());
-        std::env::remove_var("ATOMCODE_HOME");
+        let root = tmp.path();
+        save_in(root, &sample()).unwrap();
+        assert_eq!(load_in(root, "t1").unwrap().title, "Daily brief");
+        assert_eq!(list_in(root).len(), 1);
+        remove_in(root, "t1").unwrap();
+        assert!(list_in(root).is_empty());
     }
 
     #[test]
