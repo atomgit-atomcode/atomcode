@@ -14,6 +14,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 
 mod schedule_cmd;
+mod schedule_os;
 mod telemetry_cmd;
 mod vision;
 use atomcode::uninstall;
