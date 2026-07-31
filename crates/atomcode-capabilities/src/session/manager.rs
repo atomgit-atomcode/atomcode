@@ -329,6 +329,20 @@ pub struct ForkInfo {
     pub base_turn_count: u32,
 }
 
+/// How a session was created. Stored in [`SessionMeta`] so that automated
+/// scheduled-task sessions can be excluded from user-facing history pickers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionOrigin {
+    /// Started by the user (TUI, webui, CLI). The default for all legacy
+    /// sessions that predate this field (`#[serde(default)]`).
+    #[default]
+    Manual,
+    /// Started by the scheduled-tasks runner. Hidden from normal `/resume`
+    /// and sidebar pickers; visible in a dedicated scheduled-tasks view.
+    Scheduled,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
     /// `.meta` SCHEMA VERSION — the forward-compat seam (`.snapshot` has
@@ -382,6 +396,10 @@ pub struct SessionMeta {
     /// attributed to a provider/model written by older metadata.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub detached_unattributed_tokens: u64,
+    /// How this session was created. Defaults to [`SessionOrigin::Manual`] so
+    /// that sessions written before this field existed deserialize correctly.
+    #[serde(default)]
+    pub origin: SessionOrigin,
 }
 
 impl SessionMeta {
@@ -406,6 +424,7 @@ impl SessionMeta {
             turn_stats: Vec::new(),
             detached_model_usage: Vec::new(),
             detached_unattributed_tokens: 0,
+            origin: SessionOrigin::Manual,
         }
     }
 
@@ -2738,6 +2757,16 @@ impl SessionManager {
         }
         out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         out
+    }
+
+    /// Sessions for normal pickers (/resume, webui sidebar): excludes scheduled-run
+    /// sessions so recurring tasks don't flood the user's manual history. Use `list()`
+    /// for the full set (e.g. a scheduled-tasks view).
+    pub fn list_visible(&self) -> Vec<SessionMeta> {
+        self.list()
+            .into_iter()
+            .filter(|m| m.origin != SessionOrigin::Scheduled)
+            .collect()
     }
 
     /// The most-recently-updated session, if any.
@@ -6584,5 +6613,19 @@ mod tests {
         let snap = mgr.snapshot_path("abc").unwrap();
         let art = mgr.artifacts_dir("abc").unwrap();
         assert_eq!(art, snap.with_extension("artifacts"));
+    }
+
+    #[test]
+    fn session_origin_defaults_manual_and_roundtrips() {
+        let mut m = SessionMeta::new("s1", "/tmp/p", 0);
+        assert_eq!(m.origin, SessionOrigin::Manual); // default
+        m.origin = SessionOrigin::Scheduled;
+        let json = serde_json::to_string(&m).unwrap();
+        let back: SessionMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.origin, SessionOrigin::Scheduled);
+        // old meta without the field → Manual
+        let old = r#"{"id":"x","name":"n","working_dir":"/w","created_at":0,"updated_at":0}"#;
+        let parsed: SessionMeta = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.origin, SessionOrigin::Manual);
     }
 }
