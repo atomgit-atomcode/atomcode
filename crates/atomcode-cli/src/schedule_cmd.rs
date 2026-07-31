@@ -220,7 +220,7 @@ fn slug(s: &str) -> String {
 ///
 /// Installs the task into the OS scheduler.  If install fails the task is
 /// **not** deleted — the caller should log the error and suggest `sync`.
-pub(crate) fn handle_add_with(os: &dyn OsScheduler, task: &ScheduleTask) -> Result<()> {
+fn handle_add_with(os: &dyn OsScheduler, task: &ScheduleTask) -> Result<()> {
     if let Err(e) = os.install(task) {
         eprintln!(
             "[schedule] warning: OS scheduler registration failed for {}: {e}\n\
@@ -232,7 +232,7 @@ pub(crate) fn handle_add_with(os: &dyn OsScheduler, task: &ScheduleTask) -> Resu
 }
 
 /// Core logic for `schedule remove`: uninstall (best-effort) then delete.
-pub(crate) fn handle_remove_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
+fn handle_remove_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
     // best-effort — don't abort if already absent
     let _ = os.uninstall(id);
     schedule::remove(id)
@@ -241,7 +241,7 @@ pub(crate) fn handle_remove_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
 }
 
 /// Core logic for `schedule enable`.
-pub(crate) fn handle_enable_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
+fn handle_enable_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
     let mut task = schedule::load(id)
         .with_context(|| format!("task {:?} not found", id))?;
     task.enabled = true;
@@ -257,7 +257,7 @@ pub(crate) fn handle_enable_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
 }
 
 /// Core logic for `schedule disable`.
-pub(crate) fn handle_disable_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
+fn handle_disable_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
     let mut task = schedule::load(id)
         .with_context(|| format!("task {:?} not found", id))?;
     task.enabled = false;
@@ -269,7 +269,12 @@ pub(crate) fn handle_disable_with(os: &dyn OsScheduler, id: &str) -> Result<()> 
 }
 
 /// Core logic for `schedule sync`: reconcile OS registrations with the store.
-pub(crate) fn handle_sync_with(os: &dyn OsScheduler) -> Result<()> {
+///
+/// Calls `OsScheduler::install` unconditionally for every enabled task.
+/// This is intentional: `install` must be **idempotent** (launchd overwrites
+/// existing plists, schtasks uses `/F` to replace, systemd overwrites unit
+/// files), so repeated sync runs are always safe.
+fn handle_sync_with(os: &dyn OsScheduler) -> Result<()> {
     let tasks = schedule::list();
     let mut installed = 0usize;
     let mut uninstalled = 0usize;
@@ -810,16 +815,33 @@ mod tests {
     ///
     /// Acquires `store_lock()` so concurrent tests do not stomp each other's
     /// ATOMCODE_HOME env var.  The lock is held for the duration of `f`.
-    fn with_temp_home<F: FnOnce()>(f: F) {
-        let _guard = store_lock().lock().unwrap_or_else(|p| p.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::var("ATOMCODE_HOME").ok();
-        std::env::set_var("ATOMCODE_HOME", tmp.path());
-        f();
-        match prev {
-            Some(v) => std::env::set_var("ATOMCODE_HOME", v),
-            None => std::env::remove_var("ATOMCODE_HOME"),
+    ///
+    /// Restoration of ATOMCODE_HOME is performed inside a Drop guard so that a
+    /// panic inside `f` still restores the env var (and releases the lock via
+    /// normal unwind), preventing subsequent store tests from silently seeing a
+    /// dangling path.
+    fn with_temp_home<T, F: FnOnce() -> T>(f: F) -> T {
+        struct EnvGuard {
+            prev: Option<std::ffi::OsString>,
         }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("ATOMCODE_HOME", v),
+                    None => std::env::remove_var("ATOMCODE_HOME"),
+                }
+            }
+        }
+
+        let _lock = store_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _env_guard = EnvGuard { prev: std::env::var_os("ATOMCODE_HOME") };
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", tmp.path());
+        // `tmp` is kept alive until after `f()` returns (or unwinds), ensuring
+        // the tempdir is not deleted while the store operates inside it.
+        let result = f();
+        drop(tmp); // explicit for clarity; would drop at end of scope anyway
+        result
     }
 
     // ── OS-integration tests ──────────────────────────────────────────────────
