@@ -5018,10 +5018,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Instead, overlay the transient strip in the final visible slots.
         // Any covered permanent tail rows remain in `body_lines` and are
         // restored by the next paint after the spinner is cleared.
+        //
+        // The in-flight tool strip (`render_inflight_tool` → `inflight_tool_rows`)
+        // is the SAME kind of transient bottom-anchored overlay: it is written
+        // by a raw in-place path that positions itself at `body_bottom_row()`.
+        // It must be counted here too, otherwise a footer-height change while a
+        // tool animates — newly common in v5.0.3, where the pending-messages /
+        // subtask panels grow and shrink the footer mid-turn — top-anchors the
+        // overfull body and DROPS the strip's tail rows from this cell model.
+        // paint would then disagree with the raw write about where (or whether)
+        // the strip is, leaving a ghost copy of the strip block on screen (the
+        // reported "渲染重叠"). The two are mutually exclusive (the live spinner
+        // only runs when no tool is in flight), so an `else` is sufficient.
         let transient_rows = if self.live_spinner_active {
             1 + usize::from(self.live_spinner_spacer_active)
         } else {
-            0
+            self.inflight_tool_rows
         }
         .min(display_total.saturating_sub(self.scrolled_off))
         .min(body_height);
@@ -10680,6 +10692,163 @@ mod tests {
             post_open,
             vterm.dump()
         );
+    }
+
+    /// v5.0.3 regression (rendering overlap / ghost tool-call block):
+    /// the mirror of `retained_inflight_ghost_clears_when_footer_grows_around_it`,
+    /// but the footer SHRINKS mid-run instead of growing. The new
+    /// `pending_messages` panel (steer messages queued during a turn) is a
+    /// variable-height footer element; when it collapses (a queued message is
+    /// consumed, or cosmetic spacing is dropped to fit), `current_footer_rows()`
+    /// drops, `body_bottom_row()` grows, and the in-place inflight strip moves
+    /// DOWN a row. `render_inflight_tool` only sentinels prev_cells from the NEW
+    /// (lower) strip top downward (`invalidate_rows_from(first_0idx)`), so the
+    /// strip's PREVIOUS, higher physical rows are never repainted and survive as
+    /// a ghost duplicate ABOVE the live strip — exactly the reported overlap.
+    #[test]
+    fn retained_inflight_ghost_clears_when_footer_shrinks_under_it() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        // Baseline paint (mirrors the footer-GROWS sibling test).
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋".into(),
+            label: "Pondering".into(),
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+
+        // Fill body past the cap so `body_bottom_row()` pins to the footer edge
+        // and tracks footer-height changes.
+        for i in 0..20 {
+            r.render(UiLine::CommandOutput(format!("filler-{:02}\n", i)));
+        }
+        r.flush_deferred();
+
+        // Seed + tick the inflight tool with a SMALL footer (no pending panel).
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-leak".into(),
+            name: "Grep".into(),
+            detail: "LEAKMARKER_PLACEHOLDER_AAAA".into(),
+            hint: None,
+        });
+        r.render(UiLine::Spinner {
+            frame: "⠙".into(),
+            label: "Running Bash".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // GROW the footer: queue steer messages (the v5.0.3 pending-messages
+        // panel). The in-place strip moves UP to make room.
+        let with_pending = {
+            let mut s = status.clone();
+            s.pending_messages = vec![
+                "queued steer one".into(),
+                "queued steer two".into(),
+                "queued steer three".into(),
+            ];
+            s
+        };
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠹".into(),
+            label: "Running Bash".into(),
+            menu: None,
+            status: with_pending,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let high_row = (0..24)
+            .find(|&row| vterm.row_text(row).contains("LEAKMARKER"))
+            .unwrap_or_else(|| panic!("test setup broken: marker not painted\n{}", vterm.dump()));
+
+        // SHRINK the footer back: the steers are consumed at the tool boundary,
+        // the pending panel collapses, and the in-place strip moves DOWN.
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠸".into(),
+            label: "Running Bash".into(),
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let low_row = (0..24)
+            .find(|&row| vterm.row_text(row).contains("LEAKMARKER"))
+            .unwrap_or_else(|| panic!("marker vanished entirely after shrink\n{}", vterm.dump()));
+
+        // The strip must have moved DOWN and left NO ghost at its old row.
+        assert!(
+            low_row > high_row,
+            "expected strip to move down when footer shrank (high={high_row}, low={low_row})\n{}",
+            vterm.dump()
+        );
+        assert!(
+            !vterm.row_text(high_row).contains("LEAKMARKER"),
+            "ghost inflight strip survived at old row {high_row} after footer shrank:\n{}",
+            vterm.dump()
+        );
+    }
+
+    /// Guards the fix that counts the in-flight tool strip in `transient_rows`
+    /// (`paint_body_into_cells`). A MULTI-row strip (Bash: command + blank +
+    /// `Running` row) overlaid on an OVERFLOWING body, with permanent rows
+    /// streaming under it (the `task`/bash-output case), must not corrupt native
+    /// scrollback: the compaction path pins physical row 0 to
+    /// `body_lines[scrolled_off]`, so each overflow-LF promotes exactly the right
+    /// row. Every filler row must survive across scrollback+viewport exactly once
+    /// (no duplication, no loss).
+    #[test]
+    fn retained_multirow_inflight_strip_overflow_preserves_scrollback() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::StreamingBox {
+            buf: String::new(), cursor_byte: 0, frame: "⠋".into(), label: "Pondering".into(),
+            menu: None, status: status.clone(), attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        for i in 0..25 {
+            r.render(UiLine::CommandOutput(format!("FILL{:02}\n", i)));
+        }
+        r.flush_deferred();
+        // Multi-row Bash inflight strip (command + blank + Running row).
+        r.render(UiLine::ToolCallInFlight {
+            id: "c1".into(), name: "Bash".into(), detail: "echo hi".into(), hint: None,
+        });
+        r.render(UiLine::Spinner { frame: "⠙".into(), label: "Running · 1s".into() });
+        r.flush_deferred();
+        assert!(r.inflight_tool_rows >= 3, "expected multi-row strip, got {}", r.inflight_tool_rows);
+        drain_into_vterm(&buf, &mut vterm);
+        // Stream permanent rows while overflowing, re-ticking the strip each time.
+        for i in 0..6 {
+            r.render(UiLine::CommandOutput(format!("STREAM{:02}\n", i)));
+            r.render(UiLine::Spinner { frame: "⠹".into(), label: format!("Running · {i}s") });
+            r.flush_deferred();
+            drain_into_vterm(&buf, &mut vterm);
+        }
+        // Every FILL row must appear exactly once across scrollback+viewport (no dup/loss).
+        let all: Vec<String> = vterm.scrollback_texts().into_iter()
+            .chain((0..24).map(|row| vterm.row_text(row).trim_end().to_string()))
+            .collect();
+        for i in 0..25 {
+            let tag = format!("FILL{:02}", i);
+            let n = all.iter().filter(|l| l.contains(&tag)).count();
+            assert_eq!(n, 1, "{tag} appeared {n} times (dup/loss)\nSCROLLBACK:\n{}\nSCREEN:\n{}",
+                vterm.scrollback_texts().join("\n"), vterm.dump());
+        }
     }
 
     /// User report (long `cargo install` looked stuck): the inflight
