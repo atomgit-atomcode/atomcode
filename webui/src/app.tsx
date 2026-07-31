@@ -95,6 +95,11 @@ export function App() {
       if (!resizingRef.current) return;
       const w = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, e.clientX));
       setSidebarWidth(w);
+    function onMouseMove(e: MouseEvent) {
+      if (!resizingRef.current) return;
+      const w = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, e.clientX));
+      widthRef.current = w;
+      setSidebarWidth(w);
     }
     function onMouseUp() {
       if (!resizingRef.current) return;
