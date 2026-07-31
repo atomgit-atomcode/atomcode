@@ -1,4 +1,4 @@
-//! `atomcode schedule` subcommand — add / list / remove / enable / disable.
+//! `atomcode schedule` subcommand — add / list / remove / enable / disable / sync.
 //!
 //! Task 4 will fill in the `Run` arm; for now it returns a non-zero exit
 //! code with an informational message so callers can detect the stub.
@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 
 use atomcode_config::schedule::{self, Schedule, ScheduleTask};
+use crate::schedule_os::{InstallState, OsScheduler};
 
 // ── CLI enum ──────────────────────────────────────────────────────────────────
 
@@ -82,6 +83,12 @@ pub enum ScheduleCli {
         /// Task id.
         id: String,
     },
+
+    /// Sync OS scheduler registrations with the stored task list.
+    ///
+    /// Installs enabled tasks that are not yet registered and unregisters
+    /// disabled tasks that are still registered.  Safe to run repeatedly.
+    Sync,
 }
 
 // ── Pure helpers ──────────────────────────────────────────────────────────────
@@ -207,6 +214,100 @@ fn slug(s: &str) -> String {
     }
 }
 
+// ── Inner handlers (accept &dyn OsScheduler for testability) ─────────────────
+
+/// Core logic for `schedule add` after the task has been built and saved.
+///
+/// Installs the task into the OS scheduler.  If install fails the task is
+/// **not** deleted — the caller should log the error and suggest `sync`.
+pub(crate) fn handle_add_with(os: &dyn OsScheduler, task: &ScheduleTask) -> Result<()> {
+    if let Err(e) = os.install(task) {
+        eprintln!(
+            "[schedule] warning: OS scheduler registration failed for {}: {e}\n\
+             Run `atomcode schedule sync` to retry.",
+            task.id
+        );
+    }
+    Ok(())
+}
+
+/// Core logic for `schedule remove`: uninstall (best-effort) then delete.
+pub(crate) fn handle_remove_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
+    // best-effort — don't abort if already absent
+    let _ = os.uninstall(id);
+    schedule::remove(id)
+        .with_context(|| format!("failed to remove task {:?}", id))?;
+    Ok(())
+}
+
+/// Core logic for `schedule enable`.
+pub(crate) fn handle_enable_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
+    let mut task = schedule::load(id)
+        .with_context(|| format!("task {:?} not found", id))?;
+    task.enabled = true;
+    schedule::save(&task)
+        .with_context(|| format!("failed to save task {:?}", id))?;
+    if let Err(e) = os.install(&task) {
+        eprintln!(
+            "[schedule] warning: OS scheduler registration failed for {id}: {e}\n\
+             Run `atomcode schedule sync` to retry."
+        );
+    }
+    Ok(())
+}
+
+/// Core logic for `schedule disable`.
+pub(crate) fn handle_disable_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
+    let mut task = schedule::load(id)
+        .with_context(|| format!("task {:?} not found", id))?;
+    task.enabled = false;
+    schedule::save(&task)
+        .with_context(|| format!("failed to save task {:?}", id))?;
+    // best-effort
+    let _ = os.uninstall(id);
+    Ok(())
+}
+
+/// Core logic for `schedule sync`: reconcile OS registrations with the store.
+pub(crate) fn handle_sync_with(os: &dyn OsScheduler) -> Result<()> {
+    let tasks = schedule::list();
+    let mut installed = 0usize;
+    let mut uninstalled = 0usize;
+    let mut errors = 0usize;
+
+    for task in &tasks {
+        if task.enabled {
+            match os.install(task) {
+                Ok(()) => {
+                    println!("  sync: installed {}", task.id);
+                    installed += 1;
+                }
+                Err(e) => {
+                    eprintln!("  sync: failed to install {}: {e}", task.id);
+                    errors += 1;
+                }
+            }
+        } else {
+            match os.uninstall(&task.id) {
+                Ok(()) => {
+                    println!("  sync: uninstalled {}", task.id);
+                    uninstalled += 1;
+                }
+                Err(e) => {
+                    eprintln!("  sync: failed to uninstall {}: {e}", task.id);
+                    errors += 1;
+                }
+            }
+        }
+    }
+
+    println!(
+        "  sync done: {} installed, {} uninstalled, {} errors",
+        installed, uninstalled, errors
+    );
+    Ok(())
+}
+
 // ── Handler ───────────────────────────────────────────────────────────────────
 
 /// Dispatch `atomcode schedule <subcommand>`.  Returns an exit code.
@@ -240,6 +341,8 @@ pub async fn handle_schedule(cli: ScheduleCli) -> Result<i32> {
             let task = build_task(&title, &prompt, &cwd, sched, &mode, &notify);
             schedule::save(&task)
                 .with_context(|| format!("failed to save scheduled task {:?}", task.id))?;
+            let os = crate::schedule_os::current()?;
+            handle_add_with(os.as_ref(), &task)?;
             println!("  Added task {} ({})", task.id, task.title);
             Ok(0)
         }
@@ -250,6 +353,7 @@ pub async fn handle_schedule(cli: ScheduleCli) -> Result<i32> {
                 println!("  No scheduled tasks. Use `atomcode schedule add` to create one.");
                 return Ok(0);
             }
+            let os = crate::schedule_os::current()?;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
@@ -261,42 +365,46 @@ pub async fn handle_schedule(cli: ScheduleCli) -> Result<i32> {
                     .unwrap_or_else(|| "-".to_string());
                 let last = t.last_status.as_deref().unwrap_or("-");
                 let state = if t.enabled { "on" } else { "off" };
+                let reg = match os.status(&t.id) {
+                    InstallState::Installed => "registered",
+                    InstallState::Missing => "missing",
+                };
                 println!(
-                    "  {} | {} | next:{} | last:{} | {}",
-                    t.id, t.title, next, last, state
+                    "  {} | {} | next:{} | last:{} | {} | {}",
+                    t.id, t.title, next, last, state, reg
                 );
             }
             Ok(0)
         }
 
         ScheduleCli::Remove { id } => {
-            schedule::remove(&id)
-                .with_context(|| format!("failed to remove task {:?}", id))?;
+            let os = crate::schedule_os::current()?;
+            handle_remove_with(os.as_ref(), &id)?;
             println!("  Removed task {}", id);
             Ok(0)
         }
 
         ScheduleCli::Enable { id } => {
-            let mut task = schedule::load(&id)
-                .with_context(|| format!("task {:?} not found", id))?;
-            task.enabled = true;
-            schedule::save(&task)
-                .with_context(|| format!("failed to save task {:?}", id))?;
-            println!("  Enabled task {} ({})", task.id, task.title);
+            let os = crate::schedule_os::current()?;
+            handle_enable_with(os.as_ref(), &id)?;
+            println!("  Enabled task {}", id);
             Ok(0)
         }
 
         ScheduleCli::Disable { id } => {
-            let mut task = schedule::load(&id)
-                .with_context(|| format!("task {:?} not found", id))?;
-            task.enabled = false;
-            schedule::save(&task)
-                .with_context(|| format!("failed to save task {:?}", id))?;
-            println!("  Disabled task {} ({})", task.id, task.title);
+            let os = crate::schedule_os::current()?;
+            handle_disable_with(os.as_ref(), &id)?;
+            println!("  Disabled task {}", id);
             Ok(0)
         }
 
         ScheduleCli::Run { id } => run_task(&id).await,
+
+        ScheduleCli::Sync => {
+            let os = crate::schedule_os::current()?;
+            handle_sync_with(os.as_ref())?;
+            Ok(0)
+        }
     }
 }
 
@@ -621,31 +729,167 @@ mod tests {
 
     #[test]
     fn add_builds_daily_task_and_persists() {
-        // Use a dedicated tempdir so this test is isolated from any other
-        // schedule tests running concurrently under the same binary.
+        with_temp_home(|| {
+            let t = build_task(
+                "Brief",
+                "summarize",
+                "/tmp/p",
+                Schedule::Daily { time: "09:00".into() },
+                "plan",
+                "important",
+            );
+            atomcode_config::schedule::save(&t).unwrap();
+            let all = atomcode_config::schedule::list();
+            assert_eq!(all.len(), 1);
+            assert_eq!(all[0].title, "Brief");
+        });
+    }
+
+    // ── FakeScheduler — records install/uninstall calls ───────────────────────
+
+    use std::sync::{Mutex, OnceLock};
+    use crate::schedule_os::{InstallState, OsScheduler};
+    use atomcode_config::schedule::ScheduleTask;
+
+    /// Global lock to serialize tests that mutate ATOMCODE_HOME / the schedule store.
+    fn store_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[derive(Default)]
+    struct FakeScheduler {
+        installed: Mutex<Vec<String>>,
+        uninstalled: Mutex<Vec<String>>,
+    }
+
+    impl FakeScheduler {
+        fn installed(&self) -> Vec<String> {
+            self.installed.lock().unwrap().clone()
+        }
+        fn uninstalled(&self) -> Vec<String> {
+            self.uninstalled.lock().unwrap().clone()
+        }
+    }
+
+    impl OsScheduler for FakeScheduler {
+        fn install(&self, task: &ScheduleTask) -> anyhow::Result<()> {
+            self.installed.lock().unwrap().push(task.id.clone());
+            Ok(())
+        }
+        fn uninstall(&self, id: &str) -> anyhow::Result<()> {
+            self.uninstalled.lock().unwrap().push(id.to_string());
+            Ok(())
+        }
+        fn status(&self, id: &str) -> InstallState {
+            if self.installed.lock().unwrap().contains(&id.to_string()) {
+                InstallState::Installed
+            } else {
+                InstallState::Missing
+            }
+        }
+    }
+
+    fn make_task(id: &str, enabled: bool) -> ScheduleTask {
+        ScheduleTask {
+            id: id.into(),
+            title: "Test".into(),
+            prompt: "do it".into(),
+            cwd: "/tmp".into(),
+            schedule: Schedule::Daily { time: "09:00".into() },
+            permission_mode: "plan".into(),
+            notify: "important".into(),
+            enabled,
+            created_at: 0,
+            last_run_at: None,
+            last_status: None,
+        }
+    }
+
+    /// Convenience: set ATOMCODE_HOME to a fresh tempdir, call `f`, restore.
+    ///
+    /// Acquires `store_lock()` so concurrent tests do not stomp each other's
+    /// ATOMCODE_HOME env var.  The lock is held for the duration of `f`.
+    fn with_temp_home<F: FnOnce()>(f: F) {
+        let _guard = store_lock().lock().unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::tempdir().unwrap();
-        // Save and restore ATOMCODE_HOME so any pre-existing value set by a
-        // per-process ctor (or another test) is not permanently discarded.
         let prev = std::env::var("ATOMCODE_HOME").ok();
         std::env::set_var("ATOMCODE_HOME", tmp.path());
-
-        let t = build_task(
-            "Brief",
-            "summarize",
-            "/tmp/p",
-            Schedule::Daily { time: "09:00".into() },
-            "plan",
-            "important",
-        );
-        atomcode_config::schedule::save(&t).unwrap();
-        let all = atomcode_config::schedule::list();
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].title, "Brief");
-
-        // Restore the previous value (or remove the var if it was absent).
+        f();
         match prev {
             Some(v) => std::env::set_var("ATOMCODE_HOME", v),
             None => std::env::remove_var("ATOMCODE_HOME"),
         }
+    }
+
+    // ── OS-integration tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn add_registers_via_os_scheduler() {
+        with_temp_home(|| {
+            let fake = FakeScheduler::default();
+            let task = make_task("add-test-abc123", true);
+            atomcode_config::schedule::save(&task).unwrap();
+            handle_add_with(&fake, &task).unwrap();
+            assert_eq!(fake.installed(), vec!["add-test-abc123"]);
+            assert!(fake.uninstalled().is_empty());
+        });
+    }
+
+    #[test]
+    fn remove_unregisters_via_os_scheduler() {
+        with_temp_home(|| {
+            let fake = FakeScheduler::default();
+            let task = make_task("rm-test-abc123", true);
+            atomcode_config::schedule::save(&task).unwrap();
+            handle_remove_with(&fake, "rm-test-abc123").unwrap();
+            assert_eq!(fake.uninstalled(), vec!["rm-test-abc123"]);
+            // Task should be gone from the store.
+            assert!(atomcode_config::schedule::load("rm-test-abc123").is_err());
+        });
+    }
+
+    #[test]
+    fn disable_unregisters_via_os_scheduler() {
+        with_temp_home(|| {
+            let fake = FakeScheduler::default();
+            let task = make_task("dis-test-abc123", true);
+            atomcode_config::schedule::save(&task).unwrap();
+            handle_disable_with(&fake, "dis-test-abc123").unwrap();
+            assert_eq!(fake.uninstalled(), vec!["dis-test-abc123"]);
+            // Task should now be stored as disabled.
+            let loaded = atomcode_config::schedule::load("dis-test-abc123").unwrap();
+            assert!(!loaded.enabled);
+        });
+    }
+
+    #[test]
+    fn enable_registers_via_os_scheduler() {
+        with_temp_home(|| {
+            let fake = FakeScheduler::default();
+            let task = make_task("en-test-abc123", false);
+            atomcode_config::schedule::save(&task).unwrap();
+            handle_enable_with(&fake, "en-test-abc123").unwrap();
+            assert_eq!(fake.installed(), vec!["en-test-abc123"]);
+            // Task should now be stored as enabled.
+            let loaded = atomcode_config::schedule::load("en-test-abc123").unwrap();
+            assert!(loaded.enabled);
+        });
+    }
+
+    #[test]
+    fn sync_installs_enabled_and_uninstalls_disabled() {
+        with_temp_home(|| {
+            let fake = FakeScheduler::default();
+            let t_on = make_task("sync-on-abc123", true);
+            let t_off = make_task("sync-off-abc123", false);
+            atomcode_config::schedule::save(&t_on).unwrap();
+            atomcode_config::schedule::save(&t_off).unwrap();
+
+            handle_sync_with(&fake).unwrap();
+
+            assert_eq!(fake.installed(), vec!["sync-on-abc123"]);
+            assert_eq!(fake.uninstalled(), vec!["sync-off-abc123"]);
+        });
     }
 }
