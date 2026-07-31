@@ -1,7 +1,6 @@
 package com.atomcode.jetbrains.services
 
 import com.atomcode.jetbrains.daemon.AtomCodeDaemonClient
-import com.atomcode.jetbrains.daemon.AtomCodeDaemonProcess
 import com.atomcode.jetbrains.daemon.ApprovalMode
 import com.atomcode.jetbrains.daemon.AuthStatusResponse
 import com.atomcode.jetbrains.daemon.ChatEvent
@@ -11,7 +10,6 @@ import com.atomcode.jetbrains.daemon.ConnectionErrorKind
 import com.atomcode.jetbrains.daemon.ConnectionState
 import com.atomcode.jetbrains.daemon.CreateProviderRequest
 import com.atomcode.jetbrains.daemon.DaemonAuth
-import com.atomcode.jetbrains.daemon.HealthResponse
 import com.atomcode.jetbrains.daemon.ImageInput
 import com.atomcode.jetbrains.daemon.MessageInfo
 import com.atomcode.jetbrains.daemon.ModelInfo
@@ -40,12 +38,18 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
-private const val DAEMON_PROBE_TIMEOUT_MS = 3_000
-private const val DAEMON_STARTUP_PROBE_TIMEOUT_MS = 1_000
-private const val DAEMON_STARTUP_WAIT_SECONDS = 15L
-private const val DAEMON_STARTUP_RETRY_DELAY_MS = 150L
 private const val BACKGROUND_HEALTH_INITIAL_DELAY_SECONDS = 5L
 private const val BACKGROUND_HEALTH_INTERVAL_SECONDS = 30L
+
+private data class ProjectConnectionAttempt(
+    val key: DaemonConnectionKey,
+    val future: CompletableFuture<ConnectionState>,
+)
+
+internal fun shouldResetBackgroundConnection(
+    connectedKey: DaemonConnectionKey?,
+    currentKey: DaemonConnectionKey,
+): Boolean = connectedKey != null && connectedKey != currentKey
 
 internal fun providerSetupRequired(
     providers: List<ProviderInfo>,
@@ -124,6 +128,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
     private val changes = PropertyChangeSupport(this)
     private val settingsService = AtomCodeSettingsState.getInstance()
     private val auth = DaemonAuth(AtomCodeTokenFactory.createToken())
+    private val daemonSupervisor = AtomCodeDaemonSupervisor.getInstance()
 
     @Volatile
     var connectionState: ConnectionState = ConnectionState.Idle
@@ -155,13 +160,19 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
     @Volatile
     private var activeClient: AtomCodeDaemonClient? = null
 
+    @Volatile
+    private var activeClientKey: DaemonConnectionKey? = null
+
+    @Volatile
+    private var connectedEndpointKey: DaemonConnectionKey? = null
+
     private val backgroundHealthStarted = AtomicBoolean(false)
     private val backgroundHealthInFlight = AtomicBoolean(false)
 
     @Volatile
     private var backgroundHealthTask: ScheduledFuture<*>? = null
 
-    private val ensureConnectedInFlight = AtomicReference<CompletableFuture<ConnectionState>>()
+    private val ensureConnectedInFlight = AtomicReference<ProjectConnectionAttempt>()
 
     fun addConnectionListener(listener: PropertyChangeListener) {
         changes.addPropertyChangeListener("connectionState", listener)
@@ -189,142 +200,65 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
     }
 
     fun ensureConnected(): CompletableFuture<ConnectionState> {
-        // 已连接则短路，避免多余 HTTP 往返
+        val settings = settingsService.state.copy()
+        val key = DaemonConnectionKey.from(settings)
         val current = connectionState
-        if (current is ConnectionState.Ready) {
+        if (current is ConnectionState.Ready && connectedEndpointKey == key) {
             return CompletableFuture.completedFuture(current)
         }
 
         val existing = ensureConnectedInFlight.get()
-        if (existing != null) return existing
-
-        val future = CompletableFuture<ConnectionState>()
-        if (!ensureConnectedInFlight.compareAndSet(null, future)) {
-            return ensureConnectedInFlight.get()!!
+        if (existing != null) {
+            return if (existing.key == key) {
+                existing.future
+            } else {
+                existing.future.thenCompose { ensureConnected() }
+            }
         }
 
-        return ensureConnectedImpl()
-            .whenComplete { result, error ->
-                future.complete(if (error != null) connectionState else result)
-                // 无论正常/异常/取消都清空缓存（exception + cancel）
-            }
-            .thenCompose { future }
-            .whenComplete { _, _ -> ensureConnectedInFlight.set(null) }
+        val future = CompletableFuture<ConnectionState>()
+        val attempt = ProjectConnectionAttempt(key, future)
+        if (!ensureConnectedInFlight.compareAndSet(null, attempt)) {
+            return ensureConnected()
+        }
+
+        ensureConnectedImpl(settings, key).whenComplete { result, error ->
+            ensureConnectedInFlight.compareAndSet(attempt, null)
+            future.complete(if (error != null) connectionState else result)
+        }
+        return future
     }
 
-    private fun ensureConnectedImpl(): CompletableFuture<ConnectionState> {
+    private fun ensureConnectedImpl(
+        settings: AtomCodeSettings,
+        key: DaemonConnectionKey,
+    ): CompletableFuture<ConnectionState> {
         setConnectionState(ConnectionState.CheckingDaemon)
-        val settings = settingsService.state.copy()
-        val daemonProcess = AtomCodeDaemonProcess(settings)
-
-        // 初始探测用短超时（3s），daemon 本地响应只需 <100ms
-        // 避免 daemon 未运行时等满 30s 才超时
-        val probeClient = AtomCodeDaemonClient(settings.host, settings.port, DAEMON_PROBE_TIMEOUT_MS, auth)
-        val startupProbeClient = AtomCodeDaemonClient(settings.host, settings.port, DAEMON_STARTUP_PROBE_TIMEOUT_MS, auth)
-        val client = AtomCodeDaemonClient(settings.host, settings.port, settings.requestTimeoutMs, auth)
-
-        return probeClient.health()
-            .handle { health, healthError ->
-                if (healthError == null && health.service == "atomcode-daemon") {
-                    setConnectionState(ConnectionState.Connecting)
-                    val expectedVersion = daemonProcess.expectedBundledVersion()
-                    val expectedHash = daemonProcess.expectedBundledHash()
-                    val binaryMismatch = expectedHash != null && health.binaryHash != expectedHash
-                    if (binaryMismatch || (expectedVersion != null && health.version != expectedVersion)) {
-                        setConnectionState(ConnectionState.StartingDaemon)
-                        return@handle restartMismatchedDaemon(
-                            client,
-                            daemonProcess,
-                            health.version,
-                            expectedVersion ?: health.version,
-                        )
-                    }
-                    return@handle CompletableFuture.completedFuture(health.version)
-                }
-
-                if (!settings.autoStart) {
-                    setConnectionState(ConnectionState.SetupRequired("AtomCode daemon is not running."))
-                    return@handle CompletableFuture.completedFuture<String?>(null)
-                }
-
-                setConnectionState(ConnectionState.StartingDaemon)
-                daemonProcess.ensureRunning(auth).thenCompose { started ->
-                    if (!started) {
-                        setConnectionState(ConnectionState.SetupRequired("AtomCode CLI was not found."))
-                        CompletableFuture.completedFuture<String?>(null)
-                    } else {
-                        waitForDaemonReady(startupProbeClient)
-                    }
-                }
-            }
-            .thenCompose { it }
-            .thenCompose { version ->
-                if (version == null) {
-                    CompletableFuture.completedFuture(connectionState)
-                } else {
-                    syncProjectDirectory(client, version)
-                }
+        return daemonSupervisor.ensureReady(settings, auth)
+            .thenCompose { ready ->
+                setConnectionState(ConnectionState.Connecting)
+                val client = newClient(settings)
+                syncProjectDirectory(client, ready.version, key)
             }
             .exceptionally { error ->
-                val errorState = ConnectionState.Error(ConnectionErrorKind.Unknown, error.message ?: "Connection failed")
+                val cause = unwrapConnectionError(error)
+                val errorState = when (cause) {
+                    is DaemonConnectionException -> {
+                        if (cause.kind == ConnectionErrorKind.MissingBinary) {
+                            ConnectionState.SetupRequired(cause.message ?: "AtomCode daemon was not found.")
+                        } else {
+                            ConnectionState.Error(cause.kind, cause.message ?: "Connection failed")
+                        }
+                    }
+                    else -> ConnectionState.Error(
+                        ConnectionErrorKind.Unknown,
+                        cause.message ?: "Connection failed",
+                    )
+                }
+                clearActiveConnection()
                 setConnectionState(errorState)
                 errorState
             }
-    }
-
-    private fun restartMismatchedDaemon(
-        client: AtomCodeDaemonClient,
-        daemonProcess: AtomCodeDaemonProcess,
-        runningVersion: String,
-        expectedVersion: String,
-    ): CompletableFuture<String?> {
-        return client.shutdown()
-            .exceptionally { false }
-            .thenCompose { waitForDaemonStop(client, System.nanoTime() + TimeUnit.SECONDS.toNanos(5)) }
-            .thenCompose { stopped ->
-                if (!stopped) {
-                    val message = "AtomCode daemon version mismatch: running $runningVersion, expected $expectedVersion. Stop the old daemon or change the daemon binary path."
-                    setConnectionState(ConnectionState.Error(ConnectionErrorKind.IncompatibleDaemon, message))
-                    CompletableFuture.completedFuture<String?>(null)
-                } else {
-                    daemonProcess.ensureRunning(auth).thenCompose { started ->
-                        if (!started) {
-                            setConnectionState(ConnectionState.SetupRequired("AtomCode CLI was not found."))
-                            CompletableFuture.completedFuture<String?>(null)
-                        } else {
-                            waitForDaemonReady(client).thenApply { version ->
-                                val healthVersion = version ?: throw IllegalStateException("AtomCode daemon did not become ready after restart.")
-                                if (healthVersion != expectedVersion) {
-                                    throw IllegalStateException("AtomCode daemon restarted with $healthVersion, expected $expectedVersion")
-                                }
-                                healthVersion
-                            }
-                        }
-                    }
-                }
-            }
-    }
-
-    private fun waitForDaemonStop(client: AtomCodeDaemonClient, deadlineNanos: Long): CompletableFuture<Boolean> {
-        return client.health()
-            .handle { _, error -> error != null }
-            .thenCompose { stopped ->
-                if (stopped) {
-                    CompletableFuture.completedFuture(true)
-                } else if (System.nanoTime() >= deadlineNanos) {
-                    CompletableFuture.completedFuture(false)
-                } else {
-                    CompletableFuture.supplyAsync(
-                        { Unit },
-                        CompletableFuture.delayedExecutor(100, TimeUnit.MILLISECONDS),
-                    ).thenCompose { waitForDaemonStop(client, deadlineNanos) }
-                }
-            }
-    }
-
-    private fun waitForDaemonReady(client: AtomCodeDaemonClient): CompletableFuture<String?> {
-        val deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(DAEMON_STARTUP_WAIT_SECONDS)
-        return waitForDaemonHealth(deadlineNanos) { client.health() }
     }
 
     fun sendPrompt(prompt: String): CompletableFuture<Unit> {
@@ -523,60 +457,56 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
             }
         }
 
-    fun loadSetupSnapshot(): CompletableFuture<SetupSnapshot> =
-        ensureConnected().thenCompose { state ->
-            if (state !is ConnectionState.Ready) {
-                CompletableFuture.completedFuture(
-                    SetupSnapshot(
-                        auth = null,
-                        providers = emptyList(),
-                        models = emptyList(),
-                        defaultProvider = "",
-                        currentModel = "",
-                        setupRequired = true,
-                    ),
-                )
-            } else {
-                val client = getOrCreateClient()
-                val authFuture = client.authStatus().exceptionally { null }
-                val providersFuture = client.listProviders().exceptionally { null }
-                val modelsFuture = client.listModels().exceptionally { emptyList() }
+    fun loadSetupSnapshot(): CompletableFuture<SetupSnapshot> {
+        val settings = settingsService.state.copy()
+        val key = DaemonConnectionKey.from(settings)
+        val client = activeClient
+        return if (connectionState is ConnectionState.Ready && connectedEndpointKey == key && client != null) {
+            loadSetupSnapshot(client)
+        } else {
+            CompletableFuture.completedFuture(emptySetupSnapshot())
+        }
+    }
 
-                CompletableFuture.allOf(authFuture, providersFuture, modelsFuture).thenApply {
-                    val auth = authFuture.get()
-                    val providers = providersFuture.get()
-                    val models = modelsFuture.get()
-                    val defaultProvider = providers?.defaultProvider.orEmpty()
-                    val currentModel = providers?.providers?.firstOrNull { it.isDefault }?.model
-                        ?: models.firstOrNull { it.isDefault }?.model
-                        ?: ""
-                    SetupSnapshot(
-                        auth = auth,
-                        providers = providers?.providers.orEmpty(),
-                        models = models,
-                        defaultProvider = defaultProvider,
-                        currentModel = currentModel,
-                        setupRequired = providerSetupRequired(
-                            providers = providers?.providers.orEmpty(),
-                            defaultProvider = defaultProvider,
-                            auth = auth,
-                        ),
-                    )
-                }
+    private fun loadSetupSnapshot(client: AtomCodeDaemonClient): CompletableFuture<SetupSnapshot> {
+        val authFuture = client.authStatus().exceptionally { null }
+        val providersFuture = client.listProviders().exceptionally { null }
+        val modelsFuture = client.listModels().exceptionally { emptyList() }
+
+        return CompletableFuture.allOf(authFuture, providersFuture, modelsFuture).thenApply {
+            val auth = authFuture.get()
+            val providers = providersFuture.get()
+            val models = modelsFuture.get()
+            val defaultProvider = providers?.defaultProvider.orEmpty()
+            val currentModel = providers?.providers?.firstOrNull { it.isDefault }?.model
+                ?: models.firstOrNull { it.isDefault }?.model
+                ?: ""
+            SetupSnapshot(
+                auth = auth,
+                providers = providers?.providers.orEmpty(),
+                models = models,
+                defaultProvider = defaultProvider,
+                currentModel = currentModel,
+                setupRequired = providerSetupRequired(
+                    providers = providers?.providers.orEmpty(),
+                    defaultProvider = defaultProvider,
+                    auth = auth,
+                ),
+            )
+        }
+    }
+
+    fun loginWithBrowser(onStatus: (String) -> Unit): CompletableFuture<SetupSnapshot> {
+        val settings = settingsService.state.copy()
+        return daemonSupervisor.ensureReady(settings, auth).thenCompose {
+            val client = newClient(settings)
+            AtomCodeLoginCoordinator.getInstance().login(client, onStatus).thenCompose {
+                loadSetupSnapshot(client)
+            }.whenComplete { _, error ->
+                if (error == null) ensureConnected()
             }
         }
-
-    fun loginWithBrowser(onStatus: (String) -> Unit): CompletableFuture<SetupSnapshot> =
-        ensureConnected().thenCompose { state ->
-            if (state !is ConnectionState.Ready) {
-                CompletableFuture.failedFuture(IllegalStateException("AtomCode is not connected."))
-            } else {
-                val client = getOrCreateClient()
-                AtomCodeLoginCoordinator.getInstance().login(client, onStatus).thenCompose {
-                    loadSetupSnapshot()
-                }
-            }
-        }
+    }
 
     fun setDefaultModel(model: ModelInfo): CompletableFuture<SetupSnapshot> {
         val client = getOrCreateClient()
@@ -633,6 +563,18 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
         if (connectionState.isConnecting()) return
         if (!backgroundHealthInFlight.compareAndSet(false, true)) return
 
+        val settings = settingsService.state.copy()
+        val key = DaemonConnectionKey.from(settings)
+        if (shouldResetBackgroundConnection(connectedEndpointKey, key)) {
+            clearActiveConnection()
+            setConnectionState(ConnectionState.Idle)
+            if (settings.autoStart) {
+                backgroundHealthInFlight.set(false)
+                ensureConnected()
+                return
+            }
+        }
+
         val client = getOrCreateClient()
         client.health()
             .thenCompose { health ->
@@ -641,22 +583,27 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
                 } else if (connectionState is ConnectionState.Ready) {
                     CompletableFuture.completedFuture(connectionState)
                 } else {
-                    syncProjectDirectory(client, health.version)
+                    syncProjectDirectory(client, health.version, key)
                 }
             }
             .whenComplete { _, error ->
                 backgroundHealthInFlight.set(false)
                 if (error != null && !connectionState.isConnecting()) {
-                    activeClient = null
+                    clearActiveConnection()
                     setConnectionState(ConnectionState.SetupRequired("AtomCode daemon is not running."))
+                    if (settings.autoStart) ensureConnected()
                 }
             }
     }
 
-    private fun syncProjectDirectory(client: AtomCodeDaemonClient, version: String): CompletableFuture<ConnectionState> {
+    private fun syncProjectDirectory(
+        client: AtomCodeDaemonClient,
+        version: String,
+        key: DaemonConnectionKey,
+    ): CompletableFuture<ConnectionState> {
         val basePath = project.basePath
         if (basePath.isNullOrBlank()) {
-            activeClient = client
+            activateClient(client, key)
             return refreshApprovalMode(client).thenApply {
                 setConnectionState(ConnectionState.Ready(version, ""))
                 connectionState
@@ -669,7 +616,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
                 if (!response.success) {
                     throw IllegalStateException("AtomCode daemon rejected project directory: ${response.message}")
                 }
-                activeClient = client
+                activateClient(client, key)
                 setConnectionState(ConnectionState.CheckingProvider)
                 response.currentDir
             }
@@ -751,13 +698,31 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
         AtomCodeDaemonClient(settings.host, settings.port, settings.requestTimeoutMs, auth)
 
     private fun getOrCreateClient(): AtomCodeDaemonClient {
-        activeClient?.let { return it }
+        val settings = settingsService.state.copy()
+        val key = DaemonConnectionKey.from(settings)
+        activeClient?.takeIf { activeClientKey == key }?.let { return it }
         synchronized(this) {
-            activeClient?.let { return it }
-            val settings = settingsService.state.copy()
+            activeClient?.takeIf { activeClientKey == key }?.let { return it }
             val client = newClient(settings)
             activeClient = client
+            activeClientKey = key
             return client
+        }
+    }
+
+    private fun activateClient(client: AtomCodeDaemonClient, key: DaemonConnectionKey) {
+        synchronized(this) {
+            activeClient = client
+            activeClientKey = key
+            connectedEndpointKey = key
+        }
+    }
+
+    private fun clearActiveConnection() {
+        synchronized(this) {
+            activeClient = null
+            activeClientKey = null
+            connectedEndpointKey = null
         }
     }
 
@@ -775,7 +740,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
         changes.propertyChangeListeners.forEach {
             changes.removePropertyChangeListener(it)
         }
-        activeClient = null
+        clearActiveConnection()
     }
 
     companion object {
@@ -791,27 +756,25 @@ private fun ConnectionState.isConnecting(): Boolean =
         this == ConnectionState.SyncingProject ||
         this == ConnectionState.CheckingProvider
 
-internal fun waitForDaemonHealth(
-    deadlineNanos: Long,
-    retryDelayMs: Long = DAEMON_STARTUP_RETRY_DELAY_MS,
-    health: () -> CompletableFuture<HealthResponse>,
-): CompletableFuture<String?> =
-    health()
-        .handle { response, error ->
-            if (error == null && response.service == "atomcode-daemon") response.version else null
-        }
-        .thenCompose { version ->
-            if (version != null) {
-                CompletableFuture.completedFuture(version)
-            } else if (System.nanoTime() >= deadlineNanos) {
-                CompletableFuture.completedFuture(null)
-            } else {
-                CompletableFuture.supplyAsync(
-                    { Unit },
-                    CompletableFuture.delayedExecutor(retryDelayMs, TimeUnit.MILLISECONDS),
-                ).thenCompose { waitForDaemonHealth(deadlineNanos, retryDelayMs, health) }
-            }
-        }
+private fun emptySetupSnapshot(): SetupSnapshot = SetupSnapshot(
+    auth = null,
+    providers = emptyList(),
+    models = emptyList(),
+    defaultProvider = "",
+    currentModel = "",
+    setupRequired = true,
+)
+
+private fun unwrapConnectionError(error: Throwable): Throwable {
+    var current = error
+    while (
+        (current is java.util.concurrent.CompletionException ||
+            current is java.util.concurrent.ExecutionException) && current.cause != null
+    ) {
+        current = requireNotNull(current.cause)
+    }
+    return current
+}
 
 data class SessionRefView(
     val id: String,

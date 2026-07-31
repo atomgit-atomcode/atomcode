@@ -1,6 +1,13 @@
 package com.atomcode.jetbrains.daemon
 
 import com.atomcode.jetbrains.settings.AtomCodeSettings
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -88,6 +95,27 @@ class AtomCodeDaemonProcessTest {
         assertEquals("UTF-8", env["LC_CTYPE"])
     }
 
+    @Test
+    fun processExitRemainsObservableWhenStderrReadFails() {
+        val exit = JvmManagedDaemonProcess(BrokenStderrProcess()).onExit().get(1, TimeUnit.SECONDS)
+
+        assertEquals(7, exit.exitCode)
+        assertEquals("", exit.stderr)
+    }
+
     private fun isWindows(): Boolean =
         System.getProperty("os.name").lowercase().contains("win")
+}
+
+private class BrokenStderrProcess : Process() {
+    override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
+    override fun getInputStream(): InputStream = ByteArrayInputStream(byteArrayOf())
+    override fun getErrorStream(): InputStream = object : InputStream() {
+        override fun read(): Int = throw IOException("stderr pipe closed")
+    }
+    override fun waitFor(): Int = 7
+    override fun exitValue(): Int = 7
+    override fun destroy() = Unit
+    override fun isAlive(): Boolean = false
+    override fun onExit(): CompletableFuture<Process> = CompletableFuture.completedFuture(this)
 }

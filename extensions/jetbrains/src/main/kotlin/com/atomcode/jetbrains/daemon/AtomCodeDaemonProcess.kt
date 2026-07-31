@@ -10,14 +10,34 @@ import java.util.HexFormat
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 
-class AtomCodeDaemonProcess(
+private const val MAX_DAEMON_STDERR_CHARS = 8_192
+
+internal data class DaemonProcessExit(
+    val exitCode: Int,
+    val stderr: String,
+)
+
+internal interface ManagedDaemonProcess {
+    fun isAlive(): Boolean
+    fun onExit(): CompletableFuture<DaemonProcessExit>
+    fun destroy()
+}
+
+internal sealed interface DaemonLaunchResult {
+    data object MissingBinary : DaemonLaunchResult
+    data class Started(val process: ManagedDaemonProcess) : DaemonLaunchResult
+    data class Failed(val message: String) : DaemonLaunchResult
+}
+
+internal interface DaemonProcessLauncher {
+    fun expectedVersion(): String?
+    fun expectedHash(): String?
+    fun start(): CompletableFuture<DaemonLaunchResult>
+}
+
+internal class AtomCodeDaemonProcess(
     private val settings: AtomCodeSettings,
-) {
-    private val processLock = Any()
-
-    @Volatile
-    private var ownedProcess: Process? = null
-
+) : DaemonProcessLauncher {
     fun locateBinary(): BinaryResolution? {
         configuredBinary()?.let { return it }
         bundledDaemon()?.let { return BinaryResolution(it.toString(), emptyList()) }
@@ -61,48 +81,29 @@ class AtomCodeDaemonProcess(
         }
     }
 
-    fun ensureRunning(auth: DaemonAuth): CompletableFuture<Boolean> =
+    override fun expectedVersion(): String? = expectedBundledVersion()
+
+    override fun expectedHash(): String? = expectedBundledHash()
+
+    override fun start(): CompletableFuture<DaemonLaunchResult> =
         CompletableFuture.supplyAsync {
-            val binary = locateBinary() ?: return@supplyAsync false
+            val binary = locateBinary() ?: return@supplyAsync DaemonLaunchResult.MissingBinary
             val args = mutableListOf<String>()
             args += binary.path
             args += binary.argsPrefix
             args += listOf("--port", settings.port.toString(), "--client", "jetbrains")
 
-            val builder = ProcessBuilder(args)
-                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
-                .redirectError(ProcessBuilder.Redirect.DISCARD)
-            normalizeDaemonEnvForUtf8Locale(builder.environment())
-            val process = builder.start()
-            synchronized(processLock) {
-                ownedProcess?.takeIf { it.isAlive }?.let {
-                    it.destroy()
-                    it.waitFor(2, TimeUnit.SECONDS)
-                }
-                ownedProcess = process
+            try {
+                val builder = ProcessBuilder(args)
+                    .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                    .redirectError(ProcessBuilder.Redirect.PIPE)
+                normalizeDaemonEnvForUtf8Locale(builder.environment())
+                val process = builder.start()
+                DaemonLaunchResult.Started(JvmManagedDaemonProcess(process))
+            } catch (error: Exception) {
+                DaemonLaunchResult.Failed(error.message ?: error.javaClass.simpleName)
             }
-            true
         }
-
-    fun restartOwnedDaemon(auth: DaemonAuth): CompletableFuture<Boolean> =
-        CompletableFuture.supplyAsync {
-            synchronized(processLock) {
-                ownedProcess?.let {
-                    if (it.isAlive) {
-                        it.destroy()
-                        if (!it.waitFor(2, TimeUnit.SECONDS)) {
-                            it.destroyForcibly()
-                        }
-                    }
-                }
-                ownedProcess = null
-            }
-            ensureRunning(auth).get(10, TimeUnit.SECONDS)
-        }
-
-    fun isOwnedProcess(): Boolean = synchronized(processLock) {
-        ownedProcess?.isAlive == true
-    }
 
     private fun configuredBinary(): BinaryResolution? {
         val raw = settings.daemonBinaryPath.trim()
@@ -201,6 +202,38 @@ class AtomCodeDaemonProcess(
             path
         }
         return Path.of(expanded)
+    }
+}
+
+internal class JvmManagedDaemonProcess(
+    private val process: Process,
+) : ManagedDaemonProcess {
+    private val stderr = CompletableFuture.supplyAsync {
+        process.errorStream.bufferedReader().use { reader ->
+            val tail = StringBuilder()
+            val buffer = CharArray(1_024)
+            while (true) {
+                val count = reader.read(buffer)
+                if (count < 0) break
+                val overflow = tail.length + count - MAX_DAEMON_STDERR_CHARS
+                if (overflow > 0) tail.delete(0, overflow.coerceAtMost(tail.length))
+                tail.append(buffer, 0, count)
+            }
+            tail.toString()
+        }
+    }.handle { diagnostic, _ -> diagnostic.orEmpty() }
+    private val exit = process.onExit().thenCombine(stderr) { exited, diagnostic ->
+        DaemonProcessExit(exited.exitValue(), diagnostic.trim())
+    }
+
+    override fun isAlive(): Boolean = process.isAlive
+
+    override fun onExit(): CompletableFuture<DaemonProcessExit> = exit
+
+    override fun destroy() {
+        if (!process.isAlive) return
+        process.destroy()
+        if (!process.waitFor(2, TimeUnit.SECONDS)) process.destroyForcibly()
     }
 }
 
