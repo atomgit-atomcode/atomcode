@@ -460,6 +460,9 @@ mod tests {
         // Use a dedicated tempdir so this test is isolated from any other
         // schedule tests running concurrently under the same binary.
         let tmp = tempfile::tempdir().unwrap();
+        // Save and restore ATOMCODE_HOME so any pre-existing value set by a
+        // per-process ctor (or another test) is not permanently discarded.
+        let prev = std::env::var("ATOMCODE_HOME").ok();
         std::env::set_var("ATOMCODE_HOME", tmp.path());
 
         let t = build_task(
@@ -475,10 +478,10 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].title, "Brief");
 
-        // Restore the shared isolation home so subsequent tests are not affected.
-        // The #[ctor] sets it to a per-process temp dir; we can't easily recover
-        // the exact original value, but the shared home is empty and clean for
-        // schedule purposes because we write to a subdirectory keyed by task id.
-        std::env::remove_var("ATOMCODE_HOME");
+        // Restore the previous value (or remove the var if it was absent).
+        match prev {
+            Some(v) => std::env::set_var("ATOMCODE_HOME", v),
+            None => std::env::remove_var("ATOMCODE_HOME"),
+        }
     }
 }
