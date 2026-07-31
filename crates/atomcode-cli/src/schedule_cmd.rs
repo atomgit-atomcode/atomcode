@@ -484,14 +484,17 @@ async fn run_task(id: &str) -> Result<i32> {
         return Ok(1);
     }
 
-    // 5. Build runtime config.  auto → skip_permissions; plan/accept_edits → false.
+    // 5. Build runtime config.
+    //    Scheduled tasks never do a full bypass (dangerously_skip_permissions=false).
+    //    The strict_unattended approver in run_native_headless blocks any dangerous/
+    //    out-of-workspace bash regardless of permission_mode — no human is present.
     let mode = mode_from_str(&task.permission_mode);
     let runtime_cfg = crate::runtime_config_from(
         &config,
         &cwd,
         None,
         None, // no per-task telemetry arc needed
-        mode.is_auto(),
+        false, // dangerously_skip_permissions=false — scheduled: never full bypass
         false, // headless: fail-closed approval timeout
     );
 
@@ -517,15 +520,20 @@ async fn run_task(id: &str) -> Result<i32> {
         });
     }
 
-    // 8. For non-auto modes, set the runtime mode explicitly after spawn.
-    //    (auto was already set inside spawn_native_cli_runtime via dangerously_skip_permissions.)
-    if !mode.is_auto() {
-        runtime
-            .handle
-            .set_mode(mode)
-            .await
-            .map_err(anyhow::Error::new)?;
-    }
+    // 8. Set the runtime mode after spawn.
+    //    Scheduled tasks cap Auto at AcceptEdits so the middleware layer does not
+    //    blanket-approve dangerous bash — the strict approver in run_native_headless
+    //    provides the second safety net.  Plan and AcceptEdits pass through unchanged.
+    let effective_mode = if mode == atomcode_coding::RuntimeMode::Auto {
+        atomcode_coding::RuntimeMode::AcceptEdits
+    } else {
+        mode
+    };
+    runtime
+        .handle
+        .set_mode(effective_mode)
+        .await
+        .map_err(anyhow::Error::new)?;
 
     // 9. Build notification config.
     //    "off" → disabled config; anything else → use the user's config.
@@ -538,7 +546,11 @@ async fn run_task(id: &str) -> Result<i32> {
         config.notifications.clone()
     };
 
-    // 10. Run headless.
+    // 10. Run headless with strict unattended approver.
+    //    skip_permissions=false: scheduled tasks never do full bypass.
+    //    strict_unattended=true: any tool escalated to approval is denied — no human
+    //    is available to vet destructive or out-of-workspace commands.
+    //    auto permission_mode is equivalent to accept-edits + strict bash gating.
     let (exit_code, _captured) = crate::run_native_headless(
         notifications_cfg,
         runtime,
@@ -547,8 +559,9 @@ async fn run_task(id: &str) -> Result<i32> {
         false,
         false,
         cwd.clone(),
-        mode.is_auto(),
-        false,
+        false,          // skip_permissions=false — never bypass for scheduled runs
+        false,          // is_admin=false
+        true,           // strict_unattended=true — deny risky/out-of-workspace bash
     )
     .await?;
 
@@ -618,6 +631,18 @@ mod tests {
     use super::*;
 
     // ── Pure-function tests (no I/O, no env) ──────────────────────────────────
+
+    #[test]
+    fn strict_unattended_denies_escalated_bash() {
+        // Normal -p: bash escalated to approval → allow (current behaviour).
+        assert!(crate::headless_auto_approve(false, false, "bash"));
+        // scheduled (strict): bash escalated to approval (= dangerous/out-of-workspace) → deny.
+        assert!(!crate::headless_auto_approve(true, false, "bash"));
+        // scheduled (strict): non-bash tool needs approval → deny (no human present).
+        assert!(!crate::headless_auto_approve(true, false, "edit_file"));
+        // strict + skip_permissions still denies (scheduled never skips, but defensive).
+        assert!(!crate::headless_auto_approve(true, true, "bash"));
+    }
 
     #[test]
     fn permission_mode_str_maps_to_runtime_mode() {

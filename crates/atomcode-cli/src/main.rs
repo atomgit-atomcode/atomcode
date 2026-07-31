@@ -1863,6 +1863,7 @@ async fn run() -> Result<i32> {
                 working_dir.clone(),
                 cli.dangerously_skip_permissions,
                 is_admin,
+                false, // strict_unattended=false: preserve -p behaviour exactly
             )
             .await
             {
@@ -2364,6 +2365,24 @@ fn should_fork_busy_continue(
         )
 }
 
+/// Decide whether to auto-approve a headless approval request.
+///
+/// A request only reaches this point when a gate (BashWorkspaceGate /
+/// ApprovalMiddleware) already escalated the tool call — i.e. it is NOT
+/// trivially safe.  `-p` (skip_permissions) blanket-approves bash; scheduled
+/// runs (strict_unattended=true) refuse everything because no human is present
+/// to vet a destructive or out-of-workspace command.
+pub(crate) fn headless_auto_approve(
+    strict_unattended: bool,
+    skip_permissions: bool,
+    tool: &str,
+) -> bool {
+    if strict_unattended {
+        return false; // scheduled: deny everything that was escalated to approval
+    }
+    skip_permissions || tool == "bash" // -p: current behaviour unchanged
+}
+
 pub(crate) async fn run_native_headless(
     notifications_cfg: atomcode_config::config::NotificationConfig,
     runtime: atomcode_coding::CodingRuntime,
@@ -2374,6 +2393,7 @@ pub(crate) async fn run_native_headless(
     working_dir: PathBuf,
     skip_permissions: bool,
     is_admin: bool,
+    strict_unattended: bool,
 ) -> Result<(i32, Option<String>)> {
     use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
     use atomcode_coding::{CodingRuntimeEvent, TurnCompletion, UserInput};
@@ -2528,7 +2548,11 @@ pub(crate) async fn run_native_headless(
                     serde_json::from_value::<ApprovalRequest>(request.payload)
                         .ok()
                         .map(|approval| {
-                            if skip_permissions || approval.tool == "bash" {
+                            if headless_auto_approve(
+                                strict_unattended,
+                                skip_permissions,
+                                &approval.tool,
+                            ) {
                                 eprintln!("[headless] auto-approved {}", approval.tool);
                                 ApprovalResponse::allow()
                             } else {
