@@ -399,6 +399,14 @@ const LIST_HEADER_ROWS: usize = 4;
 /// Virtual last row on the 账号 tab: "+ 添加自定义 provider". Not a real id, so it
 /// never collides with an account; selecting it opens the add-account form.
 const ADD_PROVIDER_ROW: &str = "\u{1}add-provider";
+const ADD_MODEL_ROW: &str = "\u{1}add-model";
+
+fn is_add_shortcut(code: &KeyCode, mods: KeyModifiers) -> bool {
+    matches!(
+        code,
+        KeyCode::Char('a' | 'A') if mods.contains(KeyModifiers::CONTROL)
+    ) || matches!(code, KeyCode::Char('\u{1}'))
+}
 
 impl ProviderPanel {
     /// Apply a single-line paste to the field currently being edited.
@@ -603,19 +611,34 @@ impl ProviderPanel {
         }
     }
 
-    /// Selectable row count, including the trailing "+ add provider" row on the
-    /// 账号 tab.
+    /// Selectable row count, including the trailing add row on both tabs.
     fn current_len(&self, config: &Config) -> usize {
-        self.filtered_ids(config).len() + usize::from(self.tab == Tab::Accounts)
+        self.filtered_ids(config).len() + 1
     }
 
     fn selected_id(&self, config: &Config) -> Option<String> {
         let ids = self.filtered_ids(config);
-        // The virtual add row sits just past the real accounts on the 账号 tab.
-        if self.tab == Tab::Accounts && self.selected == ids.len() {
-            return Some(ADD_PROVIDER_ROW.to_string());
+        // The virtual add row sits just past the real rows on either tab.
+        if self.selected == ids.len() {
+            return Some(
+                match self.tab {
+                    Tab::Accounts => ADD_PROVIDER_ROW,
+                    Tab::Models => ADD_MODEL_ROW,
+                }
+                .to_string(),
+            );
         }
         ids.get(self.selected).cloned()
+    }
+
+    fn begin_add_for_current_tab(&mut self, config: &Config) {
+        self.pending_delete = None;
+        self.mode = match self.tab {
+            Tab::Accounts => Mode::Add(AddForm::new()),
+            Tab::Models => ModelForm::new_add(config, self.account_filter.as_deref())
+                .map(Mode::Model)
+                .unwrap_or_else(|| Mode::Add(AddForm::new())),
+        };
     }
 
     /// Persist the add form as one provider ACCOUNT (no model — models are added
@@ -1141,28 +1164,15 @@ impl Modal for ProviderPanel {
                 self.pending_delete = None;
             }
             // Ctrl+A: add. Letter keys are reserved for the search filter.
-            KeyCode::Char('a') if ctrl => {
-                self.pending_delete = None;
-                match self.tab {
-                    // New account (+ its first model).
-                    Tab::Accounts => self.mode = Mode::Add(AddForm::new()),
-                    // Add a model to an existing account; if none exist yet, fall
-                    // back to creating an account first.
-                    Tab::Models => {
-                        self.mode =
-                            match ModelForm::new_add(&ctx.config, self.account_filter.as_deref()) {
-                                Some(f) => Mode::Model(f),
-                                None => Mode::Add(AddForm::new()),
-                            };
-                    }
-                }
+            code if is_add_shortcut(&code, mods) => {
+                self.begin_add_for_current_tab(&ctx.config);
             }
             // Ctrl+E: edit the selected row.
             KeyCode::Char('e') if ctrl => {
                 self.pending_delete = None;
                 if let Some(id) = self
                     .selected_id(&ctx.config)
-                    .filter(|i| i != ADD_PROVIDER_ROW)
+                    .filter(|i| i != ADD_PROVIDER_ROW && i != ADD_MODEL_ROW)
                 {
                     self.mode = match self.tab {
                         Tab::Accounts => Mode::EditAccount(Self::open_edit(&ctx.config, &id)),
@@ -1178,7 +1188,7 @@ impl Modal for ProviderPanel {
             KeyCode::Char('d') if ctrl => {
                 if let Some(id) = self
                     .selected_id(&ctx.config)
-                    .filter(|i| i != ADD_PROVIDER_ROW)
+                    .filter(|i| i != ADD_PROVIDER_ROW && i != ADD_MODEL_ROW)
                 {
                     let is_account = self.tab == Tab::Accounts;
                     let is_virtual_preset =
@@ -1215,6 +1225,9 @@ impl Modal for ProviderPanel {
                 if let Some(id) = self.selected_id(&ctx.config) {
                     match self.tab {
                         // Set default + switch session.
+                        Tab::Models if id == ADD_MODEL_ROW => {
+                            self.begin_add_for_current_tab(&ctx.config);
+                        }
                         Tab::Models => {
                             if set_default_provider_and_reload(ctx, &id, renderer) {
                                 return Ok(ModalAction::Close);
@@ -1310,14 +1323,16 @@ impl Modal for ProviderPanel {
                     }
                     Tab::Models => {
                         let ids = self.filtered_ids(&ctx.config);
-                        if ids.is_empty() {
+                        let empty_description = if ids.is_empty() {
                             let msg = if self.query.trim().is_empty() {
                                 crate::i18n::t(crate::i18n::Msg::ProviderPanelEmptyModels)
                             } else {
                                 crate::i18n::t(crate::i18n::Msg::ProviderPanelNoMatchingModels)
                             };
-                            items.push((msg.into_owned(), String::new()));
-                        }
+                            msg.into_owned()
+                        } else {
+                            String::new()
+                        };
                         for id in &ids {
                             let m = models.get(id);
                             let mark = if *id == cur {
@@ -1336,6 +1351,10 @@ impl Modal for ProviderPanel {
                                 .unwrap_or_default();
                             items.push((id.clone(), desc));
                         }
+                        items.push((
+                            crate::i18n::t(crate::i18n::Msg::ProviderPanelAddModelRow).into_owned(),
+                            empty_description,
+                        ));
                         hint = if let Some(acct) = &self.account_filter {
                             crate::i18n::t(crate::i18n::Msg::ProviderPanelFilteredModelsHint {
                                 account: acct,
@@ -1565,6 +1584,57 @@ impl Modal for ProviderPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_shortcut_accepts_terminal_ctrl_a_variants() {
+        assert!(is_add_shortcut(&KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(is_add_shortcut(&KeyCode::Char('A'), KeyModifiers::CONTROL));
+        assert!(is_add_shortcut(&KeyCode::Char('\u{1}'), KeyModifiers::NONE));
+        assert!(!is_add_shortcut(&KeyCode::Char('a'), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn both_provider_tabs_expose_a_selectable_add_row() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "acc": { "provider": "deepseek" } },
+            "models": { "acc/chat": { "account": "acc", "model": "chat", "context_window": 8000 } }
+        }))
+        .unwrap();
+        let mut panel = ProviderPanel::open();
+
+        let account_rows = panel.filtered_ids(&cfg).len();
+        assert_eq!(panel.current_len(&cfg), account_rows + 1);
+        panel.selected = account_rows;
+        assert_eq!(panel.selected_id(&cfg).as_deref(), Some(ADD_PROVIDER_ROW));
+
+        panel.tab = Tab::Models;
+        panel.selected = panel.filtered_ids(&cfg).len();
+        assert_eq!(panel.current_len(&cfg), 2);
+        assert_eq!(panel.selected_id(&cfg).as_deref(), Some(ADD_MODEL_ROW));
+
+        panel.query = "no-match".into();
+        panel.selected = 0;
+        assert_eq!(panel.current_len(&cfg), 1);
+        assert_eq!(panel.selected_id(&cfg).as_deref(), Some(ADD_MODEL_ROW));
+    }
+
+    #[test]
+    fn model_add_row_opens_the_model_form_for_the_drilled_in_account() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "acc": { "provider": "deepseek" } }
+        }))
+        .unwrap();
+        let mut panel = ProviderPanel::open();
+        panel.tab = Tab::Models;
+        panel.account_filter = Some("acc".into());
+
+        panel.begin_add_for_current_tab(&cfg);
+
+        let Mode::Model(form) = &panel.mode else {
+            panic!("model add row should open the model form");
+        };
+        assert_eq!(form.account_id(), "acc");
+    }
 
     #[test]
     fn add_form_is_custom_provider_with_protocol_toggle() {

@@ -370,6 +370,7 @@ pub enum Msg<'a> {
     ProviderPanelModelCount {
         count: usize,
     },
+    ProviderPanelAddModelRow,
     ProviderPanelAccountsHint,
     ProviderPanelModelsHint,
     ProviderPanelFilteredModelsHint {
