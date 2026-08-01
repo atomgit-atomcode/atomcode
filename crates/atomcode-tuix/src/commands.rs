@@ -218,6 +218,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "save",    desc: "Save the current conversation to a markdown file (/save, /save [filename])", needs_args: false, hidden: false },
     Command { name: "view",    desc: "View file content in an overlay modal", needs_args: true, hidden: false },
     Command { name: "todo",    desc: "Show the todo list; /todo add <task> appends one, /todo clear wipes it", needs_args: false, hidden: false },
+    Command { name: "schedule", desc: "List scheduled tasks and next run times", needs_args: false, hidden: false },
     Command { name: "desktop", desc: "Open the AtomCode desktop app (or show the download link)", needs_args: false, hidden: false },
 ];
 
@@ -283,6 +284,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "proxy" => Msg::CmdDescProxy,
         "todo" => Msg::CmdDescTodo,
         "loop" => Msg::CmdDescLoop,
+        "schedule" => Msg::CmdDescSchedule,
         "desktop" => Msg::CmdDescDesktop,
         _ => return None,
     };

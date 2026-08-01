@@ -1898,6 +1898,20 @@ fn execute_slash_command_impl(
                 renderer.flush();
             }
         }
+        "schedule" => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let tasks = atomcode_config::schedule::list();
+            let text = build_schedule_list_text(&tasks, now);
+            if matches!(state.phase, crate::state::UiPhase::Streaming) {
+                state.footer_command_output = Some(text);
+            } else {
+                renderer.render(UiLine::CommandOutput(text));
+                renderer.flush();
+            }
+        }
         "context" => {
             // `/context` = breakdown only.
             // `/context prompt` = breakdown + full assembled system prompt
@@ -5236,6 +5250,88 @@ mod cost_session_location_tests {
             manager.root(),
             atomcode_capabilities::session::SessionManager::sessions_root().join(bucket)
         );
+    }
+}
+
+/// `/schedule` list text (pure function, easy to test).
+/// Empty → usage hint; otherwise one line per task: id | title | next | last | enabled.
+pub(crate) fn build_schedule_list_text(
+    tasks: &[atomcode_config::schedule::ScheduleTask],
+    now: i64,
+) -> String {
+    if tasks.is_empty() {
+        return "  No scheduled tasks. Use `atomcode schedule add` to create one.\n".to_string();
+    }
+    let mut out = String::from("  Scheduled tasks:\n\n");
+    for t in tasks {
+        let next = atomcode_config::schedule::next_run(&t.schedule, now)
+            .map(|ts| format!("{ts}"))
+            .unwrap_or_else(|| "-".to_string());
+        let en = if t.enabled { "on" } else { "off" };
+        out.push_str(&format!(
+            "  {} | {} | next:{} | last:{} | {}\n",
+            t.id,
+            t.title,
+            next,
+            t.last_status.as_deref().unwrap_or("-"),
+            en
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+mod schedule_list_text_tests {
+    use super::build_schedule_list_text;
+    use atomcode_config::schedule::{Schedule, ScheduleTask};
+
+    fn make_task(id: &str, title: &str, enabled: bool, last_status: Option<&str>) -> ScheduleTask {
+        ScheduleTask {
+            id: id.to_string(),
+            title: title.to_string(),
+            prompt: "do something".to_string(),
+            cwd: "/tmp".to_string(),
+            schedule: Schedule::Daily { time: "09:00".to_string() },
+            permission_mode: "plan".to_string(),
+            notify: "important".to_string(),
+            enabled,
+            created_at: 0,
+            last_run_at: None,
+            last_status: last_status.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn empty_list_shows_hint() {
+        let out = build_schedule_list_text(&[], 0);
+        assert!(
+            out.contains("No scheduled tasks"),
+            "empty list should mention No scheduled tasks, got: {out}"
+        );
+        assert!(
+            out.contains("atomcode schedule add"),
+            "empty list should mention add command, got: {out}"
+        );
+    }
+
+    #[test]
+    fn two_tasks_shown_in_order_with_id_title_enabled() {
+        let tasks = vec![
+            make_task("task-1", "Daily brief", true, Some("ok")),
+            make_task("task-2", "Weekly report", false, None),
+        ];
+        let now = 1785657600_i64; // 2026-07-31 08:00 UTC
+        let out = build_schedule_list_text(&tasks, now);
+        assert!(out.contains("task-1"), "should contain first task id");
+        assert!(out.contains("Daily brief"), "should contain first task title");
+        assert!(out.contains("on"), "enabled task should show 'on'");
+        assert!(out.contains("task-2"), "should contain second task id");
+        assert!(out.contains("Weekly report"), "should contain second task title");
+        assert!(out.contains("off"), "disabled task should show 'off'");
+        // Order: task-1 line comes before task-2 line
+        let pos1 = out.find("task-1").unwrap();
+        let pos2 = out.find("task-2").unwrap();
+        assert!(pos1 < pos2, "task-1 should appear before task-2");
     }
 }
 

@@ -13204,7 +13204,7 @@ fn streaming_executable_slash(line: &str) -> Option<(String, String)> {
     //   streaming redraws would paint over that overlay.
     if matches!(
         cmd.to_ascii_lowercase().as_str(),
-        "status" | "cost" | "diff" | "usage"
+        "status" | "cost" | "diff" | "usage" | "schedule"
     ) && arg.trim().is_empty()
     {
         return Some((cmd.to_ascii_lowercase(), String::new()));

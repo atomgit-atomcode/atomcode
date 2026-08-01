@@ -1257,6 +1257,8 @@ pub enum Msg<'a> {
     CmdDescProxy,
     /// Description for the `/todo` slash command — reprint the current task list.
     CmdDescTodo,
+    /// Description for the `/schedule` slash command — list local scheduled tasks.
+    CmdDescSchedule,
     /// Description for the `/desktop` slash command.
     CmdDescDesktop,
     /// `/desktop` — launching the found app (`name` = app, `path` = its location).
