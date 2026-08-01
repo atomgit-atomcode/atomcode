@@ -386,7 +386,7 @@ pub async fn ensure_headless_runtime(
     }
     let provider_fingerprint = provider_fingerprint(&config, &provider_name)?;
     let runtime_config: CodingRuntimeConfig =
-        crate::live_api::chat_runtime_config(&config, &provider_name, &working_dir, telemetry);
+        crate::live_api::live_runtime_config(&config, &provider_name, &working_dir, telemetry);
     let (session_mode, initial_snapshot) = match requested_session_id {
         Some(id) => {
             let snapshot = load_snapshot(&working_dir, &id)?;

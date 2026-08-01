@@ -7171,6 +7171,7 @@ mod tests {
         CodingRuntimeStart {
             agent: CodingAgentConfig::new("key", "https://example.test/v1", "test", "."),
             prepare: PrepareOptions {
+                request_user_input: true,
                 session: crate::SessionMode::Disabled,
                 skill_dirs: Some(Vec::new()),
                 plugin_skill_dirs: Vec::new(),

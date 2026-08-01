@@ -27,7 +27,7 @@
 
 import { VNode } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, postLiveCompact, type CommandResult, UserInputRequestEvent } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, postLiveCompact, postLiveUserInput, postChatUserInput, type CommandResult, UserInputRequestEvent } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -494,7 +494,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // Pending live-session permission request (shown as PermissionCard, calls /live/permission).
   // Kept separate from the non-sync `onPermission` prop so the /chat path is untouched.
   const [livePending, setLivePending] = useState<{ tool_name: string; reason: string; call_id: string; arguments: string } | null>(null);
-  // Pending user_input_request from the live stream (shown as UserInputCard, calls /live/user-input).
+  // Pending structured input from either transport. The event's optional session_id
+  // selects `/chat/user-input`; live requests answer the bound `/live` runtime.
   const [userInputReq, setUserInputReq] = useState<UserInputRequestEvent | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef<string | null>(null);
@@ -1224,7 +1225,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         break;
       }
       case 'user_input_request': {
-        // Show the UserInputCard; it calls /live/user-input directly.
+        // Show the UserInputCard for the bound live runtime.
         setUserInputReq(e);
         break;
       }
@@ -1703,6 +1704,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         onPermission(event as PermissionRequestEvent);
         break;
 
+      case 'user_input_request':
+        setUserInputReq(event);
+        break;
+
       case 'done': {
         // 标记这是本 Chat 自己产生的会话 id，避免下面的 useEffect 误把当前对话清空，
         // 并标记其历史「已就位」（就是当前画布），防止 project_hash 回填后重新加载覆盖。
@@ -1723,6 +1728,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         transitionChatRecovery({ type: 'authoritative_terminal' });
         setBusy(false);
         onPermissionResolved?.(null); // 回合结束：兜底清掉任何残留审批卡片
+        setUserInputReq(null);
         break;
       }
 
@@ -1731,6 +1737,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setBusy(false);
         setQueued([]); // 用户中止：丢弃排队消息（对齐 VSCode 插件）
         onPermissionResolved?.(null);
+        setUserInputReq(null);
         break;
 
       case 'error':
@@ -1739,6 +1746,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setBusy(false);
         setQueued([]); // 出错：丢弃排队消息
         onPermissionResolved?.(null);
+        setUserInputReq(null);
         break;
 
       case 'warning':
@@ -2616,11 +2624,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     />
   );
 
-  // Live-session UserInputCard: shown when a user_input_request arrives on the live stream.
-  const liveUserInputCard = userInputReq && (
+  // Shared structured-input card for `/chat` and `/live`.
+  const userInputCard = userInputReq && (
     <UserInputCard
       req={userInputReq}
       onDone={() => setUserInputReq(null)}
+      submitAnswer={(body) => userInputReq.session_id
+        ? postChatUserInput(userInputReq.session_id, body)
+        : postLiveUserInput(body)}
     />
   );
 
@@ -2672,7 +2683,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         </div>
         {filePickerModal}
         {livePermissionCard}
-        {liveUserInputCard}
+        {userInputCard}
       </>
     );
   }
@@ -2936,7 +2947,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       </div>
       {filePickerModal}
       {livePermissionCard}
-      {liveUserInputCard}
+      {userInputCard}
     </>
   );
 }

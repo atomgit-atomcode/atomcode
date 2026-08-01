@@ -1,5 +1,5 @@
 // User input request card — mirrors PermissionCard structure/styling.
-// Shown when the daemon emits a `user_input_request` SSE event on the live stream.
+// Shown when the daemon emits a `user_input_request` on `/chat` or `/live`.
 //
 // Single question → post the answer directly. Multi-question batch (`req.questions`)
 // → a sequential stepper (one question at a time, reusing the same question body),
@@ -7,12 +7,13 @@
 // the webui fallback for the TUI's Tab-navigated batch form.
 
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { postLiveUserInput, UserInputQuestion, UserInputRequestEvent, UserInputResponseBody } from '../api';
+import { isUserInputBatch, UserInputAnswer, UserInputQuestion, UserInputRequestEvent, UserInputResponseBody } from '../api';
 import { useT } from '../settings';
 
 interface UserInputCardProps {
   req: UserInputRequestEvent;
   onDone: () => void;
+  submitAnswer: (body: UserInputAnswer) => Promise<{ accepted: boolean }>;
 }
 
 const OTHER_SENTINEL = '__other__';
@@ -265,7 +266,7 @@ function CardShell({
   );
 }
 
-function SingleCard({ req, onDone }: UserInputCardProps) {
+function SingleCard({ req, onDone, submitAnswer }: UserInputCardProps) {
   const t = useT();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -284,7 +285,7 @@ function SingleCard({ req, onDone }: UserInputCardProps) {
     setLoading(true);
     setError(null);
     try {
-      await postLiveUserInput({ request_id: req.request_id, ...buildAnswer(q, state) });
+      await submitAnswer({ request_id: req.request_id, ...buildAnswer(q, state) });
       onDone();
     } catch {
       setLoading(false);
@@ -294,13 +295,13 @@ function SingleCard({ req, onDone }: UserInputCardProps) {
   async function skip() {
     if (loading) return;
     setLoading(true);
+    setError(null);
     try {
-      await postLiveUserInput({ request_id: req.request_id, ...declinedAnswer() });
-    } catch {
-      // Best-effort — declining dismisses even on POST failure.
-    } finally {
-      setLoading(false);
+      await submitAnswer({ request_id: req.request_id, ...declinedAnswer() });
       onDone();
+    } catch {
+      setLoading(false);
+      setError(t('userInput.error'));
     }
   }
 
@@ -324,7 +325,7 @@ function SingleCard({ req, onDone }: UserInputCardProps) {
   );
 }
 
-function BatchCard({ req, onDone }: UserInputCardProps) {
+function BatchCard({ req, onDone, submitAnswer }: UserInputCardProps) {
   const t = useT();
   const qs = req.questions as UserInputQuestion[];
   const [step, setStep] = useState(0);
@@ -354,7 +355,7 @@ function BatchCard({ req, onDone }: UserInputCardProps) {
     setLoading(true);
     setError(null);
     try {
-      await postLiveUserInput({ request_id: req.request_id, responses: all });
+      await submitAnswer({ request_id: req.request_id, responses: all });
       onDone();
     } catch {
       setLoading(false);
@@ -376,13 +377,13 @@ function BatchCard({ req, onDone }: UserInputCardProps) {
   async function skipAll() {
     if (loading) return;
     setLoading(true);
+    setError(null);
     try {
-      await postLiveUserInput({ request_id: req.request_id, responses: qs.map(declinedAnswer) });
-    } catch {
-      // Best-effort.
-    } finally {
-      setLoading(false);
+      await submitAnswer({ request_id: req.request_id, responses: qs.map(declinedAnswer) });
       onDone();
+    } catch {
+      setLoading(false);
+      setError(t('userInput.error'));
     }
   }
 
@@ -413,7 +414,9 @@ function BatchCard({ req, onDone }: UserInputCardProps) {
   );
 }
 
-export function UserInputCard({ req, onDone }: UserInputCardProps) {
-  const isBatch = (req.questions?.length ?? 0) > 1;
-  return isBatch ? <BatchCard req={req} onDone={onDone} /> : <SingleCard req={req} onDone={onDone} />;
+export function UserInputCard({ req, onDone, submitAnswer }: UserInputCardProps) {
+  const isBatch = isUserInputBatch(req);
+  return isBatch
+    ? <BatchCard req={req} onDone={onDone} submitAnswer={submitAnswer} />
+    : <SingleCard req={req} onDone={onDone} submitAnswer={submitAnswer} />;
 }

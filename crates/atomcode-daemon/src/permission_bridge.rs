@@ -8,11 +8,60 @@ use atomcode_capabilities::tools::PermissionDecision;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
 
 /// session_id -> decider 的 response 发送端。
 #[derive(Clone, Default)]
 pub struct PermissionResponders {
     inner: Arc<RwLock<HashMap<String, UnboundedSender<PermissionDecision>>>>,
+}
+
+/// A pending `/chat` structured-input request, keyed by the native runtime request id.
+/// The runtime remains the request owner; this registry is only the HTTP response route.
+#[derive(Clone, Default)]
+pub struct UserInputResponders {
+    inner: Arc<RwLock<HashMap<(String, u64), oneshot::Sender<serde_json::Value>>>>,
+}
+
+impl UserInputResponders {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(
+        &self,
+        session_id: String,
+        request_id: u64,
+        tx: oneshot::Sender<serde_json::Value>,
+    ) {
+        self.inner
+            .write()
+            .unwrap()
+            .insert((session_id, request_id), tx);
+    }
+
+    pub fn unregister(&self, session_id: &str, request_id: u64) {
+        self.inner
+            .write()
+            .unwrap()
+            .remove(&(session_id.to_owned(), request_id));
+    }
+
+    pub fn unregister_session(&self, session_id: &str) {
+        self.inner
+            .write()
+            .unwrap()
+            .retain(|(registered, _), _| registered != session_id);
+    }
+
+    /// Delivers at most one answer. Removing before send rejects duplicate/stale POSTs.
+    pub fn deliver(&self, session_id: &str, request_id: u64, value: serde_json::Value) -> bool {
+        self.inner
+            .write()
+            .unwrap()
+            .remove(&(session_id.to_owned(), request_id))
+            .is_some_and(|tx| tx.send(value).is_ok())
+    }
 }
 
 impl PermissionResponders {
@@ -62,5 +111,17 @@ mod tests {
     fn deliver_to_unknown_session_returns_false() {
         let reg = PermissionResponders::new();
         assert!(!reg.deliver("nope", PermissionDecision::Deny));
+    }
+
+    #[tokio::test]
+    async fn routes_user_input_once_by_session_and_request() {
+        let reg = UserInputResponders::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        reg.register("sess-1".into(), 42, tx);
+
+        assert!(!reg.deliver("sess-1", 41, serde_json::json!({"text":"wrong"})));
+        assert!(reg.deliver("sess-1", 42, serde_json::json!({"text":"ok"})));
+        assert!(!reg.deliver("sess-1", 42, serde_json::json!({"text":"late"})));
+        assert_eq!(rx.await.unwrap(), serde_json::json!({"text":"ok"}));
     }
 }

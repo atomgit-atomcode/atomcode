@@ -106,6 +106,10 @@ pub struct PrepareOptions {
     /// in-session via the review specialization). Reuses the host provider (set at
     /// assemble), so it works on a signing gateway. `false` ⇒ not mounted.
     pub review: bool,
+    /// Mount the structured `request_user_input` tool. Drivers without a typed
+    /// request/response protocol must set this false instead of advertising a tool
+    /// they can only fail with `Null`.
+    pub request_user_input: bool,
     /// Provider-specific quota source supplied by the host. `None` keeps 429 handling generic.
     pub rate_limit_source: Option<Arc<dyn RateLimitWindowSource>>,
 }
@@ -120,6 +124,7 @@ impl Default for PrepareOptions {
             memory: true,
             web: true,
             review: true,
+            request_user_input: true,
             rate_limit_source: None,
         }
     }
@@ -163,6 +168,7 @@ impl Drop for McpWorkGuard {
 pub struct CodingParts {
     registry: ToolRegistry,
     tool_names: Vec<String>,
+    request_user_input_enabled: bool,
     mcp_tool_names: Arc<std::sync::RwLock<Vec<String>>>,
     mounted_tools: Option<MountedTools>,
     mounted_tools_publisher: Option<MountedToolsPublisher>,
@@ -278,6 +284,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             .iter()
             .map(|s| s.to_string()),
     );
+    let request_user_input_enabled =
+        opts.request_user_input && crate::persona::request_user_input_switch_enabled();
+    if !request_user_input_enabled {
+        names.retain(|name| name != "request_user_input");
+    }
     register_codeintel_tools(&mut registry);
     names.extend(
         atomcode_capabilities::codeintel::codeintel_tool_names()
@@ -703,6 +714,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         ),
         registry,
         tool_names: names,
+        request_user_input_enabled,
         mcp_tool_names: Arc::new(std::sync::RwLock::new(Vec::new())),
         mounted_tools: None,
         mounted_tools_publisher: None,
@@ -1140,7 +1152,12 @@ pub fn assemble(
             Ok(loaded) => {
                 let mut snap = loaded.snapshot;
                 check_snapshot_version(&snap)?;
-                reconcile_coding_persona(&mut snap, cfg, parts.review_provider.is_some());
+                reconcile_coding_persona(
+                    &mut snap,
+                    cfg,
+                    parts.request_user_input_enabled,
+                    parts.review_provider.is_some(),
+                );
                 b.resume = Some(snap);
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound && b.staged_fresh.is_some() => {}
@@ -1259,7 +1276,7 @@ pub fn assemble(
             &cfg.model,
             cfg.preferred_language,
             crate::persona::todo_switch_enabled(),
-            crate::persona::request_user_input_switch_enabled(),
+            parts.request_user_input_enabled,
             parts.review_provider.is_some(),
         ))
         // Repair model-produced arguments before any observer or policy gate reads them.
@@ -1481,7 +1498,12 @@ pub fn assemble(
             builder = builder.resume(snap.clone());
         }
     } else if let Some(mut snapshot) = parts.runtime_resume.as_ref().cloned() {
-        reconcile_coding_persona(&mut snapshot, cfg, parts.review_provider.is_some());
+        reconcile_coding_persona(
+            &mut snapshot,
+            cfg,
+            parts.request_user_input_enabled,
+            parts.review_provider.is_some(),
+        );
         builder = builder.resume(snapshot);
     }
     // Ensure the repo's `atomcode` project label after a successful `git push` to a
@@ -1527,13 +1549,14 @@ fn persona_model(text: &str) -> Option<&str> {
 fn reconcile_coding_persona(
     snapshot: &mut SessionSnapshot,
     cfg: &CodingAgentConfig,
+    request_user_input_enabled: bool,
     review_enabled: bool,
 ) {
     let persona = coding_persona_with_capabilities(
         &cfg.model,
         cfg.preferred_language,
         crate::persona::todo_switch_enabled(),
-        crate::persona::request_user_input_switch_enabled(),
+        request_user_input_enabled,
         review_enabled,
     );
     let is_persona = |message: &Message| {
@@ -1735,7 +1758,12 @@ mod tests {
     fn resume_adds_persona_before_legacy_session_context() {
         let mut snapshot = SessionSnapshot::new(vec![Message::system("SESSION CONTEXT")]);
 
-        reconcile_coding_persona(&mut snapshot, &agent_config("deepseek-v4-flash"), true);
+        reconcile_coding_persona(
+            &mut snapshot,
+            &agent_config("deepseek-v4-flash"),
+            true,
+            true,
+        );
 
         assert!(snapshot.messages[0]
             .text
@@ -1761,7 +1789,12 @@ mod tests {
             Message::system("SESSION CONTEXT"),
         ]);
 
-        reconcile_coding_persona(&mut snapshot, &agent_config("deepseek-v4-flash"), true);
+        reconcile_coding_persona(
+            &mut snapshot,
+            &agent_config("deepseek-v4-flash"),
+            true,
+            true,
+        );
 
         let personas = snapshot
             .messages
@@ -1804,8 +1837,8 @@ mod tests {
             Message::assistant("I am model-a", vec![]),
         ]);
 
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true);
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-c"), true);
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true);
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-c"), true, true);
 
         let transitions: Vec<_> = snapshot
             .messages
@@ -1837,7 +1870,12 @@ mod tests {
             Message::system("SESSION CONTEXT"),
         ]);
 
-        reconcile_coding_persona(&mut snapshot, &agent_config("deepseek-v4-flash"), true);
+        reconcile_coding_persona(
+            &mut snapshot,
+            &agent_config("deepseek-v4-flash"),
+            true,
+            true,
+        );
 
         assert_eq!(snapshot.messages[0].text, persona);
         assert_eq!(snapshot.cache_epoch, 0);
@@ -1861,7 +1899,7 @@ mod tests {
         let mut cfg = agent_config("model-a");
         cfg.preferred_language = Some(Locale::ZhCn);
 
-        reconcile_coding_persona(&mut snapshot, &cfg, true);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true);
 
         assert!(snapshot.messages[0]
             .text
@@ -1888,12 +1926,12 @@ mod tests {
             )),
             Message::assistant("I am model-a", vec![]),
         ]);
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true);
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true);
         let transition = snapshot.messages.last().cloned().unwrap();
         let mut cfg = agent_config("model-b");
         cfg.preferred_language = Some(Locale::ZhCn);
 
-        reconcile_coding_persona(&mut snapshot, &cfg, true);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true);
 
         assert_eq!(snapshot.messages.last(), Some(&transition));
         assert_eq!(
@@ -1939,6 +1977,7 @@ mod tests {
             memory: false,
             web: false,
             review: false,
+            request_user_input: true,
             rate_limit_source: None,
         };
 
@@ -1983,8 +2022,24 @@ mod tests {
             memory: false,
             web: false,
             review: false,
+            request_user_input: true,
             rate_limit_source: None,
         }
+    }
+
+    #[tokio::test]
+    async fn driver_can_disable_request_user_input_at_mount_boundary() {
+        let project = tempfile::tempdir().unwrap();
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        let mut opts = io_free_opts();
+        opts.request_user_input = false;
+        let parts = prepare(&cfg, opts).await.unwrap();
+
+        assert!(!parts
+            .selected_tool_names()
+            .iter()
+            .any(|name| name == "request_user_input"));
+        assert!(!parts.request_user_input_enabled);
     }
 
     #[cfg(feature = "atomgit")]

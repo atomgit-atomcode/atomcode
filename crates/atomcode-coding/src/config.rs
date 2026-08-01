@@ -98,8 +98,8 @@ pub struct CodingAgentConfig {
     /// answered approval must not park a turn forever. `None` ⇒ PARK: block until the driver
     /// answers (or the turn is cancelled / the driver dies) — for INTERACTIVE drivers, so a
     /// present human is never auto-denied for thinking too long. Default `Some(300s)`.
-    /// NOTE: approval is the only driver round-trip in this stack, so this is effectively the
-    /// approval timeout.
+    /// Applies to every kernel request/respond round-trip, including approvals and
+    /// structured `request_user_input` prompts.
     pub request_timeout: Option<Duration>,
     /// Safety fuse: max edit-then-verify continuations per turn (kernel default is 50).
     pub max_continuations: u32,

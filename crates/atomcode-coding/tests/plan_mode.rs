@@ -32,6 +32,7 @@ async fn plan_mode_blocks_a_write_tool_through_full_assembly() {
         memory: false,
         web: false,
         review: false,
+        request_user_input: true,
         rate_limit_source: None,
     };
 

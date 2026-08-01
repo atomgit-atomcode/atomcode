@@ -106,6 +106,7 @@ async fn start_native_runtime_with_session_bootstrap(
         other => (other, None),
     };
     let prepare = PrepareOptions {
+        request_user_input: true,
         session,
         skill_dirs: None,
         plugin_skill_dirs: crate::gather_plugin_skill_dirs_for(&cfg.working_dir),

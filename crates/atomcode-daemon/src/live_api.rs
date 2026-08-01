@@ -333,6 +333,19 @@ pub(crate) fn chat_runtime_config(
     }
 }
 
+/// Derive the runtime config for `/live`, whose UI has a complete request/respond
+/// transport. Interactive requests park until an answer, cancellation, or shutdown.
+pub(crate) fn live_runtime_config(
+    config: &Config,
+    provider_name: &str,
+    working_dir: &Path,
+    telemetry: Arc<Telemetry>,
+) -> atomcode_coding::CodingRuntimeConfig {
+    let mut runtime = chat_runtime_config(config, provider_name, working_dir, telemetry);
+    runtime.interactive = true;
+    runtime
+}
+
 fn send_chat_runtime_error(
     events: &mpsc::UnboundedSender<CodingRuntimeEvent>,
     message: impl Into<String>,
@@ -346,6 +359,20 @@ fn send_chat_runtime_error(
     ));
 }
 
+async fn await_chat_user_input_response(
+    rx: tokio::sync::oneshot::Receiver<serde_json::Value>,
+    request_timeout: Option<std::time::Duration>,
+) -> serde_json::Value {
+    match request_timeout {
+        Some(timeout) => tokio::time::timeout(timeout, rx)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(serde_json::Value::Null),
+        None => rx.await.unwrap_or(serde_json::Value::Null),
+    }
+}
+
 /// Drive a native runtime over `conv` and forward its native events to the shared
 /// `/chat` consumer. `perm_rx` carries interactive approval decisions from `/chat/permission`
 /// (`None` = apply [`fallback_approval_decision`] for the selected mode). The kernel
@@ -357,6 +384,7 @@ pub(crate) async fn run_chat_turn_v2(
     cancel: CancellationToken,
     runtime_cfg: atomcode_coding::CodingRuntimeConfig,
     mut perm_rx: Option<mpsc::UnboundedReceiver<PermissionDecision>>,
+    user_input_responders: Option<crate::permission_bridge::UserInputResponders>,
     approval_mode: ApprovalMode,
 ) {
     use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
@@ -383,10 +411,10 @@ pub(crate) async fn run_chat_turn_v2(
     let naming_session_id = session_id.clone();
     let naming_project_bucket =
         atomcode_capabilities::session::SessionManager::project_hash(&runtime_cfg.working_dir);
-    let (runtime, _coding_cfg) = match crate::start_native_runtime_with_session(
+    let (runtime, coding_cfg) = match crate::start_native_runtime_with_session(
         runtime_cfg,
         atomcode_coding::SessionMode::ExternalSnapshot {
-            id: session_id,
+            id: session_id.clone(),
             snapshot: prefix,
         },
     )
@@ -470,11 +498,35 @@ pub(crate) async fn run_chat_turn_v2(
                 let value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
                 let _ = handle.respond(request.id, value).await;
             }
+            CodingRuntimeEvent::Request(request)
+                if request.kind
+                    == atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND =>
+            {
+                let Some(responders) = &user_input_responders else {
+                    let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
+                    let _ = handle.respond(request.id, serde_json::Value::Null).await;
+                    continue;
+                };
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                responders.register(session_id.clone(), request.id, tx);
+                // Register before publishing the SSE event so a very fast browser answer
+                // cannot race the response route and be rejected as stale.
+                let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
+                let answer = await_chat_user_input_response(rx, coding_cfg.request_timeout);
+                tokio::pin!(answer);
+                let value = tokio::select! {
+                    _ = cancel.cancelled(), if !cancelled => {
+                        cancelled = true;
+                        let _ = handle.cancel().await;
+                        serde_json::Value::Null
+                    }
+                    answer = &mut answer => answer,
+                };
+                responders.unregister(&session_id, request.id);
+                let _ = handle.respond(request.id, value).await;
+            }
             CodingRuntimeEvent::Request(request) => {
                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
-                // `/chat` has no interactive user-input endpoint. Fail closed so
-                // request_user_input returns its graceful unsupported result instead
-                // of leaving the native runtime parked forever.
                 let _ = handle.respond(request.id, serde_json::Value::Null).await;
             }
             CodingRuntimeEvent::TurnFinished(completion @ TurnCompletion::Completed { .. }) => {
@@ -1788,7 +1840,7 @@ pub(crate) async fn live_permission(
     Json(serde_json::json!({ "accepted": ok }))
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 pub(crate) struct UserInputAnswerReq {
     pub request_id: u64,
     #[serde(default)]
@@ -1803,6 +1855,19 @@ pub(crate) struct UserInputAnswerReq {
     pub responses: Option<serde_json::Value>,
 }
 
+impl UserInputAnswerReq {
+    pub(crate) fn into_response_value(self) -> serde_json::Value {
+        match self.responses {
+            Some(responses) => serde_json::json!({ "responses": responses }),
+            None => serde_json::json!({
+                "declined": self.declined,
+                "selected": self.selected,
+                "text": self.text,
+            }),
+        }
+    }
+}
+
 /// POST /live/user-input — Deliver the user's answer to a pending `request_user_input`
 /// question raised by the agent, correlated by native request id.
 ///
@@ -1814,15 +1879,9 @@ pub(crate) async fn live_user_input(
     Json(req): Json<UserInputAnswerReq>,
 ) -> impl IntoResponse {
     // Batch answer (webui stepper) → `{ "responses": [...] }`; single → the flat shape.
-    let value = match req.responses {
-        Some(responses) => serde_json::json!({ "responses": responses }),
-        None => serde_json::json!({
-            "declined": req.declined,
-            "selected": req.selected,
-            "text": req.text,
-        }),
-    };
-    match crate::native_live::respond_confirmed(req.request_id, value).await {
+    let request_id = req.request_id;
+    let value = req.into_response_value();
+    match crate::native_live::respond_confirmed(request_id, value).await {
         Ok(()) => axum::Json(serde_json::json!({ "accepted": true })),
         Err(error) => axum::Json(serde_json::json!({
             "accepted": false,
@@ -2333,6 +2392,53 @@ mod tests {
         )
         .await;
         assert_eq!(out, "看下这个图片");
+    }
+
+    #[test]
+    fn live_runtime_config_parks_interactive_requests_without_timeout() {
+        let telemetry = atomcode_telemetry::Telemetry::init(
+            atomcode_telemetry::config::ResolvedConfig {
+                state: atomcode_telemetry::config::TelemetryState::Disabled("test"),
+                endpoint: String::new(),
+                atomcode_dir: std::env::temp_dir(),
+            },
+            "test".into(),
+        );
+        let runtime = live_runtime_config(
+            &atomcode_config::config::Config::default(),
+            "missing-test-provider",
+            &std::env::temp_dir(),
+            telemetry,
+        );
+        assert!(runtime.interactive);
+        assert_eq!(
+            crate::kernel_runtime::coding_config_from_runtime(&runtime).request_timeout,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_user_input_wait_degrades_to_null_at_driver_timeout() {
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let value = await_chat_user_input_response(
+            rx,
+            Some(std::time::Duration::from_millis(1)),
+        )
+        .await;
+        assert!(value.is_null());
+    }
+
+    #[tokio::test]
+    async fn chat_user_input_wait_returns_the_correlated_answer() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(serde_json::json!({ "selected": ["Blue"] }))
+            .unwrap();
+        let value = await_chat_user_input_response(
+            rx,
+            Some(std::time::Duration::from_secs(1)),
+        )
+        .await;
+        assert_eq!(value["selected"][0], "Blue");
     }
 
     #[test]

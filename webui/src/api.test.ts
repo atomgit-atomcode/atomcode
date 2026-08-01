@@ -100,6 +100,54 @@ test('postLiveUserInput rejects an answer the runtime did not accept', async () 
   }
 });
 
+test('postChatUserInput correlates the answer by session and native request id', async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({ url: String(url), init });
+    return new Response('{"accepted":true}', { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const { postChatUserInput } = await import('./api.ts');
+    await postChatUserInput('session-1', {
+      request_id: 42,
+      declined: false,
+      selected: ['继续'],
+      text: null,
+    });
+
+    assert.equal(calls[0].url, '/chat/user-input');
+    assert.deepEqual(JSON.parse(String(calls[0].init?.body)), {
+      session_id: 'session-1',
+      request_id: 42,
+      declined: false,
+      selected: ['继续'],
+      text: null,
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a one-question questions payload still uses the batch response protocol', async () => {
+  const { isUserInputBatch } = await import('./api.ts');
+  assert.equal(isUserInputBatch({
+    type: 'user_input_request',
+    request_id: 42,
+    header: '',
+    question: '',
+    mode: 'single',
+    options: [],
+    questions: [{
+      header: 'Pick',
+      question: 'Red or blue?',
+      mode: 'single',
+      options: [{ label: 'Red' }, { label: 'Blue' }],
+    }],
+  }), true);
+});
+
 test('collection APIs reject server error payloads instead of returning non-arrays', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response(

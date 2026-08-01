@@ -570,6 +570,8 @@ pub struct AppState {
     pub app_user_id: String,
     /// webui 交互式权限：session_id -> decider response 发送端
     pub pending_permissions: permission_bridge::PermissionResponders,
+    /// `/chat` structured user-input answers, keyed by (session_id, native request_id).
+    pub pending_user_inputs: permission_bridge::UserInputResponders,
     /// server 绑定的地址 / 端口（供 /tunnel/status 报告远程可达性）。
     pub bind_host: String,
     pub bind_port: u16,
@@ -2667,6 +2669,15 @@ pub enum ChatEvent {
         call_id: String,
         arguments: String,
     },
+    /// The model asks the user a structured question. The browser answers through
+    /// `/chat/user-input`, correlated by session and native request id.
+    #[serde(rename = "user_input_request")]
+    UserInputRequest {
+        session_id: String,
+        request_id: u64,
+        #[serde(flatten)]
+        payload: serde_json::Value,
+    },
     /// Chat was stopped by user
     #[serde(rename = "stopped")]
     Stopped,
@@ -2816,6 +2827,34 @@ mod chat_event_type_tests {
                 ..
             }] if session_id == "session-1" && call_id == "call-42" && tool_name == "bash"
         ));
+    }
+
+    #[test]
+    fn native_user_input_request_keeps_session_request_and_batch_payload() {
+        let mut projector = ChatRuntimeProjector::default();
+        let request = atomcode_coding::RuntimeRequest {
+            id: 77,
+            kind: atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND.into(),
+            payload: serde_json::json!({
+                "questions": [{
+                    "header": "Pick",
+                    "question": "Red or blue?",
+                    "mode": "single",
+                    "options": [{"label": "Red"}, {"label": "Blue"}]
+                }]
+            }),
+            snapshot: None,
+        };
+
+        let events = projector.project_runtime(
+            atomcode_coding::CodingRuntimeEvent::Request(request),
+            "session-1",
+        );
+        let json = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(json["type"], "user_input_request");
+        assert_eq!(json["session_id"], "session-1");
+        assert_eq!(json["request_id"], 77);
+        assert_eq!(json["questions"][0]["options"][1]["label"], "Blue");
     }
 
     #[test]
@@ -3230,8 +3269,17 @@ impl ChatRuntimeProjector {
         match event {
             CodingRuntimeEvent::Agent(event) => self.project_agent(event),
             CodingRuntimeEvent::Request(request) => {
-                use atomcode_capabilities::tools::{ApprovalRequest, APPROVAL_KIND};
+                use atomcode_capabilities::tools::{
+                    request_user_input::REQUEST_USER_INPUT_KIND, ApprovalRequest, APPROVAL_KIND,
+                };
 
+                if request.kind == REQUEST_USER_INPUT_KIND {
+                    return vec![ChatEvent::UserInputRequest {
+                        session_id: permission_session_id.to_string(),
+                        request_id: request.id,
+                        payload: request.payload,
+                    }];
+                }
                 if request.kind != APPROVAL_KIND {
                     return Vec::new();
                 }
@@ -3550,8 +3598,11 @@ async fn chat_stream(
     let mcp_cache = state.mcp_cache.clone();
     let telemetry = state.telemetry.clone();
     let pending_permissions = state.pending_permissions.clone();
+    let pending_user_inputs = state.pending_user_inputs.clone();
     let interactive_permission =
         client_interactive_permission(client_mode, state.enforce_token, &state.bind_host);
+    // Only the WebUI currently implements the typed `/chat/user-input` response endpoint.
+    let interactive_user_input = matches!(client_mode, SessionMode::Webui);
 
     // Build CurrentContext for the spawned task (task_local doesn't auto-propagate across spawn)
     // Use the request's working_dir to detect repo_origin dynamically (not the
@@ -3587,7 +3638,9 @@ async fn chat_stream(
                     mcp_cache,
                     telemetry,
                     pending_permissions,
+                    pending_user_inputs,
                     interactive_permission,
+                    interactive_user_input,
                     inner_terminal_sent,
                 )
                 .await
@@ -3691,7 +3744,9 @@ async fn process_chat_request(
     _mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
     telemetry: Arc<Telemetry>,
     pending_permissions: permission_bridge::PermissionResponders,
+    pending_user_inputs: permission_bridge::UserInputResponders,
     interactive_permission: bool,
+    interactive_user_input: bool,
     terminal_sent: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     let approval_mode = effective_chat_approval_mode(req.approval_mode);
@@ -3814,6 +3869,7 @@ async fn process_chat_request(
         if registered_permission_responder {
             pending_permissions.unregister(&perm_session_key);
         }
+        pending_user_inputs.unregister_session(&perm_session_key);
         return Ok(());
     }
 
@@ -3842,6 +3898,7 @@ async fn process_chat_request(
         let conv = conversation.clone();
         let cancel = cancel_token.clone();
         let runtime_session_id = perm_session_key.clone();
+        let runtime_user_inputs = pending_user_inputs.clone();
         tokio::spawn(async move {
             CurrentContext::scope(tel_ctx, || async move {
                 live_api::run_chat_turn_v2(
@@ -3851,6 +3908,11 @@ async fn process_chat_request(
                     cancel,
                     runtime_cfg,
                     perm_rx,
+                    if interactive_user_input {
+                        Some(runtime_user_inputs)
+                    } else {
+                        None
+                    },
                     approval_mode,
                 )
                 .await;
@@ -3893,6 +3955,7 @@ async fn process_chat_request(
     if registered_permission_responder {
         pending_permissions.unregister(&perm_session_key);
     }
+    pending_user_inputs.unregister_session(&perm_session_key);
     Ok(())
 }
 
@@ -4012,6 +4075,26 @@ async fn chat_permission(
     } else {
         Json(serde_json::json!({ "success": false, "error": "no pending permission for session" }))
     }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ChatUserInputAnswerRequest {
+    session_id: String,
+    #[serde(flatten)]
+    answer: live_api::UserInputAnswerReq,
+}
+
+/// POST /chat/user-input — answer a structured question emitted on the `/chat` SSE stream.
+async fn chat_user_input(
+    State(state): State<AppState>,
+    Json(req): Json<ChatUserInputAnswerRequest>,
+) -> impl IntoResponse {
+    let request_id = req.answer.request_id;
+    let value = req.answer.into_response_value();
+    let accepted = state
+        .pending_user_inputs
+        .deliver(&req.session_id, request_id, value);
+    Json(serde_json::json!({ "accepted": accepted }))
 }
 
 // --- MCP API handlers ---
@@ -5131,6 +5214,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         webui_tokens: webui_tokens.unwrap_or_default(),
         app_user_id: opts.app_user_id.unwrap_or_default(),
         pending_permissions: permission_bridge::PermissionResponders::new(),
+        pending_user_inputs: permission_bridge::UserInputResponders::new(),
         bind_host: host.clone(),
         bind_port: port,
         // `port` here is the ACTUAL bound port (the enforce_token=true webui path
@@ -5183,6 +5267,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/chat/stop", post(stop_chat))
         .route("/chat/active", get(active_chat_sessions))
         .route("/chat/permission", post(chat_permission))
+        .route("/chat/user-input", post(chat_user_input))
         .route(
             "/approval_mode",
             get(live_api::approval_mode_get).post(live_api::approval_mode_set),
@@ -5681,6 +5766,7 @@ mod tests {
             enforce_token: false,
             app_user_id: String::new(),
             pending_permissions: permission_bridge::PermissionResponders::new(),
+            pending_user_inputs: permission_bridge::UserInputResponders::new(),
             bind_host: "127.0.0.1".into(),
             bind_port: 13456,
             webui_cookie_name: auth_token::webui_cookie_name(13456),
@@ -6038,6 +6124,8 @@ mod tests {
             Arc::new(RwLock::new(HashMap::new())),
             chat_test_telemetry(&home),
             permission_bridge::PermissionResponders::new(),
+            permission_bridge::UserInputResponders::new(),
+            false,
             false,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
@@ -6691,6 +6779,8 @@ mod tests {
             Arc::new(RwLock::new(HashMap::new())),
             telemetry,
             permission_bridge::PermissionResponders::new(),
+            permission_bridge::UserInputResponders::new(),
+            false,
             false,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )

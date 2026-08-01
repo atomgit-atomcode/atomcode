@@ -26,6 +26,7 @@ export type SSEEvent =
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown }
+  | UserInputRequestEvent
   | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stop_reason?: string; message?: string }
   | { type: 'stopped' }
   | { type: 'error'; message: string }
@@ -925,6 +926,8 @@ export interface UserInputResponseBody {
 export interface UserInputRequestEvent {
   type: 'user_input_request';
   request_id: number;
+  /** Present on the `/chat` path; `/live` is already bound to one session. */
+  session_id?: string;
   header: string;
   question: string;
   mode: 'single' | 'multiple' | 'text';
@@ -936,10 +939,16 @@ export interface UserInputRequestEvent {
   custom?: boolean;
 }
 
+export function isUserInputBatch(req: UserInputRequestEvent): boolean {
+  return Array.isArray(req.questions) && req.questions.length > 0;
+}
+
+export type UserInputAnswer =
+  | ({ request_id: number } & UserInputResponseBody)
+  | { request_id: number; responses: UserInputResponseBody[] };
+
 export async function postLiveUserInput(
-  body:
-    | ({ request_id: number } & UserInputResponseBody)
-    | { request_id: number; responses: UserInputResponseBody[] },
+  body: UserInputAnswer,
 ): Promise<{ accepted: boolean }> {
   const resp = await fetch('/live/user-input', {
     method: 'POST',
@@ -950,6 +959,23 @@ export async function postLiveUserInput(
   const result = await resp.json() as { accepted: boolean; error?: string };
   if (!result.accepted) {
     throw new Error(result.error ?? 'live runtime did not accept the user input answer');
+  }
+  return result;
+}
+
+export async function postChatUserInput(
+  sessionId: string,
+  body: UserInputAnswer,
+): Promise<{ accepted: boolean }> {
+  const resp = await fetch('/chat/user-input', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ session_id: sessionId, ...body }),
+  });
+  if (!resp.ok) throw new Error(`answer chat user input failed: ${resp.status}`);
+  const result = await resp.json() as { accepted: boolean; error?: string };
+  if (!result.accepted) {
+    throw new Error(result.error ?? 'chat runtime did not accept the user input answer');
   }
   return result;
 }
