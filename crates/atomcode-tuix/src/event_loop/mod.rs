@@ -4799,8 +4799,10 @@ impl Buffer {
         }
         let (spans, cur_row, cur_col) =
             crate::width::wrap_with_spans(&self.text, max_cols, self.cursor);
-        // If the cursor is past the last span (shouldn't happen in practice),
-        // fall back to logical-line down.
+        // Cursor is on the last visual line: no next span to jump to.
+        // Fall back to logical-line down, which snaps to `text.len()`
+        // (returning `true`) so the next Down falls through to
+        // `HistoryNext`.
         if cur_row + 1 >= spans.len() {
             return self.cursor_line_down();
         }
