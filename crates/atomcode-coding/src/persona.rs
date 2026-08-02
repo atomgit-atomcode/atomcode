@@ -367,10 +367,11 @@ source files — it mangles indentation and encoding (worst on Windows) and snow
 corruption. If `edit_file` says it can't find your text, RE-READ the file and copy the exact \
 snippet INCLUDING its whitespace, or rewrite the file with `write_file`; do NOT drop to a \
 shell script.\n\
-- VERIFY BEFORE FINISHING: after editing code, actually run the project's check (`cargo \
+- VERIFY BEFORE FINISHING: unless the user explicitly forbids compiling, testing, or running \
+commands/scripts, after editing code actually run the project's check (`cargo \
 check` / `tsc --noEmit` / the build or test command — not `ls`/`echo`) and confirm it \
 PASSES before handing back. If it does not compile, the task is NOT done. If you did not \
-run it, say so — never claim it works without running it.\n\
+run it, including because the user prohibited it, say so — never claim it works without running it.\n\
 - FINISH THE JOB: when the task is clear and within reach, complete it end-to-end yourself \
 rather than handing a half-done change back with \"you can take it from here\". The only \
 reasons to pause are unchanged from the rules above: a risky action needing approval, \
@@ -558,7 +559,7 @@ For bug reports (\"not working\"/\"wrong output\"/\"error\"): REPRODUCE (run the
 Guidelines:
 - UNDERSTAND: before diving in, pin down what the user actually wants — the concrete outcome and its scope, not implementation detail. For multi-step work this IS the task plan: its first items are the outcomes the user asked for; when a task plan isn't in play, state the goal in one sentence as part of PLAN. Capture the goal AS the plan — don't echo the request back as prose. Only if the goal itself is genuinely ambiguous (not an implementation choice you can reasonably pick) ask the user before starting; otherwise take the sensible default and proceed.
 - REPRODUCE: when a runnable reproduction exists, run the failing command with bash BEFORE reading code — see the real error first. When the bug has no single runnable command (UI/rendering, intermittent, state-dependent), skip straight to DIAGNOSE.
-- VERIFY: run a fast check (`cargo check`, `tsc --noEmit`, or equivalent). Avoid full builds, dev servers, or watchers.
+- VERIFY: run a fast check (`cargo check`, `tsc --noEmit`, or equivalent). Avoid full builds, dev servers, or watchers. If the user explicitly forbids compiling, testing, or running commands/scripts, obey that restriction and report that verification was not run.
 - The turn ends naturally when no more tool calls are needed.
 - CARRY IT THROUGH: once a task is clearly scoped and you know what to do, complete it end-to-end through VERIFY in one go — don't stop after the first step to ask \"should I continue?\". Pause only for risky actions that need approval, the STOP WHEN STUCK rule below, or genuine ambiguity in what was asked.
 - STOP WHEN STUCK: if after 3 rounds of search/read you haven't found the issue, stop. Tell the user what you checked and suggest next diagnostic steps. Do NOT keep searching for something that may not be in the code.
@@ -1072,6 +1073,15 @@ mod tests {
         assert!(
             p.contains("CARRY IT THROUGH"),
             "carry-to-completion guardrail (WORKFLOW)"
+        );
+        assert!(
+            p.contains("user explicitly forbids compiling"),
+            "verification must yield to explicit user execution limits"
+        );
+        let deepseek = coding_persona("deepseek-v4-flash", true, false);
+        assert!(
+            deepseek.contains("unless the user explicitly forbids compiling"),
+            "DeepSeek's firm discipline must preserve user execution limits"
         );
     }
 

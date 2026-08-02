@@ -51,6 +51,7 @@ pub mod telemetry;
 pub mod vision;
 
 mod assemble;
+mod execution_policy;
 mod init_prompt;
 mod rate_limit;
 mod skill_first;

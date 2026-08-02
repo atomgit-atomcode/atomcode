@@ -35,7 +35,6 @@ const DEFAULT_CHILD_MAX_ROUNDS: u32 = 200;
 
 pub mod approval;
 pub mod ast_grep;
-pub mod output_artifact;
 /// AtomGit REST tools (repo / pr / issue). Opt-in `atomgit` feature.
 #[cfg(feature = "atomgit")]
 pub mod atomgit;
@@ -52,6 +51,7 @@ pub mod list;
 #[cfg(feature = "memory")]
 mod memory;
 pub mod open_file;
+pub mod output_artifact;
 pub mod parallel_edit;
 pub mod read;
 pub mod repair;
@@ -82,14 +82,16 @@ pub use approval::{
     ApprovalResponse, InMemoryPermissionStore, PermissionDecision, PermissionStore, APPROVAL_KIND,
 };
 pub use ast_grep::AstGrepTool;
-pub use output_artifact::{artifact_id, ArtifactMiddleware, ArtifactStore, FetchOutputTool, THRESHOLD_BYTES};
 #[cfg(feature = "atomgit")]
 pub use atomgit::{
     atomgit_tool_names, register_atomgit_tools, AtomgitIssueTool, AtomgitPrTool, AtomgitRepoTool,
 };
 #[cfg(feature = "atomgit")]
 pub use atomgit_bash_gate::AtomgitBashGate;
-pub use bash::{normalize_command_for_grant, run_shell, BashTool, ShellExit, ShellOutcome};
+pub use bash::{
+    bash_invocations, normalize_command_for_grant, run_shell, BashInvocation, BashTool, ShellExit,
+    ShellOutcome,
+};
 pub use bash_workspace_gate::BashWorkspaceGate;
 pub use cd::ChangeDirTool;
 pub use edit::EditFileTool;
@@ -97,6 +99,9 @@ pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use list::ListDirTool;
 pub use open_file::{OpenFileTool, OpenFileWorkspaceGate};
+pub use output_artifact::{
+    artifact_id, ArtifactMiddleware, ArtifactStore, FetchOutputTool, THRESHOLD_BYTES,
+};
 pub use parallel_edit::ParallelEditTool;
 pub use read::ReadFileTool;
 pub use repair::{repair_tool_args, RepairToolArgsMiddleware};

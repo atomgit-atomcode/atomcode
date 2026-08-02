@@ -2,6 +2,7 @@
 
 use crate::config::CodingAgentConfig;
 use crate::discipline::VerifyCadenceHook;
+use crate::execution_policy::TurnExecutionPolicy;
 use crate::persona::coding_persona_with_language;
 use atomcode_capabilities::codeintel::{codeintel_tool_names, register_codeintel_tools};
 use atomcode_capabilities::provider::{
@@ -108,12 +109,14 @@ fn build_coding_agent_from_tools(
         persona.push_str(&warning);
         persona.push_str("</system-reminder>");
     }
+    let turn_execution_policy = Arc::new(TurnExecutionPolicy::new());
     let mut builder = Agent::builder()
         .provider(provider)
         .tools(tools)
         .persona(persona)
         // Repair model-produced arguments before approval inspects them.
         .middleware(Arc::new(RepairToolArgsMiddleware))
+        .middleware(turn_execution_policy.clone())
         // Auto-approve in-workspace open_file (it's Risky → would otherwise prompt on every
         // preview). This path pins an immutable working_dir, so the gate pins the same root.
         // BEFORE approval so its `Allow` short-circuits the prompt.
@@ -129,7 +132,11 @@ fn build_coding_agent_from_tools(
         .middleware(Arc::new(ApprovalMiddleware::in_memory()))
         // Env / project-instructions / git context at session start (after persona).
         .hook(Arc::new(SessionContextHook::new(cfg.working_dir.clone())))
-        .hook(Arc::new(VerifyCadenceHook::new(cfg.working_dir.clone())))
+        .hook(turn_execution_policy.clone())
+        .hook(Arc::new(VerifyCadenceHook::with_execution_policy(
+            cfg.working_dir.clone(),
+            turn_execution_policy,
+        )))
         .working_dir(cfg.working_dir.clone())
         // Cache-friendly task-boundary stub + hard-overflow recovery ladder (stub→truncate
         // →drain+LLM-summary). The overflow path is off the normal path (typed error only).

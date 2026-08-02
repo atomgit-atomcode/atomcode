@@ -2941,6 +2941,16 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(error));
                             continue;
                         }
+                        // The real-user submit boundary owns per-turn execution intent.
+                        // Update before forwarding (including steer) so a newly received
+                        // "do not compile/run scripts" instruction blocks later Bash calls
+                        // from an already-active turn without waiting for another LLM round.
+                        if let Some(runtime) = resources.as_ref() {
+                            runtime
+                                .parts
+                                .turn_execution_policy
+                                .update_from_user_text(&input.text);
+                        }
                         let receipt = if let Some(turn_id) = active_turn {
                             SubmitReceipt::Steered { generation, turn_id }
                         } else {

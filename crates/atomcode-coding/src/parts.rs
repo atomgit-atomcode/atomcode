@@ -36,8 +36,8 @@ use atomcode_capabilities::skills::{
 };
 use atomcode_capabilities::tools::{
     register_coding_tools_with_vision, ApprovalMiddleware, ArtifactMiddleware, ArtifactStore,
-    BashWorkspaceGate, FetchOutputTool, OpenFileWorkspaceGate, ReadFileTool, SensitivePathGate,
-    RepairToolArgsMiddleware, WebFetchTool, WebSearchTool, WriteApprovalGate,
+    BashWorkspaceGate, FetchOutputTool, OpenFileWorkspaceGate, ReadFileTool,
+    RepairToolArgsMiddleware, SensitivePathGate, WebFetchTool, WebSearchTool, WriteApprovalGate,
 };
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::checkpoint::CompactionCheckpoint;
@@ -50,6 +50,7 @@ use atomcode_review::{ReviewTool, ReviewToolConfig, SharedReviewProvider};
 
 use crate::config::CodingAgentConfig;
 use crate::discipline::VerifyCadenceHook;
+use crate::execution_policy::TurnExecutionPolicy;
 #[cfg(test)]
 use crate::persona::coding_persona;
 use crate::persona::coding_persona_with_capabilities;
@@ -215,6 +216,9 @@ pub struct CodingParts {
     /// `bypass_mode` this is enforced in middleware, mirroring `plan_mode`. Shared
     /// (not rebuilt) so a respawn preserves the mode.
     pub accept_edits: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Current real-user turn's explicit execution restriction. The same instance is
+    /// a lifecycle hook and a pre-approval Bash middleware.
+    pub(crate) turn_execution_policy: Arc<TurnExecutionPolicy>,
     /// Session grant store for mutating MCP tools the user approved "always" while in
     /// PLAN mode. Owned here (not rebuilt in [`assemble`]) so a respawn / model-swap
     /// preserves the grants — the same reason the mode flags above are shared.
@@ -271,6 +275,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
 ) -> io::Result<CodingParts> {
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
+    let turn_execution_policy = Arc::new(TurnExecutionPolicy::new());
 
     // Always-on core: neutral fs/bash toolset + codeintel. Vision gating: a VL model
     // (e.g. Qwen3-VL) makes read_file hand image files to the model as pictures. Uses the
@@ -441,7 +446,8 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 )
                 .with_max_concurrent(max_concurrent)
                 .with_max_rounds(max_rounds)
-                .with_tool_loop_policy(cfg.tool_loop_policy),
+                .with_tool_loop_policy(cfg.tool_loop_policy)
+                .with_worker_middleware(turn_execution_policy.clone()),
             ));
             names.push("task".to_string());
             Some(slot)
@@ -633,7 +639,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // the edit/write tools resolve relative `file_path` against — they stay in lockstep because
     // `/cd` respawns the agent (rebuilding this hook with the new dir), not by mutating cwd in
     // place. If `/cd` ever moves to an in-place cwd mutation, thread the live cwd in here too.
-    hooks.push(Arc::new(VerifyCadenceHook::new(cfg.working_dir.clone())));
+    hooks.push(turn_execution_policy.clone());
+    hooks.push(Arc::new(VerifyCadenceHook::with_execution_policy(
+        cfg.working_dir.clone(),
+        turn_execution_policy.clone(),
+    )));
     // Todo hook (native runtime path — the live TUI + webui): per-turn <system-reminder> of the
     // current list so the model keeps it accurate after compaction, PLUS an `offer_continuation`
     // that nudges once to close out open items when the model tries to stop. Gated on the SAME
@@ -703,6 +713,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         bypass_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         accept_edits: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        turn_execution_policy,
         mcp_plan_grants: std::sync::Arc::new(
             atomcode_capabilities::tools::InMemoryPermissionStore::new(),
         ),
@@ -1260,12 +1271,12 @@ pub fn assemble(
     // When a session is present, wire the artifact store: register the fetch_output tool
     // so the model can retrieve large outputs, and prepare the middleware that intercepts
     // oversized tool results and spills them to disk.  No session → no artifact I/O.
-    let artifact_store: Option<Arc<ArtifactStore>> =
-        parts.session.as_ref().and_then(|b| {
-            b.manager.artifacts_dir(&b.id).ok().map(|dir| {
-                Arc::new(ArtifactStore::new(dir))
-            })
-        });
+    let artifact_store: Option<Arc<ArtifactStore>> = parts.session.as_ref().and_then(|b| {
+        b.manager
+            .artifacts_dir(&b.id)
+            .ok()
+            .map(|dir| Arc::new(ArtifactStore::new(dir)))
+    });
     if let Some(store) = &artifact_store {
         parts
             .registry
@@ -1324,6 +1335,9 @@ pub fn assemble(
         None => Arc::new(crate::rate_limit::RateLimitHook::new(cfg.base_url.clone())),
     };
     let mut builder = builder
+        // Hard per-turn user boundary. Register before every middleware that can `Allow`
+        // and bypass downstream approval gates.
+        .middleware(parts.turn_execution_policy.clone())
         // Plan-mode gate BEFORE approval: while active it blocks mutating (Risky)
         // tools outright, so there's no point prompting the user to approve a write
         // plan mode forbids. Read-only when inactive — zero cost off the plan path.
@@ -2744,10 +2758,12 @@ mod tests {
     /// big tool result → preview+handle stored → fetch_output retrieves full bytes.
     #[tokio::test]
     async fn artifact_wiring_store_middleware_and_fetch_roundtrip() {
-        use atomcode_capabilities::tools::{ArtifactMiddleware, ArtifactStore, FetchOutputTool, THRESHOLD_BYTES};
+        use atomcode_capabilities::tools::{
+            ArtifactMiddleware, ArtifactStore, FetchOutputTool, THRESHOLD_BYTES,
+        };
         use atomcode_kernel::middleware::ToolMiddleware;
-        use atomcode_kernel::tool::{ToolContext, ToolResult};
         use atomcode_kernel::tool::Tool as _;
+        use atomcode_kernel::tool::{ToolContext, ToolResult};
         use tokio_util::sync::CancellationToken;
 
         let artifacts_tmp = tempfile::tempdir().unwrap();

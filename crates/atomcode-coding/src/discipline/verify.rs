@@ -12,12 +12,13 @@
 //! enumerates build commands (no cargo/npm allowlist) — a real check of ANY language still
 //! counts. The nudge text lists `cargo check` / `tsc --noEmit` only as examples.
 
+use crate::execution_policy::{execution_policy_for_messages, TurnExecutionPolicy};
 use async_trait::async_trait;
 use atomcode_kernel::hook::{Continuation, LifecycleHooks};
 use atomcode_kernel::message::{Conversation, Role};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const NUDGE: &str = "You made code edits but have not verified them. Run a fast check \
 (`cargo check`, `tsc --noEmit`, or the equivalent for this project) to catch errors \
@@ -32,6 +33,7 @@ pub struct VerifyCadenceHook {
     /// — see [`path_in_workspace_lexical`]. An empty root (the `Default`) treats every edit as
     /// in-workspace, preserving the pre-gate behavior for tests / constructions without a cwd.
     workspace: PathBuf,
+    execution_policy: Arc<TurnExecutionPolicy>,
     state: Mutex<State>,
 }
 
@@ -55,6 +57,18 @@ impl VerifyCadenceHook {
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
         Self {
             workspace: workspace.into(),
+            execution_policy: Arc::new(TurnExecutionPolicy::new()),
+            state: Mutex::new(State::default()),
+        }
+    }
+
+    pub(crate) fn with_execution_policy(
+        workspace: impl Into<PathBuf>,
+        execution_policy: Arc<TurnExecutionPolicy>,
+    ) -> Self {
+        Self {
+            workspace: workspace.into(),
+            execution_policy,
             state: Mutex::new(State::default()),
         }
     }
@@ -334,6 +348,11 @@ impl LifecycleHooks for VerifyCadenceHook {
     }
 
     async fn offer_typed_continuation(&self, convo: &Conversation) -> Option<Continuation> {
+        if !self.execution_policy.current().is_default()
+            || !execution_policy_for_messages(&convo.messages).is_default()
+        {
+            return None;
+        }
         let edit = unverified_edit(convo, &self.workspace)?;
         if verify_reminder_already_present(convo, &edit) {
             return None;
@@ -423,6 +442,35 @@ mod tests {
             hook.offer_continuation(&convo).await.is_none(),
             "must not nudge twice for the same edit"
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_user_execution_limit_suppresses_verify_nudge() {
+        for instruction in [
+            "修改代码，但禁止编译和禁止执行脚本",
+            "Make the edit, but do not run tests.",
+            "不要运行任何命令，只修改文件",
+        ] {
+            let msgs = vec![
+                user(instruction),
+                assistant_call("e1", "edit_file"),
+                tool_result("e1", false),
+            ];
+            assert!(
+                nudge_of(msgs).await.1.is_none(),
+                "must suppress verify cadence for {instruction:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn live_steer_policy_suppresses_nudge_before_conversation_catches_up() {
+        let policy = Arc::new(TurnExecutionPolicy::new());
+        let hook = VerifyCadenceHook::with_execution_policy("/", policy.clone());
+        let mut convo = Conversation::new();
+        convo.messages = vec![assistant_call("e1", "edit_file"), tool_result("e1", false)];
+        policy.update_from_user_text("现在停止验证，不要运行测试");
+        assert!(hook.offer_continuation(&convo).await.is_none());
     }
 
     #[tokio::test]
