@@ -62,18 +62,6 @@ pub fn platform_exchange_url() -> String {
 pub fn platform_refresh_url() -> String {
     format!("{}/oauth/refresh", platform_base_url())
 }
-#[allow(dead_code)]
-pub fn authorize_url() -> String {
-    format!("{}/oauth/authorize", platform_base_url())
-}
-#[allow(dead_code)]
-pub fn token_url() -> String {
-    format!("{}/oauth/token", platform_base_url())
-}
-#[allow(dead_code)]
-pub fn user_url() -> String {
-    format!("{}/api/v5/user", platform_base_url())
-}
 
 /// Blocking HTTP client pre-configured with `ATOMCODE_USER_AGENT`. Every
 /// OAuth-side request must carry the token or AtomGit's gate rejects it.
