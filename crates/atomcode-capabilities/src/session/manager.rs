@@ -549,6 +549,16 @@ pub struct LoadedSession {
     pub presentation: PresentationFile,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum NativeSessionRepairOutcome {
+    Healthy(LoadedSession),
+    RepairableMissingPresentation {
+        meta: SessionMeta,
+        snapshot: SessionSnapshot,
+    },
+    Repaired(LoadedSession),
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct InflightSnapshot {
     version: u32,
@@ -1769,22 +1779,69 @@ impl SessionManager {
     /// any missing artifact is an explicit error; callers must cut over through the
     /// importer instead of manufacturing defaults.
     pub fn load_native_session(&self, id: &str) -> SessionResult<LoadedSession> {
-        self.with_meta_lock(id, || {
+        self.with_meta_lock(id, || self.load_native_session_unlocked(id))
+    }
+
+    fn load_native_session_unlocked(&self, id: &str) -> SessionResult<LoadedSession> {
+        let meta = self.read_meta(id)?;
+        if meta.owner != StorageOwner::Native {
+            return Err(SessionStoreError::OwnershipConflict {
+                id: id.to_string(),
+                owner: meta.owner,
+                operation: "load native session",
+            });
+        }
+        let snapshot = self.load_snapshot(id)?;
+        let presentation = self.read_presentation(id)?;
+        Ok(LoadedSession {
+            meta,
+            snapshot,
+            presentation,
+        })
+    }
+
+    /// Inspect or explicitly repair the one safe incomplete-native state: valid
+    /// native metadata and snapshot with an absent presentation sidecar.
+    ///
+    /// Existing presentation bytes are never replaced. The caller must hold the
+    /// active session lease so a runtime cannot publish a concurrent aggregate.
+    pub fn repair_missing_presentation(
+        &self,
+        lease: &SessionLease,
+        apply: bool,
+    ) -> SessionResult<NativeSessionRepairOutcome> {
+        self.validate_active_lease(lease)?;
+        self.with_meta_lock(lease.id(), || {
+            let id = lease.id();
             let meta = self.read_meta(id)?;
             if meta.owner != StorageOwner::Native {
                 return Err(SessionStoreError::OwnershipConflict {
                     id: id.to_string(),
                     owner: meta.owner,
-                    operation: "load native session",
+                    operation: "repair missing presentation",
                 });
             }
             let snapshot = self.load_snapshot(id)?;
-            let presentation = self.read_presentation(id)?;
-            Ok(LoadedSession {
-                meta,
-                snapshot,
-                presentation,
-            })
+            let presentation_path = self.presentation_path(id)?;
+            match self.read_presentation(id) {
+                Ok(presentation) => Ok(NativeSessionRepairOutcome::Healthy(LoadedSession {
+                    meta,
+                    snapshot,
+                    presentation,
+                })),
+                Err(SessionStoreError::NotFound { path }) if path == presentation_path => {
+                    if !apply {
+                        return Ok(NativeSessionRepairOutcome::RepairableMissingPresentation {
+                            meta,
+                            snapshot,
+                        });
+                    }
+                    self.write_presentation_unlocked(id, &PresentationFile::default())?;
+                    self.load_native_session_unlocked(id)
+                        .map(NativeSessionRepairOutcome::Repaired)
+                }
+                Err(error) => Err(error),
+            }
         })
     }
 
@@ -4427,6 +4484,70 @@ mod tests {
         assert_eq!(mgr.read_presentation("s1").unwrap(), presentation);
         assert_eq!(mgr.read_meta("s1").unwrap(), meta);
         assert!(!stale.exists());
+    }
+
+    #[test]
+    fn missing_presentation_repair_is_explicit_and_reloads_a_strict_aggregate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let snapshot = snap(&["kept"]);
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &lease,
+            Some(&snapshot),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+
+        std::fs::remove_file(mgr.presentation_path("s1").unwrap()).unwrap();
+        assert!(matches!(
+            mgr.repair_missing_presentation(&lease, false).unwrap(),
+            NativeSessionRepairOutcome::RepairableMissingPresentation { .. }
+        ));
+        assert!(!mgr.presentation_path("s1").unwrap().exists());
+
+        let repaired = mgr.repair_missing_presentation(&lease, true).unwrap();
+        assert!(matches!(repaired, NativeSessionRepairOutcome::Repaired(_)));
+        assert_eq!(mgr.load_native_session("s1").unwrap().snapshot, snapshot);
+        assert_eq!(
+            mgr.read_presentation("s1").unwrap(),
+            PresentationFile::default()
+        );
+        assert!(matches!(
+            mgr.repair_missing_presentation(&lease, true).unwrap(),
+            NativeSessionRepairOutcome::Healthy(_)
+        ));
+    }
+
+    #[test]
+    fn missing_presentation_repair_never_overwrites_corrupt_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let snapshot = snap(&["kept"]);
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &lease,
+            Some(&snapshot),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        let path = mgr.presentation_path("s1").unwrap();
+        std::fs::write(&path, b"corrupt presentation").unwrap();
+
+        assert!(matches!(
+            mgr.repair_missing_presentation(&lease, true),
+            Err(SessionStoreError::Corrupt {
+                kind: "presentation",
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), b"corrupt presentation");
     }
 
     #[test]

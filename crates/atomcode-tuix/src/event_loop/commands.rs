@@ -62,8 +62,9 @@ fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
 /// gesture triggers. Kicks off an async catalog refresh; the runtime replies
 /// with `RewindCatalogRefreshed`, which the main loop turns into the Rewind
 /// modal (or a "no rewind points" notice) via `install_pending_rewind_modal`.
-/// Idle-only: rewinding mutates conversation + files, so it must not race a
-/// running turn (mirrors the double-Esc gate and `dispatch_undo`).
+/// Idle-only: rewinding mutates conversation history, so it must not race a
+/// running turn (mirrors the double-Esc gate and `dispatch_undo`). Workspace/code
+/// Rewind is disabled in v5.0.4.
 pub(super) fn dispatch_rewind(state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
     if state.phase != crate::state::UiPhase::Idle {
         renderer.render(UiLine::CommandOutput(t(Msg::CmdRewindBusy).into_owned()));

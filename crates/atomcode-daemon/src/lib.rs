@@ -2367,6 +2367,239 @@ fn classify_delete_session_error(error: &anyhow::Error) -> (StatusCode, Json<Api
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct RepairSessionRequest {
+    #[serde(default)]
+    pub apply: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RepairSessionResponse {
+    pub success: bool,
+    pub status: &'static str,
+    pub applied: bool,
+    pub metadata: &'static str,
+    pub snapshot: &'static str,
+    pub presentation: &'static str,
+    pub transcript: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<usize>,
+}
+
+fn transcript_state(manager: &NativeSessionManager, id: &str) -> &'static str {
+    let Ok(path) = manager.jsonl_path(id) else {
+        return "invalid";
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => "unsafe",
+        Ok(metadata) if metadata.len() == 0 => "empty",
+        Ok(_) => "present",
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing",
+        Err(_) => "unreadable",
+    }
+}
+
+fn repair_session_file(
+    project_hash: &str,
+    session_id: &str,
+    apply: bool,
+) -> Result<RepairSessionResponse, RepairSessionFailure> {
+    let manager =
+        NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(project_hash));
+    repair_session_with_manager(&manager, session_id, apply).map_err(|error| RepairSessionFailure {
+        transcript: transcript_state(&manager, session_id),
+        error,
+    })
+}
+
+#[derive(Debug)]
+struct RepairSessionFailure {
+    error: SessionStoreError,
+    transcript: &'static str,
+}
+
+fn repair_session_with_manager(
+    manager: &NativeSessionManager,
+    session_id: &str,
+    apply: bool,
+) -> Result<RepairSessionResponse, SessionStoreError> {
+    let lease = manager.acquire_lease(session_id)?;
+    let outcome = manager.repair_missing_presentation(&lease, apply)?;
+    let transcript = transcript_state(manager, session_id);
+    use atomcode_capabilities::session::NativeSessionRepairOutcome as Outcome;
+    let (status, applied, presentation, message_count) = match outcome {
+        Outcome::Healthy(session) => ("healthy", false, "valid", session.snapshot.messages.len()),
+        Outcome::RepairableMissingPresentation { snapshot, .. } => (
+            "repairable_missing_presentation",
+            false,
+            "missing",
+            snapshot.messages.len(),
+        ),
+        Outcome::Repaired(session) => ("repaired", true, "valid", session.snapshot.messages.len()),
+    };
+    Ok(RepairSessionResponse {
+        success: true,
+        status,
+        applied,
+        metadata: "valid",
+        snapshot: "valid",
+        presentation,
+        transcript,
+        message_count: Some(message_count),
+    })
+}
+
+fn repair_artifact_kind(error: &SessionStoreError) -> Option<(&'static str, &'static str)> {
+    fn normalize(kind: &str) -> Option<&'static str> {
+        if matches!(kind, "session meta" | "meta turn stats" | "metadata") {
+            Some("metadata")
+        } else if kind.starts_with("snapshot") {
+            Some("snapshot")
+        } else if kind.starts_with("presentation") {
+            Some("presentation")
+        } else {
+            None
+        }
+    }
+
+    match error {
+        SessionStoreError::NotFound { path } => match path.extension().and_then(|ext| ext.to_str())
+        {
+            Some("snapshot") => Some(("snapshot", "missing")),
+            Some("presentation") => Some(("presentation", "missing")),
+            _ => None,
+        },
+        SessionStoreError::Corrupt { kind, .. } => normalize(kind).map(|kind| (kind, "corrupt")),
+        SessionStoreError::FutureSchema { kind, .. } => {
+            normalize(kind).map(|kind| (kind, "future_schema"))
+        }
+        SessionStoreError::TooLarge { kind, .. } => normalize(kind).map(|kind| (kind, "too_large")),
+        SessionStoreError::UnsafeFile { path, .. } => {
+            match path.extension().and_then(|ext| ext.to_str()) {
+                Some("meta") => Some(("metadata", "unsafe")),
+                Some("snapshot") => Some(("snapshot", "unsafe")),
+                Some("presentation") => Some(("presentation", "unsafe")),
+                _ => None,
+            }
+        }
+        SessionStoreError::OwnershipConflict { .. } => Some(("metadata", "non_native_owner")),
+        _ => None,
+    }
+}
+
+fn not_repairable_response(
+    artifact: &'static str,
+    state: &'static str,
+    transcript: &'static str,
+) -> RepairSessionResponse {
+    let mut response = RepairSessionResponse {
+        success: false,
+        status: "not_repairable",
+        applied: false,
+        metadata: "valid",
+        snapshot: "valid",
+        presentation: "valid",
+        transcript,
+        message_count: None,
+    };
+    match artifact {
+        "metadata" | "meta" => {
+            response.metadata = state;
+            response.snapshot = "unchecked";
+            response.presentation = "unchecked";
+        }
+        "snapshot" => {
+            response.snapshot = state;
+            response.presentation = "unchecked";
+        }
+        "presentation" => response.presentation = state,
+        _ => {
+            response.metadata = "unchecked";
+            response.snapshot = "unchecked";
+            response.presentation = "unchecked";
+        }
+    }
+    response
+}
+
+fn classify_repair_session_error(
+    error: &SessionStoreError,
+    transcript: &'static str,
+) -> axum::response::Response {
+    match error {
+        SessionStoreError::SessionInUse { .. } => delete_session_api_error(
+            StatusCode::CONFLICT,
+            "SESSION_IN_USE",
+            "This session is active. Switch to or create another session, then try again.",
+        )
+        .into_response(),
+        SessionStoreError::NotFound { path }
+            if path.extension().and_then(|ext| ext.to_str()) == Some("meta") =>
+        {
+            delete_session_api_error(
+                StatusCode::NOT_FOUND,
+                "SESSION_NOT_FOUND",
+                "The session metadata was not found.",
+            )
+            .into_response()
+        }
+        SessionStoreError::InvalidId { .. } | SessionStoreError::AmbiguousId { .. } => {
+            delete_session_api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_SESSION",
+                "The project or session identifier is invalid.",
+            )
+            .into_response()
+        }
+        _ if repair_artifact_kind(error).is_some() => {
+            let (artifact, state) = repair_artifact_kind(error).expect("guarded above");
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(not_repairable_response(artifact, state, transcript)),
+            )
+                .into_response()
+        }
+        _ => delete_session_api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "REPAIR_FAILED",
+            "Failed to inspect or repair the session. Check the AtomCode logs for details.",
+        )
+        .into_response(),
+    }
+}
+
+/// POST /projects/:hash/sessions/:id/repair - Inspect or explicitly repair a session.
+async fn repair_session(
+    Path((hash, id)): Path<(String, String)>,
+    Json(request): Json<RepairSessionRequest>,
+) -> impl IntoResponse {
+    if !valid_project_bucket(&hash) {
+        return delete_session_api_error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_SESSION",
+            "The project or session identifier is invalid.",
+        )
+        .into_response();
+    }
+    let task = tokio::task::spawn_blocking(move || repair_session_file(&hash, &id, request.apply));
+    match task.await {
+        Ok(Ok(response)) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(Err(failure)) => {
+            tracing::warn!(error = %failure.error, "session repair was rejected");
+            classify_repair_session_error(&failure.error, failure.transcript)
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "session repair task failed");
+            delete_session_api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "REPAIR_FAILED",
+                "Failed to inspect or repair the session. Check the AtomCode logs for details.",
+            )
+            .into_response()
+        }
+    }
+}
+
 /// DELETE /projects/:hash/sessions/:id - Delete a session
 async fn delete_session(
     State(state): State<AppState>,
@@ -5257,6 +5490,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             get(get_session_detail).delete(delete_session),
         )
         .route("/projects/:hash/sessions/:id/rename", patch(rename_session))
+        .route("/projects/:hash/sessions/:id/repair", post(repair_session))
         // Model API
         .route("/models", get(get_models))
         // Chat API
@@ -5409,6 +5643,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         println!("  GET    /projects/:hash/sessions/:id    - Get session detail");
         println!("  DELETE /projects/:hash/sessions/:id    - Delete a session");
         println!("  PATCH  /projects/:hash/sessions/:id/rename - Rename a session");
+        println!("  POST   /projects/:hash/sessions/:id/repair - Inspect or repair a session");
         println!("  GET    /sessions                       - List all sessions (cross-project)");
         println!("  GET    /sessions/search?q=<keyword>    - Search sessions by name");
         println!("  GET    /models                         - List available models");
@@ -5633,9 +5868,15 @@ mod tests {
 
         let models = models_from_config(&config);
         let ids: Vec<&str> = models.iter().map(|m| m.provider.as_str()).collect();
-        assert!(ids.contains(&"AtomGit-GLM-5.2"), "new-schema model listed: {ids:?}");
+        assert!(
+            ids.contains(&"AtomGit-GLM-5.2"),
+            "new-schema model listed: {ids:?}"
+        );
         assert!(ids.contains(&"AtomGit-Qwen"), "{ids:?}");
-        let glm = models.iter().find(|m| m.provider == "AtomGit-GLM-5.2").unwrap();
+        let glm = models
+            .iter()
+            .find(|m| m.provider == "AtomGit-GLM-5.2")
+            .unwrap();
         assert!(glm.is_default, "effective selection is the default");
         assert_eq!(glm.model, "GLM-5.2");
     }
@@ -5656,7 +5897,11 @@ mod tests {
         let ids: Vec<&str> = models.iter().map(|m| m.provider.as_str()).collect();
         assert!(ids.contains(&"claude") && ids.contains(&"glm"), "{ids:?}");
         assert!(
-            models.iter().find(|m| m.provider == "claude").unwrap().is_default,
+            models
+                .iter()
+                .find(|m| m.provider == "claude")
+                .unwrap()
+                .is_default,
             "default_provider maps to the default selection"
         );
     }
@@ -5697,6 +5942,133 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body.code.as_deref(), Some("DELETE_FAILED"));
         assert!(!body.error.contains("unexpected storage failure"));
+    }
+
+    #[test]
+    fn session_repair_dry_run_does_not_write_and_apply_restores_strict_load() {
+        use atomcode_capabilities::session::{PresentationFile, SessionMeta, StorageOwner};
+        use atomcode_kernel::message::{Message, SessionSnapshot};
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = NativeSessionManager::with_root(dir.path());
+        let lease = manager.acquire_lease("s1").unwrap();
+        let snapshot = SessionSnapshot::new(vec![Message::user("recover me")]);
+        let mut meta = SessionMeta::new("s1", "/project", 1);
+        meta.owner = StorageOwner::Native;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        assert!(matches!(
+            repair_session_with_manager(&manager, "s1", false),
+            Err(SessionStoreError::SessionInUse { .. })
+        ));
+        drop(lease);
+        std::fs::remove_file(manager.presentation_path("s1").unwrap()).unwrap();
+
+        let inspected = repair_session_with_manager(&manager, "s1", false).unwrap();
+        assert_eq!(inspected.status, "repairable_missing_presentation");
+        assert!(!inspected.applied);
+        assert_eq!(inspected.metadata, "valid");
+        assert_eq!(inspected.snapshot, "valid");
+        assert_eq!(inspected.presentation, "missing");
+        assert_eq!(inspected.message_count, Some(1));
+        assert_eq!(inspected.transcript, "missing");
+        assert!(!manager.presentation_path("s1").unwrap().exists());
+
+        let repaired = repair_session_with_manager(&manager, "s1", true).unwrap();
+        assert_eq!(repaired.status, "repaired");
+        assert!(repaired.applied);
+        assert_eq!(
+            manager.load_native_session("s1").unwrap().snapshot,
+            snapshot
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_session_repair_error_is_non_destructive_and_redacted() {
+        let error = SessionStoreError::Corrupt {
+            kind: "presentation",
+            message: "private corrupt bytes".into(),
+        };
+        let response = classify_repair_session_error(&error, "missing");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "not_repairable");
+        assert_eq!(body["metadata"], "valid");
+        assert_eq!(body["snapshot"], "valid");
+        assert_eq!(body["presentation"], "corrupt");
+        assert_eq!(body["transcript"], "missing");
+        assert!(!String::from_utf8_lossy(&bytes).contains("private corrupt bytes"));
+    }
+
+    #[tokio::test]
+    async fn missing_snapshot_is_not_misreported_as_a_missing_session() {
+        let response = classify_repair_session_error(
+            &SessionStoreError::NotFound {
+                path: PathBuf::from("existing.snapshot"),
+            },
+            "present",
+        );
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "not_repairable");
+        assert_eq!(body["metadata"], "valid");
+        assert_eq!(body["snapshot"], "missing");
+        assert_eq!(body["presentation"], "unchecked");
+        assert_eq!(body["transcript"], "present");
+    }
+
+    #[tokio::test]
+    async fn real_metadata_error_kinds_are_structured_as_not_repairable() {
+        let cases = [
+            (
+                SessionStoreError::Corrupt {
+                    kind: "session meta",
+                    message: "bad json".into(),
+                },
+                "corrupt",
+            ),
+            (
+                SessionStoreError::FutureSchema {
+                    kind: "session meta",
+                    found: 9,
+                    supported: 1,
+                },
+                "future_schema",
+            ),
+            (
+                SessionStoreError::TooLarge {
+                    kind: "session meta",
+                    limit: 10,
+                    actual: 11,
+                },
+                "too_large",
+            ),
+        ];
+
+        for (error, expected_state) in cases {
+            let response = classify_repair_session_error(&error, "missing");
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["status"], "not_repairable");
+            assert_eq!(body["metadata"], expected_state);
+            assert_eq!(body["snapshot"], "unchecked");
+            assert_eq!(body["presentation"], "unchecked");
+        }
     }
 
     struct ScopedChatHome {

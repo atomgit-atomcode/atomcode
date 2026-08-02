@@ -976,9 +976,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescMemory => "Show all saved memories".into(),
         Msg::CmdDescMcp => "Show MCP server status (subcommand: reload)".into(),
         Msg::CmdDescUndo => "Undo: roll conversation memory back a turn (/undo or /undo N)".into(),
-        Msg::CmdDescRewind => {
-            "Rewind: restore the conversation (and files) to an earlier checkpoint".into()
-        }
+        Msg::CmdDescRewind => "Rewind: restore the conversation to an earlier checkpoint".into(),
         Msg::CmdDescWorktree => "Git worktree isolation (create/list/done/cleanup)".into(),
         Msg::CmdDescUpgrade => "Upgrade atomcode to latest (subcommand: rollback)".into(),
         Msg::CmdDescPlan => "Switch to Plan mode (read-only exploration)".into(),

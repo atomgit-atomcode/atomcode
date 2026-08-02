@@ -40,8 +40,14 @@ impl RewindLedger {
         }
         let mut previous_turn = 0;
         for point in &self.points {
-            validate_object_id(&point.before_tree).map_err(|error| error.to_string())?;
-            validate_object_id(&point.after_tree).map_err(|error| error.to_string())?;
+            match (&point.before_tree, &point.after_tree) {
+                (Some(before), Some(after)) => {
+                    validate_object_id(before).map_err(|error| error.to_string())?;
+                    validate_object_id(after).map_err(|error| error.to_string())?;
+                }
+                (None, None) => {}
+                _ => return Err("rewind point has only one workspace tree".into()),
+            }
             if point.turn_id == 0 || point.turn_id <= previous_turn {
                 return Err("rewind turn ids are not strictly increasing".into());
             }
@@ -64,8 +70,13 @@ pub struct RewindPoint {
     pub turn_id: u64,
     pub prompt_number: usize,
     pub prompt_preview: String,
-    pub before_tree: String,
-    pub after_tree: String,
+    /// Workspace trees are optional so conversation-only Rewind points do not
+    /// require a filesystem snapshot. Older ledgers deserialize their string
+    /// values as `Some`, while v5.0.4 writes `None` for both fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_tree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_tree: Option<String>,
     pub files: Vec<FileChangeSummary>,
 }
 
@@ -203,6 +214,95 @@ impl WorkspaceCheckpoint {
             .join(bucket)
             .join(session_id);
         Self::with_store(worktree, git_dir)
+    }
+
+    /// Open an already-existing v1 store only for crash recovery. This never
+    /// initializes a Git directory or publishes new checkpoint objects, so the
+    /// v5.0.4 safety stop remains in force for ordinary turns.
+    pub(crate) fn for_session_recovery(
+        worktree: &Path,
+        session_id: &str,
+    ) -> Result<Self, WorkspaceCheckpointError> {
+        let requested =
+            fs::canonicalize(worktree).map_err(|source| WorkspaceCheckpointError::Io {
+                path: worktree.to_path_buf(),
+                source,
+            })?;
+        let worktree = git_worktree_root(&requested)?;
+        let safe_session = session_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'));
+        if !safe_session {
+            return Err(WorkspaceCheckpointError::InvalidPath(session_id.into()));
+        }
+        let git_dir = super::config_dir()
+            .join("rewind")
+            .join(super::SessionManager::project_hash(&worktree))
+            .join(session_id);
+        let regular_file = |path: &Path| {
+            fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+        };
+        let regular_dir = |path: &Path| {
+            fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+        };
+        if !regular_dir(&git_dir)
+            || !regular_file(&git_dir.join("HEAD"))
+            || !regular_dir(&git_dir.join("objects"))
+        {
+            return Err(WorkspaceCheckpointError::Unsupported(format!(
+                "legacy rewind store is unavailable at {}",
+                git_dir.display()
+            )));
+        }
+        let marker = git_dir.join("atomcode-rewind-version");
+        if !regular_file(&marker) {
+            return Err(WorkspaceCheckpointError::Unsupported(format!(
+                "legacy rewind store marker is unsafe at {}",
+                marker.display()
+            )));
+        }
+        let version =
+            fs::read_to_string(&marker).map_err(|source| WorkspaceCheckpointError::Io {
+                path: marker,
+                source,
+            })?;
+        if version != STORE_VERSION {
+            return Err(WorkspaceCheckpointError::Unsupported(format!(
+                "unsupported legacy rewind store version {version:?}"
+            )));
+        }
+        let process_lock_path = git_dir.join("operation.lock");
+        match fs::symlink_metadata(&process_lock_path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(WorkspaceCheckpointError::Unsupported(format!(
+                    "legacy rewind operation lock is unsafe at {}",
+                    process_lock_path.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(WorkspaceCheckpointError::Io {
+                    path: process_lock_path,
+                    source,
+                })
+            }
+        }
+        let process_lock = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&process_lock_path)
+            .map_err(|source| WorkspaceCheckpointError::Io {
+                path: process_lock_path,
+                source,
+            })?;
+        Ok(Self {
+            worktree,
+            git_dir,
+            lock: Mutex::new(()),
+            process_lock,
+        })
     }
 
     pub fn with_store(
@@ -366,12 +466,16 @@ impl WorkspaceCheckpoint {
             let mut wanted = BTreeSet::new();
             let mut updates = Vec::new();
             for point in points {
-                validate_object_id(&point.before_tree)?;
-                validate_object_id(&point.after_tree)?;
+                let (Some(before_tree), Some(after_tree)) = (&point.before_tree, &point.after_tree)
+                else {
+                    continue;
+                };
+                validate_object_id(before_tree)?;
+                validate_object_id(after_tree)?;
                 let before_ref = format!("refs/atomcode/turn-{}/before", point.turn_id);
                 let after_ref = format!("refs/atomcode/turn-{}/after", point.turn_id);
-                updates.push(format!("update {before_ref} {}\n", point.before_tree));
-                updates.push(format!("update {after_ref} {}\n", point.after_tree));
+                updates.push(format!("update {before_ref} {before_tree}\n"));
+                updates.push(format!("update {after_ref} {after_tree}\n"));
                 wanted.insert(before_ref);
                 wanted.insert(after_ref);
             }
@@ -423,7 +527,7 @@ impl WorkspaceCheckpoint {
             source,
         })?;
         if !self.git_dir.join("HEAD").exists() {
-            let output = Command::new("git")
+            let output = git_command()
                 .arg("init")
                 .arg("--bare")
                 .arg("--quiet")
@@ -617,7 +721,7 @@ impl WorkspaceCheckpoint {
         &self,
         args: impl IntoIterator<Item = String>,
     ) -> Result<Output, WorkspaceCheckpointError> {
-        let output = Command::new("git")
+        let output = git_command()
             .arg("--git-dir")
             .arg(&self.git_dir)
             .arg("--work-tree")
@@ -637,7 +741,7 @@ impl WorkspaceCheckpoint {
         args: [&str; N],
         input: &[u8],
     ) -> Result<Output, WorkspaceCheckpointError> {
-        let mut child = Command::new("git")
+        let mut child = git_command()
             .arg("--git-dir")
             .arg(&self.git_dir)
             .arg("--work-tree")
@@ -676,7 +780,7 @@ impl WorkspaceCheckpoint {
         &self,
         args: [&str; N],
     ) -> Result<Vec<String>, WorkspaceCheckpointError> {
-        let output = Command::new("git")
+        let output = git_command()
             .arg("-C")
             .arg(&self.worktree)
             .args(args)
@@ -695,6 +799,12 @@ impl WorkspaceCheckpoint {
     }
 }
 
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    crate::process_utils::suppress_console_window_sync(&mut command);
+    command
+}
+
 fn checked(output: Output, operation: &'static str) -> Result<Output, WorkspaceCheckpointError> {
     if output.status.success() {
         Ok(output)
@@ -707,7 +817,7 @@ fn checked(output: Output, operation: &'static str) -> Result<Output, WorkspaceC
 }
 
 fn ensure_git_worktree(path: &Path) -> Result<(), WorkspaceCheckpointError> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["-C"])
         .arg(path)
         .args(["rev-parse", "--is-inside-work-tree"])
@@ -726,7 +836,7 @@ fn ensure_git_worktree(path: &Path) -> Result<(), WorkspaceCheckpointError> {
 
 fn git_worktree_root(path: &Path) -> Result<PathBuf, WorkspaceCheckpointError> {
     ensure_git_worktree(path)?;
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--show-toplevel"])
@@ -783,7 +893,7 @@ mod tests {
     use super::*;
 
     fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
+        let output = git_command()
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -819,6 +929,63 @@ mod tests {
         let checkpoint =
             WorkspaceCheckpoint::with_store(worktree.path(), store.path().join("git")).unwrap();
         (worktree, store, checkpoint)
+    }
+
+    #[test]
+    fn ledger_accepts_conversation_only_points_and_legacy_tree_strings() {
+        let conversation_only = RewindLedger {
+            version: LEDGER_VERSION,
+            points: vec![RewindPoint {
+                turn_id: 1,
+                prompt_number: 1,
+                prompt_preview: "prompt".into(),
+                before_tree: None,
+                after_tree: None,
+                files: Vec::new(),
+            }],
+        };
+        conversation_only.validate().unwrap();
+        let encoded = serde_json::to_value(&conversation_only).unwrap();
+        assert!(encoded["points"][0].get("before_tree").is_none());
+
+        let legacy: RewindLedger = serde_json::from_value(serde_json::json!({
+            "version": LEDGER_VERSION,
+            "points": [{
+                "turn_id": 1,
+                "prompt_number": 1,
+                "prompt_preview": "legacy",
+                "before_tree": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "after_tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "files": []
+            }]
+        }))
+        .unwrap();
+        legacy.validate().unwrap();
+        assert!(legacy.points[0].before_tree.is_some());
+        assert!(legacy.points[0].after_tree.is_some());
+    }
+
+    #[test]
+    fn recovery_open_never_initializes_an_absent_store() {
+        let worktree = tempfile::tempdir().unwrap();
+        git(worktree.path(), &["init", "--quiet"]);
+        let root = fs::canonicalize(worktree.path()).unwrap();
+        let store = super::super::config_dir()
+            .join("rewind")
+            .join(super::super::SessionManager::project_hash(&root))
+            .join("absent-recovery-store");
+        assert!(!store.exists());
+
+        let error = match WorkspaceCheckpoint::for_session_recovery(
+            worktree.path(),
+            "absent-recovery-store",
+        ) {
+            Ok(_) => panic!("recovery must not initialize an absent store"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, WorkspaceCheckpointError::Unsupported(_)));
+        assert!(!store.exists());
     }
 
     #[test]
@@ -921,12 +1088,12 @@ mod tests {
             turn_id: 1,
             prompt_number: 1,
             prompt_preview: "change".into(),
-            before_tree: before.clone(),
-            after_tree: after.clone(),
+            before_tree: Some(before.clone()),
+            after_tree: Some(after.clone()),
             files: checkpoint.diff(&before, &after).unwrap(),
         };
         checkpoint.retain_points(&[point]).unwrap();
-        let output = Command::new("git")
+        let output = git_command()
             .arg("--git-dir")
             .arg(&checkpoint.git_dir)
             .args(["gc", "--prune=now", "--quiet"])

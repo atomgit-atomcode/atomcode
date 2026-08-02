@@ -616,8 +616,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         snapshot_persistence_status = Some(snapshot_hook.persistence_status());
         compaction_checkpoint = Some(snapshot_hook.clone());
         snapshot_hook_handle = Some(snapshot_hook.clone());
-        hooks.push(snapshot_hook);
-        hooks.push(Arc::new(TranscriptHook::new(b.manager.clone(), &b.id)));
+        hooks.push(snapshot_hook.clone());
+        hooks.push(Arc::new(
+            TranscriptHook::new(b.manager.clone(), &b.id)
+                .with_persistence_status(snapshot_hook.persistence_status()),
+        ));
     }
     // Status awareness is UNCONDITIONAL (production parity): a per-turn <system-reminder>
     // with date + round budget (NO context-usage gauge — pressure is handled silently by
