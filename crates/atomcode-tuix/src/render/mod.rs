@@ -555,6 +555,9 @@ pub struct StatusLine {
     /// Current recalled input-history position, shown on the input box's
     /// top rule only while Up/Down navigation is active.
     pub history: Option<HistoryPosition>,
+    /// Active Ctrl+R reverse-i-search state, shown on the input box's
+    /// top rule while searching. `None` outside search mode.
+    pub search: Option<SearchState>,
     /// Optional read-only command report rendered as a transient multi-line
     /// footer panel directly below the input box. It never enters scrollback.
     pub command_output: Option<String>,
@@ -636,6 +639,18 @@ pub struct StatusLine {
 pub struct HistoryPosition {
     pub current: usize,
     pub total: usize,
+}
+
+/// Live Ctrl+R reverse-i-search state, rendered on the input box's top
+/// rule while the user is searching input history. `current` is the
+/// 1-based position of the shown match among all `total` matches; when
+/// `matched` is false the query has no matches and `current` is 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchState {
+    pub query: String,
+    pub current: usize,
+    pub total: usize,
+    pub matched: bool,
 }
 
 /// Renderer-facing snapshot of the approval panel (mirrors how `TodoProgress`

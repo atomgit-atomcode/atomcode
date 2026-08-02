@@ -3776,6 +3776,13 @@ pub struct Buffer {
     /// that contained a folded paste survives a round-trip through
     /// history navigation. Mirrors `stash` for the paste registry.
     stash_pastes: Vec<String>,
+    /// True while Ctrl+R reverse-i-search is active. In this state keys
+    /// edit `search_query` (not `text`); `history_idx` doubles as the
+    /// index of the current match so attachment rehydration and menu
+    /// suppression behave exactly like Up/Down recall.
+    searching: bool,
+    /// The query being typed in reverse-i-search mode.
+    search_query: String,
 }
 
 /// Minimum line count or char count for a paste to fold into a
@@ -3802,6 +3809,8 @@ impl Buffer {
             stash: String::new(),
             pastes: Vec::new(),
             stash_pastes: Vec::new(),
+            searching: false,
+            search_query: String::new(),
         }
     }
 
@@ -3818,6 +3827,8 @@ impl Buffer {
         self.cursor = text.len();
         self.text = text;
         self.history_idx = None;
+        self.searching = false;
+        self.search_query.clear();
         self.menu_suppressed = true;
     }
 
@@ -3836,14 +3847,28 @@ impl Buffer {
     }
 
     /// True while the user is scrolling input history (Up/Down on an
-    /// empty / non-empty buffer). The slash-command menu suppresses
-    /// itself in this state so that recalling a previous `/session foo`
-    /// from history doesn't immediately re-pop the menu and trap Up
-    /// inside it. Cleared automatically by `Insert` / `Cancel` (typing
-    /// or Esc) and by `HistoryNext` returning past the newest entry
-    /// to the user's stashed draft.
+    /// empty / non-empty buffer) or running Ctrl+R reverse-i-search.
+    /// The slash-command menu suppresses itself in this state so that
+    /// recalling a previous `/session foo` from history doesn't
+    /// immediately re-pop the menu and trap Up inside it. Cleared
+    /// automatically by `Insert` / `Cancel` (typing or Esc) and by
+    /// `HistoryNext` returning past the newest entry to the user's
+    /// stashed draft.
     pub fn is_in_history(&self) -> bool {
-        self.history_idx.is_some()
+        self.history_idx.is_some() || self.searching
+    }
+
+    /// True while Ctrl+R reverse-i-search is active. While searching,
+    /// keys edit `search_query` rather than the buffer; `history_idx`
+    /// tracks the currently shown match.
+    pub fn is_searching(&self) -> bool {
+        self.searching
+    }
+
+    /// The query typed so far in reverse-i-search mode. Empty when not
+    /// searching.
+    pub fn search_query(&self) -> &str {
+        &self.search_query
     }
 
     /// The index into history of the entry currently being displayed,
@@ -3957,6 +3982,12 @@ impl Buffer {
         // restore, so editing / navigating a restored `/command` reopens the
         // command list as usual.
         self.menu_suppressed = false;
+        // Ctrl+R reverse-i-search owns the keys while active: typing edits
+        // the query, Ctrl+R steps to the next older match, Enter accepts the
+        // current match into the buffer, Esc restores the pre-search draft.
+        if self.searching {
+            return self.apply_search(action, history, commands);
+        }
         match action {
             Action::Insert(c) => {
                 self.text.insert(self.cursor, c);
@@ -4083,6 +4114,24 @@ impl Buffer {
                 self.cursor = end;
                 BufferResult::Redraw
             }
+            Action::HistorySearch => {
+                // Enter Ctrl+R reverse-i-search. The current draft is
+                // stashed so Esc restores it; `search_query` seeds from the
+                // draft (readline-style: Ctrl+R on a non-empty line searches
+                // for what you already typed, and an empty line shows the
+                // most recent entry). `history_idx` doubles as the index of
+                // the currently shown match, so attachment rehydration and
+                // slash-menu suppression behave exactly like Up/Down recall.
+                if history.is_empty() {
+                    return BufferResult::Redraw;
+                }
+                self.stash = self.text.clone();
+                self.stash_pastes = self.pastes.clone();
+                self.searching = true;
+                self.search_query = self.text.clone();
+                self.search_jump_newest(history);
+                BufferResult::Redraw
+            }
             Action::HistoryPrev => {
                 if history.is_empty() {
                     return BufferResult::Redraw;
@@ -4162,6 +4211,107 @@ impl Buffer {
             Action::NoOp => BufferResult::NoOp,
             Action::ToggleToolOutput => BufferResult::NoOp,
         }
+    }
+
+    /// Ctrl+R reverse-i-search key handling. Runs while `searching` is
+    /// true; printable keys edit `search_query` rather than the buffer,
+    /// and the buffer mirrors the currently matched history entry.
+    fn apply_search(
+        &mut self,
+        action: Action,
+        history: &[crate::input::history::HistoryEntry],
+        commands: &CommandRegistry,
+    ) -> BufferResult {
+        match action {
+            Action::Insert(c) => {
+                self.search_query.push(c);
+                self.search_jump_newest(history);
+                BufferResult::Redraw
+            }
+            Action::Backspace => {
+                self.search_query.pop();
+                self.search_jump_newest(history);
+                BufferResult::Redraw
+            }
+            // Ctrl+R again while searching: step to the next OLDER match.
+            Action::HistorySearch => {
+                self.search_jump_older(history);
+                BufferResult::Redraw
+            }
+            // Enter accepts the current match into the buffer and leaves
+            // search mode; a second Enter then submits normally.
+            Action::Submit => {
+                self.searching = false;
+                self.search_query.clear();
+                self.cursor = self.text.len();
+                BufferResult::Redraw
+            }
+            // Esc restores the pre-search draft.
+            Action::Cancel => {
+                self.searching = false;
+                self.search_query.clear();
+                self.history_idx = None;
+                self.text = self.stash.clone();
+                self.pastes = self.stash_pastes.clone();
+                self.cursor = self.text.len();
+                BufferResult::Redraw
+            }
+            // Any other key leaves search mode first, then applies
+            // normally (arrows, Ctrl+U, etc. keep working on the
+            // accepted text).
+            _ => {
+                self.searching = false;
+                self.search_query.clear();
+                self.apply(action, history, commands)
+            }
+        }
+    }
+
+    /// Jump the buffer to the newest history entry whose text contains
+    /// `search_query` (case-insensitive). When nothing matches, the
+    /// buffer keeps the query text itself so the user can see what they
+    /// typed; an empty query matches every entry, so the most recent
+    /// one is shown (readline behaviour).
+    fn search_jump_newest(&mut self, history: &[crate::input::history::HistoryEntry]) {
+        let q = self.search_query.to_lowercase();
+        let hit = (0..history.len())
+            .rev()
+            .find(|&i| history[i].text.to_lowercase().contains(&q));
+        match hit {
+            Some(i) => self.search_show(history, i),
+            None => {
+                self.history_idx = None;
+                self.text = self.search_query.clone();
+                self.pastes.clear();
+                self.cursor = self.text.len();
+            }
+        }
+    }
+
+    /// Step to the next OLDER history entry matching `search_query`,
+    /// starting just before the currently shown match. No-op when the
+    /// current match is already the oldest one.
+    fn search_jump_older(&mut self, history: &[crate::input::history::HistoryEntry]) {
+        let q = self.search_query.to_lowercase();
+        let start = match self.history_idx {
+            Some(i) if i > 0 => i - 1,
+            _ => return, // no current match, or already at the oldest entry
+        };
+        for i in (0..=start).rev() {
+            if history[i].text.to_lowercase().contains(&q) {
+                self.search_show(history, i);
+                return;
+            }
+        }
+    }
+
+    /// Display history entry `i` as the current search match: rehydrate
+    /// text + paste registry and park the cursor (mirrors HistoryPrev).
+    fn search_show(&mut self, history: &[crate::input::history::HistoryEntry], i: usize) {
+        self.history_idx = Some(i);
+        self.text = history[i].text.clone();
+        self.pastes = history[i].pastes.clone();
+        self.cursor = 0;
     }
 
     /// Try to move the cursor up one logical line, preserving the
@@ -5693,6 +5843,289 @@ mod menu_tests {
         assert_eq!(buf.text, "/session foo");
         assert_eq!(buf.cursor, 0, "cursor must park at 0 to suppress menu");
         assert!(buf.is_in_history(), "buffer must report history mode");
+    }
+
+    #[test]
+    fn history_search_enters_mode_and_shows_newest_match() {
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec![
+            crate::input::history::HistoryEntry {
+                text: "git push origin main".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+            crate::input::history::HistoryEntry {
+                text: "git status".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+            crate::input::history::HistoryEntry {
+                text: "cargo test".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+        ];
+
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+
+        assert!(buf.is_searching(), "Ctrl+R enters search mode");
+        assert_eq!(buf.search_query(), "");
+        assert_eq!(
+            buf.text, "cargo test",
+            "empty query shows the most recent entry"
+        );
+        assert_eq!(buf.history_idx(), Some(2));
+        assert!(buf.is_in_history(), "search suppresses the slash menu");
+        // Draft (empty) was stashed so Esc can restore it.
+        let _ = buf.apply(Action::Cancel, &history, &reg);
+        assert!(!buf.is_searching());
+        assert_eq!(buf.text, "");
+    }
+
+    #[test]
+    fn history_search_seeds_query_from_draft() {
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec![
+            crate::input::history::HistoryEntry {
+                text: "fix the typo".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+            crate::input::history::HistoryEntry {
+                text: "fix the build".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+        ];
+
+        // User typed a partial draft before pressing Ctrl+R — readline
+        // seeds the search query with it.
+        for c in "fix".chars() {
+            let _ = buf.apply(Action::Insert(c), &history, &reg);
+        }
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+
+        assert!(buf.is_searching());
+        assert_eq!(buf.search_query(), "fix");
+        assert_eq!(
+            buf.text, "fix the build",
+            "seeded query jumps to the newest matching entry"
+        );
+    }
+
+    #[test]
+    fn history_search_typing_filters_live() {
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec![
+            crate::input::history::HistoryEntry {
+                text: "git status".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+            crate::input::history::HistoryEntry {
+                text: "git stash".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+        ];
+
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+        // Type "stat" — narrows to the only entry containing it
+        // ("git stash" has no "stat").
+        for c in "stat".chars() {
+            let _ = buf.apply(Action::Insert(c), &history, &reg);
+        }
+        assert_eq!(buf.search_query(), "stat");
+        assert_eq!(buf.text, "git status");
+        assert_eq!(buf.history_idx(), Some(0));
+
+        // Backspace widens the match set again: "sta" ALSO matches the
+        // NEWER "git stash", so the jump lands on the newest match.
+        let _ = buf.apply(Action::Backspace, &history, &reg);
+        assert_eq!(buf.search_query(), "sta");
+        assert_eq!(buf.text, "git stash", "back to newest entry containing 'sta'");
+
+        // Backspace again keeps the newest match ("git stash" still
+        // contains "st").
+        let _ = buf.apply(Action::Backspace, &history, &reg);
+        assert_eq!(buf.search_query(), "st");
+        assert_eq!(buf.text, "git stash");
+    }
+
+    #[test]
+    fn history_search_ctrl_r_steps_to_older_match() {
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec![
+            crate::input::history::HistoryEntry {
+                text: "git log --oneline".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+            crate::input::history::HistoryEntry {
+                text: "git status".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+            crate::input::history::HistoryEntry {
+                text: "git push origin main".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+        ];
+
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+        for c in "git".chars() {
+            let _ = buf.apply(Action::Insert(c), &history, &reg);
+        }
+        assert_eq!(buf.text, "git push origin main", "newest match first");
+
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+        assert_eq!(buf.text, "git status", "second Ctrl+R steps older");
+        assert_eq!(buf.history_idx(), Some(1));
+
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+        assert_eq!(buf.text, "git log --oneline", "third Ctrl+R steps older");
+        assert_eq!(buf.history_idx(), Some(0));
+
+        // Already at the oldest match — further Ctrl+R is a no-op.
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+        assert_eq!(buf.text, "git log --oneline");
+    }
+
+    #[test]
+    fn history_search_is_case_insensitive() {
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec![crate::input::history::HistoryEntry {
+            text: "Build the Agent".into(),
+            images: vec![],
+            pastes: vec![],
+        }];
+
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+        for c in "build".chars() {
+            let _ = buf.apply(Action::Insert(c), &history, &reg);
+        }
+        assert_eq!(buf.text, "Build the Agent");
+    }
+
+    #[test]
+    fn history_search_no_match_keeps_query_visible() {
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec![crate::input::history::HistoryEntry {
+            text: "cargo test".into(),
+            images: vec![],
+            pastes: vec![],
+        }];
+
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+        for c in "zzz".chars() {
+            let _ = buf.apply(Action::Insert(c), &history, &reg);
+        }
+        assert!(buf.is_searching(), "still searching on no match");
+        assert_eq!(buf.history_idx(), None);
+        assert_eq!(buf.text, "zzz", "query stays visible when nothing matches");
+    }
+
+    #[test]
+    fn history_search_submit_accepts_match_into_buffer() {
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec![
+            crate::input::history::HistoryEntry {
+                text: "fix the typo".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+            crate::input::history::HistoryEntry {
+                text: "fix the build".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+        ];
+
+        for c in "fix".chars() {
+            let _ = buf.apply(Action::Insert(c), &history, &reg);
+        }
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+
+        let result = buf.apply(Action::Submit, &history, &reg);
+        assert!(matches!(result, BufferResult::Redraw), "Enter accepts, not commits");
+        assert!(!buf.is_searching(), "search mode ends on Enter");
+        assert_eq!(buf.text, "fix the build", "match stays in the buffer");
+        assert_eq!(
+            buf.cursor,
+            buf.text.len(),
+            "cursor moves to end so the user can review and hit Enter again"
+        );
+
+        // A second Enter submits normally.
+        let result = buf.apply(Action::Submit, &history, &reg);
+        assert!(matches!(result, BufferResult::Commit(line) if line == "fix the build"));
+    }
+
+    #[test]
+    fn history_search_esc_restores_stashed_draft() {
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec![crate::input::history::HistoryEntry {
+            text: "git status".into(),
+            images: vec![],
+            pastes: vec![],
+        }];
+
+        // Type a draft, then search for something else.
+        for c in "my draft".chars() {
+            let _ = buf.apply(Action::Insert(c), &history, &reg);
+        }
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+        // The draft seeds the search query (readline behaviour); clear it
+        // with Backspace so we can search for a different term.
+        for _ in 0.."my draft".chars().count() {
+            let _ = buf.apply(Action::Backspace, &history, &reg);
+        }
+        assert_eq!(buf.search_query(), "");
+        for c in "git".chars() {
+            let _ = buf.apply(Action::Insert(c), &history, &reg);
+        }
+        assert_eq!(buf.text, "git status");
+
+        let _ = buf.apply(Action::Cancel, &history, &reg);
+        assert!(!buf.is_searching());
+        assert_eq!(buf.text, "my draft", "Esc restores the pre-search draft");
+        assert_eq!(buf.cursor, buf.text.len());
+    }
+
+    #[test]
+    fn history_search_other_key_exits_and_applies() {
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec![
+            crate::input::history::HistoryEntry {
+                text: "long command to clear".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+            crate::input::history::HistoryEntry {
+                text: "git status".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+        ];
+
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+        let _ = buf.apply(Action::Insert('g'), &history, &reg);
+        assert_eq!(buf.text, "git status");
+
+        // Ctrl+U outside search-clears: exits search mode, then clears.
+        let _ = buf.apply(Action::ClearLine, &history, &reg);
+        assert!(!buf.is_searching());
+        assert_eq!(buf.text, "");
     }
 
     #[test]
@@ -21666,6 +22099,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             .map(|pending| pending.display_text.clone())
             .collect(),
         history: None,
+        search: None,
         command_output: state.footer_command_output.clone(),
         ctx_used,
         ctx_window,
@@ -21716,8 +22150,44 @@ fn round_cap_stats(state: &crate::state::UiState) -> String {
 
 fn build_input_status(state: &UiState, ctx: &LoopCtx, buf: &Buffer) -> crate::render::StatusLine {
     let mut status = build_status(state, ctx);
-    status.history = input_history_position(buf, ctx.history.entries().len());
+    if buf.is_searching() {
+        // Ctrl+R reverse-i-search takes over the top-rule indicator;
+        // the History N/N position is hidden while searching.
+        status.search = input_search_state(buf, ctx.history.entries());
+        status.history = None;
+    } else {
+        status.history = input_history_position(buf, ctx.history.entries().len());
+    }
     status
+}
+
+/// Live reverse-i-search snapshot: current match position among all
+/// matching entries, plus the query for the indicator label.
+fn input_search_state(
+    buf: &Buffer,
+    history: &[crate::input::history::HistoryEntry],
+) -> Option<crate::render::SearchState> {
+    if !buf.is_searching() {
+        return None;
+    }
+    let q = buf.search_query().to_lowercase();
+    let matches: Vec<usize> = (0..history.len())
+        .rev()
+        .filter(|&i| history[i].text.to_lowercase().contains(&q))
+        .collect();
+    // history_idx() is the currently shown match; find its 1-based
+    // position within the match list.
+    let current = buf
+        .history_idx()
+        .and_then(|idx| matches.iter().position(|&m| m == idx))
+        .map(|pos| pos + 1)
+        .unwrap_or(0);
+    Some(crate::render::SearchState {
+        query: buf.search_query().to_string(),
+        current,
+        total: matches.len(),
+        matched: buf.history_idx().is_some(),
+    })
 }
 
 fn input_history_position(buf: &Buffer, total: usize) -> Option<crate::render::HistoryPosition> {

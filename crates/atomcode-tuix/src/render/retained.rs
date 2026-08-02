@@ -1654,15 +1654,38 @@ impl<W: Write + Send> RetainedRenderer<W> {
         rule_width: usize,
         session_name: Option<&str>,
         history: Option<super::HistoryPosition>,
+        search: Option<&super::SearchState>,
         shell: bool,
     ) -> Vec<Cell> {
         let mut row = self.build_rule_row(rule_width, shell);
         const LEFT_MARGIN: usize = 2;
         const BADGE_GAP: usize = 2;
-        let history_end = history
-            .filter(|position| position.total > 0 && position.current <= position.total)
-            .map(|position| {
-                let text = format!(" History {}/{} ", position.current, position.total);
+        // Ctrl+R reverse-i-search wins the badge slot while active; the
+        // History N/N position is hidden during a search.
+        let history_end = search
+            .map(|s| {
+                // Budget: query gets whatever width is left after the
+                // fixed chrome (" Search '" prefix + closing quote) and
+                // the count, so a long query truncates instead of being
+                // dropped wholesale.
+                let prefix_w = crate::width::display_width(" Search '");
+                let count_text = format!(" {}/{} ", s.current, s.total);
+                let count_w = crate::width::display_width(&count_text);
+                // +1 chrome for the closing quote after the query.
+                let chrome = LEFT_MARGIN + BADGE_GAP + prefix_w + 1 + count_w;
+                // +1 more for the ellipsis when truncating.
+                let max_query = rule_width.saturating_sub(chrome + 1);
+                let (query, ellipsis) = if max_query >= 1 {
+                    let qw = crate::width::display_width(&s.query);
+                    if qw > max_query {
+                        (crate::width::truncate_to_width(&s.query, max_query), "…")
+                    } else {
+                        (s.query.clone(), "")
+                    }
+                } else {
+                    (String::new(), "")
+                };
+                let text = format!(" Search '{}'{}{}", query, ellipsis, count_text);
                 let cells = {
                     let mut cells = Vec::new();
                     push_str_cells(&mut cells, &text, &self.style_faint(Role::Muted));
@@ -1676,6 +1699,26 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 } else {
                     0
                 }
+            })
+            .or_else(|| {
+                history
+                    .filter(|position| position.total > 0 && position.current <= position.total)
+                    .map(|position| {
+                        let text = format!(" History {}/{} ", position.current, position.total);
+                        let cells = {
+                            let mut cells = Vec::new();
+                            push_str_cells(&mut cells, &text, &self.style_faint(Role::Muted));
+                            cells
+                        };
+                        if LEFT_MARGIN + cells.len() + BADGE_GAP <= rule_width {
+                            for (offset, cell) in cells.into_iter().enumerate() {
+                                row[LEFT_MARGIN + offset] = cell;
+                            }
+                            LEFT_MARGIN + crate::width::display_width(&text)
+                        } else {
+                            0
+                        }
+                    })
             })
             .unwrap_or(0);
 
@@ -3873,6 +3916,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             input_rule_width,
             self.status.session_name.as_deref(),
             self.status.history,
+            self.status.search.as_ref(),
             shell,
         );
         let middle_cells: Vec<Vec<Cell>> = lines[input_view_start..input_view_start + middle_rows]
@@ -8779,6 +8823,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/project/atomcode".into(),
             history: None,
+            search: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -9145,6 +9190,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
             history: None,
+            search: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -9199,6 +9245,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
             history: None,
+            search: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -9272,6 +9319,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
             history: None,
+            search: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -9321,6 +9369,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
             history: None,
+            search: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -9374,6 +9423,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
             history: None,
+            search: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -9427,6 +9477,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
             history: None,
+            search: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -9467,6 +9518,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
             history: None,
+            search: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -9507,7 +9559,7 @@ mod tests {
         let (mut r, _counter) = new_counting(80, 24);
         r.caps.colors = true;
         r.caps.unicode_symbols = true;
-        let row = r.build_top_rule_with_context(60, Some("atomcode加解密"), None, false);
+        let row = r.build_top_rule_with_context(60, Some("atomcode加解密"), None, None, false);
         // Skip continuation cells (width 0 placeholders that follow a
         // wide glyph) — they carry `ch = ' '` and would break a naive
         // substring check on a CJK name.
@@ -9536,6 +9588,7 @@ mod tests {
                 current: 100,
                 total: 100,
             }),
+            None,
             false,
         );
         let visible: String = row
@@ -9561,6 +9614,7 @@ mod tests {
                 current: 999,
                 total: 1000,
             }),
+            None,
             false,
         );
         let visible: String = row
@@ -9570,6 +9624,77 @@ mod tests {
             .collect();
         assert!(visible.contains("History 999/1000"), "{visible:?}");
         assert!(visible.contains("release/v5.0.3"), "{visible:?}");
+    }
+
+    #[test]
+    fn build_top_rule_search_indicator_replaces_history_position() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        // While Ctrl+R search is active, the badge shows the query +
+        // match position instead of "History N/N" — even though the
+        // buffer also carries a history_idx during search.
+        let row = r.build_top_rule_with_context(
+            80,
+            None,
+            Some(crate::render::HistoryPosition {
+                current: 2,
+                total: 100,
+            }),
+            Some(&crate::render::SearchState {
+                query: "git".into(),
+                current: 2,
+                total: 5,
+                matched: true,
+            }),
+            false,
+        );
+        let visible: String = row
+            .iter()
+            .filter(|cell| cell.width > 0)
+            .map(|cell| cell.ch)
+            .collect();
+        assert!(
+            visible.contains("Search 'git' 2/5"),
+            "search indicator must appear on the top rule: {visible:?}"
+        );
+        assert!(
+            !visible.contains("History"),
+            "history position must be hidden while searching: {visible:?}"
+        );
+    }
+
+    #[test]
+    fn build_top_rule_search_indicator_truncates_long_query() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let long_query = "a very long search query that definitely overflows the badge budget".to_string();
+        let row = r.build_top_rule_with_context(
+            40,
+            None,
+            None,
+            Some(&crate::render::SearchState {
+                query: long_query,
+                current: 1,
+                total: 1,
+                matched: true,
+            }),
+            false,
+        );
+        let visible: String = row
+            .iter()
+            .filter(|cell| cell.width > 0)
+            .map(|cell| cell.ch)
+            .collect();
+        assert!(
+            visible.contains("Search"),
+            "search badge must still render: {visible:?}"
+        );
+        assert!(
+            visible.contains('…'),
+            "long query must be truncated with ellipsis: {visible:?}"
+        );
     }
 
     #[test]
@@ -9619,7 +9744,7 @@ mod tests {
         let (mut r, _counter) = new_counting(80, 24);
         r.caps.colors = true;
         r.caps.unicode_symbols = true;
-        let row = r.build_top_rule_with_context(60, None, None, false);
+        let row = r.build_top_rule_with_context(60, None, None, None, false);
         assert_eq!(row.len(), 60, "rule width must be preserved");
         assert!(
             row.iter().all(|c| c.ch == '─'),
@@ -9640,7 +9765,7 @@ mod tests {
         r.caps.colors = true;
         r.caps.unicode_symbols = true;
         let long = "这是一个非常非常非常非常长的会话名字应当被截断省略";
-        let row = r.build_top_rule_with_context(40, Some(long), None, false);
+        let row = r.build_top_rule_with_context(40, Some(long), None, None, false);
         // Same continuation-cell filter rationale as the badge-render
         // test above: width-0 cells carry ' ' and would obscure the
         // substring assertions on CJK names.
@@ -20138,6 +20263,7 @@ mod tests {
             model: String::new(), // no status row (has_status=false → status_rows=0)
             cwd: String::new(),
             history: None,
+            search: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
