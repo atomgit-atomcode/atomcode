@@ -8667,6 +8667,30 @@ struct DesiredConfigCommit {
     previous: Config,
 }
 
+struct ConfigDeltaCommit<T> {
+    commit: ConfigCommit,
+    previous: Config,
+    value: T,
+}
+
+fn commit_config_delta<T, F>(store: &ConfigStore, mutate: F) -> Result<ConfigDeltaCommit<T>>
+where
+    F: FnOnce(&mut Config) -> Result<T>,
+{
+    let mut previous = None;
+    let mut value = None;
+    let commit = store.update(|persisted| {
+        previous = Some(persisted.clone());
+        value = Some(mutate(persisted)?);
+        Ok(())
+    })?;
+    Ok(ConfigDeltaCommit {
+        commit,
+        previous: previous.expect("ConfigStore update observed the previous snapshot"),
+        value: value.expect("ConfigStore update applied the config delta"),
+    })
+}
+
 fn commit_desired_config(
     store: &ConfigStore,
     observed_revision: Option<&ConfigRevision>,
@@ -9033,6 +9057,50 @@ mod external_config_tests {
         let persisted = store.read().unwrap().config;
         assert_eq!(persisted.providers["main"].model, "external-model");
         assert_eq!(persisted.network.proxy, proxy);
+    }
+
+    #[test]
+    fn config_delta_uses_latest_snapshot_and_preserves_unrelated_edits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(tmp.path().join("config.toml"));
+        store.replace(&config("initial-model", false)).unwrap();
+        store
+            .update(|persisted| {
+                persisted.language = Some(atomcode_config::locale::Locale::ZhCn);
+                Ok(())
+            })
+            .unwrap();
+
+        let committed = commit_config_delta(&store, |persisted| {
+            persisted.provider_accounts.insert(
+                "new-account".into(),
+                atomcode_config::config::provider::ProviderAccountConfig {
+                    provider: "openai".into(),
+                    display_name: None,
+                    api_key: None,
+                    base_url: None,
+                    user_agent: None,
+                    skip_tls_verify: false,
+                    enterprise_url: None,
+                    ephemeral: false,
+                },
+            );
+            Ok("new-account".to_string())
+        })
+        .unwrap();
+
+        assert_eq!(committed.value, "new-account");
+        assert_eq!(
+            committed.commit.snapshot.config.language,
+            Some(atomcode_config::locale::Locale::ZhCn),
+            "the provider delta must not overwrite an unrelated concurrent edit"
+        );
+        assert!(committed
+            .commit
+            .snapshot
+            .config
+            .provider_accounts
+            .contains_key("new-account"));
     }
 
     #[test]
@@ -12640,6 +12708,79 @@ pub(crate) fn save_and_reload(
         persist_runtime_provider_as_default,
         LanguageChangeNotice::None,
     )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigReloadSelection {
+    KeepCurrent,
+    FollowPersisted,
+}
+
+/// Atomically mutate the latest persisted config, then reload the runtime from
+/// the committed snapshot. Unlike whole-config CAS writes, a field-scoped
+/// mutation remains safe when this TUI has not observed the latest revision and
+/// preserves unrelated edits made by another AtomCode process.
+pub(crate) fn update_config_and_reload<T, F, M>(
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    selection: ConfigReloadSelection,
+    mutate: F,
+    success_message: M,
+) -> Option<T>
+where
+    F: FnOnce(&mut Config) -> Result<T>,
+    M: FnOnce(&T) -> String,
+{
+    if provider_transition_pending(ctx) {
+        renderer.render(UiLine::Error(
+            crate::i18n::t(crate::i18n::Msg::CmdProviderReloading).into_owned(),
+        ));
+        renderer.flush();
+        return None;
+    }
+
+    let previous_runtime_config = ctx.config.clone();
+    let previous_model_name = ctx.model_name.clone();
+    let ConfigDeltaCommit {
+        commit,
+        previous,
+        value,
+    } = match commit_config_delta(&ctx.config_store, mutate) {
+        Ok(committed) => committed,
+        Err(error) => {
+            renderer.render(UiLine::Error(
+                crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed {
+                    error: &error.to_string(),
+                })
+                .into_owned(),
+            ));
+            renderer.flush();
+            return None;
+        }
+    };
+
+    let desired = match selection {
+        ConfigReloadSelection::KeepCurrent => desired_config_from_snapshot_parts(
+            &ctx.config,
+            crate::ProviderSelectionMode::Pinned,
+            commit.snapshot.config.clone(),
+            true,
+        ),
+        ConfigReloadSelection::FollowPersisted => commit.snapshot.config.clone(),
+    };
+    let message = success_message(&value);
+    stage_committed_config_reload(
+        ctx,
+        desired,
+        commit,
+        previous,
+        previous_runtime_config,
+        previous_model_name,
+        renderer,
+        message,
+        LanguageChangeNotice::None,
+    )
+    .then_some(value)
 }
 
 fn save_and_reload_with_notice(
