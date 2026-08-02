@@ -318,6 +318,13 @@ export function Sidebar({
   const loginIdleLabel = auth.expired ? auth.labels.expired : auth.labels.signIn;
   const [sessions, setSessions] = useState<SessionMetaWithProject[]>([]);
   const [loading, setLoading] = useState(true);
+  const sessionListBodyRef = useRef<HTMLDivElement | null>(null);
+  const activeSessionItemRef = useRef<HTMLDivElement | null>(null);
+  // Selection is an explicit navigation intent, unlike a background reload.
+  // Keep it pending across a cross-project fetch until the destination row
+  // actually exists; ordinary reloads must not steal the user's scroll.
+  const pendingCenterSessionIdRef = useRef<string | null>(activeSessionId);
+  const previousActiveSessionIdRef = useRef<string | null>(activeSessionId);
   // Project selector: the sidebar lists ONE project's sessions. `viewProjectHash`
   // is which project is shown — it MIRRORS the real current project (follows the
   // `projectHash` prop). Picking another project in the dropdown switches INTO it
@@ -418,6 +425,23 @@ export function Sidebar({
   useEffect(() => {
     setViewProjectHash(projectHash);
   }, [projectHash]);
+
+  useEffect(() => {
+    if (activeSessionId !== previousActiveSessionIdRef.current) {
+      pendingCenterSessionIdRef.current = activeSessionId;
+      previousActiveSessionIdRef.current = activeSessionId;
+    }
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    const pendingId = pendingCenterSessionIdRef.current;
+    if (loading || collapsed || !pendingId || pendingId !== activeSessionId) return;
+    const container = sessionListBodyRef.current;
+    const item = activeSessionItemRef.current;
+    if (!container || !item || !container.contains(item)) return;
+    item.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+    pendingCenterSessionIdRef.current = null;
+  }, [activeSessionId, collapsed, loading, sessions, viewProjectHash]);
 
   // Project list for the dropdown (all projects that have sessions). Cheap,
   // refetched with the session list so newly-created projects appear.
@@ -998,6 +1022,7 @@ export function Sidebar({
     return (
       <div
         key={s.id}
+        ref={active ? activeSessionItemRef : undefined}
         class={
           'session-item' +
           (active ? ' active' : '') +
@@ -1212,21 +1237,22 @@ export function Sidebar({
         <span class="session-group-label">{t('sidebar.recent')}</span>
       </div>
 
-      <div class="session-list-body">
-        {loading && <div class="session-empty">{t('sidebar.loading')}</div>}
+      <div class="session-list-body" ref={sessionListBodyRef} aria-busy={loading}>
+        {loading && dateGroups.length === 0 && (
+          <div class="session-empty">{t('sidebar.loading')}</div>
+        )}
         {!loading && inCwd.length === 0 && (
           <div class="session-empty">{t('sidebar.emptyInCwd')}</div>
         )}
         {!loading && inCwd.length > 0 && filtered.length === 0 && (
           <div class="session-empty">{t('sidebar.noMatch')}</div>
         )}
-        {!loading &&
-          dateGroups.map((g) => (
-            <div key={g.key} class="session-date-group">
-              <div class="session-date-label">{friendlyDateLabel(g.key, t)}</div>
-              {g.items.map(renderItem)}
-            </div>
-          ))}
+        {dateGroups.map((g) => (
+          <div key={g.key} class="session-date-group">
+            <div class="session-date-label">{friendlyDateLabel(g.key, t)}</div>
+            {g.items.map(renderItem)}
+          </div>
+        ))}
       </div>
 
       <div class="sidebar-bottom">
