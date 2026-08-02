@@ -511,7 +511,14 @@ export function Sidebar({
   }
 
   function handleDeleted(id: string) {
-    loadSessions();
+    // The DELETE response is authoritative for this row. Removing it locally
+    // avoids an O(N) catalog reload after every deletion, which made clearing a
+    // large history progressively slow. Invalidate any older in-flight list
+    // response so it cannot resurrect the deleted row; normal reload triggers
+    // still reconcile the complete list later.
+    loadEpochRef.current += 1;
+    setLoading(false);
+    setSessions((current) => current.filter((session) => session.id !== id));
     onSessionDeleted?.(id);
   }
 

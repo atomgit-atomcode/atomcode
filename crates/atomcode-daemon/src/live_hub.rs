@@ -65,6 +65,15 @@ pub struct LiveJoin {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreshSessionOutcome {
+    pub changed: atomcode_coding::SessionChanged,
+    /// The runtime transition is already committed when this is populated.
+    /// Callers must not report the operation as wholly rejected or retry the
+    /// transition against the replacement runtime.
+    pub projection_error: Option<HubError>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HubError {
     Unbound,
     StaleBinding,
@@ -457,6 +466,28 @@ impl LiveViewHub {
         self.commit_changed_snapshot(&binding, &handle, &changed)
             .await?;
         Ok(changed)
+    }
+
+    /// Move an idle runtime to a fresh staged session. CodingRuntime owns the
+    /// transition and releases the previous session lease before returning the
+    /// terminal, which lets callers safely delete the old aggregate afterwards.
+    pub async fn fresh_session(
+        &self,
+        expected: &LiveBinding,
+    ) -> Result<FreshSessionOutcome, HubError> {
+        let handle = self.bound_handle_for(expected)?;
+        let changed = handle
+            .fresh_session()
+            .await
+            .map_err(map_session_transition_error)?;
+        let projection_error = self
+            .commit_changed_snapshot(expected, &handle, &changed)
+            .await
+            .err();
+        Ok(FreshSessionOutcome {
+            changed,
+            projection_error,
+        })
     }
 
     pub async fn change_directory(
@@ -1347,6 +1378,20 @@ mod tests {
             map_session_transition_error(atomcode_coding::RuntimeError::Unavailable),
             HubError::RuntimeRejected("coding runtime is unavailable".into())
         );
+    }
+
+    #[tokio::test]
+    async fn fresh_session_rejects_a_stale_expected_binding() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let current = hub
+            .bind("session-1", PathBuf::from("/one"), snapshot("old"), control)
+            .unwrap();
+        let mut stale = current.clone();
+        stale.session_id = "session-2".into();
+
+        assert_eq!(hub.fresh_session(&stale).await, Err(HubError::StaleBinding));
+        assert_eq!(hub.binding().unwrap(), current);
     }
 
     #[test]

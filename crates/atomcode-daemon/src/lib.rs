@@ -1410,6 +1410,17 @@ fn resolve_active_catalog_location(
     })
 }
 
+fn binding_targets_catalog_location(
+    entries: &[atomcode_capabilities::session::CatalogEntry],
+    binding: &crate::live_hub::LiveBinding,
+    project_bucket: &str,
+    session_id: &str,
+) -> bool {
+    binding.session_id == session_id
+        && resolve_active_catalog_location(entries, session_id, &binding.working_dir)
+            .is_some_and(|location| location.project_bucket == project_bucket)
+}
+
 fn catalog_entry_is_visible(
     sessions_root: &std::path::Path,
     entry: &atomcode_capabilities::session::CatalogEntry,
@@ -2618,8 +2629,98 @@ async fn delete_session(
             )
             .into_response();
         }
-        match delete_session_file(&hash, &id) {
-            Ok(()) => {
+        // A displayed session can still be the runtime's idle binding, which
+        // keeps its lease for the whole binding lifetime. Do not bypass that
+        // lease: ask the single runtime owner to transition to a fresh staged
+        // session first. Active turns fail closed as SESSION_IN_USE.
+        let current_binding = match crate::native_live::binding()
+            .ok()
+            .filter(|binding| binding.session_id == id)
+        {
+            Some(binding) => {
+                let sessions_root = NativeSessionManager::sessions_root();
+                match run_session_catalog_io(move || catalog_scan_in_root(&sessions_root)).await {
+                    Ok(scan)
+                        if binding_targets_catalog_location(
+                            &scan.entries,
+                            &binding,
+                            &hash,
+                            &id,
+                        ) =>
+                    {
+                        Some(binding)
+                    }
+                    Ok(_) => None,
+                    Err(error) => {
+                        tracing::warn!(
+                            project_bucket = %hash,
+                            session_id = %id,
+                            error = %error,
+                            "failed to resolve current session catalog location before delete"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        if let Some(binding) = current_binding {
+            match crate::native_live::fresh_session(&binding).await {
+                Ok(outcome) => {
+                    if let Some(error) = outcome.projection_error {
+                        // The runtime already moved to `outcome.changed` and
+                        // released the old lease. Its SessionChanged event also
+                        // repairs the live projection asynchronously, so the
+                        // lease-protected delete can safely continue.
+                        tracing::warn!(
+                            project_bucket = %hash,
+                            session_id = %id,
+                            replacement_session_id = ?outcome.changed.session_id,
+                            error = ?error,
+                            "current session was released but its live projection is still pending"
+                        );
+                    }
+                }
+                Err(error) => match error {
+                    crate::live_hub::HubError::ActiveTurn => {
+                        return delete_session_api_error(
+                            StatusCode::CONFLICT,
+                            "SESSION_IN_USE",
+                            "This session has an active turn. Stop it, then try again.",
+                        )
+                        .into_response();
+                    }
+                    // Another transition won the race after the exact binding
+                    // was observed. Do not fresh its replacement; continue to
+                    // lease-protected deletion. If the requested session is
+                    // still owned, acquire_lease returns SESSION_IN_USE.
+                    crate::live_hub::HubError::StaleBinding
+                    | crate::live_hub::HubError::RuntimeGenerationChanged { .. } => {}
+                    error => {
+                        tracing::warn!(
+                            project_bucket = %hash,
+                            session_id = %id,
+                            error = ?error,
+                            "failed to release current session before delete"
+                        );
+                        return delete_session_api_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "DELETE_FAILED",
+                            "Failed to release the current session before deleting it.",
+                        )
+                        .into_response();
+                    }
+                },
+            }
+        }
+
+        let delete_hash = hash.clone();
+        let delete_id = id.clone();
+        let deleted =
+            tokio::task::spawn_blocking(move || delete_session_file(&delete_hash, &delete_id))
+                .await;
+        match deleted {
+            Ok(Ok(())) => {
                 state_clone.telemetry.track(Event::UseCommand {
                     type_: "delete_session".into(),
                     success: Some(true),
@@ -2629,7 +2730,7 @@ async fn delete_session(
                 let msg = format!("Session {} deleted successfully", id);
                 (StatusCode::OK, Json(msg)).into_response()
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let response = classify_delete_session_error(&e);
                 if response.0 == StatusCode::INTERNAL_SERVER_ERROR {
                     tracing::error!(
@@ -2640,6 +2741,20 @@ async fn delete_session(
                     );
                 }
                 response.into_response()
+            }
+            Err(error) => {
+                tracing::error!(
+                    project_bucket = %hash,
+                    session_id = %id,
+                    error = %error,
+                    "session delete task failed"
+                );
+                delete_session_api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "DELETE_FAILED",
+                    "Failed to delete the session. Check the AtomCode logs for details.",
+                )
+                .into_response()
             }
         }
     })
@@ -6877,10 +6992,31 @@ mod tests {
             presence: CatalogPresence::NativeOnly,
         };
 
+        let entries = [entry];
         let location =
-            resolve_active_catalog_location(&[entry], "resumed-session", &working_dir).unwrap();
+            resolve_active_catalog_location(&entries, "resumed-session", &working_dir).unwrap();
 
         assert_eq!(location.project_bucket, historical_bucket);
+        let binding = crate::live_hub::LiveBinding {
+            id: 1,
+            generation: 1,
+            session_id: "resumed-session".into(),
+            working_dir,
+            provider: String::new(),
+            provider_fingerprint: String::new(),
+        };
+        assert!(binding_targets_catalog_location(
+            &entries,
+            &binding,
+            historical_bucket,
+            "resumed-session"
+        ));
+        assert!(!binding_targets_catalog_location(
+            &entries,
+            &binding,
+            "ffffffffffffffff",
+            "resumed-session"
+        ));
     }
 
     #[test]
