@@ -89,7 +89,22 @@ struct Args {
 /// content, at most one `in_progress`. Returns a human-readable reason on failure
 /// (fed back to the model so it can correct and resend).
 pub fn parse_todos(args: &str) -> Result<Vec<TodoItem>, String> {
-    let a: Args = serde_json::from_str(args)
+    let mut value: serde_json::Value = serde_json::from_str(args)
+        .map_err(|e| format!("todowrite: invalid arguments: {e}. Expected {{\"todos\":[{{\"content\":\"…\",\"status\":\"pending|in_progress|completed\"}}]}}."))?;
+    // Keep transcript-derived state aligned with RepairToolArgsMiddleware. The
+    // kernel stores the model's original tool call before middleware rewriting,
+    // so a provider that emits `{"todos":"[...]"}` must be tolerated here too:
+    // live execution, TodoHook, replay, and resume all converge on parse_todos.
+    // Decode exactly one layer and only for `todos`, whose public schema is an
+    // array; malformed, double-stringified, or wrong-container values still fail.
+    if let Some(raw) = value.get("todos").and_then(serde_json::Value::as_str) {
+        if let Ok(decoded) = serde_json::from_str::<serde_json::Value>(raw) {
+            if decoded.is_array() {
+                value["todos"] = decoded;
+            }
+        }
+    }
+    let a: Args = serde_json::from_value(value)
         .map_err(|e| format!("todowrite: invalid arguments: {e}. Expected {{\"todos\":[{{\"content\":\"…\",\"status\":\"pending|in_progress|completed\"}}]}}."))?;
     let mut out = Vec::with_capacity(a.todos.len());
     let mut in_progress = 0usize;
@@ -355,6 +370,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_accepts_one_stringified_todos_layer() {
+        let todos =
+            parse_todos(r#"{"todos":"[{\"content\":\"a\",\"status\":\"in_progress\"}]"}"#).unwrap();
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].content, "a");
+        assert_eq!(todos[0].status, TodoStatus::InProgress);
+    }
+
+    #[test]
+    fn parse_rejects_double_stringified_todos() {
+        let error = parse_todos(r#"{"todos":"\"[]\""}"#).unwrap_err();
+        assert!(error.contains("invalid arguments"), "{error}");
+    }
+
+    #[test]
     fn parse_rejects_bad_status() {
         let e = parse_todos(r#"{"todos":[{"content":"a","status":"done"}]}"#).unwrap_err();
         assert!(e.contains("pending"), "{e}");
@@ -429,6 +459,26 @@ mod tests {
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0].content, "new"); // LAST wins
         assert_eq!(todos[0].status, TodoStatus::InProgress);
+    }
+
+    #[test]
+    fn derive_recovers_stringified_todowrite_from_transcript() {
+        let msgs = vec![
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "1".into(),
+                    name: "todowrite".into(),
+                    arguments:
+                        r#"{"todos":"[{\"content\":\"persisted\",\"status\":\"pending\"}]"}"#.into(),
+                }],
+            ),
+            todo_call("2", r#"{"action":"update","id":1,"status":"completed"}"#),
+        ];
+        let todos = derive_current_todos(&msgs);
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].content, "persisted");
+        assert_eq!(todos[0].status, TodoStatus::Completed);
     }
 
     #[test]
@@ -629,6 +679,18 @@ mod tests {
             .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("task"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn execute_accepts_stringified_todos_from_provider() {
+        let result = TodoTool::new()
+            .execute(
+                r#"{"todos":"[{\"content\":\"task\",\"status\":\"pending\"}]"}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("task"), "{}", result.content);
     }
 
     #[tokio::test]
