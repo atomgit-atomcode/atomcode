@@ -61,6 +61,7 @@ import {
   createLiveLifecycleState,
   isCurrentChatStream,
   liveDetachDisposition,
+  liveSessionSwitchDisposition,
   liveSnapshotQueueDisposition,
   reduceChatRecovery,
   reduceLiveLifecycle,
@@ -573,6 +574,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     if (sessionId !== activeIdRef.current) {
       const switchGeneration = sessionGenerationRef.current;
       const prevId = activeIdRef.current;
+      const liveSwitch = liveSessionSwitchDisposition(
+        liveLifecycleRef.current.running || busyRef.current,
+      );
+      if (syncRef.current && !liveSwitch.allowed) {
+        if (prevId) onSessionId(prevId);
+        pushCommandNotice(t('cmd.session.busy'));
+        return;
+      }
       const detachedRequestId = requestIdRef.current;
       const detachedController = abortRef.current;
       if (prevId && messagesRef.current.length > 0) {
@@ -590,7 +599,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       requestIdRef.current = sessionId;
       abortRef.current = null;
       transitionChatRecovery({ type: 'session_switch', hasSession: sessionId !== null });
-      if (detachedRequestId) {
+      if (!syncRef.current && detachedRequestId) {
         const cancellation = detachedController
           ? cancelDetachedChat(detachedRequestId, detachedController)
           : stopChat(detachedRequestId);
@@ -601,7 +610,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             pushCommandNotice(t('chat.cancelFailed', { error: String(error) }));
           }
         });
-      } else {
+      } else if (!syncRef.current) {
         detachedController?.abort();
       }
       liveLifecycleRef.current = createLiveLifecycleState();
@@ -631,14 +640,24 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       // 不会回环：远端 session_switched 事件的 handler 会先把 activeIdRef 设为该 id，
       // 故由广播回流引起的 sessionId 变化进不来这个分支（条件已不成立），不会再次广播。
       if (sync && sessionId) {
-        postLiveSwitchSession(sessionId).catch((error) => {
-          if (sessionGenerationRef.current !== switchGeneration) return;
-          stopLiveStream();
-          setSync(false);
-          setBusy(false);
-          setQueued([]);
-          setHistoryHint(t('sync.switchFailed', { error: String(error) }));
-        });
+        postLiveSwitchSession(sessionId)
+          .then((result) => {
+            if (result.ok || sessionGenerationRef.current !== switchGeneration) return;
+            if (result.activeTurn && prevId) {
+              onSessionId(prevId);
+              pushCommandNotice(t('cmd.session.busy'));
+              return;
+            }
+            throw new Error(result.error ?? 'live runtime rejected the session switch');
+          })
+          .catch((error) => {
+            if (sessionGenerationRef.current !== switchGeneration) return;
+            stopLiveStream();
+            setSync(false);
+            setBusy(false);
+            setQueued([]);
+            setHistoryHint(t('sync.switchFailed', { error: String(error) }));
+          });
       }
     }
 
@@ -1270,7 +1289,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         const sid = activeIdRef.current;
         if (sid) {
           postLiveSwitchSession(sid)
-            .then(() => startLiveStream())
+            .then((result) => {
+              if (!result.ok) {
+                throw new Error(result.error ?? 'live runtime rejected the session switch');
+              }
+              startLiveStream();
+            })
             .catch((error) => {
               setSync(false);
               setHistoryHint(t('sync.switchFailed', { error: String(error) }));

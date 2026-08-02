@@ -6,6 +6,7 @@ import {
   createLiveLifecycleState,
   isCurrentChatStream,
   liveDetachDisposition,
+  liveSessionSwitchDisposition,
   liveSnapshotQueueDisposition,
   reduceChatRecovery,
   reduceLiveLifecycle,
@@ -114,6 +115,14 @@ test('an active live turn cannot be detached locally without a recoverable proto
     reason: 'active_turn',
   });
   assert.deepEqual(liveDetachDisposition(false), { allowed: true });
+});
+
+test('an active live turn keeps ownership of its foreground session', () => {
+  assert.deepEqual(liveSessionSwitchDisposition(true), {
+    allowed: false,
+    reason: 'active_turn',
+  });
+  assert.deepEqual(liveSessionSwitchDisposition(false), { allowed: true });
 });
 
 test('reconnect snapshot discards an unresolved queue when terminal replay is unavailable', () => {

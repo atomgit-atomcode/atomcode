@@ -199,3 +199,10 @@ export type LiveDetachDisposition =
 export function liveDetachDisposition(running: boolean): LiveDetachDisposition {
   return running ? { allowed: false, reason: 'active_turn' } : { allowed: true };
 }
+
+/** A shared live runtime has one foreground session owner. Switching that
+ * owner while its turn is active would reconfigure the runtime and cancel the
+ * turn, so navigation must wait for an authoritative terminal. */
+export function liveSessionSwitchDisposition(running: boolean): LiveDetachDisposition {
+  return running ? { allowed: false, reason: 'active_turn' } : { allowed: true };
+}

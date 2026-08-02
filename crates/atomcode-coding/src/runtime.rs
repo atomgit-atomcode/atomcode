@@ -3931,7 +3931,13 @@ fn spawn_runtime_owner_with_optional_agent(
                                 crate::SessionMode::Fresh | crate::SessionMode::Disabled => None,
                             })
                             .is_some_and(|(current, target)| current.id == *target);
-                        if active_turn.is_some() && reuses_current_session {
+                        let changes_session = matches!(
+                            operation,
+                            ReconfigureKind::FreshSession
+                                | ReconfigureKind::ResumeSession
+                                | ReconfigureKind::ChangeDirectory
+                        );
+                        if active_turn.is_some() && (reuses_current_session || changes_session) {
                             resources = Some(runtime);
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
@@ -10281,7 +10287,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reprepare_preflight_failure_does_not_stop_active_agent() {
+    async fn session_transitions_are_rejected_before_preflight_while_turn_is_active() {
         let (agent, mut kernel_commands, _kernel_events) = fake_agent();
         let (handle, controls) = coding_runtime_control_channel();
         let (runtime_tx, mut runtime_events) = mpsc::unbounded_channel();
@@ -10328,17 +10334,20 @@ mod tests {
         ));
 
         let missing_session_id = format!("missing-{}", uuid::Uuid::new_v4());
-        assert!(matches!(
+        assert_eq!(
             handle.resume_session(missing_session_id).await,
-            Err(RuntimeError::ReconfigureFailed(_))
-        ));
+            Err(RuntimeError::Busy)
+        );
+        assert_eq!(handle.fresh_session().await, Err(RuntimeError::Busy));
+        let other_dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            handle
+                .change_directory(other_dir.path().to_path_buf())
+                .await,
+            Err(RuntimeError::Busy)
+        );
         assert_eq!(handle.status().phase, RuntimePhase::InTurn);
-        assert!(matches!(
-            runtime_events.recv().await,
-            Some(CodingRuntimeEvent::Reconfiguring {
-                operation: ReconfigureKind::ResumeSession
-            })
-        ));
+        assert!(runtime_events.try_recv().is_err());
         assert!(kernel_commands.try_recv().is_err());
 
         handle.shutdown().await.unwrap();
@@ -10346,7 +10355,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
-    async fn fresh_session_clears_held_loop_without_duplicate_terminal() {
+    async fn fresh_session_rejects_a_held_loop_without_cancelling_it() {
         let (agent, mut kernel_commands, kernel_events) = fake_agent();
         let (handle, controls) = coding_runtime_control_channel();
         let (runtime_tx, mut runtime_events) = mpsc::unbounded_channel();
@@ -10413,14 +10422,12 @@ mod tests {
             })
             .unwrap();
 
-        let changed = handle.fresh_session().await.unwrap();
-        assert_eq!(changed.generation, RuntimeGeneration(1));
-        assert!(matches!(
-            runtime_events.recv().await,
-            Some(CodingRuntimeEvent::Reconfiguring {
-                operation: ReconfigureKind::FreshSession
-            })
-        ));
+        assert_eq!(handle.fresh_session().await, Err(RuntimeError::Busy));
+        assert_eq!(handle.status().phase, RuntimePhase::InTurn);
+        assert!(runtime_events.try_recv().is_err());
+        assert!(kernel_commands.try_recv().is_err());
+
+        handle.stop_loop().await.unwrap();
         assert!(matches!(
             runtime_events.recv().await,
             Some(CodingRuntimeEvent::LoopChanged(LoopProgress {
@@ -10439,21 +10446,11 @@ mod tests {
             ))
         ));
         assert!(matches!(
-            runtime_events.recv().await,
-            Some(CodingRuntimeEvent::SessionChanged(SessionChanged {
-                generation: RuntimeGeneration(1),
-                ..
-            }))
-        ));
-        assert!(matches!(
-            runtime_events.recv().await,
-            Some(CodingRuntimeEvent::Reconfigured {
-                operation: ReconfigureKind::FreshSession
-            })
+            kernel_commands.recv().await,
+            Some(AgentCommand::Cancel)
         ));
         assert_eq!(handle.status().phase, RuntimePhase::Ready);
 
-        handle.stop_loop().await.unwrap();
         assert!(runtime_events.try_recv().is_err());
         handle.shutdown().await.unwrap();
     }

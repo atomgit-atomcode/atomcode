@@ -790,15 +790,21 @@ export async function postLiveCompact(): Promise<{ accepted: boolean }> {
 }
 
 /** Ask the bound native runtime to resume an existing session. */
-export async function postLiveSwitchSession(sessionId: string): Promise<void> {
+export async function postLiveSwitchSession(
+  sessionId: string,
+): Promise<{ ok: boolean; activeTurn: boolean; error?: string }> {
   const resp = await fetch('/live/switch_session', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ session_id: sessionId }),
   });
   if (!resp.ok) throw new Error(`switch live session failed: ${resp.status}`);
-  const body = await resp.json() as { ok?: boolean; error?: string };
-  if (!body.ok) throw new Error(body.error ?? 'live runtime rejected the session switch');
+  const body = await resp.json() as { ok?: boolean; active_turn?: boolean; error?: string };
+  return {
+    ok: body.ok === true,
+    activeTurn: body.active_turn === true,
+    error: body.error,
+  };
 }
 
 /** Sync-mode model switch: notify the daemon immediately when the dropdown

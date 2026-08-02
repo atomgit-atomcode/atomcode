@@ -1486,10 +1486,14 @@ pub(crate) async fn live_switch_session_endpoint(
             crate::update_project_state(&mut *state.project.write().await, &changed.working_dir);
             Json(serde_json::json!({ "ok": true }))
         }
-        Err(error) => Json(serde_json::json!({
-            "ok": false,
-            "error": format!("session switch rejected: {error:?}"),
-        })),
+        Err(error) => {
+            let active_turn = matches!(error, crate::live_hub::HubError::ActiveTurn);
+            Json(serde_json::json!({
+                "ok": false,
+                "active_turn": active_turn,
+                "error": format!("session switch rejected: {error:?}"),
+            }))
+        }
     }
 }
 

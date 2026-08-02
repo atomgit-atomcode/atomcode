@@ -55,7 +55,26 @@ test('postLiveProvider scopes the runtime switch to the active session', async (
   }
 });
 
-test('live control APIs reject protocol-level failures', async () => {
+test('live session switch returns a structured active-turn rejection', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(
+    JSON.stringify({ ok: false, active_turn: true, error: 'runtime is busy' }),
+    { status: 200, headers: { 'Content-Type': 'application/json' } },
+  )) as typeof fetch;
+
+  try {
+    const { postLiveSwitchSession } = await import('./api.ts');
+    assert.deepEqual(await postLiveSwitchSession('session-2'), {
+      ok: false,
+      activeTurn: true,
+      error: 'runtime is busy',
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('live mode still rejects protocol-level failures', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response(
     JSON.stringify({ ok: false, error: 'runtime is busy' }),
@@ -63,11 +82,7 @@ test('live control APIs reject protocol-level failures', async () => {
   )) as typeof fetch;
 
   try {
-    const { postLiveMode, postLiveSwitchSession } = await import('./api.ts');
-    await assert.rejects(
-      () => postLiveSwitchSession('session-2'),
-      /runtime is busy/,
-    );
+    const { postLiveMode } = await import('./api.ts');
     await assert.rejects(
       () => postLiveMode('plan'),
       /rejected the mode switch/,

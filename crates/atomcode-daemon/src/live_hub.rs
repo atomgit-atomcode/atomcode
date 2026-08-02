@@ -453,7 +453,7 @@ impl LiveViewHub {
         let changed = handle
             .resume_session_with_lease(session_id, working_dir, lease)
             .await
-            .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
+            .map_err(map_session_transition_error)?;
         self.commit_changed_snapshot(&binding, &handle, &changed)
             .await?;
         Ok(changed)
@@ -467,7 +467,7 @@ impl LiveViewHub {
         let changed = handle
             .change_directory(working_dir)
             .await
-            .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
+            .map_err(map_session_transition_error)?;
         if session_change_is_noop(&binding, &changed) {
             return Ok(changed);
         }
@@ -852,6 +852,13 @@ impl LiveViewHub {
     }
 }
 
+fn map_session_transition_error(error: atomcode_coding::RuntimeError) -> HubError {
+    match error {
+        atomcode_coding::RuntimeError::Busy => HubError::ActiveTurn,
+        error => HubError::RuntimeRejected(error.to_string()),
+    }
+}
+
 fn session_change_is_noop(
     binding: &LiveBinding,
     changed: &atomcode_coding::SessionChanged,
@@ -874,8 +881,8 @@ mod tests {
     use atomcode_kernel::message::{Message, SessionSnapshot};
 
     use super::{
-        session_change_is_noop, HubError, LiveBinding, LiveRuntimeControl, LiveViewEvent,
-        LiveViewHub,
+        map_session_transition_error, session_change_is_noop, HubError, LiveBinding,
+        LiveRuntimeControl, LiveViewEvent, LiveViewHub,
     };
 
     #[derive(Clone)]
@@ -1328,6 +1335,18 @@ mod tests {
         // must also be refused — mirrors bind_with_provider's active set.
         control.status.lock().unwrap().phase = RuntimePhase::Reconfiguring;
         assert!(hub.turn_in_progress());
+    }
+
+    #[test]
+    fn busy_session_transition_maps_to_active_turn() {
+        assert_eq!(
+            map_session_transition_error(atomcode_coding::RuntimeError::Busy),
+            HubError::ActiveTurn
+        );
+        assert_eq!(
+            map_session_transition_error(atomcode_coding::RuntimeError::Unavailable),
+            HubError::RuntimeRejected("coding runtime is unavailable".into())
+        );
     }
 
     #[test]
