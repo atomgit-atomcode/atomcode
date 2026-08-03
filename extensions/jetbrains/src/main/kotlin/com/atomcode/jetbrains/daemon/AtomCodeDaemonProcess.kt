@@ -41,15 +41,32 @@ internal class AtomCodeDaemonProcess(
     fun locateBinary(): BinaryResolution? {
         configuredBinary()?.let { return it }
         bundledDaemon()?.let { return BinaryResolution(it.toString(), emptyList()) }
+        // On Windows the standalone `atomcode-daemon` binary is a GUI-subsystem
+        // app (no console window when spawned from the IDE), while the
+        // `atomcode` CLI is a console-subsystem app that flashes a cmd window.
+        // Prefer the daemon binary over the CLI on Windows; keep the CLI-first
+        // order elsewhere since both behave identically there.
+        if (isWindows()) {
+            commonDaemonPaths().firstOrNull { Files.isRegularFile(it) }?.let {
+                return BinaryResolution(it.toString(), emptyList())
+            }
+            developerDaemonPaths().firstOrNull { Files.isRegularFile(it) }?.let {
+                return BinaryResolution(it.toString(), emptyList())
+            }
+        }
         pathBinary("atomcode")?.let { return BinaryResolution(it.toString(), listOf("daemon")) }
         commonAtomcodePaths().firstOrNull { Files.isRegularFile(it) }?.let {
             return BinaryResolution(it.toString(), listOf("daemon"))
         }
-        commonDaemonPaths().firstOrNull { Files.isRegularFile(it) }?.let {
-            return BinaryResolution(it.toString(), emptyList())
-        }
-        developerDaemonPaths().firstOrNull { Files.isRegularFile(it) }?.let {
-            return BinaryResolution(it.toString(), emptyList())
+        // On Windows the daemon paths were already probed above and would never
+        // newly succeed here — keep the tail check for macOS/Linux only.
+        if (!isWindows()) {
+            commonDaemonPaths().firstOrNull { Files.isRegularFile(it) }?.let {
+                return BinaryResolution(it.toString(), emptyList())
+            }
+            developerDaemonPaths().firstOrNull { Files.isRegularFile(it) }?.let {
+                return BinaryResolution(it.toString(), emptyList())
+            }
         }
         return null
     }
@@ -92,6 +109,16 @@ internal class AtomCodeDaemonProcess(
             args += binary.path
             args += binary.argsPrefix
             args += listOf("--port", settings.port.toString(), "--client", "jetbrains")
+            // Windows only: disable the daemon's idle shutdown (default 30 min)
+            // so an idled daemon doesn't exit and get restarted by the next sent
+            // message — which flashes a console window when the fallback CLI
+            // binary is used. On macOS/Linux the restart is windowless, and the
+            // idle self-shutdown is the only cleanup for a daemon orphaned by a
+            // hard IDE termination (crash / kill -9, where dispose() never runs),
+            // so keep the watchdog there.
+            if (isWindows()) {
+                args += listOf("--idle-timeout", "0")
+            }
 
             try {
                 val builder = ProcessBuilder(args)
@@ -175,7 +202,10 @@ internal class AtomCodeDaemonProcess(
     ).map { executableName(it) }.map { Path.of(it).toAbsolutePath() }
 
     private fun executableName(name: String): String =
-        if (System.getProperty("os.name").lowercase().contains("win") && !name.endsWith(".exe")) "$name.exe" else name
+        if (isWindows() && !name.endsWith(".exe")) "$name.exe" else name
+
+    private fun isWindows(): Boolean =
+        System.getProperty("os.name").lowercase().contains("win")
 
     private fun platformDir(): String? {
         val os = System.getProperty("os.name").lowercase()

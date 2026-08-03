@@ -3,6 +3,7 @@ package com.atomcode.jetbrains.ui.message
 import com.google.gson.Gson
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
+import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.editor.colors.EditorColorsManager
 import com.intellij.ui.JBColor
 import com.intellij.util.ui.UIUtil
@@ -28,6 +29,7 @@ class JBCefMessageView(
     private val gson = Gson()
     private data class BrowserTheme(val dark: Boolean, val bg: String, val fg: String)
     private companion object {
+        val LOG: Logger = Logger.getInstance(JBCefMessageView::class.java)
         const val RENDERER_VERSION = "stream-markdown-v3"
     }
 
@@ -84,10 +86,12 @@ class JBCefMessageView(
     private fun initBrowser() {
         val supported = try {
             JBCefMessageBridge.isSupported()
-        } catch (_: LinkageError) {
-            false
-        } catch (_: ClassNotFoundException) {
-            false
+        } catch (error: LinkageError) {
+            showBrowserUnavailable(error)
+            return
+        } catch (error: ClassNotFoundException) {
+            showBrowserUnavailable(error)
+            return
         }
         if (!supported) {
             showBrowserUnavailable()
@@ -103,11 +107,11 @@ class JBCefMessageView(
                 },
                 { markJsReady() },
             )
-        } catch (_: LinkageError) {
-            showBrowserUnavailable()
+        } catch (error: LinkageError) {
+            showBrowserUnavailable(error)
             return
-        } catch (_: ReflectiveOperationException) {
-            showBrowserUnavailable()
+        } catch (error: ReflectiveOperationException) {
+            showBrowserUnavailable(error)
             return
         }
         bridge = newBridge
@@ -115,7 +119,12 @@ class JBCefMessageView(
         newBridge.loadHtml(buildChatHtml())
     }
 
-    private fun showBrowserUnavailable() {
+    private fun showBrowserUnavailable(cause: Throwable? = null) {
+        if (cause == null) {
+            LOG.warn("AtomCode message rendering is unavailable because JBCefApp.isSupported() returned false")
+        } else {
+            LOG.warn("AtomCode message rendering failed to initialize JCEF", cause)
+        }
         removeAll()
         add(JLabel("AtomCode message rendering is unavailable in this IDE runtime.").apply {
             foreground = JBColor.GRAY

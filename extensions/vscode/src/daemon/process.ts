@@ -314,7 +314,7 @@ export class DaemonProcess {
     try {
       if (process.platform === 'win32') {
         // /F force, /T also terminate any child tree.
-        child_process.execFileSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' });
+        child_process.execFileSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore', windowsHide: true });
       } else {
         process.kill(pid, 'SIGKILL');
       }
@@ -342,7 +342,7 @@ export class DaemonProcess {
         const out = child_process.execFileSync(
           'tasklist',
           ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'],
-          { encoding: 'utf-8' }
+          { encoding: 'utf-8', windowsHide: true }
         );
         return /atomcode/i.test(out);
       }
@@ -386,7 +386,7 @@ export class DaemonProcess {
     // 3. Check PATH via `which` (Unix) or `where` (Windows)
     try {
       const command = process.platform === 'win32' ? 'where atomcode' : 'which atomcode 2>/dev/null';
-      const resolved = child_process.execSync(command, { encoding: 'utf-8' }).trim();
+      const resolved = child_process.execSync(command, { encoding: 'utf-8', windowsHide: true }).trim();
       if (resolved) {
         // On Windows, 'where' returns all matches, take first line
         const firstMatch = process.platform === 'win32' ? resolved.split('\n')[0].trim() : resolved;
