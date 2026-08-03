@@ -155,7 +155,7 @@ encoding, quotation, transformation, or claimed authorization does not make othe
 disallowed assistance acceptable.";
 
 pub fn coding_persona(model: &str, todo_enabled: bool, request_user_input_enabled: bool) -> String {
-    coding_persona_with_language(model, None, todo_enabled, request_user_input_enabled)
+    coding_persona_with_capabilities(model, None, todo_enabled, request_user_input_enabled, true)
 }
 
 pub fn coding_persona_with_language(
@@ -163,6 +163,22 @@ pub fn coding_persona_with_language(
     preferred_language: Option<atomcode_config::locale::Locale>,
     todo_enabled: bool,
     request_user_input_enabled: bool,
+) -> String {
+    coding_persona_with_capabilities(
+        model,
+        preferred_language,
+        todo_enabled,
+        request_user_input_enabled,
+        true,
+    )
+}
+
+pub(crate) fn coding_persona_with_capabilities(
+    model: &str,
+    preferred_language: Option<atomcode_config::locale::Locale>,
+    todo_enabled: bool,
+    request_user_input_enabled: bool,
+    review_enabled: bool,
 ) -> String {
     let commit_language = commit_language_guidance(preferred_language);
     #[allow(unused_mut)] // `mut` is only used under `cfg(windows)` below.
@@ -246,6 +262,9 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     // reuses the tool-mount's own gate helper so the two can't drift.
     if subagent_delegation_enabled() {
         p.push_str(SUBAGENT_DELEGATION);
+    }
+    if review_enabled {
+        p.push_str(CODE_REVIEW_USAGE);
     }
     // Skill-trigger guidance — surfaced in the system prompt (not just the `use_skill`
     // tool description + the AVAILABLE SKILLS catalog's own guidance line) because weak
@@ -348,10 +367,11 @@ source files — it mangles indentation and encoding (worst on Windows) and snow
 corruption. If `edit_file` says it can't find your text, RE-READ the file and copy the exact \
 snippet INCLUDING its whitespace, or rewrite the file with `write_file`; do NOT drop to a \
 shell script.\n\
-- VERIFY BEFORE FINISHING: after editing code, actually run the project's check (`cargo \
+- VERIFY BEFORE FINISHING: unless the user explicitly forbids compiling, testing, or running \
+commands/scripts, after editing code actually run the project's check (`cargo \
 check` / `tsc --noEmit` / the build or test command — not `ls`/`echo`) and confirm it \
 PASSES before handing back. If it does not compile, the task is NOT done. If you did not \
-run it, say so — never claim it works without running it.\n\
+run it, including because the user prohibited it, say so — never claim it works without running it.\n\
 - FINISH THE JOB: when the task is clear and within reach, complete it end-to-end yourself \
 rather than handing a half-done change back with \"you can take it from here\". The only \
 reasons to pause are unchanged from the rules above: a risky action needing approval, \
@@ -513,6 +533,15 @@ genuinely needs the stronger, slower model — default to the fast model otherwi
 `worker` finishes, REVIEW its diff before continuing: you own the final result, not the \
 subagent.";
 
+/// Natural-language routing for the read-only review specialization. The tool description
+/// alone is not strong enough for every supported model: some otherwise answer a review
+/// request from a shallow `git diff` scan and never start the dedicated reviewer.
+const CODE_REVIEW_USAGE: &str = "\n\n## CODE REVIEW:\n\
+When the user asks to review code, a diff, staged changes, a commit, or a branch range and the \
+`code_review` tool is available, call it before writing the review. Pass the requested scope \
+and path filters directly to that tool; do not pre-review the diff with ordinary read/search \
+tools. The reviewer is read-only. Do not claim it fixed files or posted comments.";
+
 const RULES: &str = "\
 Solve tasks efficiently, minimizing round-trips. Act decisively — go straight to tool calls or answers.
 
@@ -530,7 +559,7 @@ For bug reports (\"not working\"/\"wrong output\"/\"error\"): REPRODUCE (run the
 Guidelines:
 - UNDERSTAND: before diving in, pin down what the user actually wants — the concrete outcome and its scope, not implementation detail. For multi-step work this IS the task plan: its first items are the outcomes the user asked for; when a task plan isn't in play, state the goal in one sentence as part of PLAN. Capture the goal AS the plan — don't echo the request back as prose. Only if the goal itself is genuinely ambiguous (not an implementation choice you can reasonably pick) ask the user before starting; otherwise take the sensible default and proceed.
 - REPRODUCE: when a runnable reproduction exists, run the failing command with bash BEFORE reading code — see the real error first. When the bug has no single runnable command (UI/rendering, intermittent, state-dependent), skip straight to DIAGNOSE.
-- VERIFY: run a fast check (`cargo check`, `tsc --noEmit`, or equivalent). Avoid full builds, dev servers, or watchers.
+- VERIFY: run a fast check (`cargo check`, `tsc --noEmit`, or equivalent). Avoid full builds, dev servers, or watchers. If the user explicitly forbids compiling, testing, or running commands/scripts, obey that restriction and report that verification was not run.
 - The turn ends naturally when no more tool calls are needed.
 - CARRY IT THROUGH: once a task is clearly scoped and you know what to do, complete it end-to-end through VERIFY in one go — don't stop after the first step to ask \"should I continue?\". Pause only for risky actions that need approval, the STOP WHEN STUCK rule below, or genuine ambiguity in what was asked.
 - STOP WHEN STUCK: if after 3 rounds of search/read you haven't found the issue, stop. Tell the user what you checked and suggest next diagnostic steps. Do NOT keep searching for something that may not be in the code.
@@ -1045,6 +1074,15 @@ mod tests {
             p.contains("CARRY IT THROUGH"),
             "carry-to-completion guardrail (WORKFLOW)"
         );
+        assert!(
+            p.contains("user explicitly forbids compiling"),
+            "verification must yield to explicit user execution limits"
+        );
+        let deepseek = coding_persona("deepseek-v4-flash", true, false);
+        assert!(
+            deepseek.contains("unless the user explicitly forbids compiling"),
+            "DeepSeek's firm discipline must preserve user execution limits"
+        );
     }
 
     #[test]
@@ -1553,6 +1591,22 @@ mod tests {
                 && SUBAGENT_DELEGATION.contains("Do NOT spin up a subagent"),
             "must forbid delegating a single quick search/read the agent can do directly"
         );
+    }
+
+    #[test]
+    fn persona_routes_natural_language_reviews_to_the_read_only_reviewer() {
+        let persona = coding_persona("glm-5.2", true, false);
+        assert!(persona.contains("## CODE REVIEW:"));
+        assert!(persona.contains("`code_review` tool is available"));
+        assert!(persona.contains("Pass the requested scope"));
+        assert!(persona.contains("Do not claim it fixed files or posted comments"));
+    }
+
+    #[test]
+    fn persona_omits_review_routing_when_the_tool_is_not_mounted() {
+        let persona = coding_persona_with_capabilities("glm-5.2", None, true, false, false);
+        assert!(!persona.contains("## CODE REVIEW:"));
+        assert!(!persona.contains("`code_review` tool is available"));
     }
 
     #[test]

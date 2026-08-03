@@ -64,8 +64,8 @@ impl RewindModal {
         let mut rows = vec![
             row(
                 Self::l(
-                    "Restore the code and/or conversation to the point before…",
-                    "将代码和/或对话恢复到以下提示之前…",
+                    "Restore the conversation to the point before…",
+                    "将对话恢复到以下提示之前…",
                 ),
                 DiffPanelTone::Default,
                 false,
@@ -110,7 +110,9 @@ impl RewindModal {
                 },
                 index == self.selected_target,
             ));
-            let detail = if point.files.is_empty() {
+            let detail = if self.catalog.code_unavailable.is_some() {
+                Self::l("  Conversation checkpoint", "  对话检查点").to_string()
+            } else if point.files.is_empty() {
                 Self::l("  No code changes", "  无代码变更").to_string()
             } else if point.files.len() == 1 {
                 let file = &point.files[0];
@@ -327,11 +329,14 @@ mod tests {
                 turn_id: 1,
                 prompt_number: 1,
                 prompt_preview: "first prompt".into(),
-                before_tree: "a".repeat(40),
-                after_tree: "b".repeat(40),
+                before_tree: Some("a".repeat(40)),
+                after_tree: Some("b".repeat(40)),
                 files: Vec::new(),
             }],
-            code_unavailable: None,
+            code_unavailable: Some(
+                "Code Rewind is temporarily disabled; conversation Rewind remains available."
+                    .into(),
+            ),
         }
     }
 
@@ -352,6 +357,21 @@ mod tests {
         assert!(modal.scope_disabled());
         modal.selected_scope = 0;
         assert!(!modal.scope_disabled());
+    }
+
+    #[test]
+    fn disabled_workspace_backend_renders_conversation_checkpoints() {
+        let mut modal = RewindModal::open(catalog());
+        modal.selected_target = 0;
+        let rows = modal.target_rows(4);
+        assert!(rows.iter().any(|row| row
+            .spans
+            .iter()
+            .any(|span| span.text.contains("Conversation checkpoint"))));
+        assert!(!rows.iter().any(|row| row
+            .spans
+            .iter()
+            .any(|span| span.text.contains("No code changes"))));
     }
 
     #[test]

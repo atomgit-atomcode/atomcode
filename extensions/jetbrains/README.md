@@ -45,6 +45,24 @@ AtomCode for JetBrains 是本地 `atomcode-daemon` 的 IntelliJ 平台前端。
 ./gradlew "-PplatformLocalPath=/Applications/IntelliJ IDEA CE.app" verifyPlugin
 ```
 
+### JCEF 跨版本兼容
+
+AtomCode 的聊天消息视图依赖 JCEF。插件描述符将 `com.intellij.modules.jcef` 声明为可选依赖：
+
+- 2024.3 至 2025.3.0 中没有该模块别名，插件继续使用平台内置的 JCEF 类；
+- 2025.3.1 及以后在模块存在时建立显式类加载依赖；
+- 2026.2 及以后 JCEF 已拆为 bundled plugin，构建脚本会根据目标 IDE 的 baseline version 自动加入 `intellij.platform.ui.jcef` 构建依赖。
+
+默认 `platformVersion=2024.3.6` 保持最低版本编译基线。验证 2026.2 时显式覆盖目标版本：
+
+```bash
+./gradlew --no-daemon -PplatformVersion=2026.2 test
+./gradlew --no-daemon -PplatformVersion=2026.2 buildPlugin
+./gradlew --no-daemon -PplatformVersion=2026.2 verifyPlugin
+```
+
+使用 `platformLocalPath` 时，构建脚本从 IDE 的 `product-info.json` 读取 baseline version，因此无需额外开关。
+
 仅在测试机器拥有有效的 Ultimate 许可证时才使用 IntelliJ IDEA Ultimate。类似 `There are no valid licenses associated with the account ...` 的许可证错误是 IDE 授权问题，而非插件构建失败。
 
 打包后的插件 zip 文件写入 `build/distributions/`。

@@ -5,6 +5,8 @@
 /// These functions attempt to repair such output before falling back to
 /// last-resort key-value extraction.
 
+const MAX_REPAIR_BYTES: usize = 512 * 1024;
+
 /// Normalize tool-call arguments into valid JSON before execution.
 ///
 /// Runs the repair chain: direct parse → repair_json → tool-specific extractor →
@@ -20,7 +22,6 @@ pub fn repair_tool_args(tool_name: &str, args: &str) -> String {
     // giant blob. The passes below are O(N), but this caps total work and
     // allocation on pathological input and is a hard ceiling for the middleware
     // (which runs synchronously on the host thread under panic=abort).
-    const MAX_REPAIR_BYTES: usize = 512 * 1024;
     if args.len() > MAX_REPAIR_BYTES {
         return args.to_string();
     }
@@ -66,6 +67,95 @@ pub fn repair_tool_args(tool_name: &str, args: &str) -> String {
         }
     }
     args.to_string()
+}
+
+/// Decode one stringified JSON layer for top-level fields whose tool schema
+/// requires an array or object.
+///
+/// Some OpenAI-compatible providers emit otherwise-valid arguments such as
+/// `{"todos":"[{...}]"}`. The ordinary repair fast path cannot distinguish
+/// that provider defect from an intentional string, so this pass is explicitly
+/// schema-bound: string fields are never touched, nested fields are not walked,
+/// and the decoded value must have the required container kind.
+fn repair_stringified_structured_fields(args: &str, schema: &serde_json::Value) -> String {
+    if args.len() > MAX_REPAIR_BYTES {
+        return args.to_string();
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(args) else {
+        return args.to_string();
+    };
+    let (Some(arguments), Some(properties)) = (
+        value.as_object_mut(),
+        schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object),
+    ) else {
+        return args.to_string();
+    };
+
+    let mut changed = false;
+    for (name, property_schema) in properties {
+        let Some(raw) = arguments.get(name).and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let mut types = std::collections::BTreeSet::new();
+        collect_schema_types(property_schema, &mut types, 0);
+        // A union that explicitly permits strings is ambiguous; preserve it.
+        if types.contains("string") {
+            continue;
+        }
+        let wants_array = types.contains("array");
+        let wants_object = types.contains("object");
+        if !wants_array && !wants_object {
+            continue;
+        }
+        let Ok(decoded) = serde_json::from_str::<serde_json::Value>(raw) else {
+            continue;
+        };
+        if (wants_array && decoded.is_array()) || (wants_object && decoded.is_object()) {
+            arguments.insert(name.clone(), decoded);
+            changed = true;
+        }
+    }
+
+    if changed {
+        serde_json::to_string(&value).unwrap_or_else(|_| args.to_string())
+    } else {
+        args.to_string()
+    }
+}
+
+fn collect_schema_types(
+    schema: &serde_json::Value,
+    types: &mut std::collections::BTreeSet<String>,
+    depth: u8,
+) {
+    if depth > 8 {
+        return;
+    }
+    if let Some(kind) = schema.get("type") {
+        match kind {
+            serde_json::Value::String(kind) => {
+                types.insert(kind.clone());
+            }
+            serde_json::Value::Array(kinds) => {
+                types.extend(
+                    kinds
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                );
+            }
+            _ => {}
+        }
+    }
+    for keyword in ["anyOf", "oneOf", "allOf"] {
+        if let Some(branches) = schema.get(keyword).and_then(serde_json::Value::as_array) {
+            for branch in branches {
+                collect_schema_types(branch, types, depth + 1);
+            }
+        }
+    }
 }
 
 /// Pre-escape ambiguous backslash sequences inside JSON string literals
@@ -1505,8 +1595,14 @@ impl RepairToolArgsMiddleware {
     /// Normalize the call's arguments to valid JSON in place, selecting the
     /// `edit_file` specialized extractor by `tool_name`. Extracted from `before`
     /// so it can be unit-tested without a `Tool`/`RequestCtx`.
-    fn repair_call(&self, tool_name: &str, call: &mut ToolCall) {
+    fn repair_call(
+        &self,
+        tool_name: &str,
+        parameters_schema: &serde_json::Value,
+        call: &mut ToolCall,
+    ) {
         call.arguments = repair_tool_args(tool_name, &call.arguments);
+        call.arguments = repair_stringified_structured_fields(&call.arguments, parameters_schema);
     }
 }
 
@@ -1524,7 +1620,7 @@ impl ToolMiddleware for RepairToolArgsMiddleware {
         // edit_file extractor selection survives any future alias / case-insensitive
         // tool resolution in the kernel — matching v1, which repaired with the
         // corrected name.
-        self.repair_call(tool.name(), call);
+        self.repair_call(tool.name(), &tool.parameters_schema(), call);
         BeforeOutcome::Proceed
     }
 }
@@ -1532,6 +1628,19 @@ impl ToolMiddleware for RepairToolArgsMiddleware {
 #[cfg(test)]
 mod middleware_tests {
     use super::*;
+    use serde_json::json;
+
+    fn schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "todos": { "type": "array" },
+                "metadata": { "type": "object" },
+                "content": { "type": "string" },
+                "ambiguous": { "type": ["string", "array"] }
+            }
+        })
+    }
 
     fn call(name: &str, args: &str) -> ToolCall {
         ToolCall {
@@ -1550,7 +1659,7 @@ mod middleware_tests {
             "write_file",
             r#"{"file_path":"game.html","content":"<html>",}"#,
         );
-        mw.repair_call("write_file", &mut c);
+        mw.repair_call("write_file", &schema(), &mut c);
         let v: serde_json::Value = serde_json::from_str(&c.arguments)
             .expect("arguments should be valid JSON after repair");
         assert_eq!(v["file_path"], "game.html");
@@ -1561,8 +1670,69 @@ mod middleware_tests {
         let mw = RepairToolArgsMiddleware;
         let valid = r#"{"file_path":"a.html","content":"x"}"#;
         let mut c = call("write_file", valid);
-        mw.repair_call("write_file", &mut c);
+        mw.repair_call("write_file", &schema(), &mut c);
         assert_eq!(c.arguments, valid, "valid JSON must not be altered");
+    }
+
+    #[test]
+    fn decodes_one_stringified_array_layer_when_schema_requires_array() {
+        let mw = RepairToolArgsMiddleware;
+        let mut c = call(
+            "todowrite",
+            r#"{"todos":"[{\"content\":\"build\",\"status\":\"in_progress\"}]"}"#,
+        );
+        mw.repair_call("todowrite", &schema(), &mut c);
+        let value: serde_json::Value = serde_json::from_str(&c.arguments).unwrap();
+        assert!(
+            value["todos"].is_array(),
+            "todos should be decoded: {}",
+            c.arguments
+        );
+        assert_eq!(value["todos"][0]["content"], "build");
+    }
+
+    #[test]
+    fn decodes_one_stringified_object_layer_when_schema_requires_object() {
+        let mw = RepairToolArgsMiddleware;
+        let mut c = call("tool", r#"{"metadata":"{\"attempt\":1}"}"#);
+        mw.repair_call("tool", &schema(), &mut c);
+        let value: serde_json::Value = serde_json::from_str(&c.arguments).unwrap();
+        assert_eq!(value["metadata"]["attempt"], 1);
+    }
+
+    #[test]
+    fn preserves_strings_malformed_json_and_ambiguous_unions() {
+        let mw = RepairToolArgsMiddleware;
+        let input = r#"{"content":"[1,2]","todos":"not json","ambiguous":"[1,2]"}"#;
+        let mut c = call("tool", input);
+        mw.repair_call("tool", &schema(), &mut c);
+        assert_eq!(c.arguments, input);
+    }
+
+    #[test]
+    fn does_not_recursively_decode_nested_or_double_stringified_values() {
+        let mw = RepairToolArgsMiddleware;
+        let mut nested = call("tool", r#"{"metadata":"{\"items\":\"[1,2]\"}"}"#);
+        mw.repair_call("tool", &schema(), &mut nested);
+        let value: serde_json::Value = serde_json::from_str(&nested.arguments).unwrap();
+        assert_eq!(value["metadata"]["items"], "[1,2]");
+
+        let double = r#"{"todos":"\"[1,2]\""}"#;
+        let mut doubled = call("tool", double);
+        mw.repair_call("tool", &schema(), &mut doubled);
+        assert_eq!(doubled.arguments, double);
+    }
+
+    #[test]
+    fn schema_repair_preserves_the_middleware_size_bound() {
+        let mw = RepairToolArgsMiddleware;
+        let oversized = format!(
+            r#"{{"metadata":"{{\"data\":\"{}\"}}"}}"#,
+            "x".repeat(MAX_REPAIR_BYTES)
+        );
+        let mut c = call("tool", &oversized);
+        mw.repair_call("tool", &schema(), &mut c);
+        assert_eq!(c.arguments, oversized);
     }
 }
 

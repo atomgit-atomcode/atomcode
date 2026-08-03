@@ -165,6 +165,10 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "memory", desc: "Show all saved memories", needs_args: false, hidden: false },
     Command { name: "mcp",     desc: "Show MCP server status (subcommands: reload, tools, login, logout, trust, untrust)", needs_args: false, hidden: false },
     Command { name: "undo",    desc: "Undo a turn (memory rollback): /undo or /undo N", needs_args: true, hidden: false },
+    // Opens the checkpoint picker — the same modal the double-Esc gesture opens —
+    // so the feature is discoverable without knowing the keybind. needs_args=false:
+    // selection happens in the modal, not on the command line.
+    Command { name: "rewind",  desc: "Restore the conversation to an earlier checkpoint", needs_args: false, hidden: false },
     Command { name: "worktree", desc: "Git worktree isolation (create/list/done/cleanup)", needs_args: true, hidden: false },
     Command { name: "upgrade", desc: "Upgrade atomcode to latest (subcommand: rollback)", needs_args: false, hidden: false },
     Command { name: "plan",    desc: "Switch to Plan mode (read-only exploration)", needs_args: false, hidden: false },
@@ -214,6 +218,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "save",    desc: "Save the current conversation to a markdown file (/save, /save [filename])", needs_args: false, hidden: false },
     Command { name: "view",    desc: "View file content in an overlay modal", needs_args: true, hidden: false },
     Command { name: "todo",    desc: "Show the todo list; /todo add <task> appends one, /todo clear wipes it", needs_args: false, hidden: false },
+    Command { name: "schedule", desc: "List scheduled tasks and next run times", needs_args: false, hidden: false },
     Command { name: "desktop", desc: "Open the AtomCode desktop app (or show the download link)", needs_args: false, hidden: false },
 ];
 
@@ -251,6 +256,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "memory" => Msg::CmdDescMemory,
         "mcp" => Msg::CmdDescMcp,
         "undo" => Msg::CmdDescUndo,
+        "rewind" => Msg::CmdDescRewind,
         "worktree" => Msg::CmdDescWorktree,
         "upgrade" => Msg::CmdDescUpgrade,
         "plan" => Msg::CmdDescPlan,
@@ -278,6 +284,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "proxy" => Msg::CmdDescProxy,
         "todo" => Msg::CmdDescTodo,
         "loop" => Msg::CmdDescLoop,
+        "schedule" => Msg::CmdDescSchedule,
         "desktop" => Msg::CmdDescDesktop,
         _ => return None,
     };
@@ -376,6 +383,18 @@ pub fn parse_bash_command(s: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewind_is_a_registered_command_with_i18n_desc() {
+        assert!(
+            BUILTIN_COMMANDS.iter().any(|c| c.name == "rewind" && !c.needs_args),
+            "/rewind must be a registered, no-arg builtin command"
+        );
+        assert!(
+            cmd_desc_i18n("rewind").is_some(),
+            "/rewind must map to an i18n description"
+        );
+    }
 
     #[test]
     fn bash_prefix_extracts_command() {

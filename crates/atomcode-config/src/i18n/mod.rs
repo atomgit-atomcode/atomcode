@@ -621,6 +621,14 @@ mod tests {
         assert!(zh_hint.contains("Ctrl+Dx2"));
         assert!(en_hint.contains("Ctrl+A") && en_hint.contains("Ctrl+E"));
         assert!(zh_hint.contains("Ctrl+A") && zh_hint.contains("Ctrl+E"));
+        assert_eq!(
+            t_with(Locale::En, Msg::ProviderPanelAddModelRow),
+            "+ Add model"
+        );
+        assert_eq!(
+            t_with(Locale::ZhCn, Msg::ProviderPanelAddModelRow),
+            "＋ 添加模型"
+        );
 
         assert_eq!(
             t_with(Locale::En, Msg::ProviderPanelEmptyModels),

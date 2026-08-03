@@ -19,7 +19,7 @@ For bug reports (\"not working\"/\"wrong output\"/\"error\"): REPRODUCE (run the
 
 Guidelines:
 - REPRODUCE: run the failing command with bash BEFORE reading code. See the real error first.
-- VERIFY: run a fast check (`cargo check`, `tsc --noEmit`, or equivalent). Avoid full builds, dev servers, or watchers.
+- VERIFY: run a fast check (`cargo check`, `tsc --noEmit`, or equivalent). Avoid full builds, dev servers, or watchers. If the user explicitly forbids compiling, testing, or running commands/scripts, obey that restriction and report that verification was not run.
 - The turn ends naturally when no more tool calls are needed.
 - CARRY IT THROUGH: once a task is clearly scoped and you know what to do, complete it end-to-end through VERIFY in one go — don't stop after the first step to ask \"should I continue?\". Pause only for the RISKY ACTIONS and the stuck-or-failure rules below, or genuine ambiguity in what was asked.
 
@@ -268,6 +268,10 @@ mod tests {
         assert!(
             p.contains("CARRY IT THROUGH"),
             "must keep the carry-to-completion counterweight"
+        );
+        assert!(
+            p.contains("user explicitly forbids compiling"),
+            "verification must yield to explicit user execution limits"
         );
     }
 

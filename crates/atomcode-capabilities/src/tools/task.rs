@@ -253,8 +253,12 @@ fn child_middlewares(
     is_worker: bool,
     scope: &[String],
     working_dir: &Path,
+    inherited_worker_middlewares: &[Arc<dyn ToolMiddleware>],
 ) -> Vec<Arc<dyn ToolMiddleware>> {
     let mut mw: Vec<Arc<dyn ToolMiddleware>> = vec![Arc::new(DenySensitivePaths)];
+    if is_worker {
+        mw.extend(inherited_worker_middlewares.iter().cloned());
+    }
     #[cfg(feature = "atomgit")]
     mw.push(Arc::new(super::AtomgitBashGate::new()));
     if is_worker {
@@ -303,6 +307,7 @@ pub struct TaskTool {
     max_concurrent: usize,
     max_rounds: Option<u32>,
     tool_loop_policy: Option<ToolLoopPolicy>,
+    inherited_worker_middlewares: Vec<Arc<dyn ToolMiddleware>>,
 }
 
 impl TaskTool {
@@ -320,6 +325,7 @@ impl TaskTool {
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             max_rounds: Some(super::DEFAULT_CHILD_MAX_ROUNDS),
             tool_loop_policy: Some(ToolLoopPolicy::default()),
+            inherited_worker_middlewares: Vec::new(),
         }
     }
 
@@ -339,6 +345,13 @@ impl TaskTool {
     /// for intentional repeated operations; the independent round cap remains.
     pub fn with_tool_loop_policy(mut self, policy: Option<ToolLoopPolicy>) -> Self {
         self.tool_loop_policy = policy;
+        self
+    }
+
+    /// Install a parent-owned hard policy in every worker child. Explore children have
+    /// no shell/write tools and deliberately remain unaffected.
+    pub fn with_worker_middleware(mut self, middleware: Arc<dyn ToolMiddleware>) -> Self {
+        self.inherited_worker_middlewares.push(middleware);
         self
     }
 }
@@ -448,6 +461,7 @@ parallel workers NON-OVERLAPPING scopes."
         let sem = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent));
         let max_rounds = self.max_rounds;
         let tool_loop_policy = self.tool_loop_policy;
+        let inherited_worker_middlewares = self.inherited_worker_middlewares.clone();
         let mut set = tokio::task::JoinSet::new();
         // Live progress: the whole batch would otherwise be a black box until every subtask
         // finishes. Emit a header + per-subtask start/done so the driver renders them live.
@@ -491,6 +505,7 @@ parallel workers NON-OVERLAPPING scopes."
             let desc = t.description;
             let sem = sem.clone();
             let progress = ctx.progress.clone();
+            let inherited_worker_middlewares = inherited_worker_middlewares.clone();
             // Advertise the selected model while this child is still queued.
             // Marker-prefixed means retained UIs update the fixed panel without
             // committing an extra transcript row. The later ↻ event is the sole
@@ -531,7 +546,12 @@ parallel workers NON-OVERLAPPING scopes."
                 // The child runs AutoRespond::AllowAll (no human in its loop), so the parent's
                 // prompting gates wouldn't protect it. Hard-deny sensitive-path ops for every
                 // child (#1); additionally confine a `worker`'s WRITES to its declared scope.
-                for mw in child_middlewares(is_worker, &scope, &wd) {
+                for mw in child_middlewares(
+                    is_worker,
+                    &scope,
+                    &wd,
+                    &inherited_worker_middlewares,
+                ) {
                     builder = builder.middleware(mw);
                 }
                 let child = builder.build();
@@ -1750,16 +1770,36 @@ mod tests {
 
     #[test]
     fn child_middlewares_add_the_scope_gate_only_for_workers() {
-        use super::child_middlewares;
+        use super::{child_middlewares, DenySensitivePaths};
         use std::path::Path;
         #[cfg(feature = "atomgit")]
         let base = 2; // DenySensitivePaths + AtomgitBashGate.
         #[cfg(not(feature = "atomgit"))]
         let base = 1; // DenySensitivePaths.
-        assert_eq!(child_middlewares(false, &[], Path::new("/w")).len(), base);
         assert_eq!(
-            child_middlewares(true, &["src/**".into()], Path::new("/w")).len(),
+            child_middlewares(false, &[], Path::new("/w"), &[]).len(),
+            base
+        );
+        assert_eq!(
+            child_middlewares(true, &["src/**".into()], Path::new("/w"), &[]).len(),
             base + 1
+        );
+        let inherited: Vec<Arc<dyn ToolMiddleware>> = vec![Arc::new(DenySensitivePaths)];
+        assert_eq!(
+            child_middlewares(false, &[], Path::new("/w"), &inherited).len(),
+            base,
+            "read-only explore children do not need worker execution policy"
+        );
+        assert_eq!(
+            child_middlewares(
+                true,
+                &["src/**".into()],
+                Path::new("/w"),
+                &inherited,
+            )
+            .len(),
+            base + 2,
+            "worker receives inherited policy plus its scope gate"
         );
     }
 }

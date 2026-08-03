@@ -1987,6 +1987,67 @@ fn parse_bash(command: &str) -> Option<tree_sitter::Tree> {
     })
 }
 
+/// One concrete command invocation extracted from a Bash syntax tree.
+///
+/// This is intentionally syntax-only: product layers decide whether `cargo test`,
+/// `git commit`, or an arbitrary executable is permitted. Returning `None` means the
+/// source could not be parsed completely, so policy callers can fail closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BashInvocation {
+    pub command: String,
+    pub arguments: Vec<String>,
+}
+
+/// Parse every command invocation in `source`, including invocations nested in command
+/// substitutions and subshells. Quoted separators remain argument data rather than being
+/// mistaken for pipelines. The result preserves source order.
+pub fn bash_invocations(source: &str) -> Option<Vec<BashInvocation>> {
+    let source = source.trim();
+    if source.is_empty() {
+        return None;
+    }
+    let tree = parse_bash(source)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let mut nodes = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "command" {
+            nodes.push(node);
+        }
+        for index in (0..node.child_count() as u32).rev() {
+            stack.push(node.child(index)?);
+        }
+    }
+    nodes.sort_by_key(|node| node.start_byte());
+
+    let mut invocations = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let mut command = None;
+        let mut arguments = Vec::new();
+        for index in 0..node.named_child_count() as u32 {
+            let child = node.named_child(index)?;
+            let text = child.utf8_text(bytes).ok()?.to_string();
+            if child.kind() == "command_name" && command.is_none() {
+                command = Some(text);
+            } else if matches!(
+                child.kind(),
+                "word" | "raw_string" | "string" | "concatenation" | "number"
+            ) {
+                arguments.push(text);
+            }
+        }
+        invocations.push(BashInvocation {
+            command: command?,
+            arguments,
+        });
+    }
+    Some(invocations)
+}
+
 /// Whether `command` is PROVABLY read-only, so it may run CONCURRENTLY without a
 /// sandbox. AST-based (tree-sitter-bash): only a fixed set of STRUCTURAL node kinds is
 /// allowed; any other NAMED kind (command substitution, subshell, expansion, …) means
@@ -2759,6 +2820,38 @@ mod tests {
             double.iter().any(|k| k == "command_substitution"),
             "double-quoted $(...) MUST parse as command_substitution: {double:?}"
         );
+    }
+
+    #[test]
+    fn bash_invocations_follow_syntax_and_include_nested_commands() {
+        assert_eq!(
+            super::bash_invocations(
+                r#"cd app && cargo +nightly test | tee out; echo "$(npm --prefix ui run build)""#
+            ),
+            Some(vec![
+                super::BashInvocation {
+                    command: "cd".into(),
+                    arguments: vec!["app".into()],
+                },
+                super::BashInvocation {
+                    command: "cargo".into(),
+                    arguments: vec!["+nightly".into(), "test".into()],
+                },
+                super::BashInvocation {
+                    command: "tee".into(),
+                    arguments: vec!["out".into()],
+                },
+                super::BashInvocation {
+                    command: "echo".into(),
+                    arguments: vec![r#""$(npm --prefix ui run build)""#.into()],
+                },
+                super::BashInvocation {
+                    command: "npm".into(),
+                    arguments: vec!["--prefix".into(), "ui".into(), "run".into(), "build".into()],
+                },
+            ])
+        );
+        assert!(super::bash_invocations("cargo test |").is_none());
     }
 
     #[test]

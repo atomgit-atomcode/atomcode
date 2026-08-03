@@ -406,6 +406,17 @@ impl Conversation {
     /// APPEND-ONLY — existing messages are never mutated or reordered — so it
     /// preserves the prefix-cache invariant guarded by `tests/cache_prefix.rs`.
     pub fn backfill_cancelled_tool_results(&mut self) {
+        self.backfill_missing_tool_results("(cancelled)");
+    }
+
+    /// Pair complete tool calls recovered from a failed provider stream without ever
+    /// executing them. Distinct wording prevents a transport failure from being
+    /// misreported as a user cancellation on resume.
+    pub(crate) fn backfill_interrupted_tool_results(&mut self) {
+        self.backfill_missing_tool_results("(interrupted before execution)");
+    }
+
+    fn backfill_missing_tool_results(&mut self, content: &str) {
         // Collect call_ids that already have results.
         let mut seen_result_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
@@ -417,20 +428,21 @@ impl Conversation {
 
         // Find assistant tool_calls with no matching result.
         let mut missing: Vec<String> = Vec::new();
+        let mut seen_missing_ids = std::collections::HashSet::new();
         for m in &self.messages {
             if m.role == Role::Assistant {
                 for tc in &m.tool_calls {
-                    if !seen_result_ids.contains(&tc.id) {
+                    if !seen_result_ids.contains(&tc.id) && seen_missing_ids.insert(tc.id.clone()) {
                         missing.push(tc.id.clone());
                     }
                 }
             }
         }
 
-        // Append one (cancelled) result per dangling call (append-only).
+        // Append one synthetic result per unique dangling call id (append-only).
         for id in missing {
             self.messages
-                .push(Message::tool_result(id, "(cancelled)", true));
+                .push(Message::tool_result(id, content, true));
         }
     }
 
@@ -1119,6 +1131,26 @@ mod tests {
             assert_eq!(r.text, "(cancelled)");
             assert_eq!(r.role, Role::Tool);
         }
+    }
+
+    #[test]
+    fn backfill_adds_only_one_result_for_a_duplicate_call_id() {
+        let mut c = Conversation::new();
+        c.push(Message::assistant(
+            "calling",
+            vec![call("same", "write_file"), call("same", "write_file")],
+        ));
+
+        c.backfill_interrupted_tool_results();
+
+        let results: Vec<&Message> = c
+            .messages
+            .iter()
+            .filter(|m| m.tool_call_id.as_deref() == Some("same"))
+            .collect();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].text, "(interrupted before execution)");
+        assert!(results[0].is_error);
     }
 
     // Mirrors production

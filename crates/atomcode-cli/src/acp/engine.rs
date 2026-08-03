@@ -61,7 +61,12 @@ pub async fn spawn_session(
     });
     CodingRuntime::start(CodingRuntimeStart {
         agent: cfg,
-        prepare: PrepareOptions::default(),
+        prepare: PrepareOptions {
+            // ACP 1.0.1 has no general elicitation request/response. Do not expose a
+            // tool whose only possible driver result would be a synthetic Null.
+            request_user_input: false,
+            ..PrepareOptions::default()
+        },
         provider_factory,
         plugin_hooks: Arc::new(StaticPluginHookSource::default()),
         image_preprocessor: None,

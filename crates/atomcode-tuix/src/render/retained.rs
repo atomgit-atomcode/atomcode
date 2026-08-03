@@ -47,6 +47,16 @@ pub const MAX_SCROLLBACK_ROWS: usize = 5000;
 /// so it can't grow the buffer until allocation fails. 1 MiB ≫ any real line.
 const ASSISTANT_LINE_BUF_MAX: usize = 1 << 20;
 
+/// Append one stream chunk and remove its complete-line prefix.
+/// The existing buffer has no newline, so only the new chunk needs a scan.
+fn append_stream_chunk(buffer: &mut String, chunk: &str) -> Option<String> {
+    let buffered_len = buffer.len();
+    let last_newline = chunk.rfind('\n');
+    buffer.push_str(chunk);
+    let split_at = buffered_len + last_newline? + 1;
+    Some(buffer.drain(..split_at).collect())
+}
+
 /// Hard cap on how many rows the input box may DISPLAY before it scrolls
 /// internally. Bounds the footer so a long paste / typed text can't grow it
 /// past the screen height (the overflow bug). This caps DISPLAY only — the
@@ -1654,15 +1664,38 @@ impl<W: Write + Send> RetainedRenderer<W> {
         rule_width: usize,
         session_name: Option<&str>,
         history: Option<super::HistoryPosition>,
+        search: Option<&super::SearchState>,
         shell: bool,
     ) -> Vec<Cell> {
         let mut row = self.build_rule_row(rule_width, shell);
         const LEFT_MARGIN: usize = 2;
         const BADGE_GAP: usize = 2;
-        let history_end = history
-            .filter(|position| position.total > 0 && position.current <= position.total)
-            .map(|position| {
-                let text = format!(" History {}/{} ", position.current, position.total);
+        // Ctrl+R reverse-i-search wins the badge slot while active; the
+        // History N/N position is hidden during a search.
+        let history_end = search
+            .map(|s| {
+                // Budget: query gets whatever width is left after the
+                // fixed chrome (" Search '" prefix + closing quote) and
+                // the count, so a long query truncates instead of being
+                // dropped wholesale.
+                let prefix_w = crate::width::display_width(" Search '");
+                let count_text = format!(" {}/{} ", s.current, s.total);
+                let count_w = crate::width::display_width(&count_text);
+                // +1 chrome for the closing quote after the query.
+                let chrome = LEFT_MARGIN + BADGE_GAP + prefix_w + 1 + count_w;
+                // +1 more for the ellipsis when truncating.
+                let max_query = rule_width.saturating_sub(chrome + 1);
+                let (query, ellipsis) = if max_query >= 1 {
+                    let qw = crate::width::display_width(&s.query);
+                    if qw > max_query {
+                        (crate::width::truncate_to_width(&s.query, max_query), "…")
+                    } else {
+                        (s.query.clone(), "")
+                    }
+                } else {
+                    (String::new(), "")
+                };
+                let text = format!(" Search '{}'{}{}", query, ellipsis, count_text);
                 let cells = {
                     let mut cells = Vec::new();
                     push_str_cells(&mut cells, &text, &self.style_faint(Role::Muted));
@@ -1676,6 +1709,26 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 } else {
                     0
                 }
+            })
+            .or_else(|| {
+                history
+                    .filter(|position| position.total > 0 && position.current <= position.total)
+                    .map(|position| {
+                        let text = format!(" History {}/{} ", position.current, position.total);
+                        let cells = {
+                            let mut cells = Vec::new();
+                            push_str_cells(&mut cells, &text, &self.style_faint(Role::Muted));
+                            cells
+                        };
+                        if LEFT_MARGIN + cells.len() + BADGE_GAP <= rule_width {
+                            for (offset, cell) in cells.into_iter().enumerate() {
+                                row[LEFT_MARGIN + offset] = cell;
+                            }
+                            LEFT_MARGIN + crate::width::display_width(&text)
+                        } else {
+                            0
+                        }
+                    })
             })
             .unwrap_or(0);
 
@@ -3873,6 +3926,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             input_rule_width,
             self.status.session_name.as_deref(),
             self.status.history,
+            self.status.search.as_ref(),
             shell,
         );
         let middle_cells: Vec<Vec<Cell>> = lines[input_view_start..input_view_start + middle_rows]
@@ -5018,10 +5072,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Instead, overlay the transient strip in the final visible slots.
         // Any covered permanent tail rows remain in `body_lines` and are
         // restored by the next paint after the spinner is cleared.
+        //
+        // The in-flight tool strip (`render_inflight_tool` → `inflight_tool_rows`)
+        // is the SAME kind of transient bottom-anchored overlay: it is written
+        // by a raw in-place path that positions itself at `body_bottom_row()`.
+        // It must be counted here too, otherwise a footer-height change while a
+        // tool animates — newly common in v5.0.3, where the pending-messages /
+        // subtask panels grow and shrink the footer mid-turn — top-anchors the
+        // overfull body and DROPS the strip's tail rows from this cell model.
+        // paint would then disagree with the raw write about where (or whether)
+        // the strip is, leaving a ghost copy of the strip block on screen (the
+        // reported "渲染重叠"). The two are mutually exclusive (the live spinner
+        // only runs when no tool is in flight), so an `else` is sufficient.
         let transient_rows = if self.live_spinner_active {
             1 + usize::from(self.live_spinner_spacer_active)
         } else {
-            0
+            self.inflight_tool_rows
         }
         .min(display_total.saturating_sub(self.scrolled_off))
         .min(body_height);
@@ -5901,17 +5967,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// streaming assistant buffer into `body_lines`, rendering
     /// each through the markdown inline renderer so bold / inline
     /// code / lists / headings get their styled cells.
-    fn flush_assistant_lines(&mut self) {
-        if !self.assistant_line_buf.contains('\n') {
+    fn flush_assistant_lines(&mut self, chunk: &str) {
+        let Some(complete) = append_stream_chunk(&mut self.assistant_line_buf, chunk) else {
             return;
-        }
+        };
         let md_width = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
         let mut completed: Vec<String> = Vec::new();
-        while let Some(nl) = self.assistant_line_buf.find('\n') {
-            let line: String = self.assistant_line_buf.drain(..=nl).collect();
-            let content = line[..line.len() - 1].to_string();
+        for content in complete.split_terminator('\n') {
             if let Some(rendered) = crate::markdown::render_line_with_width(
-                &content,
+                content,
                 &mut self.md_state,
                 self.caps,
                 md_width,
@@ -5960,22 +6024,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
-    fn flush_reasoning_lines(&mut self) {
-        if !self.reasoning_line_buf.contains('\n') {
+    fn flush_reasoning_lines(&mut self, chunk: &str) {
+        let Some(complete) = append_stream_chunk(&mut self.reasoning_line_buf, chunk) else {
             return;
-        }
-        let mut completed: Vec<String> = Vec::new();
-        while let Some(nl) = self.reasoning_line_buf.find('\n') {
-            let line: String = self.reasoning_line_buf.drain(..=nl).collect();
-            let content = line[..line.len() - 1].to_string();
-            completed.push(content);
-        }
+        };
         let style = CellStyle {
             faint: true,
             ..CellStyle::default()
         };
-        for content in completed {
-            self.push_body_text(&content, &style);
+        for content in complete.split_terminator('\n') {
+            self.push_body_text(content, &style);
         }
     }
 
@@ -6813,8 +6871,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                         }
                     }
                 }
-                self.assistant_line_buf.push_str(&scrub_controls(&text));
-                self.flush_assistant_lines();
+                let safe = scrub_controls(&text);
+                self.flush_assistant_lines(&safe);
                 // Safety cap: `flush_assistant_lines` only drains up to a `\n`, so a
                 // stream that dribbles bytes without ever emitting a newline (a hung
                 // keep-alive connection, or a model streaming one enormous single
@@ -6828,8 +6886,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 }
             }
             UiLine::ReasoningText(text) => {
-                self.reasoning_line_buf.push_str(&scrub_controls(&text));
-                self.flush_reasoning_lines();
+                let safe = scrub_controls(&text);
+                self.flush_reasoning_lines(&safe);
             }
             UiLine::AssistantLineBreak => {
                 self.flush_assistant_remainder();
@@ -7468,14 +7526,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_text(&body, &warn_style);
             }
             UiLine::Muted(msg) => {
-                // Dim, non-bold informational line — no forced prefix.
-                // Same DarkGrey palette as CompactionMark so it recedes
-                // into scrollback without reading as a warning or error.
-                let style = CellStyle {
-                    fg: Some(crossterm::style::Color::DarkGrey),
-                    bold: false,
-                    ..CellStyle::default()
-                };
+                // Dim, non-bold informational line — no forced prefix. Use the
+                // THEME-AWARE muted role, NOT a hardcoded DarkGrey: DarkGrey is
+                // `MUTED_LIGHT` (SGR 90), which on a dark terminal collapses into
+                // the background and is illegible — e.g. the rate-limit
+                // "限流，Ns 后自动继续…" countdown. `Role::Muted` resolves to
+                // SGR 37 (readable light-gray) on dark themes and keeps DarkGrey
+                // on light, and it also honours NO_COLOR (no fg SGR).
+                let style = self.style_for(Role::Muted);
                 self.push_body_text(&scrub_controls(&msg), &style);
             }
             UiLine::CompactionMark(label) => {
@@ -8767,6 +8825,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/project/atomcode".into(),
             history: None,
+            search: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -9133,6 +9192,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
             history: None,
+            search: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -9187,6 +9247,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
             history: None,
+            search: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -9260,6 +9321,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
             history: None,
+            search: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -9309,6 +9371,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
             history: None,
+            search: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -9362,6 +9425,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
             history: None,
+            search: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -9415,6 +9479,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
             history: None,
+            search: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -9455,6 +9520,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
             history: None,
+            search: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,
@@ -9495,7 +9561,7 @@ mod tests {
         let (mut r, _counter) = new_counting(80, 24);
         r.caps.colors = true;
         r.caps.unicode_symbols = true;
-        let row = r.build_top_rule_with_context(60, Some("atomcode加解密"), None, false);
+        let row = r.build_top_rule_with_context(60, Some("atomcode加解密"), None, None, false);
         // Skip continuation cells (width 0 placeholders that follow a
         // wide glyph) — they carry `ch = ' '` and would break a naive
         // substring check on a CJK name.
@@ -9524,6 +9590,7 @@ mod tests {
                 current: 100,
                 total: 100,
             }),
+            None,
             false,
         );
         let visible: String = row
@@ -9549,6 +9616,7 @@ mod tests {
                 current: 999,
                 total: 1000,
             }),
+            None,
             false,
         );
         let visible: String = row
@@ -9558,6 +9626,77 @@ mod tests {
             .collect();
         assert!(visible.contains("History 999/1000"), "{visible:?}");
         assert!(visible.contains("release/v5.0.3"), "{visible:?}");
+    }
+
+    #[test]
+    fn build_top_rule_search_indicator_replaces_history_position() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        // While Ctrl+R search is active, the badge shows the query +
+        // match position instead of "History N/N" — even though the
+        // buffer also carries a history_idx during search.
+        let row = r.build_top_rule_with_context(
+            80,
+            None,
+            Some(crate::render::HistoryPosition {
+                current: 2,
+                total: 100,
+            }),
+            Some(&crate::render::SearchState {
+                query: "git".into(),
+                current: 2,
+                total: 5,
+                matched: true,
+            }),
+            false,
+        );
+        let visible: String = row
+            .iter()
+            .filter(|cell| cell.width > 0)
+            .map(|cell| cell.ch)
+            .collect();
+        assert!(
+            visible.contains("Search 'git' 2/5"),
+            "search indicator must appear on the top rule: {visible:?}"
+        );
+        assert!(
+            !visible.contains("History"),
+            "history position must be hidden while searching: {visible:?}"
+        );
+    }
+
+    #[test]
+    fn build_top_rule_search_indicator_truncates_long_query() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let long_query = "a very long search query that definitely overflows the badge budget".to_string();
+        let row = r.build_top_rule_with_context(
+            40,
+            None,
+            None,
+            Some(&crate::render::SearchState {
+                query: long_query,
+                current: 1,
+                total: 1,
+                matched: true,
+            }),
+            false,
+        );
+        let visible: String = row
+            .iter()
+            .filter(|cell| cell.width > 0)
+            .map(|cell| cell.ch)
+            .collect();
+        assert!(
+            visible.contains("Search"),
+            "search badge must still render: {visible:?}"
+        );
+        assert!(
+            visible.contains('…'),
+            "long query must be truncated with ellipsis: {visible:?}"
+        );
     }
 
     #[test]
@@ -9607,7 +9746,7 @@ mod tests {
         let (mut r, _counter) = new_counting(80, 24);
         r.caps.colors = true;
         r.caps.unicode_symbols = true;
-        let row = r.build_top_rule_with_context(60, None, None, false);
+        let row = r.build_top_rule_with_context(60, None, None, None, false);
         assert_eq!(row.len(), 60, "rule width must be preserved");
         assert!(
             row.iter().all(|c| c.ch == '─'),
@@ -9628,7 +9767,7 @@ mod tests {
         r.caps.colors = true;
         r.caps.unicode_symbols = true;
         let long = "这是一个非常非常非常非常长的会话名字应当被截断省略";
-        let row = r.build_top_rule_with_context(40, Some(long), None, false);
+        let row = r.build_top_rule_with_context(40, Some(long), None, None, false);
         // Same continuation-cell filter rationale as the badge-render
         // test above: width-0 cells carry ' ' and would obscure the
         // substring assertions on CJK names.
@@ -10680,6 +10819,163 @@ mod tests {
             post_open,
             vterm.dump()
         );
+    }
+
+    /// v5.0.3 regression (rendering overlap / ghost tool-call block):
+    /// the mirror of `retained_inflight_ghost_clears_when_footer_grows_around_it`,
+    /// but the footer SHRINKS mid-run instead of growing. The new
+    /// `pending_messages` panel (steer messages queued during a turn) is a
+    /// variable-height footer element; when it collapses (a queued message is
+    /// consumed, or cosmetic spacing is dropped to fit), `current_footer_rows()`
+    /// drops, `body_bottom_row()` grows, and the in-place inflight strip moves
+    /// DOWN a row. `render_inflight_tool` only sentinels prev_cells from the NEW
+    /// (lower) strip top downward (`invalidate_rows_from(first_0idx)`), so the
+    /// strip's PREVIOUS, higher physical rows are never repainted and survive as
+    /// a ghost duplicate ABOVE the live strip — exactly the reported overlap.
+    #[test]
+    fn retained_inflight_ghost_clears_when_footer_shrinks_under_it() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        // Baseline paint (mirrors the footer-GROWS sibling test).
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋".into(),
+            label: "Pondering".into(),
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+
+        // Fill body past the cap so `body_bottom_row()` pins to the footer edge
+        // and tracks footer-height changes.
+        for i in 0..20 {
+            r.render(UiLine::CommandOutput(format!("filler-{:02}\n", i)));
+        }
+        r.flush_deferred();
+
+        // Seed + tick the inflight tool with a SMALL footer (no pending panel).
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-leak".into(),
+            name: "Grep".into(),
+            detail: "LEAKMARKER_PLACEHOLDER_AAAA".into(),
+            hint: None,
+        });
+        r.render(UiLine::Spinner {
+            frame: "⠙".into(),
+            label: "Running Bash".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // GROW the footer: queue steer messages (the v5.0.3 pending-messages
+        // panel). The in-place strip moves UP to make room.
+        let with_pending = {
+            let mut s = status.clone();
+            s.pending_messages = vec![
+                "queued steer one".into(),
+                "queued steer two".into(),
+                "queued steer three".into(),
+            ];
+            s
+        };
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠹".into(),
+            label: "Running Bash".into(),
+            menu: None,
+            status: with_pending,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let high_row = (0..24)
+            .find(|&row| vterm.row_text(row).contains("LEAKMARKER"))
+            .unwrap_or_else(|| panic!("test setup broken: marker not painted\n{}", vterm.dump()));
+
+        // SHRINK the footer back: the steers are consumed at the tool boundary,
+        // the pending panel collapses, and the in-place strip moves DOWN.
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠸".into(),
+            label: "Running Bash".into(),
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let low_row = (0..24)
+            .find(|&row| vterm.row_text(row).contains("LEAKMARKER"))
+            .unwrap_or_else(|| panic!("marker vanished entirely after shrink\n{}", vterm.dump()));
+
+        // The strip must have moved DOWN and left NO ghost at its old row.
+        assert!(
+            low_row > high_row,
+            "expected strip to move down when footer shrank (high={high_row}, low={low_row})\n{}",
+            vterm.dump()
+        );
+        assert!(
+            !vterm.row_text(high_row).contains("LEAKMARKER"),
+            "ghost inflight strip survived at old row {high_row} after footer shrank:\n{}",
+            vterm.dump()
+        );
+    }
+
+    /// Guards the fix that counts the in-flight tool strip in `transient_rows`
+    /// (`paint_body_into_cells`). A MULTI-row strip (Bash: command + blank +
+    /// `Running` row) overlaid on an OVERFLOWING body, with permanent rows
+    /// streaming under it (the `task`/bash-output case), must not corrupt native
+    /// scrollback: the compaction path pins physical row 0 to
+    /// `body_lines[scrolled_off]`, so each overflow-LF promotes exactly the right
+    /// row. Every filler row must survive across scrollback+viewport exactly once
+    /// (no duplication, no loss).
+    #[test]
+    fn retained_multirow_inflight_strip_overflow_preserves_scrollback() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::StreamingBox {
+            buf: String::new(), cursor_byte: 0, frame: "⠋".into(), label: "Pondering".into(),
+            menu: None, status: status.clone(), attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        for i in 0..25 {
+            r.render(UiLine::CommandOutput(format!("FILL{:02}\n", i)));
+        }
+        r.flush_deferred();
+        // Multi-row Bash inflight strip (command + blank + Running row).
+        r.render(UiLine::ToolCallInFlight {
+            id: "c1".into(), name: "Bash".into(), detail: "echo hi".into(), hint: None,
+        });
+        r.render(UiLine::Spinner { frame: "⠙".into(), label: "Running · 1s".into() });
+        r.flush_deferred();
+        assert!(r.inflight_tool_rows >= 3, "expected multi-row strip, got {}", r.inflight_tool_rows);
+        drain_into_vterm(&buf, &mut vterm);
+        // Stream permanent rows while overflowing, re-ticking the strip each time.
+        for i in 0..6 {
+            r.render(UiLine::CommandOutput(format!("STREAM{:02}\n", i)));
+            r.render(UiLine::Spinner { frame: "⠹".into(), label: format!("Running · {i}s") });
+            r.flush_deferred();
+            drain_into_vterm(&buf, &mut vterm);
+        }
+        // Every FILL row must appear exactly once across scrollback+viewport (no dup/loss).
+        let all: Vec<String> = vterm.scrollback_texts().into_iter()
+            .chain((0..24).map(|row| vterm.row_text(row).trim_end().to_string()))
+            .collect();
+        for i in 0..25 {
+            let tag = format!("FILL{:02}", i);
+            let n = all.iter().filter(|l| l.contains(&tag)).count();
+            assert_eq!(n, 1, "{tag} appeared {n} times (dup/loss)\nSCROLLBACK:\n{}\nSCREEN:\n{}",
+                vterm.scrollback_texts().join("\n"), vterm.dump());
+        }
     }
 
     /// User report (long `cargo install` looked stuck): the inflight
@@ -12149,6 +12445,55 @@ mod tests {
             !name_cell.faint,
             "tool name must NOT be faint, got {:?}",
             name_cell,
+        );
+    }
+
+    /// A `UiLine::Muted` line (rate-limit countdown, version notice, …) must be
+    /// legible on a dark terminal. Regression: the handler hardcoded DarkGrey
+    /// (`MUTED_LIGHT` / SGR 90 = "bright black"), which on a dark background
+    /// collapses into the bg and reads as unreadable — the "限流，Ns 后自动继续…"
+    /// countdown was invisible. It must use the theme-aware muted role, which
+    /// is `Color::Grey` (SGR 37) on dark and DarkGrey on light.
+    #[test]
+    fn muted_line_uses_legible_theme_aware_gray_not_hardcoded_darkgrey() {
+        let _theme = crate::highlight::theme::test_lock();
+
+        // Dark theme → Color::Grey (readable light-gray), never DarkGrey.
+        crate::highlight::theme::set_theme_mode(false);
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        r.render(UiLine::Muted("限流，3s 后自动继续…".into()));
+        r.flush_deferred();
+        let dark_cells: Vec<_> = r
+            .body_lines
+            .iter()
+            .flatten()
+            .filter(|c| c.ch != ' ')
+            .collect();
+        assert!(!dark_cells.is_empty(), "muted line rendered no visible cells");
+        assert!(
+            dark_cells.iter().all(|c| c.style.fg == Some(Color::Grey)),
+            "dark-theme muted must be Color::Grey (legible), got {:?}",
+            dark_cells.iter().map(|c| c.style.fg).collect::<Vec<_>>(),
+        );
+        assert!(
+            dark_cells.iter().all(|c| c.style.fg != Some(Color::DarkGrey)),
+            "dark-theme muted must NOT be DarkGrey (SGR 90 collapses into the bg)",
+        );
+
+        // Light theme keeps DarkGrey (a readable gray on white) — unchanged.
+        crate::highlight::theme::set_theme_mode(true);
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        r.render(UiLine::Muted("限流，3s 后自动继续…".into()));
+        r.flush_deferred();
+        assert!(
+            r.body_lines
+                .iter()
+                .flatten()
+                .filter(|c| c.ch != ' ')
+                .all(|c| c.style.fg == Some(Color::DarkGrey)),
+            "light-theme muted stays DarkGrey",
         );
     }
 
@@ -19093,6 +19438,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stream_chunk_extracts_complete_prefix_and_keeps_partial_tail() {
+        let mut buffer = "prefix".repeat(1024);
+        let original = buffer.clone();
+
+        assert!(append_stream_chunk(&mut buffer, "-tail").is_none());
+        let completed = append_stream_chunk(&mut buffer, "\nsecond\npartial").unwrap();
+
+        assert_eq!(completed, format!("{original}-tail\nsecond\n"));
+        assert_eq!(buffer, "partial");
+    }
+
+    #[test]
+    fn stream_chunk_preserves_empty_complete_lines() {
+        let mut buffer = "first".to_string();
+
+        let completed = append_stream_chunk(&mut buffer, "\n\nthird\nrest").unwrap();
+
+        assert_eq!(completed, "first\n\nthird\n");
+        assert_eq!(buffer, "rest");
+    }
+
     /// Regression (long-session resize duplication): once `body_log` evicts its
     /// oldest entries (`body_log_truncated`), on_resize MUST still clear native
     /// scrollback (`\x1b[3J`). The reflow below re-appends the whole RETAINED
@@ -19969,6 +20336,7 @@ mod tests {
             model: String::new(), // no status row (has_status=false → status_rows=0)
             cwd: String::new(),
             history: None,
+            search: None,
             command_output: None,
             ctx_used: 0,
             ctx_window: 0,

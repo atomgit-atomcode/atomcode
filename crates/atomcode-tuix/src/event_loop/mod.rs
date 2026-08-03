@@ -164,6 +164,84 @@ fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// Decode a packed `CF_DIB` clipboard payload (a `BITMAPINFOHEADER`-family
+/// header, optional bitfield masks + palette, then the pixel array) into
+/// `(width, height, RGBA8)`.
+///
+/// The payload is wrapped in a synthesized `BITMAPFILEHEADER` and decoded via
+/// the BMP *file* path so the explicit `bfOffBits` pins the pixel offset. That
+/// is the crux of the Windows paste bug: arboard's header-less decode
+/// mis-places the pixel offset for V4/V5 headers with `BI_BITFIELDS`
+/// compression (it skips the 12 trailing mask bytes those headers embed), so it
+/// rejects the DIBs that Qt-based screenshot tools (PixPin, Snipaste) and the
+/// Windows Snipping Tool produce, and `/paste` then reports "no image". Ported
+/// from oh-my-pi's fix for the identical arboard limitation.
+///
+/// Kept target-independent (not `cfg(windows)`) so the pure decoder and its
+/// fixtures are unit-tested on every host; only the raw clipboard read
+/// (`read_raw_cf_dib`) is Windows-only.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn decode_cf_dib_to_rgba(dib: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    const FILE_HEADER_SIZE: u64 = 14;
+    const INFO_HEADER_SIZE: u64 = 40;
+    const BI_BITFIELDS: u32 = 3;
+
+    if dib.len() < INFO_HEADER_SIZE as usize {
+        return None;
+    }
+    let u32_at = |at: usize| u32::from_le_bytes(dib[at..at + 4].try_into().expect("bounds checked"));
+    let header_size = u64::from(u32_at(0));
+    if header_size < INFO_HEADER_SIZE || header_size > dib.len() as u64 {
+        return None;
+    }
+    let bit_count = u16::from_le_bytes([dib[14], dib[15]]);
+    let compression = u32_at(16);
+    let colors_used = u64::from(u32_at(32));
+
+    // A plain BITMAPINFOHEADER with BI_BITFIELDS is trailed by three DWORD
+    // masks; larger (V2..V5) headers embed the masks in the header itself.
+    let mask_bytes: u64 = if header_size == INFO_HEADER_SIZE && compression == BI_BITFIELDS {
+        12
+    } else {
+        0
+    };
+    let palette_entries: u64 = if colors_used != 0 {
+        colors_used
+    } else if bit_count <= 8 {
+        1u64 << bit_count
+    } else {
+        0
+    };
+    let pixel_offset =
+        u32::try_from(FILE_HEADER_SIZE + header_size + mask_bytes + palette_entries * 4).ok()?;
+    let file_size = u32::try_from(FILE_HEADER_SIZE + dib.len() as u64).ok()?;
+
+    let mut bmp = Vec::with_capacity(FILE_HEADER_SIZE as usize + dib.len());
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&file_size.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&pixel_offset.to_le_bytes());
+    bmp.extend_from_slice(dib);
+
+    let decoded = image::load_from_memory_with_format(&bmp, image::ImageFormat::Bmp).ok()?;
+    let rgba = decoded.into_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some((w, h, rgba.into_raw()))
+}
+
+/// Read the raw `CF_DIB` bytes from the Windows clipboard. Windows synthesizes
+/// `CF_DIB` from whatever bitmap formats are present, so it is available
+/// whenever the clipboard holds any image at all — including the Qt/Snipping-
+/// Tool payloads arboard's `get_image()` rejects.
+#[cfg(windows)]
+fn read_raw_cf_dib() -> Option<Vec<u8>> {
+    let clip = clipboard_win::Clipboard::new_attempts(10).ok()?;
+    let mut dib = Vec::new();
+    clipboard_win::raw::get_vec(clipboard_win::formats::CF_DIB, &mut dib).ok()?;
+    drop(clip);
+    (!dib.is_empty()).then_some(dib)
+}
+
 /// Try to grab an image from the system clipboard via `arboard`.
 /// Returns `Some((ImageContent, fingerprint))` if the clipboard holds an
 /// image, `None` otherwise. The fingerprint is hashed off the raw RGBA
@@ -210,17 +288,46 @@ fn try_paste_clipboard_image() -> Option<(ImageContent, u64)> {
     //   Sources: Cmd+Shift+Ctrl+4 screenshot, Preview "Copy", browser
     //   "Copy image", any app's Edit-menu Copy on a bitmap. arboard's
     //   get_image decodes these into RGBA.
-    if let Ok(img) = clipboard.get_image() {
-        let hash = rgba_fingerprint(img.width, img.height, img.bytes.as_ref());
-        let png_data = encode_rgba_to_png(img.width as u32, img.height as u32, img.bytes.as_ref())?;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
-        return Some((
-            ImageContent {
-                media_type: "image/png".into(),
-                data: b64,
-            },
-            hash,
-        ));
+    match clipboard.get_image() {
+        Ok(img) => {
+            let hash = rgba_fingerprint(img.width, img.height, img.bytes.as_ref());
+            if let Some(png_data) =
+                encode_rgba_to_png(img.width as u32, img.height as u32, img.bytes.as_ref())
+            {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
+                return Some((
+                    ImageContent {
+                        media_type: "image/png".into(),
+                        data: b64,
+                    },
+                    hash,
+                ));
+            }
+        }
+        Err(_e) => {
+            // arboard's header-less DIB decode rejects the CF_DIBV5 payloads
+            // that Qt-based screenshot tools (PixPin, Snipaste) and the Windows
+            // Snipping Tool produce (V4/V5 header + BI_BITFIELDS) — the reported
+            // "剪贴板中没有图片" on Windows Terminal. Windows synthesizes a raw
+            // CF_DIB from any clipboard bitmap, so read + decode that ourselves
+            // before giving up. The error is otherwise swallowed, so log it too.
+            crate::tuix_trace!("IMG", "arboard get_image failed: {_e}");
+            #[cfg(windows)]
+            if let Some((w, h, rgba)) = read_raw_cf_dib().and_then(|dib| decode_cf_dib_to_rgba(&dib))
+            {
+                let hash = rgba_fingerprint(w as usize, h as usize, &rgba);
+                if let Some(png_data) = encode_rgba_to_png(w, h, &rgba) {
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
+                    return Some((
+                        ImageContent {
+                            media_type: "image/png".into(),
+                            data: b64,
+                        },
+                        hash,
+                    ));
+                }
+            }
+        }
     }
 
     // Tier 2: file URL / path arriving via the text type (`public.utf8-
@@ -638,6 +745,140 @@ mod image_path_tests {
     use super::*;
     use std::io::Write as _;
     use tempfile::tempdir;
+
+    // ── CF_DIB clipboard fallback decoder (Windows paste bug) ──
+    // Fixtures + assertions ported from oh-my-pi (#3426): the exact DIB byte
+    // shapes that arboard's header-less decode rejects. The decoder is
+    // target-independent, so these run and guard the fix on every host.
+
+    fn push32(v: u32, out: &mut Vec<u8>) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    fn push16(v: u16, out: &mut Vec<u8>) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// 2x2 bottom-up BGRA pixel array: memory rows are [red, green] (bottom)
+    /// then [blue, white] (top), all with alpha 0xff.
+    const PIXELS_2X2: [u8; 16] = [
+        0x00, 0x00, 0xff, 0xff, // (0,1) red
+        0x00, 0xff, 0x00, 0xff, // (1,1) green
+        0xff, 0x00, 0x00, 0xff, // (0,0) blue
+        0xff, 0xff, 0xff, 0xff, // (1,0) white
+    ];
+
+    /// `CF_DIB` as Qt's clipboard writer emits it for 32-bit content: a plain
+    /// `BITMAPINFOHEADER` with `BI_BITFIELDS` and three trailing DWORD masks.
+    fn qt_cf_dib(width: u32, height: u32, pixels_bgra: &[u8], compression: u32) -> Vec<u8> {
+        let mut d = Vec::with_capacity(52 + pixels_bgra.len());
+        push32(40, &mut d); // biSize
+        push32(width, &mut d);
+        push32(height, &mut d); // positive: bottom-up
+        push16(1, &mut d); // biPlanes
+        push16(32, &mut d); // biBitCount
+        push32(compression, &mut d);
+        push32(pixels_bgra.len() as u32, &mut d); // biSizeImage
+        push32(0, &mut d); // biXPelsPerMeter
+        push32(0, &mut d); // biYPelsPerMeter
+        push32(0, &mut d); // biClrUsed
+        push32(0, &mut d); // biClrImportant
+        if compression == 3 {
+            push32(0x00ff_0000, &mut d); // red mask
+            push32(0x0000_ff00, &mut d); // green mask
+            push32(0x0000_00ff, &mut d); // blue mask
+        }
+        d.extend_from_slice(pixels_bgra);
+        d
+    }
+
+    /// `CF_DIBV5` as `PixPin` (Qt) places it, after arboard's
+    /// `maybe_tweak_header` rewrite: a 124-byte `BITMAPV5HEADER` with
+    /// `BI_BITFIELDS` and masks embedded in the header. This is the exact
+    /// buffer arboard's header-less BMP decode rejects with `ConversionFailure`.
+    fn pixpin_dibv5_tweaked(width: u32, height: u32, pixels_bgra: &[u8]) -> Vec<u8> {
+        let mut d = Vec::with_capacity(124 + pixels_bgra.len());
+        push32(124, &mut d); // bV5Size
+        push32(width, &mut d);
+        push32(height, &mut d);
+        push16(1, &mut d); // bV5Planes
+        push16(32, &mut d); // bV5BitCount
+        push32(3, &mut d); // bV5Compression = BI_BITFIELDS
+        push32(0, &mut d); // bV5SizeImage
+        push32(0, &mut d); // bV5XPelsPerMeter
+        push32(0, &mut d); // bV5YPelsPerMeter
+        push32(0, &mut d); // bV5ClrUsed
+        push32(0, &mut d); // bV5ClrImportant
+        push32(0x00ff_0000, &mut d); // bV5RedMask
+        push32(0x0000_ff00, &mut d); // bV5GreenMask
+        push32(0x0000_00ff, &mut d); // bV5BlueMask
+        push32(0xff00_0000, &mut d); // bV5AlphaMask
+        push32(0x7352_4742, &mut d); // bV5CSType = LCS_sRGB
+        d.extend_from_slice(&[0u8; 36]); // bV5Endpoints
+        push32(0, &mut d); // bV5GammaRed
+        push32(0, &mut d); // bV5GammaGreen
+        push32(0, &mut d); // bV5GammaBlue
+        push32(4, &mut d); // bV5Intent = LCS_GM_IMAGES
+        push32(0, &mut d); // bV5ProfileData
+        push32(0, &mut d); // bV5ProfileSize
+        push32(0, &mut d); // bV5Reserved
+        assert_eq!(d.len(), 124);
+        d.extend_from_slice(pixels_bgra);
+        d
+    }
+
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const GREEN: [u8; 4] = [0, 255, 0, 255];
+    const BLUE: [u8; 4] = [0, 0, 255, 255];
+    const WHITE: [u8; 4] = [255, 255, 255, 255];
+
+    fn decoded_pixels(dib: &[u8]) -> (u32, u32, Vec<[u8; 4]>) {
+        let (w, h, rgba) = decode_cf_dib_to_rgba(dib).expect("DIB must decode");
+        let px = rgba.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
+        (w, h, px)
+    }
+
+    #[test]
+    fn decodes_qt_cf_dib_with_bitfields_masks() {
+        let dib = qt_cf_dib(2, 2, &PIXELS_2X2, 3);
+        let (w, h, px) = decoded_pixels(&dib);
+        assert_eq!((w, h), (2, 2));
+        // Row order flipped versus the bottom-up pixel array; BGRA -> RGBA.
+        assert_eq!(px, vec![BLUE, WHITE, RED, GREEN]);
+    }
+
+    #[test]
+    fn decodes_pixpin_dibv5_payload_that_arboard_rejects() {
+        let dib = pixpin_dibv5_tweaked(2, 2, &PIXELS_2X2);
+        let (w, h, px) = decoded_pixels(&dib);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(px, vec![BLUE, WHITE, RED, GREEN]);
+    }
+
+    #[test]
+    fn decodes_plain_bi_rgb_dib() {
+        // Common "copy image" payload: BI_RGB, 32-bit, no masks. The 4th byte
+        // is unused per the DIB contract — zero it to prove decode still yields
+        // opaque pixels.
+        let mut pixels = PIXELS_2X2;
+        for alpha in pixels.iter_mut().skip(3).step_by(4) {
+            *alpha = 0;
+        }
+        let dib = qt_cf_dib(2, 2, &pixels, 0);
+        let (w, h, px) = decoded_pixels(&dib);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(px, vec![BLUE, WHITE, RED, GREEN]);
+    }
+
+    #[test]
+    fn rejects_malformed_dib() {
+        assert!(decode_cf_dib_to_rgba(&[0u8; 12]).is_none(), "short buffer");
+        let mut oversized = qt_cf_dib(2, 2, &PIXELS_2X2, 3);
+        oversized[0..4].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        assert!(
+            decode_cf_dib_to_rgba(&oversized).is_none(),
+            "header size beyond buffer"
+        );
+    }
 
     #[test]
     fn paste_image_chord_accepts_ctrl_v_and_ctrl_alt_v_only() {
@@ -3535,6 +3776,13 @@ pub struct Buffer {
     /// that contained a folded paste survives a round-trip through
     /// history navigation. Mirrors `stash` for the paste registry.
     stash_pastes: Vec<String>,
+    /// True while Ctrl+R reverse-i-search is active. In this state keys
+    /// edit `search_query` (not `text`); `history_idx` doubles as the
+    /// index of the current match so attachment rehydration and menu
+    /// suppression behave exactly like Up/Down recall.
+    searching: bool,
+    /// The query being typed in reverse-i-search mode.
+    search_query: String,
 }
 
 /// Minimum line count or char count for a paste to fold into a
@@ -3561,6 +3809,8 @@ impl Buffer {
             stash: String::new(),
             pastes: Vec::new(),
             stash_pastes: Vec::new(),
+            searching: false,
+            search_query: String::new(),
         }
     }
 
@@ -3577,6 +3827,8 @@ impl Buffer {
         self.cursor = text.len();
         self.text = text;
         self.history_idx = None;
+        self.searching = false;
+        self.search_query.clear();
         self.menu_suppressed = true;
     }
 
@@ -3595,14 +3847,28 @@ impl Buffer {
     }
 
     /// True while the user is scrolling input history (Up/Down on an
-    /// empty / non-empty buffer). The slash-command menu suppresses
-    /// itself in this state so that recalling a previous `/session foo`
-    /// from history doesn't immediately re-pop the menu and trap Up
-    /// inside it. Cleared automatically by `Insert` / `Cancel` (typing
-    /// or Esc) and by `HistoryNext` returning past the newest entry
-    /// to the user's stashed draft.
+    /// empty / non-empty buffer) or running Ctrl+R reverse-i-search.
+    /// The slash-command menu suppresses itself in this state so that
+    /// recalling a previous `/session foo` from history doesn't
+    /// immediately re-pop the menu and trap Up inside it. Cleared
+    /// automatically by `Insert` / `Cancel` (typing or Esc) and by
+    /// `HistoryNext` returning past the newest entry to the user's
+    /// stashed draft.
     pub fn is_in_history(&self) -> bool {
-        self.history_idx.is_some()
+        self.history_idx.is_some() || self.searching
+    }
+
+    /// True while Ctrl+R reverse-i-search is active. While searching,
+    /// keys edit `search_query` rather than the buffer; `history_idx`
+    /// tracks the currently shown match.
+    pub fn is_searching(&self) -> bool {
+        self.searching
+    }
+
+    /// The query typed so far in reverse-i-search mode. Empty when not
+    /// searching.
+    pub fn search_query(&self) -> &str {
+        &self.search_query
     }
 
     /// The index into history of the entry currently being displayed,
@@ -3716,6 +3982,12 @@ impl Buffer {
         // restore, so editing / navigating a restored `/command` reopens the
         // command list as usual.
         self.menu_suppressed = false;
+        // Ctrl+R reverse-i-search owns the keys while active: typing edits
+        // the query, Ctrl+R steps to the next older match, Enter accepts the
+        // current match into the buffer, Esc restores the pre-search draft.
+        if self.searching {
+            return self.apply_search(action, history, commands);
+        }
         match action {
             Action::Insert(c) => {
                 self.text.insert(self.cursor, c);
@@ -3842,6 +4114,24 @@ impl Buffer {
                 self.cursor = end;
                 BufferResult::Redraw
             }
+            Action::HistorySearch => {
+                // Enter Ctrl+R reverse-i-search. The current draft is
+                // stashed so Esc restores it; `search_query` seeds from the
+                // draft (readline-style: Ctrl+R on a non-empty line searches
+                // for what you already typed, and an empty line shows the
+                // most recent entry). `history_idx` doubles as the index of
+                // the currently shown match, so attachment rehydration and
+                // slash-menu suppression behave exactly like Up/Down recall.
+                if history.is_empty() {
+                    return BufferResult::Redraw;
+                }
+                self.stash = self.text.clone();
+                self.stash_pastes = self.pastes.clone();
+                self.searching = true;
+                self.search_query = self.text.clone();
+                self.search_jump_newest(history);
+                BufferResult::Redraw
+            }
             Action::HistoryPrev => {
                 if history.is_empty() {
                     return BufferResult::Redraw;
@@ -3921,6 +4211,107 @@ impl Buffer {
             Action::NoOp => BufferResult::NoOp,
             Action::ToggleToolOutput => BufferResult::NoOp,
         }
+    }
+
+    /// Ctrl+R reverse-i-search key handling. Runs while `searching` is
+    /// true; printable keys edit `search_query` rather than the buffer,
+    /// and the buffer mirrors the currently matched history entry.
+    fn apply_search(
+        &mut self,
+        action: Action,
+        history: &[crate::input::history::HistoryEntry],
+        commands: &CommandRegistry,
+    ) -> BufferResult {
+        match action {
+            Action::Insert(c) => {
+                self.search_query.push(c);
+                self.search_jump_newest(history);
+                BufferResult::Redraw
+            }
+            Action::Backspace => {
+                self.search_query.pop();
+                self.search_jump_newest(history);
+                BufferResult::Redraw
+            }
+            // Ctrl+R again while searching: step to the next OLDER match.
+            Action::HistorySearch => {
+                self.search_jump_older(history);
+                BufferResult::Redraw
+            }
+            // Enter accepts the current match into the buffer and leaves
+            // search mode; a second Enter then submits normally.
+            Action::Submit => {
+                self.searching = false;
+                self.search_query.clear();
+                self.cursor = self.text.len();
+                BufferResult::Redraw
+            }
+            // Esc restores the pre-search draft.
+            Action::Cancel => {
+                self.searching = false;
+                self.search_query.clear();
+                self.history_idx = None;
+                self.text = self.stash.clone();
+                self.pastes = self.stash_pastes.clone();
+                self.cursor = self.text.len();
+                BufferResult::Redraw
+            }
+            // Any other key leaves search mode first, then applies
+            // normally (arrows, Ctrl+U, etc. keep working on the
+            // accepted text).
+            _ => {
+                self.searching = false;
+                self.search_query.clear();
+                self.apply(action, history, commands)
+            }
+        }
+    }
+
+    /// Jump the buffer to the newest history entry whose text contains
+    /// `search_query` (case-insensitive). When nothing matches, the
+    /// buffer keeps the query text itself so the user can see what they
+    /// typed; an empty query matches every entry, so the most recent
+    /// one is shown (readline behaviour).
+    fn search_jump_newest(&mut self, history: &[crate::input::history::HistoryEntry]) {
+        let q = self.search_query.to_lowercase();
+        let hit = (0..history.len())
+            .rev()
+            .find(|&i| history[i].text.to_lowercase().contains(&q));
+        match hit {
+            Some(i) => self.search_show(history, i),
+            None => {
+                self.history_idx = None;
+                self.text = self.search_query.clone();
+                self.pastes.clear();
+                self.cursor = self.text.len();
+            }
+        }
+    }
+
+    /// Step to the next OLDER history entry matching `search_query`,
+    /// starting just before the currently shown match. No-op when the
+    /// current match is already the oldest one.
+    fn search_jump_older(&mut self, history: &[crate::input::history::HistoryEntry]) {
+        let q = self.search_query.to_lowercase();
+        let start = match self.history_idx {
+            Some(i) if i > 0 => i - 1,
+            _ => return, // no current match, or already at the oldest entry
+        };
+        for i in (0..=start).rev() {
+            if history[i].text.to_lowercase().contains(&q) {
+                self.search_show(history, i);
+                return;
+            }
+        }
+    }
+
+    /// Display history entry `i` as the current search match: rehydrate
+    /// text + paste registry and park the cursor (mirrors HistoryPrev).
+    fn search_show(&mut self, history: &[crate::input::history::HistoryEntry], i: usize) {
+        self.history_idx = Some(i);
+        self.text = history[i].text.clone();
+        self.pastes = history[i].pastes.clone();
+        self.cursor = 0;
     }
 
     /// Try to move the cursor up one logical line, preserving the
@@ -5452,6 +5843,289 @@ mod menu_tests {
         assert_eq!(buf.text, "/session foo");
         assert_eq!(buf.cursor, 0, "cursor must park at 0 to suppress menu");
         assert!(buf.is_in_history(), "buffer must report history mode");
+    }
+
+    #[test]
+    fn history_search_enters_mode_and_shows_newest_match() {
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec![
+            crate::input::history::HistoryEntry {
+                text: "git push origin main".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+            crate::input::history::HistoryEntry {
+                text: "git status".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+            crate::input::history::HistoryEntry {
+                text: "cargo test".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+        ];
+
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+
+        assert!(buf.is_searching(), "Ctrl+R enters search mode");
+        assert_eq!(buf.search_query(), "");
+        assert_eq!(
+            buf.text, "cargo test",
+            "empty query shows the most recent entry"
+        );
+        assert_eq!(buf.history_idx(), Some(2));
+        assert!(buf.is_in_history(), "search suppresses the slash menu");
+        // Draft (empty) was stashed so Esc can restore it.
+        let _ = buf.apply(Action::Cancel, &history, &reg);
+        assert!(!buf.is_searching());
+        assert_eq!(buf.text, "");
+    }
+
+    #[test]
+    fn history_search_seeds_query_from_draft() {
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec![
+            crate::input::history::HistoryEntry {
+                text: "fix the typo".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+            crate::input::history::HistoryEntry {
+                text: "fix the build".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+        ];
+
+        // User typed a partial draft before pressing Ctrl+R — readline
+        // seeds the search query with it.
+        for c in "fix".chars() {
+            let _ = buf.apply(Action::Insert(c), &history, &reg);
+        }
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+
+        assert!(buf.is_searching());
+        assert_eq!(buf.search_query(), "fix");
+        assert_eq!(
+            buf.text, "fix the build",
+            "seeded query jumps to the newest matching entry"
+        );
+    }
+
+    #[test]
+    fn history_search_typing_filters_live() {
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec![
+            crate::input::history::HistoryEntry {
+                text: "git status".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+            crate::input::history::HistoryEntry {
+                text: "git stash".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+        ];
+
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+        // Type "stat" — narrows to the only entry containing it
+        // ("git stash" has no "stat").
+        for c in "stat".chars() {
+            let _ = buf.apply(Action::Insert(c), &history, &reg);
+        }
+        assert_eq!(buf.search_query(), "stat");
+        assert_eq!(buf.text, "git status");
+        assert_eq!(buf.history_idx(), Some(0));
+
+        // Backspace widens the match set again: "sta" ALSO matches the
+        // NEWER "git stash", so the jump lands on the newest match.
+        let _ = buf.apply(Action::Backspace, &history, &reg);
+        assert_eq!(buf.search_query(), "sta");
+        assert_eq!(buf.text, "git stash", "back to newest entry containing 'sta'");
+
+        // Backspace again keeps the newest match ("git stash" still
+        // contains "st").
+        let _ = buf.apply(Action::Backspace, &history, &reg);
+        assert_eq!(buf.search_query(), "st");
+        assert_eq!(buf.text, "git stash");
+    }
+
+    #[test]
+    fn history_search_ctrl_r_steps_to_older_match() {
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec![
+            crate::input::history::HistoryEntry {
+                text: "git log --oneline".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+            crate::input::history::HistoryEntry {
+                text: "git status".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+            crate::input::history::HistoryEntry {
+                text: "git push origin main".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+        ];
+
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+        for c in "git".chars() {
+            let _ = buf.apply(Action::Insert(c), &history, &reg);
+        }
+        assert_eq!(buf.text, "git push origin main", "newest match first");
+
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+        assert_eq!(buf.text, "git status", "second Ctrl+R steps older");
+        assert_eq!(buf.history_idx(), Some(1));
+
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+        assert_eq!(buf.text, "git log --oneline", "third Ctrl+R steps older");
+        assert_eq!(buf.history_idx(), Some(0));
+
+        // Already at the oldest match — further Ctrl+R is a no-op.
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+        assert_eq!(buf.text, "git log --oneline");
+    }
+
+    #[test]
+    fn history_search_is_case_insensitive() {
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec![crate::input::history::HistoryEntry {
+            text: "Build the Agent".into(),
+            images: vec![],
+            pastes: vec![],
+        }];
+
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+        for c in "build".chars() {
+            let _ = buf.apply(Action::Insert(c), &history, &reg);
+        }
+        assert_eq!(buf.text, "Build the Agent");
+    }
+
+    #[test]
+    fn history_search_no_match_keeps_query_visible() {
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec![crate::input::history::HistoryEntry {
+            text: "cargo test".into(),
+            images: vec![],
+            pastes: vec![],
+        }];
+
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+        for c in "zzz".chars() {
+            let _ = buf.apply(Action::Insert(c), &history, &reg);
+        }
+        assert!(buf.is_searching(), "still searching on no match");
+        assert_eq!(buf.history_idx(), None);
+        assert_eq!(buf.text, "zzz", "query stays visible when nothing matches");
+    }
+
+    #[test]
+    fn history_search_submit_accepts_match_into_buffer() {
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec![
+            crate::input::history::HistoryEntry {
+                text: "fix the typo".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+            crate::input::history::HistoryEntry {
+                text: "fix the build".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+        ];
+
+        for c in "fix".chars() {
+            let _ = buf.apply(Action::Insert(c), &history, &reg);
+        }
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+
+        let result = buf.apply(Action::Submit, &history, &reg);
+        assert!(matches!(result, BufferResult::Redraw), "Enter accepts, not commits");
+        assert!(!buf.is_searching(), "search mode ends on Enter");
+        assert_eq!(buf.text, "fix the build", "match stays in the buffer");
+        assert_eq!(
+            buf.cursor,
+            buf.text.len(),
+            "cursor moves to end so the user can review and hit Enter again"
+        );
+
+        // A second Enter submits normally.
+        let result = buf.apply(Action::Submit, &history, &reg);
+        assert!(matches!(result, BufferResult::Commit(line) if line == "fix the build"));
+    }
+
+    #[test]
+    fn history_search_esc_restores_stashed_draft() {
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec![crate::input::history::HistoryEntry {
+            text: "git status".into(),
+            images: vec![],
+            pastes: vec![],
+        }];
+
+        // Type a draft, then search for something else.
+        for c in "my draft".chars() {
+            let _ = buf.apply(Action::Insert(c), &history, &reg);
+        }
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+        // The draft seeds the search query (readline behaviour); clear it
+        // with Backspace so we can search for a different term.
+        for _ in 0.."my draft".chars().count() {
+            let _ = buf.apply(Action::Backspace, &history, &reg);
+        }
+        assert_eq!(buf.search_query(), "");
+        for c in "git".chars() {
+            let _ = buf.apply(Action::Insert(c), &history, &reg);
+        }
+        assert_eq!(buf.text, "git status");
+
+        let _ = buf.apply(Action::Cancel, &history, &reg);
+        assert!(!buf.is_searching());
+        assert_eq!(buf.text, "my draft", "Esc restores the pre-search draft");
+        assert_eq!(buf.cursor, buf.text.len());
+    }
+
+    #[test]
+    fn history_search_other_key_exits_and_applies() {
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec![
+            crate::input::history::HistoryEntry {
+                text: "long command to clear".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+            crate::input::history::HistoryEntry {
+                text: "git status".into(),
+                images: vec![],
+                pastes: vec![],
+            },
+        ];
+
+        let _ = buf.apply(Action::HistorySearch, &history, &reg);
+        let _ = buf.apply(Action::Insert('g'), &history, &reg);
+        assert_eq!(buf.text, "git status");
+
+        // Ctrl+U outside search-clears: exits search mode, then clears.
+        let _ = buf.apply(Action::ClearLine, &history, &reg);
+        assert!(!buf.is_searching());
+        assert_eq!(buf.text, "");
     }
 
     #[test]
@@ -8426,6 +9100,30 @@ struct DesiredConfigCommit {
     previous: Config,
 }
 
+struct ConfigDeltaCommit<T> {
+    commit: ConfigCommit,
+    previous: Config,
+    value: T,
+}
+
+fn commit_config_delta<T, F>(store: &ConfigStore, mutate: F) -> Result<ConfigDeltaCommit<T>>
+where
+    F: FnOnce(&mut Config) -> Result<T>,
+{
+    let mut previous = None;
+    let mut value = None;
+    let commit = store.update(|persisted| {
+        previous = Some(persisted.clone());
+        value = Some(mutate(persisted)?);
+        Ok(())
+    })?;
+    Ok(ConfigDeltaCommit {
+        commit,
+        previous: previous.expect("ConfigStore update observed the previous snapshot"),
+        value: value.expect("ConfigStore update applied the config delta"),
+    })
+}
+
 fn commit_desired_config(
     store: &ConfigStore,
     observed_revision: Option<&ConfigRevision>,
@@ -8792,6 +9490,50 @@ mod external_config_tests {
         let persisted = store.read().unwrap().config;
         assert_eq!(persisted.providers["main"].model, "external-model");
         assert_eq!(persisted.network.proxy, proxy);
+    }
+
+    #[test]
+    fn config_delta_uses_latest_snapshot_and_preserves_unrelated_edits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(tmp.path().join("config.toml"));
+        store.replace(&config("initial-model", false)).unwrap();
+        store
+            .update(|persisted| {
+                persisted.language = Some(atomcode_config::locale::Locale::ZhCn);
+                Ok(())
+            })
+            .unwrap();
+
+        let committed = commit_config_delta(&store, |persisted| {
+            persisted.provider_accounts.insert(
+                "new-account".into(),
+                atomcode_config::config::provider::ProviderAccountConfig {
+                    provider: "openai".into(),
+                    display_name: None,
+                    api_key: None,
+                    base_url: None,
+                    user_agent: None,
+                    skip_tls_verify: false,
+                    enterprise_url: None,
+                    ephemeral: false,
+                },
+            );
+            Ok("new-account".to_string())
+        })
+        .unwrap();
+
+        assert_eq!(committed.value, "new-account");
+        assert_eq!(
+            committed.commit.snapshot.config.language,
+            Some(atomcode_config::locale::Locale::ZhCn),
+            "the provider delta must not overwrite an unrelated concurrent edit"
+        );
+        assert!(committed
+            .commit
+            .snapshot
+            .config
+            .provider_accounts
+            .contains_key("new-account"));
     }
 
     #[test]
@@ -11119,10 +11861,7 @@ fn handle_idle_key(
                 {
                     renderer.render(UiLine::Error(format!(
                         "{}: {error}",
-                        match crate::i18n::current_locale() {
-                            crate::i18n::Locale::ZhCn => "暂时无法打开回退",
-                            crate::i18n::Locale::En => "Rewind is unavailable",
-                        }
+                        crate::i18n::t(crate::i18n::Msg::CmdRewindUnavailable)
                     )));
                     renderer.flush();
                 }
@@ -12404,6 +13143,79 @@ pub(crate) fn save_and_reload(
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigReloadSelection {
+    KeepCurrent,
+    FollowPersisted,
+}
+
+/// Atomically mutate the latest persisted config, then reload the runtime from
+/// the committed snapshot. Unlike whole-config CAS writes, a field-scoped
+/// mutation remains safe when this TUI has not observed the latest revision and
+/// preserves unrelated edits made by another AtomCode process.
+pub(crate) fn update_config_and_reload<T, F, M>(
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    selection: ConfigReloadSelection,
+    mutate: F,
+    success_message: M,
+) -> Option<T>
+where
+    F: FnOnce(&mut Config) -> Result<T>,
+    M: FnOnce(&T) -> String,
+{
+    if provider_transition_pending(ctx) {
+        renderer.render(UiLine::Error(
+            crate::i18n::t(crate::i18n::Msg::CmdProviderReloading).into_owned(),
+        ));
+        renderer.flush();
+        return None;
+    }
+
+    let previous_runtime_config = ctx.config.clone();
+    let previous_model_name = ctx.model_name.clone();
+    let ConfigDeltaCommit {
+        commit,
+        previous,
+        value,
+    } = match commit_config_delta(&ctx.config_store, mutate) {
+        Ok(committed) => committed,
+        Err(error) => {
+            renderer.render(UiLine::Error(
+                crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed {
+                    error: &error.to_string(),
+                })
+                .into_owned(),
+            ));
+            renderer.flush();
+            return None;
+        }
+    };
+
+    let desired = match selection {
+        ConfigReloadSelection::KeepCurrent => desired_config_from_snapshot_parts(
+            &ctx.config,
+            crate::ProviderSelectionMode::Pinned,
+            commit.snapshot.config.clone(),
+            true,
+        ),
+        ConfigReloadSelection::FollowPersisted => commit.snapshot.config.clone(),
+    };
+    let message = success_message(&value);
+    stage_committed_config_reload(
+        ctx,
+        desired,
+        commit,
+        previous,
+        previous_runtime_config,
+        previous_model_name,
+        renderer,
+        message,
+        LanguageChangeNotice::None,
+    )
+    .then_some(value)
+}
+
 fn save_and_reload_with_notice(
     ctx: &mut LoopCtx,
     desired: Config,
@@ -12966,7 +13778,7 @@ fn streaming_executable_slash(line: &str) -> Option<(String, String)> {
     //   streaming redraws would paint over that overlay.
     if matches!(
         cmd.to_ascii_lowercase().as_str(),
-        "status" | "cost" | "diff" | "usage"
+        "status" | "cost" | "diff" | "usage" | "schedule"
     ) && arg.trim().is_empty()
     {
         return Some((cmd.to_ascii_lowercase(), String::new()));
@@ -20355,9 +21167,10 @@ fn handle_agent_event(
             //   "⏸ 5小时窗口已用尽，约 HH:MM 恢复…" / "…稍后恢复…"
             // auto_resuming=false + NO window data (external-model / generic 429):
             //   "⏸ 限流（HTTP 429）[：<provider reason>]…" — not a CodingPlan quota.
-            // UiLine::Muted: dim DarkGrey, no forced prefix, non-bold.
-            // Rate-limit is a pause, not an error/warning — it must not
-            // render with the yellow `! ` prefix that Warning applies.
+            // UiLine::Muted: theme-aware muted gray (legible on dark AND light),
+            // no forced prefix, non-bold. Rate-limit is a pause, not an
+            // error/warning — it must not render with the yellow `! ` prefix
+            // that Warning applies.
             let line = format_rate_limited_line(
                 &reset_at_display,
                 &reset_label,
@@ -21287,6 +22100,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             .map(|pending| pending.display_text.clone())
             .collect(),
         history: None,
+        search: None,
         command_output: state.footer_command_output.clone(),
         ctx_used,
         ctx_window,
@@ -21337,8 +22151,44 @@ fn round_cap_stats(state: &crate::state::UiState) -> String {
 
 fn build_input_status(state: &UiState, ctx: &LoopCtx, buf: &Buffer) -> crate::render::StatusLine {
     let mut status = build_status(state, ctx);
-    status.history = input_history_position(buf, ctx.history.entries().len());
+    if buf.is_searching() {
+        // Ctrl+R reverse-i-search takes over the top-rule indicator;
+        // the History N/N position is hidden while searching.
+        status.search = input_search_state(buf, ctx.history.entries());
+        status.history = None;
+    } else {
+        status.history = input_history_position(buf, ctx.history.entries().len());
+    }
     status
+}
+
+/// Live reverse-i-search snapshot: current match position among all
+/// matching entries, plus the query for the indicator label.
+fn input_search_state(
+    buf: &Buffer,
+    history: &[crate::input::history::HistoryEntry],
+) -> Option<crate::render::SearchState> {
+    if !buf.is_searching() {
+        return None;
+    }
+    let q = buf.search_query().to_lowercase();
+    let matches: Vec<usize> = (0..history.len())
+        .rev()
+        .filter(|&i| history[i].text.to_lowercase().contains(&q))
+        .collect();
+    // history_idx() is the currently shown match; find its 1-based
+    // position within the match list.
+    let current = buf
+        .history_idx()
+        .and_then(|idx| matches.iter().position(|&m| m == idx))
+        .map(|pos| pos + 1)
+        .unwrap_or(0);
+    Some(crate::render::SearchState {
+        query: buf.search_query().to_string(),
+        current,
+        total: matches.len(),
+        matched: buf.history_idx().is_some(),
+    })
 }
 
 fn input_history_position(buf: &Buffer, total: usize) -> Option<crate::render::HistoryPosition> {

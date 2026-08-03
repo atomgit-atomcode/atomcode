@@ -131,6 +131,7 @@ async fn full_assembly_wire_prefix_is_cacheable_across_turns() {
         memory: true,
         web: false,
         review: false,
+        request_user_input: true,
         rate_limit_source: None,
     };
     let mut parts = prepare(&cfg, opts).await.unwrap();
@@ -219,6 +220,7 @@ async fn tool_block_and_system_are_deterministic_across_independent_assemblies()
         memory: true,
         web: true, // include web tools too — more tools = a stronger ordering check
         review: false,
+        request_user_input: true,
         rate_limit_source: None,
     };
 

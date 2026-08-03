@@ -230,7 +230,9 @@ class AtomCodeChatPanel(
     private var welcomeLanguage: String = defaultWelcomeLanguage()
     private var loggedIn = false
     private val setupRefreshTimer = Timer(2_000) {
-        if (isShowing && !disposed) refreshSetupSnapshot(silent = true)
+        if (isShowing && !disposed && service.connectionState is ConnectionState.Ready) {
+            refreshSetupSnapshot(silent = true)
+        }
     }.apply {
         isRepeats = true
         initialDelay = 2_000
@@ -393,10 +395,12 @@ class AtomCodeChatPanel(
     }
 
     private fun refreshAfterConnect() {
-        service.ensureConnected().thenRun {
-            SwingUtilities.invokeLater {
-                refreshSetupSnapshot()
-                refreshSessionList()
+        service.ensureConnected().thenAccept { state ->
+            if (state is ConnectionState.Ready) {
+                SwingUtilities.invokeLater {
+                    refreshSetupSnapshot()
+                    refreshSessionList()
+                }
             }
         }
     }

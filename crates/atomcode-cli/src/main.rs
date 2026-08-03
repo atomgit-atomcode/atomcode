@@ -13,6 +13,8 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 
+mod schedule_cmd;
+mod schedule_os;
 mod telemetry_cmd;
 mod vision;
 use atomcode::uninstall;
@@ -200,9 +202,9 @@ fn close_thinking_chunk(out: &mut String, open: &mut bool) {
 }
 
 /// True if `--dev` is present in argv. Used to skip every auto-update
-/// path (pre-parse `apply_pending_upgrade`, sync stage+apply, and the
-/// post-parse detached stager). Scanned manually because two of those
-/// paths run before clap touches argv. The flag is also declared on
+/// path (pre-parse `apply_pending_upgrade` and the post-parse detached
+/// stager). Scanned manually because one of those paths runs before clap
+/// touches argv. The flag is also declared on
 /// `Cli` so `clap::Parser` accepts it without erroring after the early
 /// scan.
 fn is_dev_mode() -> bool {
@@ -228,21 +230,6 @@ fn is_running_as_backup() -> bool {
         .map(|n| n.ends_with(".bak"))
         .unwrap_or(false)
 }
-
-/// Decide whether the startup-time synchronous upgrade path should fire.
-/// Returns false when any of these hold:
-///   * We're running as `atomcode.bak` → user wants the old binary,
-///     don't silently swap it back to latest.
-///   * `-p` / `--prompt` / `--prompt-file` is in argv → headless script run,
-///     shouldn't stall 5-20 s on a network download for a 2 s task.
-///   * A subcommand (login, logout, status, upgrade, rollback, mcp) is in argv
-///     → those have their own flows and don't want a surprise re-exec.
-///   * Config has `auto_update = false` → user explicitly opted out.
-/// Anything else (including missing config) → true, because fresh installs
-/// that haven't written a config yet are exactly the case we want to help.
-///
-/// Deliberately scans argv by hand — clap hasn't parsed yet at this point
-/// in main(), and we need to decide before any slower setup happens.
 
 /// Scan argv by hand to extract the value of --lang <VALUE> or --lang=VALUE.
 /// This runs BEFORE clap parses the arguments, so that the i18n locale
@@ -339,188 +326,6 @@ fn build_i18n_command() -> clap::Command {
         .mut_subcommand("hooks", |s| s.about(t(Msg::CliAboutHooks).into_owned()));
 
     cmd
-}
-
-fn should_try_sync_upgrade() -> bool {
-    if is_running_as_backup() {
-        return false;
-    }
-    if is_dev_mode() {
-        return false;
-    }
-
-    // PlainRenderer 模式（ATOMCODE_PLAIN=1）：跳过同步自更新检查。
-    // 自更新用 eprintln! 直接写 stderr，和 PlainRenderer 的 stdout
-    // 流式输出交错，破坏启动体验。后台异步自更新不受影响，用户仍可
-    // 手动 /upgrade。
-    if std::env::var("ATOMCODE_PLAIN")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .is_some()
-    {
-        return false;
-    }
-
-    let args: Vec<String> = std::env::args().collect();
-    let any = |needle: &[&str]| {
-        args.iter().skip(1).any(|a| {
-            needle
-                .iter()
-                .any(|n| a == n || a.starts_with(&format!("{}=", n)))
-        })
-    };
-
-    if any(&["-p", "--prompt", "--prompt-file"]) {
-        return false;
-    }
-    if args.iter().skip(1).any(|a| {
-        matches!(
-            a.as_str(),
-            "login"
-                | "logout"
-                | "status"
-                | "upgrade"
-                | "rollback"
-                | "uninstall"
-                | "mcp"
-                | "telemetry"
-                | "completion"
-                | "--version"
-                | "-V"
-                | "--help"
-                | "-h"
-        )
-    }) {
-        return false;
-    }
-
-    // Load config once to honor both `auto_update = false` and `offline_mode`.
-    // Runs pre-seed, so offline is resolved directly rather than via the process
-    // verdict. Env wins over config; only forced On skips. Failure to load = assume
-    // defaults (auto_update true, offline Off) — fresh installs benefit.
-    let path = atomcode_config::config::Config::default_path();
-    let offline_mode = if path.exists() {
-        if let Ok(cfg) = atomcode_config::config::Config::load(&path) {
-            if !cfg.auto_update {
-                return false;
-            }
-            cfg.offline_mode
-        } else {
-            atomcode_config::config::offline::OfflineMode::Off
-        }
-    } else {
-        atomcode_config::config::offline::OfflineMode::Off
-    };
-    // Offline (env wins over config; only forced On skips) disables binary self-update,
-    // same as auto_update=false. Works even with no config file (e.g. air-gapped container).
-    if atomcode_config::config::offline::offline_resolved(
-        offline_mode,
-        std::env::var(atomcode_config::config::offline::ATOMCODE_OFFLINE_ENV)
-            .ok()
-            .as_deref(),
-    ) {
-        return false;
-    }
-    true
-}
-
-/// Startup-time synchronous upgrade. Fetches the manifest, and if a newer
-/// release exists, downloads + verifies + stages + applies it in-line,
-/// then re-execs into the new binary. Progress is printed to stderr so
-/// the user sees something happen during the 5-20 s window (as opposed
-/// to a silent hang). Anything that fails → fall through; the parent's
-/// `main` continues with the current binary, and the detached worker
-/// spawned later (`spawn_detached_upgrade_prep`) is still there as a
-/// second chance for the next session.
-///
-/// Bounded by an overall 120 s timeout so a slow mirror / hung DNS can't
-/// wedge startup forever.
-async fn sync_stage_and_apply_if_newer() {
-    use atomcode_updater::{self as self_update, UpgradeEvent};
-
-    let current = format!("v{}", env!("CARGO_PKG_VERSION"));
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UpgradeEvent>();
-
-    // Progress consumer: renders ManifestFetched / Downloading / Verifying
-    // as a single-line updating status on stderr. Percent-debounced so a
-    // 15 MB download at 64 KiB chunks doesn't flood the terminal.
-    let progress = tokio::spawn(async move {
-        use std::io::Write;
-        let mut last_pct: i32 = -1;
-        while let Some(ev) = rx.recv().await {
-            match ev {
-                UpgradeEvent::ManifestFetched { version } => {
-                    eprintln!("✨ New version available: {}", version);
-                }
-                UpgradeEvent::Downloading { bytes, total } => {
-                    let pct = if total == 0 {
-                        0
-                    } else {
-                        ((bytes * 100) / total) as i32
-                    };
-                    if pct != last_pct {
-                        eprint!(
-                            "\r   Downloading {}% ({:.1} / {:.1} MB)      ",
-                            pct,
-                            bytes as f64 / 1_048_576.0,
-                            total as f64 / 1_048_576.0
-                        );
-                        let _ = std::io::stderr().flush();
-                        last_pct = pct;
-                    }
-                }
-                UpgradeEvent::Verifying => {
-                    eprintln!("\n✓ Verifying sha256");
-                }
-                _ => {}
-            }
-        }
-    });
-
-    let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
-        self_update::prepare_deferred_upgrade(&current, tx),
-    )
-    .await;
-
-    // Wait briefly for the progress consumer to drain — it closes when
-    // the sender drops at the end of prepare_deferred_upgrade.
-    let _ = progress.await;
-
-    match outcome {
-        Ok(Ok(Some(_staged))) => {
-            // Staged successfully. Apply right now so the user gets the new
-            // binary on this same invocation.
-            match self_update::apply_pending_upgrade() {
-                Ok(Some(applied)) => {
-                    eprintln!("✓ Upgrading to {}...", applied.version);
-                    // Save the CURRENT version (before upgrade) so TUI can show "Upgraded old → new"
-                    std::env::set_var(UPGRADED_FROM_ENV, &current);
-                    match self_update::re_exec_self(Some(&applied.exe)) {
-                        Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
-                        Err(e) => {
-                            eprintln!(
-                                "Upgrade applied but re-exec failed ({}). The new version will be used on the next launch.",
-                                e
-                            );
-                            std::env::remove_var(UPGRADED_FROM_ENV);
-                        }
-                    }
-                }
-                _ => {
-                    // Stage succeeded but apply didn't — weird, just continue.
-                }
-            }
-        }
-        Ok(Ok(None)) => {
-            // Already latest, no-op.
-        }
-        Ok(Err(_)) | Err(_) => {
-            // Network error or 120 s timeout. Don't spam the user —
-            // `/upgrade` will surface the real error if they ask.
-            eprintln!("Note: could not check for updates at startup (will retry in background).");
-        }
-    }
 }
 
 /// Body of the detached upgrade-prep worker. One call to
@@ -662,8 +467,8 @@ struct Cli {
     verbose: bool,
 
     /// Disable auto-update for this launch. Skips applying any staged
-    /// upgrade, skips the sync stage+apply on startup, and skips the
-    /// detached background stager. Use during local development so a
+    /// upgrade and skips the detached background stager. Use during
+    /// local development so a
     /// fresh `cargo run` build isn't silently overwritten by the
     /// released binary.
     #[arg(long)]
@@ -771,6 +576,9 @@ enum Commands {
     /// Manage hooks (list, test, enable/disable)
     #[command(subcommand)]
     Hooks(HookCommands),
+    /// Manage local scheduled tasks (add/list/remove/enable/disable).
+    #[command(subcommand)]
+    Schedule(schedule_cmd::ScheduleCli),
     /// Generate a shell completion script on stdout.
     Completion(CompletionCommand),
     /// Internal: askpass helper invoked by sudo/ssh via SUDO_ASKPASS / SSH_ASKPASS.
@@ -1094,6 +902,7 @@ fn merge_startup_notices(
 }
 
 async fn async_main() {
+    let process_start = std::time::Instant::now();
     // Wire `tracing::` diagnostics to `<config_dir>/logs/atomcode.log` (file-only,
     // TUI-safe). Must run before anything that emits traces so nothing is lost.
     init_file_logging();
@@ -1157,6 +966,7 @@ async fn async_main() {
     // circuit-breaker in `apply_pending_upgrade` ensures a broken release
     // can't wedge this loop indefinitely.
     if !is_backup && !dev_mode {
+        let stage_start = std::time::Instant::now();
         // Capture current version BEFORE applying upgrade, so we can pass it to the re-exec'd child
         let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
         match atomcode_updater::apply_pending_upgrade() {
@@ -1177,26 +987,18 @@ async fn async_main() {
                     }
                 }
             }
-            Ok(None) => {
-                // No pre-staged upgrade. If the user isn't passing `-p` /
-                // `--prompt-file` (headless one-shots shouldn't pay the network
-                // tax) and auto_update isn't disabled, try to fetch + stage +
-                // apply v_next right here. This is the "user launched atomcode,
-                // wants it upgraded NOW" path — single invocation instead of
-                // the stage-on-session-N / apply-on-session-N+1 dance.
-                //
-                // Anything goes wrong (offline, timeout, sha mismatch, no
-                // newer release) → silently fall through and continue with
-                // the current binary. The `/upgrade` slash command is still
-                // there as the explicit/loud alternative.
-                if should_try_sync_upgrade() {
-                    sync_stage_and_apply_if_newer().await;
-                }
-            }
+            Ok(None) => {}
             Err(e) => {
                 eprintln!("Note: pending upgrade could not be applied ({}). Continuing with current version.", e);
             }
         }
+        tracing::info!(
+            target: "atomcode::startup",
+            stage = "pending_upgrade",
+            elapsed_ms = stage_start.elapsed().as_millis() as u64,
+            total_ms = process_start.elapsed().as_millis() as u64,
+            "startup stage completed"
+        );
     } // end `if !is_backup`
 
     // Set a minimal pre-telemetry panic hook (replaced after telemetry init in run()).
@@ -1226,6 +1028,7 @@ async fn async_main() {
 }
 
 async fn run() -> Result<i32> {
+    let run_start = std::time::Instant::now();
     // -- Pre-parse --lang to set locale BEFORE clap renders --help --
     // clap help text is generated during parse, so we must resolve
     // the locale first (from --lang flag, env vars, or config) so that
@@ -1511,7 +1314,7 @@ async fn run() -> Result<i32> {
                 );
                 let working_dir = resolve_working_dir(cli.dir.clone());
                 if !atomcode_config::config::offline::is_offline_active() {
-                    atomcode_capabilities::provider::ensure_models_dev_catalog().await;
+                    atomcode_capabilities::provider::spawn_models_dev_catalog_refresh();
                 }
                 let runtime_cfg = runtime_config_from(
                     &config,
@@ -1593,6 +1396,7 @@ async fn run() -> Result<i32> {
         _ => {}
     }
 
+    let config_load_start = std::time::Instant::now();
     let (mut config, config_startup_notice) = if config_path.exists() {
         match Config::load_with_diagnostics(&config_path) {
             Ok((config, warnings)) if warnings.is_empty() => (config, None),
@@ -1623,6 +1427,13 @@ async fn run() -> Result<i32> {
         // No config yet — TUI Welcome screen will guide first-run setup
         (Config::default(), None)
     };
+    tracing::info!(
+        target: "atomcode::startup",
+        stage = "config_load",
+        elapsed_ms = config_load_start.elapsed().as_millis() as u64,
+        total_ms = run_start.elapsed().as_millis() as u64,
+        "startup stage completed"
+    );
     atomcode_config::proxy::apply_process_proxy_config(&config.network.proxy);
 
     // ── i18n locale ──
@@ -1674,9 +1485,17 @@ async fn run() -> Result<i32> {
     // config, so the `tool_registry`/`tool_context` assembled above are no longer
     // wired to an agent loop; they remain constructed (unchanged lifetime) pending
     // a follow-up cleanup.
-    if !atomcode_config::config::offline::is_offline_active() {
-        atomcode_capabilities::provider::ensure_models_dev_catalog().await;
+    let pricing_refresh_spawned = !atomcode_config::config::offline::is_offline_active();
+    if pricing_refresh_spawned {
+        atomcode_capabilities::provider::spawn_models_dev_catalog_refresh();
     }
+    tracing::info!(
+        target: "atomcode::startup",
+        stage = "pricing_refresh_spawned",
+        spawned = pricing_refresh_spawned,
+        total_ms = run_start.elapsed().as_millis() as u64,
+        "optional metadata refresh detached from startup"
+    );
     let runtime_cfg = runtime_config_from(
         &config,
         &working_dir,
@@ -1693,6 +1512,7 @@ async fn run() -> Result<i32> {
     } else {
         interactive_provider_bootstrap(&runtime_cfg)
     };
+    let runtime_start = std::time::Instant::now();
     let (native_runtime, native_coding_cfg, continued_session) = spawn_native_cli_runtime(
         &runtime_cfg,
         resume_session_id,
@@ -1703,6 +1523,13 @@ async fn run() -> Result<i32> {
         !is_headless,
     )
     .await?;
+    tracing::info!(
+        target: "atomcode::startup",
+        stage = "runtime_start",
+        elapsed_ms = runtime_start.elapsed().as_millis() as u64,
+        total_ms = run_start.elapsed().as_millis() as u64,
+        "startup stage completed"
+    );
     // TUI replay remains a presentation projection during S4; runtime resume above
     // has already converged and loaded the native snapshot under one lease.
     let resume_project_bucket =
@@ -1858,6 +1685,7 @@ async fn run() -> Result<i32> {
                 working_dir.clone(),
                 cli.dangerously_skip_permissions,
                 is_admin,
+                false, // strict_unattended=false: preserve -p behaviour exactly
             )
             .await
             {
@@ -1908,6 +1736,12 @@ async fn run() -> Result<i32> {
             // changes only define the default for sessions opened afterwards;
             // they must not retarget an already-open runtime.
             let provider_selection_mode = atomcode_tuix::ProviderSelectionMode::Pinned;
+            tracing::info!(
+                target: "atomcode::startup",
+                stage = "tui_enter",
+                total_ms = run_start.elapsed().as_millis() as u64,
+                "handing control to TUI"
+            );
             match atomcode_tuix::run(
                 config,
                 model_name,
@@ -2210,7 +2044,7 @@ fn apply_cli_runtime_overrides(
 /// points to a deleted section). Reading `default_provider` directly silently
 /// ignored `--provider`, so a headless `--provider X` run picked the config
 /// default instead of X.
-fn runtime_config_from(
+pub(crate) fn runtime_config_from(
     config: &atomcode_config::config::Config,
     working_dir: &std::path::Path,
     provider_override: Option<&str>,
@@ -2249,7 +2083,7 @@ fn interactive_provider_bootstrap(
     }
 }
 
-async fn spawn_native_cli_runtime(
+pub(crate) async fn spawn_native_cli_runtime(
     cfg: &atomcode_coding::CodingRuntimeConfig,
     resume_session_id: Option<String>,
     bootstrap: atomcode_coding::ProviderBootstrap,
@@ -2343,7 +2177,7 @@ async fn spawn_native_cli_runtime(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ContinuedCliSession {
+pub(crate) struct ContinuedCliSession {
     id: String,
     forked_from: Option<String>,
 }
@@ -2359,7 +2193,25 @@ fn should_fork_busy_continue(
         )
 }
 
-async fn run_native_headless(
+/// Decide whether to auto-approve a headless approval request.
+///
+/// A request only reaches this point when a gate (BashWorkspaceGate /
+/// ApprovalMiddleware) already escalated the tool call — i.e. it is NOT
+/// trivially safe.  `-p` (skip_permissions) blanket-approves bash; scheduled
+/// runs (strict_unattended=true) refuse everything because no human is present
+/// to vet a destructive or out-of-workspace command.
+pub(crate) fn headless_auto_approve(
+    strict_unattended: bool,
+    skip_permissions: bool,
+    tool: &str,
+) -> bool {
+    if strict_unattended {
+        return false; // scheduled: deny everything that was escalated to approval
+    }
+    skip_permissions || tool == "bash" // -p: current behaviour unchanged
+}
+
+pub(crate) async fn run_native_headless(
     notifications_cfg: atomcode_config::config::NotificationConfig,
     runtime: atomcode_coding::CodingRuntime,
     prompt: String,
@@ -2369,6 +2221,7 @@ async fn run_native_headless(
     working_dir: PathBuf,
     skip_permissions: bool,
     is_admin: bool,
+    strict_unattended: bool,
 ) -> Result<(i32, Option<String>)> {
     use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
     use atomcode_coding::{CodingRuntimeEvent, TurnCompletion, UserInput};
@@ -2523,7 +2376,11 @@ async fn run_native_headless(
                     serde_json::from_value::<ApprovalRequest>(request.payload)
                         .ok()
                         .map(|approval| {
-                            if skip_permissions || approval.tool == "bash" {
+                            if headless_auto_approve(
+                                strict_unattended,
+                                skip_permissions,
+                                &approval.tool,
+                            ) {
                                 eprintln!("[headless] auto-approved {}", approval.tool);
                                 ApprovalResponse::allow()
                             } else {
@@ -2826,6 +2683,9 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             unreachable!("completion is handled before runtime startup")
         }
         Commands::Hooks(subcmd) => handle_hooks(subcmd).await,
+        Commands::Schedule(sub) => {
+            schedule_cmd::handle_schedule(sub).await.map(|_| ())
+        }
         Commands::Askpass { .. } => {
             unreachable!("__askpass is handled early in run() before handle_command")
         }

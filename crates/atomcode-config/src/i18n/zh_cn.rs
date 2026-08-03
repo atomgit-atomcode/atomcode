@@ -321,12 +321,13 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelLegacyBadge => "旧".into(),
         Msg::ProviderPanelDefaultBadge => "默认".into(),
         Msg::ProviderPanelModelCount { count } => format!("{count} 个模型").into(),
+        Msg::ProviderPanelAddModelRow => "＋ 添加模型".into(),
         Msg::ProviderPanelAccountsHint =>
             "筛选 · ↑↓选择 · ↵模型 · Ctrl+A添加 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab切换 · Esc关闭".into(),
         Msg::ProviderPanelModelsHint =>
-            "筛选 · ↑↓选择 · ↵默认 · Ctrl+A添加 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab切换 · Esc关闭".into(),
+            "筛选 · ↑↓选择 · ↵默认/添加 · Ctrl+A添加 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab切换 · Esc关闭".into(),
         Msg::ProviderPanelFilteredModelsHint { account } =>
-            format!("〔{account}〕· ↑↓选择 · ↵默认 · Ctrl+A加模型 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab全部 · Esc关闭").into(),
+            format!("〔{account}〕· ↑↓选择 · ↵默认/添加 · Ctrl+A加模型 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab全部 · Esc关闭").into(),
         Msg::ProviderPanelModelSaved { model } => format!("已保存模型“{model}”。").into(),
         Msg::ProviderPanelAddTitle => "【添加 Provider 账号】".into(),
         Msg::ProviderPanelEditAccountTitle { account } =>
@@ -533,6 +534,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  无效的轮次 {requested}（当前共 {available} 轮）。\n").into(),
         Msg::CmdUndoBusy =>
             "  当前回合进行中，无法撤销——请先按 Esc 取消。\n".into(),
+        Msg::CmdRewindBusy =>
+            "  当前回合进行中，无法回退——请先按 Esc 取消。\n".into(),
+        Msg::CmdRewindUnavailable => "暂时无法打开回退".into(),
         Msg::CmdUndoBadArg =>
             "  用法：/undo 或 /undo N（N 为轮次号）。\n".into(),
         Msg::CmdNoChanges =>
@@ -945,6 +949,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescMemory => "显示所有已保存的记忆".into(),
         Msg::CmdDescMcp => "显示 MCP 服务器状态（子命令：reload）".into(),
         Msg::CmdDescUndo => "撤销：把对话记忆回退一轮（/undo 或 /undo N）".into(),
+        Msg::CmdDescRewind => "回退：把对话恢复到更早的检查点".into(),
         Msg::CmdDescWorktree => "Git 工作树隔离（create/list/done/cleanup）".into(),
         Msg::CmdDescUpgrade => "升级到最新版本（子命令：rollback）".into(),
         Msg::CmdDescPlan => "切换到 Plan 模式（只读探索）".into(),
@@ -981,6 +986,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescGoal => "设定完成目标（自主循环直到达成）".into(),
         Msg::CmdDescProxy => "切换出站代理模式".into(),
         Msg::CmdDescTodo => "显示当前任务清单；`/todo add <任务>` 追加一条，`/todo clear` 清空".into(),
+        Msg::CmdDescSchedule => "查看定时任务列表和下次运行时间".into(),
         Msg::CmdDescDesktop =>
             "打开 AtomCode 桌面端（已安装则启动，否则显示下载地址）".into(),
         Msg::DesktopOpening { name, path } =>

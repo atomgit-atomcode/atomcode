@@ -257,6 +257,15 @@ pub async fn resume_session(
         .await
 }
 
+/// Move the bound runtime to a fresh staged session. This is the only safe way
+/// for the daemon to release the current idle session's lease before deleting
+/// that session from disk.
+pub async fn fresh_session(
+    expected: &LiveBinding,
+) -> Result<crate::live_hub::FreshSessionOutcome, HubError> {
+    hub().fresh_session(expected).await
+}
+
 pub async fn change_directory(
     working_dir: PathBuf,
 ) -> Result<atomcode_coding::SessionChanged, HubError> {
@@ -386,7 +395,7 @@ pub async fn ensure_headless_runtime(
     }
     let provider_fingerprint = provider_fingerprint(&config, &provider_name)?;
     let runtime_config: CodingRuntimeConfig =
-        crate::live_api::chat_runtime_config(&config, &provider_name, &working_dir, telemetry);
+        crate::live_api::live_runtime_config(&config, &provider_name, &working_dir, telemetry);
     let (session_mode, initial_snapshot) = match requested_session_id {
         Some(id) => {
             let snapshot = load_snapshot(&working_dir, &id)?;

@@ -10,26 +10,67 @@ import java.util.HexFormat
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 
-class AtomCodeDaemonProcess(
-    private val settings: AtomCodeSettings,
-) {
-    private val processLock = Any()
+private const val MAX_DAEMON_STDERR_CHARS = 8_192
 
-    @Volatile
-    private var ownedProcess: Process? = null
+internal data class DaemonProcessExit(
+    val exitCode: Int,
+    val stderr: String,
+)
+
+internal interface ManagedDaemonProcess {
+    fun isAlive(): Boolean
+    fun onExit(): CompletableFuture<DaemonProcessExit>
+    fun destroy()
+}
+
+internal sealed interface DaemonLaunchResult {
+    data object MissingBinary : DaemonLaunchResult
+    data class Started(val process: ManagedDaemonProcess) : DaemonLaunchResult
+    data class Failed(val message: String) : DaemonLaunchResult
+}
+
+internal interface DaemonProcessLauncher {
+    fun expectedVersion(): String?
+    fun expectedHash(): String?
+    fun start(): CompletableFuture<DaemonLaunchResult>
+}
+
+internal class AtomCodeDaemonProcess(
+    private val settings: AtomCodeSettings,
+) : DaemonProcessLauncher {
+    private companion object {
+        val EXTRACTION_LOCK = Any()
+    }
 
     fun locateBinary(): BinaryResolution? {
         configuredBinary()?.let { return it }
         bundledDaemon()?.let { return BinaryResolution(it.toString(), emptyList()) }
+        // On Windows the standalone `atomcode-daemon` binary is a GUI-subsystem
+        // app (no console window when spawned from the IDE), while the
+        // `atomcode` CLI is a console-subsystem app that flashes a cmd window.
+        // Prefer the daemon binary over the CLI on Windows; keep the CLI-first
+        // order elsewhere since both behave identically there.
+        if (isWindows()) {
+            commonDaemonPaths().firstOrNull { Files.isRegularFile(it) }?.let {
+                return BinaryResolution(it.toString(), emptyList())
+            }
+            developerDaemonPaths().firstOrNull { Files.isRegularFile(it) }?.let {
+                return BinaryResolution(it.toString(), emptyList())
+            }
+        }
         pathBinary("atomcode")?.let { return BinaryResolution(it.toString(), listOf("daemon")) }
         commonAtomcodePaths().firstOrNull { Files.isRegularFile(it) }?.let {
             return BinaryResolution(it.toString(), listOf("daemon"))
         }
-        commonDaemonPaths().firstOrNull { Files.isRegularFile(it) }?.let {
-            return BinaryResolution(it.toString(), emptyList())
-        }
-        developerDaemonPaths().firstOrNull { Files.isRegularFile(it) }?.let {
-            return BinaryResolution(it.toString(), emptyList())
+        // On Windows the daemon paths were already probed above and would never
+        // newly succeed here — keep the tail check for macOS/Linux only.
+        if (!isWindows()) {
+            commonDaemonPaths().firstOrNull { Files.isRegularFile(it) }?.let {
+                return BinaryResolution(it.toString(), emptyList())
+            }
+            developerDaemonPaths().firstOrNull { Files.isRegularFile(it) }?.let {
+                return BinaryResolution(it.toString(), emptyList())
+            }
         }
         return null
     }
@@ -61,48 +102,39 @@ class AtomCodeDaemonProcess(
         }
     }
 
-    fun ensureRunning(auth: DaemonAuth): CompletableFuture<Boolean> =
+    override fun expectedVersion(): String? = expectedBundledVersion()
+
+    override fun expectedHash(): String? = expectedBundledHash()
+
+    override fun start(): CompletableFuture<DaemonLaunchResult> =
         CompletableFuture.supplyAsync {
-            val binary = locateBinary() ?: return@supplyAsync false
-            val args = mutableListOf<String>()
-            args += binary.path
-            args += binary.argsPrefix
-            args += listOf("--port", settings.port.toString(), "--client", "jetbrains")
-
-            val builder = ProcessBuilder(args)
-                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
-                .redirectError(ProcessBuilder.Redirect.DISCARD)
-            normalizeDaemonEnvForUtf8Locale(builder.environment())
-            val process = builder.start()
-            synchronized(processLock) {
-                ownedProcess?.takeIf { it.isAlive }?.let {
-                    it.destroy()
-                    it.waitFor(2, TimeUnit.SECONDS)
+            try {
+                val binary = locateBinary() ?: return@supplyAsync DaemonLaunchResult.MissingBinary
+                val args = mutableListOf<String>()
+                args += binary.path
+                args += binary.argsPrefix
+                args += listOf("--port", settings.port.toString(), "--client", "jetbrains")
+                // Windows only: disable the daemon's idle shutdown (default 30 min)
+                // so an idled daemon doesn't exit and get restarted by the next sent
+                // message — which flashes a console window when the fallback CLI
+                // binary is used. On macOS/Linux the restart is windowless, and the
+                // idle self-shutdown is the only cleanup for a daemon orphaned by a
+                // hard IDE termination (crash / kill -9, where dispose() never runs),
+                // so keep the watchdog there.
+                if (isWindows()) {
+                    args += listOf("--idle-timeout", "0")
                 }
-                ownedProcess = process
-            }
-            true
-        }
 
-    fun restartOwnedDaemon(auth: DaemonAuth): CompletableFuture<Boolean> =
-        CompletableFuture.supplyAsync {
-            synchronized(processLock) {
-                ownedProcess?.let {
-                    if (it.isAlive) {
-                        it.destroy()
-                        if (!it.waitFor(2, TimeUnit.SECONDS)) {
-                            it.destroyForcibly()
-                        }
-                    }
-                }
-                ownedProcess = null
+                val builder = ProcessBuilder(args)
+                    .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                    .redirectError(ProcessBuilder.Redirect.PIPE)
+                normalizeDaemonEnvForUtf8Locale(builder.environment())
+                val process = builder.start()
+                DaemonLaunchResult.Started(JvmManagedDaemonProcess(process))
+            } catch (error: Exception) {
+                DaemonLaunchResult.Failed(error.message ?: error.javaClass.simpleName)
             }
-            ensureRunning(auth).get(10, TimeUnit.SECONDS)
         }
-
-    fun isOwnedProcess(): Boolean = synchronized(processLock) {
-        ownedProcess?.isAlive == true
-    }
 
     private fun configuredBinary(): BinaryResolution? {
         val raw = settings.daemonBinaryPath.trim()
@@ -121,21 +153,27 @@ class AtomCodeDaemonProcess(
         val platformDir = platformDir() ?: return null
         val executable = executableName("atomcode-daemon")
         val resourcePath = "resources/bin/$platformDir/$executable"
+        val contentHash = expectedBundledHash() ?: return null
         val loader = AtomCodeDaemonProcess::class.java.classLoader
-        loader.getResourceAsStream(resourcePath)?.use { stream ->
-            val destination = Path.of(
-                System.getProperty("java.io.tmpdir"),
-                "atomcode-jetbrains",
-                "bin",
-                platformDir,
-                executable,
-            )
-            Files.createDirectories(destination.parent)
-            Files.copy(stream, destination, StandardCopyOption.REPLACE_EXISTING)
-            if (!System.getProperty("os.name").lowercase().contains("win")) {
-                destination.toFile().setExecutable(true, false)
+        val destination = Path.of(
+            System.getProperty("java.io.tmpdir"),
+            "atomcode-jetbrains",
+            "bin",
+            platformDir,
+            contentHash.take(16),
+            ProcessHandle.current().pid().toString(),
+            executable,
+        )
+        synchronized(EXTRACTION_LOCK) {
+            if (Files.isRegularFile(destination)) return destination
+            loader.getResourceAsStream(resourcePath)?.use { stream ->
+                Files.createDirectories(destination.parent)
+                Files.copy(stream, destination, StandardCopyOption.REPLACE_EXISTING)
+                if (!isWindows()) {
+                    destination.toFile().setExecutable(true, false)
+                }
+                return destination
             }
-            return destination
         }
         return null
     }
@@ -174,7 +212,10 @@ class AtomCodeDaemonProcess(
     ).map { executableName(it) }.map { Path.of(it).toAbsolutePath() }
 
     private fun executableName(name: String): String =
-        if (System.getProperty("os.name").lowercase().contains("win") && !name.endsWith(".exe")) "$name.exe" else name
+        if (isWindows() && !name.endsWith(".exe")) "$name.exe" else name
+
+    private fun isWindows(): Boolean =
+        System.getProperty("os.name").lowercase().contains("win")
 
     private fun platformDir(): String? {
         val os = System.getProperty("os.name").lowercase()
@@ -201,6 +242,38 @@ class AtomCodeDaemonProcess(
             path
         }
         return Path.of(expanded)
+    }
+}
+
+internal class JvmManagedDaemonProcess(
+    private val process: Process,
+) : ManagedDaemonProcess {
+    private val stderr = CompletableFuture.supplyAsync {
+        process.errorStream.bufferedReader().use { reader ->
+            val tail = StringBuilder()
+            val buffer = CharArray(1_024)
+            while (true) {
+                val count = reader.read(buffer)
+                if (count < 0) break
+                val overflow = tail.length + count - MAX_DAEMON_STDERR_CHARS
+                if (overflow > 0) tail.delete(0, overflow.coerceAtMost(tail.length))
+                tail.append(buffer, 0, count)
+            }
+            tail.toString()
+        }
+    }.handle { diagnostic, _ -> diagnostic.orEmpty() }
+    private val exit = process.onExit().thenCombine(stderr) { exited, diagnostic ->
+        DaemonProcessExit(exited.exitValue(), diagnostic.trim())
+    }
+
+    override fun isAlive(): Boolean = process.isAlive
+
+    override fun onExit(): CompletableFuture<DaemonProcessExit> = exit
+
+    override fun destroy() {
+        if (!process.isAlive) return
+        process.destroy()
+        if (!process.waitFor(2, TimeUnit.SECONDS)) process.destroyForcibly()
     }
 }
 

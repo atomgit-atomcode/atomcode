@@ -329,6 +329,20 @@ pub struct ForkInfo {
     pub base_turn_count: u32,
 }
 
+/// How a session was created. Stored in [`SessionMeta`] so that automated
+/// scheduled-task sessions can be excluded from user-facing history pickers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionOrigin {
+    /// Started by the user (TUI, webui, CLI). The default for all legacy
+    /// sessions that predate this field (`#[serde(default)]`).
+    #[default]
+    Manual,
+    /// Started by the scheduled-tasks runner. Hidden from normal `/resume`
+    /// and sidebar pickers; visible in a dedicated scheduled-tasks view.
+    Scheduled,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
     /// `.meta` SCHEMA VERSION — the forward-compat seam (`.snapshot` has
@@ -382,6 +396,10 @@ pub struct SessionMeta {
     /// attributed to a provider/model written by older metadata.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub detached_unattributed_tokens: u64,
+    /// How this session was created. Defaults to [`SessionOrigin::Manual`] so
+    /// that sessions written before this field existed deserialize correctly.
+    #[serde(default)]
+    pub origin: SessionOrigin,
 }
 
 impl SessionMeta {
@@ -406,6 +424,7 @@ impl SessionMeta {
             turn_stats: Vec::new(),
             detached_model_usage: Vec::new(),
             detached_unattributed_tokens: 0,
+            origin: SessionOrigin::Manual,
         }
     }
 
@@ -528,6 +547,16 @@ pub struct LoadedSession {
     pub meta: SessionMeta,
     pub snapshot: SessionSnapshot,
     pub presentation: PresentationFile,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum NativeSessionRepairOutcome {
+    Healthy(LoadedSession),
+    RepairableMissingPresentation {
+        meta: SessionMeta,
+        snapshot: SessionSnapshot,
+    },
+    Repaired(LoadedSession),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1750,22 +1779,69 @@ impl SessionManager {
     /// any missing artifact is an explicit error; callers must cut over through the
     /// importer instead of manufacturing defaults.
     pub fn load_native_session(&self, id: &str) -> SessionResult<LoadedSession> {
-        self.with_meta_lock(id, || {
+        self.with_meta_lock(id, || self.load_native_session_unlocked(id))
+    }
+
+    fn load_native_session_unlocked(&self, id: &str) -> SessionResult<LoadedSession> {
+        let meta = self.read_meta(id)?;
+        if meta.owner != StorageOwner::Native {
+            return Err(SessionStoreError::OwnershipConflict {
+                id: id.to_string(),
+                owner: meta.owner,
+                operation: "load native session",
+            });
+        }
+        let snapshot = self.load_snapshot(id)?;
+        let presentation = self.read_presentation(id)?;
+        Ok(LoadedSession {
+            meta,
+            snapshot,
+            presentation,
+        })
+    }
+
+    /// Inspect or explicitly repair the one safe incomplete-native state: valid
+    /// native metadata and snapshot with an absent presentation sidecar.
+    ///
+    /// Existing presentation bytes are never replaced. The caller must hold the
+    /// active session lease so a runtime cannot publish a concurrent aggregate.
+    pub fn repair_missing_presentation(
+        &self,
+        lease: &SessionLease,
+        apply: bool,
+    ) -> SessionResult<NativeSessionRepairOutcome> {
+        self.validate_active_lease(lease)?;
+        self.with_meta_lock(lease.id(), || {
+            let id = lease.id();
             let meta = self.read_meta(id)?;
             if meta.owner != StorageOwner::Native {
                 return Err(SessionStoreError::OwnershipConflict {
                     id: id.to_string(),
                     owner: meta.owner,
-                    operation: "load native session",
+                    operation: "repair missing presentation",
                 });
             }
             let snapshot = self.load_snapshot(id)?;
-            let presentation = self.read_presentation(id)?;
-            Ok(LoadedSession {
-                meta,
-                snapshot,
-                presentation,
-            })
+            let presentation_path = self.presentation_path(id)?;
+            match self.read_presentation(id) {
+                Ok(presentation) => Ok(NativeSessionRepairOutcome::Healthy(LoadedSession {
+                    meta,
+                    snapshot,
+                    presentation,
+                })),
+                Err(SessionStoreError::NotFound { path }) if path == presentation_path => {
+                    if !apply {
+                        return Ok(NativeSessionRepairOutcome::RepairableMissingPresentation {
+                            meta,
+                            snapshot,
+                        });
+                    }
+                    self.write_presentation_unlocked(id, &PresentationFile::default())?;
+                    self.load_native_session_unlocked(id)
+                        .map(NativeSessionRepairOutcome::Repaired)
+                }
+                Err(error) => Err(error),
+            }
         })
     }
 
@@ -2738,6 +2814,16 @@ impl SessionManager {
         }
         out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         out
+    }
+
+    /// Sessions for normal pickers (/resume, webui sidebar): excludes scheduled-run
+    /// sessions so recurring tasks don't flood the user's manual history. Use `list()`
+    /// for the full set (e.g. a scheduled-tasks view).
+    pub fn list_visible(&self) -> Vec<SessionMeta> {
+        self.list()
+            .into_iter()
+            .filter(|m| m.origin != SessionOrigin::Scheduled)
+            .collect()
     }
 
     /// The most-recently-updated session, if any.
@@ -4398,6 +4484,70 @@ mod tests {
         assert_eq!(mgr.read_presentation("s1").unwrap(), presentation);
         assert_eq!(mgr.read_meta("s1").unwrap(), meta);
         assert!(!stale.exists());
+    }
+
+    #[test]
+    fn missing_presentation_repair_is_explicit_and_reloads_a_strict_aggregate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let snapshot = snap(&["kept"]);
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &lease,
+            Some(&snapshot),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+
+        std::fs::remove_file(mgr.presentation_path("s1").unwrap()).unwrap();
+        assert!(matches!(
+            mgr.repair_missing_presentation(&lease, false).unwrap(),
+            NativeSessionRepairOutcome::RepairableMissingPresentation { .. }
+        ));
+        assert!(!mgr.presentation_path("s1").unwrap().exists());
+
+        let repaired = mgr.repair_missing_presentation(&lease, true).unwrap();
+        assert!(matches!(repaired, NativeSessionRepairOutcome::Repaired(_)));
+        assert_eq!(mgr.load_native_session("s1").unwrap().snapshot, snapshot);
+        assert_eq!(
+            mgr.read_presentation("s1").unwrap(),
+            PresentationFile::default()
+        );
+        assert!(matches!(
+            mgr.repair_missing_presentation(&lease, true).unwrap(),
+            NativeSessionRepairOutcome::Healthy(_)
+        ));
+    }
+
+    #[test]
+    fn missing_presentation_repair_never_overwrites_corrupt_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let snapshot = snap(&["kept"]);
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &lease,
+            Some(&snapshot),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        let path = mgr.presentation_path("s1").unwrap();
+        std::fs::write(&path, b"corrupt presentation").unwrap();
+
+        assert!(matches!(
+            mgr.repair_missing_presentation(&lease, true),
+            Err(SessionStoreError::Corrupt {
+                kind: "presentation",
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), b"corrupt presentation");
     }
 
     #[test]
@@ -6584,5 +6734,19 @@ mod tests {
         let snap = mgr.snapshot_path("abc").unwrap();
         let art = mgr.artifacts_dir("abc").unwrap();
         assert_eq!(art, snap.with_extension("artifacts"));
+    }
+
+    #[test]
+    fn session_origin_defaults_manual_and_roundtrips() {
+        let mut m = SessionMeta::new("s1", "/tmp/p", 0);
+        assert_eq!(m.origin, SessionOrigin::Manual); // default
+        m.origin = SessionOrigin::Scheduled;
+        let json = serde_json::to_string(&m).unwrap();
+        let back: SessionMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.origin, SessionOrigin::Scheduled);
+        // old meta without the field → Manual
+        let old = r#"{"id":"x","name":"n","working_dir":"/w","created_at":0,"updated_at":0}"#;
+        let parsed: SessionMeta = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.origin, SessionOrigin::Manual);
     }
 }

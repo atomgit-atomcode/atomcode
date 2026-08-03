@@ -35,6 +35,7 @@ async fn always_allow_grants_survive_reassembly() {
         memory: false,
         web: false,
         review: false,
+        request_user_input: true,
         rate_limit_source: None,
     };
     let mut parts = prepare(&cfg, opts).await.unwrap();

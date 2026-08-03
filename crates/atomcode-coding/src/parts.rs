@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use atomcode_capabilities::cc_hooks::{CCExternalHooks, HookConfig};
 use atomcode_capabilities::codeintel::register_codeintel_tools;
+use atomcode_capabilities::datalog::DatalogHook;
 use atomcode_capabilities::mcp::{self, McpConnectEvent, McpRegistry};
 use atomcode_capabilities::memory::MemoryHook;
 use atomcode_capabilities::provider::model_suggests_vision;
@@ -35,22 +36,24 @@ use atomcode_capabilities::skills::{
 };
 use atomcode_capabilities::tools::{
     register_coding_tools_with_vision, ApprovalMiddleware, ArtifactMiddleware, ArtifactStore,
-    BashWorkspaceGate, FetchOutputTool, OpenFileWorkspaceGate, ReadFileTool, SensitivePathGate,
-    RepairToolArgsMiddleware, WebFetchTool, WebSearchTool, WriteApprovalGate,
+    BashWorkspaceGate, FetchOutputTool, OpenFileWorkspaceGate, ReadFileTool,
+    RepairToolArgsMiddleware, SensitivePathGate, WebFetchTool, WebSearchTool, WriteApprovalGate,
 };
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::checkpoint::CompactionCheckpoint;
 use atomcode_kernel::hook::LifecycleHooks;
 use atomcode_kernel::message::{Message, Role, SessionSnapshot};
+use atomcode_kernel::middleware::ToolMiddleware;
 use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::tool::{MountedTools, MountedToolsPublisher, ToolRegistry};
 use atomcode_review::{ReviewTool, ReviewToolConfig, SharedReviewProvider};
 
 use crate::config::CodingAgentConfig;
 use crate::discipline::VerifyCadenceHook;
+use crate::execution_policy::TurnExecutionPolicy;
 #[cfg(test)]
 use crate::persona::coding_persona;
-use crate::persona::coding_persona_with_language;
+use crate::persona::coding_persona_with_capabilities;
 use crate::plugin_hooks::PluginHookSource;
 use crate::rate_limit::RateLimitWindowSource;
 
@@ -104,6 +107,10 @@ pub struct PrepareOptions {
     /// in-session via the review specialization). Reuses the host provider (set at
     /// assemble), so it works on a signing gateway. `false` ⇒ not mounted.
     pub review: bool,
+    /// Mount the structured `request_user_input` tool. Drivers without a typed
+    /// request/response protocol must set this false instead of advertising a tool
+    /// they can only fail with `Null`.
+    pub request_user_input: bool,
     /// Provider-specific quota source supplied by the host. `None` keeps 429 handling generic.
     pub rate_limit_source: Option<Arc<dyn RateLimitWindowSource>>,
 }
@@ -118,6 +125,7 @@ impl Default for PrepareOptions {
             memory: true,
             web: true,
             review: true,
+            request_user_input: true,
             rate_limit_source: None,
         }
     }
@@ -161,6 +169,7 @@ impl Drop for McpWorkGuard {
 pub struct CodingParts {
     registry: ToolRegistry,
     tool_names: Vec<String>,
+    request_user_input_enabled: bool,
     mcp_tool_names: Arc<std::sync::RwLock<Vec<String>>>,
     mounted_tools: Option<MountedTools>,
     mounted_tools_publisher: Option<MountedToolsPublisher>,
@@ -207,6 +216,9 @@ pub struct CodingParts {
     /// `bypass_mode` this is enforced in middleware, mirroring `plan_mode`. Shared
     /// (not rebuilt) so a respawn preserves the mode.
     pub accept_edits: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Current real-user turn's explicit execution restriction. The same instance is
+    /// a lifecycle hook and a pre-approval Bash middleware.
+    pub(crate) turn_execution_policy: Arc<TurnExecutionPolicy>,
     /// Session grant store for mutating MCP tools the user approved "always" while in
     /// PLAN mode. Owned here (not rebuilt in [`assemble`]) so a respawn / model-swap
     /// preserves the grants — the same reason the mode flags above are shared.
@@ -263,6 +275,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
 ) -> io::Result<CodingParts> {
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
+    let turn_execution_policy = Arc::new(TurnExecutionPolicy::new());
 
     // Always-on core: neutral fs/bash toolset + codeintel. Vision gating: a VL model
     // (e.g. Qwen3-VL) makes read_file hand image files to the model as pictures. Uses the
@@ -276,6 +289,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             .iter()
             .map(|s| s.to_string()),
     );
+    let request_user_input_enabled =
+        opts.request_user_input && crate::persona::request_user_input_switch_enabled();
+    if !request_user_input_enabled {
+        names.retain(|name| name != "request_user_input");
+    }
     register_codeintel_tools(&mut registry);
     names.extend(
         atomcode_capabilities::codeintel::codeintel_tool_names()
@@ -428,7 +446,8 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 )
                 .with_max_concurrent(max_concurrent)
                 .with_max_rounds(max_rounds)
-                .with_tool_loop_policy(cfg.tool_loop_policy),
+                .with_tool_loop_policy(cfg.tool_loop_policy)
+                .with_worker_middleware(turn_execution_policy.clone()),
             ));
             names.push("task".to_string());
             Some(slot)
@@ -603,8 +622,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         snapshot_persistence_status = Some(snapshot_hook.persistence_status());
         compaction_checkpoint = Some(snapshot_hook.clone());
         snapshot_hook_handle = Some(snapshot_hook.clone());
-        hooks.push(snapshot_hook);
-        hooks.push(Arc::new(TranscriptHook::new(b.manager.clone(), &b.id)));
+        hooks.push(snapshot_hook.clone());
+        hooks.push(Arc::new(
+            TranscriptHook::new(b.manager.clone(), &b.id)
+                .with_persistence_status(snapshot_hook.persistence_status()),
+        ));
     }
     // Status awareness is UNCONDITIONAL (production parity): a per-turn <system-reminder>
     // with date + round budget (NO context-usage gauge — pressure is handled silently by
@@ -617,7 +639,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // the edit/write tools resolve relative `file_path` against — they stay in lockstep because
     // `/cd` respawns the agent (rebuilding this hook with the new dir), not by mutating cwd in
     // place. If `/cd` ever moves to an in-place cwd mutation, thread the live cwd in here too.
-    hooks.push(Arc::new(VerifyCadenceHook::new(cfg.working_dir.clone())));
+    hooks.push(turn_execution_policy.clone());
+    hooks.push(Arc::new(VerifyCadenceHook::with_execution_policy(
+        cfg.working_dir.clone(),
+        turn_execution_policy.clone(),
+    )));
     // Todo hook (native runtime path — the live TUI + webui): per-turn <system-reminder> of the
     // current list so the model keeps it accurate after compaction, PLUS an `offer_continuation`
     // that nudges once to close out open items when the model tries to stop. Gated on the SAME
@@ -687,6 +713,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         bypass_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         accept_edits: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        turn_execution_policy,
         mcp_plan_grants: std::sync::Arc::new(
             atomcode_capabilities::tools::InMemoryPermissionStore::new(),
         ),
@@ -701,6 +728,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         ),
         registry,
         tool_names: names,
+        request_user_input_enabled,
         mcp_tool_names: Arc::new(std::sync::RwLock::new(Vec::new())),
         mounted_tools: None,
         mounted_tools_publisher: None,
@@ -1138,7 +1166,12 @@ pub fn assemble(
             Ok(loaded) => {
                 let mut snap = loaded.snapshot;
                 check_snapshot_version(&snap)?;
-                reconcile_coding_persona(&mut snap, cfg);
+                reconcile_coding_persona(
+                    &mut snap,
+                    cfg,
+                    parts.request_user_input_enabled,
+                    parts.review_provider.is_some(),
+                );
                 b.resume = Some(snap);
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound && b.staged_fresh.is_some() => {}
@@ -1238,12 +1271,12 @@ pub fn assemble(
     // When a session is present, wire the artifact store: register the fetch_output tool
     // so the model can retrieve large outputs, and prepare the middleware that intercepts
     // oversized tool results and spills them to disk.  No session → no artifact I/O.
-    let artifact_store: Option<Arc<ArtifactStore>> =
-        parts.session.as_ref().and_then(|b| {
-            b.manager.artifacts_dir(&b.id).ok().map(|dir| {
-                Arc::new(ArtifactStore::new(dir))
-            })
-        });
+    let artifact_store: Option<Arc<ArtifactStore>> = parts.session.as_ref().and_then(|b| {
+        b.manager
+            .artifacts_dir(&b.id)
+            .ok()
+            .map(|dir| Arc::new(ArtifactStore::new(dir)))
+    });
     if let Some(store) = &artifact_store {
         parts
             .registry
@@ -1253,11 +1286,12 @@ pub fn assemble(
     let mut builder = Agent::builder()
         .provider(provider)
         .tools(parts.mount())
-        .persona(coding_persona_with_language(
+        .persona(coding_persona_with_capabilities(
             &cfg.model,
             cfg.preferred_language,
             crate::persona::todo_switch_enabled(),
-            crate::persona::request_user_input_switch_enabled(),
+            parts.request_user_input_enabled,
+            parts.review_provider.is_some(),
         ))
         // Repair model-produced arguments before any observer or policy gate reads them.
         // Approval must inspect the same bytes that the tool executes.
@@ -1286,6 +1320,13 @@ pub fn assemble(
             parts.session.as_ref().map(|b| b.id.as_str()),
         )));
     }
+    let datalog = DatalogHook::new(
+        &cfg.working_dir,
+        &cfg.datalog,
+        &cfg.model,
+        cfg.context_window,
+    )
+    .map(Arc::new);
     let rate_limit_hook: Arc<dyn LifecycleHooks> = match &parts.rate_limit_source {
         Some(source) => Arc::new(crate::rate_limit::RateLimitHook::with_source(
             cfg.base_url.clone(),
@@ -1294,6 +1335,9 @@ pub fn assemble(
         None => Arc::new(crate::rate_limit::RateLimitHook::new(cfg.base_url.clone())),
     };
     let mut builder = builder
+        // Hard per-turn user boundary. Register before every middleware that can `Allow`
+        // and bypass downstream approval gates.
+        .middleware(parts.turn_execution_policy.clone())
         // Plan-mode gate BEFORE approval: while active it blocks mutating (Risky)
         // tools outright, so there's no point prompting the user to approve a write
         // plan mode forbids. Read-only when inactive — zero cost off the plan path.
@@ -1411,6 +1455,14 @@ pub fn assemble(
     for h in &parts.hooks {
         builder = builder.hook(h.clone());
     }
+    if let Some(datalog) = datalog {
+        // Register last in both chains: the lifecycle observer sees the final prompt/request
+        // after product hooks, and the tool observer sees the final middleware-transformed
+        // result. The same writer owns correlation for both without owning runtime state.
+        builder = builder
+            .hook(datalog.clone())
+            .middleware(datalog as Arc<dyn ToolMiddleware>);
+    }
     if let Some(checkpoint) = &parts.compaction_checkpoint {
         builder = builder.compaction_checkpoint(checkpoint.clone());
     }
@@ -1463,7 +1515,12 @@ pub fn assemble(
             builder = builder.resume(snap.clone());
         }
     } else if let Some(mut snapshot) = parts.runtime_resume.as_ref().cloned() {
-        reconcile_coding_persona(&mut snapshot, cfg);
+        reconcile_coding_persona(
+            &mut snapshot,
+            cfg,
+            parts.request_user_input_enabled,
+            parts.review_provider.is_some(),
+        );
         builder = builder.resume(snapshot);
     }
     // Ensure the repo's `atomcode` project label after a successful `git push` to a
@@ -1506,12 +1563,18 @@ fn persona_model(text: &str) -> Option<&str> {
 /// Legacy drivers persist conversation history without the separately supplied
 /// system prompt. A v2 resume must restore that prompt, while a model switch must
 /// replace the old model identity instead of retaining or duplicating it.
-fn reconcile_coding_persona(snapshot: &mut SessionSnapshot, cfg: &CodingAgentConfig) {
-    let persona = coding_persona_with_language(
+fn reconcile_coding_persona(
+    snapshot: &mut SessionSnapshot,
+    cfg: &CodingAgentConfig,
+    request_user_input_enabled: bool,
+    review_enabled: bool,
+) {
+    let persona = coding_persona_with_capabilities(
         &cfg.model,
         cfg.preferred_language,
         crate::persona::todo_switch_enabled(),
-        crate::persona::request_user_input_switch_enabled(),
+        request_user_input_enabled,
+        review_enabled,
     );
     let is_persona = |message: &Message| {
         message.role == Role::System && message.text.starts_with(ATOMCODE_PERSONA_PREFIX)
@@ -1712,7 +1775,12 @@ mod tests {
     fn resume_adds_persona_before_legacy_session_context() {
         let mut snapshot = SessionSnapshot::new(vec![Message::system("SESSION CONTEXT")]);
 
-        reconcile_coding_persona(&mut snapshot, &agent_config("deepseek-v4-flash"));
+        reconcile_coding_persona(
+            &mut snapshot,
+            &agent_config("deepseek-v4-flash"),
+            true,
+            true,
+        );
 
         assert!(snapshot.messages[0]
             .text
@@ -1738,7 +1806,12 @@ mod tests {
             Message::system("SESSION CONTEXT"),
         ]);
 
-        reconcile_coding_persona(&mut snapshot, &agent_config("deepseek-v4-flash"));
+        reconcile_coding_persona(
+            &mut snapshot,
+            &agent_config("deepseek-v4-flash"),
+            true,
+            true,
+        );
 
         let personas = snapshot
             .messages
@@ -1781,8 +1854,8 @@ mod tests {
             Message::assistant("I am model-a", vec![]),
         ]);
 
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"));
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-c"));
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true);
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-c"), true, true);
 
         let transitions: Vec<_> = snapshot
             .messages
@@ -1814,7 +1887,12 @@ mod tests {
             Message::system("SESSION CONTEXT"),
         ]);
 
-        reconcile_coding_persona(&mut snapshot, &agent_config("deepseek-v4-flash"));
+        reconcile_coding_persona(
+            &mut snapshot,
+            &agent_config("deepseek-v4-flash"),
+            true,
+            true,
+        );
 
         assert_eq!(snapshot.messages[0].text, persona);
         assert_eq!(snapshot.cache_epoch, 0);
@@ -1838,7 +1916,7 @@ mod tests {
         let mut cfg = agent_config("model-a");
         cfg.preferred_language = Some(Locale::ZhCn);
 
-        reconcile_coding_persona(&mut snapshot, &cfg);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true);
 
         assert!(snapshot.messages[0]
             .text
@@ -1865,12 +1943,12 @@ mod tests {
             )),
             Message::assistant("I am model-a", vec![]),
         ]);
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"));
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true);
         let transition = snapshot.messages.last().cloned().unwrap();
         let mut cfg = agent_config("model-b");
         cfg.preferred_language = Some(Locale::ZhCn);
 
-        reconcile_coding_persona(&mut snapshot, &cfg);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true);
 
         assert_eq!(snapshot.messages.last(), Some(&transition));
         assert_eq!(
@@ -1916,6 +1994,7 @@ mod tests {
             memory: false,
             web: false,
             review: false,
+            request_user_input: true,
             rate_limit_source: None,
         };
 
@@ -1960,8 +2039,24 @@ mod tests {
             memory: false,
             web: false,
             review: false,
+            request_user_input: true,
             rate_limit_source: None,
         }
+    }
+
+    #[tokio::test]
+    async fn driver_can_disable_request_user_input_at_mount_boundary() {
+        let project = tempfile::tempdir().unwrap();
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        let mut opts = io_free_opts();
+        opts.request_user_input = false;
+        let parts = prepare(&cfg, opts).await.unwrap();
+
+        assert!(!parts
+            .selected_tool_names()
+            .iter()
+            .any(|name| name == "request_user_input"));
+        assert!(!parts.request_user_input_enabled);
     }
 
     #[cfg(feature = "atomgit")]
@@ -2513,6 +2608,53 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
+    async fn primary_runtime_mounts_configured_datalog_at_assemble() {
+        use atomcode_kernel::agent::AutoRespond;
+
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let project = tempfile::tempdir().unwrap();
+        let datalog_root = home.path().join("custom-datalog");
+        let mut cfg =
+            CodingAgentConfig::new("k", "http://localhost", "logged-model", project.path());
+        cfg.datalog.enabled = true;
+        cfg.datalog.dir = Some(datalog_root.display().to_string());
+
+        let mut parts = prepare(&cfg, io_free_opts()).await.unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
+        let agent = assemble(&mut parts, &cfg, provider).unwrap();
+        let _ = agent
+            .run_to_completion("record this turn", AutoRespond::AllowAll)
+            .await;
+
+        let project_dir = std::fs::read_dir(&datalog_root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let files: Vec<_> = std::fs::read_dir(project_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        let markdown = files
+            .iter()
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+            .expect("turn markdown");
+        let jsonl = files
+            .iter()
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+            .expect("per-round request jsonl");
+        assert!(std::fs::read_to_string(markdown)
+            .unwrap()
+            .contains("**Response:**\nlooks good"));
+        let request = std::fs::read_to_string(jsonl).unwrap();
+        assert!(request.contains("\"model\":\"logged-model\""));
+        assert!(request.contains("record this turn"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
     async fn snapshot_cost_attribution_tracks_model_swapped_at_assemble() {
         use atomcode_kernel::agent::AutoRespond;
 
@@ -2616,10 +2758,12 @@ mod tests {
     /// big tool result → preview+handle stored → fetch_output retrieves full bytes.
     #[tokio::test]
     async fn artifact_wiring_store_middleware_and_fetch_roundtrip() {
-        use atomcode_capabilities::tools::{ArtifactMiddleware, ArtifactStore, FetchOutputTool, THRESHOLD_BYTES};
+        use atomcode_capabilities::tools::{
+            ArtifactMiddleware, ArtifactStore, FetchOutputTool, THRESHOLD_BYTES,
+        };
         use atomcode_kernel::middleware::ToolMiddleware;
-        use atomcode_kernel::tool::{ToolContext, ToolResult};
         use atomcode_kernel::tool::Tool as _;
+        use atomcode_kernel::tool::{ToolContext, ToolResult};
         use tokio_util::sync::CancellationToken;
 
         let artifacts_tmp = tempfile::tempdir().unwrap();

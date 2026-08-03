@@ -1,4 +1,5 @@
 import java.nio.file.Files
+import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.util.concurrent.TimeUnit
 
@@ -10,6 +11,16 @@ plugins {
 
 group = "com.atomcode"
 version = providers.gradleProperty("pluginVersion").get()
+
+val platformLocalPath = providers.gradleProperty("platformLocalPath")
+val platformVersion = providers.gradleProperty("platformVersion")
+val targetPlatformBaseline = providers.provider {
+    val localBaseline = platformLocalPath.orNull?.let(::localIdeBaselineVersion)
+    val configuredBaseline = platformBaselineVersion(platformVersion.get())
+    localBaseline ?: configuredBaseline ?: 0
+}
+val targetUsesUnifiedIdea = targetPlatformBaseline.map { it >= 253 }
+val targetUsesSeparateJcefPlugin = targetPlatformBaseline.map { it >= 262 }
 
 repositories {
     mavenCentral()
@@ -39,11 +50,15 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-collections-immutable:0.3.8")
 
     intellijPlatform {
-        val localIdePath = providers.gradleProperty("platformLocalPath")
-        if (localIdePath.isPresent) {
-            local(localIdePath)
+        if (platformLocalPath.isPresent) {
+            local(platformLocalPath)
+        } else if (targetUsesUnifiedIdea.get()) {
+            intellijIdea(platformVersion.get())
         } else {
-            intellijIdeaCommunity(providers.gradleProperty("platformVersion").get())
+            intellijIdeaCommunity(platformVersion.get())
+        }
+        if (targetUsesSeparateJcefPlugin.get()) {
+            bundledPlugin("intellij.platform.ui.jcef")
         }
 
         pluginVerifier()
@@ -68,9 +83,8 @@ intellijPlatform {
 
     pluginVerification {
         ides {
-            val localIdePath = providers.gradleProperty("platformLocalPath")
-            if (localIdePath.isPresent) {
-                local(localIdePath)
+            if (platformLocalPath.isPresent) {
+                local(platformLocalPath)
             } else {
                 recommended()
             }
@@ -162,6 +176,9 @@ tasks {
         mustRunAfter(verifyOfficialDaemonForRunIde)
         doLast {
             val outputRoot = bundledDaemonDir.get().asFile.toPath()
+            if (Files.exists(outputRoot) && !outputRoot.toFile().deleteRecursively()) {
+                throw GradleException("Failed to clean stale bundled daemon output: $outputRoot")
+            }
             Files.createDirectories(outputRoot)
             var copied = 0
             daemonTargets.forEach { target ->
@@ -194,12 +211,34 @@ tasks {
         }
     }
 
+    val verifyBundledDaemon by registering {
+        dependsOn(bundleDaemon)
+        doLast {
+            val expectedTargets = daemonTargets.filter { target ->
+                providers.environmentVariable(target.env).orNull
+                    ?.let { repoRoot.fileSystem.getPath(it).toAbsolutePath().normalize() }
+                    ?.let(Files::isRegularFile)
+                    ?: (localDaemonCandidate(repoRoot, target, currentTargetId) != null)
+            }.mapTo(sortedSetOf()) { it.id }
+            val outputRoot = bundledDaemonDir.get().asFile.toPath()
+            val actualTargets = daemonTargets.filter { target ->
+                Files.isRegularFile(
+                    outputRoot.resolve("resources/bin/${target.id}/${target.executable}"),
+                )
+            }.mapTo(sortedSetOf()) { it.id }
+            check(actualTargets == expectedTargets) {
+                "Bundled daemon targets do not match this build's inputs: " +
+                    "expected=$expectedTargets, actual=$actualTargets"
+            }
+        }
+    }
+
     test {
         useJUnitPlatform()
     }
 
     processResources {
-        dependsOn(bundleDaemon)
+        dependsOn(verifyBundledDaemon)
         from(bundledDaemonDir)
     }
 
@@ -255,4 +294,31 @@ fun parseWorkspaceVersion(repoRoot: java.nio.file.Path): String? {
     val text = Files.readString(cargoToml)
     val match = Regex("""(?s)\[workspace\.package].*?version\s*=\s*"([^"]+)"""").find(text)
     return match?.groupValues?.get(1)
+}
+
+fun localIdeBaselineVersion(idePath: String): Int? {
+    val root = Path.of(idePath).toAbsolutePath().normalize()
+    val productInfo = listOf(
+        root.resolve("product-info.json"),
+        root.resolve("Resources/product-info.json"),
+        root.resolve("Contents/Resources/product-info.json"),
+    ).firstOrNull { Files.isRegularFile(it) } ?: return null
+    val buildNumber = Regex(""""buildNumber"\s*:\s*"([^"]+)"""")
+        .find(Files.readString(productInfo))
+        ?.groupValues
+        ?.get(1)
+        ?: return null
+    return platformBaselineVersion(buildNumber)
+}
+
+fun platformBaselineVersion(version: String): Int? {
+    Regex("""(?:^|[^0-9])(\d{3})(?:\.|$)""").find(version)?.let { match ->
+        return match.groupValues[1].toIntOrNull()
+    }
+    Regex("""(?:^|[^0-9])(\d{4})\.(\d+)(?:\.|$)""").find(version)?.let { match ->
+        val year = match.groupValues[1].toIntOrNull() ?: return null
+        val release = match.groupValues[2].toIntOrNull() ?: return null
+        return (year - 2000) * 10 + release
+    }
+    return null
 }

@@ -1,10 +1,24 @@
 # Rewind Implementation Plan
 
+> **v5.0.4 status override:** Tasks below describe the original implementation.
+> Workspace/code Rewind is disabled in v5.0.4 after the per-session Git object
+> stores were found able to exhaust the system disk. Current production behavior
+> records conversation-only points with optional/absent workspace trees, keeps
+> conversation Rewind available, and rejects code-only or combined scopes with an
+> explicit reason. Re-enabling code restoration requires a separate plan covering
+> a project-shared object store, source-object reuse, quotas, free-space checks,
+> killable timeouts, GC, and orphan cleanup.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Add a safe Claude-style Rewind picker with conversation-only, code-only, and combined restoration.
+**Original goal (superseded for v5.0.4):** Add a safe Claude-style Rewind picker
+with conversation-only, code-only, and combined restoration.
 
-**Architecture:** Extend the existing native session `SnapshotHook` with a separate-Git-dir workspace checkpoint service, persist compact per-turn rewind metadata, and expose one runtime-owned rewind operation. The TUI is a pure selector/projection and defaults to `(current)`.
+**Original architecture (workspace portion disabled for v5.0.4):** Extend the
+existing native session `SnapshotHook` with a separate-Git-dir workspace
+checkpoint service, persist compact per-turn rewind metadata, and expose one
+runtime-owned rewind operation. The TUI is a pure selector/projection and
+defaults to `(current)`.
 
 **Tech Stack:** Rust, Tokio, serde/serde_json, Git plumbing commands, crossterm, AtomCode native session/runtime APIs.
 

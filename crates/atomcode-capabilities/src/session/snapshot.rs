@@ -47,6 +47,7 @@ struct TurnAccum {
 pub struct SnapshotPersistenceStatus {
     uncertain_commit: Arc<Mutex<Option<String>>>,
     cost_warning: Arc<Mutex<Option<String>>>,
+    auxiliary_warning: Arc<Mutex<Option<String>>>,
 }
 
 impl SnapshotPersistenceStatus {
@@ -78,6 +79,20 @@ impl SnapshotPersistenceStatus {
             .unwrap_or_else(|error| error.into_inner())
             .take()
     }
+
+    pub fn report_auxiliary_warning(&self, message: impl Into<String>) {
+        *self
+            .auxiliary_warning
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(message.into());
+    }
+
+    pub fn take_auxiliary_warning(&self) -> Option<String> {
+        self.auxiliary_warning
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
 }
 
 /// Saves `<id>.snapshot` (the compacted working set) + updates `<id>.meta` each turn.
@@ -104,8 +119,11 @@ struct RewindState {
 struct PendingRewindPoint {
     prompt_number: usize,
     prompt_preview: String,
-    before_tree: String,
+    before_tree: Option<String>,
 }
+
+const CODE_REWIND_DISABLED_REASON: &str =
+    "Code Rewind is temporarily disabled in v5.0.4 to protect disk space; conversation Rewind remains available.";
 
 #[derive(Clone, Debug)]
 pub struct RewindTransactionReceipt {
@@ -144,12 +162,12 @@ impl SnapshotHook {
     ) -> Self {
         let session_id = session_id.into();
         let working_dir = working_dir.into();
-        let (checkpoint, unavailable) =
-            match WorkspaceCheckpoint::for_session(std::path::Path::new(&working_dir), &session_id)
-            {
-                Ok(checkpoint) => (Some(Arc::new(checkpoint)), None),
-                Err(error) => (None, Some(error.to_string())),
-            };
+        // v5.0.4 safety stop: the per-session shadow Git store could grow without
+        // a quota or object collection and exhaust the system disk. Keep the
+        // conversation checkpoint ledger active, but do not initialize or write
+        // a workspace object database until the bounded shared-store design lands.
+        let checkpoint = None;
+        let unavailable = Some(CODE_REWIND_DISABLED_REASON.to_string());
         let points = mgr
             .load_rewind_ledger(&session_id)
             .map(|ledger| ledger.points)
@@ -261,12 +279,18 @@ impl SnapshotHook {
                     .unwrap_or_else(|| "code rewind is unavailable".into()),
             )
         })?;
+        let before_tree = point.before_tree.as_deref().ok_or_else(|| {
+            WorkspaceCheckpointError::Unsupported("rewind point has no code snapshot".into())
+        })?;
         let expected_current = rewind
             .points
             .last()
-            .map(|latest| latest.after_tree.as_str())
-            .unwrap_or(point.after_tree.as_str());
-        checkpoint.restore(&point.before_tree, expected_current)
+            .and_then(|latest| latest.after_tree.as_deref())
+            .or(point.after_tree.as_deref())
+            .ok_or_else(|| {
+                WorkspaceCheckpointError::Unsupported("rewind point has no code snapshot".into())
+            })?;
+        checkpoint.restore(before_tree, expected_current)
     }
 
     pub fn compensate_workspace(
@@ -314,11 +338,19 @@ impl SnapshotHook {
                         .unwrap_or_else(|| "code rewind is unavailable".into()),
                 )
             })?;
+            let before_tree = point.before_tree.as_deref().ok_or_else(|| {
+                WorkspaceCheckpointError::Unsupported("rewind point has no code snapshot".into())
+            })?;
             let expected_current = previous
                 .last()
-                .map(|latest| latest.after_tree.as_str())
-                .unwrap_or(point.after_tree.as_str());
-            Some(checkpoint.prepare_restore(&point.before_tree, expected_current)?)
+                .and_then(|latest| latest.after_tree.as_deref())
+                .or(point.after_tree.as_deref())
+                .ok_or_else(|| {
+                    WorkspaceCheckpointError::Unsupported(
+                        "rewind point has no code snapshot".into(),
+                    )
+                })?;
+            Some(checkpoint.prepare_restore(before_tree, expected_current)?)
         } else {
             None
         };
@@ -571,12 +603,19 @@ impl SnapshotHook {
             } else {
                 self.replace_rewind_points_locked(&mut rewind, journal.previous_points)?;
                 if let Some(tree) = journal.recovery_tree.as_deref() {
-                    let checkpoint = rewind.checkpoint.as_ref().ok_or_else(|| {
-                        WorkspaceCheckpointError::Unsupported(
-                            "pending rewind recovery has no workspace checkpoint".into(),
-                        )
-                    })?;
-                    checkpoint.compensate(tree, &journal.restored_files)?;
+                    // v5.0.4 disables the live workspace backend, but an
+                    // interrupted v5.0.3 transaction may have already changed
+                    // files. Open its existing store only long enough to
+                    // compensate; never retain it for future turn capture.
+                    if let Some(checkpoint) = rewind.checkpoint.as_ref() {
+                        checkpoint.compensate(tree, &journal.restored_files)?;
+                    } else {
+                        let checkpoint = WorkspaceCheckpoint::for_session_recovery(
+                            std::path::Path::new(&self.working_dir),
+                            &self.session_id,
+                        )?;
+                        checkpoint.compensate(tree, &journal.restored_files)?;
+                    }
                 }
             }
             self.clear_rewind_transaction()
@@ -723,7 +762,7 @@ impl LifecycleHooks for SnapshotHook {
                 .rewind
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            rewind.pending = before_tree.map(|before_tree| PendingRewindPoint {
+            rewind.pending = Some(PendingRewindPoint {
                 prompt_number,
                 prompt_preview,
                 before_tree,
@@ -790,23 +829,34 @@ impl LifecycleHooks for SnapshotHook {
             (rewind.pending.take(), rewind.checkpoint.clone())
         };
         let turn_id = ctx.turn_id;
-        let completed_rewind = match (pending, checkpoint) {
-            (Some(pending), Some(checkpoint)) => tokio::task::spawn_blocking(move || {
-                let after_tree = checkpoint.capture().ok()?;
-                let files = checkpoint.diff(&pending.before_tree, &after_tree).ok()?;
+        let completed_rewind = match pending {
+            Some(pending) => {
+                let workspace = match (pending.before_tree, checkpoint) {
+                    (Some(before_tree), Some(checkpoint)) => {
+                        tokio::task::spawn_blocking(move || {
+                            let after_tree = checkpoint.capture().ok()?;
+                            let files = checkpoint.diff(&before_tree, &after_tree).ok()?;
+                            Some((before_tree, after_tree, files))
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                    }
+                    _ => None,
+                };
+                let (before_tree, after_tree, files) = workspace
+                    .map(|(before, after, files)| (Some(before), Some(after), files))
+                    .unwrap_or_else(|| (None, None, Vec::new()));
                 Some(RewindPoint {
                     turn_id,
                     prompt_number: pending.prompt_number,
                     prompt_preview: pending.prompt_preview,
-                    before_tree: pending.before_tree,
+                    before_tree,
                     after_tree,
                     files,
                 })
-            })
-            .await
-            .ok()
-            .flatten(),
-            _ => None,
+            }
+            None => None,
         };
         let mut snap = SessionSnapshot::from_conversation(convo);
         // `from_conversation` DERIVES the id high-water marks from stored metas; a
@@ -970,8 +1020,8 @@ mod tests {
             turn_id,
             prompt_number,
             prompt_preview: format!("prompt {prompt_number}"),
-            before_tree: "a".repeat(40),
-            after_tree: "b".repeat(40),
+            before_tree: Some("a".repeat(40)),
+            after_tree: Some("b".repeat(40)),
             files: Vec::new(),
         }
     }
@@ -1076,15 +1126,15 @@ mod tests {
                 "initial",
             ],
         );
-        let store = tempfile::tempdir().unwrap();
-        let checkpoint =
-            Arc::new(WorkspaceCheckpoint::with_store(worktree.path(), store.path()).unwrap());
+        let checkpoint = Arc::new(
+            WorkspaceCheckpoint::for_session(worktree.path(), "rewind-code-crash").unwrap(),
+        );
         let before = checkpoint.capture().unwrap();
         std::fs::write(worktree.path().join("tracked.txt"), "after\n").unwrap();
         let after = checkpoint.capture().unwrap();
         let point = RewindPoint {
-            before_tree: before,
-            after_tree: after,
+            before_tree: Some(before),
+            after_tree: Some(after),
             files: vec![super::super::FileChangeSummary {
                 path: "tracked.txt".into(),
                 additions: 1,
@@ -1123,26 +1173,28 @@ mod tests {
         );
         drop(hook);
 
-        let checkpoint =
-            Arc::new(WorkspaceCheckpoint::with_store(worktree.path(), store.path()).unwrap());
         let lease = manager.acquire_lease("rewind-code-crash").unwrap();
         let recovered = SnapshotHook::new(
             manager.clone(),
             "rewind-code-crash",
             worktree.path().to_string_lossy(),
-        );
-        recovered
-            .rewind
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .checkpoint = Some(checkpoint);
-        let recovered = recovered.with_lease(lease);
+        )
+        .with_lease(lease);
 
         assert_eq!(
             std::fs::read_to_string(worktree.path().join("tracked.txt")).unwrap(),
             "after\n"
         );
         assert_eq!(recovered.rewind_points(), vec![point]);
+        assert!(recovered
+            .code_rewind_unavailable()
+            .is_some_and(|reason| reason.contains("temporarily disabled")));
+        assert!(recovered
+            .rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .checkpoint
+            .is_none());
     }
 
     #[test]
@@ -1811,6 +1863,42 @@ mod tests {
         assert_eq!(
             manager.load_snapshot("inflight-clear").unwrap(),
             SessionSnapshot::from_conversation(&conversation)
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_rewind_point_does_not_require_a_workspace_snapshot() {
+        let (hook, manager, _dir) = hook("conversation-rewind");
+        let mut conversation = convo_with(1);
+        hook.turn_start(&mut conversation).await;
+
+        hook.turn_complete(
+            &conversation,
+            &StopReason::Stopped,
+            &TurnCtx {
+                turn_id: 1,
+                request_id: 1,
+                ..TurnCtx::default()
+            },
+        )
+        .await;
+
+        let points = hook.rewind_points();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].prompt_number, 1);
+        assert_eq!(points[0].prompt_preview, "m0");
+        assert!(points[0].before_tree.is_none());
+        assert!(points[0].after_tree.is_none());
+        assert!(points[0].files.is_empty());
+        assert!(hook
+            .code_rewind_unavailable()
+            .is_some_and(|reason| reason.contains("temporarily disabled")));
+        assert_eq!(
+            manager
+                .load_rewind_ledger("conversation-rewind")
+                .unwrap()
+                .points,
+            points
         );
     }
 

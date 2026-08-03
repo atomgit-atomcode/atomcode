@@ -11,6 +11,7 @@ use atomcode_capabilities::session::{
     PresentationEntry, PresentationFile, PresentationRole, SessionLease, SessionManager,
     SessionMeta, SessionResult, SessionStoreError, StorageOwner, TurnStat,
 };
+use atomcode_capabilities::session::manager::SessionOrigin;
 
 /// In-memory result of the one legacy → native conversion. S2b owns persistence
 /// and commit; keeping this function side-effect free makes conversion testable.
@@ -539,6 +540,7 @@ fn convert_legacy_session_with_diagnostic(
         turn_stats: normalized_turns.turn_stats,
         detached_model_usage: Vec::new(),
         detached_unattributed_tokens: 0,
+        origin: SessionOrigin::Manual,
     };
     meta.auto_name_from_messages(&snapshot.messages);
 

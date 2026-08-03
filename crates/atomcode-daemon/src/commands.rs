@@ -481,10 +481,12 @@ fn exec_config() -> anyhow::Result<CommandResult> {
 }
 
 fn exec_diff(working_dir: &std::path::Path) -> anyhow::Result<CommandResult> {
-    let out = std::process::Command::new("git")
-        .args(["diff", "--stat"])
-        .current_dir(working_dir)
-        .output()?;
+    // No console-window flash for git when spawned from the console-less daemon
+    // on Windows (no-op elsewhere). Mirrors capabilities' own tool spawns.
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["diff", "--stat"]).current_dir(working_dir);
+    atomcode_capabilities::process_utils::suppress_console_window_sync(&mut cmd);
+    let out = cmd.output()?;
     let stat = if out.status.success() {
         String::from_utf8_lossy(&out.stdout).trim_end().to_string()
     } else {

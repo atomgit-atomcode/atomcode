@@ -267,7 +267,11 @@ mod tests {
     fn for_project_labels_with_directory_name() {
         let h = MemoryHook::for_project(Path::new("/tmp/some/repo-name"));
         assert_eq!(h.project_name, "repo-name");
-        assert!(h.project.path().ends_with(".atomcode/memory.md"));
+        // Env-neutral: the default `.atomcode` dir is covered deterministically by
+        // `store::project_memory_path_resolves_override`. Asserting the literal `.atomcode`
+        // here would couple this test to `ATOMCODE_PROJECT_MEMORY_DIR` being unset, and
+        // mutating the process env (remove_var) would race sibling tests that read it.
+        assert!(h.project.path().ends_with("memory.md"));
     }
 
     #[test]

@@ -165,18 +165,19 @@ impl LlmProvider for OllamaProvider {
         .await?;
 
         let s = async_stream::stream! {
-            // v1 parity: a body that dies BEFORE any event reaches the consumer is
-            // safe to redo wholesale (nothing committed). Once an event has been
-            // emitted, retry would duplicate output, so the error surfaces verbatim.
+            // A body that dies before replay-sensitive output reaches the consumer is
+            // safe to redo wholesale. Metadata may repeat; content and tool data may not.
             // 1 initial open + up to 2 transparent reopens — a gateway resetting
             // connections under load can drop more than one attempt before a
             // healthy backend answers.
             const MAX_STREAM_ATTEMPTS: u32 = 3;
             let mut stream_attempt = 1u32;
+            let mut reconnect_attempts = 0u32;
             let mut resp = resp;
             'reopen: loop {
                 let mut dec = OllamaNdjsonDecoder::new();
-                let mut emitted_any = false;
+                let mut emitted_replay_sensitive = false;
+                let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
                 futures::pin_mut!(byte_stream);
                 loop {
@@ -190,11 +191,24 @@ impl LlmProvider for OllamaProvider {
                             return;
                         }
                         Ok(None) => {
-                            for ev in dec.finish() { yield ev; }
+                            for ev in dec.finish() {
+                                if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
+                                    pending_metadata.push(ev);
+                                    continue;
+                                }
+                                if retry::is_replay_sensitive_event(&ev)
+                                    || matches!(ev, StreamEvent::Done { .. } | StreamEvent::Error(_))
+                                {
+                                    for metadata in pending_metadata.drain(..) { yield metadata; }
+                                }
+                                emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
+                                yield ev;
+                            }
                             return;
                         }
                         Ok(Some(Err(e))) => {
-                            if !emitted_any && stream_attempt < MAX_STREAM_ATTEMPTS {
+                            if !emitted_replay_sensitive && stream_attempt < MAX_STREAM_ATTEMPTS {
+                                reconnect_attempts += 1;
                                 // Brief, esc-interruptible backoff before reopening so an
                                 // immediate retry does not slam a gateway resetting under load.
                                 tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
@@ -206,7 +220,16 @@ impl LlmProvider for OllamaProvider {
                             }
                             yield StreamEvent::Error(ProviderError {
                                 retryable: false,
-                                message: retry::stream_read_error_message(&e),
+                                message: retry::stream_read_error_message(
+                                    &e,
+                                    if emitted_replay_sensitive {
+                                        retry::StreamReadRecovery::PartialResponse
+                                    } else {
+                                        retry::StreamReadRecovery::RetryExhausted {
+                                            attempts: reconnect_attempts,
+                                        }
+                                    },
+                                ),
                                 ..Default::default()
                             });
                             return;
@@ -214,7 +237,16 @@ impl LlmProvider for OllamaProvider {
                         Ok(Some(Ok(chunk))) => {
                             let mut saw_done = false;
                             for ev in dec.feed(chunk.as_ref()) {
-                                emitted_any = true;
+                                if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
+                                    pending_metadata.push(ev);
+                                    continue;
+                                }
+                                if retry::is_replay_sensitive_event(&ev)
+                                    || matches!(ev, StreamEvent::Done { .. } | StreamEvent::Error(_))
+                                {
+                                    for metadata in pending_metadata.drain(..) { yield metadata; }
+                                }
+                                emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
                                 if matches!(ev, StreamEvent::Done { .. }) {
                                     saw_done = true;
                                 }

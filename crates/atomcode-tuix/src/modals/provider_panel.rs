@@ -11,7 +11,8 @@ use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{tab_chip, Modal, ModalAction};
 use crate::event_loop::{
-    build_status, save_and_reload, set_default_provider_and_reload, Buffer, LoopCtx,
+    build_status, set_default_provider_and_reload, update_config_and_reload, Buffer,
+    ConfigReloadSelection, LoopCtx,
 };
 use crate::render::{MenuKind, MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
@@ -24,10 +25,9 @@ enum Tab {
 
 /// A unique account id derived from a preset id, avoiding collisions with
 /// existing accounts or legacy provider names.
-fn unique_account_id(base: &str, ctx: &LoopCtx) -> String {
-    let taken = |id: &str| {
-        ctx.config.provider_accounts.contains_key(id) || ctx.config.providers.contains_key(id)
-    };
+fn unique_account_id(base: &str, config: &Config) -> String {
+    let taken =
+        |id: &str| config.provider_accounts.contains_key(id) || config.providers.contains_key(id);
     if !taken(base) {
         return base.to_string();
     }
@@ -399,6 +399,14 @@ const LIST_HEADER_ROWS: usize = 4;
 /// Virtual last row on the 账号 tab: "+ 添加自定义 provider". Not a real id, so it
 /// never collides with an account; selecting it opens the add-account form.
 const ADD_PROVIDER_ROW: &str = "\u{1}add-provider";
+const ADD_MODEL_ROW: &str = "\u{1}add-model";
+
+fn is_add_shortcut(code: &KeyCode, mods: KeyModifiers) -> bool {
+    matches!(
+        code,
+        KeyCode::Char('a' | 'A') if mods.contains(KeyModifiers::CONTROL)
+    ) || matches!(code, KeyCode::Char('\u{1}'))
+}
 
 impl ProviderPanel {
     /// Apply a single-line paste to the field currently being edited.
@@ -603,19 +611,34 @@ impl ProviderPanel {
         }
     }
 
-    /// Selectable row count, including the trailing "+ add provider" row on the
-    /// 账号 tab.
+    /// Selectable row count, including the trailing add row on both tabs.
     fn current_len(&self, config: &Config) -> usize {
-        self.filtered_ids(config).len() + usize::from(self.tab == Tab::Accounts)
+        self.filtered_ids(config).len() + 1
     }
 
     fn selected_id(&self, config: &Config) -> Option<String> {
         let ids = self.filtered_ids(config);
-        // The virtual add row sits just past the real accounts on the 账号 tab.
-        if self.tab == Tab::Accounts && self.selected == ids.len() {
-            return Some(ADD_PROVIDER_ROW.to_string());
+        // The virtual add row sits just past the real rows on either tab.
+        if self.selected == ids.len() {
+            return Some(
+                match self.tab {
+                    Tab::Accounts => ADD_PROVIDER_ROW,
+                    Tab::Models => ADD_MODEL_ROW,
+                }
+                .to_string(),
+            );
         }
         ids.get(self.selected).cloned()
+    }
+
+    fn begin_add_for_current_tab(&mut self, config: &Config) {
+        self.pending_delete = None;
+        self.mode = match self.tab {
+            Tab::Accounts => Mode::Add(AddForm::new()),
+            Tab::Models => ModelForm::new_add(config, self.account_filter.as_deref())
+                .map(Mode::Model)
+                .unwrap_or_else(|| Mode::Add(AddForm::new())),
+        };
     }
 
     /// Persist the add form as one provider ACCOUNT (no model — models are added
@@ -639,7 +662,6 @@ impl ProviderPanel {
         if atomcode_config::config::is_codingplan_provider_name(&base_id) {
             base_id = format!("custom-{base_id}");
         }
-        let account_id = unique_account_id(&base_id, ctx);
         // base_url is pre-filled with the preset default and editable. Persist
         // only a genuine override; blank + no preset default = missing endpoint.
         let base_url = {
@@ -668,18 +690,21 @@ impl ProviderPanel {
             enterprise_url: None,
             ephemeral: false,
         };
-        let mut desired = ctx.config.clone();
-        desired
-            .provider_accounts
-            .insert(account_id.clone(), account);
-        save_and_reload(
+        update_config_and_reload(
             ctx,
-            desired,
             renderer,
-            crate::i18n::t(crate::i18n::Msg::ProviderAdded { name: &account_id }).into_owned(),
-            true,
+            ConfigReloadSelection::KeepCurrent,
+            move |persisted| {
+                let account_id = unique_account_id(&base_id, persisted);
+                persisted
+                    .provider_accounts
+                    .insert(account_id.clone(), account);
+                Ok(account_id)
+            },
+            |account_id| {
+                crate::i18n::t(crate::i18n::Msg::ProviderAdded { name: account_id }).into_owned()
+            },
         )
-        .then_some(account_id)
     }
 
     /// Build an edit form pre-filled from the selected account.
@@ -737,15 +762,27 @@ impl ProviderPanel {
 
     /// Apply an account edit in place (blank fields keep the current value), save.
     fn save_edit(&self, form: &EditForm, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> bool {
-        let mut desired = ctx.config.clone();
-        Self::apply_account_edit(form, &mut desired);
-        save_and_reload(
+        let form = form.clone();
+        let account_id = form.id.clone();
+        update_config_and_reload(
             ctx,
-            desired,
             renderer,
-            crate::i18n::t(crate::i18n::Msg::ProviderUpdated { name: &form.id }).into_owned(),
-            true,
+            ConfigReloadSelection::KeepCurrent,
+            move |persisted| {
+                if form.materialize_provider.is_none()
+                    && !persisted.provider_accounts.contains_key(&form.id)
+                    && !persisted.providers.contains_key(&form.id)
+                {
+                    anyhow::bail!("provider account {:?} changed; reopen /provider", form.id);
+                }
+                Self::apply_account_edit(&form, persisted);
+                Ok(())
+            },
+            |_| {
+                crate::i18n::t(crate::i18n::Msg::ProviderUpdated { name: &account_id }).into_owned()
+            },
         )
+        .is_some()
     }
 
     fn apply_account_edit(form: &EditForm, desired: &mut Config) {
@@ -824,119 +861,134 @@ impl ProviderPanel {
     /// + window in place (preserving its other fields), then save.
     fn save_model(&self, form: &ModelForm, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> bool {
         let account_id = form.account_id().to_string();
-        let model_name = form.model.trim();
+        let model_name = form.model.trim().to_string();
         if model_name.is_empty() {
             return false;
         }
-        // For an unconfigured preset-vendor quick-add, the account id IS the
-        // preset id, so fall back to it.
-        let preset_id = ctx
-            .config
-            .logical_accounts()
-            .get(&account_id)
-            .map(|a| a.provider.clone())
-            .unwrap_or_else(|| account_id.clone());
-        let wire = provider_preset::preset_or_compatible(&preset_id)
-            .provider_type
-            .wire();
-        let context_window = form
+        let requested_window = form
             .window
             .trim()
             .parse::<usize>()
             .ok()
-            .filter(|w| *w > 0)
-            .unwrap_or_else(|| atomcode_config::config::provider::default_context_window_for(wire));
-        let mut desired = ctx.config.clone();
-        // Materialize a preset-vendor account on first use (quick-add from the
-        // list): create the account with the preset's defaults; its api_key is
-        // filled by the key-write block below.
-        if form.edit_id.is_none()
-            && !desired.provider_accounts.contains_key(&account_id)
-            && !atomcode_config::config::is_codingplan_provider_name(&account_id)
-        {
-            let preset = provider_preset::preset_or_compatible(&account_id);
-            desired.provider_accounts.insert(
-                account_id.clone(),
-                ProviderAccountConfig {
-                    provider: account_id.clone(),
-                    display_name: None,
-                    api_key: None,
-                    base_url: preset.default_base_url.map(str::to_string),
-                    user_agent: None,
-                    skip_tls_verify: false,
-                    enterprise_url: None,
-                    ephemeral: false,
-                },
-            );
-        }
-        let selection_id = if let Some(id) = &form.edit_id {
-            // Edit in place — new-schema model or legacy provider.
-            if let Some(m) = desired.models.get_mut(id) {
-                m.model = model_name.to_string();
-                m.context_window = context_window;
-            } else if let Some(p) = desired.providers.get_mut(id) {
-                p.model = model_name.to_string();
-                p.context_window = context_window;
-            }
-            id.clone()
+            .filter(|window| *window > 0);
+        let edit_id = form.edit_id.clone();
+        let needs_key = form.edit_id.is_none() && form.account_needs_key();
+        let api_key = form.api_key.trim().to_string();
+        let make_default = form.make_default;
+        let was_virtual_account = Self::is_virtual_account_row(&ctx.config, &account_id);
+        let selection = if make_default {
+            ConfigReloadSelection::FollowPersisted
         } else {
-            // Make the selection-id key unique so a slash in the model name (or a
-            // repeat add) never silently overwrites a different model profile.
-            let base = format!("{account_id}/{model_name}");
-            let model_id = if desired.models.contains_key(&base)
-                || desired.providers.contains_key(&base)
-            {
-                (2..)
-                    .map(|n| format!("{base}-{n}"))
-                    .find(|c| !desired.models.contains_key(c) && !desired.providers.contains_key(c))
-                    .unwrap_or(base)
-            } else {
-                base
-            };
-            desired.models.insert(
-                model_id.clone(),
-                ModelProfileConfig {
-                    account: account_id,
-                    model: model_name.to_string(),
-                    display_name: None,
-                    system_prompt: None,
-                    context_window,
-                    max_tokens: None,
-                    capable_model: None,
-                    thinking_type: None,
-                    thinking_keep: None,
-                    reasoning_history: None,
-                    reasoning_effort: None,
-                    thinking_enabled: None,
-                    thinking_budget: None,
-                    pricing: None,
-                },
-            );
-            model_id
+            ConfigReloadSelection::KeepCurrent
         };
-        // A deferred provider api_key entered here fills the account once — all
-        // its models share it.
-        if form.edit_id.is_none() && form.account_needs_key() {
-            let key = form.api_key.trim();
-            if !key.is_empty() {
-                if let Some(a) = desired.provider_accounts.get_mut(form.account_id()) {
-                    a.api_key = Some(key.to_string());
-                }
-            }
-        }
-        if form.make_default {
-            desired.default_model = Some(selection_id.clone());
-        }
-        save_and_reload(
+        update_config_and_reload(
             ctx,
-            desired,
             renderer,
-            crate::i18n::t(crate::i18n::Msg::ProviderPanelModelSaved {
-                model: &selection_id,
-            })
-            .into_owned(),
-            true,
+            selection,
+            move |persisted| {
+                if edit_id.is_none()
+                    && !persisted.provider_accounts.contains_key(&account_id)
+                    && !persisted.providers.contains_key(&account_id)
+                {
+                    if !was_virtual_account
+                        || atomcode_config::config::is_codingplan_provider_name(&account_id)
+                    {
+                        anyhow::bail!("provider account {account_id:?} changed; reopen /provider");
+                    }
+                    let preset = provider_preset::preset_or_compatible(&account_id);
+                    persisted.provider_accounts.insert(
+                        account_id.clone(),
+                        ProviderAccountConfig {
+                            provider: account_id.clone(),
+                            display_name: None,
+                            api_key: None,
+                            base_url: preset.default_base_url.map(str::to_string),
+                            user_agent: None,
+                            skip_tls_verify: false,
+                            enterprise_url: None,
+                            ephemeral: false,
+                        },
+                    );
+                }
+
+                let preset_id = persisted
+                    .logical_accounts()
+                    .get(&account_id)
+                    .map(|account| account.provider.clone())
+                    .unwrap_or_else(|| account_id.clone());
+                let wire = provider_preset::preset_or_compatible(&preset_id)
+                    .provider_type
+                    .wire();
+                let context_window = requested_window.unwrap_or_else(|| {
+                    atomcode_config::config::provider::default_context_window_for(wire)
+                });
+
+                let selection_id = if let Some(id) = &edit_id {
+                    if let Some(model) = persisted.models.get_mut(id) {
+                        model.model = model_name.clone();
+                        model.context_window = context_window;
+                    } else if let Some(provider) = persisted.providers.get_mut(id) {
+                        provider.model = model_name.clone();
+                        provider.context_window = context_window;
+                    } else {
+                        anyhow::bail!("model {id:?} changed; reopen /provider");
+                    }
+                    id.clone()
+                } else {
+                    let base = format!("{account_id}/{model_name}");
+                    let model_id = if persisted.models.contains_key(&base)
+                        || persisted.providers.contains_key(&base)
+                    {
+                        (2..)
+                            .map(|n| format!("{base}-{n}"))
+                            .find(|candidate| {
+                                !persisted.models.contains_key(candidate)
+                                    && !persisted.providers.contains_key(candidate)
+                            })
+                            .unwrap_or(base)
+                    } else {
+                        base
+                    };
+                    persisted.models.insert(
+                        model_id.clone(),
+                        ModelProfileConfig {
+                            account: account_id.clone(),
+                            model: model_name.clone(),
+                            display_name: None,
+                            system_prompt: None,
+                            context_window,
+                            max_tokens: None,
+                            capable_model: None,
+                            thinking_type: None,
+                            thinking_keep: None,
+                            reasoning_history: None,
+                            reasoning_effort: None,
+                            thinking_enabled: None,
+                            thinking_budget: None,
+                            pricing: None,
+                        },
+                    );
+                    model_id
+                };
+
+                if needs_key && !api_key.is_empty() {
+                    if let Some(account) = persisted.provider_accounts.get_mut(&account_id) {
+                        account.api_key = Some(api_key);
+                    }
+                }
+                if make_default {
+                    persisted.default_model = Some(selection_id.clone());
+                }
+                Ok(selection_id)
+            },
+            |selection_id| {
+                crate::i18n::t(crate::i18n::Msg::ProviderPanelModelSaved {
+                    model: selection_id,
+                })
+                .into_owned()
+            },
         )
+        .is_some()
     }
 
     /// Delete the account (and its models) or a single model, then save.
@@ -947,37 +999,58 @@ impl ProviderPanel {
         ctx: &mut LoopCtx,
         renderer: &mut dyn Renderer,
     ) -> bool {
-        let mut desired = ctx.config.clone();
-        if is_account {
-            desired.provider_accounts.remove(id);
-            desired.providers.remove(id); // legacy projection
-            desired.models.retain(|_, m| m.account != id);
+        let active_selection = ctx.config.effective_model_selection();
+        let deletes_active = if is_account {
+            active_selection.as_deref().is_some_and(|selection| {
+                ctx.config
+                    .resolve_model(Some(selection))
+                    .is_ok_and(|resolved| resolved.account_id == id)
+            })
         } else {
-            desired.models.remove(id);
-            desired.providers.remove(id); // legacy single-model provider
-        }
-        // Clear a now-dangling default (both the canonical `default_model` and
-        // the legacy `default_provider`, so neither points at the deleted entry).
-        if desired
-            .default_model
-            .as_deref()
-            .is_some_and(|d| desired.resolve_model(Some(d)).is_err())
-        {
-            desired.default_model = None;
-        }
-        if desired
-            .resolve_model(Some(&desired.default_provider))
-            .is_err()
-        {
-            desired.default_provider.clear();
-        }
-        save_and_reload(
+            active_selection.as_deref() == Some(id)
+        };
+        let id = id.to_string();
+        let selection = if deletes_active {
+            ConfigReloadSelection::FollowPersisted
+        } else {
+            ConfigReloadSelection::KeepCurrent
+        };
+        let message_id = id.clone();
+        update_config_and_reload(
             ctx,
-            desired,
             renderer,
-            crate::i18n::t(crate::i18n::Msg::ProviderDeleted { name: id }).into_owned(),
-            true,
+            selection,
+            move |persisted| {
+                if is_account {
+                    persisted.provider_accounts.remove(&id);
+                    persisted.providers.remove(&id);
+                    persisted.models.retain(|_, model| model.account != id);
+                } else {
+                    persisted.models.remove(&id);
+                    persisted.providers.remove(&id);
+                }
+                // Clear a now-dangling default (both the canonical
+                // `default_model` and legacy `default_provider`).
+                if persisted
+                    .default_model
+                    .as_deref()
+                    .is_some_and(|default| persisted.resolve_model(Some(default)).is_err())
+                {
+                    persisted.default_model = None;
+                }
+                if persisted
+                    .resolve_model(Some(&persisted.default_provider))
+                    .is_err()
+                {
+                    persisted.default_provider.clear();
+                }
+                Ok(())
+            },
+            |_| {
+                crate::i18n::t(crate::i18n::Msg::ProviderDeleted { name: &message_id }).into_owned()
+            },
         )
+        .is_some()
     }
 }
 
@@ -1141,28 +1214,15 @@ impl Modal for ProviderPanel {
                 self.pending_delete = None;
             }
             // Ctrl+A: add. Letter keys are reserved for the search filter.
-            KeyCode::Char('a') if ctrl => {
-                self.pending_delete = None;
-                match self.tab {
-                    // New account (+ its first model).
-                    Tab::Accounts => self.mode = Mode::Add(AddForm::new()),
-                    // Add a model to an existing account; if none exist yet, fall
-                    // back to creating an account first.
-                    Tab::Models => {
-                        self.mode =
-                            match ModelForm::new_add(&ctx.config, self.account_filter.as_deref()) {
-                                Some(f) => Mode::Model(f),
-                                None => Mode::Add(AddForm::new()),
-                            };
-                    }
-                }
+            code if is_add_shortcut(&code, mods) => {
+                self.begin_add_for_current_tab(&ctx.config);
             }
             // Ctrl+E: edit the selected row.
             KeyCode::Char('e') if ctrl => {
                 self.pending_delete = None;
                 if let Some(id) = self
                     .selected_id(&ctx.config)
-                    .filter(|i| i != ADD_PROVIDER_ROW)
+                    .filter(|i| i != ADD_PROVIDER_ROW && i != ADD_MODEL_ROW)
                 {
                     self.mode = match self.tab {
                         Tab::Accounts => Mode::EditAccount(Self::open_edit(&ctx.config, &id)),
@@ -1178,7 +1238,7 @@ impl Modal for ProviderPanel {
             KeyCode::Char('d') if ctrl => {
                 if let Some(id) = self
                     .selected_id(&ctx.config)
-                    .filter(|i| i != ADD_PROVIDER_ROW)
+                    .filter(|i| i != ADD_PROVIDER_ROW && i != ADD_MODEL_ROW)
                 {
                     let is_account = self.tab == Tab::Accounts;
                     let is_virtual_preset =
@@ -1215,6 +1275,9 @@ impl Modal for ProviderPanel {
                 if let Some(id) = self.selected_id(&ctx.config) {
                     match self.tab {
                         // Set default + switch session.
+                        Tab::Models if id == ADD_MODEL_ROW => {
+                            self.begin_add_for_current_tab(&ctx.config);
+                        }
                         Tab::Models => {
                             if set_default_provider_and_reload(ctx, &id, renderer) {
                                 return Ok(ModalAction::Close);
@@ -1310,14 +1373,16 @@ impl Modal for ProviderPanel {
                     }
                     Tab::Models => {
                         let ids = self.filtered_ids(&ctx.config);
-                        if ids.is_empty() {
+                        let empty_description = if ids.is_empty() {
                             let msg = if self.query.trim().is_empty() {
                                 crate::i18n::t(crate::i18n::Msg::ProviderPanelEmptyModels)
                             } else {
                                 crate::i18n::t(crate::i18n::Msg::ProviderPanelNoMatchingModels)
                             };
-                            items.push((msg.into_owned(), String::new()));
-                        }
+                            msg.into_owned()
+                        } else {
+                            String::new()
+                        };
                         for id in &ids {
                             let m = models.get(id);
                             let mark = if *id == cur {
@@ -1336,6 +1401,10 @@ impl Modal for ProviderPanel {
                                 .unwrap_or_default();
                             items.push((id.clone(), desc));
                         }
+                        items.push((
+                            crate::i18n::t(crate::i18n::Msg::ProviderPanelAddModelRow).into_owned(),
+                            empty_description,
+                        ));
                         hint = if let Some(acct) = &self.account_filter {
                             crate::i18n::t(crate::i18n::Msg::ProviderPanelFilteredModelsHint {
                                 account: acct,
@@ -1565,6 +1634,57 @@ impl Modal for ProviderPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_shortcut_accepts_terminal_ctrl_a_variants() {
+        assert!(is_add_shortcut(&KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(is_add_shortcut(&KeyCode::Char('A'), KeyModifiers::CONTROL));
+        assert!(is_add_shortcut(&KeyCode::Char('\u{1}'), KeyModifiers::NONE));
+        assert!(!is_add_shortcut(&KeyCode::Char('a'), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn both_provider_tabs_expose_a_selectable_add_row() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "acc": { "provider": "deepseek" } },
+            "models": { "acc/chat": { "account": "acc", "model": "chat", "context_window": 8000 } }
+        }))
+        .unwrap();
+        let mut panel = ProviderPanel::open();
+
+        let account_rows = panel.filtered_ids(&cfg).len();
+        assert_eq!(panel.current_len(&cfg), account_rows + 1);
+        panel.selected = account_rows;
+        assert_eq!(panel.selected_id(&cfg).as_deref(), Some(ADD_PROVIDER_ROW));
+
+        panel.tab = Tab::Models;
+        panel.selected = panel.filtered_ids(&cfg).len();
+        assert_eq!(panel.current_len(&cfg), 2);
+        assert_eq!(panel.selected_id(&cfg).as_deref(), Some(ADD_MODEL_ROW));
+
+        panel.query = "no-match".into();
+        panel.selected = 0;
+        assert_eq!(panel.current_len(&cfg), 1);
+        assert_eq!(panel.selected_id(&cfg).as_deref(), Some(ADD_MODEL_ROW));
+    }
+
+    #[test]
+    fn model_add_row_opens_the_model_form_for_the_drilled_in_account() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "acc": { "provider": "deepseek" } }
+        }))
+        .unwrap();
+        let mut panel = ProviderPanel::open();
+        panel.tab = Tab::Models;
+        panel.account_filter = Some("acc".into());
+
+        panel.begin_add_for_current_tab(&cfg);
+
+        let Mode::Model(form) = &panel.mode else {
+            panic!("model add row should open the model form");
+        };
+        assert_eq!(form.account_id(), "acc");
+    }
 
     #[test]
     fn add_form_is_custom_provider_with_protocol_toggle() {

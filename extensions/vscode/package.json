@@ -2,7 +2,7 @@
   "name": "atomcode-tools",
   "displayName": "%atomcode.displayName%",
   "description": "%atomcode.description%",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "publisher": "atomcode-tools",
   "license": "MIT",
   "repository": {

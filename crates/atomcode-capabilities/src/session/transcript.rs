@@ -16,7 +16,7 @@ use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::{Conversation, Message, Role};
 use serde::{Deserialize, Serialize};
 
-use super::{now_ms, SessionManager, SessionResult};
+use super::{now_ms, snapshot::SnapshotPersistenceStatus, SessionManager, SessionResult};
 
 pub const RECORD_VERSION: u32 = 1;
 
@@ -97,6 +97,7 @@ pub struct TranscriptHook {
     mgr: Arc<SessionManager>,
     session_id: String,
     buf: Mutex<Option<TurnBuffer>>,
+    persistence_status: Option<SnapshotPersistenceStatus>,
 }
 
 impl TranscriptHook {
@@ -105,7 +106,13 @@ impl TranscriptHook {
             mgr,
             session_id: session_id.into(),
             buf: Mutex::new(None),
+            persistence_status: None,
         }
+    }
+
+    pub fn with_persistence_status(mut self, status: SnapshotPersistenceStatus) -> Self {
+        self.persistence_status = Some(status);
+        self
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<TurnBuffer>> {
@@ -166,8 +173,17 @@ impl TranscriptHook {
             tools,
             usage: b.usage,
         };
-        // Best-effort: a transcript IO failure must never panic or break the turn.
-        let _ = self.append(&record);
+        // The transcript is auxiliary to the committed native aggregate, so its
+        // failure must not fail the turn. It must still be visible to the driver:
+        // silently dropping ENOSPC here made missing history look successful.
+        if let Err(error) = self.append(&record) {
+            let warning =
+                format!("session transcript was not saved; check available disk space: {error}");
+            eprintln!("[TranscriptHook] {warning}");
+            if let Some(status) = &self.persistence_status {
+                status.report_auxiliary_warning(warning);
+            }
+        }
     }
 
     fn append(&self, record: &TurnRecord) -> SessionResult<()> {
@@ -366,5 +382,30 @@ mod tests {
             "an errored turn with output is still recorded"
         );
         assert_eq!(recs[0].assistant, "partial answer");
+    }
+
+    #[tokio::test]
+    async fn transcript_write_failure_is_reported_without_failing_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SessionManager::with_root(dir.path()));
+        let status = SnapshotPersistenceStatus::default();
+        let hook =
+            TranscriptHook::new(manager, "../invalid").with_persistence_status(status.clone());
+        let mut text = "keep the turn alive".to_string();
+        hook.user_prompt_submit(&mut text).await.unwrap();
+        hook.on_model_response(&mut assistant("answer", vec![], 1))
+            .await;
+
+        hook.turn_complete(
+            &Conversation::new(),
+            &StopReason::Stopped,
+            &TurnCtx::default(),
+        )
+        .await;
+
+        let warning = status.take_auxiliary_warning().unwrap();
+        assert!(warning.contains("transcript was not saved"));
+        assert!(warning.contains("invalid session id"));
+        assert!(status.take_uncertain_commit().is_none());
     }
 }

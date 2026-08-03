@@ -55,7 +55,26 @@ test('postLiveProvider scopes the runtime switch to the active session', async (
   }
 });
 
-test('live control APIs reject protocol-level failures', async () => {
+test('live session switch returns a structured active-turn rejection', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(
+    JSON.stringify({ ok: false, active_turn: true, error: 'runtime is busy' }),
+    { status: 200, headers: { 'Content-Type': 'application/json' } },
+  )) as typeof fetch;
+
+  try {
+    const { postLiveSwitchSession } = await import('./api.ts');
+    assert.deepEqual(await postLiveSwitchSession('session-2'), {
+      ok: false,
+      activeTurn: true,
+      error: 'runtime is busy',
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('live mode still rejects protocol-level failures', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response(
     JSON.stringify({ ok: false, error: 'runtime is busy' }),
@@ -63,11 +82,7 @@ test('live control APIs reject protocol-level failures', async () => {
   )) as typeof fetch;
 
   try {
-    const { postLiveMode, postLiveSwitchSession } = await import('./api.ts');
-    await assert.rejects(
-      () => postLiveSwitchSession('session-2'),
-      /runtime is busy/,
-    );
+    const { postLiveMode } = await import('./api.ts');
     await assert.rejects(
       () => postLiveMode('plan'),
       /rejected the mode switch/,
@@ -98,6 +113,54 @@ test('postLiveUserInput rejects an answer the runtime did not accept', async () 
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('postChatUserInput correlates the answer by session and native request id', async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({ url: String(url), init });
+    return new Response('{"accepted":true}', { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const { postChatUserInput } = await import('./api.ts');
+    await postChatUserInput('session-1', {
+      request_id: 42,
+      declined: false,
+      selected: ['继续'],
+      text: null,
+    });
+
+    assert.equal(calls[0].url, '/chat/user-input');
+    assert.deepEqual(JSON.parse(String(calls[0].init?.body)), {
+      session_id: 'session-1',
+      request_id: 42,
+      declined: false,
+      selected: ['继续'],
+      text: null,
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a one-question questions payload still uses the batch response protocol', async () => {
+  const { isUserInputBatch } = await import('./api.ts');
+  assert.equal(isUserInputBatch({
+    type: 'user_input_request',
+    request_id: 42,
+    header: '',
+    question: '',
+    mode: 'single',
+    options: [],
+    questions: [{
+      header: 'Pick',
+      question: 'Red or blue?',
+      mode: 'single',
+      options: [{ label: 'Red' }, { label: 'Blue' }],
+    }],
+  }), true);
 });
 
 test('collection APIs reject server error payloads instead of returning non-arrays', async () => {

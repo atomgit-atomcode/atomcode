@@ -3,10 +3,13 @@ import * as child_process from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import { createHash } from 'crypto';
 import { DaemonClient } from './client';
 import { HealthResponse } from './types';
 import { DEFAULT_PORT } from '../config';
 import { normalizeDaemonEnvForUtf8Locale } from './env';
+import { daemonIdentityMatches } from './identity';
+import type { ExpectedDaemonIdentity } from './identity';
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
@@ -49,24 +52,29 @@ export class DaemonProcess {
     const health = await this.tryGetHealth();
 
     if (health) {
-      const expected = this.getExpectedVersion();
-      if (!expected || health.version === expected) {
-        // Version matches (or we can't determine expected version), reuse running daemon
+      const expected = this.getExpectedBundledIdentity();
+      if (daemonIdentityMatches(health, expected)) {
+        // Exact bundled build matches (or no bundled identity applies).
         return true;
       }
 
-      // Version mismatch — restart
-      console.log(`[AtomCode] Daemon version mismatch: running=${health.version}, expected=${expected}. Restarting...`);
+      // Same-version daemon builds can expose different config/runtime schemas.
+      // Compare the executable hash as well so an older 5.0.3 process cannot
+      // survive an extension update that bundles a newer 5.0.3 daemon.
+      console.log(
+        `[AtomCode] Daemon identity mismatch: running=${health.version}/${health.binary_hash || 'unknown'}, `
+        + `expected=${expected.version || 'any'}/${expected.binaryHash || 'any'}. Restarting...`,
+      );
 
       const shutdownOk = await this.shutdownDaemon();
       if (shutdownOk) {
         console.log('[AtomCode] Old daemon stopped successfully');
       } else {
         console.warn(
-          `[AtomCode] Refusing to start daemon because old daemon ${health.version} is still running; expected ${expected}`
+          `[AtomCode] Refusing to start daemon because an incompatible daemon ${health.version} is still running`
         );
         vscode.window.showWarningMessage(
-          `AtomCode daemon version mismatch: running ${health.version}, expected ${expected}. AtomCode could not stop the old daemon. Please stop the old AtomCode daemon or reload VS Code.`
+          'AtomCode daemon build mismatch. AtomCode could not stop the old daemon. Please stop the old AtomCode daemon or reload VS Code.'
         );
         return false;
       }
@@ -75,8 +83,8 @@ export class DaemonProcess {
       if (!started) {
         // start() failed — check if another window already started the correct version
         const postHealth = await this.tryGetHealth();
-        if (postHealth && postHealth.version === expected) {
-          console.log(`[AtomCode] Daemon restarted to version ${expected}`);
+        if (postHealth && daemonIdentityMatches(postHealth, expected)) {
+          console.log(`[AtomCode] Daemon restarted to version ${postHealth.version}`);
           return true;
         }
         return false;
@@ -84,8 +92,8 @@ export class DaemonProcess {
 
       // Verify new version after start
       const newHealth = await this.tryGetHealth();
-      if (newHealth && newHealth.version === expected) {
-        console.log(`[AtomCode] Daemon restarted to version ${expected}`);
+      if (newHealth && daemonIdentityMatches(newHealth, expected)) {
+        console.log(`[AtomCode] Daemon restarted to version ${newHealth.version}`);
         return true;
       }
 
@@ -120,6 +128,26 @@ export class DaemonProcess {
     }
     console.warn('[AtomCode] Could not read daemon-version.txt, skipping version check');
     return '';
+  }
+
+  private getExpectedBundledIdentity(): ExpectedDaemonIdentity {
+    // A user-configured/external daemon is authoritative. Only pin identity
+    // when this extension will launch its own bundled executable.
+    if (this.configBinaryPath) return {};
+    const bundled = this.findBundledDaemon();
+    if (!bundled) return {};
+
+    let binaryHash: string | undefined;
+    try {
+      binaryHash = createHash('sha256').update(fs.readFileSync(bundled)).digest('hex');
+    } catch {
+      console.warn('[AtomCode] Could not hash bundled daemon, falling back to version check');
+    }
+
+    return {
+      version: this.getExpectedVersion() || undefined,
+      binaryHash,
+    };
   }
 
   private async tryGetHealth(): Promise<HealthResponse | null> {
@@ -286,7 +314,7 @@ export class DaemonProcess {
     try {
       if (process.platform === 'win32') {
         // /F force, /T also terminate any child tree.
-        child_process.execFileSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' });
+        child_process.execFileSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore', windowsHide: true });
       } else {
         process.kill(pid, 'SIGKILL');
       }
@@ -314,7 +342,7 @@ export class DaemonProcess {
         const out = child_process.execFileSync(
           'tasklist',
           ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'],
-          { encoding: 'utf-8' }
+          { encoding: 'utf-8', windowsHide: true }
         );
         return /atomcode/i.test(out);
       }
@@ -358,7 +386,7 @@ export class DaemonProcess {
     // 3. Check PATH via `which` (Unix) or `where` (Windows)
     try {
       const command = process.platform === 'win32' ? 'where atomcode' : 'which atomcode 2>/dev/null';
-      const resolved = child_process.execSync(command, { encoding: 'utf-8' }).trim();
+      const resolved = child_process.execSync(command, { encoding: 'utf-8', windowsHide: true }).trim();
       if (resolved) {
         // On Windows, 'where' returns all matches, take first line
         const firstMatch = process.platform === 'win32' ? resolved.split('\n')[0].trim() : resolved;

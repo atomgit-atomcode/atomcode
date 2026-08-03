@@ -30,7 +30,10 @@ pub use ollama::{OllamaConfig, OllamaProvider};
 pub use openai_compat::{
     model_suggests_vision, reason_effort_applicable, OpenAiCompatConfig, OpenAiCompatProvider,
 };
-pub use pricing_catalog::{ensure_models_dev_catalog, resolve_models_dev_pricing, CatalogPricing};
+pub use pricing_catalog::{
+    ensure_models_dev_catalog, resolve_models_dev_pricing, spawn_models_dev_catalog_refresh,
+    CatalogPricing,
+};
 pub use reasoning::{ReasoningPolicy, REASONING_PLACEHOLDER};
 pub use retry::RetryPolicy;
 pub use sign::{RequestSigner, RequestSigningError, SignedAuth};
@@ -130,15 +133,24 @@ pub(crate) fn push_system_coalesced(out: &mut Vec<Value>, text: &str) {
 /// (openai-compat, Anthropic/Claude, ollama, …) so the wording stays consistent
 /// regardless of which wire format hit the error.
 ///
-/// Only 401/402 get a headline, and for those the provider's raw `detail` is
+/// 401/402 get a headline, and for those the provider's raw `detail` is
 /// deliberately DROPPED — the headline already says it and this short form folds
 /// cleanly into the interrupted-turn summary (`✗ 已中断：账户余额不足（HTTP 402）`).
-/// 403 is left raw — AtomGit reuses it for session-concurrency conflicts, so the
-/// structured reason must survive (see the test) — and 429 must keep the literal
-/// `HTTP 429: ` prefix the kernel rate-limit path (`rate_limit_server_message`)
-/// strips. Everything else keeps `HTTP {code}: {detail}` (the detail is the only
-/// signal there).
+/// One explicit CodingPlan entitlement rejection also gets an actionable `/login`
+/// hint. Other 403 responses stay raw because AtomGit reuses that status for
+/// session-concurrency conflicts and their structured reason must survive. 429
+/// must keep the literal `HTTP 429: ` prefix the kernel rate-limit path
+/// (`rate_limit_server_message`) strips. Everything else keeps
+/// `HTTP {code}: {detail}` (the detail is the only signal there).
 pub(crate) fn friendly_http_error(code: u16, detail: &str) -> String {
+    if code == 403
+        && detail
+            .to_ascii_lowercase()
+            .contains("user has no codingplan")
+    {
+        return "CodingPlan 未领取或已失效（HTTP 403）。请运行 /login 重新登录并领取 CodingPlan。"
+            .to_string();
+    }
     let headline = match code {
         401 => "API key 未授权或已失效",
         402 => "账户余额不足",

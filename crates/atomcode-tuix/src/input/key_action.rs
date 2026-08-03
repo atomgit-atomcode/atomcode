@@ -17,6 +17,10 @@ pub enum Action {
     LineEnd,
     HistoryPrev,
     HistoryNext,
+    /// Ctrl+R — enter reverse-i-search over the input history (readline /
+    /// bash style). While searching, further Ctrl+R presses jump to the
+    /// next older match.
+    HistorySearch,
     Backspace,
     DeleteForward,
     ToggleToolOutput,
@@ -46,6 +50,10 @@ pub fn classify(code: KeyCode, modifiers: KeyModifiers) -> Action {
         (KeyCode::Char('e'), true) => Action::LineEnd,
         // Ctrl+O toggles real-time tool output visibility.
         (KeyCode::Char('o'), true) => Action::ToggleToolOutput,
+        // Ctrl+R enters reverse-i-search over input history. Bash/zsh
+        // users expect the chord; it was previously unmapped (NoOp), so
+        // nothing depends on the old behaviour.
+        (KeyCode::Char('r'), true) => Action::HistorySearch,
         // Ctrl+H is the POSIX / readline alias for Backspace. MobaXterm,
         // PuTTY and other Windows SSH clients often ship with "Backspace
         // sends ^H" turned on by default, so the physical Backspace key
@@ -171,6 +179,24 @@ mod tests {
             k(KeyCode::Char('e'), KeyModifiers::CONTROL),
             Action::LineEnd
         );
+    }
+
+    #[test]
+    fn ctrl_o_toggles_tool_output() {
+        assert_eq!(
+            k(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            Action::ToggleToolOutput
+        );
+    }
+
+    #[test]
+    fn ctrl_r_starts_history_search() {
+        assert_eq!(
+            k(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            Action::HistorySearch
+        );
+        // Bare r still inserts a character.
+        assert_eq!(k(KeyCode::Char('r'), KeyModifiers::NONE), Action::Insert('r'));
     }
 
     #[test]

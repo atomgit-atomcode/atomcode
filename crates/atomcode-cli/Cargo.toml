@@ -62,6 +62,7 @@ is-terminal = "0.4"
 # but installed NO subscriber, so they all went to the no-op dispatcher. This wires
 # them to `<config_dir>/logs/atomcode.log`, filtered by RUST_LOG.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = "0.1"
 # Process scan for the uninstall flow (detect running atomcode instances).
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 

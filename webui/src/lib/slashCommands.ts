@@ -31,6 +31,7 @@ export interface SlashHandlers {
   reloadConfig(): void | Promise<void>;
   openSlashSkillsMenu(): void;
   notice(text: string): void;
+  submitPrompt?(text: string): void | Promise<void>;
   execServerCommand(command: string, arg: string): void | Promise<void>;
   t(key: string, params?: Record<string, string | number>): string;
 }
@@ -66,6 +67,12 @@ export const FRONTEND_COMMANDS: SlashCommandDef[] = [
   { name: 'reload', descKey: 'cmd.reload.desc', run: (_a, h) => h.reloadConfig() },
   { name: 'skills', descKey: 'cmd.skills.desc', run: (_a, h) => h.openSlashSkillsMenu() },
   { name: 'help', descKey: 'cmd.help.desc', run: (_a, h) => h.notice(buildHelpText(h.t)) },
+  {
+    name: 'review',
+    descKey: 'cmd.review.desc',
+    argHint: '[staged|base]',
+    run: (a, h) => h.submitPrompt?.(reviewPrompt(a)),
+  },
   { name: 'undo', descKey: 'cmd.undo.desc', argHint: '[n]', run: (a, h) => h.execServerCommand('undo', a) },
   {
     name: 'remember',
@@ -89,6 +96,21 @@ export const FRONTEND_COMMANDS: SlashCommandDef[] = [
   { name: 'cost', descKey: 'cmd.cost.desc', run: (a, h) => h.execServerCommand('cost', a) },
   { name: 'todo', descKey: 'cmd.todo.desc', run: (a, h) => h.execServerCommand('todo', a) },
 ];
+
+export function reviewPrompt(arg: string): string {
+  const scope = arg.trim();
+  if (!scope) {
+    return 'Review my current uncommitted changes: call the `code_review` tool with ' +
+      '{"scope":{"kind":"working_tree"}}, then give me a concise summary of its findings.';
+  }
+  if (scope.toLowerCase() === 'staged') {
+    return 'Review my staged changes: call the `code_review` tool with ' +
+      '{"scope":{"kind":"staged"}}, then give me a concise summary of its findings.';
+  }
+  return 'Review the requested committed range: call the `code_review` tool with ' +
+    JSON.stringify({ scope: { kind: 'range', base: scope, head: 'HEAD' } }) +
+    ', then give me a concise summary of its findings.';
+}
 
 export function buildCommandMap(defs: SlashCommandDef[]): Map<string, SlashCommandDef> {
   const m = new Map<string, SlashCommandDef>();

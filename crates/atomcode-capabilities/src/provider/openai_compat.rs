@@ -492,22 +492,23 @@ impl LlmProvider for OpenAiCompatProvider {
 
         let s = async_stream::stream! {
             // v1 parity (core/openai.rs ~676): a chunked body that dies BEFORE any
-            // event has reached the consumer is safe to redo wholesale — no
-            // text/tool-call/UI delta was committed, so a fresh request is
-            // equivalent to a first attempt. Common cause: gateways that reset the
+            // replay-sensitive event has reached the consumer is safe to redo
+            // wholesale — metadata may repeat, but no text/tool-call/UI delta was
+            // committed. Common cause: gateways that reset the
             // connection under load (surfaces as "error decoding response body" /
-            // "unexpected EOF during chunk size line"). Once an event HAS been
-            // emitted, retry would duplicate output, so the error is surfaced
-            // verbatim with its full cause chain for diagnosis.
+            // "unexpected EOF during chunk size line"). Once replay-sensitive output
+            // has been emitted, retry would duplicate it, so the error is surfaced.
             // 1 initial open + up to 2 transparent reopens. A gateway resetting
             // connections under load can drop more than one attempt before a
             // healthy backend answers, so a single reopen is not enough.
             const MAX_STREAM_ATTEMPTS: u32 = 3;
             let mut stream_attempt = 1u32;
+            let mut reconnect_attempts = 0u32;
             let mut resp = resp;
             'reopen: loop {
                 let mut dec = SseDecoder::new();
-                let mut emitted_any = false;
+                let mut emitted_replay_sensitive = false;
+                let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
                 futures::pin_mut!(byte_stream);
                 loop {
@@ -523,13 +524,26 @@ impl LlmProvider for OpenAiCompatProvider {
                             return;
                         }
                         Ok(None) => {
-                            for ev in dec.finish() { yield ev; }
+                            for ev in dec.finish() {
+                                if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
+                                    pending_metadata.push(ev);
+                                    continue;
+                                }
+                                if retry::is_replay_sensitive_event(&ev)
+                                    || matches!(ev, StreamEvent::Done { .. } | StreamEvent::Error(_))
+                                {
+                                    for metadata in pending_metadata.drain(..) { yield metadata; }
+                                }
+                                emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
+                                yield ev;
+                            }
                             return;
                         }
                         Ok(Some(Err(e))) => {
-                            // Nothing reached the consumer yet → re-open the whole
-                            // request transparently (bounded by MAX_STREAM_ATTEMPTS).
-                            if !emitted_any && stream_attempt < MAX_STREAM_ATTEMPTS {
+                            // No replay-sensitive output reached the consumer yet → re-open
+                            // the whole request transparently (bounded by MAX_STREAM_ATTEMPTS).
+                            if !emitted_replay_sensitive && stream_attempt < MAX_STREAM_ATTEMPTS {
+                                reconnect_attempts += 1;
                                 // Brief backoff so an immediate reopen does not slam a
                                 // gateway that is resetting under load. Bounded and
                                 // esc-interruptible: the kernel races the whole
@@ -566,7 +580,16 @@ impl LlmProvider for OpenAiCompatProvider {
                             }
                             yield StreamEvent::Error(ProviderError {
                                 retryable: false,
-                                message: retry::stream_read_error_message(&e),
+                                message: retry::stream_read_error_message(
+                                    &e,
+                                    if emitted_replay_sensitive {
+                                        retry::StreamReadRecovery::PartialResponse
+                                    } else {
+                                        retry::StreamReadRecovery::RetryExhausted {
+                                            attempts: reconnect_attempts,
+                                        }
+                                    },
+                                ),
                                 ..Default::default()
                             });
                             return;
@@ -574,7 +597,16 @@ impl LlmProvider for OpenAiCompatProvider {
                         Ok(Some(Ok(chunk))) => {
                             let mut saw_done = false;
                             for ev in dec.feed(chunk.as_ref()) {
-                                emitted_any = true;
+                                if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
+                                    pending_metadata.push(ev);
+                                    continue;
+                                }
+                                if retry::is_replay_sensitive_event(&ev)
+                                    || matches!(ev, StreamEvent::Done { .. } | StreamEvent::Error(_))
+                                {
+                                    for metadata in pending_metadata.drain(..) { yield metadata; }
+                                }
+                                emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
                                 if matches!(ev, StreamEvent::Done { .. }) {
                                     saw_done = true;
                                 }
@@ -2834,6 +2866,14 @@ mod tests {
             ),
             "HTTP 403: [atomgit_session_concurrency_conflict/403] 该模型不支持多窗口同时发起请求"
         );
+        assert_eq!(
+            friendly_http_error(403, "user has no codingplan"),
+            "CodingPlan 未领取或已失效（HTTP 403）。请运行 /login 重新登录并领取 CodingPlan。"
+        );
+        assert_eq!(
+            friendly_http_error(403, "USER HAS NO CODINGPLAN"),
+            "CodingPlan 未领取或已失效（HTTP 403）。请运行 /login 重新登录并领取 CodingPlan。"
+        );
         assert!(friendly_http_error(401, "").contains("API key"));
         // 429 is NOT wrapped (kernel rate-limit path owns it — must keep the
         // literal `HTTP 429: ` prefix so `rate_limit_server_message` can strip it).
@@ -2996,6 +3036,78 @@ mod tests {
             text, "ok",
             "should deliver the re-opened response: {events:?}"
         );
+
+        let _ = handle.join();
+    }
+
+    #[tokio::test]
+    async fn abandoned_attempt_metadata_is_not_emitted_after_reopen() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            let (mut stale, _) = listener.accept().unwrap();
+            read_http_request(&mut stale);
+            let payload =
+                "data: {\"id\":\"resp_stale\",\"model\":\"model-stale\",\"choices\":[]}\n\n";
+            stale
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .unwrap();
+            stale
+                .write_all(format!("{:x}\r\n{payload}\r\n", payload.len()).as_bytes())
+                .unwrap();
+            stale.flush().unwrap();
+            drop(stale);
+
+            let (mut fresh, _) = listener.accept().unwrap();
+            read_http_request(&mut fresh);
+            let body = "data: {\"id\":\"resp_fresh\",\"model\":\"model-fresh\",\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+            fresh
+                .write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}")
+                        .as_bytes(),
+                )
+                .unwrap();
+            fresh.flush().unwrap();
+        });
+
+        let mut cfg = OpenAiCompatConfig::new(
+            "k",
+            format!("http://127.0.0.1:{port}"),
+            "glm-test",
+        );
+        cfg.retry.base_delay = std::time::Duration::from_millis(1);
+        cfg.retry.max_delay = std::time::Duration::from_millis(2);
+        let provider = OpenAiCompatProvider::new(cfg).unwrap();
+        let events: Vec<StreamEvent> = provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+
+        let ids: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ResponseId(id) => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let models: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ResponseModel(model) => Some(model.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["resp_fresh"]);
+        assert_eq!(models, vec!["model-fresh"]);
+        assert!(!events.iter().any(|event| matches!(event, StreamEvent::Error(_))));
 
         let _ = handle.join();
     }

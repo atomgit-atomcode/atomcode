@@ -58,6 +58,54 @@ fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
     }
 }
 
+/// `/rewind`: open the checkpoint picker — the exact flow the double-Esc
+/// gesture triggers. Kicks off an async catalog refresh; the runtime replies
+/// with `RewindCatalogRefreshed`, which the main loop turns into the Rewind
+/// modal (or a "no rewind points" notice) via `install_pending_rewind_modal`.
+/// Idle-only: rewinding mutates conversation history, so it must not race a
+/// running turn (mirrors the double-Esc gate and `dispatch_undo`). Workspace/code
+/// Rewind is disabled in v5.0.4.
+pub(super) fn dispatch_rewind(state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    if state.phase != crate::state::UiPhase::Idle {
+        renderer.render(UiLine::CommandOutput(t(Msg::CmdRewindBusy).into_owned()));
+        renderer.flush();
+        return;
+    }
+    if let Err(error) = ctx
+        .runtime
+        .refresh_rewind_catalog(ctx.foreground_runtime_id, ctx.runtime_event_tx.clone())
+    {
+        renderer.render(UiLine::Error(format!("{}: {error}", t(Msg::CmdRewindUnavailable))));
+        renderer.flush();
+    }
+}
+
+/// Translate the compact TUI `/review` syntax into the explicit schema accepted by the
+/// `code_review` tool. Keeping this pure makes command semantics testable and avoids the
+/// legacy top-level `base` form whose diff included the working tree as an accidental side
+/// effect. `/review <base>` now consistently means the committed `<base>..HEAD` range.
+fn review_prompt(arg: &str) -> String {
+    let scope = arg.trim();
+    if scope.is_empty() {
+        return "Review my current uncommitted changes: call the `code_review` tool with \
+                {\"scope\":{\"kind\":\"working_tree\"}}, then give me a concise summary of \
+                its findings."
+            .to_string();
+    }
+    if scope.eq_ignore_ascii_case("staged") {
+        return "Review my staged changes: call the `code_review` tool with \
+                {\"scope\":{\"kind\":\"staged\"}}, then give me a concise summary of its \
+                findings."
+            .to_string();
+    }
+    format!(
+        "Review the requested committed range: call the `code_review` tool with \
+         {{\"scope\":{{\"kind\":\"range\",\"base\":{base},\"head\":\"HEAD\"}}}}, then give \
+         me a concise summary of its findings.",
+        base = serde_json::to_string(scope).expect("serializing a string cannot fail")
+    )
+}
+
 pub(super) fn dispatch_undo(
     arg: &str,
     state: &UiState,
@@ -1583,22 +1631,7 @@ fn execute_slash_command_impl(
             // arg to the tool's scope (default = working-tree changes; `staged`; or a base
             // ref), then the model calls the tool and summarizes its findings. If the
             // configured runtime lacks the tool, the model simply says so.
-            let scope = arg.trim();
-            let text = if scope.is_empty() {
-                "Review my current uncommitted changes: call the `code_review` tool with no \
-                 arguments, then give me a concise summary of its findings."
-                    .to_string()
-            } else if scope.eq_ignore_ascii_case("staged") {
-                "Review my staged changes: call the `code_review` tool with {\"staged\": true}, \
-                 then give me a concise summary of its findings."
-                    .to_string()
-            } else {
-                format!(
-                    "Review the changes since `{scope}`: call the `code_review` tool with \
-                     {{\"base\": \"{scope}\"}}, then give me a concise summary of its findings."
-                )
-            };
-            submit_agent_turn(ctx, state, text);
+            submit_agent_turn(ctx, state, review_prompt(arg));
         }
         "config" => {
             // Head: current active provider + config path so users know
@@ -1821,6 +1854,9 @@ fn execute_slash_command_impl(
         "undo" => {
             dispatch_undo(arg, state, ctx, renderer);
         }
+        "rewind" => {
+            dispatch_rewind(state, ctx, renderer);
+        }
         "usage" => {
             // Mid-turn (Streaming): keep a text snapshot in the footer directly
             // below the input box. It must not enter conversation scrollback,
@@ -1857,6 +1893,20 @@ fn execute_slash_command_impl(
                 // `/cost` is a static report — drop any live `/usage` panel so
                 // tab keys don't steer a report that's no longer on screen.
                 state.footer_usage = None;
+                state.footer_command_output = Some(text);
+            } else {
+                renderer.render(UiLine::CommandOutput(text));
+                renderer.flush();
+            }
+        }
+        "schedule" => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let tasks = atomcode_config::schedule::list();
+            let text = build_schedule_list_text(&tasks, now);
+            if matches!(state.phase, crate::state::UiPhase::Streaming) {
                 state.footer_command_output = Some(text);
             } else {
                 renderer.render(UiLine::CommandOutput(text));
@@ -5204,6 +5254,88 @@ mod cost_session_location_tests {
     }
 }
 
+/// `/schedule` list text (pure function, easy to test).
+/// Empty → usage hint; otherwise one line per task: id | title | next | last | enabled.
+pub(crate) fn build_schedule_list_text(
+    tasks: &[atomcode_config::schedule::ScheduleTask],
+    now: i64,
+) -> String {
+    if tasks.is_empty() {
+        return "  No scheduled tasks. Use `atomcode schedule add` to create one.\n".to_string();
+    }
+    let mut out = String::from("  Scheduled tasks:\n\n");
+    for t in tasks {
+        let next = atomcode_config::schedule::next_run(&t.schedule, now)
+            .map(|ts| format!("{ts}"))
+            .unwrap_or_else(|| "-".to_string());
+        let en = if t.enabled { "on" } else { "off" };
+        out.push_str(&format!(
+            "  {} | {} | next:{} | last:{} | {}\n",
+            t.id,
+            t.title,
+            next,
+            t.last_status.as_deref().unwrap_or("-"),
+            en
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+mod schedule_list_text_tests {
+    use super::build_schedule_list_text;
+    use atomcode_config::schedule::{Schedule, ScheduleTask};
+
+    fn make_task(id: &str, title: &str, enabled: bool, last_status: Option<&str>) -> ScheduleTask {
+        ScheduleTask {
+            id: id.to_string(),
+            title: title.to_string(),
+            prompt: "do something".to_string(),
+            cwd: "/tmp".to_string(),
+            schedule: Schedule::Daily { time: "09:00".to_string() },
+            permission_mode: "plan".to_string(),
+            notify: "important".to_string(),
+            enabled,
+            created_at: 0,
+            last_run_at: None,
+            last_status: last_status.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn empty_list_shows_hint() {
+        let out = build_schedule_list_text(&[], 0);
+        assert!(
+            out.contains("No scheduled tasks"),
+            "empty list should mention No scheduled tasks, got: {out}"
+        );
+        assert!(
+            out.contains("atomcode schedule add"),
+            "empty list should mention add command, got: {out}"
+        );
+    }
+
+    #[test]
+    fn two_tasks_shown_in_order_with_id_title_enabled() {
+        let tasks = vec![
+            make_task("task-1", "Daily brief", true, Some("ok")),
+            make_task("task-2", "Weekly report", false, None),
+        ];
+        let now = 1785657600_i64; // 2026-07-31 08:00 UTC
+        let out = build_schedule_list_text(&tasks, now);
+        assert!(out.contains("task-1"), "should contain first task id");
+        assert!(out.contains("Daily brief"), "should contain first task title");
+        assert!(out.contains("on"), "enabled task should show 'on'");
+        assert!(out.contains("task-2"), "should contain second task id");
+        assert!(out.contains("Weekly report"), "should contain second task title");
+        assert!(out.contains("off"), "disabled task should show 'off'");
+        // Order: task-1 line comes before task-2 line
+        let pos1 = out.find("task-1").unwrap();
+        let pos2 = out.find("task-2").unwrap();
+        assert!(pos1 < pos2, "task-1 should appear before task-2");
+    }
+}
+
 /// 手机端可远程触发的**只读信息类**命令白名单。返回 None = 不允许远程执行
 /// （交互式/桌面专属命令一律拒绝，由调用方回话术）。
 pub(super) fn run_remote_command(ctx: &LoopCtx, state: &UiState, cmd: &str) -> Option<String> {
@@ -7202,6 +7334,28 @@ mod expand_cd_target_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_prompt_uses_explicit_tool_scopes() {
+        assert!(review_prompt("").contains(
+            r#"{"scope":{"kind":"working_tree"}}"#
+        ));
+        assert!(review_prompt("staged").contains(
+            r#"{"scope":{"kind":"staged"}}"#
+        ));
+        let range = review_prompt("release/v5.0.3");
+        assert!(range.contains(
+            r#"{"scope":{"kind":"range","base":"release/v5.0.3","head":"HEAD"}}"#
+        ));
+        assert!(!range.contains(r#"{"base":"#));
+    }
+
+    #[test]
+    fn review_prompt_json_escapes_the_base_ref() {
+        let prompt = review_prompt("odd\"ref");
+        assert!(prompt.contains(r#""base":"odd\"ref""#));
+        assert!(!prompt.contains("`odd\"ref..HEAD`"));
+    }
 
     #[test]
     fn context_file_status_shows_instruction_and_memory_paths() {

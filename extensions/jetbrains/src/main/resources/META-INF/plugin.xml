@@ -22,6 +22,7 @@
   ]]></change-notes>
 
   <depends>com.intellij.modules.platform</depends>
+  <depends optional="true" config-file="atomcode-jcef.xml">com.intellij.modules.jcef</depends>
 
   <extensions defaultExtensionNs="com.intellij">
     <toolWindow
@@ -61,6 +62,7 @@
     <projectService serviceImplementation="com.atomcode.jetbrains.session.SessionWorkspace" />
     <projectService serviceImplementation="com.atomcode.jetbrains.persistence.AtomCodeProjectWorkspaceState" />
     <applicationService serviceImplementation="com.atomcode.jetbrains.settings.AtomCodeSettingsState" />
+    <applicationService serviceImplementation="com.atomcode.jetbrains.services.AtomCodeDaemonSupervisor" />
     <applicationService serviceImplementation="com.atomcode.jetbrains.services.AtomCodeLoginCoordinator" />
     <postStartupActivity implementation="com.atomcode.jetbrains.services.AtomCodeStartupActivity" />
   </extensions>

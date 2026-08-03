@@ -65,6 +65,15 @@ pub struct LiveJoin {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreshSessionOutcome {
+    pub changed: atomcode_coding::SessionChanged,
+    /// The runtime transition is already committed when this is populated.
+    /// Callers must not report the operation as wholly rejected or retry the
+    /// transition against the replacement runtime.
+    pub projection_error: Option<HubError>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HubError {
     Unbound,
     StaleBinding,
@@ -453,10 +462,32 @@ impl LiveViewHub {
         let changed = handle
             .resume_session_with_lease(session_id, working_dir, lease)
             .await
-            .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
+            .map_err(map_session_transition_error)?;
         self.commit_changed_snapshot(&binding, &handle, &changed)
             .await?;
         Ok(changed)
+    }
+
+    /// Move an idle runtime to a fresh staged session. CodingRuntime owns the
+    /// transition and releases the previous session lease before returning the
+    /// terminal, which lets callers safely delete the old aggregate afterwards.
+    pub async fn fresh_session(
+        &self,
+        expected: &LiveBinding,
+    ) -> Result<FreshSessionOutcome, HubError> {
+        let handle = self.bound_handle_for(expected)?;
+        let changed = handle
+            .fresh_session()
+            .await
+            .map_err(map_session_transition_error)?;
+        let projection_error = self
+            .commit_changed_snapshot(expected, &handle, &changed)
+            .await
+            .err();
+        Ok(FreshSessionOutcome {
+            changed,
+            projection_error,
+        })
     }
 
     pub async fn change_directory(
@@ -467,7 +498,7 @@ impl LiveViewHub {
         let changed = handle
             .change_directory(working_dir)
             .await
-            .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
+            .map_err(map_session_transition_error)?;
         if session_change_is_noop(&binding, &changed) {
             return Ok(changed);
         }
@@ -852,6 +883,13 @@ impl LiveViewHub {
     }
 }
 
+fn map_session_transition_error(error: atomcode_coding::RuntimeError) -> HubError {
+    match error {
+        atomcode_coding::RuntimeError::Busy => HubError::ActiveTurn,
+        error => HubError::RuntimeRejected(error.to_string()),
+    }
+}
+
 fn session_change_is_noop(
     binding: &LiveBinding,
     changed: &atomcode_coding::SessionChanged,
@@ -874,8 +912,8 @@ mod tests {
     use atomcode_kernel::message::{Message, SessionSnapshot};
 
     use super::{
-        session_change_is_noop, HubError, LiveBinding, LiveRuntimeControl, LiveViewEvent,
-        LiveViewHub,
+        map_session_transition_error, session_change_is_noop, HubError, LiveBinding,
+        LiveRuntimeControl, LiveViewEvent, LiveViewHub,
     };
 
     #[derive(Clone)]
@@ -1328,6 +1366,32 @@ mod tests {
         // must also be refused — mirrors bind_with_provider's active set.
         control.status.lock().unwrap().phase = RuntimePhase::Reconfiguring;
         assert!(hub.turn_in_progress());
+    }
+
+    #[test]
+    fn busy_session_transition_maps_to_active_turn() {
+        assert_eq!(
+            map_session_transition_error(atomcode_coding::RuntimeError::Busy),
+            HubError::ActiveTurn
+        );
+        assert_eq!(
+            map_session_transition_error(atomcode_coding::RuntimeError::Unavailable),
+            HubError::RuntimeRejected("coding runtime is unavailable".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_session_rejects_a_stale_expected_binding() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let current = hub
+            .bind("session-1", PathBuf::from("/one"), snapshot("old"), control)
+            .unwrap();
+        let mut stale = current.clone();
+        stale.session_id = "session-2".into();
+
+        assert_eq!(hub.fresh_session(&stale).await, Err(HubError::StaleBinding));
+        assert_eq!(hub.binding().unwrap(), current);
     }
 
     #[test]
