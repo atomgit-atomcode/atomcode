@@ -38,6 +38,10 @@ internal interface DaemonProcessLauncher {
 internal class AtomCodeDaemonProcess(
     private val settings: AtomCodeSettings,
 ) : DaemonProcessLauncher {
+    private companion object {
+        val EXTRACTION_LOCK = Any()
+    }
+
     fun locateBinary(): BinaryResolution? {
         configuredBinary()?.let { return it }
         bundledDaemon()?.let { return BinaryResolution(it.toString(), emptyList()) }
@@ -104,23 +108,23 @@ internal class AtomCodeDaemonProcess(
 
     override fun start(): CompletableFuture<DaemonLaunchResult> =
         CompletableFuture.supplyAsync {
-            val binary = locateBinary() ?: return@supplyAsync DaemonLaunchResult.MissingBinary
-            val args = mutableListOf<String>()
-            args += binary.path
-            args += binary.argsPrefix
-            args += listOf("--port", settings.port.toString(), "--client", "jetbrains")
-            // Windows only: disable the daemon's idle shutdown (default 30 min)
-            // so an idled daemon doesn't exit and get restarted by the next sent
-            // message — which flashes a console window when the fallback CLI
-            // binary is used. On macOS/Linux the restart is windowless, and the
-            // idle self-shutdown is the only cleanup for a daemon orphaned by a
-            // hard IDE termination (crash / kill -9, where dispose() never runs),
-            // so keep the watchdog there.
-            if (isWindows()) {
-                args += listOf("--idle-timeout", "0")
-            }
-
             try {
+                val binary = locateBinary() ?: return@supplyAsync DaemonLaunchResult.MissingBinary
+                val args = mutableListOf<String>()
+                args += binary.path
+                args += binary.argsPrefix
+                args += listOf("--port", settings.port.toString(), "--client", "jetbrains")
+                // Windows only: disable the daemon's idle shutdown (default 30 min)
+                // so an idled daemon doesn't exit and get restarted by the next sent
+                // message — which flashes a console window when the fallback CLI
+                // binary is used. On macOS/Linux the restart is windowless, and the
+                // idle self-shutdown is the only cleanup for a daemon orphaned by a
+                // hard IDE termination (crash / kill -9, where dispose() never runs),
+                // so keep the watchdog there.
+                if (isWindows()) {
+                    args += listOf("--idle-timeout", "0")
+                }
+
                 val builder = ProcessBuilder(args)
                     .redirectOutput(ProcessBuilder.Redirect.DISCARD)
                     .redirectError(ProcessBuilder.Redirect.PIPE)
@@ -149,21 +153,27 @@ internal class AtomCodeDaemonProcess(
         val platformDir = platformDir() ?: return null
         val executable = executableName("atomcode-daemon")
         val resourcePath = "resources/bin/$platformDir/$executable"
+        val contentHash = expectedBundledHash() ?: return null
         val loader = AtomCodeDaemonProcess::class.java.classLoader
-        loader.getResourceAsStream(resourcePath)?.use { stream ->
-            val destination = Path.of(
-                System.getProperty("java.io.tmpdir"),
-                "atomcode-jetbrains",
-                "bin",
-                platformDir,
-                executable,
-            )
-            Files.createDirectories(destination.parent)
-            Files.copy(stream, destination, StandardCopyOption.REPLACE_EXISTING)
-            if (!System.getProperty("os.name").lowercase().contains("win")) {
-                destination.toFile().setExecutable(true, false)
+        val destination = Path.of(
+            System.getProperty("java.io.tmpdir"),
+            "atomcode-jetbrains",
+            "bin",
+            platformDir,
+            contentHash.take(16),
+            ProcessHandle.current().pid().toString(),
+            executable,
+        )
+        synchronized(EXTRACTION_LOCK) {
+            if (Files.isRegularFile(destination)) return destination
+            loader.getResourceAsStream(resourcePath)?.use { stream ->
+                Files.createDirectories(destination.parent)
+                Files.copy(stream, destination, StandardCopyOption.REPLACE_EXISTING)
+                if (!isWindows()) {
+                    destination.toFile().setExecutable(true, false)
+                }
+                return destination
             }
-            return destination
         }
         return null
     }

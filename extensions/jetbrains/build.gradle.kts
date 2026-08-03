@@ -176,6 +176,9 @@ tasks {
         mustRunAfter(verifyOfficialDaemonForRunIde)
         doLast {
             val outputRoot = bundledDaemonDir.get().asFile.toPath()
+            if (Files.exists(outputRoot) && !outputRoot.toFile().deleteRecursively()) {
+                throw GradleException("Failed to clean stale bundled daemon output: $outputRoot")
+            }
             Files.createDirectories(outputRoot)
             var copied = 0
             daemonTargets.forEach { target ->
@@ -208,12 +211,34 @@ tasks {
         }
     }
 
+    val verifyBundledDaemon by registering {
+        dependsOn(bundleDaemon)
+        doLast {
+            val expectedTargets = daemonTargets.filter { target ->
+                providers.environmentVariable(target.env).orNull
+                    ?.let { repoRoot.fileSystem.getPath(it).toAbsolutePath().normalize() }
+                    ?.let(Files::isRegularFile)
+                    ?: (localDaemonCandidate(repoRoot, target, currentTargetId) != null)
+            }.mapTo(sortedSetOf()) { it.id }
+            val outputRoot = bundledDaemonDir.get().asFile.toPath()
+            val actualTargets = daemonTargets.filter { target ->
+                Files.isRegularFile(
+                    outputRoot.resolve("resources/bin/${target.id}/${target.executable}"),
+                )
+            }.mapTo(sortedSetOf()) { it.id }
+            check(actualTargets == expectedTargets) {
+                "Bundled daemon targets do not match this build's inputs: " +
+                    "expected=$expectedTargets, actual=$actualTargets"
+            }
+        }
+    }
+
     test {
         useJUnitPlatform()
     }
 
     processResources {
-        dependsOn(bundleDaemon)
+        dependsOn(verifyBundledDaemon)
         from(bundledDaemonDir)
     }
 

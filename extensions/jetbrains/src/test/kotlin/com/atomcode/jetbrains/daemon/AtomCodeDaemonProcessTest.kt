@@ -33,6 +33,19 @@ class AtomCodeDaemonProcessTest {
     }
 
     @Test
+    fun extractsBundledDaemonToContentAddressedPath() {
+        val daemon = AtomCodeDaemonProcess(AtomCodeSettings())
+        val expectedHash = assertNotNull(daemon.expectedBundledHash())
+
+        val resolution = assertNotNull(daemon.locateBinary())
+
+        assertTrue(
+            resolution.path.contains(expectedHash.take(16)),
+            "bundled daemon path must change with its content so a running Windows executable is never overwritten",
+        )
+    }
+
+    @Test
     fun normalizeDaemonEnvForUtf8LocaleReplacesCLocale() {
         if (isWindows()) return
         val env = mutableMapOf(
