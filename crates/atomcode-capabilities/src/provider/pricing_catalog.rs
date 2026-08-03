@@ -144,6 +144,19 @@ pub async fn ensure_models_dev_catalog() {
     }
 }
 
+/// Refresh the optional pricing catalog without putting metadata I/O on a
+/// caller's startup critical path.
+///
+/// The task is deliberately detached: callers continue using the existing
+/// cache (including a stale cache) while this best-effort refresh runs. The
+/// process-wide `REFRESHING` guard inside [`ensure_models_dev_catalog`] keeps
+/// concurrent CLI/daemon startup paths from issuing duplicate requests.
+pub fn spawn_models_dev_catalog_refresh() {
+    tokio::spawn(async {
+        ensure_models_dev_catalog().await;
+    });
+}
+
 /// Resolve a price from the current disk cache.
 ///
 /// Provider ID is preferred. If it does not identify a catalog provider, an

@@ -5485,7 +5485,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     if !atomcode_config::config::offline::is_offline_active() {
         // Best-effort metadata; failure leaves `/cost` token-only and never
         // prevents daemon/provider startup.
-        atomcode_capabilities::provider::ensure_models_dev_catalog().await;
+        atomcode_capabilities::provider::spawn_models_dev_catalog_refresh();
     }
 
     // Step 2: Resolve telemetry state (R1.2, R2.1-R2.3, R2.5)

@@ -308,6 +308,7 @@ pub async fn run(
     dangerously_skip_permissions: bool,
     is_admin: bool,
 ) -> Result<()> {
+    let tui_start = std::time::Instant::now();
     let SpawnedRuntime {
         endpoint,
         event_rx,
@@ -419,6 +420,11 @@ pub async fn run(
             }
         }
     };
+    crate::tuix_trace!(
+        "START",
+        "stage=terminal_probe elapsed_ms={}",
+        tui_start.elapsed().as_millis()
+    );
     crate::highlight::theme::set_theme_mode(theme_light);
 
     // If the terminal doesn't support Kitty keyboard protocol (CSI u),
@@ -519,11 +525,18 @@ pub async fn run(
     // inside `platform::history_path`), so the explicit else-branch
     // with a hardcoded Unix path is gone — Windows used to fall here
     // and then fail to write to `/tmp`.
+    let history_start = std::time::Instant::now();
     let history = {
         let path = History::default_path().unwrap_or_else(crate::platform::history_path);
         let cache = crate::platform::image_cache_dir();
         crate::input::history::History::load_with_cache(path, cache)
     };
+    crate::tuix_trace!(
+        "START",
+        "stage=history_load elapsed_ms={} total_ms={}",
+        history_start.elapsed().as_millis(),
+        tui_start.elapsed().as_millis()
+    );
 
     // Fresh session by default; `/resume` replaces this on load.
     let mut current_session = crate::session::Session::default_session(working_dir.clone());
@@ -605,6 +618,7 @@ pub async fn run(
         dirs
     };
 
+    let capability_scan_start = std::time::Instant::now();
     let custom_commands = crate::custom_commands::CustomCommandRegistry::load(&working_dir);
     // Same Arc the agent loop holds — reload() calls there propagate
     // here automatically, so the slash menu reflects newly-installed
@@ -616,6 +630,12 @@ pub async fn run(
     if let Ok(mut registry) = skill_registry.write() {
         let _ = event_loop::reload_skill_registry(&mut registry, &working_dir);
     }
+    crate::tuix_trace!(
+        "START",
+        "stage=tui_capability_scan elapsed_ms={} total_ms={}",
+        capability_scan_start.elapsed().as_millis(),
+        tui_start.elapsed().as_millis()
+    );
 
     // ── Plugin marketplace bootstrap (detached) ──
     //
@@ -829,6 +849,11 @@ pub async fn run(
         );
     }
 
+    crate::tuix_trace!(
+        "START",
+        "stage=event_loop_ready total_ms={}",
+        tui_start.elapsed().as_millis()
+    );
     let result = run_loop(ctx, renderer.as_mut()).await;
 
     // Must shut down the renderer BEFORE re-exec: the alternate screen is
