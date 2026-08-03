@@ -558,3 +558,125 @@ async fn multi_round_reasoning_is_stripped_for_deepseek_r1() {
         "assistant tool_call still echoed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Transport failure: the connection is closed before the response completes
+// (hyper `IncompleteMessage`).
+//
+// wiremock cannot model "accept the connection, then close it without responding",
+// so this group hand-rolls a fake gateway on a raw `TcpListener`.
+// ---------------------------------------------------------------------------
+
+/// A controllable fake gateway: the first `fail_times` connections read the request
+/// and then close outright (reproducing `connection closed before message completed`);
+/// later connections answer with `sse`. Returns (base_url, connection counter).
+fn flaky_gateway(
+    fail_times: usize,
+    sse: &'static str,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_bg = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = [0u8; 8192];
+            let _ = s.read(&mut buf);
+            let n = hits_bg.fetch_add(1, Ordering::SeqCst);
+            if n < fail_times {
+                drop(s); // no response at all — just close
+                continue;
+            }
+            let body = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"
+            );
+            let _ = s.write_all(body.as_bytes());
+            let _ = s.flush();
+        }
+    });
+    (format!("http://{addr}"), hits)
+}
+
+const SSE_HELLO: &str = concat!(
+    "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+    "data: [DONE]\n\n"
+);
+
+#[tokio::test]
+async fn incomplete_message_open_failure_is_retried_and_recovers() {
+    let (base, hits) = flaky_gateway(2, SSE_HELLO);
+    let provider = provider_for(&base, "test-model");
+    let msgs = vec![Message::user("hi")];
+
+    let stream = provider
+        .chat_stream(&msgs, &[], &ChatOptions::default())
+        .await
+        .expect("after two closed connections the third must succeed");
+    drop(stream);
+
+    // 1 initial + 2 retries = 3 real connections.
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
+/// Pins the REPLAY semantics honestly: the server reads the WHOLE request body and
+/// only then drops the connection — the client still replays it. This does NOT assert
+/// that replaying is safe; it records that the server may well have received and
+/// processed the first copy, and the retry hands it a second one.
+#[tokio::test]
+async fn retry_replays_the_request_even_when_server_read_it_fully() {
+    let (base, hits) = flaky_gateway(1, SSE_HELLO);
+    let provider = provider_for(&base, "test-model");
+    let msgs = vec![Message::user("hi")];
+    let _ = provider
+        .chat_stream(&msgs, &[], &ChatOptions::default())
+        .await;
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "server read the request then dropped → the client replayed it once"
+    );
+}
+
+/// Accepts the connection but never responds and never closes — an upstream that
+/// hangs with no first byte.
+fn black_hole_gateway() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            if let Ok(s) = stream {
+                held.push(s); // hold it open, never read, never write
+            }
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn open_gives_up_on_a_hung_gateway_within_the_open_timeout() {
+    let base = black_hole_gateway();
+    let mut cfg = OpenAiCompatConfig::new("k", &base, "test-model");
+    cfg.open_timeout = Duration::from_millis(300);
+    cfg.retry = RetryPolicy::none(); // single attempt, so the timing is unambiguous
+    let provider = OpenAiCompatProvider::new(cfg).unwrap();
+    let msgs = vec![Message::user("hi")];
+
+    let started = std::time::Instant::now();
+    let err = provider
+        .chat_stream(&msgs, &[], &ChatOptions::default())
+        .await
+        .err()
+        .expect("a hung gateway must time out, not wait forever");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "took {elapsed:?} — not bounded by open_timeout"
+    );
+    assert!(err.retryable, "a TTFB timeout is transient, so it must be retryable");
+}

@@ -400,6 +400,7 @@ dependencies = [
  "globset",
  "grep",
  "httpdate",
+ "hyper",
  "ignore",
  "libc",
  "regex",
