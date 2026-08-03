@@ -1,9 +1,11 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use atomcode_auth as auth;
 use atomcode_codingplan as coding_plan;
-use atomcode_telemetry::{CodingplanErrorKind, CodingplanResult, Event};
+use atomcode_telemetry::{CodingplanErrorKind, CodingplanResult, Event, SessionMode};
 
 use crate::{
     api_auth::{pending_invite_for_login, poll_login_session, LoginPollStep},
@@ -310,5 +312,134 @@ fn step_info_from_result<T: std::fmt::Debug>(result: &coding_plan::StepResult<T>
             status: "error".to_string(),
             message: msg.clone(),
         },
+    }
+}
+
+/// Single-flight guard so concurrent logins (VS Code + JetBrains at once)
+/// don't fire duplicate background syncs.
+static AUTO_SYNC_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Background CodingPlan model sync triggered right after a successful OAuth
+/// login (newly authorized).
+///
+/// Login alone only persists the token; the model list served by `/models`
+/// comes from the local config, which is populated by the CodingPlan claim +
+/// models-v2 steps. Without this, both IDE plugins show "signed in" but an
+/// empty model picker until the user manually runs `/codingplan` / clicks
+/// "Sync CodingPlan models". Triggering the sync here in the daemon means both
+/// VS Code and JetBrains pick up the models via their usual `/models` refresh
+/// (and config-file watch), with zero plugin changes.
+///
+/// Deliberately fire-and-forget: the login poll response must not wait for the
+/// claim/models network round-trips. Failures are logged / telemetry-tracked
+/// but never fail the login itself.
+pub(crate) fn sync_codingplan_after_login(state: AppState, client_mode: SessionMode) {
+    if AUTO_SYNC_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        tracing::debug!("codingplan auto-sync already in flight; skipping");
+        return;
+    }
+    let state_for_scope = state.clone();
+    tokio::spawn(async move {
+        let _reset = AutoSyncReset;
+        daemon_scope(&state, None, client_mode, || async move {
+            let mut config = match load_config() {
+                Ok(c) => c,
+                Err(e) => {
+                    state_for_scope.telemetry.track(Event::TakeCodingplan {
+                        type_: CodingplanResult::Fail,
+                        error_kind: Some(CodingplanErrorKind::ExecutionFailed),
+                        error_data: Some(
+                            serde_json::json!({
+                                "step": "config_load",
+                                "message": e,
+                            })
+                            .to_string(),
+                        ),
+                    });
+                    tracing::warn!(error = %e, "codingplan auto-sync: config load failed");
+                    return;
+                }
+            };
+
+            let setup_result = tokio::task::spawn_blocking(move || {
+                let report = coding_plan::run(&mut config, None)?;
+                Ok::<_, anyhow::Error>((config, report))
+            })
+            .await;
+
+            let (config, report) = match setup_result {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    state_for_scope.telemetry.track(Event::TakeCodingplan {
+                        type_: CodingplanResult::Fail,
+                        error_kind: Some(CodingplanErrorKind::ExecutionFailed),
+                        error_data: Some(
+                            serde_json::json!({
+                                "step": "claim",
+                                "message": format!("CodingPlan auto-sync failed: {:#}", e),
+                            })
+                            .to_string(),
+                        ),
+                    });
+                    tracing::warn!(error = ?e, "codingplan auto-sync after login failed");
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!(error = ?e, "codingplan auto-sync task panicked");
+                    return;
+                }
+            };
+
+            if !report.should_persist_config() {
+                // e.g. claim refused / empty model list — leave existing
+                // config untouched; the user can still set up providers
+                // manually.
+                tracing::info!(
+                    report = %report.render(),
+                    "codingplan auto-sync after login did not persist config"
+                );
+                return;
+            }
+
+            if let Err(e) = update_config(|latest| {
+                coding_plan::merge_successful_config(latest, &config, &report)
+            }) {
+                state_for_scope.telemetry.track(Event::TakeCodingplan {
+                    type_: CodingplanResult::Fail,
+                    error_kind: Some(CodingplanErrorKind::ExecutionFailed),
+                    error_data: Some(
+                        serde_json::json!({
+                            "step": "config_save",
+                            "message": e,
+                        })
+                        .to_string(),
+                    ),
+                });
+                tracing::warn!(error = %e, "codingplan auto-sync: config merge failed");
+                return;
+            }
+            if let Err(e) = coding_plan::write_last_sync_now() {
+                tracing::warn!(error = ?e, "codingplan auto-sync: sync marker write failed");
+            }
+
+            state_for_scope.telemetry.track(Event::TakeCodingplan {
+                type_: CodingplanResult::Success,
+                error_kind: None,
+                error_data: Some(serde_json::json!({ "step": null }).to_string()),
+            });
+            tracing::info!("codingplan auto-sync after login completed");
+        })
+        .await;
+    });
+}
+
+/// Resets the single-flight flag when the spawned sync task finishes.
+struct AutoSyncReset;
+impl Drop for AutoSyncReset {
+    fn drop(&mut self) {
+        AUTO_SYNC_IN_FLIGHT.store(false, Ordering::SeqCst);
     }
 }
