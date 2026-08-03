@@ -1553,6 +1553,43 @@ impl RunningAgent {
         self.rt.emit(AgentEvent::TurnComplete { reason });
     }
 
+    /// Persist only the replay-safe, fully assembled portion of a failed stream.
+    /// `ToolCallDelta` is display-only and never enters `pending_calls`; complete calls
+    /// are retained but paired with synthetic error results so resume cannot execute
+    /// them or send an invalid dangling tool-call sequence to the provider.
+    fn persist_partial_assistant(
+        convo: &mut Conversation,
+        assistant_text: &str,
+        reasoning: &str,
+        reasoning_blocks: &[crate::message::ReasoningBlock],
+        pending_calls: &[ToolCall],
+        suppress_internal_stream: bool,
+    ) {
+        let partial_reasoning = strip_reasoning_filler(reasoning);
+        if assistant_text.is_empty() && partial_reasoning.is_empty() && pending_calls.is_empty() {
+            return;
+        }
+
+        let mut seen_call_ids = std::collections::HashSet::new();
+        let safe_calls = pending_calls
+            .iter()
+            .filter(|call| seen_call_ids.insert(call.id.clone()))
+            .cloned()
+            .collect();
+        let mut partial = Message::assistant(assistant_text.to_string(), safe_calls);
+        if suppress_internal_stream {
+            partial.internal_origin = Some("verify_cadence".to_string());
+            partial.text.clear();
+            partial.reasoning = None;
+            partial.reasoning_blocks.clear();
+        } else {
+            partial.reasoning = (!partial_reasoning.is_empty()).then_some(partial_reasoning);
+            partial.reasoning_blocks = reasoning_blocks.to_vec();
+        }
+        convo.push(partial);
+        convo.backfill_interrupted_tool_results();
+    }
+
     /// Terminal for a CANCELLED turn under "cancel = undo" semantics: roll the
     /// conversation back to `rollback_len` (its length before this turn's user
     /// message was pushed) so the cancelled prompt + any partial assistant/tool
@@ -2123,7 +2160,7 @@ impl RunningAgent {
                         // per-round accumulators reset on `continue`, so partial output is
                         // discarded and never pushed), with exponential backoff. Only after
                         // the budget is spent do we take the clean-fail path.
-                        if stream_retry < MAX_STREAM_RETRIES {
+                        if !saw_stream_content && stream_retry < MAX_STREAM_RETRIES {
                             stream_retry += 1;
                             self.rt.emit(AgentEvent::Warning(format!(
                                 "stream idle timeout — reconnecting ({stream_retry}/{MAX_STREAM_RETRIES})"
@@ -2146,7 +2183,21 @@ impl RunningAgent {
                             retry_this_round = true;
                             break;
                         }
-                        let msg = "stream timeout".to_string();
+                        if saw_stream_content {
+                            Self::persist_partial_assistant(
+                                convo,
+                                &assistant_text,
+                                &reasoning,
+                                &reasoning_blocks,
+                                &pending_calls,
+                                suppress_internal_stream,
+                            );
+                        }
+                        let msg = if saw_stream_content {
+                            "stream timeout after partial response; to avoid duplicate output or tool execution, the request was not replayed; partial response preserved"
+                        } else {
+                            "stream timeout after automatic reconnects"
+                        }.to_string();
                         self.hooks.on_error(&msg).await;
                         self.rt.emit(AgentEvent::Error { message: msg, http_status: None, code: None });
                         self.finish_turn(convo, StopReason::Timeout, &turn_ctx).await;
@@ -2294,32 +2345,14 @@ impl RunningAgent {
                         // but do not auto-retry this partially-consumed stream. A 429 before
                         // the first content event remains safe to retry below.
                         if saw_stream_content {
-                            // Persist exactly what the driver has already rendered;
-                            // otherwise snapshot/resume would lose visible output.
-                            let partial_reasoning = strip_reasoning_filler(&reasoning);
-                            if !assistant_text.is_empty()
-                                || !partial_reasoning.is_empty()
-                                || !pending_calls.is_empty()
-                            {
-                                let mut partial = crate::message::Message::assistant(
-                                    assistant_text.clone(),
-                                    pending_calls.clone(),
-                                );
-                                if suppress_internal_stream {
-                                    partial.internal_origin = Some("verify_cadence".to_string());
-                                    partial.text.clear();
-                                    partial.reasoning = None;
-                                    partial.reasoning_blocks.clear();
-                                } else {
-                                    partial.reasoning = if partial_reasoning.is_empty() {
-                                        None
-                                    } else {
-                                        Some(partial_reasoning)
-                                    };
-                                    partial.reasoning_blocks = reasoning_blocks.clone();
-                                }
-                                convo.push(partial);
-                            }
+                            Self::persist_partial_assistant(
+                                convo,
+                                &assistant_text,
+                                &reasoning,
+                                &reasoning_blocks,
+                                &pending_calls,
+                                suppress_internal_stream,
+                            );
                             let (reset_at_display, reset_label, secs_until_reset) = match decision {
                                 crate::hook::RateLimitDecision::WaitAndRetry { secs } => {
                                     (String::new(), String::new(), Some(secs))
@@ -2396,6 +2429,16 @@ impl RunningAgent {
                         }
                     }
                     StreamEvent::Error(e) => {
+                        if saw_stream_content {
+                            Self::persist_partial_assistant(
+                                convo,
+                                &assistant_text,
+                                &reasoning,
+                                &reasoning_blocks,
+                                &pending_calls,
+                                suppress_internal_stream,
+                            );
+                        }
                         self.hooks.on_error(&e.message).await;
                         self.rt.emit(AgentEvent::Error {
                             message: e.message,
@@ -4167,6 +4210,51 @@ mod session_affinity_tests {
             seen.lock().unwrap().is_none(),
             "without a session id the provider must stay unbound so the affinity header is omitted"
         );
+    }
+}
+
+#[cfg(test)]
+mod partial_stream_persistence_tests {
+    use super::*;
+    use crate::message::Role;
+
+    #[test]
+    fn partial_response_keeps_content_and_never_executes_dangling_tool_call() {
+        let mut convo = Conversation::new();
+        convo.push(Message::user("work"));
+        let call = ToolCall {
+            id: "call-1".into(),
+            name: "write_file".into(),
+            arguments: r#"{"path":"x"}"#.into(),
+        };
+
+        RunningAgent::persist_partial_assistant(
+            &mut convo,
+            "partial text",
+            "partial reasoning",
+            &[],
+            &[call.clone(), call],
+            false,
+        );
+
+        let assistant = &convo.messages[1];
+        assert_eq!(assistant.text, "partial text");
+        assert_eq!(assistant.reasoning.as_deref(), Some("partial reasoning"));
+        assert_eq!(assistant.tool_calls.len(), 1, "same call_id is persisted once");
+
+        let result = &convo.messages[2];
+        assert_eq!(result.role, Role::Tool);
+        assert_eq!(result.tool_call_id.as_deref(), Some("call-1"));
+        assert!(result.is_error);
+        assert_eq!(result.text, "(interrupted before execution)");
+        assert_eq!(convo.messages.len(), 3, "same call_id receives one result");
+    }
+
+    #[test]
+    fn display_only_incomplete_tool_delta_cannot_create_persisted_tool_call() {
+        let mut convo = Conversation::new();
+        RunningAgent::persist_partial_assistant(&mut convo, "", "", &[], &[], false);
+        assert!(convo.messages.is_empty());
     }
 }
 

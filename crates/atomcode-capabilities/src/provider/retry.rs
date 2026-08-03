@@ -1,9 +1,8 @@
 //! HTTP retry / backoff helpers for OpenAI-compatible providers (L1).
 //!
-//! Retries happen ONLY before the streaming response begins (the OPEN). Once the
-//! adapter starts consuming `bytes_stream()`, any mid-stream error is surfaced as
-//! [`StreamEvent::Error`](atomcode_kernel::stream::StreamEvent) and NEVER retried —
-//! partial deltas may already have reached the consumer.
+//! OPEN failures are retried per policy. A response-body read failure may also
+//! transparently reopen the request, but only until replay-sensitive output (text,
+//! reasoning, or tool data) reaches the consumer. Metadata alone is replay-safe.
 //!
 //! HTTP 429 ownership is selected per call: direct consumers retain the bounded
 //! provider OPEN retry, while kernel turns surface the first 429 so their
@@ -12,6 +11,36 @@
 use std::time::Duration;
 
 use atomcode_kernel::provider::RateLimitRetryOwner;
+use atomcode_kernel::stream::StreamEvent;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamReadRecovery {
+    RetryExhausted { attempts: u32 },
+    PartialResponse,
+}
+
+/// Whether replaying the whole provider request could duplicate user-visible output
+/// or a tool side effect. Observational metadata is deliberately replay-safe.
+pub(crate) fn is_replay_sensitive_event(event: &StreamEvent) -> bool {
+    matches!(
+        event,
+        StreamEvent::TextDelta(_)
+            | StreamEvent::Reasoning(_)
+            | StreamEvent::ReasoningSignature { .. }
+            | StreamEvent::ToolCall(_)
+            | StreamEvent::ToolCallDelta { .. }
+    )
+}
+
+/// Attempt-scoped metadata must not escape until the response commits by producing
+/// replay-sensitive output or a terminal event. Otherwise a transparent reopen can
+/// leave the kernel holding an id/model/usage value from the abandoned attempt.
+pub(crate) fn is_attempt_metadata_event(event: &StreamEvent) -> bool {
+    matches!(
+        event,
+        StreamEvent::ResponseId(_) | StreamEvent::ResponseModel(_) | StreamEvent::Usage(_)
+    )
+}
 
 /// How long an idle keep-alive connection may sit in the pool before we drop
 /// it. reqwest's default is 90s; gateway load balancers commonly close idle
@@ -182,10 +211,22 @@ pub(crate) fn err_chain(err: &(dyn std::error::Error + 'static)) -> String {
 /// gateway dropping the connection under load) we LEAD with a Chinese
 /// explanation and append the full cause chain for diagnosis. Logical failures
 /// (e.g. a malformed body) keep the verbatim `stream read error: <chain>` form.
-pub(crate) fn stream_read_error_message(err: &(dyn std::error::Error + 'static)) -> String {
+pub(crate) fn stream_read_error_message(
+    err: &(dyn std::error::Error + 'static),
+    recovery: StreamReadRecovery,
+) -> String {
     if chain_has_transient_io(err) {
+        let explanation = match recovery {
+            StreamReadRecovery::RetryExhausted { attempts } => {
+                format!("自动重连 {attempts} 次后仍失败，可重试")
+            }
+            StreamReadRecovery::PartialResponse => {
+                "响应过程中断；为避免重复输出或工具执行，未自动重放，已保留可安全保存的部分回复，可继续"
+                    .to_string()
+            }
+        };
         format!(
-            "网络连接中断:远端关闭或重置了连接(已自动重连仍失败,可重试)。详情: {}",
+            "网络连接中断:远端关闭或重置了连接({explanation})。详情: {}",
             err_chain(err)
         )
     } else {
@@ -510,7 +551,7 @@ mod tests {
             chain_has_transient_io(&e),
             "ETIMEDOUT buried in the chain is a transport drop"
         );
-        let msg = stream_read_error_message(&e);
+        let msg = stream_read_error_message(&e, StreamReadRecovery::RetryExhausted { attempts: 2 });
         assert!(
             msg.contains("网络连接中断"),
             "leads with a plain-language notice: {msg}"
@@ -653,7 +694,7 @@ mod tests {
             ErrorKind::ConnectionReset,
             "远程主机强迫关闭了一个现有的连接。 (os error 10054)",
         ));
-        let msg = stream_read_error_message(&e);
+        let msg = stream_read_error_message(&e, StreamReadRecovery::RetryExhausted { attempts: 2 });
         assert!(
             msg.contains("网络连接中断"),
             "leads with a plain-language notice: {msg}"
@@ -662,6 +703,12 @@ mod tests {
             msg.contains("os error 10054"),
             "still appends the raw cause for diagnosis: {msg}"
         );
+        assert!(msg.contains("自动重连 2 次后仍失败"));
+
+        let partial = stream_read_error_message(&e, StreamReadRecovery::PartialResponse);
+        assert!(partial.contains("为避免重复输出或工具执行"));
+        assert!(partial.contains("已保留可安全保存的部分回复"));
+        assert!(!partial.contains("自动重连仍失败"));
     }
 
     #[test]
@@ -671,7 +718,7 @@ mod tests {
         // it must keep the verbatim `stream read error:` form, not be mislabeled
         // a connection interruption.
         let e = Wrap(Error::new(ErrorKind::InvalidData, "bad frame"));
-        let msg = stream_read_error_message(&e);
+        let msg = stream_read_error_message(&e, StreamReadRecovery::PartialResponse);
         assert!(
             msg.starts_with("stream read error:"),
             "verbatim form for logical errors: {msg}"
@@ -680,5 +727,37 @@ mod tests {
             !msg.contains("网络连接中断"),
             "must not mislabel a logical error: {msg}"
         );
+    }
+
+    #[test]
+    fn only_content_and_tool_events_are_replay_sensitive() {
+        use atomcode_kernel::stream::TokenUsage;
+
+        assert!(!is_replay_sensitive_event(&StreamEvent::ResponseId(
+            "r".into()
+        )));
+        assert!(!is_replay_sensitive_event(&StreamEvent::ResponseModel(
+            "m".into()
+        )));
+        assert!(!is_replay_sensitive_event(&StreamEvent::Usage(
+            TokenUsage::default()
+        )));
+        assert!(!is_replay_sensitive_event(&StreamEvent::Malformed));
+        assert!(is_attempt_metadata_event(&StreamEvent::ResponseId("r".into())));
+        assert!(is_attempt_metadata_event(&StreamEvent::ResponseModel("m".into())));
+        assert!(is_attempt_metadata_event(&StreamEvent::Usage(TokenUsage::default())));
+        assert!(!is_attempt_metadata_event(&StreamEvent::Malformed));
+        assert!(is_replay_sensitive_event(&StreamEvent::TextDelta(
+            "x".into()
+        )));
+        assert!(is_replay_sensitive_event(&StreamEvent::Reasoning(
+            "x".into()
+        )));
+        assert!(is_replay_sensitive_event(&StreamEvent::ToolCallDelta {
+            index: 0,
+            id: None,
+            name: None,
+            arguments: "{".into(),
+        }));
     }
 }
