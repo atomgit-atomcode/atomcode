@@ -47,6 +47,16 @@ pub const MAX_SCROLLBACK_ROWS: usize = 5000;
 /// so it can't grow the buffer until allocation fails. 1 MiB ≫ any real line.
 const ASSISTANT_LINE_BUF_MAX: usize = 1 << 20;
 
+/// Append one stream chunk and remove its complete-line prefix.
+/// The existing buffer has no newline, so only the new chunk needs a scan.
+fn append_stream_chunk(buffer: &mut String, chunk: &str) -> Option<String> {
+    let buffered_len = buffer.len();
+    let last_newline = chunk.rfind('\n');
+    buffer.push_str(chunk);
+    let split_at = buffered_len + last_newline? + 1;
+    Some(buffer.drain(..split_at).collect())
+}
+
 /// Hard cap on how many rows the input box may DISPLAY before it scrolls
 /// internally. Bounds the footer so a long paste / typed text can't grow it
 /// past the screen height (the overflow bug). This caps DISPLAY only — the
@@ -5957,17 +5967,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// streaming assistant buffer into `body_lines`, rendering
     /// each through the markdown inline renderer so bold / inline
     /// code / lists / headings get their styled cells.
-    fn flush_assistant_lines(&mut self) {
-        if !self.assistant_line_buf.contains('\n') {
+    fn flush_assistant_lines(&mut self, chunk: &str) {
+        let Some(complete) = append_stream_chunk(&mut self.assistant_line_buf, chunk) else {
             return;
-        }
+        };
         let md_width = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
         let mut completed: Vec<String> = Vec::new();
-        while let Some(nl) = self.assistant_line_buf.find('\n') {
-            let line: String = self.assistant_line_buf.drain(..=nl).collect();
-            let content = line[..line.len() - 1].to_string();
+        for content in complete.split_terminator('\n') {
             if let Some(rendered) = crate::markdown::render_line_with_width(
-                &content,
+                content,
                 &mut self.md_state,
                 self.caps,
                 md_width,
@@ -6016,22 +6024,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
-    fn flush_reasoning_lines(&mut self) {
-        if !self.reasoning_line_buf.contains('\n') {
+    fn flush_reasoning_lines(&mut self, chunk: &str) {
+        let Some(complete) = append_stream_chunk(&mut self.reasoning_line_buf, chunk) else {
             return;
-        }
-        let mut completed: Vec<String> = Vec::new();
-        while let Some(nl) = self.reasoning_line_buf.find('\n') {
-            let line: String = self.reasoning_line_buf.drain(..=nl).collect();
-            let content = line[..line.len() - 1].to_string();
-            completed.push(content);
-        }
+        };
         let style = CellStyle {
             faint: true,
             ..CellStyle::default()
         };
-        for content in completed {
-            self.push_body_text(&content, &style);
+        for content in complete.split_terminator('\n') {
+            self.push_body_text(content, &style);
         }
     }
 
@@ -6869,8 +6871,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                         }
                     }
                 }
-                self.assistant_line_buf.push_str(&scrub_controls(&text));
-                self.flush_assistant_lines();
+                let safe = scrub_controls(&text);
+                self.flush_assistant_lines(&safe);
                 // Safety cap: `flush_assistant_lines` only drains up to a `\n`, so a
                 // stream that dribbles bytes without ever emitting a newline (a hung
                 // keep-alive connection, or a model streaming one enormous single
@@ -6884,8 +6886,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 }
             }
             UiLine::ReasoningText(text) => {
-                self.reasoning_line_buf.push_str(&scrub_controls(&text));
-                self.flush_reasoning_lines();
+                let safe = scrub_controls(&text);
+                self.flush_reasoning_lines(&safe);
             }
             UiLine::AssistantLineBreak => {
                 self.flush_assistant_remainder();
@@ -19385,6 +19387,28 @@ mod tests {
             "assistant_line_buf must stay bounded (cap+one chunk), got {}",
             r.assistant_line_buf.len()
         );
+    }
+
+    #[test]
+    fn stream_chunk_extracts_complete_prefix_and_keeps_partial_tail() {
+        let mut buffer = "prefix".repeat(1024);
+        let original = buffer.clone();
+
+        assert!(append_stream_chunk(&mut buffer, "-tail").is_none());
+        let completed = append_stream_chunk(&mut buffer, "\nsecond\npartial").unwrap();
+
+        assert_eq!(completed, format!("{original}-tail\nsecond\n"));
+        assert_eq!(buffer, "partial");
+    }
+
+    #[test]
+    fn stream_chunk_preserves_empty_complete_lines() {
+        let mut buffer = "first".to_string();
+
+        let completed = append_stream_chunk(&mut buffer, "\n\nthird\nrest").unwrap();
+
+        assert_eq!(completed, "first\n\nthird\n");
+        assert_eq!(buffer, "rest");
     }
 
     /// Regression (long-session resize duplication): once `body_log` evicts its
