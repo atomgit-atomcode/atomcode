@@ -2866,6 +2866,14 @@ mod tests {
             ),
             "HTTP 403: [atomgit_session_concurrency_conflict/403] 该模型不支持多窗口同时发起请求"
         );
+        assert_eq!(
+            friendly_http_error(403, "user has no codingplan"),
+            "CodingPlan 未领取或已失效（HTTP 403）。请运行 /login 重新登录并领取 CodingPlan。"
+        );
+        assert_eq!(
+            friendly_http_error(403, "USER HAS NO CODINGPLAN"),
+            "CodingPlan 未领取或已失效（HTTP 403）。请运行 /login 重新登录并领取 CodingPlan。"
+        );
         assert!(friendly_http_error(401, "").contains("API key"));
         // 429 is NOT wrapped (kernel rate-limit path owns it — must keep the
         // literal `HTTP 429: ` prefix so `rate_limit_server_message` can strip it).
