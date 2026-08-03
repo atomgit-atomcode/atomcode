@@ -1,4 +1,5 @@
 use atomcode_config::schedule::{Schedule, ScheduleTask};
+#[cfg(any(test, not(target_os = "windows")))]
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -48,11 +49,13 @@ pub trait OsScheduler {
 
 // ---- Launchd (macOS) ----
 
+#[cfg(any(test, target_os = "macos"))]
 pub struct Launchd {
     pub root: PathBuf,
     pub runner: Arc<dyn CommandRunner + Send + Sync>,
 }
 
+#[cfg(any(test, target_os = "macos"))]
 impl Launchd {
     fn label(id: &str) -> String {
         format!("com.atomcode.schedule.{id}")
@@ -117,6 +120,7 @@ impl Launchd {
     }
 }
 
+#[cfg(any(test, target_os = "macos"))]
 impl OsScheduler for Launchd {
     fn install(&self, task: &ScheduleTask) -> anyhow::Result<()> {
         #[cfg(not(unix))]
@@ -179,11 +183,13 @@ impl OsScheduler for Launchd {
 
 // ---- SystemdTimer (Linux) ----
 
+#[cfg(any(test, not(any(target_os = "macos", target_os = "windows"))))]
 pub struct SystemdTimer {
     pub root: PathBuf,
     pub runner: Arc<dyn CommandRunner + Send + Sync>,
 }
 
+#[cfg(any(test, not(any(target_os = "macos", target_os = "windows"))))]
 impl SystemdTimer {
     fn service_name(id: &str) -> String {
         format!("atomcode-schedule-{id}.service")
@@ -221,6 +227,7 @@ impl SystemdTimer {
     }
 }
 
+#[cfg(any(test, not(any(target_os = "macos", target_os = "windows"))))]
 impl OsScheduler for SystemdTimer {
     fn install(&self, task: &ScheduleTask) -> anyhow::Result<()> {
         let cal = systemd_calendar(&task.schedule)?;
@@ -274,16 +281,19 @@ impl OsScheduler for SystemdTimer {
 
 // ---- TaskSched (Windows) ----
 
+#[cfg(any(test, target_os = "windows"))]
 pub struct TaskSched {
     pub runner: Arc<dyn CommandRunner + Send + Sync>,
 }
 
+#[cfg(any(test, target_os = "windows"))]
 impl TaskSched {
     fn task_name(id: &str) -> String {
         format!("atomcode\\schedule\\{id}")
     }
 }
 
+#[cfg(any(test, target_os = "windows"))]
 impl OsScheduler for TaskSched {
     fn install(&self, task: &ScheduleTask) -> anyhow::Result<()> {
         let exe = std::env::current_exe()?;
@@ -334,6 +344,7 @@ impl OsScheduler for TaskSched {
 
 // ---- Platform UID helper ----
 
+#[cfg(any(test, target_os = "macos"))]
 fn get_uid() -> u32 {
     #[cfg(unix)]
     {
@@ -395,6 +406,7 @@ pub fn current() -> anyhow::Result<Box<dyn OsScheduler + Send + Sync>> {
 ///
 /// Replaces `&`, `<`, `>`, and `"` with their XML entity equivalents so that
 /// paths containing those characters produce well-formed plist XML.
+#[cfg(any(test, target_os = "macos"))]
 fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -416,12 +428,14 @@ fn hhmm(s: &str) -> anyhow::Result<(u8, u8)> {
 
 // ---- systemd ----
 
+#[cfg(any(test, not(any(target_os = "macos", target_os = "windows"))))]
 #[derive(Debug, PartialEq, Eq)]
 pub enum OnCalendar {
     Calendar(String),
     Interval(String),
 }
 
+#[cfg(any(test, not(any(target_os = "macos", target_os = "windows"))))]
 pub fn systemd_calendar(s: &Schedule) -> anyhow::Result<OnCalendar> {
     Ok(match s {
         Schedule::Daily { time } => {
@@ -442,6 +456,7 @@ pub fn systemd_calendar(s: &Schedule) -> anyhow::Result<OnCalendar> {
     })
 }
 
+#[cfg(any(test, not(any(target_os = "macos", target_os = "windows"))))]
 fn dow_abbr(wd: u8) -> anyhow::Result<&'static str> {
     if wd == 0 || wd > 7 {
         anyhow::bail!("bad weekday {wd}");
@@ -451,6 +466,7 @@ fn dow_abbr(wd: u8) -> anyhow::Result<&'static str> {
 
 // ---- launchd ----
 
+#[cfg(any(test, target_os = "macos"))]
 #[derive(Debug, PartialEq, Eq)]
 pub enum LaunchdTrigger {
     Calendar {
@@ -461,6 +477,7 @@ pub enum LaunchdTrigger {
     Interval(u64),
 }
 
+#[cfg(any(test, target_os = "macos"))]
 pub fn launchd_calendar(s: &Schedule) -> anyhow::Result<LaunchdTrigger> {
     Ok(match s {
         Schedule::Daily { time } => {
@@ -488,6 +505,7 @@ pub fn launchd_calendar(s: &Schedule) -> anyhow::Result<LaunchdTrigger> {
 
 // ---- schtasks ----
 
+#[cfg(any(test, target_os = "windows"))]
 pub fn schtasks_args(s: &Schedule) -> anyhow::Result<Vec<String>> {
     let v = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
     Ok(match s {
@@ -518,6 +536,7 @@ pub fn schtasks_args(s: &Schedule) -> anyhow::Result<Vec<String>> {
     })
 }
 
+#[cfg(any(test, target_os = "windows"))]
 fn schtasks_dow(wd: u8) -> anyhow::Result<&'static str> {
     if wd == 0 || wd > 7 {
         anyhow::bail!("bad weekday {wd}");
