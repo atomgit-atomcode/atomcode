@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.3</span>
+    <span class="dhdr-ver">v5.0.4</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -104,7 +104,7 @@
       <ul>
         <li>先确认 <code>~/.atomcode/config.toml</code> 里的 <code>base_url</code> 是否可达，<code>curl</code> 一下对应的 <code>/v1/models</code> 接口；</li>
         <li>企业网络里常见是代理问题，设置 <code>HTTPS_PROXY</code> 环境变量后重试；</li>
-        <li>Windows v5.0.3 默认使用系统 SChannel 证书库，可识别企业安装的根证书；若仍失败，请分别检查系统证书、代理和 <code>SSL_CERT_FILE</code> 等覆盖变量。</li>
+        <li>Windows v5.0.4 默认使用系统 SChannel 证书库，可识别企业安装的根证书；若仍失败，请分别检查系统证书、代理和 <code>SSL_CERT_FILE</code> 等覆盖变量。</li>
         <li>国内访问境外模型需要确认出口网络；可以先用 <code>/model</code> 切换到 AtomGit 官方通道确认整体链路是通的。</li>
       </ul>
 
