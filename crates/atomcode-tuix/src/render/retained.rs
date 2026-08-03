@@ -7526,14 +7526,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_text(&body, &warn_style);
             }
             UiLine::Muted(msg) => {
-                // Dim, non-bold informational line — no forced prefix.
-                // Same DarkGrey palette as CompactionMark so it recedes
-                // into scrollback without reading as a warning or error.
-                let style = CellStyle {
-                    fg: Some(crossterm::style::Color::DarkGrey),
-                    bold: false,
-                    ..CellStyle::default()
-                };
+                // Dim, non-bold informational line — no forced prefix. Use the
+                // THEME-AWARE muted role, NOT a hardcoded DarkGrey: DarkGrey is
+                // `MUTED_LIGHT` (SGR 90), which on a dark terminal collapses into
+                // the background and is illegible — e.g. the rate-limit
+                // "限流，Ns 后自动继续…" countdown. `Role::Muted` resolves to
+                // SGR 37 (readable light-gray) on dark themes and keeps DarkGrey
+                // on light, and it also honours NO_COLOR (no fg SGR).
+                let style = self.style_for(Role::Muted);
                 self.push_body_text(&scrub_controls(&msg), &style);
             }
             UiLine::CompactionMark(label) => {
@@ -12445,6 +12445,55 @@ mod tests {
             !name_cell.faint,
             "tool name must NOT be faint, got {:?}",
             name_cell,
+        );
+    }
+
+    /// A `UiLine::Muted` line (rate-limit countdown, version notice, …) must be
+    /// legible on a dark terminal. Regression: the handler hardcoded DarkGrey
+    /// (`MUTED_LIGHT` / SGR 90 = "bright black"), which on a dark background
+    /// collapses into the bg and reads as unreadable — the "限流，Ns 后自动继续…"
+    /// countdown was invisible. It must use the theme-aware muted role, which
+    /// is `Color::Grey` (SGR 37) on dark and DarkGrey on light.
+    #[test]
+    fn muted_line_uses_legible_theme_aware_gray_not_hardcoded_darkgrey() {
+        let _theme = crate::highlight::theme::test_lock();
+
+        // Dark theme → Color::Grey (readable light-gray), never DarkGrey.
+        crate::highlight::theme::set_theme_mode(false);
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        r.render(UiLine::Muted("限流，3s 后自动继续…".into()));
+        r.flush_deferred();
+        let dark_cells: Vec<_> = r
+            .body_lines
+            .iter()
+            .flatten()
+            .filter(|c| c.ch != ' ')
+            .collect();
+        assert!(!dark_cells.is_empty(), "muted line rendered no visible cells");
+        assert!(
+            dark_cells.iter().all(|c| c.style.fg == Some(Color::Grey)),
+            "dark-theme muted must be Color::Grey (legible), got {:?}",
+            dark_cells.iter().map(|c| c.style.fg).collect::<Vec<_>>(),
+        );
+        assert!(
+            dark_cells.iter().all(|c| c.style.fg != Some(Color::DarkGrey)),
+            "dark-theme muted must NOT be DarkGrey (SGR 90 collapses into the bg)",
+        );
+
+        // Light theme keeps DarkGrey (a readable gray on white) — unchanged.
+        crate::highlight::theme::set_theme_mode(true);
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        r.render(UiLine::Muted("限流，3s 后自动继续…".into()));
+        r.flush_deferred();
+        assert!(
+            r.body_lines
+                .iter()
+                .flatten()
+                .filter(|c| c.ch != ' ')
+                .all(|c| c.style.fg == Some(Color::DarkGrey)),
+            "light-theme muted stays DarkGrey",
         );
     }
 

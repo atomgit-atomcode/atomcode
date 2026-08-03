@@ -21167,9 +21167,10 @@ fn handle_agent_event(
             //   "⏸ 5小时窗口已用尽，约 HH:MM 恢复…" / "…稍后恢复…"
             // auto_resuming=false + NO window data (external-model / generic 429):
             //   "⏸ 限流（HTTP 429）[：<provider reason>]…" — not a CodingPlan quota.
-            // UiLine::Muted: dim DarkGrey, no forced prefix, non-bold.
-            // Rate-limit is a pause, not an error/warning — it must not
-            // render with the yellow `! ` prefix that Warning applies.
+            // UiLine::Muted: theme-aware muted gray (legible on dark AND light),
+            // no forced prefix, non-bold. Rate-limit is a pause, not an
+            // error/warning — it must not render with the yellow `! ` prefix
+            // that Warning applies.
             let line = format_rate_limited_line(
                 &reset_at_display,
                 &reset_label,
