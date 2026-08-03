@@ -18,6 +18,7 @@ async function main() {
     'daemon-client-error.test.ts',
     'auth-status.test.ts',
     'daemon-process-env.test.ts',
+    'daemon-identity.test.ts',
     'provider-queue-regression.test.ts',
     'mode-state.test.ts',
     'mode-selector-style.test.ts',
