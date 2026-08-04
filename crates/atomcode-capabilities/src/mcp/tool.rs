@@ -15,6 +15,33 @@ use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
 use super::client::McpToolInfo;
 use super::registry::McpRegistry;
 
+/// Replace every character that OpenAI/litellm forbids in a `function.name`
+/// (anything outside `[a-zA-Z0-9_-]`) with `-`. Real MCP servers routinely
+/// declare server/tool names containing spaces, dots, colons or CJK characters;
+/// unsanitized they break the whole request with a 400
+/// `invalid_request_error` (see issue #1289).
+pub fn sanitize_name_segment(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// The name the LLM sees for an MCP tool. Keeps the `mcp__{server}__{tool}`
+/// shape while making every segment a valid OpenAI function-name fragment.
+pub fn mcp_tool_full_name(server: &str, tool: &str) -> String {
+    format!(
+        "mcp__{}__{}",
+        sanitize_name_segment(server),
+        sanitize_name_segment(tool)
+    )
+}
+
 /// Wraps one MCP tool (`server` + `tool`) as a kernel `Tool`. The LLM sees it as
 /// `mcp__{server}__{tool}`; calls route through the shared [`McpRegistry`].
 pub struct McpToolAdapter {
@@ -33,7 +60,7 @@ impl McpToolAdapter {
     /// Build an adapter from a discovered tool's [`McpToolInfo`] and the live
     /// registry that owns the server connection.
     pub fn new(registry: Arc<McpRegistry>, info: McpToolInfo) -> Self {
-        let full_name = format!("mcp__{}__{}", info.server_name, info.tool_name);
+        let full_name = mcp_tool_full_name(&info.server_name, &info.tool_name);
         let description = if info.description.is_empty() {
             format!(
                 "MCP tool from server '{}'. See input schema for details.",
@@ -213,5 +240,45 @@ mod tests {
             adapter.always_grant_scope(r#"{"q":"b"}"#)
         );
         assert_eq!(adapter.always_grant_scope("{}"), "");
+    }
+
+    /// The mounted full name must be a valid OpenAI function name, i.e. only
+    /// `[a-zA-Z0-9_-]` (litellm rejects any other character with a 400
+    /// `invalid_request_error`). Real MCP servers routinely declare server/tool
+    /// names with spaces, colons, dots — see issue #1289 where a server with
+    /// such a name broke the whole request.
+    #[test]
+    fn full_name_sanitizes_characters_opena_llm_rejects() {
+        let adapter = McpToolAdapter::new(
+            Arc::new(McpRegistry::new()),
+            info("docs w/ spaces", "query#result"),
+        );
+        let name = adapter.full_name();
+        // No character outside the allowed set may survive into the function name.
+        for ch in name.chars() {
+            assert!(
+                ch.is_ascii_alphanumeric() || ch == '_' || ch == '-',
+                "unexpected char {ch:?} in {name:?}"
+            );
+        }
+        assert!(name.starts_with("mcp__"), "must keep mcp__ prefix: {name}");
+    }
+
+    /// Chinese / other non-ASCII server or tool names (seen with CJK-region MCP
+    /// servers) must likewise sanitize to a valid OpenAI function name.
+    #[test]
+    fn non_ascii_names_are_sanitized() {
+        let adapter = McpToolAdapter::new(
+            Arc::new(McpRegistry::new()),
+            info("文档服务", "读取文件"),
+        );
+        let name = adapter.full_name();
+        assert!(name.is_ascii(), "must be pure ASCII: {name}");
+        for ch in name.chars() {
+            assert!(
+                ch.is_ascii_alphanumeric() || ch == '_' || ch == '-',
+                "unexpected char {ch:?} in {name:?}"
+            );
+        }
     }
 }
