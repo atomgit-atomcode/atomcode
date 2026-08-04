@@ -1,253 +1,240 @@
 # AtomCode MCP 集成说明
 
-> AtomCode 已实现 **MCP（Model Context Protocol）客户端**：通过 `.mcp.json` / `~/.atomcode/mcp.json` 连接外部 MCP server，将其 **tools** 暴露为与普通内建工具一致的可调用工具（含审批链路）。
+> AtomCode 实现了 **MCP（Model Context Protocol）客户端**：通过 `.mcp.json` / `~/.atomcode/mcp.json` 连接外部 MCP server，把它们的 **tools** 暴露成与内建工具一致的可调用工具（含审批链路）。
+>
+> 实现位于 **`crates/atomcode-capabilities/src/mcp/`**（L1 能力层，`mcp` Cargo feature，非 default），零 `atomcode-core` 依赖。
 
 ---
 
-## 1. 当前能力概览
+## 1. 用户如何添加一个 MCP server
 
-### 1.1 已实现
-
-- **配置**：项目根 `.mcp.json` 与用户目录 `~/.atomcode/mcp.json`；顶层键 **`mcpServers`**（与 Cursor 等一致）；旧键 `servers` 仍可解析；同名 server **项目覆盖用户**；支持 `disabled`；字符串中 `${VAR}`、`${VAR:-default}` 展开。
-- **传输**：`stdio`（`command` + `args` + `env`）、`HTTP`（`url` + `headers`）；默认超时 30s，可用 `timeout_ms` 覆盖。HTTP 请求在未自定义 `Accept` 时默认带 `Accept: application/json, text/event-stream`（与 Playwright 等要求 Streamable HTTP / SSE 协商的端点一致）。HTTP OAuth 支持 `auth.type = "oauth"`、Bearer 注入、401 metadata discovery、PKCE 登录、动态客户端注册与 refresh token。**stdio 消息格式**与 MCP 规范一致：每条 JSON-RPC 为 **一行 NDJSON**（末尾换行）；仍兼容读取旧式 **`Content-Length:` + 正文** 的服务端响应。
-- **协议**：JSON-RPC；`initialize`、`tools/list`、`tools/call`；`initialize` 结果里解析 `capabilities`（当前仅用到 tools 能力标记）。
-- **兼容性细节**：当某个请求不需要参数时，客户端会**省略** `params` 字段（不会发送 `"params": null`），避免部分 JS SDK 服务端在收到 `null` 时卡住（例如 `tools/list`）。
-- **工具注册**：每个远端 tool 映射为 `mcp__{server_key}__{tool_name}`，经 `McpToolAdapter` 注册到 `ToolRegistry`。
-- **权限**：MCP 适配器对每次调用返回 `RequireApproval`（说明里带 server / tool / 参数摘要），走现有交互式审批；`PermissionStore` 的 session grant / override 按键为 **完整工具名** `mcp__...`（与内建工具相同），**不是** `mcp:server:tool` 形式。
-- **无头模式**（`-p` / `--prompt-file` / `fixissue`）：启动时 **`McpRegistry::from_config` 同步连接**启用中的 server，连接成功后再 `list_tools` 并一次性注册 MCP 工具。
-- **TUI 模式**：**后台并行连接**（`from_config_background_with_events`），不阻塞进入界面；连接成功或失败通过 `McpConnectEvent` 写入会话区；**每连上一个 server 就 `register_mcp_tools_async` 动态追加**该 server 的工具。
-- **`/mcp`**：列出当前 registry 中 **已成功 `initialize` 并入表** 的 server 及其 `ServerStatus`（见下节限制）；`/mcp reload` 重新加载 `.mcp.json` / `~/.atomcode/mcp.json` 并后台重连启用中的 server；`/mcp tools <server>` 异步列出该 server 的远端 tools（若超时/失败会提示）。TUI 动态注册和 `/mcp tools` 的外层 `tools/list` 等待时间按该 server 的 `timeout_ms + 5s` 计算（默认 35s），避免早于 transport 自身超时取消。
-
-### 1.2 未实现 / 限制（与代码一致）
-
-- **Resources / Prompts**：无 `list_mcp_resources`、`read_mcp_resource`，无 MCP prompt → slash command。
-- **HTTP 自动重连**：无指数退避；stdio 子进程无自动重启。
-- **`tools/list` 变更**：无 `list_changed` 动态刷新。
-- **`/mcp` 展示**：registry 里**只保存连接成功**（`initialize` 成功）的 server，因此 `/mcp` 只会展示**已连接**的 server；失败/未连上/正在连接的 server **不会**出现在列表中（失败仅通过会话行 `✗ MCP server '…' failed: …` 可见）。
-- **工具结果内容**：`call_tool` 仅将 **text** 类型 content 块拼接为字符串；image/resource 块当前不参与输出。
-- **roots / elicitation**、daemon 侧 MCP API、插件捆绑 server：未实现。
-- **OAuth 限制**：通用 OAuth 只覆盖 HTTP MCP；登录需显式执行 `atomcode mcp login <server>` 或 `/mcp login <server>`，后台连接不会自动弹浏览器。若授权服务器不提供 dynamic client registration，需要在配置或命令行提供 `client_id`；confidential client 需要通过环境变量提供 secret。
-
----
-
-## 2. 设计原则（仍适用）
-
-- **内建工具优先，MCP 作外延**：内建工具语义稳定；MCP 用于 GitHub、数据库等外部能力。
-- **复用现有栈**：`ToolRegistry`、`PermissionStore` / `InteractivePermissionDecider`、`TurnRunner`、`AgentLoop`；工具输出与其它工具一样会经过统一的 `post_process_tool_results` 等后处理路径（大输出截断策略由全局 truncate 逻辑决定，**无**单独的「MCP-only」外部化存储）。
-
----
-
-## 3. 代码模块布局
-
-实现位于 `crates/atomcode-core/src/mcp/`：
-
-| 文件 | 职责 |
-|------|------|
-| `mod.rs` | 模块导出 |
-| `config.rs` | 配置反序列化、`load_mcp_config`、环境变量展开 |
-| `types.rs` | JSON-RPC、initialize/list/call 相关类型、`ServerStatus` |
-| `client.rs` | `McpClient` trait、`McpToolInfo` |
-| `registry.rs` | `McpRegistry`、后台/阻塞加载、`McpConnectEvent`、`call_tool` |
-| `transport_stdio.rs` | stdio 子进程与读写循环 |
-| `transport_http.rs` | HTTP 客户端封装 |
-| `tool_adapter.rs` | `McpToolAdapter`、`register_mcp_tools` / `register_mcp_tools_async` |
-
-CLI 入口（`crates/atomcode-cli/src/main.rs`）根据是否无头选择阻塞或后台 MCP 初始化；TUI（`crates/atomcode-tuix`）消费 `mcp_connect_rx` 并动态注册工具；斜杠命令 **`/mcp`** 在 `crates/atomcode-tuix/src/event_loop/commands.rs` 中实现。
-
----
-
-## 4. 工具命名与执行路径
-
-- **对外工具名**：`mcp__{mcpServers 映射中的 key}__{远端 tool name}`  
-  例：配置里 `"mcpServers": { "github": { ... } }` 且远端有 `get_issue` → `mcp__github__get_issue`。
-- **执行**：`TurnRunner` 分发到适配器 → `McpRegistry::call_tool` → 对应 transport 的 `tools/call`。
-- **禁用工具**：与其它工具相同，可使用 `--disable-tools` 或环境变量 `ATOMCODE_DISABLE_TOOLS`（逗号分隔），传入完整名如 `mcp__github__get_issue`。
-
----
-
-## 5. 配置说明
-
-### 5.1 Schema 要点
-
-顶层为 `{ "mcpServers": { "<name>": { ... } } }`（亦兼容旧键 `"servers"`）。每个 server 建议只写一种 transport：
-
-- **stdio**：`command`（必填）+ 可选 `args`、`env`、`timeout_ms`、`disabled`
-- **HTTP**：`url`（必填）+ 可选 `headers`、`auth`、`timeout_ms`、`disabled`
-
-如果同一个 server 同时写了 `command` 和 `url`，当前实现会优先按 stdio（`command`）处理；为避免歧义，对外配置请不要双写。
-
-### 5.2 项目级 `.mcp.json` 示例
-
-```json
-{
-  "mcpServers": {
-    "github": {
-      "url": "https://api.githubcopilot.com/mcp/",
-      "auth": {
-        "type": "oauth",
-        "provider": "github",
-        "client_secret_env": "GITHUB_MCP_CLIENT_SECRET"
-      },
-      "timeout_ms": 60000
-    },
-    "notion": {
-      "url": "https://mcp.notion.com/mcp",
-      "auth": {
-        "type": "oauth",
-        "issuer": "https://mcp.notion.com",
-        "resource": "https://mcp.notion.com/mcp"
-      },
-      "timeout_ms": 30000
-    },
-    "postgres": {
-      "command": "npx",
-      "args": ["-y", "@bytebase/dbhub", "--dsn", "${POSTGRES_DSN}"],
-      "env": {
-        "NODE_ENV": "production"
-      },
-      "timeout_ms": 10000
-    }
-  }
-}
-```
-
-OAuth 字段：
-
-- `type = "oauth"`：启用 HTTP OAuth。
-- `issuer`：可选授权服务器 issuer；省略时客户端会先请求 MCP server 并从 `WWW-Authenticate` 发现 resource metadata。
-- `resource`：可选 resource identifier 或 metadata URL；token 请求会带上 resource。
-- `client_id`：可选预注册客户端 ID；若省略，客户端会尝试 dynamic client registration。
-- `client_secret_env`：可选环境变量名，用于 confidential client 的 secret。
-- `scopes`：可选 scope 列表；省略时不主动请求 scope，由授权服务器使用默认授权范围。
-
-GitHub OAuth App 使用 authorization-code flow 时需要 client secret；可在配置中写 `"client_secret_env": "GITHUB_MCP_CLIENT_SECRET"`，或登录时传 `--client-secret-env GITHUB_MCP_CLIENT_SECRET`。
-
-GitHub MCP 的完整配置和排错流程见 [mcp/github.md](./mcp/github.md)。
-
-### 5.3 用户级配置
-
-路径：`~/.atomcode/mcp.json`，字段相同。**同名 server 以项目级为准**（后写入的 project 配置覆盖 user）。
-
-### 5.4 CLI：`atomcode mcp add`（类 Claude `mcp add`）
-
-向 **stdio** 配置写入 `mcpServers.<name>`（`command` + `args`），无需手改 JSON：
+### 1.1 `atomcode mcp add`（最快；仅 stdio）
 
 ```bash
-# 项目根 .mcp.json（默认当前目录）
+# 写进项目根 .mcp.json（默认当前目录）
 atomcode mcp add playwright npx @playwright/mcp@latest
 
-# 用户级 ~/.atomcode/mcp.json
-atomcode mcp add playwright npx @playwright/mcp@latest --global
+# 写进用户级 ~/.atomcode/mcp.json
+atomcode mcp add playwright npx -y @playwright/mcp@latest --global
 
 # 指定项目目录
 atomcode mcp add playwright npx @playwright/mcp@latest -C /path/to/repo
 ```
 
-说明：
+首参是 server 键名，其后整串是可执行文件 + 参数。**同名会整段覆盖**该键（只写 `command`/`args`，原有 `env` 等字段不保留）。HTTP 型 server 请手写 JSON。
 
-- 与 `claude mcp add <name> <command> [args…]` 同一思路：首参为 server 键名，其后为可执行文件及参数。
-- **同名会整段覆盖**该键（仅写入 `command` / `args`，不保留该键下原 `env` 等字段）；HTTP 型 `url` 条目请仍用手写 JSON 或编辑器。
-- 合并时会读入已有 `servers` + `mcpServers`，写回时只保留 **`mcpServers`**（去掉顶层 `servers`）。
+### 1.2 手写配置（HTTP 只能走这条）
 
-### 5.5 CLI：HTTP OAuth 登录
+项目根 `.mcp.json` 或用户级 `~/.atomcode/mcp.json`，顶层键 `mcpServers`（兼容旧键 `servers`）：
 
-```bash
-# GitHub remote MCP（client id 也可由 ATOMCODE_GITHUB_MCP_CLIENT_ID 提供）
-atomcode mcp add-github-oauth github --global
-atomcode mcp login github \
-  --client-id "$ATOMCODE_GITHUB_MCP_CLIENT_ID" \
-  --client-secret-env GITHUB_MCP_CLIENT_SECRET
-
-# 通用 HTTP OAuth MCP
-atomcode mcp login notion
-
-# 需要 confidential client 的服务
-atomcode mcp login slack --client-id "$SLACK_CLIENT_ID" --client-secret-env SLACK_CLIENT_SECRET
+```json
+{
+  "mcpServers": {
+    "postgres": {
+      "command": "npx",
+      "args": ["-y", "@bytebase/dbhub", "--dsn", "${POSTGRES_DSN}"],
+      "env": { "NODE_ENV": "production" },
+      "timeout_ms": 10000
+    },
+    "notion": {
+      "url": "https://mcp.notion.com/mcp",
+      "headers": { "X-Workspace": "${NOTION_WS}" },
+      "auth": { "type": "oauth", "issuer": "https://mcp.notion.com" },
+      "trust": true,
+      "autoApprove": ["search"]
+    }
+  }
+}
 ```
 
-登录成功后 token 存在 `~/.atomcode/mcp_auth.toml`，后续 HTTP 请求自动加 `Authorization: Bearer ...`。token 过期且有 refresh token 时会自动刷新；刷新失败时重新执行 login。
+**支持 JSONC 注释**：`//` 行注释与 `/* */` 块注释都会在解析前被剔除（`config.rs::strip_json_comments`），字符串内容不受影响——`"https://…"` 里的 `//` 不会被误当注释。仓库根的 `.mcp.json.example` 可以原样复制使用。
 
----
+两条限制：
 
-## 6. 运行时行为摘要
+- **尾逗号仍然非法**，这是注释容忍不是 JSON5。
+- `atomcode mcp add` 和运行时「Always 放行」是读-改-写，会重新序列化整个文件。为了不抹掉你的注释，它们检测到注释时**拒绝改写并报错**，请手动编辑（或先移除注释）。只读加载不受影响。
 
-| 模式 | MCP 加载 | 工具出现时机 |
-|------|------------|----------------|
-| TUI | 后台 `tokio::spawn` 并行连接 | 各 server `initialize` 成功后陆续注册 |
-| 无头（`-p` / `--prompt-file` / `fixissue`） | `from_config().await` 阻塞至各连接尝试结束 | 仅在至少拿到一批工具时挂载 `McpRegistry`；若全部失败则无 MCP 工具 |
-
-单个 server 连接失败 **不会**拖垮进程；错误打到 stderr 或 TUI 会话中的 `McpConnectEvent::Failed`。
-
----
-
-## 7. 安全与审批
-
-- MCP 工具默认 **每次** 走 `RequireApproval`（外部不可信代码）。
-- 持久/会话放行在 `PermissionStore` 中按 **`mcp__server__tool` 全名** 记录。
-- 将 MCP 返回内容视为不可信工具输出，不得当作 system 指令升级。
-
----
-
-## 8. 路线图（文档层跟踪，非代码承诺）
-
-| 阶段 | 内容 | 状态 |
-|------|------|------|
-| Phase 1 MVP | stdio/HTTP、tools、配置、审批、TUI 连接提示与 `/mcp`（已连 server） | **已落地** |
-| Phase 2 | resources/prompts 工具、动态 list_changed、HTTP 重连、更完整的 MCP 面板 | 未做 |
-| Phase 3 | roots、elicitation、daemon MCP API、插件携带 server | 未做 |
-
----
-
-## 9. 验收参考（手工）
-
-1. 项目根放置 `.mcp.json` 后，启动 AtomCode（TUI）可在会话区看到 MCP 连接成功/失败行。
-2. 连接成功后，对应 MCP tools 以 `mcp__...` 形式进入模型可用工具集（TUI 下可能略晚于首屏）。
-3. 模型调用 MCP tool 时走现有确认 UI；无头模式下需审批的工具策略与现有一致（如 bash 自动允许等，其它仍受审批逻辑约束）。
-4. 某一 server 失败时，其余 server 与主程序仍可用。
-
----
-
-## 10. 测试方法
-
-### 10.1 内置 `mcp-test-server`
-
-源码：`crates/atomcode-core/src/bin/mcp-test-server.rs`，提供 `echo` tool（参数 `message`）。
-
-在工作区根目录构建：
+### 1.3 远程 OAuth server
 
 ```bash
-cargo build --release -p atomcode-core --bin mcp-test-server
+atomcode mcp add-github-oauth github --global    # 只写配置，不登录
+atomcode mcp login github --client-secret-env GITHUB_MCP_CLIENT_SECRET
+atomcode mcp logout github                       # 删除已存凭证
 ```
 
-可执行文件：`target/release/mcp-test-server`（相对仓库根）。
+TUI 里等价的是 `/mcp login <server>` / `/mcp logout <server>`。token 存 `~/.atomcode/mcp_auth.toml`（0600），后续 HTTP 请求自动加 `Authorization: Bearer`；过期且有 refresh token 会自动刷新，刷新失败需重新 login。**后台连接不会自动弹浏览器**，必须显式登录。
 
-### 10.2 `.mcp.json` 最小示例
+### 1.4 ⚠️ 项目信任门（容易踩的一步）
+
+**项目级 `.mcp.json` 里的 server，在未信任的项目里根本不会连**，状态显示 `blocked: untrusted project`（`registry.rs::partition_by_trust`）。用户级 `~/.atomcode/mcp.json` 不受此限。
+
+```
+/mcp trust        # 信任当前项目
+/mcp untrust      # 撤销
+```
+
+信任记录在 `~/.atomcode/mcp_trust.json`（可用 `ATOMCODE_MCP_TRUST_STORE` 覆盖路径，测试用）。daemon 侧对应 `POST /live/mcp/trust`。
+
+### 1.5 生效
+
+改完配置**不用重启**，`/mcp reload` 即可（重新读两份配置并后台重连）。
+
+---
+
+## 2. 配置 schema
+
+顶层 `{ "mcpServers": { "<name>": { … } } }`。每个 server 只写一种 transport；同时写 `command` 和 `url` 时**按 stdio 处理**，请勿双写。
+
+| 字段 | 适用 | 说明 |
+|---|---|---|
+| `command` | stdio | 必填。可执行文件 |
+| `args` | stdio | 参数数组 |
+| `env` | stdio | 传给子进程的环境变量 |
+| `url` | HTTP | 必填。Streamable HTTP 端点 |
+| `headers` | HTTP | 自定义请求头；用户在此钉的头不会被客户端覆盖 |
+| `auth` | HTTP | `{"type":"oauth", …}` 或 bearer/header 形式 |
+| `timeout_ms` | 两者 | 单请求超时，默认 30000 |
+| `disabled` | 两者 | `true` 时该 server 完全跳过 |
+| `trust` | 两者 | `true` ⇒ 该 server 所有工具免审批 |
+| `autoApprove` | 两者 | 按工具名白名单免审批（别名 `auto_approve`） |
+
+`auth` 子字段：`type`（`"oauth"`）、`provider`、`issuer`、`resource`、`client_id`、`client_secret_env`、`scopes`、`bearer`、`header`。省略 `issuer` 时客户端先请求 MCP server，从 `WWW-Authenticate` 发现 resource metadata；省略 `client_id` 时尝试动态客户端注册（RFC 7591），授权服务器不支持则报错要求预注册 ID。
+
+所有字符串支持 `${VAR}` 与 `${VAR:-默认值}` 展开，`command`/`args` 还支持 `~` 展开。
+
+**同名 server 项目级覆盖用户级**。
+
+---
+
+## 3. 运行时行为
+
+**单一装配路径**：TUI / 无头 / clix 都走 `McpRegistry::from_config_background_with_events`（`atomcode-coding/src/parts.rs:490`）——后台并行连接，不阻塞启动。区别只在要不要等：
+
+| 模式 | 是否等待 |
+|---|---|
+| TUI | 不等。每个 server `initialize` 成功后，`mount()` 原子发布该 server 的工具供下一轮使用 |
+| 无头 / clix | `runtime.wait_mcp_ready(CONNECT_TIMEOUT)`（30s，`atomcode-cli/src/main.rs:2251`）等到初次连接尝试全部落定 |
+
+单个 server 失败不拖垮进程；失败通过 `McpConnectEvent::Failed` 进入会话区，并保留在 `/mcp` 列表里显示为 `failed: <error>`。
+
+MCP 总开关：`CodingRuntimeConfig.mcp` 默认 `true`；`atomcode-clix` 提供 `--no-mcp`。主 CLI 没有全局关闭开关，按 server 用 `"disabled": true`。
+
+> **缓存红线**：MCP 工具定义属于 provider 请求的缓存前缀，所以连接在首轮之前发起、工具集不在会话中途原地变更；`/mcp reload` 是重建（新前缀世代），不是原地改。
+
+---
+
+## 4. 工具命名、审批与放行
+
+- **工具名**：`mcp__{server键}__{远端工具名}`。例：`"mcpServers": {"github": …}` 且远端有 `get_issue` → `mcp__github__get_issue`。
+- **名字会被 sanitize**：模型看到的 `function.name` 必须匹配 `^[a-zA-Z0-9_-]+$`，而真实 server 常声明带空格、点、冒号甚至中文的工具名（litellm 会直接 400 打断整个请求，#1289）。因此两段名字里的非法字符都会被替换成 `-`（`tool.rs::sanitize_name_segment`），例如远端 `search.docs` → `mcp__srv__search-docs`。**实际调用仍按真实的 server / tool 名路由**，sanitize 只影响对外可见的名字；反查、autoApprove 匹配、按 server 列工具都按 sanitize 后的形式对齐。
+- **默认审批**：MCP 是外部不可信代码，适配器声明 `risk() = Risky`，每次调用都过审批。
+- **免审批的三条路**：配置 `trust: true`（整个 server）、配置 `autoApprove: [...]`（按工具）、运行时选 "Always"（写回配置，`config.rs::add_auto_approved_tool`）。
+- **权限键**：session grant / override 按**完整工具名** `mcp__server__tool` 记录，与内建工具一致，**不是** `mcp:server:tool`。
+- **Plan mode**：服务器显式标注 `readOnlyHint: true` 且未标 `destructiveHint: true` 的工具，在计划模式下可执行；矛盾标注（两者皆 true）按不可读只处理，走审批（`types.rs::is_read_only`，与 codex 行为对齐）。
+
+---
+
+## 5. `/mcp` 与命令行
+
+**TUI 斜杠命令**（`atomcode-tuix/src/event_loop/commands.rs::parse_mcp_subcommand`）：
+
+| 命令 | 作用 |
+|---|---|
+| `/mcp` | 列出所有 server 及状态（含 `failed` / `blocked: untrusted project`） |
+| `/mcp reload` | 重新加载两份配置并后台重连 |
+| `/mcp tools <server>` | 列出该 server 的远端工具（等待上限 = 该 server `timeout_ms + 5s`，默认 35s） |
+| `/mcp login <server>` / `/mcp logout <server>` | OAuth 登录 / 清除凭证 |
+| `/mcp trust` / `/mcp untrust` | 信任 / 取消信任当前项目 |
+
+**CLI 子命令**：`atomcode mcp add`、`add-github-oauth`、`login`、`logout`。
+
+**daemon HTTP 端点**：`GET /mcp/status`、`POST /mcp/reload`、`POST /live/mcp/trust`。
+
+---
+
+## 6. 协议细节
+
+- **协议修订**：`initialize` 请求 `2025-11-25`（`types.rs::MCP_PROTOCOL_VERSION`），并接受服务器协商降级到更早修订。
+- **`MCP-Protocol-Version`**：HTTP 传输在握手之后的每个请求（含 `notifications/initialized` 与会话 DELETE）都回显**服务器同意的**修订；握手本身不带、空值不带、用户自钉该头时不覆盖。
+- **客户端能力**：`initialize` 声明**空** `capabilities: {}`——我们不实现 roots / sampling / elicitation。（历史上曾错误地声明 `{"tools": {}}`，`tools` 是服务器能力。）
+- **方法**：`initialize`、`tools/list`、`tools/call`。
+- **stdio 帧**：标准 NDJSON（一行一条 JSON-RPC）；额外兼容读取旧式 `Content-Length:` + 正文；对启动期打到 stdout 的非协议日志行有容忍（上限 100 行）。
+- **stdio 断线重连**：进程退出 / EPIPE 等可恢复错误触发一次自动重连（generation 计数避免并发重复重启）。**已发出的 `tools/call` 不会自动重放**——副作用不明时宁可报错，不重复执行。
+- **HTTP**：默认 `Accept: application/json, text/event-stream`（用户未自定义时），响应支持单 JSON 或 SSE 帧；捕获并回送 `Mcp-Session-Id`（Figma Dev Mode 等有状态服务器要求），析构时尽力发 DELETE 释放会话。
+- **`params` 省略**：不需要参数的方法不会发 `"params": null`（部分 JS SDK 服务端收到 `null` 会卡住，如 `tools/list`）。
+
+---
+
+## 7. 未实现 / 已知限制
+
+- **Resources / Prompts**：无 `resources/*`、`prompts/*`，MCP prompt 不映射为斜杠命令。
+- **通知 / 订阅**：无 `list_changed` 动态刷新、无 `notifications/*` 消费、无 sampling、无 elicitation、无 roots。
+- **工具结果**：`call_tool` 只把 **text** 内容块拼成字符串，image / resource 块被丢弃（`registry.rs::call_tool`），`structuredContent` / `outputSchema` 未支持。
+- **HTTP 重连**：无指数退避（stdio 有一次性重连，HTTP 没有）。
+- **OAuth**：仅覆盖 HTTP MCP；无 `iss` 校验（RFC 9207）、DCR 不带 `application_type`、凭证未按 issuer 绑定——均为 `2026-07-28` 修订新增的 SHOULD/MUST。
+- **`2026-07-28` 修订整体未支持**：该修订删除 `initialize` 握手改用 `server/discover`，本客户端不会说；同时新增的 Tasks / MRTR / `subscriptions/listen` / 缓存提示均未实现。
+- **插件捆绑 server**：未实现。
+
+替换为官方 Rust SDK（`rmcp`）以一次性解决上述协议层落后的可行性评估见 **[mcp-rmcp-feasibility.md](./mcp-rmcp-feasibility.md)**。
+
+---
+
+## 8. 代码布局
+
+`crates/atomcode-capabilities/src/mcp/`（feature `mcp`）：
+
+| 文件 | 职责 |
+|---|---|
+| `mod.rs` | 导出 + `register_mcp_tools` + `CONNECT_TIMEOUT` |
+| `config.rs` | `.mcp.json` 解析、两级合并、env/`~` 展开、`add_auto_approved_tool` |
+| `types.rs` | JSON-RPC / initialize / list / call 类型、`MCP_PROTOCOL_VERSION`、`initialize_params()`、`ServerStatus`、工具注解判定 |
+| `client.rs` | `McpClient` trait + `McpToolInfo` |
+| `registry.rs` | `McpRegistry`：后台并行连接、trust 分区、`tools/list`、`call_tool`、状态、`McpConnectEvent` |
+| `transport_stdio.rs` | stdio 子进程、NDJSON 读写、重连、Windows `.cmd` 包装 |
+| `transport_http.rs` | Streamable HTTP、SSE 帧解析、会话 id、协议头、OAuth token 注入 |
+| `oauth.rs` | OAuth 登录/刷新、token store、GitHub 特例、metadata discovery |
+| `trust.rs` | 项目信任存储与判定 |
+| `tool.rs` | `McpToolAdapter`：远端工具 → kernel `Tool`，风险等级与审批 |
+| `util.rs` | 本地 home/config-dir 与控制台辅助 |
+
+消费侧：装配在 `atomcode-coding/src/parts.rs`；`/mcp` 斜杠命令在 `atomcode-tuix/src/event_loop/commands.rs`；CLI 子命令在 `atomcode-cli/src/main.rs`；daemon 端点在 `atomcode-daemon/src/lib.rs`。
+
+---
+
+## 9. 测试
+
+### 9.1 内置 `mcp-test-server`
+
+源码 `crates/atomcode-capabilities/src/bin/mcp-test-server.rs`，提供 `echo` 工具（参数 `message`）。**需要 `mcp` feature**（`required-features = ["mcp"]`）：
+
+```bash
+cargo build --release -p atomcode-capabilities --features mcp --bin mcp-test-server
+```
+
+产物：`target/release/mcp-test-server`。最小配置：
 
 ```json
 {
   "mcpServers": {
     "test-server": {
       "command": "target/release/mcp-test-server",
-      "args": [],
       "timeout_ms": 5000
     }
   }
 }
 ```
 
-（路径请按本机 `target/release/...` 或绝对路径调整。）
+对话中调用 `mcp__test-server__echo`，参数含 `"message": "Hello MCP!"`。
 
-### 10.3 运行与调用
+### 9.2 自动化测试
 
 ```bash
-cargo run --release -p atomcode
+cargo test -p atomcode-capabilities --features mcp
 ```
 
-在对话中可让模型使用：`mcp__test-server__echo`，参数 JSON 含 `"message": "Hello MCP!"`。
+`tests/mcp.rs` 用上面这个真实子进程覆盖连接/发现/调用、状态检测、重连与并发失败路径；各模块另有内联单测。
 
-仓库内另有 **`.mcp.json.example`**，演示用 `cargo run ... mcp-test-server` 的方式（默认 `disabled: true`，启用前请改为 `false` 并确认 `manifest-path` 指向 **`crates/atomcode-core/Cargo.toml`** 或等价路径，否则从仓库根执行会找不到包）。
-
-### 10.4 真实生态 Server 示例
+### 9.3 真实生态 server
 
 ```bash
 cat > ~/.atomcode/mcp.json << 'EOF'
@@ -263,22 +250,10 @@ cat > ~/.atomcode/mcp.json << 'EOF'
 EOF
 ```
 
+（放用户级可绕开项目信任门；放项目级记得先 `/mcp trust`。）
+
 ---
 
-## 11. 服务文档
-
-特定 MCP 服务的配置、OAuth 登录和排错步骤放在 `docs/mcp/` 目录：
+## 10. 服务专项文档
 
 - [GitHub MCP OAuth 使用说明](./mcp/github.md)
-
----
-
-## 12. 同类产品参考
-
-| 产品 | 配置 | Transport | 备注 |
-|------|------|-------------|------|
-| Claude Code | `.mcp.json` | stdio/HTTP/SSE | OAuth、resources、prompts 等更全 |
-| Cursor | `.mcp.json` | stdio/HTTP | roots、elicitation 等 |
-| Codex | CLI 添加 | stdio/HTTP | OpenAI 生态 |
-
-AtomCode 使用 **`.mcp.json` 的 `mcpServers` 块**（与 Cursor 等一致，并兼容旧 `servers` 键），常见 `command` / `url` 类型的 MCP server 配置通常可直接复用；超出当前字段或能力范围的配置需按本仓库代码与上表「未实现」一节确认。
