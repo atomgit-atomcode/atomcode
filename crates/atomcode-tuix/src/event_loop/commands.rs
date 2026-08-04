@@ -551,20 +551,33 @@ fn render_context_file_status_block(working_dir: &std::path::Path) -> String {
 }
 
 /// 将当前 TUI Coding Runtime 绑定到 live hub，供 `/webui` 和 `/sync` 共用。
+fn live_provider_selection(config: &Config) -> Result<String, String> {
+    let selection = super::resolved_provider_and_model(config).0;
+    if selection.is_empty() {
+        Err("no model is configured; run /login or /provider first".into())
+    } else {
+        Ok(selection)
+    }
+}
+
 pub(crate) fn attach_live_runtime(
     ctx: &mut LoopCtx,
     mode: AgentMode,
     renderer: &mut dyn Renderer,
 ) -> Result<(), String> {
     let snapshot = ctx.current_session.to_conversation_snapshot();
-    let provider_fingerprint = atomcode_daemon::native_live::provider_fingerprint(
-        &ctx.config,
-        &ctx.config.default_provider,
-    )?;
+    // The running TUI resolves `default_model` before the legacy
+    // `default_provider`, with a catalog fallback when both raw fields are
+    // empty. Reuse that exact selection for the live binding. In particular,
+    // first login can leave `default_provider == ""` while the runtime already
+    // runs the newly published CodingPlan model.
+    let provider_selection = live_provider_selection(&ctx.config)?;
+    let provider_fingerprint =
+        atomcode_daemon::native_live::provider_fingerprint(&ctx.config, &provider_selection)?;
     let binding = atomcode_daemon::native_live::register_embedded_runtime(
         ctx.current_session.id.to_string(),
         ctx.working_dir.clone(),
-        ctx.config.default_provider.clone(),
+        provider_selection,
         provider_fingerprint,
         snapshot,
         std::sync::Arc::new(ctx.runtime.clone()),
@@ -7334,6 +7347,47 @@ mod expand_cd_target_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn new_schema_config(default_model: Option<&str>) -> Config {
+        serde_json::from_value(serde_json::json!({
+            "default_provider": "",
+            "default_model": default_model,
+            "provider_accounts": {
+                "AtomGit": {
+                    "provider": "openai",
+                    "base_url": "https://llm-api.atomgit.com/v1"
+                }
+            },
+            "models": {
+                "AtomGit-Qwen": {
+                    "account": "AtomGit",
+                    "model": "Qwen3-VL-8B-Instruct",
+                    "context_window": 131072
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn live_provider_selection_uses_default_model_when_legacy_default_is_empty() {
+        let config = new_schema_config(Some("AtomGit-Qwen"));
+        assert_eq!(live_provider_selection(&config).unwrap(), "AtomGit-Qwen");
+    }
+
+    #[test]
+    fn live_provider_selection_matches_runtime_catalog_fallback() {
+        let config = new_schema_config(None);
+        assert_eq!(live_provider_selection(&config).unwrap(), "AtomGit-Qwen");
+    }
+
+    #[test]
+    fn live_provider_selection_reports_missing_catalog_without_empty_provider_error() {
+        let config = Config::default();
+        let error = live_provider_selection(&config).unwrap_err();
+        assert!(error.contains("no model is configured"));
+        assert!(!error.contains("provider \"\" not found"));
+    }
 
     #[test]
     fn review_prompt_uses_explicit_tool_scopes() {
