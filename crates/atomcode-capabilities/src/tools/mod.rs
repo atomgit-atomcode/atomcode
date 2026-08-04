@@ -100,7 +100,8 @@ pub use grep::GrepTool;
 pub use list::ListDirTool;
 pub use open_file::{OpenFileTool, OpenFileWorkspaceGate};
 pub use output_artifact::{
-    artifact_id, ArtifactMiddleware, ArtifactStore, FetchOutputTool, THRESHOLD_BYTES,
+    artifact_id, ArtifactMiddleware, ArtifactStore, FetchOutputTool,
+    ARTIFACT_TRUNCATION_MARKER_PREFIX, THRESHOLD_BYTES,
 };
 pub use parallel_edit::ParallelEditTool;
 pub use read::ReadFileTool;
