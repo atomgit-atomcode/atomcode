@@ -1004,21 +1004,18 @@ impl CodingParts {
     }
 
     pub(crate) fn mcp_tools_for_server(&self, server: &str) -> Vec<String> {
-        // Tool names were sanitized by `mcp_tool_full_name` when mounted, so a server
-        // name with characters outside `[a-zA-Z0-9_-]` must be matched by its sanitized
-        // form here too (issue #1289: unsanitized names broke requests with a 400).
-        let prefix = format!(
-            "mcp__{}__",
-            atomcode_capabilities::mcp::sanitize_name_segment(server)
-        );
         let names = match self.mcp_tool_names.read() {
             Ok(names) => names,
             Err(poisoned) => poisoned.into_inner(),
         };
-        names
-            .iter()
-            .filter(|name| name.starts_with(&prefix))
-            .cloned()
+        let Some(registry) = self.mcp_registry.as_ref() else {
+            return Vec::new();
+        };
+        let published: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+        registry
+            .tool_aliases_for_server(server)
+            .into_iter()
+            .filter(|alias| published.contains(alias.as_str()))
             .collect()
     }
 
@@ -1064,11 +1061,14 @@ async fn publish_ready_mcp_tools(
     };
     let adapters: Vec<Arc<dyn atomcode_kernel::tool::Tool>> = tool_infos
         .into_iter()
-        .map(|info| {
-            Arc::new(atomcode_capabilities::mcp::McpToolAdapter::new(
-                mcp_registry.clone(),
-                info,
-            )) as Arc<dyn atomcode_kernel::tool::Tool>
+        .filter_map(|info| {
+            match atomcode_capabilities::mcp::McpToolAdapter::new(mcp_registry.clone(), info) {
+                Ok(adapter) => Some(Arc::new(adapter) as Arc<dyn atomcode_kernel::tool::Tool>),
+                Err(error) => {
+                    eprintln!("[mcp] tool publication skipped: {error}");
+                    None
+                }
+            }
         })
         .collect();
     // Serialize only the in-memory commit. Re-check after locking because a
@@ -1110,11 +1110,14 @@ async fn publish_connected_mcp_server(
     };
     let adapters: Vec<Arc<dyn atomcode_kernel::tool::Tool>> = tool_infos
         .into_iter()
-        .map(|info| {
-            Arc::new(atomcode_capabilities::mcp::McpToolAdapter::new(
-                Arc::clone(&mcp_registry),
-                info,
-            )) as Arc<dyn atomcode_kernel::tool::Tool>
+        .filter_map(|info| {
+            match atomcode_capabilities::mcp::McpToolAdapter::new(Arc::clone(&mcp_registry), info) {
+                Ok(adapter) => Some(Arc::new(adapter) as Arc<dyn atomcode_kernel::tool::Tool>),
+                Err(error) => {
+                    eprintln!("[mcp] tool publication skipped: {error}");
+                    None
+                }
+            }
         })
         .collect();
     let _publish_guard = publish_lock.lock().await;
@@ -1478,6 +1481,7 @@ pub fn assemble(
     if parts.todo_enabled {
         builder = builder.hook(Arc::new(crate::todo::TodoEagerHook::new(
             &cfg.model,
+            &cfg.provider_type,
             cfg.todo.eager,
         )));
     }
@@ -2070,6 +2074,29 @@ mod tests {
 
         assert!(mounted.get("mcp__test__echo").is_none());
         assert!(parts.mcp_tool_names.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_for_server_uses_exact_alias_ownership() {
+        let project = tempfile::tempdir().unwrap();
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        let mut parts = prepare(&cfg, io_free_opts()).await.unwrap();
+        let registry = Arc::new(McpRegistry::new());
+        let info = atomcode_capabilities::mcp::McpToolInfo {
+            server_name: "docs space".into(),
+            tool_name: "read.file".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+            read_only: false,
+        };
+        let adapter =
+            atomcode_capabilities::mcp::McpToolAdapter::new(registry.clone(), info).unwrap();
+        let alias = atomcode_kernel::tool::Tool::name(&adapter).to_string();
+        parts.mcp_registry = Some(registry);
+        parts.mcp_tool_names.write().unwrap().push(alias.clone());
+
+        assert_eq!(parts.mcp_tools_for_server("docs space"), vec![alias]);
+        assert!(parts.mcp_tools_for_server("docs-space").is_empty());
     }
 
     /// `prepare` with all optional capabilities OFF — keeps the call I/O-free (no MCP

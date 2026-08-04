@@ -178,6 +178,7 @@ fn build_coding_agent_from_tools(
         builder = builder.hook(Arc::new(crate::todo::TodoHook));
         builder = builder.hook(Arc::new(crate::todo::TodoEagerHook::new(
             &cfg.model,
+            &cfg.provider_type,
             cfg.todo.eager,
         )));
     }

@@ -34,9 +34,9 @@ pub struct TodoEagerHook {
 }
 
 impl TodoEagerHook {
-    pub fn new(model: &str, configured: TodoEagerness) -> Self {
+    pub fn new(model: &str, provider_type: &str, configured: TodoEagerness) -> Self {
         let normalized = model.to_ascii_lowercase().replace(['_', ' '], "-");
-        let eagerness = match configured {
+        let mut eagerness = match configured {
             TodoEagerness::Auto
                 if normalized.contains("deepseek")
                     && normalized.contains("v4")
@@ -47,6 +47,12 @@ impl TodoEagerHook {
             TodoEagerness::Auto => TodoEagerness::Auto,
             other => other,
         };
+        if eagerness == TodoEagerness::Always && provider_type.eq_ignore_ascii_case("ollama") {
+            eprintln!(
+                "[todo] eager=always is unsupported by provider type ollama; using preferred"
+            );
+            eagerness = TodoEagerness::Preferred;
+        }
         Self { eagerness }
     }
 
@@ -315,7 +321,7 @@ mod tests {
 
     #[tokio::test]
     async fn auto_prefers_deepseek_v4_flash_on_each_new_task() {
-        let hook = TodoEagerHook::new("deepseek-v4-flash", TodoEagerness::Auto);
+        let hook = TodoEagerHook::new("deepseek-v4-flash", "openai", TodoEagerness::Auto);
         let mut msgs = vec![Message::user("analyze and fix this")];
         hook.pre_request(
             &mut msgs,
@@ -335,13 +341,13 @@ mod tests {
             ..Default::default()
         };
         let mut ordinary = vec![Message::user("analyze and fix this")];
-        TodoEagerHook::new("ordinary-model", TodoEagerness::Auto)
+        TodoEagerHook::new("ordinary-model", "openai", TodoEagerness::Auto)
             .pre_request(&mut ordinary, &ctx)
             .await;
         assert_eq!(ordinary.len(), 1, "ordinary Auto stays quiet");
 
         let mut deepseek = vec![Message::user("analyze and fix this")];
-        TodoEagerHook::new("deepseek-v4-flash", TodoEagerness::Auto)
+        TodoEagerHook::new("deepseek-v4-flash", "openai", TodoEagerness::Auto)
             .pre_request(&mut deepseek, &ctx)
             .await;
         assert_eq!(deepseek.len(), 2, "new DeepSeek generation gets the nudge");
@@ -349,7 +355,7 @@ mod tests {
 
     #[tokio::test]
     async fn always_selects_todowrite_only_without_an_existing_list() {
-        let hook = TodoEagerHook::new("any-model", TodoEagerness::Always);
+        let hook = TodoEagerHook::new("any-model", "openai", TodoEagerness::Always);
         let ctx = TurnCtx {
             round: 1,
             ..Default::default()
@@ -388,8 +394,14 @@ mod tests {
     }
 
     #[test]
-    fn always_retains_imperative_fallback_for_adapters_without_named_choice() {
-        let hook = TodoEagerHook::new("any-model", TodoEagerness::Always);
+    fn always_degrades_explicitly_for_ollama() {
+        let hook = TodoEagerHook::new("any-model", "ollama", TodoEagerness::Always);
+        assert_eq!(hook.eagerness, TodoEagerness::Preferred);
+    }
+
+    #[test]
+    fn always_remains_strict_for_supported_adapters() {
+        let hook = TodoEagerHook::new("any-model", "openai", TodoEagerness::Always);
         assert_eq!(hook.eagerness, TodoEagerness::Always);
     }
 
