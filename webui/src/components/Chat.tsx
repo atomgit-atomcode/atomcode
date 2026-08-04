@@ -65,6 +65,7 @@ import {
   liveSnapshotQueueDisposition,
   reduceChatRecovery,
   reduceLiveLifecycle,
+  resolveUserInputRequest,
   restoreLiveSnapshot,
   syncAttachDisposition,
   type ChatRecoveryEvent,
@@ -1246,6 +1247,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       case 'user_input_request': {
         // Show the UserInputCard for the bound live runtime.
         setUserInputReq(e);
+        break;
+      }
+      case 'user_input_resolved': {
+        setUserInputReq((current) => resolveUserInputRequest(current, e.request_id));
         break;
       }
       default: {

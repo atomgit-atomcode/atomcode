@@ -707,6 +707,8 @@ pub(crate) enum LiveWireEvent {
         /// Whether to offer the "type your own answer" row (single question). Default true.
         custom: bool,
     },
+    #[serde(rename = "user_input_resolved")]
+    UserInputResolved { request_id: u64 },
     #[serde(rename = "session_switched")]
     SessionSwitched { session_id: String },
     /// AI auto-renamed a session (daemon AI namer). Carries `session_id` so a
@@ -766,6 +768,14 @@ impl NativeLiveWireProjector {
                     })
                     .collect(),
             },
+            crate::live_hub::LiveViewEvent::RequestResolved { request_id, kind } => {
+                if kind == atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND
+                {
+                    LiveWireEvent::UserInputResolved { request_id }
+                } else {
+                    return None;
+                }
+            }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::Agent(event)) => match event {
                 Kernel::TurnStarted => LiveWireEvent::State {
                     running: true,
@@ -2663,6 +2673,23 @@ mod tests {
             .project(crate::live_hub::LiveViewEvent::Runtime(
                 CodingRuntimeEvent::Request(unknown),
             ))
+            .is_none());
+
+        let resolved = projector
+            .project(crate::live_hub::LiveViewEvent::RequestResolved {
+                request_id: 42,
+                kind: REQUEST_USER_INPUT_KIND.into(),
+            })
+            .expect("typed request terminal must reach the live wire");
+        assert_eq!(
+            serde_json::to_string(&resolved).unwrap(),
+            r#"{"type":"user_input_resolved","request_id":42}"#
+        );
+        assert!(projector
+            .project(crate::live_hub::LiveViewEvent::RequestResolved {
+                request_id: 43,
+                kind: "unknown_future_kind".into(),
+            })
             .is_none());
     }
 

@@ -46,6 +46,13 @@ pub struct LiveBinding {
 pub enum LiveViewEvent {
     InputAccepted(UserInput),
     CommandOutput(String),
+    /// A driver successfully delivered the response for a previously published
+    /// runtime request. This is view coordination owned by the live hub, not a
+    /// second runtime terminal: peers use it to dismiss the matching prompt.
+    RequestResolved {
+        request_id: RequestId,
+        kind: String,
+    },
     Runtime(CodingRuntimeEvent),
 }
 
@@ -535,7 +542,7 @@ impl LiveViewHub {
             return Err(HubError::UnknownRequest(id));
         }
         Self::dispatch_locked(&state, DriverCommand::Respond { id, value })?;
-        state.pending_requests.remove(&id);
+        self.resolve_request_locked(&mut state, id)?;
         Ok(())
     }
 
@@ -560,8 +567,15 @@ impl LiveViewHub {
         if current.identity.id != binding.id {
             return Err(HubError::StaleBinding);
         }
-        if current.identity.generation == binding.generation {
-            state.pending_requests.remove(&id);
+        // The accepted response can immediately resume and finish the turn. Its
+        // terminal event clears `pending_requests` concurrently while this async
+        // method is reacquiring the hub lock. That is already a successful
+        // resolution, not an UnknownRequest failure; publish the peer terminal
+        // only while the request is still present in this generation.
+        if current.identity.generation == binding.generation
+            && state.pending_requests.contains_key(&id)
+        {
+            self.resolve_request_locked(&mut state, id)?;
         }
         Ok(())
     }
@@ -578,7 +592,7 @@ impl LiveViewHub {
             .find_map(|(id, pending_kind)| (pending_kind == kind).then_some(*id))
             .ok_or(HubError::UnknownRequest(0))?;
         Self::dispatch_locked(&state, DriverCommand::Respond { id, value })?;
-        state.pending_requests.remove(&id);
+        self.resolve_request_locked(&mut state, id)?;
         Ok(id)
     }
 
@@ -881,6 +895,32 @@ impl LiveViewHub {
         }
         let _ = self.events.send(observation);
     }
+
+    /// Resolve one pending request after its response has been accepted by the
+    /// runtime command boundary. Remove the original request from replay before
+    /// broadcasting the terminal so a reconnect cannot resurrect a stale prompt.
+    fn resolve_request_locked(&self, state: &mut HubState, id: RequestId) -> Result<(), HubError> {
+        let kind = state
+            .pending_requests
+            .remove(&id)
+            .ok_or(HubError::UnknownRequest(id))?;
+        state.replay.retain(|observation| {
+            !matches!(
+                &observation.event,
+                LiveViewEvent::Runtime(CodingRuntimeEvent::Request(request))
+                    if request.id == id
+            )
+        });
+        self.publish_view_locked(
+            state,
+            LiveViewEvent::RequestResolved {
+                request_id: id,
+                kind,
+            },
+            false,
+        );
+        Ok(())
+    }
 }
 
 fn map_session_transition_error(error: atomcode_coding::RuntimeError) -> HubError {
@@ -1085,6 +1125,11 @@ mod tests {
             },
         )
         .unwrap();
+        let mut live = hub.join().unwrap();
+        assert!(live.replay.iter().any(|observation| matches!(
+            &observation.event,
+            LiveViewEvent::Runtime(CodingRuntimeEvent::Request(request)) if request.id == 42
+        )));
 
         assert_eq!(
             hub.respond(7, serde_json::Value::Null).unwrap_err(),
@@ -1100,6 +1145,28 @@ mod tests {
             commands.lock().unwrap().as_slice(),
             [DriverCommand::Respond { id: 42, .. }]
         ));
+        let resolved = live
+            .receiver
+            .try_recv()
+            .expect("peer sees request terminal");
+        assert!(matches!(
+            resolved.event,
+            LiveViewEvent::RequestResolved {
+                request_id: 42,
+                ref kind,
+            } if kind == "approval"
+        ));
+        assert!(
+            hub.join()
+                .unwrap()
+                .replay
+                .iter()
+                .all(|observation| !matches!(
+                    &observation.event,
+                    LiveViewEvent::Runtime(CodingRuntimeEvent::Request(request)) if request.id == 42
+                )),
+            "a reconnect must not replay an already-resolved request"
+        );
     }
 
     #[test]
