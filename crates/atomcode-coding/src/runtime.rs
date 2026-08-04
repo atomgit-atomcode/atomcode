@@ -2460,6 +2460,11 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut snapshot_waiters: Vec<RuntimeSnapshotWaiter> = Vec::new();
         let mut snapshot_in_flight = false;
         let mut terminal_reason = None;
+        // A cancel is not complete when the command is merely delivered. Keep the
+        // runtime closed to new submits until the cancelled conversation snapshot
+        // arrives, otherwise a prompt can be accepted as a steer and then cleared by
+        // the kernel's cancel path.
+        let mut cancel_pending = false;
         let mut turn_stats = RuntimeTurnStats::default();
         let mut turn_started_at: Option<std::time::Instant> = None;
         let mut next_prompt_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -2981,6 +2986,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(error));
                             continue;
                         }
+                        if cancel_pending {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
                         if let Some(task) = next_prompt_task.take() {
                             task.abort();
                         }
@@ -3389,6 +3398,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                             pending_wakeup = None;
                             active_turn = None;
+                            cancel_pending = false;
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(
                                 TurnCompletion::Completed {
                                     turn_id,
@@ -3403,6 +3413,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             );
                             let _ = done.send(Ok(()));
                         } else if active_turn.is_none() {
+                            cancel_pending = false;
                             let _ = done.send(Ok(()));
                         } else {
                             if let Some(mut state) = goal.take() {
@@ -3427,7 +3438,13 @@ fn spawn_runtime_owner_with_optional_agent(
                                 });
                             }
                             pending_requests.clear();
-                            if send_agent_command(&agent, AgentCommand::Cancel) {
+                            // Queue Snapshot immediately after Cancel. Mid-turn the kernel
+                            // drains it after the cancelled turn; if Cancel races with an
+                            // already-idle kernel, Snapshot still supplies the terminal
+                            // acknowledgement that the runtime needs to leave InTurn.
+                            if request_cancel_snapshot(&agent) {
+                                cancel_pending = true;
+                                snapshot_in_flight = true;
                                 controls.state.store(
                                     runtime_phase_state(generation, RuntimePhase::InTurn),
                                     Ordering::Release,
@@ -3683,6 +3700,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut pending_requests,
                             active_turn.is_some(),
                         );
+                        let had_active_turn = active_turn.is_some();
                         let stop_report = stop_current_agent(
                             &mut agent,
                             &mut compactions,
@@ -3692,6 +3710,32 @@ fn spawn_runtime_owner_with_optional_agent(
                             runtime.parts.snapshot_persistence_status(),
                         )
                         .await;
+                        if stop_report.forced
+                            && had_active_turn
+                            && !stop_report.has_verified_turn_terminal()
+                        {
+                            let message = "provider reconfiguration timed out while stopping the active agent; the latest conversation snapshot could not be verified".to_string();
+                            fail_close_after_forced_provider_stop(
+                                &message,
+                                Some(&runtime),
+                                &mut goal,
+                                &mut loop_state,
+                                &mut pending_wakeup,
+                                &mut held_turn,
+                                &mut active_turn,
+                                &mut terminal_reason,
+                                &mut turn_stats,
+                                &mut conversation_revision,
+                                &mut snapshot_waiters,
+                                &mut agent_available,
+                                controls.state.as_ref(),
+                                generation,
+                                &runtime_event_tx,
+                            );
+                            resources = Some(runtime);
+                            let _ = done.send(Err(RuntimeError::ReconfigureFailed(message)));
+                            continue;
+                        }
                         finish_stopped_native_turn(
                             &stop_report,
                             Some(&runtime),
@@ -3743,8 +3787,12 @@ fn spawn_runtime_owner_with_optional_agent(
                                 agent_available = true;
                                 provider_unavailable_reason = None;
                                 controls.provider_unavailable_reason.store(0, Ordering::Release);
-                                observed_tokens = None;
+                                // Reassembly restores the same conversation snapshot. Keep the
+                                // last observed usage until the replacement provider reports a
+                                // fresh value, otherwise callers briefly see an empty context and
+                                // may mistake a model switch for conversation loss.
                                 snapshot_in_flight = false;
+                                cancel_pending = false;
                                 compaction_suspended = false;
                                 let provider = runtime.config.provider_name.clone();
                                 let model = runtime.config.model.clone();
@@ -4684,13 +4732,23 @@ fn spawn_runtime_owner_with_optional_agent(
                             current.finish(GoalTerminal::Cancelled, "cleared by user");
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(current.progress()));
                         }
-                        if active_turn.is_some() { let _ = send_agent_command(&agent, AgentCommand::Cancel); }
                         if let Some((turn_id, _, snapshot, stats)) = held_turn.take() {
                             active_turn = None;
+                            cancel_pending = false;
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
                                 turn_id, reason: StopReason::Cancelled, snapshot, stats,
                             }));
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
+                        } else if active_turn.is_some() {
+                            if request_cancel_snapshot(&agent) {
+                                cancel_pending = true;
+                                snapshot_in_flight = true;
+                            } else {
+                                agent_available = false;
+                                controls.state.store(runtime_phase_state(generation, RuntimePhase::Failed), Ordering::Release);
+                                let _ = done.send(Err(RuntimeError::DeliveryFailed));
+                                continue;
+                            }
                         }
                         let _ = done.send(Ok(()));
                     }
@@ -4745,13 +4803,23 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         if let Some(runtime) = resources.as_ref() { runtime.loop_active.store(false, Ordering::Release); }
                         pending_wakeup = None;
-                        if active_turn.is_some() { let _ = send_agent_command(&agent, AgentCommand::Cancel); }
                         if let Some((turn_id, _, snapshot, stats)) = held_turn.take() {
                             active_turn = None;
+                            cancel_pending = false;
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
                                 turn_id, reason: StopReason::Cancelled, snapshot, stats,
                             }));
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
+                        } else if active_turn.is_some() {
+                            if request_cancel_snapshot(&agent) {
+                                cancel_pending = true;
+                                snapshot_in_flight = true;
+                            } else {
+                                agent_available = false;
+                                controls.state.store(runtime_phase_state(generation, RuntimePhase::Failed), Ordering::Release);
+                                let _ = done.send(Err(RuntimeError::DeliveryFailed));
+                                continue;
+                            }
                         }
                         let _ = done.send(Ok(()));
                     }
@@ -5123,7 +5191,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                             AgentEvent::Snapshot { snapshot } => {
                                 snapshot_in_flight = false;
-                                if terminal_reason.is_some() {
+                                if terminal_reason.is_some() || cancel_pending {
                                     conversation_revision = conversation_revision.wrapping_add(1);
                                 }
                                 if let Some(runtime) = resources.as_mut() {
@@ -5144,7 +5212,11 @@ fn spawn_runtime_owner_with_optional_agent(
                                         revision: conversation_revision,
                                     }));
                                 }
-                                if let Some(reason) = terminal_reason.take() {
+                                if let Some(reason) = terminal_reason
+                                    .take()
+                                    .or_else(|| cancel_pending.then_some(StopReason::Cancelled))
+                                {
+                                    cancel_pending = false;
                                     pending_requests.clear();
                                     let stats = std::mem::take(&mut turn_stats);
                                     let turn_id = active_turn.unwrap_or_default();
@@ -5695,6 +5767,11 @@ fn send_agent_command(agent: &Option<AgentHandle>, command: AgentCommand) -> boo
     agent
         .as_ref()
         .is_some_and(|agent| agent.commands.send(command).is_ok())
+}
+
+fn request_cancel_snapshot(agent: &Option<AgentHandle>) -> bool {
+    send_agent_command(agent, AgentCommand::Cancel)
+        && send_agent_command(agent, AgentCommand::Snapshot)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6367,8 +6444,15 @@ struct StopReport {
     forced: bool,
     reason: Option<StopReason>,
     snapshot: Option<SessionSnapshot>,
+    snapshot_after_turn_terminal: bool,
     conversation_changed: bool,
     persistence_failure: Option<String>,
+}
+
+impl StopReport {
+    fn has_verified_turn_terminal(&self) -> bool {
+        self.reason.is_some() && self.snapshot_after_turn_terminal
+    }
 }
 
 fn record_stopped_conversation_event(report: &mut StopReport, event: &AgentEvent) {
@@ -6433,6 +6517,7 @@ async fn stop_current_agent(
                         }
                         Some(AgentEvent::Snapshot { snapshot }) => {
                             report.snapshot = Some(snapshot);
+                            report.snapshot_after_turn_terminal = report.reason.is_some();
                         }
                         _ => {}
                     }
@@ -6455,7 +6540,10 @@ async fn stop_current_agent(
                 *observed_tokens = Some(meta.used_tokens as usize);
             }
             Some(AgentEvent::TurnComplete { reason }) => report.reason = Some(reason),
-            Some(AgentEvent::Snapshot { snapshot }) => report.snapshot = Some(snapshot),
+            Some(AgentEvent::Snapshot { snapshot }) => {
+                report.snapshot = Some(snapshot);
+                report.snapshot_after_turn_terminal = report.reason.is_some();
+            }
             _ => {}
         }
     }
@@ -6630,6 +6718,74 @@ fn fail_close_after_stopped_persistence(
         code: None,
     }));
     Some(RuntimeError::ReconfigureFailed(message))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fail_close_after_forced_provider_stop(
+    message: &str,
+    resources: Option<&RuntimeResources>,
+    goal: &mut Option<GoalState>,
+    loop_state: &mut Option<LoopState>,
+    pending_wakeup: &mut Option<WakeupRequest>,
+    held_turn: &mut Option<(u64, StopReason, Arc<SessionSnapshot>, RuntimeTurnStats)>,
+    active_turn: &mut Option<u64>,
+    terminal_reason: &mut Option<StopReason>,
+    turn_stats: &mut RuntimeTurnStats,
+    conversation_revision: &mut u64,
+    snapshot_waiters: &mut Vec<RuntimeSnapshotWaiter>,
+    agent_available: &mut bool,
+    state: &AtomicU64,
+    generation: u64,
+    runtime_event_tx: &RuntimeEventEmitter,
+) {
+    *conversation_revision =
+        (*conversation_revision).wrapping_add(u64::from(active_turn.is_some()));
+    let unavailable = RuntimeError::SnapshotUnavailable(message.to_string());
+    for waiter in snapshot_waiters.drain(..) {
+        let _ = waiter.send(Err(unavailable.clone()));
+    }
+    if let Some(turn_id) = active_turn.take() {
+        let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(
+            TurnCompletion::SnapshotUnavailable {
+                turn_id,
+                reason: StopReason::ProviderError,
+                error: RuntimeSnapshotError {
+                    message: message.to_string(),
+                },
+                stats: std::mem::take(turn_stats),
+            },
+        ));
+    }
+    if let Some(mut current) = goal.take() {
+        current.cancel.cancel();
+        current.finish(
+            GoalTerminal::Failed,
+            "ended: active agent did not stop safely",
+        );
+        let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(current.progress()));
+    }
+    if let Some(mut current) = loop_state.take() {
+        current.cancel.cancel();
+        current.active = false;
+        current.last_reason = Some("ended: active agent did not stop safely".into());
+        let _ = runtime_event_tx.send(CodingRuntimeEvent::LoopChanged(current.progress()));
+    }
+    if let Some(runtime) = resources {
+        runtime.loop_active.store(false, Ordering::Release);
+    }
+    *pending_wakeup = None;
+    *held_turn = None;
+    *terminal_reason = None;
+    *agent_available = false;
+    state.store(
+        runtime_phase_state(generation, RuntimePhase::Failed),
+        Ordering::Release,
+    );
+    let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(AgentEvent::Error {
+        message: message.to_string(),
+        http_status: None,
+        code: None,
+    }));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7951,6 +8107,93 @@ mod tests {
             }
         ));
 
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_waits_for_snapshot_and_rejects_a_racing_submit() {
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
+
+        handle.start_goal("finish the task").await.unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                active: true,
+                ..
+            }))
+        ));
+        handle
+            .submit(UserInput::from("long running goal"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+
+        handle.cancel().await.unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Cancel)
+        ));
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        assert_eq!(
+            handle
+                .submit(UserInput::from("must not become a lost steer"))
+                .await,
+            Err(RuntimeError::Busy)
+        );
+
+        let retained = SessionSnapshot::new(vec![
+            Message::user("long running goal"),
+            Message::assistant("completed work before interruption", vec![]),
+        ]);
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: retained.clone(),
+            })
+            .unwrap();
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::TurnFinished(completion)) => break completion,
+                    Some(_) => {}
+                    None => panic!("runtime events closed before cancel terminal"),
+                }
+            }
+        })
+        .await
+        .expect("cancel snapshot did not produce a terminal");
+        assert!(matches!(
+            terminal,
+            TurnCompletion::Completed {
+                reason: StopReason::Cancelled,
+                snapshot,
+                ..
+            } if snapshot.as_ref() == &retained
+        ));
+        assert_eq!(handle.status().phase, RuntimePhase::Ready);
+
+        handle
+            .submit(UserInput::from("continue after cancel"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { text, .. }) if text == "continue after cancel"
+        ));
         handle.shutdown().await.unwrap();
     }
 
@@ -10570,10 +10813,7 @@ mod tests {
                 }
             ))
         ));
-        assert!(matches!(
-            kernel_commands.recv().await,
-            Some(AgentCommand::Cancel)
-        ));
+        assert!(kernel_commands.try_recv().is_err());
         assert_eq!(handle.status().phase, RuntimePhase::Ready);
 
         assert!(runtime_events.try_recv().is_err());
@@ -10734,6 +10974,146 @@ mod tests {
         runtime.handle.shutdown().await.unwrap();
     }
 
+    async fn hanging_provider_reassemble_runtime(
+        emit_verified_terminal: bool,
+    ) -> (
+        CodingRuntimeHandle,
+        mpsc::UnboundedReceiver<CodingRuntimeEvent>,
+        KernelRuntimeAdapter,
+    ) {
+        let (commands, mut command_rx) = mpsc::unbounded_channel();
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            while let Some(command) = command_rx.recv().await {
+                if matches!(command, AgentCommand::Shutdown) {
+                    if emit_verified_terminal {
+                        let _ = event_tx.send(AgentEvent::TurnComplete {
+                            reason: StopReason::Cancelled,
+                        });
+                        let _ = event_tx.send(AgentEvent::Snapshot {
+                            snapshot: SessionSnapshot::new(vec![Message::user(
+                                "verified interrupted turn",
+                            )]),
+                        });
+                    }
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+        let agent = AgentHandle {
+            commands,
+            events,
+            task,
+        };
+        let (handle, controls) = coding_runtime_control_channel();
+        let (runtime_tx, runtime_events) = mpsc::unbounded_channel();
+        let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
+        let start = native_start(false);
+        let parts = prepare_with_plugin_hook_source(
+            &start.agent,
+            start.prepare.clone(),
+            start.plugin_hooks.as_ref(),
+        )
+        .await
+        .unwrap();
+        let resources = RuntimeResources {
+            config: start.agent,
+            prepare: start.prepare,
+            provider_factory: start.provider_factory,
+            plugin_hooks: start.plugin_hooks,
+            parts,
+            wakeup_tx,
+            loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            image_preprocessor: None,
+        };
+        let adapter = spawn_runtime_owner_with_protocol(
+            agent,
+            controls,
+            runtime_tx,
+            true,
+            true,
+            None,
+            Some(resources),
+            Some(wakeup_rx),
+        );
+        (handle, runtime_events, adapter)
+    }
+
+    #[tokio::test]
+    async fn provider_reassemble_fails_closed_when_the_active_agent_cannot_stop() {
+        let (handle, mut runtime_events, _adapter) =
+            hanging_provider_reassemble_runtime(false).await;
+
+        handle
+            .submit(UserInput::from("unfinished turn"))
+            .await
+            .unwrap();
+        let next = CodingAgentConfig::new(
+            "next-key",
+            "https://next.example.test/v1",
+            "next-model",
+            ".",
+        );
+        assert!(matches!(
+            handle.reassemble_provider(next).await,
+            Err(RuntimeError::ReconfigureFailed(message))
+                if message.contains("latest conversation snapshot could not be verified")
+        ));
+        assert_eq!(handle.status().phase, RuntimePhase::Failed);
+
+        let mut saw_unavailable_terminal = false;
+        while let Ok(event) = runtime_events.try_recv() {
+            match event {
+                CodingRuntimeEvent::TurnFinished(TurnCompletion::SnapshotUnavailable {
+                    ..
+                }) => {
+                    saw_unavailable_terminal = true;
+                }
+                CodingRuntimeEvent::ProviderChanged { .. }
+                | CodingRuntimeEvent::Reconfigured { .. } => {
+                    panic!("a forced stop must not publish provider reconfigure success")
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_unavailable_terminal);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_reassemble_accepts_a_verified_terminal_before_forced_cleanup() {
+        let (handle, mut runtime_events, _adapter) =
+            hanging_provider_reassemble_runtime(true).await;
+        handle
+            .submit(UserInput::from("unfinished turn"))
+            .await
+            .unwrap();
+        let next = CodingAgentConfig::new(
+            "next-key",
+            "https://next.example.test/v1",
+            "next-model",
+            ".",
+        );
+
+        assert_eq!(
+            handle.reassemble_provider(next).await.unwrap(),
+            RuntimeGeneration(1)
+        );
+        assert_eq!(handle.status().phase, RuntimePhase::Ready);
+        let mut changed = false;
+        while let Ok(event) = runtime_events.try_recv() {
+            if matches!(event, CodingRuntimeEvent::ProviderChanged { .. }) {
+                changed = true;
+            }
+            assert!(!matches!(
+                event,
+                CodingRuntimeEvent::TurnFinished(TurnCompletion::SnapshotUnavailable { .. })
+            ));
+        }
+        assert!(changed);
+        handle.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
     async fn provider_reassemble_updates_cost_attribution_and_failed_reload_keeps_current_model() {
@@ -10756,6 +11136,8 @@ mod tests {
             .await
             .unwrap();
         wait_for_turn_finished(&mut runtime).await;
+        let model_a_context = runtime.handle.context_stats().await.unwrap();
+        assert!(model_a_context.used_tokens > 0);
 
         let mut model_b =
             CodingAgentConfig::new("key", "https://example.test/v1", "model-b", project.path());
@@ -10765,6 +11147,9 @@ mod tests {
             .reassemble_provider(model_b.clone())
             .await
             .unwrap();
+        let reassembled_context = runtime.handle.context_stats().await.unwrap();
+        assert_eq!(reassembled_context.model, "model-b");
+        assert_eq!(reassembled_context.used_tokens, model_a_context.used_tokens);
         runtime
             .handle
             .submit(UserInput::from("model b turn"))

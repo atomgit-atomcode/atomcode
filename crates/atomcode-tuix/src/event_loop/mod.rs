@@ -2630,6 +2630,11 @@ impl RuntimeControl {
         }
     }
 
+    fn has_active_turn(&self) -> bool {
+        self.active_handle()
+            .is_some_and(|handle| phase_has_active_turn(handle.status().phase))
+    }
+
     pub fn detach_delivery_event_tx(&self) {
         if let Self::Ready(ready) = self {
             ready
@@ -3026,6 +3031,13 @@ impl RuntimeControl {
             Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
         }
     }
+}
+
+fn phase_has_active_turn(phase: atomcode_coding::RuntimePhase) -> bool {
+    matches!(
+        phase,
+        atomcode_coding::RuntimePhase::InTurn | atomcode_coding::RuntimePhase::WaitingApproval
+    )
 }
 
 impl From<CodingRuntimeHandle> for RuntimeControl {
@@ -11492,7 +11504,10 @@ fn handle_idle_key(
             && modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
         let is_bare_esc = code == KeyCode::Esc && app.buf.text.is_empty();
         if is_ctrl_c || is_bare_esc {
-            cancel_active_turn(ctx);
+            let has_active_turn = ctx.runtime.has_active_turn();
+            if cancel_active_turn(ctx) && has_active_turn {
+                app.interrupt_drain_pending = true;
+            }
             clear_capturing_modal_on_cancel(app);
             crate::tuix_trace!(
                 "KEY",
@@ -12698,12 +12713,33 @@ fn midturn_submit_route(streaming: bool) -> SubmitRoute {
 
 #[cfg(test)]
 mod midturn_submit_route_tests {
-    use super::{midturn_submit_route, SubmitRoute};
+    use super::{midturn_submit_route, phase_has_active_turn, SubmitRoute};
 
     #[test]
     fn midturn_submit_steers_native_runtime() {
         assert_eq!(midturn_submit_route(true), SubmitRoute::SteerNow);
         assert_eq!(midturn_submit_route(false), SubmitRoute::SendIdle);
+    }
+
+    #[test]
+    fn idle_cancel_only_waits_for_a_real_active_turn() {
+        use atomcode_coding::RuntimePhase;
+
+        assert!(phase_has_active_turn(RuntimePhase::InTurn));
+        assert!(phase_has_active_turn(RuntimePhase::WaitingApproval));
+        for phase in [
+            RuntimePhase::Ready,
+            RuntimePhase::Reconfiguring,
+            RuntimePhase::AwaitingProvider,
+            RuntimePhase::ShuttingDown,
+            RuntimePhase::Stopped,
+            RuntimePhase::Failed,
+        ] {
+            assert!(
+                !phase_has_active_turn(phase),
+                "unexpected active phase: {phase:?}"
+            );
+        }
     }
 }
 
@@ -13909,6 +13945,9 @@ fn handle_streaming_key(
     // want queued messages to auto-fire after the current one dies.
     if code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
         let send_ok = cancel_active_turn(ctx);
+        if send_ok {
+            app.interrupt_drain_pending = true;
+        }
         clear_capturing_modal_on_cancel(app);
         crate::tuix_trace!(
             "KEY",
@@ -13969,6 +14008,9 @@ fn handle_streaming_key(
             modifiers.is_empty(),
             !app.state.pending_steers.is_empty(),
         ) && stage_pending_steers_for_interrupt(app);
+        if send_ok {
+            app.interrupt_drain_pending = true;
+        }
         clear_capturing_modal_on_cancel(app);
         crate::tuix_trace!(
             "KEY",
@@ -14351,7 +14393,7 @@ fn handle_streaming_key(
                 // queued message re-expands its folded paste (#843).
                 pastes: app.buf.pastes.clone(),
             });
-            match midturn_submit_route(true) {
+            match midturn_submit_route(!app.interrupt_drain_pending) {
                 SubmitRoute::SteerNow => {
                     // Steer into the running turn and retain an exact recovery copy.
                     // The footer panel owns the acknowledgement; do not write a
@@ -14414,7 +14456,9 @@ fn handle_streaming_key(
         BufferResult::Exit => {
             // Ctrl+C on empty buf during streaming — treat as cancel
             // (consistent with the explicit Ctrl+C branch above).
-            cancel_active_turn(ctx);
+            if cancel_active_turn(ctx) {
+                app.interrupt_drain_pending = true;
+            }
             clear_capturing_modal_on_cancel(app);
             restore_cancelled_message_to_buf(app, renderer, ctx);
         }

@@ -1414,7 +1414,18 @@ impl RunningAgent {
                 _ = &mut turn => break,
                 maybe = cmd_rx.recv() => match maybe {
                     Some(AgentCommand::Respond { id, value }) => self.rt.resolve(id, value),
-                    Some(AgentCommand::Shutdown) => { shutdown = true; break; }
+                    Some(AgentCommand::Shutdown) => {
+                        // Shutdown during a live turn is a cooperative terminal, not
+                        // permission to drop the `run_turn` future. Dropping it bypasses
+                        // `finish_cancelled`, `turn_complete`, and the session snapshot
+                        // hook, so a provider/model rebuild can resume from an older
+                        // canonical snapshot. Cancel the turn and wait for its normal
+                        // terminal funnel instead.
+                        shutdown = true;
+                        turn_token.cancel();
+                        self.rt.cancel_pending();
+                        steer.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                    }
                     Some(AgentCommand::Cancel) => {
                         // Cancel both halves of a parked turn: the token covers the
                         // stream/between-tools checkpoints; flushing pending requests
@@ -1462,6 +1473,9 @@ impl RunningAgent {
                 }
             }
         }
+        // Release run_turn's mutable conversation borrow before the shutdown
+        // checkpoint below reads the now-finalized conversation.
+        drop(turn);
         // Leftover steer buffer: any steer that arrived too late to be drained by
         // run_turn (e.g. Task 2 not yet implemented, or a very late arrival) falls
         // back to the pending deque so the user's prompt is NOT silently lost.
@@ -1469,6 +1483,14 @@ impl RunningAgent {
             pending.push_back(AgentCommand::SendMessage {
                 text: s.text,
                 images: s.images,
+            });
+        }
+        if shutdown {
+            // The owner that requested shutdown may be replacing this agent. Give
+            // it the exact post-cancel in-memory conversation so replacement never
+            // has to guess from a potentially older disk checkpoint.
+            self.rt.emit(AgentEvent::Snapshot {
+                snapshot: self.capture_snapshot(convo),
             });
         }
         shutdown
