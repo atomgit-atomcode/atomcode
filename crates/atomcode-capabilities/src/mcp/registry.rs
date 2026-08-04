@@ -10,8 +10,8 @@ use tokio::sync::{mpsc, watch, RwLock};
 
 use super::client::{McpClient, McpToolInfo};
 use super::config::{load_mcp_config, McpServerConfig};
-use super::transport_http::HttpClient;
 use super::tool::mcp_tool_full_name;
+use super::transport_http::HttpClient;
 use super::transport_stdio::StdioClient;
 use super::types::ServerStatus;
 
@@ -139,6 +139,9 @@ pub struct McpRegistry {
     /// Per-tool auto-approve set, keyed by the full tool name `mcp__{server}__{tool}`
     /// (from a server's `autoApprove` allowlist, or a runtime "Always" grant).
     auto_approved_tools: Arc<std::sync::RwLock<HashSet<String>>>,
+    /// Exact model-visible alias -> original MCP identity. This is authoritative
+    /// for routing and persistent approval; sanitized names are not reversible.
+    tool_aliases: Arc<std::sync::RwLock<BTreeMap<String, (String, String)>>>,
 }
 
 impl McpRegistry {
@@ -155,6 +158,7 @@ impl McpRegistry {
             cancelled: watch::channel(false).0,
             trusted_servers: Arc::new(std::sync::RwLock::new(HashSet::new())),
             auto_approved_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            tool_aliases: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -173,6 +177,7 @@ impl McpRegistry {
                 cancelled: watch::channel(false).0,
                 trusted_servers: Arc::new(std::sync::RwLock::new(HashSet::new())),
                 auto_approved_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
+                tool_aliases: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             },
             rx,
         )
@@ -214,23 +219,54 @@ impl McpRegistry {
         }
     }
 
-    /// Split a full MCP tool name (`mcp__{server}__{tool}`) into `(server, tool)`,
-    /// matching against known server names so a server name containing `__` still
-    /// resolves. Returns `None` if the prefix is missing or no server matches.
-    pub async fn split_tool_name(&self, full: &str) -> Option<(String, String)> {
-        let rest = full.strip_prefix("mcp__")?;
-        let servers = self.servers.read().await;
-        for name in servers.keys() {
-            // Compare against the sanitized server key: the name the LLM sees was
-            // sanitized by `mcp_tool_full_name`, so a server name with characters
-            // outside `[a-zA-Z0-9_-]` must be matched by its sanitized form too
-            // (returning the real key so calls still route to the live server).
-            let key = super::tool::sanitize_name_segment(name);
-            if let Some(tool) = rest.strip_prefix(&format!("{key}__")) {
-                return Some((name.clone(), tool.to_string()));
+    /// Register an exact model-visible alias for an original MCP identity.
+    /// A collision fails closed instead of letting ToolRegistry silently replace
+    /// one external tool with another under the same approval key.
+    pub(crate) fn register_tool_alias(
+        &self,
+        alias: &str,
+        server: &str,
+        tool: &str,
+    ) -> Result<(), String> {
+        let mut aliases = self
+            .tool_aliases
+            .write()
+            .map_err(|_| "MCP tool alias registry is unavailable".to_string())?;
+        let identity = (server.to_string(), tool.to_string());
+        if let Some(existing) = aliases.get(alias) {
+            if existing != &identity {
+                return Err(format!(
+                    "MCP tool alias collision for {alias:?}: {existing:?} conflicts with {identity:?}"
+                ));
             }
+            return Ok(());
         }
-        None
+        aliases.insert(alias.to_string(), identity);
+        Ok(())
+    }
+
+    /// Return the currently known model-visible aliases for one original server.
+    pub fn tool_aliases_for_server(&self, server: &str) -> Vec<String> {
+        self.tool_aliases
+            .read()
+            .map(|aliases| {
+                aliases
+                    .iter()
+                    .filter_map(|(alias, (owner, _))| (owner == server).then(|| alias.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Split a full MCP tool name (`mcp__{server}__{tool}`) into `(server, tool)`,
+    /// using the explicit alias map because sanitization and truncation are not
+    /// reversible. Returns `None` for an unknown or non-MCP name.
+    pub async fn split_tool_name(&self, full: &str) -> Option<(String, String)> {
+        full.strip_prefix("mcp__")?;
+        self.tool_aliases
+            .read()
+            .ok()
+            .and_then(|aliases| aliases.get(full).cloned())
     }
 
     /// Split configs by project trust. Uses the shared trust store (via the local
@@ -264,16 +300,15 @@ impl McpRegistry {
             self.mark_server_trusted(&config.name);
         }
         for tool in &config.auto_approve {
-            // Accept either the bare tool name ("query") OR the already-qualified name
-            // ("mcp__server__query") that the user sees in the approval prompt — both
-            // are plausible in `autoApprove`. Normalize to the full name either way,
-            // sanitizing segments so the key matches the name the LLM actually sees.
-            let full = if tool.starts_with("mcp__") {
-                let (_, rest) = tool.split_at("mcp__".len());
-                let (server, tool_name) = rest
-                    .split_once("__")
-                    .unwrap_or((rest, ""));
-                mcp_tool_full_name(server, tool_name)
+            // Accept a bare tool name, a raw name qualified with this exact server,
+            // or the final model-visible alias shown in an approval prompt. Never
+            // split an arbitrary qualified name on `__`: server names may contain
+            // that sequence, and the alias hash is derived from the exact identity.
+            let raw_prefix = format!("mcp__{}__", config.name);
+            let full = if let Some(tool_name) = tool.strip_prefix(&raw_prefix) {
+                mcp_tool_full_name(&config.name, tool_name)
+            } else if tool.starts_with("mcp__") {
+                tool.clone()
             } else {
                 mcp_tool_full_name(&config.name, tool)
             };
@@ -795,6 +830,7 @@ impl McpRegistry {
             cancelled: self.cancelled.clone(),
             trusted_servers: self.trusted_servers.clone(),
             auto_approved_tools: self.auto_approved_tools.clone(),
+            tool_aliases: self.tool_aliases.clone(),
         })
     }
 }
@@ -830,6 +866,8 @@ mod tests {
                 barrier: Arc::new(tokio::sync::Barrier::new(1)),
             }) as Arc<dyn McpClient>,
         );
+        reg.register_tool_alias("mcp__srv__query", "srv", "query")
+            .unwrap();
         // Known server → split.
         assert_eq!(
             reg.split_tool_name("mcp__srv__query").await,
@@ -839,6 +877,18 @@ mod tests {
         assert_eq!(reg.split_tool_name("mcp__other__x").await, None);
         // Missing `mcp__` prefix → None.
         assert_eq!(reg.split_tool_name("plain_tool").await, None);
+    }
+
+    #[tokio::test]
+    async fn split_tool_name_restores_original_invalid_identity() {
+        let reg = McpRegistry::new();
+        let alias = super::super::tool::mcp_tool_full_name("文档 服务", "read.file");
+        reg.register_tool_alias(&alias, "文档 服务", "read.file")
+            .unwrap();
+        assert_eq!(
+            reg.split_tool_name(&alias).await,
+            Some(("文档 服务".to_string(), "read.file".to_string()))
+        );
     }
 
     struct BarrierListClient {
@@ -955,6 +1005,41 @@ mod tests {
         assert!(
             !reg.is_server_trusted("docs"),
             "trust:false must not trust the server"
+        );
+    }
+
+    #[test]
+    fn auto_approve_preserves_exact_identity_when_server_contains_separator() {
+        let reg = McpRegistry::new();
+        let server = "docs.__internal";
+        let tool = "read.file";
+        let alias = super::super::tool::mcp_tool_full_name(server, tool);
+        let mut cfg = McpServerConfig {
+            name: server.to_string(),
+            source: super::super::config::McpConfigSource::Project,
+            disabled: false,
+            config: super::super::config::McpTransportConfig::Stdio {
+                command: "x".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout_ms: None,
+            },
+            trust: false,
+            auto_approve: vec![format!("mcp__{server}__{tool}")],
+        };
+
+        reg.apply_trust_from_config(&cfg);
+        assert!(
+            reg.is_tool_auto_approved(&alias),
+            "raw qualified identity must produce the mounted alias"
+        );
+
+        let alias_reg = McpRegistry::new();
+        cfg.auto_approve = vec![alias.clone()];
+        alias_reg.apply_trust_from_config(&cfg);
+        assert!(
+            alias_reg.is_tool_auto_approved(&alias),
+            "model-visible alias must remain byte-identical"
         );
     }
 

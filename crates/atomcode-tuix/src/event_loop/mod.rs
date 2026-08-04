@@ -4516,6 +4516,21 @@ mod buffer_tests {
         );
     }
 
+    #[test]
+    fn persistence_warning_does_not_replace_or_dismiss_footer_report() {
+        let mut state = UiState::new();
+        state.footer_command_output = Some("usage report".into());
+        state.footer_persistence_warning = Some("⚠ transcript unavailable".into());
+
+        assert_eq!(
+            footer_command_output(&state).as_deref(),
+            Some("usage report\n⚠ transcript unavailable")
+        );
+        assert!(dismiss_footer_command_output(&mut state));
+        assert!(state.footer_persistence_warning.is_none());
+        assert_eq!(state.footer_command_output.as_deref(), Some("usage report"));
+    }
+
     fn empty_usage_panel() -> crate::modals::usage::UsageModal {
         crate::modals::usage::UsageModal::new(crate::modals::usage::UsageData {
             window: None,
@@ -7633,6 +7648,9 @@ fn intercept_empty_bare_esc(
 /// this before their normal Esc action; `true` means the key was fully handled
 /// and must not reach turn cancellation or double-Esc undo.
 fn dismiss_footer_command_output(state: &mut UiState) -> bool {
+    if state.footer_persistence_warning.take().is_some() {
+        return true;
+    }
     // Drop the panel alongside the text so a stale tab key can't steer a
     // report that's no longer on screen.
     state.footer_usage = None;
@@ -18004,6 +18022,14 @@ fn handle_runtime_event(
                     renderer.flush();
                     return;
                 }
+                CodingRuntimeEvent::PersistenceWarning(message) => {
+                    // Auxiliary persistence failures are diagnostics, not model
+                    // output. Keep a single replaceable footer notice instead of
+                    // appending a permanent transcript row. The authoritative
+                    // turn terminal that follows owns the normal idle redraw.
+                    state.footer_persistence_warning = Some(format!("⚠ {message}"));
+                    return;
+                }
                 CodingRuntimeEvent::VisionPreprocessSuccess {
                     vl_model,
                     char_count,
@@ -20202,7 +20228,10 @@ fn handle_agent_event(
             // /bg resume path).
             redraw_idle_plain(buf, state, ctx, renderer);
         }
-        AgentEvent::PhaseChange(AgentPhase::Thinking) => state.on_thinking(),
+        AgentEvent::PhaseChange(AgentPhase::Thinking) => {
+            state.footer_persistence_warning = None;
+            state.on_thinking();
+        }
         AgentEvent::PhaseChange(AgentPhase::CallingTool(name)) => {
             state.on_tool_call_streaming(&display_tool_name(&name));
         }
@@ -21780,6 +21809,18 @@ mod status_context_usage_tests {
     }
 }
 
+fn footer_command_output(state: &UiState) -> Option<String> {
+    match (
+        state.footer_command_output.as_deref(),
+        state.footer_persistence_warning.as_deref(),
+    ) {
+        (None, None) => None,
+        (Some(report), None) => Some(report.to_string()),
+        (None, Some(warning)) => Some(warning.to_string()),
+        (Some(report), Some(warning)) => Some(format!("{report}\n{warning}")),
+    }
+}
+
 pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::StatusLine {
     let cwd = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
     // Priority:
@@ -22101,7 +22142,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             .collect(),
         history: None,
         search: None,
-        command_output: state.footer_command_output.clone(),
+        command_output: footer_command_output(state),
         ctx_used,
         ctx_window,
         hint,

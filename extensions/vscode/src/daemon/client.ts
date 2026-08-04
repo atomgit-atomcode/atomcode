@@ -582,6 +582,9 @@ export class DaemonClient {
       case 'warning':
         callbacks.onWarning(event.message);
         break;
+      case 'persistence_warning':
+        callbacks.onPersistenceWarning?.(event.message);
+        break;
       case 'rate_limited':
         callbacks.onRateLimited({
           message: event.message,

@@ -889,6 +889,10 @@ pub struct UiState {
     /// appending their multi-line report to conversation scrollback. Cleared
     /// explicitly by Esc; the Esc press is consumed before turn cancellation.
     pub footer_command_output: Option<String>,
+    /// Auxiliary persistence diagnostic owned separately from `/usage` and
+    /// `/cost`. Repeated failures replace it; a new turn, Esc, or session
+    /// replacement clears it.
+    pub footer_persistence_warning: Option<String>,
     /// Live `/usage` panel state backing [`footer_command_output`] while a turn
     /// is streaming. The interactive modal can't install mid-turn (live token
     /// redraws own the footer), so tab switching re-renders the active tab from
@@ -1251,6 +1255,7 @@ impl UiState {
             completion_tokens: 0,
             cached_tokens: 0,
             footer_command_output: None,
+            footer_persistence_warning: None,
             footer_usage: None,
             deferred_background_notices: Vec::new(),
             turn_prompt_tokens: 0,
@@ -1664,6 +1669,7 @@ impl UiState {
     /// `/cost` from the previous foreground session visible.
     pub fn on_session_replaced(&mut self) {
         self.footer_command_output = None;
+        self.footer_persistence_warning = None;
         self.footer_usage = None;
         self.subagent_activity = None;
         self.active_subtasks = None;

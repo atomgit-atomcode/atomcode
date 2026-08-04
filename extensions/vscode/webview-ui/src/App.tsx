@@ -8,7 +8,7 @@ import { SessionList } from './components/SessionList';
 import { I18nProvider } from './i18n';
 
 function ChatApp() {
-  const { state } = useChatContext();
+  const { state, dispatch } = useChatContext();
   const hasMessages = state.messages.length > 0 || state.isGenerating;
 
   if (state.isSessionList) {
@@ -25,6 +25,19 @@ function ChatApp() {
       {state.historyOpen && <SessionList variant="overlay" />}
       <div className="session-body">
         {hasMessages ? <MessageList /> : <WelcomeScreen />}
+        {state.persistenceWarning && (
+          <div className="persistence-warning" role="status">
+            <span aria-hidden="true">⚠</span>
+            <span>{state.persistenceWarning}</span>
+            <button
+              type="button"
+              aria-label="Dismiss"
+              onClick={() => dispatch({ type: 'SET_PERSISTENCE_WARNING' })}
+            >
+              ×
+            </button>
+          </div>
+        )}
         <InputArea />
       </div>
     </div>

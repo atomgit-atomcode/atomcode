@@ -2882,8 +2882,14 @@ impl SessionManager {
         }
         let path = self.jsonl_path(id)?;
         fs::create_dir_all(&self.root).map_err(|e| io_at(&self.root, e))?;
-        let mut file = open_append_file(&path)?;
-        fs2::FileExt::lock_exclusive(&file).map_err(|e| io_at(&path, e))?;
+        // Windows security software and indexers can briefly deny an open or
+        // lock while inspecting a newly-updated file. Retry only those
+        // pre-write operations: retrying write_all itself could duplicate a
+        // partially-written JSONL record.
+        let mut file = retry_transient_file_access(|| open_append_file(&path))?;
+        retry_transient_file_access(|| {
+            fs2::FileExt::lock_exclusive(&file).map_err(|e| io_at(&path, e))
+        })?;
         let current = usize::try_from(file.metadata().map_err(|e| io_at(&path, e))?.len())
             .unwrap_or(usize::MAX);
         let next = current
@@ -3798,6 +3804,30 @@ fn open_append_file(path: &Path) -> SessionResult<File> {
     Ok(file)
 }
 
+const TRANSIENT_FILE_ACCESS_RETRY_DELAYS_MS: [u64; 3] = [10, 30, 60];
+
+fn retry_transient_file_access<T>(
+    mut operation: impl FnMut() -> SessionResult<T>,
+) -> SessionResult<T> {
+    for delay_ms in TRANSIENT_FILE_ACCESS_RETRY_DELAYS_MS {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::PermissionDenied
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    operation()
+}
+
 fn open_lock_file(path: &Path) -> SessionResult<File> {
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true);
@@ -4340,6 +4370,44 @@ mod tests {
             })
         ));
         assert!(!mgr.jsonl_path("s1").unwrap().exists());
+    }
+
+    #[test]
+    fn transient_file_access_is_retried_before_transcript_write() {
+        let path = Path::new("transient.jsonl");
+        let mut attempts = 0;
+
+        let result = retry_transient_file_access(|| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(io_at(
+                    path,
+                    io::Error::new(io::ErrorKind::PermissionDenied, "temporarily busy"),
+                ))
+            } else {
+                Ok("opened")
+            }
+        });
+
+        assert_eq!(result.unwrap(), "opened");
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn permanent_file_access_error_is_not_retried() {
+        let path = Path::new("broken.jsonl");
+        let mut attempts = 0;
+
+        let result = retry_transient_file_access(|| {
+            attempts += 1;
+            Err::<(), _>(io_at(
+                path,
+                io::Error::new(io::ErrorKind::InvalidData, "broken"),
+            ))
+        });
+
+        assert!(matches!(result, Err(SessionStoreError::Io { .. })));
+        assert_eq!(attempts, 1);
     }
 
     #[cfg(unix)]

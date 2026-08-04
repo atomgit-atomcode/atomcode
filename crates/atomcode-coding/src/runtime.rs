@@ -107,6 +107,10 @@ pub enum CodingRuntimeEvent {
     ProviderReloadFinished(Result<RuntimeGeneration, RuntimeError>),
     ProviderDeactivationFinished(Result<RuntimeGeneration, RuntimeError>),
     ControllerWarning(String),
+    /// Non-fatal failure of an auxiliary persistence surface such as the raw
+    /// per-turn transcript. Drivers must present this outside the conversation;
+    /// it is not model output and does not change the turn terminal.
+    PersistenceWarning(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6359,7 +6363,7 @@ fn emit_terminal_persistence_warnings(
         return;
     };
     if let Some(warning) = status.take_auxiliary_warning() {
-        let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(warning));
+        let _ = runtime_event_tx.send(CodingRuntimeEvent::PersistenceWarning(warning));
     }
     if let Some(warning) = status.take_cost_warning() {
         let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(warning));
@@ -6630,7 +6634,7 @@ mod tests {
 
         assert!(matches!(
             events.try_recv(),
-            Ok(CodingRuntimeEvent::ControllerWarning(message))
+            Ok(CodingRuntimeEvent::PersistenceWarning(message))
                 if message == "transcript write failed"
         ));
         assert!(matches!(

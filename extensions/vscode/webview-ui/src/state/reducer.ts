@@ -465,6 +465,7 @@ export const initialState: ChatState = {
   locale: document.body.dataset.locale,
   approvalMode: 'build',
   approvalModePending: false,
+  persistenceWarning: undefined,
 };
 
 export function chatReducer(state: ChatState, action: ChatAction): ChatState {
@@ -558,6 +559,7 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
         ...state,
         isGenerating: true,
         recoveryLocked: false,
+        persistenceWarning: undefined,
         messages: [...state.messages, assistant],
       };
     }
@@ -716,6 +718,9 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
       }
       return { ...state, messages: msgs };
     }
+
+    case 'SET_PERSISTENCE_WARNING':
+      return { ...state, persistenceWarning: action.message };
 
     case 'STREAM_RATE_LIMITED': {
       const msgs = [...state.messages];
@@ -877,7 +882,7 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
 
     // ─── Session management ─────────────────────────
     case 'CLEAR_CHAT':
-      return { ...state, messages: [], queuedMessages: [], activeTodos: [], tokenCount: undefined, contextFiles: [], isGenerating: false, recoveryLocked: false };
+      return { ...state, messages: [], queuedMessages: [], activeTodos: [], tokenCount: undefined, contextFiles: [], isGenerating: false, recoveryLocked: false, persistenceWarning: undefined };
 
     case 'SET_MODELS': {
       const hasCurrent = action.models.some((m) => m.provider === state.currentProvider);
@@ -1103,6 +1108,7 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
         messages: mergedMessages,
         activeTodos: reduceTodosFromMessages(mergedMessages),
         isGenerating: false,
+        persistenceWarning: undefined,
       };
     }
 

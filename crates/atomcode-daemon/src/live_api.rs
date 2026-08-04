@@ -687,6 +687,10 @@ pub(crate) enum LiveWireEvent {
     /// `Error` so a client can render it as a muted notice instead of a red error.
     #[serde(rename = "warning")]
     Warning { message: String },
+    /// Auxiliary session persistence failed. Kept distinct from conversational
+    /// warnings so browser clients render it outside the message timeline.
+    #[serde(rename = "persistence_warning")]
+    PersistenceWarning { message: String },
     #[serde(rename = "permission_request")]
     PermissionRequest {
         tool_name: String,
@@ -942,6 +946,9 @@ impl NativeLiveWireProjector {
             },
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ControllerWarning(message)) => {
                 LiveWireEvent::Warning { message }
+            }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::PersistenceWarning(message)) => {
+                LiveWireEvent::PersistenceWarning { message }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::RuntimeStopped(exit)) => {
                 self.tools.clear();

@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
 
@@ -32,14 +33,37 @@ pub fn sanitize_name_segment(s: &str) -> String {
         .collect()
 }
 
+/// Conservative OpenAI-compatible upper bound for a function name.
+pub const MAX_MCP_TOOL_NAME_LEN: usize = 64;
+
 /// The name the LLM sees for an MCP tool. Keeps the `mcp__{server}__{tool}`
-/// shape while making every segment a valid OpenAI function-name fragment.
+/// shape for already-valid names. Invalid or overlong names receive a stable
+/// hash suffix derived from the length-delimited original identity, so two
+/// names that sanitize to the same readable prefix remain distinct.
 pub fn mcp_tool_full_name(server: &str, tool: &str) -> String {
-    format!(
+    let raw = format!("mcp__{server}__{tool}");
+    if raw.len() <= MAX_MCP_TOOL_NAME_LEN
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return raw;
+    }
+
+    let readable = format!(
         "mcp__{}__{}",
         sanitize_name_segment(server),
         sanitize_name_segment(tool)
-    )
+    );
+    let mut hasher = Sha256::new();
+    hasher.update((server.len() as u64).to_be_bytes());
+    hasher.update(server.as_bytes());
+    hasher.update((tool.len() as u64).to_be_bytes());
+    hasher.update(tool.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    let suffix = format!("__{}", &digest[..32]);
+    let prefix_len = MAX_MCP_TOOL_NAME_LEN - suffix.len();
+    format!("{}{}", &readable[..readable.len().min(prefix_len)], suffix)
 }
 
 /// Wraps one MCP tool (`server` + `tool`) as a kernel `Tool`. The LLM sees it as
@@ -59,7 +83,9 @@ pub struct McpToolAdapter {
 impl McpToolAdapter {
     /// Build an adapter from a discovered tool's [`McpToolInfo`] and the live
     /// registry that owns the server connection.
-    pub fn new(registry: Arc<McpRegistry>, info: McpToolInfo) -> Self {
+    /// Alias collisions fail closed so an
+    /// external server cannot replace another tool under an approved name.
+    pub fn new(registry: Arc<McpRegistry>, info: McpToolInfo) -> Result<Self, String> {
         let full_name = mcp_tool_full_name(&info.server_name, &info.tool_name);
         let description = if info.description.is_empty() {
             format!(
@@ -69,7 +95,8 @@ impl McpToolAdapter {
         } else {
             format!("[MCP:{}] {}", info.server_name, info.description)
         };
-        Self {
+        registry.register_tool_alias(&full_name, &info.server_name, &info.tool_name)?;
+        Ok(Self {
             registry,
             server: info.server_name,
             tool: info.tool_name,
@@ -77,7 +104,7 @@ impl McpToolAdapter {
             description,
             schema: info.input_schema,
             read_only: info.read_only,
-        }
+        })
     }
 
     /// The mounted name (`mcp__{server}__{tool}`).
@@ -189,14 +216,14 @@ mod tests {
     fn trusted_server_makes_its_tools_safe() {
         let reg = Arc::new(McpRegistry::new());
         reg.mark_server_trusted("docs");
-        let adapter = McpToolAdapter::new(reg, info("docs", "query"));
+        let adapter = McpToolAdapter::new(reg, info("docs", "query")).unwrap();
         assert_eq!(adapter.risk("{}"), RiskLevel::Safe);
     }
 
     #[test]
     fn untrusted_server_tool_is_risky() {
         let reg = Arc::new(McpRegistry::new());
-        let adapter = McpToolAdapter::new(reg, info("docs", "query"));
+        let adapter = McpToolAdapter::new(reg, info("docs", "query")).unwrap();
         assert_eq!(adapter.risk("{}"), RiskLevel::Risky);
         assert!(
             !adapter.read_only_hint(),
@@ -211,7 +238,7 @@ mod tests {
         let reg = Arc::new(McpRegistry::new());
         let mut ro = info("docs", "query");
         ro.read_only = true;
-        let adapter = McpToolAdapter::new(reg, ro);
+        let adapter = McpToolAdapter::new(reg, ro).unwrap();
         assert_eq!(adapter.risk("{}"), RiskLevel::Safe);
         assert!(adapter.read_only_hint());
     }
@@ -221,19 +248,24 @@ mod tests {
         let reg = Arc::new(McpRegistry::new());
         reg.mark_tool_auto_approved("mcp__docs__query");
         assert_eq!(
-            McpToolAdapter::new(reg.clone(), info("docs", "query")).risk("{}"),
+            McpToolAdapter::new(reg.clone(), info("docs", "query"))
+                .unwrap()
+                .risk("{}"),
             RiskLevel::Safe
         );
         // A different tool from the same server is NOT covered.
         assert_eq!(
-            McpToolAdapter::new(reg, info("docs", "search")).risk("{}"),
+            McpToolAdapter::new(reg, info("docs", "search"))
+                .unwrap()
+                .risk("{}"),
             RiskLevel::Risky
         );
     }
 
     #[test]
     fn always_grant_scope_is_tool_wide_not_per_args() {
-        let adapter = McpToolAdapter::new(Arc::new(McpRegistry::new()), info("docs", "query"));
+        let adapter =
+            McpToolAdapter::new(Arc::new(McpRegistry::new()), info("docs", "query")).unwrap();
         // Same scope regardless of args → "Always" persists across differing calls.
         assert_eq!(
             adapter.always_grant_scope(r#"{"q":"a"}"#),
@@ -252,7 +284,8 @@ mod tests {
         let adapter = McpToolAdapter::new(
             Arc::new(McpRegistry::new()),
             info("docs w/ spaces", "query#result"),
-        );
+        )
+        .unwrap();
         let name = adapter.full_name();
         // No character outside the allowed set may survive into the function name.
         for ch in name.chars() {
@@ -268,10 +301,9 @@ mod tests {
     /// servers) must likewise sanitize to a valid OpenAI function name.
     #[test]
     fn non_ascii_names_are_sanitized() {
-        let adapter = McpToolAdapter::new(
-            Arc::new(McpRegistry::new()),
-            info("文档服务", "读取文件"),
-        );
+        let adapter =
+            McpToolAdapter::new(Arc::new(McpRegistry::new()), info("文档服务", "读取文件"))
+                .unwrap();
         let name = adapter.full_name();
         assert!(name.is_ascii(), "must be pure ASCII: {name}");
         for ch in name.chars() {
@@ -280,5 +312,44 @@ mod tests {
                 "unexpected char {ch:?} in {name:?}"
             );
         }
+    }
+
+    #[test]
+    fn valid_short_names_remain_backward_compatible() {
+        assert_eq!(
+            mcp_tool_full_name("docs", "query-v2"),
+            "mcp__docs__query-v2"
+        );
+    }
+
+    #[test]
+    fn colliding_readable_names_receive_distinct_stable_aliases() {
+        let dotted = mcp_tool_full_name("docs", "read.file");
+        let spaced = mcp_tool_full_name("docs", "read file");
+        assert_ne!(dotted, spaced);
+        assert_eq!(dotted, mcp_tool_full_name("docs", "read.file"));
+        assert!(dotted.len() <= MAX_MCP_TOOL_NAME_LEN);
+        assert!(spaced.len() <= MAX_MCP_TOOL_NAME_LEN);
+    }
+
+    #[test]
+    fn overlong_names_are_bounded_and_distinct() {
+        let first = mcp_tool_full_name(&"server".repeat(20), &"tool".repeat(20));
+        let second = mcp_tool_full_name(&"server".repeat(20), &format!("{}x", "tool".repeat(20)));
+        assert_eq!(first.len(), MAX_MCP_TOOL_NAME_LEN);
+        assert_eq!(second.len(), MAX_MCP_TOOL_NAME_LEN);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn registry_rejects_an_explicit_alias_collision() {
+        let registry = Arc::new(McpRegistry::new());
+        registry
+            .register_tool_alias("mcp__collision", "first", "tool")
+            .unwrap();
+        let error = registry
+            .register_tool_alias("mcp__collision", "second", "tool")
+            .unwrap_err();
+        assert!(error.contains("alias collision"));
     }
 }

@@ -2330,7 +2330,10 @@ pub(crate) async fn run_native_headless(
                 exit_code = 1;
             }
             CodingRuntimeEvent::Agent(KernelEvent::Warning(message))
-            | CodingRuntimeEvent::ControllerWarning(message) => eprintln!("[warning] {message}"),
+            | CodingRuntimeEvent::ControllerWarning(message)
+            | CodingRuntimeEvent::PersistenceWarning(message) => {
+                eprintln!("[warning] {message}")
+            }
             CodingRuntimeEvent::Agent(KernelEvent::RateLimited {
                 reset_at_display,
                 reset_label,

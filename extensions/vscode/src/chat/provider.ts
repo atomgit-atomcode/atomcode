@@ -119,7 +119,7 @@ interface SessionRuntime {
   recoveryLocked?: boolean;
   messages?: MessageInfo[];
   eventBuffer: Array<{
-    type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolProgress' | 'toolResult' | 'permissionRequest' | 'artifactStart' | 'artifactContent' | 'artifactEnd' | 'warning' | 'rateLimited' | 'tokens';
+    type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolProgress' | 'toolResult' | 'permissionRequest' | 'artifactStart' | 'artifactContent' | 'artifactEnd' | 'warning' | 'persistenceWarning' | 'rateLimited' | 'tokens';
     data: any;
   }>;
 }
@@ -1340,6 +1340,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         srt.eventBuffer.push({ type: 'warning', data: { message } });
         this._postStreamEventIfReady(streamSessionId, { type: 'warning', message });
       },
+      onPersistenceWarning: (message) => {
+        const srt = runtimeForStream();
+        if (!srt) return;
+        srt.eventBuffer.push({ type: 'persistenceWarning', data: { message } });
+        this._postStreamEventIfReady(streamSessionId, { type: 'persistenceWarning', message });
+      },
       onRateLimited: (event) => {
         const srt = runtimeForStream();
         if (!srt) return;
@@ -2280,6 +2286,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'warning':
           post({ type: 'warning', message: evt.data.message });
+          break;
+        case 'persistenceWarning':
+          post({ type: 'persistenceWarning', message: evt.data.message });
           break;
         case 'rateLimited':
           post({

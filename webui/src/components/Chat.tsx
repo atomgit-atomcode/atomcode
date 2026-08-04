@@ -461,6 +461,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const queueIdRef = useRef(0);
   const [tokens, setTokens] = useState<TokenUsage | null>(null);
   const [historyHint, setHistoryHint] = useState<string | null>(null);
+  // Auxiliary persistence failures belong to application chrome, not the
+  // assistant transcript. Replacing this value also deduplicates repeated
+  // failures for the same session/path.
+  const [persistenceWarning, setPersistenceWarning] = useState<string | null>(null);
   // 正在拉取某会话历史：用于抑制落地页，避免切到「有内容的会话」时先闪一下落地页。
   const [loading, setLoading] = useState(false);
   const [provider, setProvider] = useState<string | null>(null);
@@ -633,6 +637,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       setMatchIdx(0);
       setTokens(null);
       setHistoryHint(null);
+      setPersistenceWarning(null);
       // 切到一个有 id 的会话 → 进入「加载中」，先抑制落地页（避免闪屏）；
       // 无 id（新建）则不加载、直接落地。
       setLoading(sessionId != null && !cached);
@@ -1046,6 +1051,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       case 'tool_result': return { type: 'tool_result', id: e.id, name: e.name, output: e.output, success: e.success, duration_ms: e.duration_ms };
       case 'tokens': return { type: 'tokens', prompt: e.prompt, completion: e.completion, total: e.total };
       case 'warning': return { type: 'warning', message: e.message };
+      case 'persistence_warning': return { type: 'persistence_warning', message: e.message };
       case 'rate_limited': return { type: 'rate_limited', reset_at_display: e.reset_at_display, reset_label: e.reset_label, secs_until_reset: e.secs_until_reset, auto_resuming: e.auto_resuming, server_message: e.server_message ?? null };
       // NOTE: no artifact_* mapping. This is safe today because the /sync live
       // wire forwards raw TextDelta with the ``` fences intact (see to_wire in
@@ -1163,6 +1169,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setSearchOpen(false);
         setTokens(null);
         setHistoryHint(null);
+        setPersistenceWarning(null);
       }
       if (sync) {
         stopLiveStream();
@@ -1791,6 +1798,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         // 非致命提示（如"已自动压缩上下文"）：渲染成淡色 notice 行 —— 不染红、不并进
         // 回复文本、不结束回合（任务继续）。对齐 TUI 的黄色 "!" 提示。
         pushNoticeToLastAssistant(t('chat.warning', { msg: event.message }));
+        break;
+
+      case 'persistence_warning':
+        setPersistenceWarning(event.message);
         break;
 
       case 'rate_limited': {
@@ -2977,6 +2988,20 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       )}
 
       {/* Floating input */}
+      {persistenceWarning && (
+        <div class="persistence-warning" role="status">
+          <span aria-hidden="true">⚠</span>
+          <span>{persistenceWarning}</span>
+          <button
+            type="button"
+            class="persistence-warning-dismiss"
+            aria-label="Dismiss"
+            onClick={() => setPersistenceWarning(null)}
+          >
+            ×
+          </button>
+        </div>
+      )}
       <div class="input-container">
         <div class="input-wrap">
           {inputBox}

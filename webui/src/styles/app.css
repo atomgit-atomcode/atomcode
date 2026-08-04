@@ -907,6 +907,33 @@ body {
 }
 
 /* === Input === */
+.persistence-warning {
+  flex-shrink: 0;
+  width: calc(100% - 48px);
+  max-width: var(--app-content-max-width);
+  box-sizing: border-box;
+  margin: 0 auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 10px;
+  color: var(--app-warning-accent);
+  background: color-mix(in srgb, var(--app-warning-accent), transparent 88%);
+  border-radius: 6px;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.persistence-warning-dismiss {
+  margin-left: auto;
+  padding: 0 2px;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+}
+
 .input-container {
   flex-shrink: 0;
   display: flex;

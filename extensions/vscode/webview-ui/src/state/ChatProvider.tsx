@@ -155,6 +155,9 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           markStreamActivity();
           dispatch({ type: 'STREAM_WARNING', message: msg.message });
           break;
+        case 'persistenceWarning':
+          dispatch({ type: 'SET_PERSISTENCE_WARNING', message: msg.message });
+          break;
         case 'rateLimited':
           markStreamActivity();
           dispatch({

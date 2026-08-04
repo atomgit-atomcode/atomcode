@@ -3041,6 +3041,10 @@ pub enum ChatEvent {
     /// `Error` so clients render a muted notice instead of a red error.
     #[serde(rename = "warning")]
     Warning { message: String },
+    /// Auxiliary session persistence failed. Clients must display this outside
+    /// the assistant message timeline.
+    #[serde(rename = "persistence_warning")]
+    PersistenceWarning { message: String },
     /// Rate-limit hit: provider has throttled requests. Carries display-ready reset
     /// time and label so the client can render a countdown notice.
     #[serde(rename = "rate_limited")]
@@ -3749,6 +3753,9 @@ impl ChatRuntimeProjector {
             }
             CodingRuntimeEvent::ControllerWarning(message) => {
                 vec![ChatEvent::Warning { message }]
+            }
+            CodingRuntimeEvent::PersistenceWarning(message) => {
+                vec![ChatEvent::PersistenceWarning { message }]
             }
             CodingRuntimeEvent::CompactionStarted { .. }
             | CodingRuntimeEvent::CompactionFinished { .. }

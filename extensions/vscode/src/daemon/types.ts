@@ -52,6 +52,7 @@ export type ChatEvent =
   | { type: 'artifact_end'; id: string }
   | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: string }
   | { type: 'warning'; message: string }
+  | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; message: string; retry_after_seconds?: number; attempt?: number; max_attempts?: number }
   | { type: 'done'; tokens: number; tool_calls: number; session_id?: string; stop_reason?: ChatStopReason; message?: string }
   | { type: 'stopped' }
@@ -327,6 +328,7 @@ export interface ChatStreamCallbacks {
   onArtifactContent: (id: string, content: string) => void;
   onArtifactEnd: (id: string) => void;
   onWarning: (message: string) => void;
+  onPersistenceWarning?: (message: string) => void;
   onRateLimited: (event: { message: string; retryAfterSeconds?: number; attempt?: number; maxAttempts?: number }) => void;
   onDone: (tokens: number, toolCalls: number, sessionId?: string, stopReason?: ChatStopReason, message?: string) => void;
   onStopped: () => void;
