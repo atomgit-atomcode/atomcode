@@ -169,6 +169,10 @@ impl Drop for McpWorkGuard {
 pub struct CodingParts {
     registry: ToolRegistry,
     tool_names: Vec<String>,
+    /// Capability-graph decision made at prepare time. Like request-user-input,
+    /// changing the master switch requires a capability reprepare; provider-only
+    /// reassembly must not advertise a tool absent from the mounted catalog.
+    todo_enabled: bool,
     request_user_input_enabled: bool,
     mcp_tool_names: Arc<std::sync::RwLock<Vec<String>>>,
     mounted_tools: Option<MountedTools>,
@@ -291,6 +295,10 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     );
     let request_user_input_enabled =
         opts.request_user_input && crate::persona::request_user_input_switch_enabled();
+    let todo_enabled = crate::persona::todo_switch_enabled_for(cfg.todo.enabled);
+    if !todo_enabled {
+        names.retain(|name| name != "todowrite");
+    }
     if !request_user_input_enabled {
         names.retain(|name| name != "request_user_input");
     }
@@ -653,7 +661,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // production registration of TodoHook — every real entrypoint (CLI, daemon, clix) goes
     // through prepare()/assemble() here; `assemble.rs::build_coding_agent` (which also registers
     // it) is reachable only from tests + examples, so there is no double-registration.
-    if crate::persona::todo_switch_enabled() {
+    if crate::persona::todo_switch_enabled_for(cfg.todo.enabled) {
         hooks.push(Arc::new(crate::todo::TodoHook));
     }
     // DeepSeek-only opening-turn skill-first reminder. A weak model (deepseek) skips
@@ -728,6 +736,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         ),
         registry,
         tool_names: names,
+        todo_enabled,
         request_user_input_enabled,
         mcp_tool_names: Arc::new(std::sync::RwLock::new(Vec::new())),
         mounted_tools: None,
@@ -1175,6 +1184,7 @@ pub fn assemble(
                 reconcile_coding_persona(
                     &mut snap,
                     cfg,
+                    parts.todo_enabled,
                     parts.request_user_input_enabled,
                     parts.review_provider.is_some(),
                 );
@@ -1295,7 +1305,7 @@ pub fn assemble(
         .persona(coding_persona_with_capabilities(
             &cfg.model,
             cfg.preferred_language,
-            crate::persona::todo_switch_enabled(),
+            parts.todo_enabled,
             parts.request_user_input_enabled,
             parts.review_provider.is_some(),
         ))
@@ -1461,6 +1471,16 @@ pub fn assemble(
     for h in &parts.hooks {
         builder = builder.hook(h.clone());
     }
+    // Eagerness is generation-scoped: `/model` reuses CodingParts and re-runs only
+    // `assemble`, so deriving this hook in `prepare` would freeze Auto/eagerness against the
+    // session's original model generation. TodoHook itself is model-neutral and remains
+    // in the reusable parts chain above.
+    if parts.todo_enabled {
+        builder = builder.hook(Arc::new(crate::todo::TodoEagerHook::new(
+            &cfg.model,
+            cfg.todo.eager,
+        )));
+    }
     if let Some(datalog) = datalog {
         // Register last in both chains: the lifecycle observer sees the final prompt/request
         // after product hooks, and the tool observer sees the final middleware-transformed
@@ -1524,6 +1544,7 @@ pub fn assemble(
         reconcile_coding_persona(
             &mut snapshot,
             cfg,
+            parts.todo_enabled,
             parts.request_user_input_enabled,
             parts.review_provider.is_some(),
         );
@@ -1572,13 +1593,14 @@ fn persona_model(text: &str) -> Option<&str> {
 fn reconcile_coding_persona(
     snapshot: &mut SessionSnapshot,
     cfg: &CodingAgentConfig,
+    todo_enabled: bool,
     request_user_input_enabled: bool,
     review_enabled: bool,
 ) {
     let persona = coding_persona_with_capabilities(
         &cfg.model,
         cfg.preferred_language,
-        crate::persona::todo_switch_enabled(),
+        todo_enabled,
         request_user_input_enabled,
         review_enabled,
     );
@@ -1786,6 +1808,7 @@ mod tests {
             &agent_config("deepseek-v4-flash"),
             true,
             true,
+            true,
         );
 
         assert!(snapshot.messages[0]
@@ -1793,6 +1816,19 @@ mod tests {
             .contains("running the deepseek-v4-flash model"));
         assert_eq!(snapshot.messages[1].text, "SESSION CONTEXT");
         assert_eq!(snapshot.cache_epoch, 1);
+    }
+
+    #[test]
+    fn provider_reassemble_keeps_the_prepared_todo_capability_gate() {
+        let mut snapshot = SessionSnapshot::new(vec![Message::system("SESSION CONTEXT")]);
+        let cfg = agent_config("deepseek-v4-flash");
+
+        reconcile_coding_persona(&mut snapshot, &cfg, false, true, true);
+
+        assert!(!snapshot.messages[0].text.contains("## TASK TRACKING"));
+        assert!(snapshot.messages[0]
+            .text
+            .contains("running the deepseek-v4-flash model"));
     }
 
     #[test]
@@ -1815,6 +1851,7 @@ mod tests {
         reconcile_coding_persona(
             &mut snapshot,
             &agent_config("deepseek-v4-flash"),
+            true,
             true,
             true,
         );
@@ -1860,8 +1897,8 @@ mod tests {
             Message::assistant("I am model-a", vec![]),
         ]);
 
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true);
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-c"), true, true);
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true);
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-c"), true, true, true);
 
         let transitions: Vec<_> = snapshot
             .messages
@@ -1898,6 +1935,7 @@ mod tests {
             &agent_config("deepseek-v4-flash"),
             true,
             true,
+            true,
         );
 
         assert_eq!(snapshot.messages[0].text, persona);
@@ -1922,7 +1960,7 @@ mod tests {
         let mut cfg = agent_config("model-a");
         cfg.preferred_language = Some(Locale::ZhCn);
 
-        reconcile_coding_persona(&mut snapshot, &cfg, true, true);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true);
 
         assert!(snapshot.messages[0]
             .text
@@ -1949,12 +1987,12 @@ mod tests {
             )),
             Message::assistant("I am model-a", vec![]),
         ]);
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true);
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true);
         let transition = snapshot.messages.last().cloned().unwrap();
         let mut cfg = agent_config("model-b");
         cfg.preferred_language = Some(Locale::ZhCn);
 
-        reconcile_coding_persona(&mut snapshot, &cfg, true, true);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true);
 
         assert_eq!(snapshot.messages.last(), Some(&transition));
         assert_eq!(

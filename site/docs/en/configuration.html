@@ -270,6 +270,12 @@ base_url = "http://localhost:11434"</code></pre>
 max_rounds = 200</code></pre>
       <p>When the limit is reached, the TUI asks whether to continue or stop instead of dropping the task. Set it to <code>0</code> for no limit.</p>
 
+      <h2>Todo eagerness</h2>
+      <pre><code>[tools.todo]
+enabled = true
+eager = "auto"</code></pre>
+      <p><code>eager</code> accepts <code>auto</code>, <code>preferred</code>, or <code>always</code>. Auto adds a stronger first-round reminder for DeepSeek V4 Flash while preserving the normal behavior for other models. Preferred applies that reminder to every model. Always requests <code>todowrite</code> as the first tool of a new task when no active list exists; OpenAI-compatible and Anthropic providers enforce the named choice, while adapters without named-tool selection still receive the imperative reminder. Set <code>enabled = false</code> to remove the tool, prompt guidance, and todo hooks together; restart the current runtime after changing this master switch. <code>ATOMCODE_TODO</code> remains an environment override.</p>
+
       <h2 id="vision-preprocessor">Vision preprocessor</h2>
       <p>When the active provider's model can't read images (text-only models like DeepSeek-V3 / Kimi) and the user <a href="./basic-usage.html#image-attach">attaches an image</a>, AtomCode doesn't refuse — it forwards the image to a separate "vision preprocessor" provider for OCR + description, then splices the resulting text into the user message before sending to the main model.</p>
       <p>To enable: name an image-capable provider key as <code>vision_preprocessor_provider</code> in the config:</p>

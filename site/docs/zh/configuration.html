@@ -270,6 +270,12 @@ base_url = "http://localhost:11434"</code></pre>
 max_rounds = 200</code></pre>
       <p>达到上限时，TUI 会询问继续还是停止，不会直接丢失当前任务。设置为 <code>0</code> 表示不限制。</p>
 
+      <h2>Todo 触发积极度</h2>
+      <pre><code>[tools.todo]
+enabled = true
+eager = "auto"</code></pre>
+      <p><code>eager</code> 支持 <code>auto</code>、<code>preferred</code>、<code>always</code>。Auto 会对 DeepSeek V4 Flash 在新任务首轮增加高权重提醒，其他模型保持原行为；Preferred 对所有模型启用该提醒；Always 会在没有活跃任务列表时要求先调用 <code>todowrite</code>：OpenAI-compatible 与 Anthropic provider 会强制指定该工具，不支持 named-tool selection 的 adapter 仍会收到强指令提醒。设置 <code>enabled = false</code> 会一起关闭工具、提示词和 Todo hooks；修改这个总开关后需要重启当前 runtime。环境变量 <code>ATOMCODE_TODO</code> 仍可覆盖该开关。</p>
+
       <h2 id="vision-preprocessor">视觉预处理器</h2>
       <p>当当前 active provider 的模型不支持图片输入(纯文本模型,比如 DeepSeek-V3 / Kimi),用户却 <a href="./basic-usage.html#image-attach">attach 了图片</a>时,AtomCode 不会直接拒绝,而是会把图片转给一个独立的"视觉预处理 provider"做 OCR + 描述,把结果以文本形式 splice 进用户消息里再发给主模型。</p>
       <p>启用方式:在配置里指定一个支持图片的 provider key 作为 <code>vision_preprocessor_provider</code>:</p>

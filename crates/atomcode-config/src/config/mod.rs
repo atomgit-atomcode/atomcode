@@ -58,6 +58,43 @@ pub fn platform_rules() -> &'static str {
 pub struct CodingConfig {
     pub max_rounds: u32,
 }
+
+/// How aggressively the coding agent should start a structured todo list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TodoEagerness {
+    /// Prefer todo tracking only for models known to benefit from a stronger nudge.
+    #[default]
+    Auto,
+    /// Add a high-recency reminder for a new task when no todo list exists.
+    Preferred,
+    /// Require the first model request for a new task to use `todowrite`.
+    Always,
+}
+
+/// `[tools.todo]` policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TodoToolConfig {
+    pub enabled: bool,
+    pub eager: TodoEagerness,
+}
+
+impl Default for TodoToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            eager: TodoEagerness::Auto,
+        }
+    }
+}
+
+/// Tool-specific policies. Persisted as `[tools.*]` tables.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolsConfig {
+    pub todo: TodoToolConfig,
+}
 impl Default for CodingConfig {
     fn default() -> Self {
         Self { max_rounds: 200 }
@@ -198,6 +235,10 @@ pub struct Config {
     /// `[coding]` turn-level policy. Missing from older configs → max_rounds=200.
     #[serde(default)]
     pub coding: CodingConfig,
+    /// Tool-specific behavior. Missing from older configs keeps todo enabled with
+    /// model-aware automatic eagerness.
+    #[serde(default)]
+    pub tools: ToolsConfig,
     /// Provider key (matches a key in `Config.providers`) of a vision-language
     /// model used to preprocess images before forwarding to a non-vision main
     /// provider. When `None` or empty, image preprocessing is disabled — pasted
@@ -481,6 +522,7 @@ impl Default for Config {
             subagent: Default::default(),
             loop_config: Default::default(),
             coding: CodingConfig::default(),
+            tools: ToolsConfig::default(),
             vision_preprocessor_provider: None,
             language: None,
             ui: UiConfig::default(),
@@ -2224,6 +2266,12 @@ model = "missing-type"
             subagent: Default::default(),
             loop_config: Default::default(),
             coding: CodingConfig::default(),
+            tools: ToolsConfig {
+                todo: TodoToolConfig {
+                    enabled: false,
+                    eager: TodoEagerness::Always,
+                },
+            },
             vision_preprocessor_provider: None,
             language: None,
             ui: Default::default(),
@@ -2265,6 +2313,8 @@ model = "missing-type"
         let reloaded = Config::load(&tmp).unwrap();
         assert!(!reloaded.datalog.enabled);
         assert_eq!(reloaded.datalog.dir.as_deref(), Some("/var/log/ac"));
+        assert!(!reloaded.tools.todo.enabled);
+        assert_eq!(reloaded.tools.todo.eager, TodoEagerness::Always);
         assert!(reloaded.notifications.enabled);
         assert_eq!(
             reloaded.network.proxy.mode,
@@ -3252,5 +3302,17 @@ context_window = 131072
         let toml = "default_model = \"acc/ds\"\n\n[provider_accounts.acc]\nprovider = \"deepseek\"\napi_key = \"sk-x\"\n\n[models.\"acc/ds\"]\naccount = \"acc\"\nmodel = \"deepseek-chat\"\ncontext_window = 200000\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.default_context_window(), 200000);
+    }
+
+    #[test]
+    fn todo_tool_policy_defaults_and_parses() {
+        let defaulted: Config = toml::from_str("").unwrap();
+        assert!(defaulted.tools.todo.enabled);
+        assert_eq!(defaulted.tools.todo.eager, TodoEagerness::Auto);
+
+        let configured: Config =
+            toml::from_str("[tools.todo]\nenabled = false\neager = \"always\"\n").unwrap();
+        assert!(!configured.tools.todo.enabled);
+        assert_eq!(configured.tools.todo.eager, TodoEagerness::Always);
     }
 }

@@ -243,6 +243,12 @@ mode = "follow_system"
 [loop_config]
 max_rounds = 100
 
+# Todo 任务跟踪。ATOMCODE_TODO 环境变量仍可覆盖 enabled；修改 enabled 后需重启当前 runtime。
+# eager: auto（DeepSeek V4 Flash 自动增强）| preferred（复杂任务优先提醒）| always（provider 支持时强制先建表）
+[tools.todo]
+enabled = true
+eager = "auto"
+
 # =============================================================================
 # Subagent 设置（`task` 工具：主 agent 把子任务派发给隔离上下文的子 agent）
 # =============================================================================

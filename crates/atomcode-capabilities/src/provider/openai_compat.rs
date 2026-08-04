@@ -981,13 +981,21 @@ fn build_request_body(
     if let Some(t) = options.temperature {
         body.insert("temperature".into(), json!(t));
     }
-    match options.tool_choice {
-        ToolChoice::Auto => {} // omit → byte-identical to "no opinion"
-        ToolChoice::Required => {
-            body.insert("tool_choice".into(), json!("required"));
-        }
-        ToolChoice::None => {
-            body.insert("tool_choice".into(), json!("none"));
+    if supports_tool_choice(model, &cfg.base_url) {
+        match &options.tool_choice {
+            ToolChoice::Auto => {} // omit → byte-identical to "no opinion"
+            ToolChoice::Required => {
+                body.insert("tool_choice".into(), json!("required"));
+            }
+            ToolChoice::Specific(name) => {
+                body.insert(
+                    "tool_choice".into(),
+                    json!({ "type": "function", "function": { "name": name } }),
+                );
+            }
+            ToolChoice::None => {
+                body.insert("tool_choice".into(), json!("none"));
+            }
         }
     }
     if let Some(effort) = options.reasoning_effort {
@@ -1019,6 +1027,17 @@ fn build_request_body(
         body.insert("tools".into(), json!(t));
     }
     Value::Object(body)
+}
+
+/// Official DeepSeek V4 thinking endpoints reject the `tool_choice` control
+/// parameter while still accepting tools in auto mode. Keep custom OpenAI-compatible
+/// gateways untouched because they may implement the full OpenAI contract.
+fn supports_tool_choice(model: &str, base_url: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    let base = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
+    let official_deepseek =
+        base == "https://api.deepseek.com" || base.starts_with("https://api.deepseek.com/");
+    !(official_deepseek && model.starts_with("deepseek-v4"))
 }
 
 /// Whether a model accepts a top-level `reasoning_effort` control. Exposed so a UI
@@ -2140,6 +2159,46 @@ mod tests {
             "None temperature omitted"
         );
         assert!(body.get("max_tokens").is_none(), "no max_tokens set");
+    }
+
+    #[test]
+    fn specific_tool_choice_uses_openai_function_shape() {
+        let cfg = OpenAiCompatConfig::new("k", "https://x.test", "deepseek-v4-flash");
+        let opts = ChatOptions {
+            tool_choice: ToolChoice::Specific("todowrite".into()),
+            ..Default::default()
+        };
+        let body = build_request_body(
+            "deepseek-v4-flash",
+            &[Message::user("hi")],
+            &[],
+            &opts,
+            &cfg,
+            ReasoningPolicy::Exclude,
+        );
+        assert_eq!(body["tool_choice"]["type"], "function");
+        assert_eq!(body["tool_choice"]["function"]["name"], "todowrite");
+    }
+
+    #[test]
+    fn official_deepseek_v4_omits_unsupported_tool_choice() {
+        let cfg = OpenAiCompatConfig::new("k", "https://api.deepseek.com/v1", "deepseek-v4-flash");
+        let opts = ChatOptions {
+            tool_choice: ToolChoice::Specific("todowrite".into()),
+            ..Default::default()
+        };
+        let body = build_request_body(
+            "deepseek-v4-flash",
+            &[Message::user("hi")],
+            &[],
+            &opts,
+            &cfg,
+            ReasoningPolicy::Exclude,
+        );
+        assert!(
+            body.get("tool_choice").is_none(),
+            "official DeepSeek V4 still receives the eager reminder, but not its rejected control parameter"
+        );
     }
 
     #[test]

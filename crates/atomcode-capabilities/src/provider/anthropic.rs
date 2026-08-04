@@ -395,16 +395,29 @@ fn build_request_body(
             body.insert("temperature".into(), json!(t));
         }
     }
-    match options.tool_choice {
+    let forces_tool_use = matches!(
+        &options.tool_choice,
+        ToolChoice::Required | ToolChoice::Specific(_)
+    );
+    match &options.tool_choice {
         ToolChoice::Auto => {} // omit → byte-identical to "no opinion"
         ToolChoice::Required => {
             body.insert("tool_choice".into(), json!({ "type": "any" }));
+        }
+        ToolChoice::Specific(name) => {
+            body.insert(
+                "tool_choice".into(),
+                json!({ "type": "tool", "name": name }),
+            );
         }
         ToolChoice::None => {
             body.insert("tool_choice".into(), json!({ "type": "none" }));
         }
     }
-    if cfg.thinking {
+    // Anthropic rejects extended/adaptive thinking combined with forced tool use.
+    // Suppress thinking for this one request; the session config remains unchanged,
+    // so the following round resumes thinking automatically.
+    if cfg.thinking && !forces_tool_use {
         body.insert("thinking".into(), json!({ "type": "adaptive" }));
     }
     if let Some(effort) = options.reasoning_effort {
@@ -1311,13 +1324,30 @@ mod tests {
             "sampling params omitted by default (Opus 4.7+ reject temperature)"
         );
         assert_eq!(body["tool_choice"], json!({"type":"any"}), "Required → any");
-        assert_eq!(body["thinking"], json!({"type":"adaptive"}));
+        assert!(
+            body.get("thinking").is_none(),
+            "forced tool use must suppress incompatible thinking for this request"
+        );
         assert_eq!(body["output_config"]["effort"], "high");
         // tools use input_schema, NOT function.parameters.
         assert_eq!(
             body["tools"][0],
             json!({"name":"read","description":"d","input_schema":{"type":"object"}})
         );
+    }
+
+    #[test]
+    fn specific_tool_choice_uses_anthropic_tool_shape() {
+        let mut c = cfg();
+        c.thinking = true;
+        let opts = ChatOptions {
+            tool_choice: ToolChoice::Specific("todowrite".into()),
+            ..Default::default()
+        };
+        let body = build_request_body("claude-opus-4-8", &[Message::user("hi")], &[], &opts, &c);
+        assert_eq!(body["tool_choice"]["type"], "tool");
+        assert_eq!(body["tool_choice"]["name"], "todowrite");
+        assert!(body.get("thinking").is_none());
     }
 
     #[test]

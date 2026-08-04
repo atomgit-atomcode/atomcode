@@ -80,6 +80,8 @@ pub struct CodingAgentConfig {
     /// Preferred language for natural-language commit subjects and bodies.
     /// `None` means follow the current conversation language.
     pub preferred_language: Option<Locale>,
+    /// Resolved `[tools.todo]` policy for this runtime generation.
+    pub todo: atomcode_config::config::TodoToolConfig,
     /// Stable config/provider registry key exposed to drivers. This is distinct
     /// from `provider_type`, which selects the adapter implementation.
     pub provider_name: String,
@@ -205,6 +207,7 @@ pub struct CodingRuntimeConfig {
     pub base_url: String,
     pub model: String,
     pub preferred_language: Option<Locale>,
+    pub todo: atomcode_config::config::TodoToolConfig,
     pub provider_name: String,
     pub working_dir: PathBuf,
     pub context_window: u32,
@@ -272,6 +275,7 @@ impl CodingRuntimeConfig {
                 None,
                 config.language,
             )),
+            todo: config.tools.todo.clone(),
             provider_name: r.map(|r| r.selection_id.clone()).unwrap_or_default(),
             working_dir: working_dir.to_path_buf(),
             context_window: r.map(|r| r.context_window as u32).unwrap_or(128_000),
@@ -317,6 +321,7 @@ impl CodingRuntimeConfig {
         );
         config.context_window = self.context_window;
         config.preferred_language = self.preferred_language;
+        config.todo = self.todo.clone();
         config.provider_name = self.provider_name.clone();
         config.chat_options.max_tokens = self.max_tokens;
         config.telemetry = self.telemetry.clone();
@@ -579,6 +584,7 @@ impl CodingAgentConfig {
             provider_name: model.clone(),
             model,
             preferred_language: None,
+            todo: Default::default(),
             working_dir: working_dir.into(),
             context_window: 128_000,
             stream_timeout: default_stream_timeout(),
@@ -663,6 +669,29 @@ mod tests {
         assert_eq!(
             runtime.agent_config().datalog.dir.as_deref(),
             Some("/var/tmp/atomcode-datalog")
+        );
+    }
+
+    #[test]
+    fn runtime_config_passes_todo_policy_to_agent() {
+        let mut source = atomcode_config::config::Config::default();
+        source.tools.todo.enabled = false;
+        source.tools.todo.eager = atomcode_config::config::TodoEagerness::Always;
+        let runtime = CodingRuntimeConfig::from_config(
+            &source,
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            true,
+        );
+
+        assert!(!runtime.todo.enabled);
+        let agent = runtime.agent_config();
+        assert!(!agent.todo.enabled);
+        assert_eq!(
+            agent.todo.eager,
+            atomcode_config::config::TodoEagerness::Always
         );
     }
 

@@ -1916,6 +1916,9 @@ impl RunningAgent {
             let mut request_options = self.chat_options.clone();
             request_options.rate_limit_retry_owner = crate::provider::RateLimitRetryOwner::Kernel;
             self.hooks
+                .pre_request_options(&messages, &mut request_options, &turn_ctx)
+                .await;
+            self.hooks
                 .on_request(&messages, &defs, &request_options, &turn_ctx)
                 .await;
             // A failed OPEN cleanly fails the turn — no bogus assistant message,
