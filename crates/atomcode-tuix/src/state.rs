@@ -1022,6 +1022,9 @@ pub struct UiState {
     /// can be edited + resent without re-typing. `None` between
     /// turns and after any successful completion.
     pub last_submitted_message: Option<String>,
+    /// Ephemeral next-prompt ghost text for the empty composer. It is never
+    /// submitted or persisted until the user accepts it with Right Arrow.
+    pub next_prompt_suggestion: Option<String>,
     /// Authoritative pasted `(images, markers)` of the last submitted turn,
     /// captured at submit BEFORE typed-path attachment so the image↔marker
     /// pairing stays exact (never re-derived from text, which can misorder).
@@ -1281,6 +1284,7 @@ impl UiState {
             last_context: None,
             post_compaction_used_tokens: None,
             last_submitted_message: None,
+            next_prompt_suggestion: None,
             last_submitted_pasted_images: Vec::new(),
             last_submitted_pasted_markers: Vec::new(),
             pending_context_render: None,
@@ -1549,6 +1553,7 @@ impl UiState {
     }
 
     pub fn on_submit(&mut self) {
+        self.next_prompt_suggestion = None;
         self.phase = UiPhase::Streaming;
         self.spinner_label = self.current_thinking().to_string();
         self.spinner_frame = 0;
@@ -1633,6 +1638,7 @@ impl UiState {
     }
 
     pub fn on_turn_cancelled(&mut self) {
+        self.next_prompt_suggestion = None;
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
         self.compacting = false;
@@ -1668,6 +1674,7 @@ impl UiState {
     /// normal turn terminal, a session replacement must not keep `/usage` or
     /// `/cost` from the previous foreground session visible.
     pub fn on_session_replaced(&mut self) {
+        self.next_prompt_suggestion = None;
         self.footer_command_output = None;
         self.footer_persistence_warning = None;
         self.footer_usage = None;

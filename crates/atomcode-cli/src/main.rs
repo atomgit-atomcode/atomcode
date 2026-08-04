@@ -1496,7 +1496,7 @@ async fn run() -> Result<i32> {
         total_ms = run_start.elapsed().as_millis() as u64,
         "optional metadata refresh detached from startup"
     );
-    let runtime_cfg = runtime_config_from(
+    let mut runtime_cfg = runtime_config_from(
         &config,
         &working_dir,
         cli.provider.as_deref(),
@@ -1506,6 +1506,7 @@ async fn run() -> Result<i32> {
         // fail-closed timeout so an unanswered approval can't park the run forever.
         !is_headless,
     );
+    runtime_cfg.next_prompt_suggestions = !is_headless;
     let model_name = runtime_cfg.model.clone();
     let provider_bootstrap = if is_headless {
         atomcode_coding::ProviderBootstrap::Required
@@ -1595,6 +1596,7 @@ async fn run() -> Result<i32> {
                 // event loop). `spawn_deferred_tui_runtime` is only ever the
                 // in-TUI respawn factory, so this is never a headless path.
                 runtime_cfg.round_cap_checkpoint = true;
+                runtime_cfg.next_prompt_suggestions = true;
                 spawn_deferred_tui_runtime(runtime_cfg, session)
             },
         )

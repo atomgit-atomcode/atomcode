@@ -91,6 +91,15 @@ pub enum CodingRuntimeEvent {
     SessionNameSuggested {
         name: String,
     },
+    /// Ephemeral composer suggestion sampled after a naturally completed turn.
+    /// It is not part of the conversation or session persistence. Drivers must
+    /// discard it when the correlated generation/session/turn is no longer current.
+    NextPromptSuggested {
+        generation: RuntimeGeneration,
+        session_id: Option<String>,
+        turn_id: u64,
+        text: String,
+    },
     SessionChanged(SessionChanged),
     WorkingDirectoryChanged(std::path::PathBuf),
     GoalChanged(GoalProgress),
@@ -641,6 +650,14 @@ struct RuntimeResources {
     wakeup_tx: mpsc::UnboundedSender<WakeupRequest>,
     loop_active: Arc<std::sync::atomic::AtomicBool>,
     image_preprocessor: Option<Arc<dyn ImagePreprocessor>>,
+}
+
+struct NextPromptSuggestionOutcome {
+    generation: u64,
+    revision: u64,
+    session_id: Option<String>,
+    turn_id: u64,
+    text: String,
 }
 
 /// A native coding runtime. Dropping `events` causes a fail-closed shutdown.
@@ -2404,6 +2421,8 @@ fn spawn_runtime_owner_with_optional_agent(
     let (goal_eval_tx, mut goal_eval_rx) = mpsc::unbounded_channel::<EvalOutcome>();
     let (loop_fire_tx, mut loop_fire_rx) = mpsc::unbounded_channel::<(u64, u64, WakeupRequest)>();
     let (session_name_tx, mut session_name_rx) = mpsc::unbounded_channel::<(u64, String)>();
+    let (next_prompt_tx, mut next_prompt_rx) =
+        mpsc::unbounded_channel::<NextPromptSuggestionOutcome>();
     let mut generation = 0;
     let event_generation = Arc::new(AtomicU64::new(generation));
     let runtime_event_tx = RuntimeEventEmitter {
@@ -2443,6 +2462,7 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut terminal_reason = None;
         let mut turn_stats = RuntimeTurnStats::default();
         let mut turn_started_at: Option<std::time::Instant> = None;
+        let mut next_prompt_task: Option<tokio::task::JoinHandle<()>> = None;
         let mut pending_local_context = Vec::new();
         let mut next_controller_id = 0u64;
         let mut goal: Option<GoalState> = None;
@@ -2732,6 +2752,22 @@ fn spawn_runtime_owner_with_optional_agent(
                         );
                     }
                 }
+                suggestion = next_prompt_rx.recv(), if native_protocol => {
+                    let Some(suggestion) = suggestion else { continue };
+                    if suggestion.generation == generation
+                        && suggestion.revision == conversation_revision
+                        && active_turn.is_none()
+                    {
+                        let _ = runtime_event_tx.send(
+                            CodingRuntimeEvent::NextPromptSuggested {
+                                generation: RuntimeGeneration(suggestion.generation),
+                                session_id: suggestion.session_id,
+                                turn_id: suggestion.turn_id,
+                                text: suggestion.text,
+                            },
+                        );
+                    }
+                }
                 outcome = goal_eval_rx.recv(), if native_protocol => {
                     let Some(outcome) = outcome else { continue };
                     if outcome.generation != generation
@@ -2944,6 +2980,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                 .unwrap_or(RuntimeError::Unavailable);
                             let _ = done.send(Err(error));
                             continue;
+                        }
+                        if let Some(task) = next_prompt_task.take() {
+                            task.abort();
                         }
                         // The real-user submit boundary owns per-turn execution intent.
                         // Update before forwarding (including steer) so a newly received
@@ -3177,6 +3216,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                 turn_id: point.turn_id,
                             }));
                             continue;
+                        }
+                        if let Some(task) = next_prompt_task.take() {
+                            task.abort();
                         }
                         controls.state.store(
                             runtime_phase_state(generation, RuntimePhase::Reconfiguring),
@@ -3624,6 +3666,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                         };
 
+                        if let Some(task) = next_prompt_task.take() {
+                            task.abort();
+                        }
+
                         controls.state.store(
                             runtime_phase_state(generation, RuntimePhase::Reconfiguring),
                             Ordering::Release,
@@ -3802,6 +3848,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             continue;
                         }
 
+                        if let Some(task) = next_prompt_task.take() {
+                            task.abort();
+                        }
+
                         controls.state.store(
                             runtime_phase_state(generation, RuntimePhase::Reconfiguring),
                             Ordering::Release,
@@ -3955,6 +4005,9 @@ fn spawn_runtime_owner_with_optional_agent(
                             resources = Some(runtime);
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
+                        }
+                        if let Some(task) = next_prompt_task.take() {
+                            task.abort();
                         }
                         if withdraws_mcp {
                             // Config, trust, and auth are mutable security inputs.
@@ -4206,6 +4259,9 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
+                        if let Some(task) = next_prompt_task.take() {
+                            task.abort();
+                        }
                         let undo_sidecars = match persist_runtime_undo(
                             &mut runtime,
                             Some(original.as_ref()),
@@ -4403,6 +4459,9 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
+                        if let Some(task) = next_prompt_task.take() {
+                            task.abort();
+                        }
                         controls.state.store(
                             runtime_phase_state(generation, RuntimePhase::Reconfiguring),
                             Ordering::Release,
@@ -4697,6 +4756,9 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = done.send(Ok(()));
                     }
                     Some(CodingRuntimeControl::Shutdown { generation: request_generation }) => {
+                        if let Some(task) = next_prompt_task.take() {
+                            task.abort();
+                        }
                         if request_generation == generation {
                             controls.state.store(
                                 runtime_phase_state(generation, RuntimePhase::ShuttingDown),
@@ -5306,6 +5368,52 @@ fn spawn_runtime_owner_with_optional_agent(
                                         loop_state = None;
                                     }
                                     active_turn = None;
+                                    if completion_reason == StopReason::Stopped
+                                        && resources.as_ref().is_some_and(|runtime| {
+                                            runtime.config.next_prompt_suggestions
+                                        })
+                                    {
+                                        if let Some(task) = next_prompt_task.take() {
+                                            task.abort();
+                                        }
+                                        let provider = resources.as_ref().and_then(|runtime| {
+                                            let session_id = runtime
+                                                .parts
+                                                .session
+                                                .as_ref()
+                                                .map(|binding| binding.id.as_str());
+                                            runtime
+                                                .provider_factory
+                                                .build(&runtime.config, session_id)
+                                                .ok()
+                                        });
+                                        if let Some(provider) = provider {
+                                            let tx = next_prompt_tx.clone();
+                                            let messages = snapshot.messages.clone();
+                                            let suggestion_generation = generation;
+                                            let suggestion_revision = conversation_revision;
+                                            let suggestion_session_id = resources
+                                                .as_ref()
+                                                .and_then(|runtime| runtime.parts.session.as_ref())
+                                                .map(|binding| binding.id.clone());
+                                            next_prompt_task = Some(tokio::spawn(async move {
+                                                if let Some(text) = crate::next_prompt_suggestion::generate_next_prompt_suggestion(
+                                                    provider,
+                                                    &messages,
+                                                )
+                                                .await
+                                                {
+                                                    let _ = tx.send(NextPromptSuggestionOutcome {
+                                                        generation: suggestion_generation,
+                                                        revision: suggestion_revision,
+                                                        session_id: suggestion_session_id,
+                                                        turn_id,
+                                                        text,
+                                                    });
+                                                }
+                                            }));
+                                        }
+                                    }
                                     let _ = runtime_event_tx.send(
                                         CodingRuntimeEvent::TurnFinished(
                                             TurnCompletion::Completed {
@@ -5406,6 +5514,9 @@ fn spawn_runtime_owner_with_optional_agent(
                     },
                 },
             }
+        }
+        if let Some(task) = next_prompt_task.take() {
+            task.abort();
         }
         controls.state.store(
             runtime_phase_state(generation, RuntimePhase::Stopped),

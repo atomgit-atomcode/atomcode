@@ -53,6 +53,7 @@ pub mod vision;
 mod assemble;
 mod execution_policy;
 mod init_prompt;
+mod next_prompt_suggestion;
 mod rate_limit;
 mod skill_first;
 pub mod subagent_tiers;

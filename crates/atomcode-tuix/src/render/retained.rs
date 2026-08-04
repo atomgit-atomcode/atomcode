@@ -1831,6 +1831,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
         row
     }
 
+    fn build_ghost_middle_row(&self, line: &str, is_first: bool) -> Vec<Cell> {
+        let mut row = Vec::new();
+        if is_first {
+            push_str_cells(
+                &mut row,
+                self.caps.prompt_chevron(),
+                &self.style_for(Role::Accent),
+            );
+        } else {
+            push_str_cells(&mut row, "  ", &CellStyle::default());
+        }
+        push_str_cells(&mut row, line, &self.style_faint(Role::Muted));
+        row
+    }
+
     fn build_menu_row(
         &self,
         name: &str,
@@ -3561,7 +3576,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let text_budget = input_rule_width.saturating_sub(prefix_and_reserve);
 
         // Wrap input + locate cursor in wrapped layout.
-        let safe = scrub_controls(&self.input_buf);
+        let ghost_active = self.input_buf.is_empty()
+            && self
+                .status
+                .next_prompt_suggestion
+                .as_deref()
+                .is_some_and(|text| !text.is_empty());
+        let safe = if ghost_active {
+            scrub_controls(
+                self.status
+                    .next_prompt_suggestion
+                    .as_deref()
+                    .unwrap_or_default(),
+            )
+        } else {
+            scrub_controls(&self.input_buf)
+        };
         let (mut lines, cursor_row_in_middle, cursor_col_in_row) = if text_budget == 0 {
             (vec![String::new()], 0usize, 0usize)
         } else {
@@ -3950,7 +3980,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let middle_cells: Vec<Vec<Cell>> = lines[input_view_start..input_view_start + middle_rows]
             .iter()
             .enumerate()
-            .map(|(i, line)| self.build_middle_row(line, input_view_start + i == 0, shell))
+            .map(|(i, line)| {
+                let first = input_view_start + i == 0;
+                if ghost_active {
+                    self.build_ghost_middle_row(line, first)
+                } else {
+                    self.build_middle_row(line, first, shell)
+                }
+            })
             .collect();
         // When the input is scrolled (windowed), show "+N more lines" on the
         // bottom rule so it's visible that content is hidden, not lost.
@@ -4601,7 +4638,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // matches the actual render (else body_bottom is off by a row).
         let prefix_and_reserve = if self.caps.jediterm { 3 } else { 2 };
         let text_budget = (self.screen.width() as usize).saturating_sub(prefix_and_reserve);
-        let safe = scrub_controls(&self.input_buf);
+        let safe = if self.input_buf.is_empty() {
+            self.status
+                .next_prompt_suggestion
+                .as_deref()
+                .map(scrub_controls)
+                .unwrap_or_default()
+        } else {
+            scrub_controls(&self.input_buf)
+        };
         let middle_rows = if text_budget == 0 {
             1
         } else {
@@ -8918,6 +8963,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
             round_cap_panel: None,
         }
     }
@@ -9288,6 +9334,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
             round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, false);
@@ -9343,6 +9390,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
             round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, /* shell */ true);
@@ -9417,6 +9465,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
             round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, false);
@@ -9467,6 +9516,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
             round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, false);
@@ -9521,6 +9571,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
             round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, false);
@@ -9575,6 +9626,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
             round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, false);
@@ -9613,6 +9665,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
             round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, false);
@@ -20591,6 +20644,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn empty_input_renders_next_prompt_as_faint_ghost_text() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+
+        let row = r.build_ghost_middle_row("继续审计代码改动", true);
+        let chevron_cells = r.caps.prompt_chevron().chars().count();
+        let ghost_cells = &row[chevron_cells..];
+
+        assert_eq!(
+            ghost_cells
+                .iter()
+                .filter(|cell| cell.width > 0)
+                .map(|cell| cell.ch)
+                .collect::<String>(),
+            "继续审计代码改动"
+        );
+        assert!(
+            ghost_cells
+                .iter()
+                .filter(|cell| cell.width > 0)
+                .all(|cell| cell.style.faint),
+            "recommendation text must use terminal-theme-aware faint styling"
+        );
+    }
+
     /// The footer height reported by `current_footer_rows()` must equal the
     /// height that `paint_footer` actually uses — the critical mirror invariant.
     ///
@@ -20632,6 +20712,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
             round_cap_panel: None,
         };
         status.approval = Some(crate::render::ApprovalPanelView {

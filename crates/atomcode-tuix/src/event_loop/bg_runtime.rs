@@ -763,6 +763,12 @@ impl BgRuntimeManager {
                 self.apply_background_session_name(runtime_id, name);
                 false
             }
+            RuntimeEventPayload::Native(event @ CodingRuntimeEvent::NextPromptSuggested { .. }) => {
+                if let Some(bg) = self.backgrounds.slot_mut_for_runtime_id(runtime_id) {
+                    bg.buffered_events.push(RuntimeEventPayload::Native(event));
+                }
+                false
+            }
             RuntimeEventPayload::Native(CodingRuntimeEvent::Agent(event)) => {
                 if let Some(bg) = self.backgrounds.slot_mut_for_runtime_id(runtime_id) {
                     if !matches!(
@@ -1105,6 +1111,30 @@ mod tests {
         crate::i18n::set_locale(atomcode_config::locale::Locale::En);
         let slots = BackgroundSlots::new(16);
         assert_eq!(render_bg_list(&slots), "  No background sessions.\n");
+    }
+
+    #[test]
+    fn a_new_background_turn_drops_the_previous_prompt_suggestion() {
+        let mut events = vec![
+            RuntimeEventPayload::Native(CodingRuntimeEvent::SessionNameSuggested {
+                name: "kept title".into(),
+            }),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::NextPromptSuggested {
+                generation: atomcode_coding::RuntimeGeneration(1),
+                session_id: Some("session-1".into()),
+                turn_id: 7,
+                text: "stale suggestion".into(),
+            }),
+        ];
+
+        retain_session_replay_events(&mut events);
+
+        assert!(matches!(
+            events.as_slice(),
+            [RuntimeEventPayload::Native(
+                CodingRuntimeEvent::SessionNameSuggested { name }
+            )] if name == "kept title"
+        ));
     }
 
     #[test]

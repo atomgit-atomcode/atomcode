@@ -558,6 +558,9 @@ pub struct StatusLine {
     /// Active Ctrl+R reverse-i-search state, shown on the input box's
     /// top rule while searching. `None` outside search mode.
     pub search: Option<SearchState>,
+    /// Ephemeral text rendered faintly inside an otherwise-empty composer.
+    /// Right Arrow acceptance belongs to the input driver, not the renderer.
+    pub next_prompt_suggestion: Option<String>,
     /// Optional read-only command report rendered as a transient multi-line
     /// footer panel directly below the input box. It never enters scrollback.
     pub command_output: Option<String>,

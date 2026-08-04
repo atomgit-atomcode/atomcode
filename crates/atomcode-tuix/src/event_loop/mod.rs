@@ -98,6 +98,7 @@ fn reload_runtime_provider_from(
     }
     let mut agent_cfg = config.agent_config();
     agent_cfg.round_cap_checkpoint = true; // TUI implements the checkpoint panel (Task 3+)
+    agent_cfg.next_prompt_suggestions = true;
     ctx.runtime.reload_provider(
         agent_cfg,
         ctx.foreground_runtime_id,
@@ -3871,6 +3872,20 @@ impl Buffer {
         &self.search_query
     }
 
+    /// Accept an ephemeral next-prompt suggestion into an empty draft. The
+    /// caller owns visibility/lifecycle; the buffer only performs the atomic
+    /// text+cursor transition used by Right Arrow.
+    fn accept_next_prompt_suggestion(&mut self, suggestion: &str) -> bool {
+        if !self.text.is_empty() || suggestion.trim().is_empty() || self.searching {
+            return false;
+        }
+        self.text = suggestion.to_string();
+        self.cursor = self.text.len();
+        self.history_idx = None;
+        self.menu_suppressed = false;
+        true
+    }
+
     /// The index into history of the entry currently being displayed,
     /// or `None` if the buffer is showing the user's own draft. Used
     /// by `event_loop` to look up `HistoryEntry::images` after every
@@ -5108,6 +5123,25 @@ mod buffer_tests {
             b.menu_suppressed(),
             "restored /command must not pop the menu"
         );
+    }
+
+    #[test]
+    fn next_prompt_suggestion_accepts_into_empty_buffer_without_submitting() {
+        let mut b = Buffer::new();
+
+        assert!(b.accept_next_prompt_suggestion("继续审计代码改动"));
+        assert_eq!(b.text, "继续审计代码改动");
+        assert_eq!(b.cursor, b.text.len());
+    }
+
+    #[test]
+    fn next_prompt_suggestion_does_not_replace_a_draft() {
+        let mut b = Buffer::new();
+        b.text = "已有草稿".to_string();
+        b.cursor = b.text.len();
+
+        assert!(!b.accept_next_prompt_suggestion("继续审计代码改动"));
+        assert_eq!(b.text, "已有草稿");
     }
 
     #[test]
@@ -10715,6 +10749,7 @@ fn handle_input(
             // No modal: paste goes into the type-ahead buffer just like
             // keyboard input (Idle or Streaming, both consume it).
             if matches!(app.state.phase, UiPhase::Idle | UiPhase::Streaming) {
+                app.state.next_prompt_suggestion = None;
                 // Image-paste detection — two parallel providers, mutually
                 // exclusive on `text` shape:
                 //   * `text` empty → terminal sent bracketed paste with
@@ -11995,6 +12030,19 @@ fn handle_idle_key(
     }
 
     let action = classify(code, modifiers);
+
+    if action == Action::CursorRight && modifiers.is_empty() && app.buf.text.is_empty() {
+        if let Some(suggestion) = app.state.next_prompt_suggestion.clone() {
+            if app.buf.accept_next_prompt_suggestion(&suggestion) {
+                app.state.next_prompt_suggestion = None;
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                return Ok(());
+            }
+        }
+    }
+    if !matches!(action, Action::NoOp | Action::ToggleToolOutput) {
+        app.state.next_prompt_suggestion = None;
+    }
 
     let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
     sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
@@ -17862,6 +17910,7 @@ fn handle_runtime_event(
                     return;
                 }
                 CodingRuntimeEvent::RuntimeStopped(_) => {
+                    state.next_prompt_suggestion = None;
                     ctx.pending_runtime_request_id = None;
                     if matches!(
                         state.phase,
@@ -17934,6 +17983,7 @@ fn handle_runtime_event(
                     return;
                 }
                 CodingRuntimeEvent::SessionChanged(changed) => {
+                    state.next_prompt_suggestion = None;
                     if let Some(session_id) = changed.session_id.clone() {
                         if ctx.pending_session_resume.as_ref().is_some_and(|pending| {
                             pending.session.id == session_id
@@ -17974,6 +18024,26 @@ fn handle_runtime_event(
                         reasoning_buffer,
                         buf,
                     );
+                    return;
+                }
+                CodingRuntimeEvent::NextPromptSuggested {
+                    generation,
+                    session_id,
+                    turn_id: _,
+                    text,
+                } => {
+                    let current_session_matches = session_id
+                        .as_deref()
+                        .is_none_or(|id| id == ctx.current_session.id.as_str());
+                    if ctx.runtime.current_generation() == Some(generation)
+                        && current_session_matches
+                        && matches!(state.phase, UiPhase::Idle)
+                        && buf.text.is_empty()
+                        && state.pending_images.is_empty()
+                    {
+                        state.next_prompt_suggestion = Some(text);
+                        redraw_idle_plain(buf, state, ctx, renderer);
+                    }
                     return;
                 }
                 CodingRuntimeEvent::GoalChanged(progress) => {
@@ -18209,6 +18279,7 @@ fn handle_runtime_event(
                     return;
                 }
                 CodingRuntimeEvent::ProviderChanged { provider, model } => {
+                    state.next_prompt_suggestion = None;
                     // Ready and deferred runtimes forward ProviderChanged and the
                     // awaitable reload terminal through different tasks, so their
                     // arrival order is not a commit contract. Sequenced observations
@@ -22142,6 +22213,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             .collect(),
         history: None,
         search: None,
+        next_prompt_suggestion: None,
         command_output: footer_command_output(state),
         ctx_used,
         ctx_window,
@@ -22192,6 +22264,15 @@ fn round_cap_stats(state: &crate::state::UiState) -> String {
 
 fn build_input_status(state: &UiState, ctx: &LoopCtx, buf: &Buffer) -> crate::render::StatusLine {
     let mut status = build_status(state, ctx);
+    status.next_prompt_suggestion = if matches!(state.phase, UiPhase::Idle)
+        && buf.text.is_empty()
+        && state.pending_images.is_empty()
+        && !buf.is_searching()
+    {
+        state.next_prompt_suggestion.clone()
+    } else {
+        None
+    };
     if buf.is_searching() {
         // Ctrl+R reverse-i-search takes over the top-rule indicator;
         // the History N/N position is hidden while searching.

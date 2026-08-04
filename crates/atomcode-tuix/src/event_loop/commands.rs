@@ -615,7 +615,7 @@ pub(crate) fn attach_live_runtime(
         let runtime_id = ctx.foreground_runtime_id;
         ctx.live_observation_task = Some(tokio::spawn(async move {
             while let Ok(observation) = receiver.recv().await {
-                if let atomcode_daemon::live_hub::LiveViewEvent::InputAccepted(input) =
+                if let atomcode_daemon::live_hub::LiveViewEvent::InputAccepted { input, .. } =
                     observation.event
                 {
                     // Re-attach `[Image #N]` markers dropped by the text-only echo:

@@ -113,6 +113,12 @@ pub struct CodingAgentConfig {
     /// When true, the kernel turns the `max_rounds` cap into an interactive
     /// checkpoint (see AgentBuilder). Default false; only the TUI driver sets it.
     pub round_cap_checkpoint: bool,
+    /// Generate an ephemeral next-prompt suggestion after a naturally completed
+    /// turn. The coding runtime owns the auxiliary request and cancellation;
+    /// drivers only project the resulting neutral event. Default false so
+    /// headless/daemon/ACP paths do not incur a hidden model request before they
+    /// implement the corresponding UI. The interactive TUI opts in explicitly.
+    pub next_prompt_suggestions: bool,
     /// Immutable price snapshot for this runtime generation. `None` means the
     /// configured model's price is unknown.
     pub pricing: Option<atomcode_capabilities::session::ModelPricing>,
@@ -235,6 +241,9 @@ pub struct CodingRuntimeConfig {
     /// must stay `false` for headless / ACP / daemon runtimes (there is no
     /// requester to answer the Request → the kernel fail-closes to a stop).
     pub round_cap_checkpoint: bool,
+    /// Driver opt-in for ephemeral next-prompt sampling. Default false;
+    /// currently only the interactive TUI renders and accepts the result.
+    pub next_prompt_suggestions: bool,
     pub pricing: Option<atomcode_capabilities::session::ModelPricing>,
 }
 
@@ -308,6 +317,7 @@ impl CodingRuntimeConfig {
             // Default off; only the interactive TUI opts in (see the CLI's
             // TUI spawn sites and `event_loop::reload_runtime_provider_from`).
             round_cap_checkpoint: false,
+            next_prompt_suggestions: false,
             pricing,
         }
     }
@@ -345,6 +355,7 @@ impl CodingRuntimeConfig {
         }
         config.keep_interrupted_context = self.keep_interrupted_context;
         config.round_cap_checkpoint = self.round_cap_checkpoint;
+        config.next_prompt_suggestions = self.next_prompt_suggestions;
         config.pricing = self.pricing;
         config
     }
@@ -592,6 +603,7 @@ impl CodingAgentConfig {
             max_continuations: 50,
             max_rounds: default_turn_max_rounds(),
             round_cap_checkpoint: false,
+            next_prompt_suggestions: false,
             pricing: None,
             tool_loop_policy: default_tool_loop_policy(),
             goal_max_rounds: default_goal_max_rounds(),

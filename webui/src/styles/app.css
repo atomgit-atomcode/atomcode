@@ -533,6 +533,12 @@ body {
   line-height: 1;
   padding: 0 2px;
 }
+.steer-pending-status {
+  align-self: flex-end;
+  margin: 2px 4px 8px;
+  color: var(--app-secondary-foreground);
+  font-size: 11px;
+}
 .queued-remove:hover { color: var(--app-primary-foreground); }
 
 /* 技能/文档型用户消息折叠徽章：把 TUI 注入的整段 SKILL.md 收起为一行 */
