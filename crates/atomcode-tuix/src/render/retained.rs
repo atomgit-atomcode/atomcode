@@ -761,6 +761,17 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// one older middle row with the newest permanent tail. A following
     /// permanent push must restore the continuous body before emitting LF.
     live_spinner_tail_compacted: bool,
+    /// True while a `request_user_input` footer temporarily shows the newest
+    /// transcript tail in the smaller body viewport. This is a display-only
+    /// projection: `scrolled_off` and `body_lines` remain unchanged. Before a
+    /// permanent body row is emitted, the continuous projection is restored so
+    /// the terminal LF promotes the same row that `scrolled_off` records.
+    user_input_tail_compacted: bool,
+    /// One-frame guard used while restoring a compacted user-input projection
+    /// before a permanent append. Without it, `paint_frame` would immediately
+    /// select the compacted projection again while the footer panel is still
+    /// present.
+    force_continuous_body_projection: bool,
     /// Set by `emit_body_line_inner` when an overflow LF scrolled the whole
     /// viewport (footer included) up one row; consumed (cleared) by
     /// `take_pending_scroll_flush` so the render worker repaints the footer
@@ -970,6 +981,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             live_spinner_active: false,
             live_spinner_spacer_active: false,
             live_spinner_tail_compacted: false,
+            user_input_tail_compacted: false,
+            force_continuous_body_projection: false,
             pending_scroll_flush: false,
             in_sync_batch: false,
             inflight_tool: None,
@@ -5101,6 +5114,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let permanent_visible = permanent_end.saturating_sub(self.scrolled_off);
         self.live_spinner_tail_compacted =
             transient_rows > 0 && permanent_visible > permanent_slots;
+        let compact_for_user_input = self.status.user_input.is_some()
+            && !self.force_continuous_body_projection
+            && transient_rows == 0
+            && permanent_visible > permanent_slots;
+        self.user_input_tail_compacted = compact_for_user_input;
 
         // Clone before drawing — `screen.draw_row` takes &mut self.screen
         // and direct iteration would otherwise double-borrow.
@@ -5119,7 +5137,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.body_lines[self.scrolled_off..permanent_end].to_vec()
         } else if permanent_slots == 0 {
             Vec::new()
-        } else if transient_rows == 0 {
+        } else if transient_rows == 0 && !compact_for_user_input {
             let continuous_end = self
                 .scrolled_off
                 .saturating_add(permanent_slots)
@@ -5451,6 +5469,25 @@ impl<W: Write + Send> RetainedRenderer<W> {
         cleared
     }
 
+    /// Restore the continuous permanent-body projection before an append.
+    ///
+    /// A tall `request_user_input` footer can temporarily pin the logical top
+    /// row while showing the newest transcript tail. That projection is safe
+    /// for display, but an append may emit an LF and promote physical row 0 to
+    /// native scrollback. Repaint the continuous projection first so physical
+    /// and logical scroll ownership remain aligned. This does not mutate the
+    /// transcript or advance `scrolled_off`.
+    fn restore_user_input_projection_before_permanent_body(&mut self) {
+        if !self.user_input_tail_compacted {
+            return;
+        }
+        self.force_continuous_body_projection = true;
+        self.paint_frame();
+        self.flush_frame();
+        self.force_continuous_body_projection = false;
+        self.user_input_tail_compacted = false;
+    }
+
     /// Lift the live in-flight tool-call strip off the body tail — the multi-line mirror of
     /// [`clear_live_spinner`]. Pops the strip's `inflight_tool_rows` rows so a following
     /// `push_body_row` appends CLEANLY at the tail instead of burying the strip mid-buffer.
@@ -5517,6 +5554,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 }
             }
         }
+        self.restore_user_input_projection_before_permanent_body();
         // Diagnostic trace for the user-reported "duplicate rows in
         // scrollback" bug — every push goes through here, so a single
         // log point captures the full sequence. Enable via
@@ -6552,6 +6590,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.live_spinner_active = false;
         self.live_spinner_spacer_active = false;
         self.live_spinner_tail_compacted = false;
+        self.user_input_tail_compacted = false;
+        self.force_continuous_body_projection = false;
         self.last_mark_was_assistant = false;
         self.skip_body_scroll_count = 0;
         // Take the log out so `render()` can borrow `self` mutably; the
@@ -7877,6 +7917,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         self.assistant_line_buf.clear();
         self.reasoning_line_buf.clear();
         self.md_state.reset();
+        self.user_input_tail_compacted = false;
+        self.force_continuous_body_projection = false;
         self.last_painted_footer_rows = 0;
         // Drop the reflow log too: the body it described is gone, so a
         // later resize must not replay it. The `/resume` / `/clear`
@@ -19997,6 +20039,184 @@ mod tests {
                 "{marker} must occur exactly once across scrollback and viewport"
             );
         }
+    }
+
+    #[test]
+    fn request_user_input_footer_keeps_latest_transcript_tail_visible() {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+
+        const W: u16 = 80;
+        const H: u16 = 24;
+        let (mut r, buf) = new_capturing(W, H);
+        let mut vterm = crate::test_term::VirtualTerminal::new(W, H);
+        let status = status_basic();
+
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let normal_capacity = (H as usize).saturating_sub(r.current_footer_rows());
+        for i in 0..normal_capacity {
+            let mut row = Vec::new();
+            push_str_cells(
+                &mut row,
+                &format!("transcript-{i:02}"),
+                &CellStyle::default(),
+            );
+            r.push_body_row(row);
+        }
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let scrolled_before = r.scrolled_off;
+
+        let mut modal_status = status.clone();
+        modal_status.user_input = Some(crate::render::UserInputPanelView {
+            header: "Choose".into(),
+            question: "How should I continue?".into(),
+            mode: UserInputMode::Single,
+            options: vec![
+                ("First".into(), Some("first description".into())),
+                ("Second".into(), Some("second description".into())),
+            ],
+            cursor: 0,
+            checked: vec![false; 3],
+            text: String::new(),
+            custom_text: String::new(),
+            custom: true,
+            batch: None,
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: modal_status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        assert!(r.user_input_tail_compacted);
+        assert_eq!(
+            r.scrolled_off, scrolled_before,
+            "display-only compaction must not advance native scrollback ownership"
+        );
+        assert!(
+            vterm.any_row(|row| row.contains(&format!("transcript-{:02}", normal_capacity - 1))),
+            "the newest model output must remain visible above the question panel\n{}",
+            vterm.dump()
+        );
+
+        // Closing the panel is a pure layout change. The normal viewport can
+        // show the complete body again and must not replay any row.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(!r.user_input_tail_compacted);
+        assert_eq!(r.scrolled_off, scrolled_before);
+        assert!(
+            vterm.any_row(|row| row.contains(&format!("transcript-{:02}", normal_capacity - 1)))
+        );
+    }
+
+    #[test]
+    fn permanent_append_restores_user_input_projection_before_scrolling() {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+
+        const W: u16 = 80;
+        const H: u16 = 20;
+        let (mut r, buf) = new_capturing(W, H);
+        let mut vterm = crate::test_term::VirtualTerminal::new(W, H);
+        let status = status_basic();
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        let normal_capacity = (H as usize).saturating_sub(r.current_footer_rows());
+        for i in 0..normal_capacity {
+            let mut row = Vec::new();
+            push_str_cells(&mut row, &format!("owned-{i:02}"), &CellStyle::default());
+            r.push_body_row(row);
+        }
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let mut modal_status = status;
+        modal_status.user_input = Some(crate::render::UserInputPanelView {
+            header: "Choose".into(),
+            question: "Continue?".into(),
+            mode: UserInputMode::Text,
+            options: Vec::new(),
+            cursor: 0,
+            checked: Vec::new(),
+            text: String::new(),
+            custom_text: String::new(),
+            custom: false,
+            batch: None,
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: modal_status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(r.user_input_tail_compacted);
+
+        let before = r.scrolled_off;
+        let mut row = Vec::new();
+        push_str_cells(&mut row, "after-answer", &CellStyle::default());
+        r.push_body_row(row);
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        assert!(
+            r.scrolled_off > before,
+            "the append must make forward progress"
+        );
+        let terminal_rows = vterm
+            .scrollback_texts()
+            .into_iter()
+            .chain((0..H as usize).map(|y| vterm.row_text(y)))
+            .collect::<Vec<_>>();
+        for i in 0..normal_capacity {
+            let marker = format!("owned-{i:02}");
+            let count = terminal_rows
+                .iter()
+                .filter(|line| line.contains(&marker))
+                .count();
+            assert_eq!(
+                count,
+                1,
+                "{marker} must exist exactly once\n{}",
+                vterm.dump()
+            );
+        }
+        assert_eq!(
+            terminal_rows
+                .iter()
+                .filter(|line| line.contains("after-answer"))
+                .count(),
+            1,
+            "new output must exist exactly once\n{}",
+            vterm.dump()
+        );
     }
 
     /// Repro: user runs `/whoami` AFTER the body has already overflowed
