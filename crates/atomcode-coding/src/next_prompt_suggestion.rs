@@ -17,7 +17,7 @@ const MAX_CONTEXT_CHARS: usize = 16_384;
 const MAX_MESSAGE_CHARS: usize = MAX_CONTEXT_CHARS / 2;
 const MAX_TOOL_ARGUMENT_CHARS: usize = 512;
 const MAX_TOOL_RESULT_CHARS: usize = 1_024;
-const SAMPLE_TIMEOUT: Duration = Duration::from_secs(8);
+const SAMPLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 const INSTRUCTIONS: &str = r#"Predict the short message the user is most likely to type next.
 
