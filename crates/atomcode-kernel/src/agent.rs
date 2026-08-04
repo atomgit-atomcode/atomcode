@@ -1835,6 +1835,16 @@ impl RunningAgent {
             }
             let mut messages = convo.messages.clone();
             self.hooks.pre_request(&mut messages, &turn_ctx).await;
+            // Record hook-contract violations BEFORE normalization changes the
+            // ephemeral projection. The warning must blame the hook output, not
+            // the kernel's provider-safety repair below.
+            let mut appended_only = messages.len() >= convo.messages.len()
+                && messages[..convo.messages.len()] == convo.messages[..];
+            // Normalize every projection before it participates in token-window
+            // decisions. Otherwise an orphan result that will never reach the
+            // provider can spuriously compact persistent conversation state, while
+            // synthesized results can make the final wire larger than estimated.
+            Conversation::repair_pairing(&mut messages);
             // PRE-SEND EMERGENCY COMPACTION: if the estimated outgoing request already
             // meets/exceeds the model window, COMPACT before sending rather than firing a
             // doomed over-window request. This is the case the between-turn `should_compact`
@@ -1873,6 +1883,9 @@ impl RunningAgent {
                     }
                     messages = convo.messages.clone();
                     self.hooks.pre_request(&mut messages, &turn_ctx).await;
+                    appended_only &= messages.len() >= convo.messages.len()
+                        && messages[..convo.messages.len()] == convo.messages[..];
+                    Conversation::repair_pairing(&mut messages);
                 }
             }
             // PRE-SEND over-window advisory (at most ONCE per turn — the
@@ -1899,8 +1912,6 @@ impl RunningAgent {
             // tests can't see that for a third-party hook; surface it at runtime as a
             // Warning. Cheap: compares the post-hook prefix against the untouched stored
             // `convo.messages` (no extra clone); short-circuits on a shrink (no panic).
-            let appended_only = messages.len() >= convo.messages.len()
-                && messages[..convo.messages.len()] == convo.messages[..];
             if !appended_only {
                 self.rt.emit(AgentEvent::Warning(format!(
                     "pre_request is not append-only: the outgoing prefix diverges from the \
@@ -4573,6 +4584,101 @@ mod steer_buffer_tests {
             }],
             "one folded prompt → Steered {{ count: 1 }}"
         );
+    }
+}
+
+#[cfg(test)]
+mod provider_message_pairing_tests {
+    use super::*;
+    use crate::hook::{LifecycleHooks, TurnCtx};
+    use crate::message::{Role, SessionSnapshot};
+    use crate::testkit::RecordingProvider;
+    use crate::tool::{ToolCall, ToolRegistry};
+
+    struct OrphanResultHook;
+
+    #[async_trait::async_trait]
+    impl LifecycleHooks for OrphanResultHook {
+        async fn pre_request(&self, messages: &mut Vec<Message>, _ctx: &TurnCtx) {
+            messages.retain(|message| message.tool_calls.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_boundary_repairs_hook_created_orphan_without_mutating_storage() {
+        let stored = vec![
+            Message::user("previous task"),
+            Message::assistant(
+                "calling",
+                vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "noop".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            Message::tool_result("call-1", "x".repeat(20_000), false),
+        ];
+        let provider = Arc::new(
+            RecordingProvider::new(vec![vec![
+                StreamEvent::TextDelta("ok".into()),
+                StreamEvent::Done { truncated: false },
+            ]])
+            .with_ctx_window(1_000),
+        );
+        let calls = provider.calls();
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(ToolRegistry::new().mount(&[]))
+            .hooks(Arc::new(OrphanResultHook))
+            .resume(SessionSnapshot::new(stored.clone()))
+            .build()
+            .spawn();
+
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "continue".into(),
+                images: vec![],
+            })
+            .unwrap();
+        let mut warnings = Vec::new();
+        while let Some(event) = handle.events.recv().await {
+            match event {
+                AgentEvent::Warning(warning) => warnings.push(warning),
+                AgentEvent::TurnComplete { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.contains("exceeds the model input limit")),
+            "a dropped orphan must not trigger an over-window advisory: {warnings:?}"
+        );
+
+        let recorded = calls.lock().unwrap();
+        let outgoing = &recorded[0].0;
+        assert!(
+            outgoing.iter().all(|message| message.role != Role::Tool),
+            "the provider must not receive the hook-created orphan result"
+        );
+        drop(recorded);
+
+        handle.commands.send(AgentCommand::Snapshot).unwrap();
+        let snapshot = loop {
+            match handle.events.recv().await {
+                Some(AgentEvent::Snapshot { snapshot }) => break snapshot,
+                Some(_) => {}
+                None => panic!("agent stopped before returning its snapshot"),
+            }
+        };
+        assert_eq!(
+            &snapshot.messages[..stored.len()],
+            stored.as_slice(),
+            "outbound repair must not rewrite persisted conversation history"
+        );
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
     }
 }
 
