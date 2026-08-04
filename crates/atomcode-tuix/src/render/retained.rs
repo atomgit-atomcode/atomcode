@@ -42,6 +42,11 @@ const PAD_COL: usize = 2;
 /// Bounded so memory doesn't grow without limit on long sessions.
 pub const MAX_SCROLLBACK_ROWS: usize = 5000;
 
+/// Match Codex's conservative fallback for unidentified terminals. Classic
+/// conhost cannot usefully retain an unbounded resize replay and may fastfail
+/// on very large ANSI bursts.
+const LEGACY_CONHOST_REFLOW_MAX_ROWS: usize = 1000;
+
 /// Hard cap on the partial-line buffer for streaming assistant text. It's
 /// normally drained per newline; this bounds a pathological newline-less stream
 /// so it can't grow the buffer until allocation fails. 1 MiB ≫ any real line.
@@ -5221,6 +5226,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if self.skip_body_scroll_count > 0 {
             self.skip_body_scroll_count -= 1;
         }
+        // A legacy-conhost resize first rebuilds the retained model without
+        // terminal I/O. A bounded physical-row suffix is emitted once after
+        // the semantic replay completes.
+        if self.replaying && self.caps.legacy_conhost {
+            return;
+        }
         let h = self.screen.height() as usize;
         let footer_rows = self.current_footer_rows();
         if h == 0 {
@@ -6552,6 +6563,28 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         self.replaying = false;
         self.body_log = log;
+    }
+
+    /// Rebuild a bounded suffix of the retained body into native scrollback.
+    /// The complete model remains available for marks and later rendering.
+    fn replay_legacy_conhost_scrollback(&mut self) {
+        let full_body = std::mem::take(&mut self.body_lines);
+        let suffix_start = full_body
+            .len()
+            .saturating_sub(LEGACY_CONHOST_REFLOW_MAX_ROWS);
+        let retained_rows: Vec<Vec<Cell>> = full_body[suffix_start..].to_vec();
+
+        self.scrolled_off = 0;
+        for row in retained_rows {
+            if self.next_body_emit_row() > 0 {
+                self.emit_body_line_inner(&row, 0);
+            }
+            self.body_lines.push(row);
+        }
+
+        let visible_rows = self.body_lines.len().saturating_sub(self.scrolled_off);
+        self.body_lines = full_body;
+        self.scrolled_off = self.body_lines.len().saturating_sub(visible_rows);
     }
 
     fn reflow_welcome_prefix(&mut self) {
@@ -8318,20 +8351,19 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // re-assert suppression so the `flush_frame` render_diff below paints
         // inside the outer envelope without emitting a nested one.
         self.screen.set_sync_suppressed(true);
-        // Mark physical state unknown so the upcoming paint_frame's
-        // render_diff cold-starts with a per-row CUP+EL preamble — exactly
-        // like reset() (:~3627) and resume_from_external() (:~3732), which
-        // rebuild the Screen the same way. Without this, `screen.resize`
-        // leaves `physical_dirty = false` + blank `prev_cells`, so the diff
-        // emits only cell patches and never clears the OLD footer rows. The
-        // per-row CUP+EL wipe above masks that on Unix / Windows Terminal,
-        // but legacy conhost is forced down to a single ED2 (to dodge the
-        // 0xc0000409 fastfail), and ED2 doesn't reliably clear the final
-        // geometry mid-drag — so the stale footer survives and the new
-        // footer stacks on top of it (the Windows resize footer-duplication
-        // bug). invalidate() must run AFTER resize so its sentinel rows are
-        // sized to the new width.
-        self.screen.invalidate();
+        // Re-sync the diff cache after the terminal-side wipe. Other hosts use
+        // the existing defensive cold-start because their row-local wipe is
+        // known to tolerate CUP+EL. Legacy conhost has already received ED2,
+        // so its physical state is known blank and only the cell repaint is
+        // needed; requesting another per-row clear here would recreate the
+        // resize-time burst that can trigger 0xc0000409.
+        if self.caps.legacy_conhost {
+            // ED2 above already left a known-blank display. Avoid following
+            // it with invalidate()'s per-row CUP+EL cold-start burst.
+            self.screen.invalidate_after_full_clear();
+        } else {
+            self.screen.invalidate();
+        }
         // ── Preserve streaming parser state across the reflow. Issue
         // #950: resize during a streaming turn must not reset mid-stream
         // markdown parsing (code blocks lose their fence context). The
@@ -8364,6 +8396,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // overflow into scrollback at the new width via its append-only
         // LFs, completing the `\x1b[3J` rebuild above.
         self.reflow_body_to_current_width();
+        if self.caps.legacy_conhost {
+            self.replay_legacy_conhost_scrollback();
+        }
 
         // ── Restore saved state so subsequent streaming events continue
         // correctly after the reflow ──
@@ -19495,20 +19530,10 @@ mod tests {
         );
     }
 
-    /// On legacy conhost the resize wipe is forced down to a single ED2 (to
-    /// dodge the 0xc0000409 fastfail), so it emits NO per-row CUP+EL. The
-    /// body re-emit only covers body rows. That leaves the cold-start as the
-    /// ONLY thing that clears the FOOTER rows. Without `invalidate()`,
-    /// `physical_dirty` stays false, `render_diff` skips the cold-start, the
-    /// old footer rows are never cleared, and the new footer stacks on top
-    /// of them (the user-reported Windows resize corruption).
-    ///
-    /// We exercise the conhost path on purpose: on other terminals the
-    /// per-row CUP+EL wipe clears every row regardless, masking a missing
-    /// invalidate() — which is exactly why the bug is conhost-only and why a
-    /// default-path test wouldn't distinguish fixed from broken.
+    /// Legacy conhost uses ED2 for the resize wipe. The final diff must not
+    /// add a second full-screen per-row CUP+EL cold-start afterward.
     #[test]
-    fn on_resize_cold_starts_in_legacy_conhost() {
+    fn on_resize_legacy_conhost_avoids_second_full_screen_clear() {
         let w: u16 = 40;
         let h: u16 = 12;
         let (mut r, buf) = new_capturing(w, h);
@@ -19527,30 +19552,65 @@ mod tests {
         r.flush_deferred();
         buf.lock().unwrap().clear();
 
-        // Shrink height → footer moves up; the old footer rows must be
-        // cleared. on_resize repaints internally (paint_frame → render_diff),
-        // so the cold-start (if any) lands in `buf` during this call.
         let new_h: u16 = h - 3;
         r.on_resize(w, new_h);
 
         let out_bytes = buf.lock().unwrap().clone();
         let out = String::from_utf8_lossy(&out_bytes);
-        // ED2 emits no per-row CUP+EL and the body re-emit only covers body
-        // rows, so per-row CUP+EL for EVERY row 1..=new_h can only come from
-        // the render_diff cold-start — which fires only if on_resize
-        // invalidated the screen.
-        for row in 1..=(new_h as usize) {
-            let needle = format!("\x1b[{};1H\x1b[K", row);
-            assert!(
-                out.contains(&needle),
-                "on_resize must cold-start (per-row CUP+EL) for row {} on legacy \
-                 conhost; without screen.invalidate() the footer rows are never \
-                 cleared and the old footer ghosts under the new one (Windows \
-                 resize footer-stacking bug).\nbytes: {:?}",
-                row,
-                out
-            );
+        assert!(out.contains("\x1b[2J\x1b[H"), "legacy resize must use ED2: {out:?}");
+        let cleared_rows = (1..=(new_h as usize))
+            .filter(|row| {
+                let needle = format!("\x1b[{};1H\x1b[K", row);
+                out.contains(&needle)
+            })
+            .count();
+        assert!(
+            cleared_rows < new_h as usize,
+            "legacy resize must not append a second full-screen CUP+EL clear: {out:?}"
+        );
+        assert!(
+            out.contains("pre-resize") && out.contains("content"),
+            "the final viewport repaint must preserve transcript content: {out:?}"
+        );
+    }
+
+    #[test]
+    fn on_resize_legacy_conhost_caps_scrollback_replay_rows() {
+        let (mut r, buf) = new_capturing(40, 12);
+        r.caps.legacy_conhost = true;
+        let mut transcript = String::new();
+        for i in 0..(LEGACY_CONHOST_REFLOW_MAX_ROWS + 100) {
+            use std::fmt::Write;
+            let _ = writeln!(transcript, "ROW{i:04}");
         }
+        r.render(UiLine::CommandOutput(transcript));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        buf.lock().unwrap().clear();
+
+        r.on_resize(41, 12);
+
+        let out = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        let replayed_rows = out.matches("\x1b[K").count();
+        assert!(
+            replayed_rows <= LEGACY_CONHOST_REFLOW_MAX_ROWS,
+            "legacy resize emitted {replayed_rows} row clears, cap is {}",
+            LEGACY_CONHOST_REFLOW_MAX_ROWS
+        );
+        assert!(
+            !out.contains("ROW0000"),
+            "rows older than the bounded suffix must not be replayed"
+        );
+        assert!(
+            out.contains("ROW1099"),
+            "the newest transcript row must remain in the replay"
+        );
     }
 
     #[test]
