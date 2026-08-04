@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, watch, RwLock};
 use super::client::{McpClient, McpToolInfo};
 use super::config::{load_mcp_config, McpServerConfig};
 use super::transport_http::HttpClient;
+use super::tool::mcp_tool_full_name;
 use super::transport_stdio::StdioClient;
 use super::types::ServerStatus;
 
@@ -220,7 +221,12 @@ impl McpRegistry {
         let rest = full.strip_prefix("mcp__")?;
         let servers = self.servers.read().await;
         for name in servers.keys() {
-            if let Some(tool) = rest.strip_prefix(&format!("{name}__")) {
+            // Compare against the sanitized server key: the name the LLM sees was
+            // sanitized by `mcp_tool_full_name`, so a server name with characters
+            // outside `[a-zA-Z0-9_-]` must be matched by its sanitized form too
+            // (returning the real key so calls still route to the live server).
+            let key = super::tool::sanitize_name_segment(name);
+            if let Some(tool) = rest.strip_prefix(&format!("{key}__")) {
                 return Some((name.clone(), tool.to_string()));
             }
         }
@@ -260,11 +266,16 @@ impl McpRegistry {
         for tool in &config.auto_approve {
             // Accept either the bare tool name ("query") OR the already-qualified name
             // ("mcp__server__query") that the user sees in the approval prompt — both
-            // are plausible in `autoApprove`. Normalize to the full name either way.
+            // are plausible in `autoApprove`. Normalize to the full name either way,
+            // sanitizing segments so the key matches the name the LLM actually sees.
             let full = if tool.starts_with("mcp__") {
-                tool.clone()
+                let (_, rest) = tool.split_at("mcp__".len());
+                let (server, tool_name) = rest
+                    .split_once("__")
+                    .unwrap_or((rest, ""));
+                mcp_tool_full_name(server, tool_name)
             } else {
-                format!("mcp__{}__{}", config.name, tool)
+                mcp_tool_full_name(&config.name, tool)
             };
             self.mark_tool_auto_approved(&full);
         }

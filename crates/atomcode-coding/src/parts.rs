@@ -995,7 +995,13 @@ impl CodingParts {
     }
 
     pub(crate) fn mcp_tools_for_server(&self, server: &str) -> Vec<String> {
-        let prefix = format!("mcp__{server}__");
+        // Tool names were sanitized by `mcp_tool_full_name` when mounted, so a server
+        // name with characters outside `[a-zA-Z0-9_-]` must be matched by its sanitized
+        // form here too (issue #1289: unsanitized names broke requests with a 400).
+        let prefix = format!(
+            "mcp__{}__",
+            atomcode_capabilities::mcp::sanitize_name_segment(server)
+        );
         let names = match self.mcp_tool_names.read() {
             Ok(names) => names,
             Err(poisoned) => poisoned.into_inner(),
