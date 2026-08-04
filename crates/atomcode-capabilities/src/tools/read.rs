@@ -82,15 +82,15 @@ where
         F(f64),
         S(String),
     }
-    // Reject negative / NaN rather than silently clamping to 0 — an out-of-domain
+    // Reject negative / NaN / infinite rather than silently clamping to 0; an out-of-domain
     // line number is a model error worth surfacing, not a value to guess at. Mirrors
     // the v1 deserializer policy (tolerate float/string REPRESENTATIONS of a
-    // non-negative integer; reject negative & NaN).
+    // non-negative integer; reject negative, NaN, and infinite).
     fn checked(f: f64) -> Result<usize, &'static str> {
-        if f < 0.0 || f.is_nan() {
-            return Err("negative or NaN value not allowed");
+        if f < 0.0 || f.is_nan() || f.is_infinite() {
+            return Err("negative, NaN, or infinite value not allowed");
         }
-        Ok(f as usize)
+        Ok(f.round() as usize)
     }
     Ok(match Option::<Num>::deserialize(d)? {
         None => None,
@@ -423,6 +423,30 @@ mod tests {
         // Representation leniency is preserved: non-negative float / string still OK.
         assert!(
             serde_json::from_str::<Args>(r#"{"file_path":"x","offset":2.0,"limit":"3.0"}"#).is_ok()
+        );
+    }
+
+    #[test]
+    fn lenient_usize_rounds_fractional_values() {
+        for (input, expected) in [
+            (r#"{"file_path":"x","offset":3.9}"#, 4),
+            (r#"{"file_path":"x","offset":3.4}"#, 3),
+            (r#"{"file_path":"x","limit":"3.9"}"#, 4),
+        ] {
+            let args: Args = serde_json::from_str(input).unwrap();
+            let got = if input.contains("offset") {
+                args.offset
+            } else {
+                args.limit
+            };
+            assert_eq!(got.unwrap(), expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn lenient_usize_rejects_infinite_value() {
+        assert!(
+            serde_json::from_str::<Args>(r#"{"file_path":"x","offset":"Infinity"}"#).is_err()
         );
     }
 
