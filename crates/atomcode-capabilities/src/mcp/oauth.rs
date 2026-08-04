@@ -512,11 +512,7 @@ fn discover_resource_metadata_url(
         "jsonrpc": "2.0",
         "id": 1,
         "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": {} },
-            "clientInfo": { "name": "atomcode", "version": env!("CARGO_PKG_VERSION") }
-        }
+        "params": super::types::initialize_params()
     });
     if let Ok(resp) = client
         .post(mcp_url)

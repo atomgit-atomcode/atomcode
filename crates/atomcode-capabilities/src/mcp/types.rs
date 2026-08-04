@@ -2,6 +2,36 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Protocol revision this client asks for in `initialize`.
+///
+/// The server answers with the revision it will actually speak (see
+/// [`InitializeResult::protocol_version`]); that answer — not this constant — is what
+/// the HTTP transport echoes back in `MCP-Protocol-Version`. Every revision from
+/// `2024-11-05` through this one is wire-compatible for the tools-only surface we use,
+/// so an older server simply negotiates itself down.
+///
+/// Not bumped past `2025-11-25`: `2026-07-28` removes the `initialize` handshake
+/// entirely in favour of `server/discover`, which this hand-rolled client does not speak.
+pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+
+/// `initialize` params, shared by every transport so the three handshakes cannot drift.
+///
+/// `capabilities` is deliberately EMPTY. The client-side capability set is
+/// `roots` / `sampling` / `elicitation` (plus `experimental`), and this client
+/// implements none of them. It previously advertised `{"tools": {}}`, which was a
+/// category error — `tools` is a SERVER capability, so that object told every server
+/// exactly nothing.
+pub fn initialize_params() -> serde_json::Value {
+    serde_json::json!({
+        "protocolVersion": MCP_PROTOCOL_VERSION,
+        "capabilities": {},
+        "clientInfo": {
+            "name": "atomcode",
+            "version": env!("CARGO_PKG_VERSION")
+        }
+    })
+}
+
 /// JSON-RPC request wrapper.
 #[derive(Debug, Serialize)]
 pub struct JsonRpcRequest {
