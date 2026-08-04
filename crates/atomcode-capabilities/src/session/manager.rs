@@ -3789,7 +3789,13 @@ fn open_read_file(path: &Path) -> SessionResult<File> {
 
 fn open_append_file(path: &Path) -> SessionResult<File> {
     let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    // Windows: `append(true)` alone grants only FILE_APPEND_DATA, which is not
+    // enough for LockFileEx (requires GENERIC_READ or GENERIC_WRITE) — the
+    // transcript append below would fail with ERROR_ACCESS_DENIED (os error 5).
+    // Note: `write(true)` is IGNORED when `append(true)` is set (Rust std), so
+    // GENERIC_READ via `read(true)` is what satisfies LockFileEx here. Append
+    // semantics are unchanged.
+    options.create(true).append(true).read(true);
     set_private_create_mode(&mut options);
     no_follow(&mut options);
     let file = options.open(path).map_err(|e| io_at(path, e))?;
@@ -4123,6 +4129,29 @@ mod tests {
         let loaded = mgr.load_snapshot("s1").unwrap();
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.messages[0].text, "hello");
+    }
+
+    /// Windows 回归测试：transcript 追加必须真实完成 open → lock → append → unlock。
+    /// 曾因 `open_append_file` 仅 `append(true)`（Windows 上只有 FILE_APPEND_DATA），
+    /// `LockFileEx` 要求 GENERIC_READ/GENERIC_WRITE 而必然失败，
+    /// 报 ERROR_ACCESS_DENIED (os error 5)。此问题仅存在于 Windows。
+    #[test]
+    #[cfg(windows)]
+    fn append_jsonl_line_lock_roundtrip_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let id = "s1";
+        let mut payload = br#"{"v":1,"msg":"hello"}"#.to_vec();
+        payload.push(b'\n');
+
+        // 真实代码路径: open_append_file → lock_exclusive → write_all（unlock 随句柄关闭）
+        mgr.append_jsonl_line(id, &payload).unwrap_or_else(|e| {
+            panic!("transcript append must not fail on Windows: {e:?}");
+        });
+
+        // 内容确实被追加写入
+        let written = std::fs::read(mgr.jsonl_path(id).unwrap()).unwrap();
+        assert_eq!(written, payload);
     }
 
     fn presentation_entry(anchor: DisplayAnchor, text: &str) -> PresentationEntry {
