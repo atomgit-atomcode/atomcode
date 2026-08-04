@@ -1671,6 +1671,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       case 'runtime_info':
         setProvider(event.provider);
         break;
+      case 'session_assigned':
+        // Bind a brand-new `/chat` conversation before model/provider work can
+        // fail or the SSE transport can disappear. Mark the current canvas as
+        // already loaded so the App state update cannot replace the optimistic
+        // first turn with an empty history fetch.
+        activeIdRef.current = event.session_id;
+        loadedForRef.current = event.session_id;
+        onSessionId(event.session_id);
+        break;
       case 'command_output':
         pushCommandNotice(event.text);
         break;

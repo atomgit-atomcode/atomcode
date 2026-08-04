@@ -18,6 +18,7 @@ export function getToken(): string {
 
 export type SSEEvent =
   | { type: 'runtime_info'; provider: string; model: string }
+  | { type: 'session_assigned'; session_id: string }
   | { type: 'text'; content: string }
   | { type: 'reasoning'; content: string }
   | { type: 'tool_start'; id: string; name: string; arguments: unknown }

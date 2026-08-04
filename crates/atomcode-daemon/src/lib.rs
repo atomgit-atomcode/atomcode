@@ -2937,6 +2937,11 @@ pub enum ChatEvent {
     /// Exact provider/model resolved for this request.
     #[serde(rename = "runtime_info")]
     RuntimeInfo { provider: String, model: String },
+    /// Canonical native session identity for this operation. Emitted as soon as
+    /// the daemon has allocated or resolved the session, before provider work can
+    /// delay the first turn. Clients must use this id for every later request.
+    #[serde(rename = "session_assigned")]
+    SessionAssigned { session_id: String },
     /// Tool batch started (all tools in this assistant turn)
     #[serde(rename = "tool_batch")]
     ToolBatchStarted {
@@ -3087,6 +3092,17 @@ mod chat_event_type_tests {
         assert_eq!(json["provider"], "main");
         assert_eq!(json["model"], "model-x");
         assert!(json.get("config_revision").is_none());
+    }
+
+    #[test]
+    fn session_assignment_is_an_additive_non_terminal_event() {
+        let json = serde_json::to_value(ChatEvent::SessionAssigned {
+            session_id: "session-1".into(),
+        })
+        .unwrap();
+
+        assert_eq!(json["type"], "session_assigned");
+        assert_eq!(json["session_id"], "session-1");
     }
 
     #[test]
@@ -4120,24 +4136,26 @@ async fn process_chat_request(
         .working_dir
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-    let (session_id, initial_messages) = if let Some(ref session_id_str) = req.session_id {
-        let project_bucket = NativeSessionManager::project_hash(&working_dir);
-        let session = crate::legacy_convert::load_catalog_session_view_in_project(
-            &project_bucket,
-            session_id_str,
-        )?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "session {session_id_str:?} not found in project bucket {project_bucket}"
-            )
-        })?;
-        (session.meta.id, session.snapshot.messages)
-    } else {
-        (uuid::Uuid::new_v4().to_string(), Vec::new())
-    };
+    let (session_id, initial_messages, is_new_session) =
+        if let Some(ref session_id_str) = req.session_id {
+            let project_bucket = NativeSessionManager::project_hash(&working_dir);
+            let session = crate::legacy_convert::load_catalog_session_view_in_project(
+                &project_bucket,
+                session_id_str,
+            )?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "session {session_id_str:?} not found in project bucket {project_bucket}"
+                )
+            })?;
+            (session.meta.id, session.snapshot.messages, false)
+        } else {
+            (uuid::Uuid::new_v4().to_string(), Vec::new(), true)
+        };
     active_chats
         .bind_session(&operation_id, &session_id)
         .await?;
+    publish_chat_session_assignment(&working_dir, &session_id, is_new_session, &event_tx)?;
 
     // Key used to route interactive permission decisions back to this turn's
     // decider. We use the *actual* session id (not req.session_id, which may be
@@ -4304,6 +4322,39 @@ async fn process_chat_request(
         pending_permissions.unregister(&perm_session_key);
     }
     pending_user_inputs.unregister_session(&perm_session_key);
+    Ok(())
+}
+
+/// Publish a `/chat` session identity only after a newly allocated native
+/// aggregate is durable. Existing sessions already crossed this boundary when
+/// they were loaded above. Keeping persistence and notification in one helper
+/// prevents clients from binding an id that a later request cannot resume.
+fn publish_chat_session_assignment(
+    working_dir: &std::path::Path,
+    session_id: &str,
+    is_new_session: bool,
+    event_tx: &mpsc::UnboundedSender<ChatEvent>,
+) -> anyhow::Result<()> {
+    if is_new_session {
+        let manager = NativeSessionManager::for_project(working_dir);
+        let lease = manager.acquire_lease(session_id)?;
+        let now = atomcode_capabilities::session::now_ms();
+        let mut meta = atomcode_capabilities::session::SessionMeta::new(
+            session_id,
+            working_dir.to_string_lossy(),
+            now,
+        );
+        meta.owner = atomcode_capabilities::session::StorageOwner::Native;
+        manager.commit_native_import(
+            &lease,
+            Some(&atomcode_kernel::message::SessionSnapshot::new(Vec::new())),
+            Some(&atomcode_capabilities::session::PresentationFile::default()),
+            &meta,
+        )?;
+    }
+    let _ = event_tx.send(ChatEvent::SessionAssigned {
+        session_id: session_id.to_string(),
+    });
     Ok(())
 }
 
@@ -6258,6 +6309,45 @@ mod tests {
             bind_port: 13456,
             webui_cookie_name: auth_token::webui_cookie_name(13456),
         }
+    }
+
+    #[test]
+    fn new_chat_assignment_is_sent_only_after_the_native_aggregate_is_durable() {
+        let home = ScopedChatHome::new();
+        let working_dir = home._dir.path().join("project");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let session_id = "11111111-1111-4111-8111-111111111111";
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        publish_chat_session_assignment(&working_dir, session_id, true, &event_tx).unwrap();
+
+        let manager = NativeSessionManager::for_project(&working_dir);
+        let loaded = manager.load_native_session(session_id).unwrap();
+        assert!(loaded.snapshot.messages.is_empty());
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(ChatEvent::SessionAssigned { session_id: assigned }) if assigned == session_id
+        ));
+    }
+
+    #[test]
+    fn failed_new_chat_persistence_does_not_publish_a_session_id() {
+        let home = ScopedChatHome::new();
+        let working_dir = home._dir.path().join("project");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let sessions_root = NativeSessionManager::sessions_root();
+        std::fs::write(&sessions_root, b"block session directory creation").unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        let result = publish_chat_session_assignment(
+            &working_dir,
+            "22222222-2222-4222-8222-222222222222",
+            true,
+            &event_tx,
+        );
+
+        assert!(result.is_err());
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
