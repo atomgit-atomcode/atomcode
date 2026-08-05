@@ -94,10 +94,7 @@ pub(crate) fn host_is_trusted(url: &str) -> bool {
     let Some(host) = parsed.host_str() else {
         return false;
     };
-    host == "gitcode.com"
-        || host == "atomgit.com"
-        || host.ends_with(".gitcode.com")
-        || host.ends_with(".atomgit.com")
+    atomcode_config::endpoints::is_trusted_host(host)
 }
 
 /// `scheme://host` prefix (no path), for scoping git's per-URL

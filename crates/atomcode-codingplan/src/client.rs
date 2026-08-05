@@ -42,29 +42,14 @@ fn apply_blocking_proxy_policy(
     }
 }
 
-/// Default CodingPlan REST API base URL.
-/// Override with the `ATOMCODE_CODINGPLAN_API_BASE` environment variable.
-const DEFAULT_API_BASE: &str = "https://api.gitcode.com/api/v5";
-
-/// Return the CodingPlan REST API base URL, reading
-/// `ATOMCODE_CODINGPLAN_API_BASE` once at first call and caching the
-/// result for the process lifetime.
+/// Return the CodingPlan REST API base URL.
 ///
-/// Read order:
-///   1. `ATOMCODE_CODINGPLAN_API_BASE` env var (trimmed, trailing `/`
-///      stripped, empty value treated as unset).
-///   2. [`DEFAULT_API_BASE`].
+/// Resolved by [`atomcode_config::endpoints::codingplan_api_base`]: the
+/// `ATOMCODE_CODINGPLAN_API_BASE` override, else the deployment profile's
+/// default. Cached there for the process lifetime, so every call in one
+/// claim/status flow targets the same host.
 pub fn api_base_url() -> String {
-    use std::sync::OnceLock;
-    static BASE: OnceLock<String> = OnceLock::new();
-    BASE.get_or_init(|| {
-        std::env::var("ATOMCODE_CODINGPLAN_API_BASE")
-            .ok()
-            .map(|v| v.trim().trim_end_matches('/').to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| DEFAULT_API_BASE.to_string())
-    })
-    .clone()
+    atomcode_config::endpoints::codingplan_api_base().to_string()
 }
 
 /// Typed error surfaced when the API rejects the bearer token (401/403).

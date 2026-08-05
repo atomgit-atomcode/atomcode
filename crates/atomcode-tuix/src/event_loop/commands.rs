@@ -2141,7 +2141,7 @@ fn execute_slash_command_impl(
                     }
                 }
                 None => t(Msg::DesktopNotInstalled {
-                    url: super::desktop::DOWNLOAD_URL,
+                    url: super::desktop::download_url(),
                 })
                 .into_owned(),
             };
@@ -2154,6 +2154,16 @@ fn execute_slash_command_impl(
             // 区别：① 不开浏览器，吐终端二维码；② 本机 server 走 daemon 模式
             // （无 token，仅回环绑定），鉴权边界落在中继的 route token。
             //
+            // 远程访问要连中继、并从中继的发布地址下载 relay-client 二进制。
+            // 没有自己中继的部署可设 ATOMCODE_ENABLE_RELAY=0 关掉整条链路。
+            if !atomcode_config::endpoints::relay_enabled() {
+                renderer.render(UiLine::CommandOutput(
+                    "远程访问在本部署中未启用（ATOMCODE_ENABLE_RELAY=0）。".to_string(),
+                ));
+                renderer.flush();
+                return Ok(());
+            }
+
             // 中继地址 → (ws 拨号 URL, App 用的 https 根)。
             fn derive_relay_urls(base: &str) -> (String, String) {
                 let trimmed = base.trim().trim_end_matches('/');
@@ -2214,15 +2224,10 @@ fn execute_slash_command_impl(
                 }
                 output
             } else {
-                // 官方生产中继。用户直接敲 `/app` 即可，无需选择/配置中继地址；
-                // 命令参数与 ATOMCODE_APP_RELAY 环境变量仅留作内部联调覆盖用。
-                const APP_DEFAULT_RELAY: &str = "https://relay-atomcode.atomgit.com";
-                // 中继地址：命令参数 > ATOMCODE_APP_RELAY 环境变量 > 生产默认。
+                // 部署默认中继。用户直接敲 `/app` 即可，无需选择/配置中继地址。
+                // 中继地址：命令参数 > endpoints（含 ATOMCODE_APP_RELAY 覆盖）。
                 let relay_base = if a.is_empty() {
-                    std::env::var("ATOMCODE_APP_RELAY")
-                        .ok()
-                        .filter(|s| !s.is_empty())
-                        .or_else(|| Some(APP_DEFAULT_RELAY.to_string()))
+                    Some(atomcode_config::endpoints::relay_url().to_string())
                 } else {
                     Some(a.trim_start_matches("--relay").trim().to_string())
                 };

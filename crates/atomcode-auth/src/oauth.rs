@@ -13,10 +13,6 @@ use atomcode_telemetry::{Event, Telemetry};
 
 use atomcode_config::config::Config;
 
-/// Default Platform server base URL (client_secret is kept on the broker).
-/// Override with the `ATOMCODE_PLATFORM_SERVER` environment variable.
-const DEFAULT_PLATFORM_SERVER: &str = "https://acs.atomgit.com";
-
 /// Sanitize a user-supplied base URL: add `http://` if no scheme is present,
 /// and strip trailing `/` so path concatenation never produces `//`.
 fn sanitize_base_url(raw: &str) -> String {
@@ -29,18 +25,15 @@ fn sanitize_base_url(raw: &str) -> String {
     with_scheme.trim_end_matches('/').to_string()
 }
 
-/// Return the Platform server base URL, reading `ATOMCODE_PLATFORM_SERVER` once
-/// at first call and caching the result for the process lifetime. This ensures
-/// all URL-derived functions within a single login/session flow target the
-/// same server even if the env var changes mid-flight.
+/// Return the Platform server base URL, resolved once by
+/// [`atomcode_config::endpoints::platform_server`] (deployment profile +
+/// `ATOMCODE_PLATFORM_SERVER` override) and cached for the process lifetime.
+/// This ensures all URL-derived functions within a single login/session flow
+/// target the same server even if the env var changes mid-flight.
 fn platform_base_url() -> &'static str {
     use std::sync::OnceLock;
     static BASE: OnceLock<String> = OnceLock::new();
-    BASE.get_or_init(|| {
-        let raw = std::env::var("ATOMCODE_PLATFORM_SERVER")
-            .unwrap_or_else(|_| DEFAULT_PLATFORM_SERVER.to_string());
-        sanitize_base_url(&raw)
-    })
+    BASE.get_or_init(|| sanitize_base_url(atomcode_config::endpoints::platform_server()))
 }
 
 /// Platform server URLs (derived from `ATOMCODE_PLATFORM_SERVER`).

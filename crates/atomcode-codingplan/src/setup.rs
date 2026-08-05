@@ -44,45 +44,23 @@ use atomcode_config::config::is_codingplan_provider_name;
 use atomcode_config::config::provider::ProviderConfig;
 use atomcode_config::config::Config;
 
-/// Default LLM gateway base URL for CodingPlan-managed providers when
-/// the `models-v2` payload doesn't carry a per-model `base_url`. Used
-/// only inside [`codingplan_llm_base_url`] — call that, not this.
+/// Resolve the LLM gateway base URL for CodingPlan-managed providers, used
+/// when the `models-v2` payload doesn't carry a per-model `base_url`.
 ///
-/// The signed gateway. `coding_plan::crypto::is_atomgit_gateway` matches
-/// `llm-api.atomgit.com`, `pre-llm-api-cce.atomgit.com`, and the legacy
-/// `api-ai.gitcode.com` host (see the host whitelist at `crypto.rs`), so
-/// codingplan request signing engages for all three.
-const DEFAULT_CODINGPLAN_LLM_BASE_URL: &str = "https://llm-api.atomgit.com/v1";
-
-/// Resolve the LLM gateway base URL for CodingPlan-managed providers.
+/// Resolved by [`atomcode_config::endpoints::codingplan_llm_base_url`]: the
+/// `ATOMCODE_CODINGPLAN_LLM_BASE_URL` override, else the deployment profile's
+/// default. Cached there, so every provider registered by
+/// `step_models_and_register` lands on the same host even if the env changes
+/// mid-flight.
 ///
-/// Read order:
-///   1. `ATOMCODE_CODINGPLAN_LLM_BASE_URL` env var (trimmed, trailing
-///      `/` stripped, empty value treated as unset). Set this when
-///      pointing the client at a staging gateway.
-///   2. [`DEFAULT_CODINGPLAN_LLM_BASE_URL`].
+/// Whether requests to this gateway are *signed* is a separate question owned
+/// by `gateway_crypto::is_atomgit_gateway` — signing engages only for the
+/// vendor gateway hosts and only in an official build.
 ///
-/// Cached once at first call via `OnceLock` — same shape as
-/// [`auth::oauth::platform_base_url`] — so every provider registered
-/// by `step_models_and_register` lands on the same host even if the
-/// env var changes mid-flight, and the per-provider build cost is
-/// one atomic read after the first call.
-///
-/// Returns `String` rather than `&'static str` because the cached
-/// value's lifetime is tied to the `OnceLock`; callers that need an
-/// owned URL (e.g. `ProviderConfig::base_url: Option<String>`) get
-/// one without an extra clone.
+/// Returns `String` because callers need an owned URL
+/// (e.g. `ProviderConfig::base_url: Option<String>`).
 fn codingplan_llm_base_url() -> String {
-    use std::sync::OnceLock;
-    static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| {
-        std::env::var("ATOMCODE_CODINGPLAN_LLM_BASE_URL")
-            .ok()
-            .map(|v| v.trim().trim_end_matches('/').to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| DEFAULT_CODINGPLAN_LLM_BASE_URL.to_string())
-    })
-    .clone()
+    atomcode_config::endpoints::codingplan_llm_base_url().to_string()
 }
 
 /// Provider type for the AtomGit LLM gateway (it's OpenAI-compatible).

@@ -7,7 +7,7 @@
 //! HTTP is exchanged. Capping those clients at TLS 1.2 gets the handshake through.
 //!
 //! This module is pure (no reqwest): an explicit [`MAX_ENV`] override is global,
-//! while automatic fallback is scoped to AtomGit-managed endpoints and is only
+//! while automatic fallback is scoped to first-party endpoints and is only
 //! latched after a TLS-1.2 retry succeeds.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,19 +65,12 @@ pub fn should_try_fallback(url: &str, was_capped: bool, warrants_fallback: bool)
     warrants_fallback && !was_capped && is_managed_https_url(url)
 }
 
-/// Match only HTTPS service hosts we operate. The label-aware AtomGit check
-/// deliberately rejects lookalikes such as `evilatomgit.com`.
+/// Match only HTTPS service hosts we operate. Delegates to the deployment's
+/// trusted-domain set so a self-hosted backend gets the same fallback coverage
+/// the vendor domain used to get; see [`crate::endpoints::is_managed_https_url`]
+/// for the label-aware matching that rejects lookalike hosts.
 pub fn is_managed_https_url(raw: &str) -> bool {
-    let Ok(url) = url::Url::parse(raw) else {
-        return false;
-    };
-    if url.scheme() != "https" {
-        return false;
-    }
-    matches!(url.host_str(), Some("api.gitcode.com"))
-        || url
-            .host_str()
-            .is_some_and(|host| host == "atomgit.com" || host.ends_with(".atomgit.com"))
+    crate::endpoints::is_managed_https_url(raw)
 }
 
 /// Whether an `ATOMCODE_TLS_MAX` value asks for a TLS 1.2 ceiling. Forgiving of
