@@ -60,9 +60,14 @@ impl Tool for ListSymbolsTool {
 fn render(path: &Path, display: &str) -> ToolResult {
     let lang = match Lang::detect(path) {
         Some(l) => l,
+        // NOT an error: the file is fine, this tool just has no grammar for it. Reporting it
+        // as a failure paints a red card in the UI and inflates the tool error rate with
+        // non-failures (an Android project full of .xml/.gradle drove this to 69%). Hand the
+        // model the next step instead.
         None => {
-            return err(format!(
-                "list_symbols: unsupported file type: {display} (no tree-sitter grammar for it)"
+            return ok(format!(
+                "no symbol index for {display} — no tree-sitter grammar is bundled for this \
+                 file type. Read it with read_file instead."
             ))
         }
     };
@@ -121,15 +126,31 @@ mod tests {
         assert!(r.content.contains("S"), "{}", r.content);
     }
 
+    /// 「这个类型没打包语法」是**能力边界**,不是故障:文件就在那儿、读得到,只是没有符号索引。
+    /// 判成 `is_error` 会让它在 UI 里渲染成红色失败卡、在遥测里计进工具错误率 —— 实测一个
+    /// Android 工程(.xml / .gradle / .kts 满地)能把 list_symbols 的失败率顶到 69%,而其中没有
+    /// 一次是真的坏了。降级成正常结果并**明确指路 read_file**,模型才知道下一步该干什么。
     #[tokio::test]
-    async fn unsupported_extension_errors() {
+    async fn unsupported_extension_is_not_an_error_and_points_to_read_file() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.xyzlang"), "stuff").unwrap();
         let r = ListSymbolsTool
             .execute(r#"{"file_path":"a.xyzlang"}"#, &ctx(d.path()))
             .await;
-        assert!(r.is_error);
-        assert!(r.content.contains("unsupported file type"), "{}", r.content);
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("no symbol index"), "{}", r.content);
+        assert!(r.content.contains("read_file"), "{}", r.content);
+    }
+
+    /// 降级只针对"类型不支持"。文件真的不存在仍然是错误 —— 否则模型拿着一个不存在的路径
+    /// 收到「正常结果」,会当成"这文件没符号"继续往下走,而不是去纠正路径。
+    #[tokio::test]
+    async fn missing_file_is_still_an_error() {
+        let d = tempfile::tempdir().unwrap();
+        let r = ListSymbolsTool
+            .execute(r#"{"file_path":"nope.rs"}"#, &ctx(d.path()))
+            .await;
+        assert!(r.is_error, "{}", r.content);
     }
 
     #[tokio::test]

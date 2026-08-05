@@ -61,9 +61,12 @@ impl Tool for ReadSymbolTool {
 fn render(path: &Path, display: &str, symbol: &str) -> ToolResult {
     let lang = match Lang::detect(path) {
         Some(l) => l,
+        // NOT an error — same reasoning as `list_symbols`: no bundled grammar is a capability
+        // boundary, not a failure. Point at the tool that does work.
         None => {
-            return err(format!(
-                "read_symbol: unsupported file type: {display} (no tree-sitter grammar for it)"
+            return ok(format!(
+                "no symbol index for {display} — no tree-sitter grammar is bundled for this \
+                 file type. Read it with read_file instead."
             ))
         }
     };
@@ -138,6 +141,22 @@ mod tests {
             "should only return beta: {}",
             r.content
         );
+    }
+
+    /// 与 `list_symbols` 同款降级:没打包语法 ≠ 出错。见该模块对应测试的理由。
+    #[tokio::test]
+    async fn unsupported_extension_is_not_an_error_and_points_to_read_file() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.xyzlang"), "stuff").unwrap();
+        let r = ReadSymbolTool
+            .execute(
+                r#"{"file_path":"a.xyzlang","symbol":"whatever"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("no symbol index"), "{}", r.content);
+        assert!(r.content.contains("read_file"), "{}", r.content);
     }
 
     #[tokio::test]
