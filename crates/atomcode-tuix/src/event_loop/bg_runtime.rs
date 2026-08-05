@@ -289,6 +289,16 @@ impl BackgroundSlots {
                     .push(RuntimeEventPayload::Ui(event.clone()));
                 false
             }
+            AgentEvent::SharedRequestResolved { request_id, .. } => {
+                if bg
+                    .pending_request
+                    .as_ref()
+                    .is_some_and(|request| request.id == *request_id)
+                {
+                    bg.pending_request = None;
+                }
+                false
+            }
             _ => false,
         }
     }
@@ -1449,6 +1459,42 @@ mod tests {
                 if request.id == 7
         ));
         assert_eq!(resumed.resumed_session.messages.len(), 1);
+    }
+
+    #[test]
+    fn shared_resolution_prevents_background_request_from_reappearing_on_resume() {
+        let mut manager =
+            BgRuntimeManager::new_for_test(Session::default_session(PathBuf::from("/tmp/project")));
+        manager
+            .push_test_background(session("interactive task"), RuntimeState::Running)
+            .unwrap();
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::Request(
+                atomcode_coding::RuntimeRequest {
+                    id: 42,
+                    kind: atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND
+                        .into(),
+                    payload: serde_json::json!({}),
+                    snapshot: None,
+                },
+            )),
+        );
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Ui(AgentEvent::SharedRequestResolved {
+                request_id: 42,
+                kind: atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND
+                    .into(),
+            }),
+        );
+
+        let resumed = manager.resume_slot(1, RuntimeState::Idle).unwrap();
+        assert!(resumed.replay_events.iter().all(|event| !matches!(
+            event,
+            RuntimeEventPayload::Native(CodingRuntimeEvent::Request(request))
+                if request.id == 42
+        )));
     }
 
     #[test]

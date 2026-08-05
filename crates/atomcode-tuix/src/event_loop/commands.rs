@@ -615,26 +615,17 @@ pub(crate) fn attach_live_runtime(
         let runtime_id = ctx.foreground_runtime_id;
         ctx.live_observation_task = Some(tokio::spawn(async move {
             while let Ok(observation) = receiver.recv().await {
-                if let atomcode_daemon::live_hub::LiveViewEvent::InputAccepted { input, .. } =
-                    observation.event
+                let Some(event) = project_live_view_event(observation.event) else {
+                    continue;
+                };
+                if event_tx
+                    .send(super::bg_runtime::RuntimeEvent {
+                        runtime_id,
+                        event: super::bg_runtime::RuntimeEventPayload::Ui(event),
+                    })
+                    .is_err()
                 {
-                    // Re-attach `[Image #N]` markers dropped by the text-only echo:
-                    // a webui submit keeps images separate (`input.images`) with no
-                    // inline markers, so without this the synchronized TUI echoes an
-                    // image-bearing message with an empty attachment row (the empty
-                    // box under the user text).
-                    let echo = super::echo_text_with_image_markers(input.text, input.images.len());
-                    if event_tx
-                        .send(super::bg_runtime::RuntimeEvent {
-                            runtime_id,
-                            event: super::bg_runtime::RuntimeEventPayload::Ui(
-                                super::ui_event::UiEvent::UserEcho(echo),
-                            ),
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
+                    break;
                 }
             }
         }));
@@ -643,6 +634,23 @@ pub(crate) fn attach_live_runtime(
         "已共享当前会话（与浏览器实时互通）".to_string(),
     ));
     Ok(())
+}
+
+fn project_live_view_event(
+    event: atomcode_daemon::live_hub::LiveViewEvent,
+) -> Option<super::ui_event::UiEvent> {
+    match event {
+        atomcode_daemon::live_hub::LiveViewEvent::InputAccepted { input, .. } => {
+            // Re-attach `[Image #N]` markers dropped by the text-only echo: a webui
+            // submit keeps images separate (`input.images`) with no inline markers.
+            let echo = super::echo_text_with_image_markers(input.text, input.images.len());
+            Some(super::ui_event::UiEvent::UserEcho(echo))
+        }
+        atomcode_daemon::live_hub::LiveViewEvent::RequestResolved { request_id, kind } => {
+            Some(super::ui_event::UiEvent::SharedRequestResolved { request_id, kind })
+        }
+        _ => None,
+    }
 }
 
 fn detach_live_runtime(ctx: &mut LoopCtx) -> Result<bool, String> {
@@ -7347,6 +7355,26 @@ mod expand_cd_target_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_request_resolution_projects_to_correlated_tui_event() {
+        let event =
+            project_live_view_event(atomcode_daemon::live_hub::LiveViewEvent::RequestResolved {
+                request_id: 42,
+                kind: atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND
+                    .into(),
+            })
+            .expect("request terminal must reach the TUI");
+
+        assert!(matches!(
+            event,
+            crate::event_loop::ui_event::UiEvent::SharedRequestResolved {
+                request_id: 42,
+                ref kind,
+            } if kind
+                == atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND
+        ));
+    }
 
     fn new_schema_config(default_model: Option<&str>) -> Config {
         serde_json::from_value(serde_json::json!({

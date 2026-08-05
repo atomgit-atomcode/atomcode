@@ -21267,6 +21267,22 @@ fn handle_agent_event(
             });
             renderer.flush();
         }
+        AgentEvent::SharedRequestResolved { request_id, kind } => {
+            // The live hub publishes this only after the runtime accepted a peer's
+            // response. Correlate by id so a delayed terminal from an older prompt
+            // cannot dismiss a newer request already displayed by this TUI.
+            if ctx.pending_runtime_request_id != Some(request_id) {
+                return;
+            }
+            ctx.pending_runtime_request_id = None;
+            if kind == atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND {
+                state.on_user_input_resolved();
+                redraw_idle_plain(buf, state, ctx, renderer);
+            } else if kind == atomcode_capabilities::tools::APPROVAL_KIND {
+                state.on_approval_resolved();
+                redraw_idle_plain(buf, state, ctx, renderer);
+            }
+        }
         AgentEvent::PeerBusy(running) => {
             // Live-sync: mirror the peer's busy state so TUI input is
             // visually disabled while the other side's turn is running.
