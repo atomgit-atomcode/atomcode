@@ -2788,6 +2788,9 @@ fn spawn_runtime_owner_with_optional_agent(
                     }
                     let mut finish_reason = None;
                     let mut continuation = None;
+                    // Only GoalResult::Met keeps the goal registered after the turn ends.
+                    // All other finish_reason paths (e.g. evaluator Error) must still clear it.
+                    let mut keep_goal_on_eval = false;
                     match outcome.result {
                         GoalResult::Met(verdict) => {
                             if let Some(state) = goal.as_mut() {
@@ -2795,6 +2798,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
                             finish_reason = Some(StopReason::Stopped);
+                            keep_goal_on_eval = true;
                         }
                         GoalResult::NotMet(verdict) => {
                             if let Some(state) = goal.as_mut() {
@@ -2819,9 +2823,12 @@ fn spawn_runtime_owner_with_optional_agent(
                     if let Some(reason) = finish_reason {
                         if let Some((turn_id, _held_reason, snapshot, stats)) = held_turn.take() {
                             active_turn = None;
-                            // goal is intentionally NOT cleared here: Met keeps the goal
-                            // registered with phase=Satisfied so callers can inspect it
-                            // after the turn ends.
+                            // GoalResult::Met keeps the goal registered (phase=Satisfied);
+                            // other finish_reason paths (e.g. evaluator Error) still clear
+                            // via keep_goal_on_eval=false.
+                            if !keep_goal_on_eval {
+                                goal = None;
+                            }
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { turn_id, reason, snapshot, stats }));
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
                         }
@@ -12780,6 +12787,13 @@ mod tests {
     // After the evaluator returns Met, the runtime must keep the goal registered
     // with phase=Satisfied (not clear it).  The last GoalChanged event must carry
     // phase==Satisfied and active==false.
+    //
+    // NOTE: This test validates the *event contract only* — it observes the
+    // GoalChanged(phase=Satisfied) event, which fires before any potential
+    // goal=None clearing, so it was green even before the keep-goal-on-Met fix
+    // and does NOT falsify the in-memory keep-goal change.  The falsifying
+    // coverage (confirming a still-registered goal after Met) arrives in Task 4
+    // (Submit-while-Satisfied), which can only succeed if `goal` is still set.
     #[tokio::test]
     async fn met_goal_keeps_goal_registered_with_phase_satisfied() {
         let (
