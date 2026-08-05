@@ -87,6 +87,8 @@ impl CommandRegistry {
 const COMMAND_ALIASES: &[(&str, &str)] = &[
     // `/new` is a memorable alias for `/session` (start a fresh session).
     ("new", "session"),
+    // Keep `/exit` working while presenting one canonical quit command.
+    ("exit", "quit"),
 ];
 
 /// Resolve an alias to its canonical command name (ASCII case-insensitive).
@@ -194,7 +196,6 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "language", desc: "Switch display and commit language", needs_args: false, hidden: false },
     Command { name: "welcome", desc: "Re-run the onboarding wizard", needs_args: false, hidden: false },
     Command { name: "quit",    desc: "Exit AtomCode", needs_args: false, hidden: false },
-    Command { name: "exit",    desc: "Exit AtomCode", needs_args: false, hidden: false },
     // Gateway entry that opens a second-level palette listing all
     // user-invocable skills. needs_args=true so Enter rewrites the
     // buffer to `/skills ` and lets the sub-mode menu render the
@@ -426,6 +427,8 @@ mod tests {
     fn canonical_name_resolves_aliases_case_insensitively() {
         assert_eq!(canonical_command_name("new"), "session");
         assert_eq!(canonical_command_name("NEW"), "session");
+        assert_eq!(canonical_command_name("exit"), "quit");
+        assert_eq!(canonical_command_name("EXIT"), "quit");
         // Non-alias names pass through unchanged.
         assert_eq!(canonical_command_name("session"), "session");
         assert_eq!(canonical_command_name("model"), "model");
@@ -435,6 +438,7 @@ mod tests {
     #[test]
     fn display_name_annotates_aliased_commands_only() {
         assert_eq!(command_display_name("session"), "session (new)");
+        assert_eq!(command_display_name("quit"), "quit (exit)");
         // Commands without aliases render as their bare name.
         assert_eq!(command_display_name("model"), "model");
         assert_eq!(command_display_name("resume"), "resume");
@@ -450,6 +454,9 @@ mod tests {
             via_alias.needs_args,
             reg.find("session").unwrap().needs_args
         );
+
+        let via_exit = reg.find("exit").expect("/exit must resolve to /quit");
+        assert_eq!(via_exit.name, "quit");
     }
 
     #[test]
@@ -475,6 +482,16 @@ mod tests {
             .matching_prefix("zzz")
             .iter()
             .any(|c| c.name == "session"));
+
+        for prefix in ["q", "quit", "e", "ex", "exit"] {
+            let hits = reg.matching_prefix(prefix);
+            let quit: Vec<_> = hits.iter().filter(|c| c.name == "quit").collect();
+            assert_eq!(
+                quit.len(),
+                1,
+                "prefix {prefix:?} must surface `quit (exit)` exactly once"
+            );
+        }
     }
 
     #[test]
