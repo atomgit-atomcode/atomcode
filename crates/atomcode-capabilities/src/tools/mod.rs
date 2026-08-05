@@ -295,7 +295,23 @@ const HINT_MAX_ENTRIES: usize = 40;
 /// containment (see the module trust-model note), so a model may pass any absolute path; a
 /// hint that listed whatever lies outside would turn a typo into "enumerate the user's home
 /// directory into model context".
-pub(crate) fn not_found_hint(missing: &Path, working_dir: &Path) -> String {
+///
+/// HANG-SAFE: the blocking `canonicalize`/`read_dir` run OFF the async runtime thread and are
+/// bounded by [`GATE_FS_TIMEOUT`] (a workspace on a stalled network mount can wedge these for
+/// minutes — the same reason the permission gate uses [`run_bounded`]). A timeout degrades to
+/// no hint, never a frozen turn loop. Centralized here so no call site can forget it.
+pub(crate) async fn not_found_hint(missing: &Path, working_dir: &Path) -> String {
+    let missing = missing.to_path_buf();
+    let working_dir = working_dir.to_path_buf();
+    run_bounded(GATE_FS_TIMEOUT, String::new(), move || {
+        not_found_hint_blocking(&missing, &working_dir)
+    })
+    .await
+}
+
+/// Pure, blocking core of [`not_found_hint`] (kept separate so the boundary logic is unit-
+/// testable without a runtime). MUST run off the async worker — see the wrapper.
+fn not_found_hint_blocking(missing: &Path, working_dir: &Path) -> String {
     let Ok(root) = crate::pathnorm::canonicalize(working_dir) else {
         return String::new();
     };
@@ -328,7 +344,9 @@ fn render_dir_hint(dir: &Path) -> String {
     let mut names: Vec<(bool, String)> = Vec::new();
     for ent in read.flatten() {
         let name = ent.file_name().to_string_lossy().into_owned();
-        if SKIP_DIRS.contains(&name.as_str()) {
+        // Same filter the walkers use (`is_skip_dir` also drops `.venv-*`), so the hint
+        // never surfaces noise the tools would otherwise skip.
+        if is_skip_dir(&name) {
             continue;
         }
         let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
@@ -562,7 +580,7 @@ mod tests {
         std::fs::create_dir(wd.join("app").join("libs")).unwrap();
 
         // The model guessed two levels past where the tree actually stops.
-        let hint = not_found_hint(&wd.join("app/src/main/java"), wd);
+        let hint = not_found_hint_blocking(&wd.join("app/src/main/java"), wd);
 
         assert!(hint.contains("app"), "{hint}");
         assert!(hint.contains("build.gradle"), "{hint}");
@@ -583,12 +601,55 @@ mod tests {
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(outside.join("id_rsa"), "").unwrap();
 
-        let hint = not_found_hint(&outside.join("nope/deeper"), &wd);
+        let hint = not_found_hint_blocking(&outside.join("nope/deeper"), &wd);
 
         assert!(
             hint.is_empty(),
             "must not enumerate outside the workspace: {hint}"
         );
+    }
+
+    /// The HARD escape the boundary actually defends: a symlink INSIDE the workspace that
+    /// points OUT of it. A byte-prefix check on the un-resolved path would pass
+    /// (`<wd>/link/...` starts with `<wd>`) and leak the target's contents; the guard is only
+    /// sound because it canonicalizes both sides (resolving the symlink) before comparing. This
+    /// pins that — if `pathnorm::canonicalize` were ever swapped for a lexical normalizer, the
+    /// leak would come back and this test would catch it. (Unix-only: reliable symlink creation.)
+    #[cfg(unix)]
+    #[test]
+    fn not_found_hint_does_not_follow_a_symlink_out_of_the_workspace() {
+        let d = tempfile::tempdir().unwrap();
+        let wd = d.path().join("workspace");
+        std::fs::create_dir(&wd).unwrap();
+        let outside = d.path().join("secrets");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("id_rsa"), "").unwrap();
+        // A symlink inside the workspace pointing at the secret dir outside it.
+        std::os::unix::fs::symlink(&outside, wd.join("link")).unwrap();
+
+        // The model asks for a missing path UNDER the escaping symlink.
+        let hint = not_found_hint_blocking(&wd.join("link/nope"), &wd);
+
+        assert!(
+            hint.is_empty() && !hint.contains("id_rsa"),
+            "a symlink escaping the workspace must not be enumerated: {hint}"
+        );
+    }
+
+    /// `..` traversal that climbs out of the workspace is resolved by canonicalize and rejected,
+    /// same as the symlink case.
+    #[test]
+    fn not_found_hint_rejects_dotdot_escape() {
+        let d = tempfile::tempdir().unwrap();
+        let wd = d.path().join("workspace");
+        std::fs::create_dir(&wd).unwrap();
+        let outside = d.path().join("secrets");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("id_rsa"), "").unwrap();
+
+        let hint = not_found_hint_blocking(&wd.join("../secrets/nope"), &wd);
+
+        assert!(hint.is_empty(), "a `..` escape must say nothing: {hint}");
     }
 
     /// The workspace root itself is a valid nearest-existing ancestor — that is the common
@@ -598,7 +659,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("main.py"), "").unwrap();
 
-        let hint = not_found_hint(&d.path().join("src"), d.path());
+        let hint = not_found_hint_blocking(&d.path().join("src"), d.path());
 
         assert!(hint.contains("main.py"), "{hint}");
     }

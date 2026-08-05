@@ -85,7 +85,7 @@ impl Tool for GrepTool {
             return err(format!(
                 "grep: path not found: {}{}",
                 crate::pathnorm::to_display(&root),
-                not_found_hint(&root, &ctx.working_dir)
+                not_found_hint(&root, &ctx.working_dir).await
             ));
         }
         let max = a

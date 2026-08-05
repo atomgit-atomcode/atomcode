@@ -72,7 +72,7 @@ impl Tool for ListDirTool {
                 return err(format!(
                     "Directory not found: {}{}",
                     crate::pathnorm::to_display(&root),
-                    not_found_hint(&root, &ctx.working_dir)
+                    not_found_hint(&root, &ctx.working_dir).await
                 ))
             }
         }

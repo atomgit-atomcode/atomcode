@@ -171,7 +171,7 @@ impl Tool for ReadFileTool {
                     "Error: no such file: {} (resolved to {}){}",
                     a.file_path,
                     crate::pathnorm::to_display(&path),
-                    not_found_hint(&path, &ctx.working_dir)
+                    not_found_hint(&path, &ctx.working_dir).await
                 ))
             }
         };

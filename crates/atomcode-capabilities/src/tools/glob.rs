@@ -77,7 +77,7 @@ impl Tool for GlobTool {
                 return err(format!(
                     "glob: base directory does not exist: {}{}",
                     crate::pathnorm::to_display(&base),
-                    not_found_hint(&base, &ctx.working_dir)
+                    not_found_hint(&base, &ctx.working_dir).await
                 ))
             }
         }
