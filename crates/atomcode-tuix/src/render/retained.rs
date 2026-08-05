@@ -1028,14 +1028,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
-    /// Background style for the user-input block. `bg` comes from the
-    /// theme-aware `Role::PanelBg` (dark 236 / light 254); `fg` stays `None`
-    /// so the text keeps the terminal's default foreground. Returns
-    /// `bg: None` when colours are disabled — the caller treats that as
+    /// Paired foreground/background style for the user-input block.
+    ///
+    /// Both channels are explicit because Windows cannot currently answer the
+    /// automatic background probe. If `Auto` falls back to the dark palette
+    /// while the terminal is actually light, inheriting its dark default
+    /// foreground would make the prompt unreadable on `PanelBg`.
+    /// Returns `bg: None` when colours are disabled — the caller treats that as
     /// "no block, use the plain layout".
     fn style_panel_bg(&self) -> CellStyle {
         CellStyle {
-            fg: None,
+            fg: role(self.caps, Role::PanelFg),
             bg: role(self.caps, Role::PanelBg),
             bold: false,
             reverse: false,
@@ -6731,8 +6734,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // bg so the colour sits behind the whole block.
         let mut accent = self.style_bold(Role::Accent);
         accent.bg = bg.bg;
-        let mut text_style = CellStyle::default();
-        text_style.bg = bg.bg;
+        let text_style = bg.clone();
         let mut muted = self.style_for(Role::Muted);
         muted.bg = bg.bg;
 
@@ -16490,14 +16492,15 @@ mod tests {
         }
     }
 
-    /// User-message text stays the terminal's default foreground (no fixed
-    /// colour) — the colour lives only on the `❯` Accent marker, mirroring
-    /// opencode (`<text fg={theme.text}>` + a coloured left border). The old
-    /// `!267` styling painted the whole sentence bright magenta, which read as
-    /// too vivid; this locks the text back to default fg.
+    /// User-message text uses the foreground paired with its explicit panel
+    /// background. Inheriting the terminal default is unsafe on Windows where
+    /// `Auto` may fall back to a dark panel inside an actually-light terminal.
     #[test]
-    fn retained_user_message_text_is_default_fg() {
+    fn retained_user_message_text_uses_panel_foreground() {
+        let _theme = crate::highlight::theme::test_lock();
+        crate::highlight::theme::set_theme_mode(false);
         let (mut r, _buf) = new_capturing(80, 24);
+        let expected_fg = crate::render::theme::role(r.caps, crate::render::theme::Role::PanelFg);
         r.render(UiLine::User("hello".into()));
 
         let mut found = false;
@@ -16508,13 +16511,13 @@ mod tests {
             }
             found = true;
             // The text glyphs (the alphabetic cells; the chevron is a glyph/space)
-            // must carry NO fixed fg — they inherit the terminal default.
+            // must carry the foreground selected for the panel background.
             for cell in row {
                 if cell.ch.is_alphabetic() {
                     assert_eq!(
-                        cell.style.fg, None,
-                        "user text cell '{}' must be default fg (None), got {:?}",
-                        cell.ch, cell.style.fg,
+                        cell.style.fg, expected_fg,
+                        "user text cell '{}' must use panel fg {:?}, got {:?}",
+                        cell.ch, expected_fg, cell.style.fg,
                     );
                 }
             }
