@@ -30,8 +30,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::controllers::{
     evaluate_goal, goal_cap_stop_note, goal_continuation_message, summarize_for_goal, EvalOutcome,
-    GoalProgress, GoalResult, GoalState, GoalTerminal, LoopProgress, LoopState, ScheduleWakeupTool,
-    WakeupRequest, MAX_UNPRODUCTIVE,
+    GoalPhase, GoalProgress, GoalResult, GoalState, GoalTerminal, LoopProgress, LoopState,
+    ScheduleWakeupTool, WakeupRequest, MAX_UNPRODUCTIVE,
 };
 use crate::parts::prepare_with_plugin_hook_source_reusing_lease;
 #[cfg(test)]
@@ -2791,7 +2791,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     match outcome.result {
                         GoalResult::Met(verdict) => {
                             if let Some(state) = goal.as_mut() {
-                                state.finish(GoalTerminal::Met, verdict);
+                                state.mark_satisfied(verdict);
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
                             finish_reason = Some(StopReason::Stopped);
@@ -2819,7 +2819,9 @@ fn spawn_runtime_owner_with_optional_agent(
                     if let Some(reason) = finish_reason {
                         if let Some((turn_id, _held_reason, snapshot, stats)) = held_turn.take() {
                             active_turn = None;
-                            goal = None;
+                            // goal is intentionally NOT cleared here: Met keeps the goal
+                            // registered with phase=Satisfied so callers can inspect it
+                            // after the turn ends.
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { turn_id, reason, snapshot, stats }));
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
                         }
@@ -5296,13 +5298,15 @@ fn spawn_runtime_owner_with_optional_agent(
                                             reason,
                                             StopReason::Timeout | StopReason::ProviderError
                                         );
+                                        let mut keep_goal_registered = false;
                                         if let Some(why) = stop_reason {
                                             // A cap fired (round budget, or the optional time cap).
                                             // This is "ran out of budget", NOT "the evaluator judged
                                             // the work unfinished" — the note names the budget and
                                             // how to continue, and never claims "goal not met".
                                             let note = goal_cap_stop_note(why, state.max_rounds);
-                                            state.finish(GoalTerminal::Stopped, note.clone());
+                                            state.pause_at_cap(note.clone());
+                                            keep_goal_registered = true;
                                             completion_reason = match why {
                                                 "round limit" => StopReason::MaxRounds,
                                                 "time limit" => StopReason::Timeout,
@@ -5420,7 +5424,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                             );
                                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                         }
-                                        goal = None;
+                                        if !keep_goal_registered {
+                                            goal = None;
+                                        }
                                     } else if let Some(state) = loop_state.as_mut().filter(|state| state.active) {
                                         if reason == StopReason::Stopped {
                                             if let Some(wakeup) = pending_wakeup.take() {
@@ -12769,5 +12775,176 @@ mod tests {
             .messages
             .iter()
             .any(|message| message.text.contains("anchored summary")));
+    }
+
+    // After the evaluator returns Met, the runtime must keep the goal registered
+    // with phase=Satisfied (not clear it).  The last GoalChanged event must carry
+    // phase==Satisfied and active==false.
+    #[tokio::test]
+    async fn met_goal_keeps_goal_registered_with_phase_satisfied() {
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(GoalMetProviderFactory)).await;
+
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await; // GoalChanged(active=true)
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("done", vec![])]),
+            })
+            .unwrap();
+
+        // Drain events until TurnFinished; collect the last GoalChanged seen.
+        let mut last_goal_progress: Option<GoalProgress> = None;
+        let _terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::GoalChanged(p)) => last_goal_progress = Some(p),
+                    Some(CodingRuntimeEvent::TurnFinished(completion)) => break completion,
+                    Some(_) => {}
+                    None => panic!("runtime events closed before met terminal"),
+                }
+            }
+        })
+        .await
+        .expect("met goal did not produce a turn terminal");
+
+        let progress = last_goal_progress.expect("no GoalChanged event was emitted after Met");
+        assert_eq!(
+            progress.phase,
+            GoalPhase::Satisfied,
+            "goal phase must be Satisfied after Met; got {:?}",
+            progress.phase
+        );
+        assert!(!progress.active, "goal must be inactive after Met");
+        assert_eq!(
+            progress.terminal,
+            Some(GoalTerminal::Met),
+            "goal terminal must be Met"
+        );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    // After a round-cap fires, the runtime must keep the goal registered with
+    // phase=PausedAtCap (not clear it).  The last GoalChanged event must carry
+    // phase==PausedAtCap and active==false.
+    #[tokio::test]
+    async fn cap_goal_keeps_goal_registered_with_phase_paused_at_cap() {
+        let mut config = native_start(false).agent;
+        config.goal_max_rounds = 1;
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime_with_config(
+            Arc::new(GoalNotMetProviderFactory::default()),
+            config,
+        )
+        .await;
+
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await; // GoalChanged(active=true)
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        let _ = kernel_commands.recv().await;
+
+        for attempt in 0..2 {
+            kernel_events
+                .send(AgentEvent::TurnComplete {
+                    reason: StopReason::Stopped,
+                })
+                .unwrap();
+            assert!(matches!(
+                kernel_commands.recv().await,
+                Some(AgentCommand::Snapshot)
+            ));
+            kernel_events
+                .send(AgentEvent::Snapshot {
+                    snapshot: SessionSnapshot::new(vec![Message::assistant("not done", vec![])]),
+                })
+                .unwrap();
+            if attempt == 0 {
+                // First round: evaluator says NotMet → continuation dispatched.
+                assert!(matches!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        kernel_commands.recv()
+                    )
+                    .await
+                    .expect("first goal continuation was not dispatched"),
+                    Some(AgentCommand::SendSyntheticMessage { .. })
+                ));
+            }
+        }
+
+        // Drain events until TurnFinished; collect the last GoalChanged seen.
+        let mut last_goal_progress: Option<GoalProgress> = None;
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::GoalChanged(p)) => last_goal_progress = Some(p),
+                    Some(CodingRuntimeEvent::TurnFinished(completion)) => break completion,
+                    Some(_) => {}
+                    None => panic!("runtime events closed before cap terminal"),
+                }
+            }
+        })
+        .await
+        .expect("goal round cap did not produce a turn terminal");
+
+        assert!(matches!(
+            terminal,
+            TurnCompletion::Completed {
+                reason: StopReason::MaxRounds,
+                ..
+            }
+        ));
+
+        let progress = last_goal_progress
+            .expect("no GoalChanged event was emitted after round cap");
+        assert_eq!(
+            progress.phase,
+            GoalPhase::PausedAtCap,
+            "goal phase must be PausedAtCap after round cap; got {:?}",
+            progress.phase
+        );
+        assert!(!progress.active, "goal must be inactive after round cap");
+        assert_eq!(
+            progress.terminal,
+            Some(GoalTerminal::Stopped),
+            "goal terminal must be Stopped after round cap"
+        );
+
+        handle.shutdown().await.unwrap();
     }
 }
