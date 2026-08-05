@@ -71,6 +71,10 @@ pub enum GoalPhase {
     Pursuing,
     PausedAtCap,
     Satisfied,
+    /// Terminal state for cancel / fail / clear paths.  Not persisted: the UI
+    /// row disappears when this is reached.  Satisfies the invariant that
+    /// `active == (phase == Pursuing)` on all exit paths from `finish()`.
+    Ended,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,6 +150,10 @@ impl GoalState {
 
     pub fn finish(&mut self, terminal: GoalTerminal, reason: impl Into<String>) {
         self.active = false;
+        self.phase = match terminal {
+            GoalTerminal::Met => GoalPhase::Satisfied,
+            _ => GoalPhase::Ended,
+        };
         self.terminal = Some(terminal);
         self.last_reason = Some(reason.into());
     }
@@ -676,12 +684,17 @@ mod tests {
         assert_eq!(g.phase, GoalPhase::Satisfied);
         assert!(!g.active);
         assert_eq!(g.progress().phase, GoalPhase::Satisfied);
+        // Minor fix 1: terminal and active also checked via progress()
+        assert_eq!(g.progress().terminal, Some(GoalTerminal::Met));
+        assert_eq!(g.progress().active, false);
 
         let mut g2 = GoalState::new(2, "finish".into(), 300, 0);
         g2.round = 300;
         g2.pause_at_cap("已达轮数预算（300 轮）");
         assert_eq!(g2.phase, GoalPhase::PausedAtCap);
         assert!(!g2.active);
+        // Minor fix 2: terminal checked after pause
+        assert_eq!(g2.progress().terminal, Some(GoalTerminal::Stopped));
 
         // resume 重置轮数、采纳新预算、回到 Pursuing
         g2.resume(240);
@@ -689,5 +702,27 @@ mod tests {
         assert!(g2.active);
         assert_eq!(g2.round, 0);
         assert_eq!(g2.progress().max_rounds, Some(240));
+        // Minor fix 3: terminal and last_reason cleared by resume
+        assert_eq!(g2.terminal, None);
+        assert!(g2.last_reason.is_none());
+    }
+
+    #[test]
+    fn finish_sets_honest_phase_not_pursuing() {
+        // finish(Cancelled/Failed/Stopped) → Ended; finish(Met) → Satisfied
+        let mut g = GoalState::new(1, "test".into(), 0, 0);
+        g.finish(GoalTerminal::Cancelled, "user cancelled");
+        assert_eq!(g.phase, GoalPhase::Ended);
+        assert!(!g.active);
+
+        let mut g2 = GoalState::new(2, "test".into(), 0, 0);
+        g2.finish(GoalTerminal::Failed, "evaluator said no");
+        assert_eq!(g2.phase, GoalPhase::Ended);
+        assert!(!g2.active);
+
+        let mut g3 = GoalState::new(3, "test".into(), 0, 0);
+        g3.finish(GoalTerminal::Met, "all good");
+        assert_eq!(g3.phase, GoalPhase::Satisfied);
+        assert!(!g3.active);
     }
 }
