@@ -114,13 +114,23 @@ fn build_coding_agent_from_tools(
         persona.push_str("</system-reminder>");
     }
     let turn_execution_policy = Arc::new(TurnExecutionPolicy::new());
-    let mut builder = Agent::builder()
+    let builder = Agent::builder()
         .provider(provider)
         .tools(tools)
         .persona(persona)
         // Repair model-produced arguments before approval inspects them.
         .middleware(Arc::new(RepairToolArgsMiddleware))
         .middleware(turn_execution_policy.clone())
+        // Keep hard credential policy ahead of every middleware that may return
+        // `Allow` and short-circuit the remaining before-chain.
+        .middleware(Arc::new(
+            atomcode_capabilities::tools::CredentialBashGate::new(),
+        ));
+    #[cfg(feature = "atomgit")]
+    let builder = builder.middleware(Arc::new(
+        atomcode_capabilities::tools::AtomgitBashGate::new(),
+    ));
+    let mut builder = builder
         // Auto-approve in-workspace open_file (it's Risky → would otherwise prompt on every
         // preview). This path pins an immutable working_dir, so the gate pins the same root.
         // BEFORE approval so its `Allow` short-circuits the prompt.
@@ -182,15 +192,8 @@ fn build_coding_agent_from_tools(
             cfg.todo.eager,
         )));
     }
-    // NOTE: this function is reachable only from tests/examples (see the `parts.rs::assemble`
-    // header). The PRODUCTION mount of this middleware lives in `parts::assemble`; keep both in
-    // sync — mounting it ONLY here (as was originally done) means it never runs for a real
-    // session (terminal/daemon/webui all build their agent through `parts::assemble`).
     #[cfg(feature = "atomgit")]
     {
-        builder = builder.middleware(Arc::new(
-            atomcode_capabilities::tools::AtomgitBashGate::new(),
-        ));
         builder = builder.middleware(Arc::new(
             atomcode_capabilities::tools::GitPushLabelMiddleware::new(cfg.working_dir.clone()),
         ));

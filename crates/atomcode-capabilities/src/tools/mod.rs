@@ -43,6 +43,7 @@ pub mod atomgit_bash_gate;
 pub mod bash;
 pub mod bash_workspace_gate;
 pub mod cd;
+pub mod credential_bash_gate;
 pub mod edit;
 pub mod glob;
 pub mod grep;
@@ -94,6 +95,7 @@ pub use bash::{
 };
 pub use bash_workspace_gate::BashWorkspaceGate;
 pub use cd::ChangeDirTool;
+pub use credential_bash_gate::CredentialBashGate;
 pub use edit::EditFileTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;

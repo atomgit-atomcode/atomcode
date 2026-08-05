@@ -498,7 +498,10 @@ enum CallPlan {
     Skip,
     /// A ready-to-apply result: mode-B stub, middleware `blocked:` error, or an
     /// unknown/unmounted-tool error. Applied verbatim in Phase ③ (no execute).
-    Result(ToolResult),
+    Result {
+        result: ToolResult,
+        terminate_turn: bool,
+    },
     /// Run this tool in Phase ②. `parallel_safe` is captured at classification
     /// time (Task 3 uses it to decide concurrency).
     Execute {
@@ -2885,6 +2888,7 @@ impl RunningAgent {
                 return;
             }
             let mut plans: Vec<CallPlan> = Vec::with_capacity(pending_calls.len());
+            let mut terminal_policy_denial_seen = false;
             for mut call in pending_calls {
                 // ── DUPLICATE TOOL-CALL DEDUP GATE ──
                 // Some (esp. thinking-mode / weak) models emit the SAME tool_call
@@ -2912,6 +2916,25 @@ impl RunningAgent {
                     continue;
                 }
 
+                // A hard policy denial suppresses every other call in the same
+                // model-emitted batch. Pair each id with an explicit result, but
+                // do not allow sibling side effects to run before termination.
+                if terminal_policy_denial_seen {
+                    result_ids.insert(call.id.clone());
+                    plans.push(CallPlan::Result {
+                        result: ToolResult {
+                            call_id: call.id,
+                            content:
+                                "blocked: another call in this batch terminated the turn by policy"
+                                    .into(),
+                            is_error: true,
+                            images: vec![],
+                        },
+                        terminate_turn: false,
+                    });
+                    continue;
+                }
+
                 // (2) SAME (name, arguments) with a NEW id (mode B — carry
                 // production runner.rs:933-942): do NOT re-execute. Push a stub
                 // result so this distinct id STILL gets exactly one result (parity
@@ -2927,7 +2950,10 @@ impl RunningAgent {
                         images: vec![],
                     };
                     result_ids.insert(call.id.clone());
-                    plans.push(CallPlan::Result(result));
+                    plans.push(CallPlan::Result {
+                        result,
+                        terminate_turn: false,
+                    });
                     continue;
                 }
 
@@ -2937,19 +2963,22 @@ impl RunningAgent {
                         // id (mode A) but NOT the (name,args) key — a later distinct
                         // id may legitimately retry once the tool is mounted.
                         result_ids.insert(call.id.clone());
-                        plans.push(CallPlan::Result(ToolResult {
-                            call_id: call.id.clone(),
-                            content: format!("unknown or unmounted tool: {}", call.name),
-                            is_error: true,
-                            images: vec![],
-                        }));
+                        plans.push(CallPlan::Result {
+                            result: ToolResult {
+                                call_id: call.id.clone(),
+                                content: format!("unknown or unmounted tool: {}", call.name),
+                                is_error: true,
+                                images: vec![],
+                            },
+                            terminate_turn: false,
+                        });
                     }
                     Some(tool) => {
                         // ToolMiddleware before-chain: may rewrite the call (&mut),
                         // round-trip via rt (approval), and returns a BeforeOutcome
                         // GATE decision. Runs after lookup; ToolStarted fires only for
                         // a tool that executes (no ghost row for blocked tools).
-                        let mut blocked: Option<String> = None;
+                        let mut blocked: Option<(String, bool)> = None;
                         for mw in &self.middlewares {
                             match mw.before(&mut call, &tool, &self.rt).await {
                                 BeforeOutcome::Proceed => {}
@@ -2970,22 +2999,47 @@ impl RunningAgent {
                                 // bypasses the permission system).
                                 BeforeOutcome::Allow { .. } => break,
                                 BeforeOutcome::Deny { reason } => {
-                                    blocked = Some(reason);
+                                    blocked = Some((reason, false));
+                                    break;
+                                }
+                                BeforeOutcome::DenyTurn { reason } => {
+                                    blocked = Some((reason, true));
                                     break;
                                 }
                             }
                         }
-                        if let Some(reason) = blocked {
+                        if let Some((reason, terminate_turn)) = blocked {
                             // Middleware-blocked: a ready error result. Record the id
                             // (mode A) but NOT the (name,args) key — a later distinct
                             // id may legitimately RETRY a previously blocked call.
                             result_ids.insert(call.id.clone());
-                            plans.push(CallPlan::Result(ToolResult {
-                                call_id: call.id.clone(),
-                                content: format!("blocked: {reason}"),
-                                is_error: true,
-                                images: vec![],
-                            }));
+                            plans.push(CallPlan::Result {
+                                result: ToolResult {
+                                    call_id: call.id.clone(),
+                                    content: format!("blocked: {reason}"),
+                                    is_error: true,
+                                    images: vec![],
+                                },
+                                terminate_turn,
+                            });
+                            if terminate_turn {
+                                terminal_policy_denial_seen = true;
+                                for prior in &mut plans {
+                                    if let CallPlan::Execute { call, .. } = prior {
+                                        let call_id = call.id.clone();
+                                        *prior = CallPlan::Result {
+                                            result: ToolResult {
+                                                call_id,
+                                                content: "blocked: another call in this batch terminated the turn by policy"
+                                                    .into(),
+                                                is_error: true,
+                                                images: vec![],
+                                            },
+                                            terminate_turn: false,
+                                        };
+                                    }
+                                }
+                            }
                         } else {
                             // Executes in Phase ②. Record BOTH dedup keys NOW so a
                             // later call in THIS batch that repeats the id classifies as
@@ -3034,7 +3088,7 @@ impl RunningAgent {
             let mut results: Vec<Option<ExecutedCallResult>> =
                 (0..plans.len()).map(|_| None).collect();
             for (i, plan) in plans.iter().enumerate() {
-                if let CallPlan::Result(r) = plan {
+                if let CallPlan::Result { result: r, .. } = plan {
                     results[i] = Some(ExecutedCallResult {
                         result: r.clone(),
                         effective_cwd: None,
@@ -3182,6 +3236,7 @@ impl RunningAgent {
                         )
                     }));
             let mut loop_calls = Vec::with_capacity(plans.len());
+            let mut policy_denied = false;
             for (plan, result_slot) in plans.iter().zip(results.iter_mut()) {
                 let Some(ExecutedCallResult {
                     mut result,
@@ -3255,6 +3310,15 @@ impl RunningAgent {
                     &result.content,
                     result.is_error,
                 ));
+                if matches!(
+                    plan,
+                    CallPlan::Result {
+                        terminate_turn: true,
+                        ..
+                    }
+                ) {
+                    policy_denied = true;
+                }
                 // CC PostToolUse `decision: "block"`: feed the reason back to the
                 // model so it can course-correct. Hard turn-termination (stop before
                 // the next model call) needs a dedicated StopReason and lands with the
@@ -3302,6 +3366,11 @@ impl RunningAgent {
                     total: total_non_dup,
                     elapsed_ms: started_at.elapsed().as_millis() as u64,
                 });
+            }
+            if policy_denied {
+                self.finish_turn(convo, StopReason::PolicyDenied, &turn_ctx)
+                    .await;
+                return;
             }
             // VISION: surface any images this batch's tools produced to the model via a
             // SINGLE follow-up user message (collected above). Pushed AFTER all
@@ -4276,7 +4345,11 @@ mod partial_stream_persistence_tests {
         let assistant = &convo.messages[1];
         assert_eq!(assistant.text, "partial text");
         assert_eq!(assistant.reasoning.as_deref(), Some("partial reasoning"));
-        assert_eq!(assistant.tool_calls.len(), 1, "same call_id is persisted once");
+        assert_eq!(
+            assistant.tool_calls.len(),
+            1,
+            "same call_id is persisted once"
+        );
 
         let result = &convo.messages[2];
         assert_eq!(result.role, Role::Tool);

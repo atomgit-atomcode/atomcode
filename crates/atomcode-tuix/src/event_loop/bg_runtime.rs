@@ -1548,6 +1548,7 @@ mod tests {
             StopReason::ProviderError,
             StopReason::Timeout,
             StopReason::PromptRejected,
+            StopReason::PolicyDenied,
             StopReason::RateLimited,
         ] {
             let mut manager = BgRuntimeManager::new_for_test(Session::default_session(

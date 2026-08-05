@@ -3075,6 +3075,7 @@ pub(crate) fn stop_reason_wire(reason: atomcode_kernel::event::StopReason) -> &'
         StopReason::Timeout => "timeout",
         StopReason::Cancelled => "cancelled",
         StopReason::PromptRejected => "prompt_rejected",
+        StopReason::PolicyDenied => "policy_denied",
         StopReason::RateLimited => "rate_limited",
         _ => "unknown",
     }
@@ -3236,6 +3237,10 @@ mod chat_event_type_tests {
             (
                 atomcode_kernel::event::StopReason::ToolLoopDetected,
                 "tool_loop_detected",
+            ),
+            (
+                atomcode_kernel::event::StopReason::PolicyDenied,
+                "policy_denied",
             ),
         ] {
             let mut projector = ChatRuntimeProjector::default();

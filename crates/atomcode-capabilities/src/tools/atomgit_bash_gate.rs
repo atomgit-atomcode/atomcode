@@ -1,4 +1,4 @@
-//! Fail-closed guard for raw AtomGit API calls issued through the generic bash tool.
+//! Fail-closed guard for raw AtomGit API calls issued through bash.
 
 use async_trait::async_trait;
 use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
@@ -8,14 +8,14 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 const ATOMGIT_API_HOST: &str = "api.atomgit.com";
-const TOKEN_MARKERS: &[&str] = &[
-    "access_token=",
-    "authorization: bearer",
+const ATOMGIT_TOKEN_MARKERS: &[&str] = &[
     "$atomgit_token",
     "${atomgit_token",
     "$atomgit_access_token",
     "${atomgit_access_token",
 ];
+const ATOMGIT_CREDENTIAL_DENIAL: &str = "credentials must not be passed through shell arguments. Do not retry with scripts, temporary files, environment expansion, or by reading auth files; use atomgit_repo, atomgit_pr, or atomgit_issue";
+const RAW_ATOMGIT_DENIAL: &str = "raw AtomGit API calls through bash are disabled. Do not retry through curl or scripts; use atomgit_repo, atomgit_pr, or atomgit_issue";
 
 #[derive(Deserialize)]
 struct BashArgs {
@@ -37,16 +37,14 @@ impl AtomgitBashGate {
 
 fn raw_atomgit_api_reason(command: &str) -> Option<&'static str> {
     let normalized = command.to_ascii_lowercase();
-    if TOKEN_MARKERS
+    if ATOMGIT_TOKEN_MARKERS
         .iter()
         .any(|marker| normalized.contains(marker))
     {
-        return Some("credentials must not be passed through shell arguments; use an AtomGit tool");
+        return Some(ATOMGIT_CREDENTIAL_DENIAL);
     }
     if normalized.contains(ATOMGIT_API_HOST) {
-        return Some(
-            "raw AtomGit API calls through bash are disabled; use atomgit_repo, atomgit_pr, or atomgit_issue",
-        );
+        return Some(RAW_ATOMGIT_DENIAL);
     }
     None
 }
@@ -66,7 +64,7 @@ impl ToolMiddleware for AtomgitBashGate {
             return BeforeOutcome::Proceed;
         };
         match raw_atomgit_api_reason(&args.command) {
-            Some(reason) => BeforeOutcome::deny(reason),
+            Some(reason) => BeforeOutcome::deny_turn(reason),
             None => BeforeOutcome::Proceed,
         }
     }
@@ -105,16 +103,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_credentials_in_shell_arguments() {
-        assert!(outcome("curl https://example.test?access_token=secret")
-            .await
-            .is_deny());
-        assert!(
-            outcome("curl -H 'Authorization: Bearer secret' https://example.test")
-                .await
-                .is_deny()
-        );
-        assert!(outcome("echo $ATOMGIT_TOKEN").await.is_deny());
+    async fn rejects_atomgit_credentials_in_shell_arguments() {
+        let atomgit = outcome("echo $ATOMGIT_TOKEN").await;
+        assert!(matches!(atomgit, BeforeOutcome::DenyTurn { .. }));
+        assert!(atomgit
+            .deny_reason()
+            .is_some_and(|reason| reason.contains("atomgit_repo")));
         assert_eq!(
             outcome("rg ATOMGIT_TOKEN crates/").await,
             BeforeOutcome::Proceed

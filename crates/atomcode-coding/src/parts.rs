@@ -1376,6 +1376,13 @@ pub fn assemble(
         // that keeps a user's external-model 429 from being mislabelled as a CodingPlan quota;
         // a prepare-frozen base_url would defeat it after a model switch.
         .hook(rate_limit_hook)
+        // Credentials are a product-wide security boundary, independent of whether
+        // the optional AtomGit integration is compiled in. It must run before the
+        // approval-oriented SensitivePathGate so an explicit extraction cannot be
+        // downgraded from terminal denial into a retryable approval denial.
+        .middleware(Arc::new(
+            atomcode_capabilities::tools::CredentialBashGate::new(),
+        ))
         // Sensitive-path read gate: read tools are Safe (skip approval), so without this an
         // agent could silently read ~/.ssh / .env / creds and leak them to the provider.
         // Acts ONLY on Safe tools touching a sensitive path → one approval round-trip.
