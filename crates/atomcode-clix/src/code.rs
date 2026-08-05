@@ -182,6 +182,10 @@ pub async fn code(args: CodeArgs) -> Result<()> {
         // The `code` agent can also review the current changes in-session (the dedicated
         // `atomcodex review` subcommand still exists for headless/CI one-shots).
         review: true,
+        // atomcodex has no typed request/response protocol to carry a structured
+        // prompt back to the user, so mounting `request_user_input` would advertise
+        // a tool it could only ever answer with `Null`.
+        request_user_input: false,
         // clix is intentionally core/bridge-free; external endpoints keep generic 429 handling.
         rate_limit_source: None,
     };
