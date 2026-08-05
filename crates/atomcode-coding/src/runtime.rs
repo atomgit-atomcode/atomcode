@@ -2999,6 +2999,26 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
+                        // If a goal is paused at its round cap, resume it so the
+                        // user's new message advances the goal into the next budget
+                        // window.  Satisfied / Pursuing / Ended goals are untouched.
+                        if let Some(state) = goal.as_mut() {
+                            if matches!(state.phase, GoalPhase::PausedAtCap) {
+                                let cap = resolve_goal_round_cap(
+                                    resources
+                                        .as_ref()
+                                        .and_then(|r| r.parts.rate_limit_source()),
+                                    resources
+                                        .as_ref()
+                                        .map(|r| r.config.goal_max_rounds)
+                                        .unwrap_or(300),
+                                )
+                                .await;
+                                state.resume(cap);
+                                let _ = runtime_event_tx
+                                    .send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                            }
+                        }
                         if let Some(task) = next_prompt_task.take() {
                             task.abort();
                         }
@@ -12957,6 +12977,238 @@ mod tests {
             progress.terminal,
             Some(GoalTerminal::Stopped),
             "goal terminal must be Stopped after round cap"
+        );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    // When the goal is PausedAtCap and the user submits, the runtime must:
+    // 1. Emit GoalChanged with phase==Pursuing (round reset to 0)
+    // 2. Deliver the submitted input as the normal user message (SendMessage)
+    #[tokio::test]
+    async fn submit_while_paused_at_cap_resumes_goal_and_delivers_message() {
+        let mut config = native_start(false).agent;
+        config.goal_max_rounds = 1;
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime_with_config(
+            Arc::new(GoalNotMetProviderFactory::default()),
+            config,
+        )
+        .await;
+
+        // --- Drive the goal to PausedAtCap ---
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await; // GoalChanged(active=true)
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        let _ = kernel_commands.recv().await; // SendMessage
+
+        for attempt in 0..2 {
+            kernel_events
+                .send(AgentEvent::TurnComplete {
+                    reason: StopReason::Stopped,
+                })
+                .unwrap();
+            assert!(matches!(
+                kernel_commands.recv().await,
+                Some(AgentCommand::Snapshot)
+            ));
+            kernel_events
+                .send(AgentEvent::Snapshot {
+                    snapshot: SessionSnapshot::new(vec![Message::assistant("not done", vec![])]),
+                })
+                .unwrap();
+            if attempt == 0 {
+                // First round: evaluator says NotMet → continuation dispatched.
+                assert!(matches!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        kernel_commands.recv()
+                    )
+                    .await
+                    .expect("first goal continuation was not dispatched"),
+                    Some(AgentCommand::SendSyntheticMessage { .. })
+                ));
+            }
+        }
+
+        // Wait until we see TurnFinished (goal capped) - drain GoalChanged events.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::TurnFinished(_)) => break,
+                    Some(_) => {}
+                    None => panic!("events closed before cap terminal"),
+                }
+            }
+        })
+        .await
+        .expect("cap turn did not finish");
+
+        // --- Goal is now PausedAtCap; submit new message ---
+        let submit_text = "please continue";
+        handle
+            .submit(UserInput::from(submit_text))
+            .await
+            .unwrap();
+
+        // Collect events until we see SendMessage or timeout.
+        let mut saw_goal_changed_pursuing = false;
+        let mut saw_send_message_with_input = false;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    event = runtime_events.recv() => {
+                        match event {
+                            Some(CodingRuntimeEvent::GoalChanged(p)) => {
+                                if p.phase == GoalPhase::Pursuing && p.round == 0 {
+                                    saw_goal_changed_pursuing = true;
+                                }
+                            }
+                            Some(_) => {}
+                            None => break,
+                        }
+                    }
+                    cmd = kernel_commands.recv() => {
+                        match cmd {
+                            Some(AgentCommand::SendMessage { text, .. }) => {
+                                if text == submit_text {
+                                    saw_send_message_with_input = true;
+                                }
+                                break;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("submit after PausedAtCap did not deliver message within timeout");
+
+        assert!(
+            saw_goal_changed_pursuing,
+            "submit while PausedAtCap must emit GoalChanged(phase=Pursuing, round=0)"
+        );
+        assert!(
+            saw_send_message_with_input,
+            "submit while PausedAtCap must deliver the input as a user message"
+        );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    // When the goal is Satisfied and the user submits, the runtime must:
+    // 1. Deliver the input as a normal user message (SendMessage)
+    // 2. NOT emit any GoalChanged(phase==Pursuing) event (goal untouched)
+    #[tokio::test]
+    async fn submit_while_satisfied_delivers_message_without_resuming_goal() {
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(GoalMetProviderFactory)).await;
+
+        // --- Drive the goal to Satisfied ---
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await; // GoalChanged(active=true)
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("done", vec![])]),
+            })
+            .unwrap();
+
+        // Wait until TurnFinished (goal Met/Satisfied).
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::TurnFinished(_)) => break,
+                    Some(_) => {}
+                    None => panic!("events closed before met terminal"),
+                }
+            }
+        })
+        .await
+        .expect("satisfied turn did not finish");
+
+        // --- Goal is now Satisfied; submit new message ---
+        let submit_text = "follow-up question";
+        handle
+            .submit(UserInput::from(submit_text))
+            .await
+            .unwrap();
+
+        // Collect until SendMessage; assert no GoalChanged(Pursuing) seen.
+        let mut saw_goal_changed_pursuing = false;
+        let mut saw_send_message_with_input = false;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    event = runtime_events.recv() => {
+                        match event {
+                            Some(CodingRuntimeEvent::GoalChanged(p)) => {
+                                if p.phase == GoalPhase::Pursuing {
+                                    saw_goal_changed_pursuing = true;
+                                }
+                            }
+                            Some(_) => {}
+                            None => break,
+                        }
+                    }
+                    cmd = kernel_commands.recv() => {
+                        match cmd {
+                            Some(AgentCommand::SendMessage { text, .. }) => {
+                                if text == submit_text {
+                                    saw_send_message_with_input = true;
+                                }
+                                break;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("submit after Satisfied did not deliver message within timeout");
+
+        assert!(
+            saw_send_message_with_input,
+            "submit while Satisfied must deliver input as a normal user message"
+        );
+        assert!(
+            !saw_goal_changed_pursuing,
+            "submit while Satisfied must NOT resume the goal (no GoalChanged Pursuing)"
         );
 
         handle.shutdown().await.unwrap();
