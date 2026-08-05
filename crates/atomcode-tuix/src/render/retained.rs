@@ -34,6 +34,7 @@ use super::{
 use crate::i18n::{t, Msg};
 use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
+use atomcode_coding;
 use crossterm::style::Color;
 
 const PAD_COL: usize = 2;
@@ -162,6 +163,62 @@ fn format_goal_row(
 ) -> String {
     let (marker, cond, meta) = goal_row_parts(condition, round, elapsed_secs, max_cols, unicode);
     format!("{marker}{cond}{meta}")
+}
+
+/// Phase-aware version of `goal_row_parts`: returns `(marker, body, meta)` for
+/// the three badge states (Pursuing / PausedAtCap / Satisfied). The caller
+/// styles each segment independently; joining them reproduces the full row text.
+///
+/// - **Pursuing**: delegates to `goal_row_parts` (condition + round + elapsed).
+/// - **PausedAtCap**: `⏸ goal 暂停 · 已达 {round} 轮 · 继续对话即推进`.
+/// - **Satisfied**: `✓ goal 已达成 · /goal clear 结束`.
+fn goal_row_parts_phase(
+    condition: &str,
+    round: u32,
+    elapsed_secs: u64,
+    max_cols: usize,
+    unicode: bool,
+    phase: atomcode_coding::GoalPhase,
+) -> (&'static str, String, String) {
+    match phase {
+        atomcode_coding::GoalPhase::Pursuing => {
+            goal_row_parts(condition, round, elapsed_secs, max_cols, unicode)
+        }
+        atomcode_coding::GoalPhase::PausedAtCap => {
+            let marker = if unicode { "⏸ " } else { "* " };
+            // Fixed text — no truncation needed for typical terminal widths.
+            let body = "goal 暂停".to_string();
+            let meta = format!(" · 已达 {round} 轮 · 继续对话即推进");
+            (marker, body, meta)
+        }
+        atomcode_coding::GoalPhase::Satisfied => {
+            let marker = if unicode { "✓ " } else { "* " };
+            let body = "goal 已达成".to_string();
+            let meta = " · /goal clear 结束".to_string();
+            (marker, body, meta)
+        }
+        atomcode_coding::GoalPhase::Ended => {
+            // Ended rows are never constructed (goal_condition is cleared first),
+            // but fall back to Pursuing display defensively.
+            goal_row_parts(condition, round, elapsed_secs, max_cols, unicode)
+        }
+    }
+}
+
+/// Phase-aware full goal-row text. Thin wrapper over [`goal_row_parts_phase`]
+/// for tests; the renderer uses `goal_row_parts_phase` directly for styling.
+#[cfg(test)]
+fn format_goal_row_phase(
+    condition: &str,
+    round: u32,
+    elapsed_secs: u64,
+    max_cols: usize,
+    unicode: bool,
+    phase: atomcode_coding::GoalPhase,
+) -> String {
+    let (marker, body, meta) =
+        goal_row_parts_phase(condition, round, elapsed_secs, max_cols, unicode, phase);
+    format!("{marker}{body}{meta}")
 }
 
 /// Loop marker: `⚡` (Lightning, U+26A1, Miscellaneous Symbols) when unicode is
@@ -2546,18 +2603,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
         row
     }
 
-    /// Build the dedicated goal row (one full-width line, shown only while a
-    /// `/goal` loop is active). Sits directly above the status line: the `◎`
-    /// marker, the condition, and the ` · round N · elapsed` meta.
+    /// Build the dedicated goal row (one full-width line, shown while a `/goal`
+    /// is Pursuing, PausedAtCap, or Satisfied). Three badge states drive the
+    /// marker and text via `goal_row_parts_phase`.
     fn build_goal_row(&self, goal: &crate::render::GoalStatus, rule_width: usize) -> Vec<Cell> {
-        let (marker, condition, meta) = goal_row_parts(
+        let (marker, body, meta) = goal_row_parts_phase(
             &scrub_controls(&goal.condition),
             goal.round,
             goal.elapsed_secs,
             rule_width.max(1),
             self.caps.unicode_symbols,
+            goal.phase,
         );
-        self.build_marker_row(marker, &condition, &meta)
+        self.build_marker_row(marker, &body, &meta)
     }
 
     /// Build the dedicated loop row (one full-width line, shown only while a
@@ -8736,6 +8794,56 @@ mod tests {
             row.contains("round 2"),
             "round survives even when condition dropped: {row}"
         );
+    }
+
+    #[test]
+    fn goal_row_pursuing_shows_condition_and_round_non_empty() {
+        // Pursuing phase: same as existing behaviour — condition + round + elapsed.
+        let row = format_goal_row_phase(
+            "fix all tests",
+            3,
+            30,
+            80,
+            true,
+            atomcode_coding::GoalPhase::Pursuing,
+        );
+        assert!(!row.is_empty(), "pursuing row must be non-empty: {row}");
+        assert!(row.contains("fix all tests"), "condition present: {row}");
+        assert!(row.contains("round 3"), "round present: {row}");
+    }
+
+    #[test]
+    fn goal_row_paused_at_cap_shows_pause_text_non_empty() {
+        // PausedAtCap phase: shows 暂停 and 继续对话即推进.
+        let row = format_goal_row_phase(
+            "fix all tests",
+            5,
+            60,
+            80,
+            true,
+            atomcode_coding::GoalPhase::PausedAtCap,
+        );
+        assert!(!row.is_empty(), "paused row must be non-empty: {row}");
+        assert!(row.contains("暂停"), "pause text present: {row}");
+        assert!(
+            row.contains("继续对话即推进"),
+            "resume hint present: {row}"
+        );
+    }
+
+    #[test]
+    fn goal_row_satisfied_shows_achieved_text_non_empty() {
+        // Satisfied phase: shows 已达成.
+        let row = format_goal_row_phase(
+            "fix all tests",
+            7,
+            120,
+            80,
+            true,
+            atomcode_coding::GoalPhase::Satisfied,
+        );
+        assert!(!row.is_empty(), "satisfied row must be non-empty: {row}");
+        assert!(row.contains("已达成"), "achieved text present: {row}");
     }
 
     #[test]
@@ -15540,6 +15648,7 @@ mod tests {
             condition: "finish the audit".into(),
             round: 2,
             elapsed_secs: 12,
+            phase: atomcode_coding::GoalPhase::Pursuing,
         });
         status.subtasks = Some(SubtaskProgress {
             call_id: "call-task".into(),
@@ -15618,6 +15727,7 @@ mod tests {
             condition: "finish".into(),
             round: 1,
             elapsed_secs: 1,
+            phase: atomcode_coding::GoalPhase::Pursuing,
         });
         status.subtasks = Some(SubtaskProgress {
             call_id: "call-task".into(),

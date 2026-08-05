@@ -1142,6 +1142,9 @@ pub struct UiState {
     pub goal_round: u32,
     /// When the goal was started, for elapsed-time display.
     pub goal_started_at: Option<std::time::Instant>,
+    /// Current phase of the goal loop — Pursuing / PausedAtCap / Satisfied.
+    /// Ended is not stored: the goal row is hidden by clearing `goal_condition`.
+    pub goal_phase: atomcode_coding::GoalPhase,
     /// Active loop label (prompt text), if a `/loop` is running.
     pub loop_label: Option<String>,
     /// Current round number of the running loop.
@@ -1308,6 +1311,7 @@ impl UiState {
             goal_condition: None,
             goal_round: 0,
             goal_started_at: None,
+            goal_phase: atomcode_coding::GoalPhase::Pursuing,
             loop_label: None,
             loop_round: 0,
             loop_started_at: None,

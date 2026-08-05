@@ -137,6 +137,7 @@ pub enum UiEvent {
     GoalUpdate {
         active: bool,
         terminal: Option<atomcode_coding::GoalTerminal>,
+        phase: atomcode_coding::GoalPhase,
         round: u32,
         elapsed_secs: u64,
         condition: String,

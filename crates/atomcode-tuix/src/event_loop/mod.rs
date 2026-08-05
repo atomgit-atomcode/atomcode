@@ -18122,6 +18122,7 @@ fn handle_runtime_event(
                         AgentEvent::GoalUpdate {
                             active: progress.active,
                             terminal: progress.terminal,
+                            phase: progress.phase,
                             round: progress.round,
                             elapsed_secs: progress.elapsed_secs,
                             condition: progress.condition,
@@ -21044,49 +21045,78 @@ fn handle_agent_event(
         AgentEvent::GoalUpdate {
             active,
             terminal,
+            phase,
             round,
             condition,
             last_reason,
             ..
         } => {
             if active {
+                // Pursuing: update live badge state.
                 state.goal_condition = Some(condition);
                 state.goal_round = round;
+                state.goal_phase = atomcode_coding::GoalPhase::Pursuing;
                 if state.goal_started_at.is_none() {
                     state.goal_started_at = Some(std::time::Instant::now());
                 }
             } else {
-                // Goal ended. Render order: banner (CommandOutput, bypasses
-                // markdown) ABOVE a stats-only separator. The user wanted
-                // the verdict to read top-down: assistant output → ✓ Goal
-                // met → quiet horizontal line with timing. The earlier
-                // TurnComplete buffered its stats into `pending_separator`
-                // precisely so we could re-render them in this stripped
-                // form here.
-                if state.goal_condition.is_some() {
-                    if let Some(reason) = last_reason.as_deref() {
-                        let banner = if terminal == Some(atomcode_coding::GoalTerminal::Cancelled) {
-                            // Cancel already gets its own UiLine via
-                            // TurnCancelled — skip to avoid double banner.
-                            None
-                        } else if goal_terminal_is_met(terminal) {
-                            Some(format!("  ✓ Goal met: {reason}\n"))
-                        } else {
-                            Some(format!("  ⚠ Goal stopped: {reason}\n"))
-                        };
-                        if let Some(line) = banner {
-                            renderer.render(UiLine::CommandOutput(line));
+                match phase {
+                    atomcode_coding::GoalPhase::Satisfied => {
+                        // Goal met: render the banner once, but KEEP the badge
+                        // visible so the user sees it was achieved.
+                        if state.goal_condition.is_some() {
+                            if let Some(reason) = last_reason.as_deref() {
+                                renderer.render(UiLine::CommandOutput(format!(
+                                    "  ✓ Goal met: {reason}\n"
+                                )));
+                                renderer.flush();
+                            }
+                        }
+                        state.goal_phase = atomcode_coding::GoalPhase::Satisfied;
+                        flush_pending_separator(state, renderer, /* as_goal_end */ true);
+                    }
+                    atomcode_coding::GoalPhase::PausedAtCap => {
+                        // Round cap reached: render a paused note once, but
+                        // KEEP the badge — it will resume on the next Submit.
+                        if state.goal_condition.is_some() {
+                            renderer.render(UiLine::CommandOutput(
+                                "  ⏸ Goal 已达轮次上限，继续对话即推进\n".to_string(),
+                            ));
                             renderer.flush();
                         }
+                        state.goal_phase = atomcode_coding::GoalPhase::PausedAtCap;
+                        flush_pending_separator(state, renderer, /* as_goal_end */ true);
+                    }
+                    _ => {
+                        // Ended (cancel / fail / clear / supersede): render a
+                        // verdict banner (if applicable) then tear down the badge.
+                        // Render order: banner ABOVE the stats separator so the
+                        // user reads top-down: assistant output → verdict → ─── line.
+                        if state.goal_condition.is_some() {
+                            if let Some(reason) = last_reason.as_deref() {
+                                let banner =
+                                    if terminal == Some(atomcode_coding::GoalTerminal::Cancelled) {
+                                        // Cancel already gets its own UiLine via
+                                        // TurnCancelled — skip to avoid double banner.
+                                        None
+                                    } else if goal_terminal_is_met(terminal) {
+                                        Some(format!("  ✓ Goal met: {reason}\n"))
+                                    } else {
+                                        Some(format!("  ⚠ Goal stopped: {reason}\n"))
+                                    };
+                                if let Some(line) = banner {
+                                    renderer.render(UiLine::CommandOutput(line));
+                                    renderer.flush();
+                                }
+                            }
+                        }
+                        state.goal_condition = None;
+                        state.goal_round = 0;
+                        state.goal_started_at = None;
+                        state.goal_phase = atomcode_coding::GoalPhase::Pursuing;
+                        flush_pending_separator(state, renderer, /* as_goal_end */ true);
                     }
                 }
-                state.goal_condition = None;
-                state.goal_round = 0;
-                state.goal_started_at = None;
-                // Now flush the buffered separator as a stats-only line —
-                // the verdict above already conveys what happened, the
-                // separator just visually closes the turn.
-                flush_pending_separator(state, renderer, /* as_goal_end */ true);
             }
         }
         AgentEvent::LoopUpdate {
@@ -22196,6 +22226,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
                 .goal_started_at
                 .map(|t| t.elapsed().as_secs())
                 .unwrap_or(0),
+            phase: state.goal_phase,
         });
     // Active /loop → the dedicated footer loop row. Mirrors GoalStatus exactly,
     // using the loop label as the condition equivalent. Goal takes priority if

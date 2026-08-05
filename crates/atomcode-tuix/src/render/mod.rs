@@ -818,6 +818,12 @@ pub struct GoalStatus {
     pub round: u32,
     /// Wall-clock seconds since the goal was set.
     pub elapsed_secs: u64,
+    /// Current phase of the goal (Pursuing / PausedAtCap / Satisfied / Ended).
+    /// Drives badge rendering: Pursuing → live progress; PausedAtCap → paused
+    /// badge with resume hint; Satisfied → achieved badge. Ended is never stored
+    /// (the goal row is hidden by clearing `goal_condition` before this is
+    /// constructed).
+    pub phase: atomcode_coding::GoalPhase,
 }
 
 /// Live status of an active `/loop`, rendered on the dedicated footer loop row.
