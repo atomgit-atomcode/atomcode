@@ -57,6 +57,13 @@ rustls = { version = "0.23", default-features = false, features = ["std"], optio
 # RFC 7231 HTTP-date parsing for `Retry-After` headers that use the date form (e.g. some
 # Anthropic 429s) instead of delta-seconds. Already in the tree via reqwest. provider-only.
 httpdate = { version = "1", optional = true }
+# Precisely identify hyper's `IncompleteMessage` (the server closed the connection
+# before the response message completed). That error does NOT wrap an io::Error, so
+# `chain_has_transient_io` cannot see it — it surfaced as a hard-failed
+# `open failed: … connection closed before message completed` with ZERO retries.
+# Already in-tree (transitive via reqwest); promoted to a direct dependency only so
+# we can downcast to it. provider-only.
+hyper = { version = "1", optional = true }
 getrandom = { version = "0.2", optional = true }
 tracing = { version = "0.1", optional = true }
 bytes = { version = "1", optional = true }
@@ -136,7 +143,7 @@ tar = { version = "0.4", optional = true }
 default = ["provider", "tools"]
 # Real LlmProvider adapters (OpenAI-compatible: GLM / DeepSeek / …). `dirs` resolves the
 # wire-dump output dir (config_dir()/wire-dump) for the byte-level ATOMCODE_WIRE_DUMP.
-provider = ["dep:reqwest", "dep:rustls-native-certs", "dep:rustls", "dep:bytes", "dep:async-stream", "dep:dirs", "dep:httpdate", "dep:atomcode-auth", "dep:atomcode-config", "dep:getrandom", "dep:tracing", "dep:fs2"]
+provider = ["dep:reqwest", "dep:rustls-native-certs", "dep:rustls", "dep:bytes", "dep:async-stream", "dep:dirs", "dep:httpdate", "dep:atomcode-auth", "dep:atomcode-config", "dep:getrandom", "dep:tracing", "dep:fs2", "dep:hyper"]
 # Real neutral coding Tools (fs read/write/edit/list + bash + grep/glob) + a generic
 # approval middleware. Pulls fs/process/io tokio features + the search stack.
 tools = ["dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs", "dep:chardetng", "dep:tokio-util", "dep:similar", "dep:tree-sitter", "dep:tree-sitter-bash", "dep:sha2", "tokio/fs", "tokio/process", "tokio/io-util"]

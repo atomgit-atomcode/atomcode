@@ -54,6 +54,14 @@ pub struct OpenAiCompatConfig {
     /// Per-chunk stream-idle watchdog: no bytes for this long ⇒ terminal error.
     pub idle_timeout: Duration,
     pub connect_timeout: Duration,
+    /// Per-ATTEMPT first-byte (TTFB) watchdog for the OPEN call. A gateway that
+    /// accepts the connection but never responds would otherwise hang FOREVER —
+    /// no overall request timeout is set here (deliberately: a streaming response
+    /// must not be capped). Applied to EACH attempt, not to the retry loop as a
+    /// whole, so a slow-but-alive gateway still gets the full budget. `send()`
+    /// resolves once the response HEAD arrives, so this never truncates a slow body.
+    /// A timeout is classified retryable.
+    pub open_timeout: Duration,
     /// Retry policy for the OPEN call only (mid-stream errors are never retried).
     pub retry: RetryPolicy,
     /// Optional per-request auth seam. `None` (default) ⇒ plain
@@ -126,6 +134,7 @@ impl OpenAiCompatConfig {
             thinking_type: None,
             thinking_keep: None,
             idle_timeout: Duration::from_secs(120),
+            open_timeout: Duration::from_secs(90),
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
             request_signer: None,
@@ -463,6 +472,7 @@ impl LlmProvider for OpenAiCompatProvider {
         // the initial open and any mid-stream reopen.
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
+        let open_timeout = self.cfg.open_timeout;
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
         let resp = match open_stream(
             &client,
@@ -473,6 +483,7 @@ impl LlmProvider for OpenAiCompatProvider {
             &session_id,
             &policy,
             rate_limit_retry_owner,
+            open_timeout,
         )
         .await
         {
@@ -558,7 +569,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                 // poison the pool this way; a logical/decode failure isn't cured by a
                                 // new pool. (The reopened `open_stream` additionally escalates to
                                 // managed TLS-1.2 on its first OPEN-path corruption.)
-                                if retry::chain_has_transient_io(&e)
+                                if retry::is_stale_connection_error(&e)
                                     || retry::chain_has_tls_corruption(&e)
                                 {
                                     if let Err(rebuild_error) = client.rebuild(
@@ -569,7 +580,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                     }
                                 }
                                 if let Ok(fresh) =
-                                    open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy, rate_limit_retry_owner).await
+                                    open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy, rate_limit_retry_owner, open_timeout).await
                                 {
                                     stream_attempt += 1;
                                     resp = fresh;
@@ -650,6 +661,7 @@ async fn open_stream(
     session_id: &str,
     policy: &RetryPolicy,
     rate_limit_retry_owner: atomcode_kernel::provider::RateLimitRetryOwner,
+    open_timeout: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
     let mut tls12_probe = false;
@@ -687,7 +699,30 @@ async fn open_stream(
             req = req.header("x-atomcode-session-id", session_id);
         }
         let was_capped = tls12_probe || atomcode_config::tls::should_cap_url(url);
-        match req.send().await {
+        // TTFB watchdog for THIS attempt. `send()` resolves as soon as the response
+        // HEAD arrives, so wrapping it never truncates a slow streaming body — it only
+        // bounds the wait for a gateway that accepted the connection then went silent.
+        let sent = match tokio::time::timeout(open_timeout, req.send()).await {
+            Ok(r) => r,
+            Err(_elapsed) => {
+                // A TTFB timeout is the same class as a transient transport failure:
+                // spend one attempt and retry.
+                if attempt < policy.max_attempts {
+                    tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(ProviderError {
+                    retryable: true,
+                    message: format!(
+                        "open failed: 等待首字节超过 {}s(网关无响应)",
+                        open_timeout.as_secs()
+                    ),
+                    ..Default::default()
+                });
+            }
+        };
+        match sent {
             Ok(resp) => {
                 if tls12_probe {
                     atomcode_config::tls::latch_managed_tls12();
@@ -795,14 +830,15 @@ async fn open_stream(
                     tokio::time::sleep(wait).await;
                     // Rebuild the client for the classes a fresh pool actually
                     // cures: the half-open-reuse class (a stale pooled socket
-                    // surfaces as ConnectionReset/EOF/TimedOut) and TLS record
+                    // surfaces as ConnectionReset/EOF/TimedOut in the chain, or as
+                    // hyper's IncompleteMessage with no io cause) and TLS record
                     // corruption (a desynced/mangled pooled TLS session). A plain
                     // connect-refused / DNS / slow-gateway retry is NOT fixed by a
                     // new pool, so rebuilding there would only churn a healthy pool
                     // (extra TLS handshakes) and re-read proxy env on every attempt.
                     // Safe on the OPEN path: no bytes consumed; a rebuild failure
                     // keeps the old client and is returned explicitly.
-                    if try_tls12 || retry::chain_has_transient_io(&e) || tls_corruption {
+                    if try_tls12 || retry::is_stale_connection_error(&e) || tls_corruption {
                         // `capped` = is the REBUILT client at a TLS-1.2 ceiling.
                         // Carry it into `tls12_probe` (not bare `try_tls12`) so the
                         // flag stays sticky while the client remains capped: if a
