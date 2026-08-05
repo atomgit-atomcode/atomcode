@@ -500,11 +500,45 @@ fn default_stream_timeout() -> Duration {
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(300))
 }
-fn default_goal_max_rounds() -> u32 {
+/// Share of the CodingPlan 5h rolling `call_limit` a single `/goal` may consume
+/// (percent). A goal that eats more than this starves the user's interactive work
+/// and other controllers within the same rolling window.
+const GOAL_ROUND_SHARE_PERCENT: i64 = 30;
+/// Floor so a micro plan still yields a usable goal budget.
+const GOAL_ROUND_FLOOR: u32 = 50;
+/// Fallback when there is no CodingPlan `call_limit` to derive from
+/// (non-CodingPlan provider, offline, pre-login) and no explicit env override.
+const GOAL_ROUND_FALLBACK: u32 = 300;
+
+/// Explicit `ATOMCODE_GOAL_MAX_ROUNDS` override, if set and parseable.
+pub fn goal_max_rounds_env() -> Option<u32> {
     std::env::var("ATOMCODE_GOAL_MAX_ROUNDS")
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(200)
+}
+
+/// Resolve the `/goal` round cap. Precedence: explicit env override → a share of
+/// the CodingPlan binding-window `call_limit` (Pro 1000 → 300, Lite 800 → 240) →
+/// a flat fallback. Pure so the host can call it once `call_limit` is known
+/// without threading config plumbing.
+pub fn derive_goal_max_rounds(env_override: Option<u32>, call_limit: Option<i64>) -> u32 {
+    if let Some(explicit) = env_override {
+        return explicit;
+    }
+    match call_limit {
+        Some(limit) if limit > 0 => {
+            u32::try_from(limit * GOAL_ROUND_SHARE_PERCENT / 100)
+                .unwrap_or(GOAL_ROUND_FALLBACK)
+                .max(GOAL_ROUND_FLOOR)
+        }
+        _ => GOAL_ROUND_FALLBACK,
+    }
+}
+
+fn default_goal_max_rounds() -> u32 {
+    // Construction happens before CodingPlan `call_limit` is known; the host
+    // re-derives with the real limit after login via `derive_goal_max_rounds`.
+    derive_goal_max_rounds(goal_max_rounds_env(), None)
 }
 fn default_turn_max_rounds() -> u32 {
     std::env::var("ATOMCODE_TURN_MAX_ROUNDS")
@@ -547,10 +581,15 @@ fn resolve_tool_loop_policy(
     )
 }
 fn default_goal_max_duration_secs() -> u64 {
+    // Wall-clock is a poor bound for an autonomous goal: it kills slow-but-productive
+    // work and lets fast runaways burn a full window well inside the limit, and it is
+    // only checked between rounds so a single long round sails past it. Default OFF
+    // (0 = disabled); the goal is bounded by the round cap + evaluator. Re-enable
+    // explicitly via ATOMCODE_GOAL_MAX_DURATION_SECS if a hard time cap is ever wanted.
     std::env::var("ATOMCODE_GOAL_MAX_DURATION_SECS")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(7200)
+        .unwrap_or(0)
 }
 fn default_loop_max_rounds() -> u32 {
     resolve_loop_max_rounds(
@@ -637,8 +676,41 @@ mod tests {
     fn round_caps_have_generous_defaults() {
         let c = CodingAgentConfig::new("k", "https://x/v1", "m", "/tmp");
         assert_eq!(c.max_rounds, 200);
-        assert_eq!(c.goal_max_rounds, 200);
-        assert_eq!(c.goal_max_duration_secs, 7200);
+        // No CodingPlan info at construction → the non-CodingPlan fallback.
+        assert_eq!(c.goal_max_rounds, 300);
+        // The wall-clock cap is OFF by default (0 = disabled); the goal is bounded
+        // by the round cap + evaluator instead. Re-enable via env if ever needed.
+        assert_eq!(c.goal_max_duration_secs, 0);
+    }
+
+    #[test]
+    fn derive_goal_rounds_scales_with_plan_call_limit() {
+        // 30% of the binding 5h window's call_limit. Pro=1000 → 300, Lite=800 → 240.
+        assert_eq!(derive_goal_max_rounds(None, Some(1000)), 300);
+        assert_eq!(derive_goal_max_rounds(None, Some(800)), 240);
+    }
+
+    #[test]
+    fn derive_goal_rounds_env_override_wins_over_plan() {
+        // An explicit ATOMCODE_GOAL_MAX_ROUNDS is the user's word — it beats the
+        // plan-derived value regardless of call_limit.
+        assert_eq!(derive_goal_max_rounds(Some(150), Some(1000)), 150);
+        assert_eq!(derive_goal_max_rounds(Some(1), None), 1);
+    }
+
+    #[test]
+    fn derive_goal_rounds_falls_back_without_plan() {
+        // Non-CodingPlan / offline / unknown call_limit → flat fallback, never a
+        // hardcoded 200 tied to one plan tier.
+        assert_eq!(derive_goal_max_rounds(None, None), 300);
+        assert_eq!(derive_goal_max_rounds(None, Some(0)), 300);
+        assert_eq!(derive_goal_max_rounds(None, Some(-5)), 300);
+    }
+
+    #[test]
+    fn derive_goal_rounds_floors_tiny_plans() {
+        // A micro window (30% = 30) must still leave a usable goal budget.
+        assert_eq!(derive_goal_max_rounds(None, Some(100)), 50);
     }
 
     #[test]

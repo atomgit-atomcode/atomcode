@@ -151,6 +151,24 @@ impl GoalState {
     }
 }
 
+/// Human-facing note when a goal stops on a hard budget cap (round cap, or the
+/// optional env-enabled time cap) rather than the evaluator judging the work
+/// unfinished. Deliberately does NOT say "goal not met": a cap can fire on
+/// already-complete work, so the note names the exhausted budget and tells the
+/// user how to continue instead of implying failure.
+pub fn goal_cap_stop_note(why: &str, max_rounds: Option<u32>) -> String {
+    // No leading subject word: this composes under a "Goal stopped: " progress
+    // prefix and also reads standalone when the call site adds its own "goal ".
+    match why {
+        "round limit" => match max_rounds {
+            Some(max) => format!("已达轮数预算（{max} 轮）· 运行 /goal 继续"),
+            None => "已达轮数预算 · 运行 /goal 继续".to_string(),
+        },
+        "time limit" => "已达时间上限 · 运行 /goal 继续".to_string(),
+        other => format!("已停止（{other}）· 运行 /goal 继续"),
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct LoopState {
     pub id: u64,
@@ -549,6 +567,27 @@ mod tests {
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].max_tokens, None);
         assert_eq!(recorded[0].tool_choice, ToolChoice::None);
+    }
+
+    #[test]
+    fn cap_stop_note_names_the_budget_without_claiming_failure() {
+        // Hitting the round cap is "ran out of budget", NOT "the evaluator judged
+        // the work unfinished" — the note must never say "not met", and it must
+        // tell the user how to continue.
+        let note = goal_cap_stop_note("round limit", Some(300));
+        assert!(note.contains("300"), "should name the round budget: {note}");
+        assert!(!note.contains("not met"), "must not claim failure: {note}");
+        assert!(!note.to_lowercase().contains("未达"), "must not claim failure: {note}");
+        assert!(note.contains("/goal"), "should tell the user how to continue: {note}");
+    }
+
+    #[test]
+    fn cap_stop_note_handles_time_cap_and_unbounded_rounds() {
+        // The optional time cap (env-enabled) and a round cap with no configured
+        // max still produce a continue-able, non-failure note.
+        assert!(goal_cap_stop_note("time limit", None).contains("/goal"));
+        assert!(!goal_cap_stop_note("time limit", None).contains("not met"));
+        assert!(goal_cap_stop_note("round limit", None).contains("/goal"));
     }
 
     #[test]

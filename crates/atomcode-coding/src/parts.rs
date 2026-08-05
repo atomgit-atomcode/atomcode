@@ -802,6 +802,12 @@ fn session_lease(
 }
 
 impl CodingParts {
+    /// The host-owned CodingPlan quota source, if any. Used at `/goal` start to
+    /// size the round budget from the live request quota.
+    pub(crate) fn rate_limit_source(&self) -> Option<&Arc<dyn RateLimitWindowSource>> {
+        self.rate_limit_source.as_ref()
+    }
+
     pub(crate) fn take_snapshot_persistence_uncertain(&self) -> Option<String> {
         self.snapshot_persistence_status
             .as_ref()

@@ -29,8 +29,8 @@ use atomcode_kernel::provider::LlmProvider;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::controllers::{
-    evaluate_goal, goal_continuation_message, summarize_for_goal, EvalOutcome, GoalProgress,
-    GoalResult, GoalState, GoalTerminal, LoopProgress, LoopState, ScheduleWakeupTool,
+    evaluate_goal, goal_cap_stop_note, goal_continuation_message, summarize_for_goal, EvalOutcome,
+    GoalProgress, GoalResult, GoalState, GoalTerminal, LoopProgress, LoopState, ScheduleWakeupTool,
     WakeupRequest, MAX_UNPRODUCTIVE,
 };
 use crate::parts::prepare_with_plugin_hook_source_reusing_lease;
@@ -4711,10 +4711,18 @@ fn spawn_runtime_owner_with_optional_agent(
                         );
                         if let Some(runtime) = resources.as_ref() {
                             next_controller_id = next_controller_id.wrapping_add(1);
+                            // Size the round budget from the account's live request quota so it
+                            // scales per plan (Pro 1000 → 300, Lite 800 → 240) instead of a
+                            // hardcoded number; env override wins, any miss falls back cleanly.
+                            let max_rounds = resolve_goal_round_cap(
+                                runtime.parts.rate_limit_source(),
+                                runtime.config.goal_max_rounds,
+                            )
+                            .await;
                             let next = GoalState::new(
                                 next_controller_id,
                                 condition,
-                                runtime.config.goal_max_rounds,
+                                max_rounds,
                                 runtime.config.goal_max_duration_secs,
                             );
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(next.progress()));
@@ -5289,17 +5297,19 @@ fn spawn_runtime_owner_with_optional_agent(
                                             StopReason::Timeout | StopReason::ProviderError
                                         );
                                         if let Some(why) = stop_reason {
-                                            state.finish(
-                                                GoalTerminal::Stopped,
-                                                format!("stopped: {why}"),
-                                            );
+                                            // A cap fired (round budget, or the optional time cap).
+                                            // This is "ran out of budget", NOT "the evaluator judged
+                                            // the work unfinished" — the note names the budget and
+                                            // how to continue, and never claims "goal not met".
+                                            let note = goal_cap_stop_note(why, state.max_rounds);
+                                            state.finish(GoalTerminal::Stopped, note.clone());
                                             completion_reason = match why {
                                                 "round limit" => StopReason::MaxRounds,
                                                 "time limit" => StopReason::Timeout,
                                                 _ => StopReason::ProviderError,
                                             };
                                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
-                                            let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!("goal stopped: {why} — goal not met; run /goal again to continue")));
+                                            let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!("goal {note}")));
                                         } else if evaluate {
                                             state.unproductive = 0;
                                             let condition = state.condition.clone();
@@ -6880,9 +6890,102 @@ impl fmt::Display for RuntimeUnavailable {
 
 impl Error for RuntimeUnavailable {}
 
+/// Resolve the `/goal` round cap at goal start. An explicit `ATOMCODE_GOAL_MAX_ROUNDS`
+/// wins and skips the network (its value is already baked into `config_default`).
+/// Otherwise size the budget from the account's live request quota — a share of the
+/// tightest rolling window's `call_limit` — fetched best-effort through the host
+/// source with a short timeout. Any miss (no source, fetch error/timeout, no usable
+/// window, non-CodingPlan user) falls back to `config_default` so `/goal` never blocks.
+async fn resolve_goal_round_cap(
+    rate_limit_source: Option<&Arc<dyn crate::rate_limit::RateLimitWindowSource>>,
+    config_default: u32,
+) -> u32 {
+    if crate::config::goal_max_rounds_env().is_some() {
+        return config_default;
+    }
+    let call_limit = match rate_limit_source {
+        Some(source) => match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            source.fetch_windows(),
+        )
+        .await
+        {
+            Ok(Ok(windows)) => crate::rate_limit::binding_window_call_limit(&windows),
+            _ => None,
+        },
+        None => None,
+    };
+    match call_limit {
+        Some(limit) => crate::config::derive_goal_max_rounds(None, Some(limit)),
+        None => config_default,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct FakeQuotaSource {
+        result: Result<Vec<crate::rate_limit::RateLimitWindow>, String>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::rate_limit::RateLimitWindowSource for FakeQuotaSource {
+        fn applies_to(&self, _base_url: &str) -> bool {
+            true
+        }
+        async fn fetch_windows(
+            &self,
+        ) -> Result<Vec<crate::rate_limit::RateLimitWindow>, String> {
+            self.result.clone()
+        }
+    }
+
+    fn quota_window(call_limit: i64) -> crate::rate_limit::RateLimitWindow {
+        crate::rate_limit::RateLimitWindow {
+            window_size_seconds: 18_000,
+            quota_exhausted: false,
+            reset_at_display: "18:09".into(),
+            seconds_until_reset: 7200,
+            reset_label: "5h".into(),
+            call_limit,
+        }
+    }
+
+    // NOTE: assumes ATOMCODE_GOAL_MAX_ROUNDS is unset (same assumption as
+    // `config::tests::round_caps_have_generous_defaults`); an env override would
+    // short-circuit to the config default.
+    #[tokio::test]
+    async fn goal_round_cap_derives_from_live_plan_quota() {
+        // Pro window (call_limit 1000) → 30% = 300, overriding the passed default.
+        let pro: Arc<dyn crate::rate_limit::RateLimitWindowSource> =
+            Arc::new(FakeQuotaSource {
+                result: Ok(vec![quota_window(1000)]),
+            });
+        assert_eq!(resolve_goal_round_cap(Some(&pro), 777).await, 300);
+        // Lite window (800) → 240.
+        let lite: Arc<dyn crate::rate_limit::RateLimitWindowSource> =
+            Arc::new(FakeQuotaSource {
+                result: Ok(vec![quota_window(800)]),
+            });
+        assert_eq!(resolve_goal_round_cap(Some(&lite), 777).await, 240);
+    }
+
+    #[tokio::test]
+    async fn goal_round_cap_falls_back_when_quota_unavailable() {
+        // No source, a fetch error, and empty windows all fall back to the config
+        // default instead of blocking /goal or inventing a number.
+        assert_eq!(resolve_goal_round_cap(None, 777).await, 777);
+        let err: Arc<dyn crate::rate_limit::RateLimitWindowSource> =
+            Arc::new(FakeQuotaSource {
+                result: Err("status_v2 unavailable".into()),
+            });
+        assert_eq!(resolve_goal_round_cap(Some(&err), 777).await, 777);
+        let empty: Arc<dyn crate::rate_limit::RateLimitWindowSource> =
+            Arc::new(FakeQuotaSource { result: Ok(vec![]) });
+        assert_eq!(resolve_goal_round_cap(Some(&empty), 777).await, 777);
+    }
 
     #[test]
     fn terminal_persistence_warnings_are_emitted_once() {

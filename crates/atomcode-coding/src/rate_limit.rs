@@ -26,6 +26,22 @@ pub struct RateLimitWindow {
     pub reset_at_display: String,
     pub seconds_until_reset: i64,
     pub reset_label: String,
+    /// Max model requests allowed in this rolling window (`0`/negative = unknown).
+    /// Used to size the `/goal` round budget as a share of the tightest window.
+    pub call_limit: i64,
+}
+
+/// The most-constraining rolling-window request budget, used to size a single
+/// `/goal`'s round cap. Among the short rolling windows (<= 5h) with a known
+/// positive `call_limit`, pick the smallest — that is the budget a runaway goal
+/// would exhaust first. `None` when no window carries a usable limit (non-CodingPlan
+/// / offline), so the caller falls back to the flat default.
+pub fn binding_window_call_limit(windows: &[RateLimitWindow]) -> Option<i64> {
+    windows
+        .iter()
+        .filter(|w| w.window_size_seconds > 0 && w.window_size_seconds <= 18_000 && w.call_limit > 0)
+        .map(|w| w.call_limit)
+        .min()
 }
 
 /// Host-owned source for provider-specific quota windows.
@@ -279,7 +295,37 @@ mod tests {
             reset_at_display: "18:09".into(),
             seconds_until_reset: secs_until_reset,
             reset_label: "当前窗口结束即重置额度（每 5 小时一个窗口）".into(),
+            call_limit: 1000,
         }
+    }
+
+    fn win_limit(window_size_seconds: i64, call_limit: i64) -> RateLimitWindow {
+        RateLimitWindow {
+            window_size_seconds,
+            call_limit,
+            ..win(7200, false)
+        }
+    }
+
+    #[test]
+    fn binding_call_limit_picks_the_tightest_known_window() {
+        // Pro's single 5h window.
+        assert_eq!(binding_window_call_limit(&[win_limit(18000, 1000)]), Some(1000));
+        // Two rolling windows (1000 and a looser 16000) → the tighter 1000 is what a
+        // runaway goal exhausts first.
+        assert_eq!(
+            binding_window_call_limit(&[win_limit(18000, 16000), win_limit(18000, 1000)]),
+            Some(1000)
+        );
+    }
+
+    #[test]
+    fn binding_call_limit_is_none_without_a_usable_window() {
+        // No windows (non-CodingPlan / offline), a zero/negative limit, and a window
+        // longer than the 5h rolling band all yield None → caller uses the flat default.
+        assert_eq!(binding_window_call_limit(&[]), None);
+        assert_eq!(binding_window_call_limit(&[win_limit(18000, 0)]), None);
+        assert_eq!(binding_window_call_limit(&[win_limit(2_592_000, 800)]), None);
     }
 
     fn win_sized(size: i64, secs_until_reset: i64, exhausted: bool) -> RateLimitWindow {
