@@ -19,7 +19,7 @@
 // Modals open by pushing `Some(Box::new(...))` into `active_modal` — the
 // handler arms for `/model`, `/resume`, `/provider` show the pattern.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{
     apply_persisted_config, bg_runtime, deactivate_runtime_provider_after_logout,
@@ -41,7 +41,10 @@ use atomcode_config::config::Config;
 
 use crate::markdown::{fence_start, is_closing_fence};
 
-/// Maximum recent project dirs we keep in memory + persist to disk.
+/// Maximum manual MRU project dirs we keep in memory + persist to disk.
+///
+/// This is only an ordering hint for `/cd`; the picker also includes every
+/// valid working directory found in the native session catalog.
 const MAX_RECENT_DIRS: usize = 5;
 
 fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
@@ -2477,22 +2480,15 @@ fn execute_slash_command_impl(
             }
         }
         "cd" => {
-            // Bare `/cd` — open the interactive history picker (matches legacy
-            // TUI behaviour). The picker's Enter-handler invokes `apply_cd`
-            // itself, so there's nothing else to do here.
+            // Bare `/cd` opens a searchable project picker. The complete native
+            // session catalog is the durable source; the small recent-dir ring
+            // only biases its ordering. The picker's Enter-handler invokes
+            // `apply_cd` itself, so there is nothing else to do here.
             if arg.is_empty() {
-                if ctx.recent_dirs.is_empty() {
-                    let cwd = ctx.working_dir.display().to_string();
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::CdWorkingDir { cwd: &cwd }).into_owned(),
-                    ));
-                    renderer.flush();
-                } else {
-                    *active_modal = Some(Box::new(DirPicker::open(
-                        ctx.recent_dirs.clone(),
-                        ctx.working_dir.clone(),
-                    )));
-                }
+                *active_modal = Some(Box::new(DirPicker::open(
+                    load_cd_picker_dirs(&ctx.working_dir, &ctx.recent_dirs),
+                    ctx.working_dir.clone(),
+                )));
                 return Ok(());
             }
             let new_dir = resolve_cd(arg, &ctx.working_dir, ctx.previous_dir.as_deref());
@@ -5540,6 +5536,66 @@ pub(crate) fn save_recent_dirs(dirs: &[PathBuf]) {
     let _ = std::fs::write(&path, content);
 }
 
+/// Build the complete `/cd` project list. Catalog projects retain newest-session
+/// order. A current directory with no history is prepended so it remains visible;
+/// MRU-only directories follow the catalog. Invalid/deleted paths are omitted and
+/// Windows case/verbatim aliases collapse to one row.
+pub(crate) fn load_cd_picker_dirs(current: &Path, recent: &[PathBuf]) -> Vec<PathBuf> {
+    let scan = atomcode_capabilities::session::SessionManager::scan_catalog(
+        &atomcode_capabilities::session::SessionManager::sessions_root(),
+    );
+    merge_cd_picker_dirs(
+        current,
+        recent,
+        scan.entries.into_iter().map(|entry| entry.working_dir),
+        |path| path.is_dir(),
+    )
+}
+
+fn merge_cd_picker_dirs<I, F>(
+    current: &Path,
+    recent: &[PathBuf],
+    catalog_dirs: I,
+    mut is_dir: F,
+) -> Vec<PathBuf>
+where
+    I: IntoIterator<Item = PathBuf>,
+    F: FnMut(&Path) -> bool,
+{
+    let current = atomcode_capabilities::pathnorm::strip_verbatim_path(current);
+    let mut catalog_seen = std::collections::HashSet::new();
+    let catalog_dirs = catalog_dirs
+        .into_iter()
+        .map(|path| atomcode_capabilities::pathnorm::strip_verbatim_path(&path))
+        .filter(|path| {
+            catalog_seen.insert(atomcode_capabilities::pathnorm::path_case_key(path))
+        })
+        .filter(|path| is_dir(path))
+        .collect::<Vec<_>>();
+    let current_key = atomcode_capabilities::pathnorm::path_case_key(&current);
+    let current_in_catalog = catalog_dirs
+        .iter()
+        .any(|path| atomcode_capabilities::pathnorm::path_case_key(path) == current_key);
+    let mut seen = std::collections::HashSet::new();
+    let mut dirs = Vec::new();
+    if !current_in_catalog && is_dir(&current) && seen.insert(current_key) {
+        dirs.push(current);
+    }
+    for path in catalog_dirs {
+        if seen.insert(atomcode_capabilities::pathnorm::path_case_key(&path)) {
+            dirs.push(path);
+        }
+    }
+    for path in recent {
+        let path = atomcode_capabilities::pathnorm::strip_verbatim_path(path);
+        let key = atomcode_capabilities::pathnorm::path_case_key(&path);
+        if seen.insert(key) && is_dir(&path) {
+            dirs.push(path);
+        }
+    }
+    dirs
+}
+
 pub(crate) fn resolve_cd(
     arg: &str,
     cwd: &std::path::Path,
@@ -7585,6 +7641,53 @@ mod tests {
             vec![PathBuf::from("/Users/danan")],
             "same dir in two cases must collapse, keeping the first"
         );
+    }
+
+    #[test]
+    fn cd_picker_dirs_merge_current_recent_and_complete_catalog() {
+        let current = PathBuf::from("/current");
+        let recent = vec![PathBuf::from("/recent"), PathBuf::from("/current")];
+        let catalog = vec![
+            PathBuf::from("/catalog-new"),
+            PathBuf::from("/recent"),
+            PathBuf::from("/catalog-old"),
+        ];
+        let dirs = merge_cd_picker_dirs(&current, &recent, catalog, |_| true);
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/current"),
+                PathBuf::from("/catalog-new"),
+                PathBuf::from("/recent"),
+                PathBuf::from("/catalog-old"),
+            ]
+        );
+    }
+
+    #[test]
+    fn cd_picker_dirs_drop_missing_catalog_projects_without_truncating() {
+        let catalog = (0..12).map(|n| PathBuf::from(format!("/project-{n}")));
+        let dirs = merge_cd_picker_dirs(Path::new("/current"), &[], catalog, |path| {
+            path != Path::new("/project-5")
+        });
+        assert_eq!(dirs.len(), 12, "current plus 11 live catalog projects");
+        assert!(!dirs.contains(&PathBuf::from("/project-5")));
+        assert!(dirs.contains(&PathBuf::from("/project-11")));
+    }
+
+    #[test]
+    fn cd_picker_checks_each_catalog_directory_once() {
+        let checks = std::cell::Cell::new(0usize);
+        let catalog = vec![
+            PathBuf::from("/same"),
+            PathBuf::from("/same"),
+            PathBuf::from("/other"),
+        ];
+        let _ = merge_cd_picker_dirs(Path::new("/same"), &[], catalog, |_| {
+            checks.set(checks.get() + 1);
+            true
+        });
+        assert_eq!(checks.get(), 2, "one liveness check per unique catalog dir");
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]

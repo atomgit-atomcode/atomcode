@@ -1113,7 +1113,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 } else {
                     0
                 };
-                if has_hint {
+                if m.kind == super::MenuKind::DirectoryList && m.items.len() > base {
+                    base + 1
+                } else if has_hint {
                     base + 1 + extra
                 } else {
                     base + extra
@@ -1907,10 +1909,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     format!("  {}  {}", padded, desc)
                 }
             }
-            super::MenuKind::TwoColumn {
-                row_prefix,
-                selected_marker,
-            } => {
+            kind @ (super::MenuKind::TwoColumn { .. } | super::MenuKind::DirectoryList) => {
+                let (row_prefix, selected_marker) = match kind {
+                    super::MenuKind::TwoColumn {
+                        row_prefix,
+                        selected_marker,
+                    } => (row_prefix, selected_marker),
+                    super::MenuKind::DirectoryList => ("", "▸"),
+                    _ => unreachable!(),
+                };
                 // Name left-aligned, desc right-aligned. Rows fill the
                 // full screen width so pad_row_to_width adds no trailing
                 // spaces.  Optional selected_marker (show marker + space
@@ -3619,6 +3626,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let len = m.items.len();
             if len == 0 {
                 (Vec::<(String, String)>::new(), None, 0)
+            } else if menu_kind == super::MenuKind::DirectoryList {
+                let (offset, visible, hidden) =
+                    super::directory_window(len, m.selected, h);
+                let end = offset + visible;
+                let mut items = m.items[offset..end].to_vec();
+                if hidden > 0 {
+                    items.push((format!("+ {hidden} more…"), String::new()));
+                }
+                let selected = (m.selected >= offset && m.selected < end)
+                    .then_some(m.selected - offset);
+                (items, selected, offset)
             } else if matches!(
                 menu_kind,
                 super::MenuKind::Plugin

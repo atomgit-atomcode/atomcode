@@ -3602,9 +3602,10 @@ pub struct LoopCtx {
     pub working_dir: PathBuf,
     pub previous_dir: Option<PathBuf>,
     /// Recently visited project directories, most recent first (max 5).
-    /// Persisted to `~/.atomcode/recent_dirs.txt`. Drives the `/cd`
-    /// picker when invoked with no argument and is updated whenever
-    /// the working directory changes (via slash command or agent tool).
+    /// Persisted to `~/.atomcode/recent_dirs.txt` and used as an ordering hint
+    /// by `/cd`; the picker supplements it with the complete native catalog.
+    /// Updated whenever the working directory changes (via slash command or
+    /// agent tool).
     pub recent_dirs: Vec<PathBuf>,
     pub history: History,
     pub input_rx: mpsc::UnboundedReceiver<InputEvent>,
