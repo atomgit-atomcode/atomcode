@@ -540,7 +540,7 @@ pub(crate) fn echo_text_with_image_markers(text: String, image_count: usize) -> 
 /// "未配置". Shared by every gate that surfaces the rejection to the user.
 fn image_attach_reject_line(config: &Config, model: &str) -> Option<String> {
     use atomcode_config::config::ImageAttachSupport as S;
-    match config.image_attach_support() {
+    match config.image_attach_support_for_model(model) {
         S::Supported => None,
         S::Unconfigured => {
             Some(crate::i18n::t(crate::i18n::Msg::ModelNoImageSupport { model }).into_owned())
@@ -741,6 +741,61 @@ fn try_attach_image_from_path(text: &str) -> Option<(ImageContent, u64)> {
         },
         hash,
     ))
+}
+
+/// Resolve an explicit `@image` reference against the same path roots users
+/// see elsewhere in the TUI. Unlike a bare relative `snap.png` (ambiguous
+/// prose), the leading `@` is an explicit attachment intent, so project-relative
+/// paths are safe to resolve against `working_dir`. `~/...` uses AtomCode's
+/// platform-aware real home directory rather than the process environment.
+fn resolve_at_image_path(
+    token: &str,
+    working_dir: &std::path::Path,
+    home_dir: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let referenced = token.trim().strip_prefix('@')?;
+    if referenced.is_empty() || referenced.contains(char::is_whitespace) {
+        return None;
+    }
+    if referenced == "~" {
+        return home_dir.map(std::path::Path::to_path_buf);
+    }
+    if let Some(rest) = referenced
+        .strip_prefix("~/")
+        .or_else(|| referenced.strip_prefix("~\\"))
+    {
+        return home_dir.map(|home| home.join(rest));
+    }
+    let path = std::path::Path::new(referenced);
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_dir.join(path)
+    })
+}
+
+/// Load an image named through an explicit `@path` mention. The final image
+/// validation and encoding stays centralized in `try_attach_image_from_path`,
+/// so paste, drag-and-drop, and @-mention attachments share MIME/size rules.
+fn try_attach_at_image_from_path(
+    token: &str,
+    working_dir: &std::path::Path,
+) -> Option<(ImageContent, u64)> {
+    let path = resolve_at_image_path(
+        token,
+        working_dir,
+        crate::platform::home_dir().as_deref(),
+    )?;
+    try_attach_image_from_path(path.to_str()?)
+}
+
+/// Whether the outgoing text contains an explicit `@path` that resolves to a
+/// valid local image. Used before the input buffer is cleared so an unsupported
+/// image route can fail visibly without losing the user's prompt.
+fn contains_attachable_at_image(text: &str, working_dir: &std::path::Path) -> bool {
+    text.split_whitespace()
+        .filter(|token| token.starts_with('@'))
+        .any(|token| try_attach_at_image_from_path(token, working_dir).is_some())
 }
 
 #[cfg(test)]
@@ -1063,6 +1118,61 @@ mod image_path_tests {
             try_attach_image_from_path(p.to_str().unwrap()).is_none(),
             "files over MAX_PATH_IMAGE_BYTES must be rejected before read"
         );
+    }
+
+    #[test]
+    fn at_absolute_image_path_is_recognised() {
+        let dir = tempdir().unwrap();
+        let p = write_tmp_file(&dir, "absolute.png", b"stub");
+        let token = format!("@{}", p.display());
+        let resolved = resolve_at_image_path(&token, dir.path(), None).unwrap();
+        assert_eq!(resolved, p);
+        assert!(try_attach_at_image_from_path(&token, dir.path()).is_some());
+    }
+
+    #[test]
+    fn at_tilde_image_path_resolves_against_explicit_home() {
+        let home = tempdir().unwrap();
+        let p = write_tmp_file(&home, "desktop.png", b"stub");
+        let resolved = resolve_at_image_path("@~/desktop.png", home.path(), Some(home.path()))
+            .expect("tilde @ reference must resolve");
+        assert_eq!(resolved, p);
+        assert!(try_attach_image_from_path(resolved.to_str().unwrap()).is_some());
+    }
+
+    #[test]
+    fn at_relative_image_path_resolves_against_working_directory() {
+        let project = tempdir().unwrap();
+        let p = write_tmp_file(&project, "diagram.webp", b"stub");
+        let resolved = resolve_at_image_path("@diagram.webp", project.path(), None)
+            .expect("relative @ reference must resolve");
+        assert_eq!(resolved, p);
+        assert!(try_attach_at_image_from_path("@diagram.webp", project.path()).is_some());
+    }
+
+    #[test]
+    fn at_non_image_keeps_normal_file_reference_behavior() {
+        let project = tempdir().unwrap();
+        let p = write_tmp_file(&project, "notes.md", b"hello");
+        let resolved = resolve_at_image_path("@notes.md", project.path(), None).unwrap();
+        assert_eq!(resolved, p);
+        assert!(try_attach_image_from_path(resolved.to_str().unwrap()).is_none());
+        assert!(resolve_at_image_path("notes.md", project.path(), None).is_none());
+    }
+
+    #[test]
+    fn detects_attachable_at_image_without_matching_normal_file_mentions() {
+        let project = tempdir().unwrap();
+        write_tmp_file(&project, "logo.png", b"stub");
+        write_tmp_file(&project, "notes.md", b"hello");
+        assert!(contains_attachable_at_image(
+            "请看 @logo.png 这是什么",
+            project.path()
+        ));
+        assert!(!contains_attachable_at_image(
+            "请看 @notes.md 写了什么",
+            project.path()
+        ));
     }
 }
 
@@ -10533,11 +10643,13 @@ fn attach_image_to_input(
 /// fumble with `OpenFile` / `Bash dir` / base64 to read the bytes.
 ///
 /// Scan the outgoing `text` for whitespace-separated tokens that resolve to a
-/// real local image file (same strict checks as the paste path: absolute +
-/// known image extension + existing file ≤ `MAX_PATH_IMAGE_BYTES`), read them
-/// as image attachments, and replace the path token with an `[Image #N]`
-/// marker so the payload matches the paste/drag flow. No-op when the model
-/// can't take images — the path is left as text for the model to handle.
+/// real local image file. Bare paths keep the paste path's strict absolute-path
+/// rule; explicit `@path` references additionally support `~/...` and paths
+/// relative to the current working directory. All forms share the same image
+/// extension, existence, and `MAX_PATH_IMAGE_BYTES` checks. Recognised paths
+/// become image attachments plus an `[Image #N]` marker, so text-only models
+/// enter the configured VL preprocessor instead of asking `read_file` to decode
+/// a binary. No-op when no image-capable route exists.
 fn attach_typed_image_paths(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -10545,19 +10657,21 @@ fn attach_typed_image_paths(
     images: &mut Vec<ImageContent>,
     kept_markers: &mut Vec<usize>,
 ) {
-    if !ctx.config.can_handle_attached_images() {
+    if image_attach_reject_line(&ctx.config, &ctx.model_name).is_some() {
         return;
     }
-    // Snapshot tokens before mutating `text`. The `/` `\` pre-filter avoids a
-    // filesystem stat on every word of a long message — an absolute path
-    // always carries a separator.
+    // Snapshot tokens before mutating `text`. The `/` `\` / `@` pre-filter
+    // avoids a filesystem stat on every word of a long message while keeping
+    // separator-free project references such as `@logo.png` discoverable.
     let tokens: Vec<String> = text
         .split_whitespace()
-        .filter(|t| t.contains('/') || t.contains('\\'))
+        .filter(|t| t.starts_with('@') || t.contains('/') || t.contains('\\'))
         .map(str::to_string)
         .collect();
     for tok in tokens {
-        let Some((img, _hash)) = try_attach_image_from_path(&tok) else {
+        let attachment = try_attach_image_from_path(&tok)
+            .or_else(|| try_attach_at_image_from_path(&tok, &ctx.working_dir));
+        let Some((img, _hash)) = attachment else {
             continue;
         };
         app.state.session_image_count += 1;
@@ -12157,6 +12271,18 @@ fn handle_idle_key(
                 renderer.flush();
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
+            }
+            // An explicit @image is attachment intent, not ordinary file prose.
+            // Reject before clearing the editor when neither the live model nor
+            // a configured VL preprocessor can consume it; otherwise the raw
+            // path reaches the model and it falls back to a futile read_file.
+            if let Some(reject) = image_attach_reject_line(&ctx.config, &ctx.model_name) {
+                if contains_attachable_at_image(&line, &ctx.working_dir) {
+                    renderer.render(UiLine::Error(reject));
+                    renderer.flush();
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                    return Ok(());
+                }
             }
             renderer.render(UiLine::ClearTransient);
             app.buf.text.clear();
