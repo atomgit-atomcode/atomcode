@@ -139,6 +139,18 @@ const MAX_STREAM_RETRIES: u32 = 5;
 /// 40-minute hang from a broken hook, far past the 300s `stream_timeout`).
 const MAX_RATE_LIMIT_WAITS: u32 = 5;
 
+/// The FIRST transient 429 of a turn that has NO host verdict and NO server
+/// `Retry-After` is almost always a momentary burst over a per-second gateway
+/// limit that clears immediately. Retry it QUIETLY after this short wait — without
+/// emitting a `RateLimited` banner — so a one-off blip does not spam the UI (the
+/// pre-consolidation behaviour that transparently absorbed such 429s). A SUSTAINED
+/// limit re-trips on the retry and surfaces normally from the SECOND wait onward
+/// (escalating countdown + `MAX_RATE_LIMIT_WAITS` fuse). Mirrors opencode's silent
+/// low-level retries before it shows a retry status. Only the FALLBACK path is
+/// affected: a host-supplied verdict (CodingPlan window) or a server `Retry-After`
+/// is always honoured and surfaced.
+const SILENT_FIRST_RATE_LIMIT_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// How many times the agent loop re-issues a round after the provider returns a
 /// COMPLETELY EMPTY but otherwise-successful completion (a 200 with no text, no
 /// tool calls, no reasoning). This is a DISTINCT tier from `MAX_PROVIDER_RETRIES`
@@ -2021,14 +2033,18 @@ impl RunningAgent {
                         attempt: rate_limit_waits.saturating_add(1),
                     };
                     let server_message = rate_limit_server_message(&e);
-                    let decision = if hint.terminal {
-                        crate::hook::RateLimitDecision::from_hint(&hint)
+                    // Distinguish a HOST verdict from the `from_hint` FALLBACK: only the
+                    // fallback (no host opinion) is eligible for the quiet-first retry.
+                    let host_verdict = if hint.terminal {
+                        None
                     } else {
-                        self.hooks
-                            .on_rate_limit(&hint)
-                            .await
-                            .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint))
+                        self.hooks.on_rate_limit(&hint).await
                     };
+                    let quiet_first_eligible = host_verdict.is_none()
+                        && hint.retry_after_secs.is_none()
+                        && !hint.terminal;
+                    let decision = host_verdict
+                        .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint));
                     match decision {
                         crate::hook::RateLimitDecision::WaitAndRetry { secs } => {
                             rate_limit_waits += 1;
@@ -2048,20 +2064,28 @@ impl RunningAgent {
                                     .await;
                                 return;
                             }
-                            self.rt.emit(AgentEvent::RateLimited {
-                                reset_at_display: String::new(),
-                                reset_label: String::new(),
-                                secs_until_reset: Some(secs),
-                                auto_resuming: true,
-                                server_message: None, // auto-retrying: no user-facing reason line
-                            });
+                            // QUIET-FIRST: a one-off transient 429 (fallback path, no
+                            // Retry-After) recovers silently — no banner spam. Sustained
+                            // limits re-trip and surface from the second wait onward.
+                            let wait = if quiet_first_eligible && rate_limit_waits == 1 {
+                                SILENT_FIRST_RATE_LIMIT_RETRY
+                            } else {
+                                self.rt.emit(AgentEvent::RateLimited {
+                                    reset_at_display: String::new(),
+                                    reset_label: String::new(),
+                                    secs_until_reset: Some(secs),
+                                    auto_resuming: true,
+                                    server_message: None, // auto-retrying: no user-facing reason line
+                                });
+                                std::time::Duration::from_secs(secs)
+                            };
                             tokio::select! {
                                 biased;
                                 _ = cancel.cancelled() => {
                                     self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
                                     return;
                                 }
-                                _ = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {}
+                                _ = tokio::time::sleep(wait) => {}
                             }
                             provider_retry = 0; // 429 must not consume the generic transient-retry budget
                             round -= 1; // re-issue this round, not a new one
@@ -2370,14 +2394,18 @@ impl RunningAgent {
                             attempt: rate_limit_waits.saturating_add(1),
                         };
                         let server_message = rate_limit_server_message(&e);
-                        let decision = if hint.terminal {
-                            crate::hook::RateLimitDecision::from_hint(&hint)
+                        // Distinguish a HOST verdict from the `from_hint` FALLBACK: only the
+                        // fallback (no host opinion) is eligible for the quiet-first retry.
+                        let host_verdict = if hint.terminal {
+                            None
                         } else {
-                            self.hooks
-                                .on_rate_limit(&hint)
-                                .await
-                                .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint))
+                            self.hooks.on_rate_limit(&hint).await
                         };
+                        let quiet_first_eligible = host_verdict.is_none()
+                            && hint.retry_after_secs.is_none()
+                            && !hint.terminal;
+                        let decision = host_verdict
+                            .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint));
                         // Once any model content has reached the driver, replaying the
                         // request can duplicate text/reasoning/tool calls that cannot be
                         // retracted from the live UI. Keep the clean RateLimited terminal,
@@ -2430,20 +2458,28 @@ impl RunningAgent {
                                         .await;
                                     return;
                                 }
-                                self.rt.emit(AgentEvent::RateLimited {
-                                    reset_at_display: String::new(),
-                                    reset_label: String::new(),
-                                    secs_until_reset: Some(secs),
-                                    auto_resuming: true,
-                                    server_message: None,
-                                });
+                                // QUIET-FIRST (mirrors the OPEN path): a one-off transient
+                                // 429 before any content, with no host verdict and no
+                                // Retry-After, recovers silently.
+                                let wait = if quiet_first_eligible && rate_limit_waits == 1 {
+                                    SILENT_FIRST_RATE_LIMIT_RETRY
+                                } else {
+                                    self.rt.emit(AgentEvent::RateLimited {
+                                        reset_at_display: String::new(),
+                                        reset_label: String::new(),
+                                        secs_until_reset: Some(secs),
+                                        auto_resuming: true,
+                                        server_message: None,
+                                    });
+                                    std::time::Duration::from_secs(secs)
+                                };
                                 tokio::select! {
                                     biased;
                                     _ = cancel.cancelled() => {
                                         self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
                                         return;
                                     }
-                                    _ = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {}
+                                    _ = tokio::time::sleep(wait) => {}
                                 }
                                 provider_retry = 0; // 429 must not consume the generic transient-retry budget
                                 retry_this_round = true;
