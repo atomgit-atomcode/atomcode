@@ -50,7 +50,9 @@ Reply with the single Verdict line now."#;
 pub struct GoalProgress {
     pub active: bool,
     pub terminal: Option<GoalTerminal>,
+    pub phase: GoalPhase,
     pub round: u32,
+    pub max_rounds: Option<u32>,
     pub elapsed_secs: u64,
     pub condition: String,
     pub last_reason: Option<String>,
@@ -62,6 +64,13 @@ pub enum GoalTerminal {
     Stopped,
     Failed,
     Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GoalPhase {
+    Pursuing,
+    PausedAtCap,
+    Satisfied,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,6 +94,7 @@ pub(crate) struct GoalState {
     pub id: u64,
     pub condition: String,
     pub active: bool,
+    pub phase: GoalPhase,
     pub terminal: Option<GoalTerminal>,
     pub round: u32,
     started_at: Instant,
@@ -103,6 +113,7 @@ impl GoalState {
             id,
             condition,
             active: true,
+            phase: GoalPhase::Pursuing,
             terminal: None,
             round: 0,
             started_at,
@@ -124,7 +135,9 @@ impl GoalState {
             } else {
                 Some(self.terminal.unwrap_or(GoalTerminal::Failed))
             },
+            phase: self.phase,
             round: self.round,
+            max_rounds: self.max_rounds,
             elapsed_secs: self.started_at.elapsed().as_secs(),
             condition: self.condition.clone(),
             last_reason: self.last_reason.clone(),
@@ -135,6 +148,29 @@ impl GoalState {
         self.active = false;
         self.terminal = Some(terminal);
         self.last_reason = Some(reason.into());
+    }
+
+    pub fn mark_satisfied(&mut self, verdict: impl Into<String>) {
+        self.active = false;
+        self.phase = GoalPhase::Satisfied;
+        self.terminal = Some(GoalTerminal::Met);
+        self.last_reason = Some(verdict.into());
+    }
+
+    pub fn pause_at_cap(&mut self, note: impl Into<String>) {
+        self.active = false;
+        self.phase = GoalPhase::PausedAtCap;
+        self.terminal = Some(GoalTerminal::Stopped);
+        self.last_reason = Some(note.into());
+    }
+
+    pub fn resume(&mut self, new_max_rounds: u32) {
+        self.active = true;
+        self.phase = GoalPhase::Pursuing;
+        self.round = 0;
+        self.max_rounds = (new_max_rounds != 0).then_some(new_max_rounds);
+        self.terminal = None;
+        self.last_reason = None;
     }
 
     pub fn cap_reached(&self) -> Option<&'static str> {
@@ -628,5 +664,30 @@ mod tests {
         let mut bounded = LoopState::new(2, "watch CI".into(), 3);
         bounded.round = 3;
         assert!(bounded.round_limit_reached());
+    }
+
+    #[test]
+    fn goal_phase_transitions_keep_state_consistent() {
+        let mut g = GoalState::new(1, "finish".into(), 300, 0);
+        assert_eq!(g.phase, GoalPhase::Pursuing);
+        assert!(g.active);
+
+        g.mark_satisfied("all done");
+        assert_eq!(g.phase, GoalPhase::Satisfied);
+        assert!(!g.active);
+        assert_eq!(g.progress().phase, GoalPhase::Satisfied);
+
+        let mut g2 = GoalState::new(2, "finish".into(), 300, 0);
+        g2.round = 300;
+        g2.pause_at_cap("已达轮数预算（300 轮）");
+        assert_eq!(g2.phase, GoalPhase::PausedAtCap);
+        assert!(!g2.active);
+
+        // resume 重置轮数、采纳新预算、回到 Pursuing
+        g2.resume(240);
+        assert_eq!(g2.phase, GoalPhase::Pursuing);
+        assert!(g2.active);
+        assert_eq!(g2.round, 0);
+        assert_eq!(g2.progress().max_rounds, Some(240));
     }
 }
