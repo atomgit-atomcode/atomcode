@@ -63,12 +63,19 @@ fn render(path: &Path, display: &str) -> ToolResult {
         // NOT an error: the file is fine, this tool just has no grammar for it. Reporting it
         // as a failure paints a red card in the UI and inflates the tool error rate with
         // non-failures (an Android project full of .xml/.gradle drove this to 69%). Hand the
-        // model the next step instead.
+        // model the next step instead — but ONLY when the file actually exists. `detect`
+        // runs before the read below, so this branch owns the existence check for
+        // unsupported types: a missing/typo'd path must stay an error, or the model treats
+        // it as "no symbols" and never corrects the path.
         None => {
-            return ok(format!(
-                "no symbol index for {display} — no tree-sitter grammar is bundled for this \
-                 file type. Read it with read_file instead."
-            ))
+            return if path.is_file() {
+                ok(format!(
+                    "no symbol index for {display} — no tree-sitter grammar is bundled for this \
+                     file type. Read it with read_file instead."
+                ))
+            } else {
+                err(format!("list_symbols: cannot read {display}: file not found"))
+            }
         }
     };
     let source = match std::fs::read_to_string(path) {
@@ -143,14 +150,18 @@ mod tests {
     }
 
     /// 降级只针对"类型不支持"。文件真的不存在仍然是错误 —— 否则模型拿着一个不存在的路径
-    /// 收到「正常结果」,会当成"这文件没符号"继续往下走,而不是去纠正路径。
+    /// 收到「正常结果」,会当成"这文件没符号"继续往下走,而不是去纠正路径。必须对**两类扩展名**
+    /// 都成立:`nope.rs` 由下方的读取兜住;`nope.xyzlang`(不支持类型)必须由 None 分支的
+    /// `is_file()` 守卫兜住,否则一个写错的 `.xml`/`.gradle` 路径会被降级成"没符号"。
     #[tokio::test]
     async fn missing_file_is_still_an_error() {
         let d = tempfile::tempdir().unwrap();
-        let r = ListSymbolsTool
-            .execute(r#"{"file_path":"nope.rs"}"#, &ctx(d.path()))
-            .await;
-        assert!(r.is_error, "{}", r.content);
+        for name in ["nope.rs", "nope.xyzlang"] {
+            let r = ListSymbolsTool
+                .execute(&format!(r#"{{"file_path":"{name}"}}"#), &ctx(d.path()))
+                .await;
+            assert!(r.is_error, "{name} must be an error: {}", r.content);
+        }
     }
 
     #[tokio::test]
