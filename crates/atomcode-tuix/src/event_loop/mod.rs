@@ -21087,7 +21087,12 @@ fn handle_agent_event(
                         state.goal_phase = atomcode_coding::GoalPhase::PausedAtCap;
                         flush_pending_separator(state, renderer, /* as_goal_end */ true);
                     }
-                    _ => {
+                    atomcode_coding::GoalPhase::Ended
+                    // Pursuing with active==false is unreachable by invariant
+                    // (active == (phase == Pursuing)), but listed here to keep
+                    // the match exhaustive and prevent silent falls-through if a
+                    // future phase variant is added.
+                    | atomcode_coding::GoalPhase::Pursuing => {
                         // Ended (cancel / fail / clear / supersede): render a
                         // verdict banner (if applicable) then tear down the badge.
                         // Render order: banner ABOVE the stats separator so the

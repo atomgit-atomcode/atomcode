@@ -13067,6 +13067,10 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 tokio::select! {
+                    // biased; ensures runtime_events is drained before
+                    // kernel_commands, matching the emission order (GoalChanged
+                    // is enqueued before SendMessage) and preventing CI flakes.
+                    biased;
                     event = runtime_events.recv() => {
                         match event {
                             Some(CodingRuntimeEvent::GoalChanged(p)) => {

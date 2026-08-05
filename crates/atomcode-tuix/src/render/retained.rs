@@ -8829,6 +8829,7 @@ mod tests {
             row.contains("继续对话即推进"),
             "resume hint present: {row}"
         );
+        assert!(row.contains("已达 5 轮"), "round substitution locked: {row}");
     }
 
     #[test]
@@ -8844,6 +8845,10 @@ mod tests {
         );
         assert!(!row.is_empty(), "satisfied row must be non-empty: {row}");
         assert!(row.contains("已达成"), "achieved text present: {row}");
+        assert!(
+            row.contains("/goal clear 结束"),
+            "actionable hint locked: {row}"
+        );
     }
 
     #[test]
