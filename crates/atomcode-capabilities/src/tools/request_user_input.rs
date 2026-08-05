@@ -110,24 +110,40 @@ pub fn parse_batch(args: &str) -> Result<(Vec<UserInputRequest>, bool), String> 
     }
 }
 
+/// Summarize a non-declined answer (shared by the single + batch paths).
+///
+/// `selected` and `text` are NOT mutually exclusive: in `multiple` mode a driver can let the
+/// user tick options AND type a custom note, and both come back on the wire. Returning early
+/// on `text` dropped every ticked option before the model ever saw it — the user picked
+/// "Python" and added "plus Rust", and the model was only ever told about "plus Rust".
+fn answer_summary(resp: &UserInputResponse) -> String {
+    let text = resp.text.as_deref().filter(|t| !t.trim().is_empty());
+    let selected = (!resp.selected.is_empty()).then(|| {
+        resp.selected
+            .iter()
+            .map(|s| format!("{s:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
+    match (selected, text) {
+        (Some(sel), Some(t)) => format!("User selected: {sel}, and User answered: {t:?}"),
+        (Some(sel), None) => format!("User selected: {sel}"),
+        (None, Some(t)) => format!("User answered: {t:?}"),
+        // Nothing ticked and nothing typed. A text-mode submission that is present but
+        // blank keeps its historical shape; a wholly absent answer reads as no selection.
+        (None, None) => match &resp.text {
+            Some(t) => format!("User answered: {t:?}"),
+            None => "User selected nothing.".to_string(),
+        },
+    }
+}
+
 /// Map one question's response to its answer clause (shared by single + batch).
 fn answer_clause(resp: &UserInputResponse) -> String {
     if resp.declined {
         return "No answer (declined).".to_string();
     }
-    if let Some(t) = &resp.text {
-        return format!("User answered: {t:?}");
-    }
-    if resp.selected.is_empty() {
-        return "User selected nothing.".to_string();
-    }
-    let joined = resp
-        .selected
-        .iter()
-        .map(|s| format!("{s:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("User selected: {joined}")
+    answer_summary(resp)
 }
 
 /// Format a batch of answers, one line per question keyed by its `header`. When every
@@ -179,19 +195,7 @@ pub fn format_result(resp: &UserInputResponse) -> ToolResult {
              are truly blocked.",
         );
     }
-    if let Some(t) = &resp.text {
-        return ok_result(format!("User answered: {t:?}"));
-    }
-    if resp.selected.is_empty() {
-        return ok_result("User selected nothing.");
-    }
-    let joined = resp
-        .selected
-        .iter()
-        .map(|s| format!("{s:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    ok_result(format!("User selected: {joined}"))
+    ok_result(answer_summary(resp))
 }
 
 /// Result when no driver can present the question (Null round-trip / missing requester).
@@ -503,5 +507,62 @@ mod tests {
                 .unwrap(),
             req
         );
+    }
+
+    /// Ticking an option AND typing a note must surface BOTH — the ticked option used to be
+    /// dropped outright once `text` was present.
+    #[test]
+    fn selection_and_free_text_both_reach_the_model() {
+        let r = format_result(&UserInputResponse {
+            declined: false,
+            selected: vec!["Python".into()],
+            text: Some("plus Rust".into()),
+        });
+        assert_eq!(
+            r.content,
+            r#"User selected: "Python", and User answered: "plus Rust""#
+        );
+    }
+
+    /// Same in the batch path, which shares `answer_summary`.
+    #[test]
+    fn batch_keeps_selection_alongside_free_text() {
+        let reqs = vec![UserInputRequest {
+            header: "Lang".into(),
+            question: "Pick".into(),
+            mode: UserInputMode::Multiple,
+            options: vec![
+                UserInputOption {
+                    label: "Python".into(),
+                    description: None,
+                },
+                UserInputOption {
+                    label: "Rust".into(),
+                    description: None,
+                },
+            ],
+            custom: true,
+        }];
+        let resps = vec![UserInputResponse {
+            declined: false,
+            selected: vec!["Python".into(), "Rust".into()],
+            text: Some("plus Go".into()),
+        }];
+        let r = format_batch_result(&reqs, &resps);
+        assert_eq!(
+            r.content,
+            r#"Q1 (Lang): User selected: "Python", "Rust", and User answered: "plus Go""#
+        );
+    }
+
+    /// A blank custom field is not an answer: it must not shadow the ticked options.
+    #[test]
+    fn blank_free_text_does_not_shadow_selection() {
+        let r = format_result(&UserInputResponse {
+            declined: false,
+            selected: vec!["Python".into()],
+            text: Some("   ".into()),
+        });
+        assert_eq!(r.content, r#"User selected: "Python""#);
     }
 }
