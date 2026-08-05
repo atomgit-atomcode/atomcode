@@ -190,7 +190,8 @@ fn decode_cf_dib_to_rgba(dib: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     if dib.len() < INFO_HEADER_SIZE as usize {
         return None;
     }
-    let u32_at = |at: usize| u32::from_le_bytes(dib[at..at + 4].try_into().expect("bounds checked"));
+    let u32_at =
+        |at: usize| u32::from_le_bytes(dib[at..at + 4].try_into().expect("bounds checked"));
     let header_size = u64::from(u32_at(0));
     if header_size < INFO_HEADER_SIZE || header_size > dib.len() as u64 {
         return None;
@@ -314,7 +315,8 @@ fn try_paste_clipboard_image() -> Option<(ImageContent, u64)> {
             // before giving up. The error is otherwise swallowed, so log it too.
             crate::tuix_trace!("IMG", "arboard get_image failed: {_e}");
             #[cfg(windows)]
-            if let Some((w, h, rgba)) = read_raw_cf_dib().and_then(|dib| decode_cf_dib_to_rgba(&dib))
+            if let Some((w, h, rgba)) =
+                read_raw_cf_dib().and_then(|dib| decode_cf_dib_to_rgba(&dib))
             {
                 let hash = rgba_fingerprint(w as usize, h as usize, &rgba);
                 if let Some(png_data) = encode_rgba_to_png(w, h, &rgba) {
@@ -834,7 +836,10 @@ mod image_path_tests {
 
     fn decoded_pixels(dib: &[u8]) -> (u32, u32, Vec<[u8; 4]>) {
         let (w, h, rgba) = decode_cf_dib_to_rgba(dib).expect("DIB must decode");
-        let px = rgba.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
+        let px = rgba
+            .chunks_exact(4)
+            .map(|c| [c[0], c[1], c[2], c[3]])
+            .collect();
         (w, h, px)
     }
 
@@ -5706,7 +5711,11 @@ mod menu_tests {
         let custom = CustomCommandRegistry::empty();
         let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:atomcode-smoke-test", "smoke", true));
-        skills.register(skill_fixture("skills:delegating-to-atomcode", "delegate", true));
+        skills.register(skill_fixture(
+            "skills:delegating-to-atomcode",
+            "delegate",
+            true,
+        ));
         let lock = std::sync::RwLock::new(skills);
 
         // `/skills atom smoke` keeps the menu OPEN and narrows to the one skill
@@ -5814,7 +5823,11 @@ mod menu_tests {
         // hyphenated name is reachable by typing loose fragments of it.
         let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:atomcode-smoke-test", "smoke", true));
-        skills.register(skill_fixture("skills:delegating-to-atomcode", "delegate", true));
+        skills.register(skill_fixture(
+            "skills:delegating-to-atomcode",
+            "delegate",
+            true,
+        ));
         let lock = std::sync::RwLock::new(skills);
 
         // Single fragment `atomcode` matches BOTH (substring), like the menu today.
@@ -6007,7 +6020,10 @@ mod menu_tests {
         // NEWER "git stash", so the jump lands on the newest match.
         let _ = buf.apply(Action::Backspace, &history, &reg);
         assert_eq!(buf.search_query(), "sta");
-        assert_eq!(buf.text, "git stash", "back to newest entry containing 'sta'");
+        assert_eq!(
+            buf.text, "git stash",
+            "back to newest entry containing 'sta'"
+        );
 
         // Backspace again keeps the newest match ("git stash" still
         // contains "st").
@@ -6116,7 +6132,10 @@ mod menu_tests {
         let _ = buf.apply(Action::HistorySearch, &history, &reg);
 
         let result = buf.apply(Action::Submit, &history, &reg);
-        assert!(matches!(result, BufferResult::Redraw), "Enter accepts, not commits");
+        assert!(
+            matches!(result, BufferResult::Redraw),
+            "Enter accepts, not commits"
+        );
         assert!(!buf.is_searching(), "search mode ends on Enter");
         assert_eq!(buf.text, "fix the build", "match stays in the buffer");
         assert_eq!(
@@ -9416,7 +9435,11 @@ mod external_config_tests {
     fn manual_reload_updates_the_pinned_new_schema_model_without_switching_it() {
         let current = new_schema_config("account/old");
         let mut persisted = new_schema_config("account/new");
-        persisted.models.get_mut("account/old").unwrap().context_window = 64_000;
+        persisted
+            .models
+            .get_mut("account/old")
+            .unwrap()
+            .context_window = 64_000;
 
         let merged = merge_persisted_config_preserving_active(&current, persisted, true);
 
@@ -9499,7 +9522,11 @@ mod external_config_tests {
         let persisted = new_schema_config("account/new");
         let mut desired = new_schema_config("account/old");
         desired.models.remove("account/new");
-        desired.models.get_mut("account/old").unwrap().context_window = 64_000;
+        desired
+            .models
+            .get_mut("account/old")
+            .unwrap()
+            .context_window = 64_000;
         desired.language = Some(atomcode_config::locale::Locale::ZhCn);
 
         let saved = config_for_persistence(&desired, &persisted, false);
