@@ -205,11 +205,11 @@ pub fn goal_cap_stop_note(why: &str, max_rounds: Option<u32>) -> String {
     // prefix and also reads standalone when the call site adds its own "goal ".
     match why {
         "round limit" => match max_rounds {
-            Some(max) => format!("已达轮数预算（{max} 轮）· 运行 /goal 继续"),
-            None => "已达轮数预算 · 运行 /goal 继续".to_string(),
+            Some(max) => format!("已达轮数预算（{max} 轮）· 继续对话即推进"),
+            None => "已达轮数预算 · 继续对话即推进".to_string(),
         },
-        "time limit" => "已达时间上限 · 运行 /goal 继续".to_string(),
-        other => format!("已停止（{other}）· 运行 /goal 继续"),
+        "time limit" => "已达时间上限 · 继续对话即推进".to_string(),
+        other => format!("已停止（{other}）· 继续对话即推进"),
     }
 }
 
@@ -622,16 +622,16 @@ mod tests {
         assert!(note.contains("300"), "should name the round budget: {note}");
         assert!(!note.contains("not met"), "must not claim failure: {note}");
         assert!(!note.to_lowercase().contains("未达"), "must not claim failure: {note}");
-        assert!(note.contains("/goal"), "should tell the user how to continue: {note}");
+        assert!(note.contains("继续对话"), "should tell the user how to continue: {note}");
     }
 
     #[test]
     fn cap_stop_note_handles_time_cap_and_unbounded_rounds() {
         // The optional time cap (env-enabled) and a round cap with no configured
         // max still produce a continue-able, non-failure note.
-        assert!(goal_cap_stop_note("time limit", None).contains("/goal"));
+        assert!(goal_cap_stop_note("time limit", None).contains("继续对话"));
         assert!(!goal_cap_stop_note("time limit", None).contains("not met"));
-        assert!(goal_cap_stop_note("round limit", None).contains("/goal"));
+        assert!(goal_cap_stop_note("round limit", None).contains("继续对话"));
     }
 
     #[test]
