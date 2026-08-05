@@ -2,7 +2,7 @@
 //! slicing. Non-destructive ⇒ always `Safe`. Neutral core ported from the production
 //! reader, minus the coding enrichments (semantic skeleton, read_cache, file_store).
 
-use super::{err, looks_binary, ok, ok_with_images, resolve_path};
+use super::{err, looks_binary, not_found_hint, ok, ok_with_images, resolve_path};
 use async_trait::async_trait;
 use atomcode_kernel::message::ImageContent;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
@@ -153,9 +153,10 @@ impl Tool for ReadFileTool {
             Ok(m) => m,
             Err(_) => {
                 return err(format!(
-                    "Error: no such file: {} (resolved to {})",
+                    "Error: no such file: {} (resolved to {}){}",
                     a.file_path,
-                    crate::pathnorm::to_display(&path)
+                    crate::pathnorm::to_display(&path),
+                    not_found_hint(&path, &ctx.working_dir)
                 ))
             }
         };
@@ -589,6 +590,29 @@ mod tests {
             .await;
         assert!(r.is_error);
         assert!(r.content.contains("no such file"), "{}", r.content);
+    }
+
+    /// `read_file` is the single biggest source of not-found failures in the field (234 in 14
+    /// days), for the same reason as grep/glob: a guessed path with no clue about where the
+    /// tree actually stops.
+    #[tokio::test]
+    async fn missing_file_error_carries_the_nearest_existing_ancestor() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("app")).unwrap();
+        std::fs::write(d.path().join("app/build.gradle"), "").unwrap();
+        let r = ReadFileTool::default()
+            .execute(
+                r#"{"file_path":"app/src/main/AndroidManifest.xml"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(r.is_error, "{}", r.content);
+        assert!(
+            r.content.contains("Nearest existing directory"),
+            "{}",
+            r.content
+        );
+        assert!(r.content.contains("build.gradle"), "{}", r.content);
     }
 
     #[tokio::test]

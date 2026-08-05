@@ -276,6 +276,85 @@ pub(crate) fn resolve_path(raw: &str, working_dir: &Path) -> PathBuf {
     }
 }
 
+/// Max entries listed in a not-found hint before it is truncated.
+const HINT_MAX_ENTRIES: usize = 40;
+
+/// Explain a not-found path by naming the deepest ancestor that DOES exist and listing what
+/// is in it. Returns `""` when there is nothing safe or useful to say.
+///
+/// Why: `path not found: <abs path>` tells the model only that it was wrong, not where the
+/// tree actually stops — so it guesses again, deeper (`app/src` → `app/src/main/java`), and
+/// burns a turn per guess. The nearest existing ancestor plus its entries is the one fact
+/// that ends the loop, and it is a fact we can prove by reading the directory (nothing here
+/// asserts anything about what the model was *trying* to find).
+///
+/// SAFETY: the walk stops at the workspace boundary. These tools deliberately do NOT enforce
+/// containment (see the module trust-model note), so a model may pass any absolute path; a
+/// hint that listed whatever lies outside would turn a typo into "enumerate the user's home
+/// directory into model context".
+pub(crate) fn not_found_hint(missing: &Path, working_dir: &Path) -> String {
+    let Ok(root) = crate::pathnorm::canonicalize(working_dir) else {
+        return String::new();
+    };
+    // Walk up from the parent — `missing` itself is the thing that does not exist.
+    let mut cur = missing.parent();
+    while let Some(candidate) = cur {
+        // `canonicalize` succeeds only for paths that exist, so this doubles as the
+        // existence test for each ancestor.
+        if let Ok(real) = crate::pathnorm::canonicalize(candidate) {
+            if !real.starts_with(&root) {
+                return String::new(); // left the workspace — say nothing
+            }
+            if !real.is_dir() {
+                return String::new(); // an ancestor is a FILE; there is nothing to list
+            }
+            return render_dir_hint(&real);
+        }
+        cur = candidate.parent();
+    }
+    String::new()
+}
+
+/// Render `dir`'s entries for a not-found hint: directories first (trailing `/`), then files,
+/// each group sorted by name so the text is deterministic. Build/VCS/cache dirs are dropped —
+/// the same noise the walkers skip.
+fn render_dir_hint(dir: &Path) -> String {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return String::new();
+    };
+    let mut names: Vec<(bool, String)> = Vec::new();
+    for ent in read.flatten() {
+        let name = ent.file_name().to_string_lossy().into_owned();
+        if SKIP_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+        let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        names.push((is_dir, name));
+    }
+    if names.is_empty() {
+        return format!(
+            "\nNearest existing directory: {} (it is empty).",
+            crate::pathnorm::to_display(dir)
+        );
+    }
+    names.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+    let total = names.len();
+    let mut shown: Vec<String> = names
+        .iter()
+        .take(HINT_MAX_ENTRIES)
+        .map(|(is_dir, n)| if *is_dir { format!("{n}/") } else { n.clone() })
+        .collect();
+    if total > HINT_MAX_ENTRIES {
+        shown.push(format!("… (+{} more)", total - HINT_MAX_ENTRIES));
+    }
+    format!(
+        "\nNearest existing directory: {} — contains: {}",
+        crate::pathnorm::to_display(dir),
+        shown.join(", ")
+    )
+}
+
 /// Coerce every line ending in `s` to `eol` (`"\n"` or `"\r\n"`): collapse any `\r\n`
 /// to `\n`, then expand to the target. Idempotent for `"\n"`. Used by the editors so a
 /// model that copied LF text from `read_file` (which strips `\r` via `str::lines()`) can
@@ -465,6 +544,60 @@ mod tests {
             resolve_path("src/main.rs", wd),
             PathBuf::from("/work/proj/src/main.rs")
         );
+    }
+
+    /// A model that guesses a conventional layout (`app/src/main/java` for a Gradle project)
+    /// gets `path not found` and nothing else — so it guesses again, deeper. The hint gives it
+    /// the one fact that ends the guessing: where the path stops existing, and what is actually
+    /// there.
+    #[test]
+    fn not_found_hint_names_nearest_existing_ancestor_and_its_entries() {
+        let d = tempfile::tempdir().unwrap();
+        let wd = d.path();
+        std::fs::create_dir(wd.join("app")).unwrap();
+        std::fs::write(wd.join("app").join("build.gradle"), "").unwrap();
+        std::fs::create_dir(wd.join("app").join("libs")).unwrap();
+
+        // The model guessed two levels past where the tree actually stops.
+        let hint = not_found_hint(&wd.join("app/src/main/java"), wd);
+
+        assert!(hint.contains("app"), "{hint}");
+        assert!(hint.contains("build.gradle"), "{hint}");
+        assert!(hint.contains("libs/"), "directories are marked: {hint}");
+    }
+
+    /// The tools deliberately do NOT enforce workspace containment (see the module trust-model
+    /// note), so a model can hand in any absolute path. Listing a directory outside the
+    /// workspace would pull the user's home — or anything else on disk — into model context as
+    /// a side effect of a typo. The hint stays inside the workspace or says nothing.
+    #[test]
+    fn not_found_hint_never_lists_outside_the_working_dir() {
+        let d = tempfile::tempdir().unwrap();
+        let wd = d.path().join("workspace");
+        std::fs::create_dir(&wd).unwrap();
+        // A sibling of the workspace, holding something we must never enumerate.
+        let outside = d.path().join("elsewhere");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("id_rsa"), "").unwrap();
+
+        let hint = not_found_hint(&outside.join("nope/deeper"), &wd);
+
+        assert!(
+            hint.is_empty(),
+            "must not enumerate outside the workspace: {hint}"
+        );
+    }
+
+    /// The workspace root itself is a valid nearest-existing ancestor — that is the common
+    /// case for a first-turn guess like `src/` in a project that has no `src/`.
+    #[test]
+    fn not_found_hint_accepts_the_working_dir_itself_as_the_ancestor() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("main.py"), "").unwrap();
+
+        let hint = not_found_hint(&d.path().join("src"), d.path());
+
+        assert!(hint.contains("main.py"), "{hint}");
     }
 
     /// The canonical list of tool names `register_coding_tools` and
