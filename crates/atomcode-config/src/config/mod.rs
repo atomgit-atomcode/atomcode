@@ -7,6 +7,7 @@ pub mod provider_preset;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -918,28 +919,133 @@ fn legacy_provider_to_preset_id(provider_type: &str) -> &'static str {
     }
 }
 
-/// The `[providers.*]` keys the CodingPlan login flow writes: the bare `AtomGit`
-/// (single model) plus `AtomGit-<sanitized>` (multi-model). They all share one
+/// The prefix shipped before it became configurable.
+///
+/// Pinned here rather than in [`crate::endpoints`] on purpose: that module is
+/// the one a distribution replaces wholesale to retarget a build, and
+/// recognition of already-written `AtomGit-*` keys must survive that regardless
+/// of what the replacement says.
+const LEGACY_CODINGPLAN_PREFIX: &str = "AtomGit";
+
+/// Whether `name` is `prefix` itself or `prefix-<something>`.
+///
+/// The separator is what makes a key CodingPlan-managed, so `AtomGitx` and
+/// `AtomGit_GLM` are ordinary custom providers.
+fn name_matches_prefix(name: &str, prefix: &str) -> bool {
+    name == prefix
+        || name
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('-'))
+}
+
+/// The prefix set to recognise, given the one currently configured.
+///
+/// Always includes [`LEGACY_CODINGPLAN_PREFIX`]. A config written before the
+/// prefix changed still holds `AtomGit-*` keys; if those stopped being
+/// recognised they would silently degrade into ordinary custom providers — no
+/// plan info, and the next `/login` would leave them behind instead of
+/// replacing them. Recognising both means the next login adopts them on its own.
+fn prefixes_for(configured: &str) -> Vec<String> {
+    if configured == LEGACY_CODINGPLAN_PREFIX {
+        vec![configured.to_string()]
+    } else {
+        vec![configured.to_string(), LEGACY_CODINGPLAN_PREFIX.to_string()]
+    }
+}
+
+/// Prefixes recognised as CodingPlan-managed, resolved once per process.
+fn codingplan_prefixes() -> &'static [String] {
+    static PREFIXES: OnceLock<Vec<String>> = OnceLock::new();
+    PREFIXES.get_or_init(|| prefixes_for(crate::endpoints::codingplan_provider_prefix()))
+}
+
+/// The `[providers.*]` keys the CodingPlan login flow writes: the bare prefix
+/// (single model) plus `<prefix>-<sanitized>` (multi-model). They all share one
 /// gateway base_url + OAuth signer, so the projection folds them into one
 /// synthetic account per wire format rather than one account each.
 ///
 /// Single source of truth — `atomcode-codingplan` and `atomcode-tuix` delegate
 /// here instead of re-implementing the prefix rule.
 pub fn is_codingplan_provider_name(name: &str) -> bool {
-    name == "AtomGit" || name.starts_with("AtomGit-")
+    codingplan_prefixes()
+        .iter()
+        .any(|prefix| name_matches_prefix(name, prefix))
 }
 
 /// The synthetic account id a legacy CodingPlan provider folds into. An account
 /// carries exactly one preset (one wire format), so models are grouped by wire
-/// format: openai → `AtomGit`, claude → `AtomGit-anthropic`, ollama →
-/// `AtomGit-ollama`. Matches the ids the `/login` flow writes into the new
+/// format: openai → `<prefix>`, claude → `<prefix>-anthropic`, ollama →
+/// `<prefix>-ollama`. Matches the ids the `/login` flow writes into the new
 /// schema, so a re-login is a no-op transition. `pub` so `atomcode-codingplan`
 /// can label the login report by account.
 pub fn codingplan_group_account_id(provider_type: &str) -> &'static str {
+    // Cached so this keeps returning `&'static str` and every call site stays
+    // unchanged even though the prefix is now resolved at runtime.
+    static IDS: OnceLock<(String, String, String)> = OnceLock::new();
+    let (openai, anthropic, ollama) = IDS.get_or_init(|| {
+        let prefix = crate::endpoints::codingplan_provider_prefix();
+        (
+            prefix.to_string(),
+            format!("{prefix}-anthropic"),
+            format!("{prefix}-ollama"),
+        )
+    });
     match legacy_provider_to_preset_id(provider_type) {
-        "anthropic" => "AtomGit-anthropic",
-        "ollama" => "AtomGit-ollama",
-        _ => "AtomGit",
+        "anthropic" => anthropic.as_str(),
+        "ollama" => ollama.as_str(),
+        _ => openai.as_str(),
+    }
+}
+
+#[cfg(test)]
+mod codingplan_prefix_tests {
+    use super::*;
+
+    #[test]
+    fn default_prefix_recognises_exactly_what_it_always_did() {
+        assert!(is_codingplan_provider_name("AtomGit"));
+        assert!(is_codingplan_provider_name("AtomGit-GLM-5.2"));
+        assert!(is_codingplan_provider_name("AtomGit-anthropic"));
+        // A name that merely starts with the letters is not a CodingPlan key —
+        // the separator is what makes it one.
+        assert!(!is_codingplan_provider_name("AtomGitx"));
+        assert!(!is_codingplan_provider_name("AtomGit_GLM"));
+        assert!(!is_codingplan_provider_name("deepseek"));
+        assert!(!is_codingplan_provider_name(""));
+    }
+
+    #[test]
+    fn account_ids_group_by_wire_format() {
+        assert_eq!(codingplan_group_account_id("openai"), "AtomGit");
+        assert_eq!(codingplan_group_account_id("claude"), "AtomGit-anthropic");
+        assert_eq!(codingplan_group_account_id("ollama"), "AtomGit-ollama");
+    }
+
+    // `codingplan_prefixes` caches the configured prefix once per process, so
+    // the override path is covered through the two pure helpers it is built
+    // from — the same ones the shipped predicate calls, not copies of them.
+
+    #[test]
+    fn an_override_keeps_the_historical_prefix_in_the_set() {
+        assert_eq!(prefixes_for("Longyuan"), vec!["Longyuan", "AtomGit"]);
+        // No duplicate when the configured prefix already is the historical one.
+        assert_eq!(prefixes_for("AtomGit"), vec!["AtomGit"]);
+    }
+
+    #[test]
+    fn a_key_written_under_either_prefix_is_recognised() {
+        for prefix in prefixes_for("Longyuan") {
+            assert!(name_matches_prefix(&prefix, &prefix), "{prefix}");
+            assert!(
+                name_matches_prefix(&format!("{prefix}-GLM-5.2"), &prefix),
+                "{prefix}"
+            );
+        }
+        // A config written before the prefix changed must not degrade into an
+        // ordinary custom provider.
+        assert!(name_matches_prefix("AtomGit-GLM-5.2", "AtomGit"));
+        assert!(!name_matches_prefix("deepseek", "Longyuan"));
+        assert!(!name_matches_prefix("Longyuanx", "Longyuan"));
     }
 }
 
