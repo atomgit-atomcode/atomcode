@@ -1089,6 +1089,57 @@ impl RunningAgent {
         auto_compact_trigger(used, window, thresh)
     }
 
+    /// Give an in-kernel continuation the same automatic-compaction opportunity as
+    /// an external synthetic prompt. Internal continuations bypass `handle_prompt`,
+    /// so without this safe-boundary check a long hook-driven/verification turn can grow
+    /// past `compact_threshold` indefinitely.
+    ///
+    /// At most one attempt is made per POLICY STAGE (cheap rewrite vs slow summary)
+    /// per accepted turn. This prevents no-op thrashing without letting an early
+    /// threshold rewrite suppress a later high-pressure summary.
+    async fn compact_before_internal_continuation(
+        &self,
+        convo: &mut Conversation,
+        attempted_stages: &mut [bool; 2],
+    ) {
+        let Some(trigger) = self.should_compact(convo) else {
+            return;
+        };
+        let floor = convo.sacred_floor();
+        let (recorded_window, used_tokens) = convo
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == crate::message::Role::Assistant)
+            .and_then(|message| message.meta.as_ref())
+            .map(|meta| (meta.ctx_window, meta.used_tokens))
+            .unwrap_or((0, 0));
+        let live_window = self.provider.context_window();
+        let ctx_window = if live_window > 0 {
+            live_window
+        } else {
+            recorded_window
+        };
+        let utilization = if ctx_window > 0 {
+            used_tokens as f32 / ctx_window as f32
+        } else {
+            0.0
+        };
+        let stage = usize::from(self.compaction.will_summarize(&CompactionView {
+            messages: &convo.messages,
+            trigger: trigger.clone(),
+            ctx_window,
+            used_tokens,
+            utilization,
+            sacred_floor: floor,
+        }));
+        if attempted_stages[stage] {
+            return;
+        }
+        attempted_stages[stage] = true;
+        self.run_compaction(convo, trigger).await;
+    }
+
     /// Run one compaction: build a read-only `CompactionView` over the current
     /// history + the last assistant meta's pressure facts, ask the injected
     /// strategy to PLAN, then let the kernel APPLY it (`apply_plan` owns clamping,
@@ -1723,6 +1774,11 @@ impl RunningAgent {
         // output-limit truncation (`finish_reason=length`). Bounded by
         // `MAX_TRUNCATION_CONTINUATIONS` so endless truncation cannot livelock.
         let mut truncation_continuations: u32 = 0;
+        // Internal continuations do not pass through `handle_prompt`, which owns the
+        // normal task-boundary auto-compaction check. Bound the equivalent in-turn
+        // opportunity to one attempt per policy stage. A moderate-pressure stub
+        // must not block the strategy's later high-pressure summary stage.
+        let mut internal_auto_compaction_attempted_stages = [false; 2];
         // OVERFLOW recovery counter for the CURRENT round: incremented each time a hard
         // context-overflow triggers a compact-and-retry; reset to 0 on a successful open.
         let mut overflow_attempt: u8 = 0;
@@ -2785,6 +2841,11 @@ impl RunningAgent {
                 // does not pre-empt finishing the truncated content.
                 if truncated && truncation_continuations < MAX_TRUNCATION_CONTINUATIONS {
                     truncation_continuations += 1;
+                    self.compact_before_internal_continuation(
+                        convo,
+                        &mut internal_auto_compaction_attempted_stages,
+                    )
+                    .await;
                     convo.push(Message::synthetic_user(TRUNCATION_RESUME_NUDGE.to_string()));
                     continue;
                 }
@@ -2807,6 +2868,11 @@ impl RunningAgent {
                         }
                     }
                     continuations += 1;
+                    self.compact_before_internal_continuation(
+                        convo,
+                        &mut internal_auto_compaction_attempted_stages,
+                    )
+                    .await;
                     let Continuation {
                         text,
                         kind,
@@ -4154,6 +4220,264 @@ mod auto_compact_trigger_tests {
             }
             other => panic!("expected Auto, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod internal_continuation_compaction_tests {
+    use super::*;
+    use crate::message::CompactionPlan;
+    use crate::stream::{StreamEvent, TokenUsage};
+    use crate::testkit::{MockProvider, ObservingTurnEndHook};
+    use crate::tool::ToolRegistry;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    struct ContinueTwiceHook(Mutex<u8>);
+
+    #[async_trait]
+    impl LifecycleHooks for ContinueTwiceHook {
+        async fn offer_continuation(&self, _convo: &Conversation) -> Option<String> {
+            let mut calls = self.0.lock().unwrap();
+            let reply = (*calls < 2).then(|| format!("continue-{}", *calls + 1));
+            *calls += 1;
+            reply
+        }
+    }
+
+    struct TwoStageNoopCompaction {
+        plans: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CompactionStrategy for TwoStageNoopCompaction {
+        async fn plan(&self, _view: &CompactionView<'_>) -> CompactionPlan {
+            self.plans.fetch_add(1, Ordering::Relaxed);
+            CompactionPlan::noop()
+        }
+
+        fn will_summarize(&self, view: &CompactionView<'_>) -> bool {
+            view.utilization >= 0.78
+        }
+    }
+
+    async fn run_hook_continuation(
+        prompt_tokens: u32,
+    ) -> (Vec<AgentEvent>, Vec<Vec<(String, String)>>) {
+        let provider = Arc::new(
+            MockProvider::new(vec![
+                vec![
+                    StreamEvent::TextDelta("working".into()),
+                    StreamEvent::Usage(TokenUsage {
+                        prompt: prompt_tokens,
+                        completion: 1,
+                        cached: 0,
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ],
+                vec![
+                    StreamEvent::TextDelta("done".into()),
+                    StreamEvent::Done { truncated: false },
+                ],
+            ])
+            .with_ctx_window(1_000),
+        );
+        let received = provider.received.clone();
+        let hook_log = Arc::new(Mutex::new(Vec::new()));
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(ToolRegistry::new().mount(&[]))
+            .hooks(Arc::new(ObservingTurnEndHook::new(
+                "continue-once",
+                Some("keep going".into()),
+                hook_log,
+            )))
+            .compact_threshold(0.7)
+            .build()
+            .spawn();
+
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "start".into(),
+                images: vec![],
+            })
+            .unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = handle.events.recv().await {
+            let complete = matches!(event, AgentEvent::TurnComplete { .. });
+            events.push(event);
+            if complete {
+                break;
+            }
+        }
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
+        let calls = received.lock().unwrap().clone();
+        (events, calls)
+    }
+
+    #[tokio::test]
+    async fn hook_continuation_compacts_at_threshold_before_next_round() {
+        let (events, calls) = run_hook_continuation(700).await;
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Compacted {
+                    trigger: CompactTrigger::Auto { .. },
+                    ..
+                }
+            )),
+            "an internal continuation at the configured threshold must offer compaction"
+        );
+        assert_eq!(
+            calls.len(),
+            2,
+            "the continuation must still reach the provider"
+        );
+        assert!(
+            calls[1]
+                .iter()
+                .any(|(role, text)| role == "User" && text == "keep going"),
+            "the hook's synthetic continuation must survive the compaction boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_continuation_below_threshold_does_not_compact() {
+        let (events, calls) = run_hook_continuation(699).await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Compacted { .. })),
+            "below-threshold internal continuations must remain cache-preserving"
+        );
+        assert_eq!(calls.len(), 2, "the continuation must still run normally");
+    }
+
+    #[tokio::test]
+    async fn later_summary_stage_is_not_blocked_by_an_earlier_noop_stage() {
+        let provider = Arc::new(
+            MockProvider::new(vec![
+                vec![
+                    StreamEvent::TextDelta("moderate pressure".into()),
+                    StreamEvent::Usage(TokenUsage {
+                        prompt: 700,
+                        completion: 1,
+                        cached: 0,
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ],
+                vec![
+                    StreamEvent::TextDelta("high pressure".into()),
+                    StreamEvent::Usage(TokenUsage {
+                        prompt: 780,
+                        completion: 1,
+                        cached: 0,
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ],
+                vec![StreamEvent::Done { truncated: false }],
+            ])
+            .with_ctx_window(1_000),
+        );
+        let compaction = Arc::new(TwoStageNoopCompaction {
+            plans: AtomicUsize::new(0),
+        });
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(ToolRegistry::new().mount(&[]))
+            .hooks(Arc::new(ContinueTwiceHook(Mutex::new(0))))
+            .compaction(compaction.clone())
+            .compact_threshold(0.7)
+            .build()
+            .spawn();
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "start".into(),
+                images: vec![],
+            })
+            .unwrap();
+
+        while let Some(event) = handle.events.recv().await {
+            if matches!(event, AgentEvent::TurnComplete { .. }) {
+                break;
+            }
+        }
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
+
+        assert_eq!(
+            compaction.plans.load(Ordering::Relaxed),
+            2,
+            "the policy's summary stage must get a fresh attempt after a noop rewrite stage"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncation_recovery_uses_the_same_safe_compaction_boundary() {
+        let provider = Arc::new(
+            MockProvider::new(vec![
+                vec![
+                    StreamEvent::TextDelta("partial".into()),
+                    StreamEvent::Usage(TokenUsage {
+                        prompt: 700,
+                        completion: 10,
+                        cached: 0,
+                    }),
+                    StreamEvent::Done { truncated: true },
+                ],
+                vec![
+                    StreamEvent::TextDelta("finished".into()),
+                    StreamEvent::Done { truncated: false },
+                ],
+            ])
+            .with_ctx_window(1_000),
+        );
+        let received = provider.received.clone();
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(ToolRegistry::new().mount(&[]))
+            .compact_threshold(0.7)
+            .build()
+            .spawn();
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "start".into(),
+                images: vec![],
+            })
+            .unwrap();
+
+        let mut saw_auto_compaction = false;
+        while let Some(event) = handle.events.recv().await {
+            if matches!(
+                &event,
+                AgentEvent::Compacted {
+                    trigger: CompactTrigger::Auto { .. },
+                    ..
+                }
+            ) {
+                saw_auto_compaction = true;
+            }
+            if matches!(event, AgentEvent::TurnComplete { .. }) {
+                break;
+            }
+        }
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
+
+        assert!(
+            saw_auto_compaction,
+            "output-limit recovery must not bypass threshold compaction"
+        );
+        let calls = received.lock().unwrap();
+        assert_eq!(calls.len(), 2, "truncation recovery must still continue");
+        assert!(calls[1]
+            .iter()
+            .any(|(role, text)| role == "User" && text.contains("Output limit hit")));
     }
 }
 
