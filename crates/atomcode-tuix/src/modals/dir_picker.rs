@@ -284,9 +284,16 @@ fn build_menu_payload(p: &DirPicker) -> MenuPayload {
             String::new(),
         ));
     } else {
+        // The working dir can appear more than once (e.g. as an absolute path and as
+        // `.`), all `paths_same` to `current`. Label only the FIRST occurrence so the
+        // list never shows two "current" markers.
+        let mut current_labeled = false;
         items.extend(filtered.iter().map(|d| {
             let name = crate::platform::collapse_home(&d.to_string_lossy());
-            let desc = if crate::event_loop::commands::paths_same(d, &p.current) {
+            let desc = if !current_labeled
+                && crate::event_loop::commands::paths_same(d, &p.current)
+            {
+                current_labeled = true;
                 crate::i18n::t(crate::i18n::Msg::DirCurrent).into_owned()
             } else {
                 String::new()
@@ -579,6 +586,23 @@ mod tests {
         let payload = build_menu_payload(&p);
         assert_eq!(payload.items[DIR_HEADER_ROWS].1, "");
         assert_eq!(payload.items[DIR_HEADER_ROWS + 1].1, "current");
+    }
+
+    #[test]
+    fn menu_payload_marks_only_the_first_current_dir() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        // The working dir can appear twice in the list (e.g. as an absolute path and
+        // as `.`), and both would be `paths_same` to `current`. Only ONE entry may
+        // carry the "current" label — two "current" markers is a bug.
+        let p = DirPicker::open(vec![pb("/proj"), pb("/proj")], pb("/proj"));
+        let payload = build_menu_payload(&p);
+        assert_eq!(payload.items[DIR_HEADER_ROWS].1, "current", "first match labeled");
+        assert_eq!(
+            payload.items[DIR_HEADER_ROWS + 1].1,
+            "",
+            "the aliased second occurrence must NOT be labeled current"
+        );
     }
 
     #[test]

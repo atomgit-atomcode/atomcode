@@ -1983,6 +1983,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         rule_width: usize,
         kind: super::MenuKind,
     ) -> Vec<Cell> {
+        // Directory picker rows render their own two-colour layout (path + a muted
+        // "current" label right after it), so they don't share the right-aligned desc
+        // path with TwoColumn.
+        if let super::MenuKind::DirectoryList = kind {
+            return self.build_directory_menu_row(name, desc, selected, rule_width);
+        }
         let mut row = Vec::new();
         // Both menu kinds hug the left edge — content prefixes (`▸ /`
         // or `+ `) carry the visual structure. The previous PAD_COL
@@ -2192,6 +2198,77 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     style: style.clone(),
                     width: 1,
                 });
+            }
+        }
+        row
+    }
+
+    /// Directory picker row: `▸ <path>  <label>`. The optional "current" label sits
+    /// right after the path in a muted grey, distinct from the path — not right-aligned
+    /// to the far edge like TwoColumn metadata.
+    fn build_directory_menu_row(
+        &self,
+        name: &str,
+        desc: &str,
+        selected: bool,
+        rule_width: usize,
+    ) -> Vec<Cell> {
+        let full_w = rule_width + PAD_COL * 2;
+        let marker = "▸";
+        let marker_w = unicode_width::UnicodeWidthStr::width(marker);
+        let indicator_w = marker_w + 1;
+        let indicator = if selected {
+            format!("{} ", marker)
+        } else {
+            " ".repeat(indicator_w)
+        };
+        let name_style = if selected {
+            self.session_highlight_style()
+        } else {
+            self.style_for(Role::Secondary)
+        };
+        // Calm, theme-adaptive muted grey for the "current" label. Faint Secondary is
+        // the codebase's canonical muted hint; a fixed DarkGrey can vanish on some dark
+        // presets (see build_menu_row's note).
+        let label_style = self.style_faint(Role::Secondary);
+
+        let mut row = Vec::new();
+        push_str_cells_sgr(&mut row, &indicator, name_style.clone());
+
+        let name_w = unicode_width::UnicodeWidthStr::width(name);
+        if desc.is_empty() {
+            let avail = full_w.saturating_sub(indicator_w);
+            let (shown, shown_w) = if name_w <= avail {
+                (name.to_string(), name_w)
+            } else {
+                let t = crate::width::truncate_to_width(name, avail);
+                let w = unicode_width::UnicodeWidthStr::width(t.as_str());
+                (t, w)
+            };
+            push_str_cells_sgr(&mut row, &shown, name_style.clone());
+            let rest = full_w.saturating_sub(indicator_w + shown_w);
+            for _ in 0..rest {
+                row.push(Cell { ch: ' ', style: name_style.clone(), width: 1 });
+            }
+        } else {
+            let sep = 2usize;
+            let desc_w = unicode_width::UnicodeWidthStr::width(desc);
+            let avail = full_w.saturating_sub(indicator_w);
+            let max_name = avail.saturating_sub(sep + desc_w);
+            let (shown_name, shown_name_w) = if name_w <= max_name {
+                (name.to_string(), name_w)
+            } else {
+                let t = crate::width::truncate_to_width(name, max_name);
+                let w = unicode_width::UnicodeWidthStr::width(t.as_str());
+                (t, w)
+            };
+            push_str_cells_sgr(&mut row, &shown_name, name_style.clone());
+            push_str_cells_sgr(&mut row, &" ".repeat(sep), name_style.clone());
+            push_str_cells_sgr(&mut row, desc, label_style.clone());
+            let used = indicator_w + shown_name_w + sep + desc_w;
+            let rest = full_w.saturating_sub(used);
+            for _ in 0..rest {
+                row.push(Cell { ch: ' ', style: name_style.clone(), width: 1 });
             }
         }
         row
@@ -10138,6 +10215,30 @@ mod tests {
             RetainedRenderer::<CountingSink>::session_item_height(h0 + 5),
             3
         );
+    }
+
+    #[test]
+    fn directory_menu_row_places_current_label_after_path_in_muted() {
+        let (mut r, _c) = new_counting(80, 24);
+        r.caps.colors = true;
+        let row =
+            r.build_menu_row("~/proj", "current", false, 70, crate::render::MenuKind::DirectoryList);
+        let cells: Vec<(char, bool)> = row
+            .iter()
+            .filter(|c| c.width > 0)
+            .map(|c| (c.ch, c.style.faint))
+            .collect();
+        let s: String = cells.iter().map(|(c, _)| *c).collect();
+        // The "current" label sits right after the path (2-space gap), not right-aligned
+        // to the far edge.
+        assert!(s.contains("~/proj  current"), "label adjacent to path: {s:?}");
+        let idx = s.find("current").expect("current label present");
+        // The label is muted (faint); the path is not.
+        for (ch, faint) in &cells[idx..idx + "current".len()] {
+            assert!(*faint, "label char {ch:?} must be muted/faint");
+        }
+        let pidx = s.find("~/proj").unwrap();
+        assert!(!cells[pidx].1, "path must not be faint");
     }
 
     #[test]
