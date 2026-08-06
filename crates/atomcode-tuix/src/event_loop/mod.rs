@@ -19849,10 +19849,22 @@ fn goal_terminal_is_met(terminal: Option<atomcode_coding::GoalTerminal>) -> bool
     terminal == Some(atomcode_coding::GoalTerminal::Met)
 }
 
+/// Whether the per-turn stats separator should be DEFERRED (buffered) rather than
+/// rendered now, on account of an active goal. It is deferred ONLY while the goal
+/// is still `Pursuing` (a mid-goal round whose separator the next round banner or
+/// the goal-end flush will render). Once the goal reaches a terminal/paused phase
+/// (`Satisfied`/`PausedAtCap`/`Ended`) the round is over and the separator must
+/// render immediately: a persistent goal keeps `goal_condition` set through the
+/// terminal `TurnComplete`, and the goal-end `GoalChanged` (processed first) already
+/// ran its flush against an empty buffer — deferring here would orphan the stats line.
+fn goal_defers_turn_separator(goal_condition_set: bool, phase: atomcode_coding::GoalPhase) -> bool {
+    goal_condition_set && matches!(phase, atomcode_coding::GoalPhase::Pursuing)
+}
+
 #[cfg(test)]
 mod goal_end_tests {
-    use super::goal_terminal_is_met;
-    use atomcode_coding::GoalTerminal;
+    use super::{goal_defers_turn_separator, goal_terminal_is_met};
+    use atomcode_coding::{GoalPhase, GoalTerminal};
 
     #[test]
     fn only_explicit_met_terminal_is_successful() {
@@ -19861,6 +19873,21 @@ mod goal_end_tests {
         assert!(!goal_terminal_is_met(Some(GoalTerminal::Stopped)));
         assert!(!goal_terminal_is_met(Some(GoalTerminal::Cancelled)));
         assert!(!goal_terminal_is_met(None));
+    }
+
+    // Regression: a persistent goal keeps `goal_condition` set through the
+    // terminal TurnComplete. The stats separator must only be DEFERRED while the
+    // goal is still Pursuing; once it reaches Satisfied/PausedAtCap/Ended the round
+    // is over and the separator must render immediately (deferring orphans it,
+    // because the goal-end flush already ran empty before this TurnComplete).
+    #[test]
+    fn separator_defers_only_while_pursuing() {
+        assert!(goal_defers_turn_separator(true, GoalPhase::Pursuing));
+        assert!(!goal_defers_turn_separator(true, GoalPhase::Satisfied));
+        assert!(!goal_defers_turn_separator(true, GoalPhase::PausedAtCap));
+        assert!(!goal_defers_turn_separator(true, GoalPhase::Ended));
+        // No goal at all → never defer (render directly).
+        assert!(!goal_defers_turn_separator(false, GoalPhase::Pursuing));
     }
 }
 
@@ -20561,11 +20588,14 @@ fn handle_agent_event(
             } else {
                 (total_tokens, None)
             };
-            if state.goal_condition.is_some() {
-                // A /goal is active: DEFER the separator so the next event can
-                // choose its form — a `✓ Goal met` banner ABOVE a stats-only
-                // line when the goal ends (GoalUpdate active=false), or the
+            if goal_defers_turn_separator(state.goal_condition.is_some(), state.goal_phase) {
+                // A /goal is actively PURSUING more rounds: DEFER the separator so
+                // the next event can choose its form — a `✓ Goal met` banner ABOVE a
+                // stats-only line when the goal ends (GoalUpdate active=false), or the
                 // `↻ goal round N` banner mid-goal (flushed by should_flush_now).
+                // Once the goal is Satisfied/PausedAtCap/Ended the round is over, so
+                // we fall through to render the separator directly (persistence keeps
+                // `goal_condition` set, but the goal-end flush already ran empty).
                 // `errored` rides along as a defensive fallback.
                 state.pending_separator = Some(crate::state::PendingSeparator {
                     duration,
