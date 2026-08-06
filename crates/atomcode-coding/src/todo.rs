@@ -10,6 +10,9 @@ use atomcode_capabilities::tools::todo::{
 };
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::{Conversation, Message, Role};
+use atomcode_kernel::provider::{ChatOptions, ToolChoice};
+
+use atomcode_config::config::TodoEagerness;
 
 /// Injected when the model tries to STOP while the task list still has open items — the
 /// residual weak-model gap after incremental `todo` updates land: it does the last item's work
@@ -23,6 +26,71 @@ through them. Only stop with open items if you genuinely need approval/input, ar
 request is ambiguous — in that case say so briefly.";
 
 pub struct TodoHook;
+
+/// High-recency todo activation policy. Unlike `TodoHook`, this only acts on
+/// round one of a real user turn and only while no structured list exists.
+pub struct TodoEagerHook {
+    eagerness: TodoEagerness,
+}
+
+impl TodoEagerHook {
+    pub fn new(model: &str, provider_type: &str, configured: TodoEagerness) -> Self {
+        let normalized = model.to_ascii_lowercase().replace(['_', ' '], "-");
+        let mut eagerness = match configured {
+            TodoEagerness::Auto
+                if normalized.contains("deepseek")
+                    && normalized.contains("v4")
+                    && normalized.contains("flash") =>
+            {
+                TodoEagerness::Preferred
+            }
+            TodoEagerness::Auto => TodoEagerness::Auto,
+            other => other,
+        };
+        if eagerness == TodoEagerness::Always && provider_type.eq_ignore_ascii_case("ollama") {
+            eprintln!(
+                "[todo] eager=always is unsupported by provider type ollama; using preferred"
+            );
+            eagerness = TodoEagerness::Preferred;
+        }
+        Self { eagerness }
+    }
+
+    fn should_activate(&self, messages: &[Message], ctx: &TurnCtx) -> bool {
+        let todos = derive_current_todos(messages);
+        ctx.round == 1
+            && self.eagerness != TodoEagerness::Auto
+            && todos
+                .iter()
+                .all(|todo| todo.status == TodoStatus::Completed)
+    }
+}
+
+#[async_trait]
+impl LifecycleHooks for TodoEagerHook {
+    async fn pre_request(&self, messages: &mut Vec<Message>, ctx: &TurnCtx) {
+        if !self.should_activate(messages, ctx) {
+            return;
+        }
+        let lead = if self.eagerness == TodoEagerness::Always {
+            "You MUST call `todowrite` now, before any other tool or prose, to create the task list."
+        } else {
+            "Before acting, decide whether this task benefits from a todo list. If it has multiple requests, phases, files, dependencies, ambiguity, or requires investigation plus changes, call `todowrite` now. Skip it only for a genuinely simple one-step or purely informational request."
+        };
+        messages.push(Message::user(system_reminder(lead)));
+    }
+
+    async fn pre_request_options(
+        &self,
+        messages: &[Message],
+        options: &mut ChatOptions,
+        ctx: &TurnCtx,
+    ) {
+        if self.eagerness == TodoEagerness::Always && self.should_activate(messages, ctx) {
+            options.tool_choice = ToolChoice::Specific("todowrite".to_string());
+        }
+    }
+}
 
 /// Index of the current real-user turn's start (last non-synthetic user message).
 fn current_real_user_start(convo: &Conversation) -> usize {
@@ -249,6 +317,92 @@ mod tests {
         let before = msgs.len();
         TodoHook.pre_request(&mut msgs, &TurnCtx::default()).await;
         assert_eq!(msgs.len(), before, "empty list → no injection");
+    }
+
+    #[tokio::test]
+    async fn auto_prefers_deepseek_v4_flash_on_each_new_task() {
+        let hook = TodoEagerHook::new("deepseek-v4-flash", "openai", TodoEagerness::Auto);
+        let mut msgs = vec![Message::user("analyze and fix this")];
+        hook.pre_request(
+            &mut msgs,
+            &TurnCtx {
+                round: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(msgs.last().unwrap().text.contains("todowrite"));
+    }
+
+    #[tokio::test]
+    async fn auto_policy_is_resolved_again_for_a_model_generation() {
+        let ctx = TurnCtx {
+            round: 1,
+            ..Default::default()
+        };
+        let mut ordinary = vec![Message::user("analyze and fix this")];
+        TodoEagerHook::new("ordinary-model", "openai", TodoEagerness::Auto)
+            .pre_request(&mut ordinary, &ctx)
+            .await;
+        assert_eq!(ordinary.len(), 1, "ordinary Auto stays quiet");
+
+        let mut deepseek = vec![Message::user("analyze and fix this")];
+        TodoEagerHook::new("deepseek-v4-flash", "openai", TodoEagerness::Auto)
+            .pre_request(&mut deepseek, &ctx)
+            .await;
+        assert_eq!(deepseek.len(), 2, "new DeepSeek generation gets the nudge");
+    }
+
+    #[tokio::test]
+    async fn always_selects_todowrite_only_without_an_existing_list() {
+        let hook = TodoEagerHook::new("any-model", "openai", TodoEagerness::Always);
+        let ctx = TurnCtx {
+            round: 1,
+            ..Default::default()
+        };
+        let messages = vec![Message::user("do several things")];
+        let mut options = ChatOptions::default();
+        hook.pre_request_options(&messages, &mut options, &ctx)
+            .await;
+        assert_eq!(
+            options.tool_choice,
+            ToolChoice::Specific("todowrite".into())
+        );
+
+        let with_list = vec![
+            Message::user("continue"),
+            todowrite_msg(r#"{"todos":[{"content":"a","status":"pending"}]}"#),
+        ];
+        let mut options = ChatOptions::default();
+        hook.pre_request_options(&with_list, &mut options, &ctx)
+            .await;
+        assert_eq!(options.tool_choice, ToolChoice::Auto);
+
+        let completed_list = vec![
+            Message::user("finish old task"),
+            todowrite_msg(r#"{"todos":[{"content":"old","status":"completed"}]}"#),
+            Message::user("start a different task"),
+        ];
+        let mut options = ChatOptions::default();
+        hook.pre_request_options(&completed_list, &mut options, &ctx)
+            .await;
+        assert_eq!(
+            options.tool_choice,
+            ToolChoice::Specific("todowrite".into()),
+            "a completed historical list must not suppress planning for a new task"
+        );
+    }
+
+    #[test]
+    fn always_degrades_explicitly_for_ollama() {
+        let hook = TodoEagerHook::new("any-model", "ollama", TodoEagerness::Always);
+        assert_eq!(hook.eagerness, TodoEagerness::Preferred);
+    }
+
+    #[test]
+    fn always_remains_strict_for_supported_adapters() {
+        let hook = TodoEagerHook::new("any-model", "openai", TodoEagerness::Always);
+        assert_eq!(hook.eagerness, TodoEagerness::Always);
     }
 
     // ---- offer_continuation: close out the last item ---------------------------------------

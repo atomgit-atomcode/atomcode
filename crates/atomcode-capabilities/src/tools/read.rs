@@ -2,7 +2,7 @@
 //! slicing. Non-destructive ⇒ always `Safe`. Neutral core ported from the production
 //! reader, minus the coding enrichments (semantic skeleton, read_cache, file_store).
 
-use super::{err, looks_binary, ok, ok_with_images, resolve_path};
+use super::{err, looks_binary, not_found_hint, ok, ok_with_images, resolve_path};
 use async_trait::async_trait;
 use atomcode_kernel::message::ImageContent;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
@@ -82,19 +82,34 @@ where
         F(f64),
         S(String),
     }
-    // Reject negative / NaN rather than silently clamping to 0 — an out-of-domain
-    // line number is a model error worth surfacing, not a value to guess at. Mirrors
-    // the v1 deserializer policy (tolerate float/string REPRESENTATIONS of a
-    // non-negative integer; reject negative & NaN).
+    // Be lenient about the representation, not the value: weak models commonly
+    // emit `50.0`/`"50.0"` for an integer field, but a true fraction has no
+    // unambiguous offset/limit meaning. Reject invalid and out-of-range values
+    // instead of letting Rust's float cast silently truncate or saturate them.
     fn checked(f: f64) -> Result<usize, &'static str> {
-        if f < 0.0 || f.is_nan() {
-            return Err("negative or NaN value not allowed");
+        // Near the IEEE-754 safe-integer edge, the serde_json + untagged path
+        // can already map adjacent decimal spellings to the same f64. Keep a
+        // conservative guard below that edge; callers can still send an exact
+        // JSON integer or integer string, both handled without f64.
+        const FLOAT_INTEGER_EXACT_LIMIT: f64 = 4_503_599_627_370_496.0; // 2^52
+        if !f.is_finite() || f < 0.0 {
+            return Err("negative or non-finite value not allowed");
         }
-        Ok(f as usize)
+        if f.fract() != 0.0 {
+            return Err("fractional value not allowed");
+        }
+        if f >= FLOAT_INTEGER_EXACT_LIMIT {
+            return Err("floating-point integer exceeds exact range");
+        }
+        let n = f as u128;
+        usize::try_from(n).map_err(|_| "value exceeds usize range")
     }
     Ok(match Option::<Num>::deserialize(d)? {
         None => None,
-        Some(Num::U(n)) => Some(n as usize),
+        Some(Num::U(n)) => Some(
+            usize::try_from(n)
+                .map_err(|_| serde::de::Error::custom("value exceeds usize range"))?,
+        ),
         Some(Num::F(f)) => Some(checked(f).map_err(serde::de::Error::custom)?),
         Some(Num::S(s)) => {
             let t = s.trim();
@@ -153,9 +168,10 @@ impl Tool for ReadFileTool {
             Ok(m) => m,
             Err(_) => {
                 return err(format!(
-                    "Error: no such file: {} (resolved to {})",
+                    "Error: no such file: {} (resolved to {}){}",
                     a.file_path,
-                    crate::pathnorm::to_display(&path)
+                    crate::pathnorm::to_display(&path),
+                    not_found_hint(&path, &ctx.working_dir).await
                 ))
             }
         };
@@ -405,25 +421,68 @@ mod tests {
     }
 
     #[test]
-    fn lenient_usize_rejects_negative_and_nan() {
-        // Negative / NaN are out-of-domain → reject (don't silently clamp to 0),
-        // matching the v1 deserializer policy. Covers both the float branch and
-        // the string→float fallback.
+    fn lenient_usize_rejects_out_of_domain_values() {
+        // Leniency covers integer representations only. It must not guess a
+        // fractional value, accept a non-finite value, or saturate overflow.
         for bad in [
             r#"{"file_path":"x","offset":-5.0}"#,  // negative float
             r#"{"file_path":"x","offset":-5}"#,    // bare negative int (untagged → f64)
             r#"{"file_path":"x","limit":"-5"}"#,   // negative as string
             r#"{"file_path":"x","offset":"NaN"}"#, // NaN as string
+            r#"{"file_path":"x","offset":"Infinity"}"#,
+            r#"{"file_path":"x","offset":3.9}"#,
+            r#"{"file_path":"x","limit":"3.9"}"#,
+            r#"{"file_path":"x","offset":"340282366920938463463374607431768211455"}"#,
         ] {
             assert!(
                 serde_json::from_str::<Args>(bad).is_err(),
                 "should reject out-of-domain numeric: {bad}"
             );
         }
-        // Representation leniency is preserved: non-negative float / string still OK.
-        assert!(
-            serde_json::from_str::<Args>(r#"{"file_path":"x","offset":2.0,"limit":"3.0"}"#).is_ok()
-        );
+        let args: Args =
+            serde_json::from_str(r#"{"file_path":"x","offset":2.0,"limit":"3.0"}"#).unwrap();
+        assert_eq!(args.offset, Some(2));
+        assert_eq!(args.limit, Some(3));
+    }
+
+    #[test]
+    fn lenient_usize_checks_platform_range_without_saturation() {
+        let max = usize::MAX.to_string();
+        let args: Args =
+            serde_json::from_str(&format!(r#"{{"file_path":"x","offset":"{max}"}}"#)).unwrap();
+        assert_eq!(args.offset, Some(usize::MAX));
+
+        let overflow = (usize::MAX as u128 + 1).to_string();
+        for input in [
+            format!(r#"{{"file_path":"x","offset":{overflow}}}"#),
+            format!(r#"{{"file_path":"x","offset":"{overflow}"}}"#),
+        ] {
+            assert!(
+                serde_json::from_str::<Args>(&input).is_err(),
+                "must reject a value above this platform's usize range: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn lenient_usize_rejects_ambiguous_f64_integers() {
+        // The first value is exact, but must be rejected conservatively because
+        // the second distinct decimal input decodes to the same f64 value.
+        for input in [
+            r#"{"file_path":"x","offset":4503599627370496.0}"#,
+            r#"{"file_path":"x","offset":9007199254740992.0}"#,
+            r#"{"file_path":"x","offset":9007199254740993.0}"#,
+            r#"{"file_path":"x","offset":"9007199254740993.0"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Args>(input).is_err(),
+                "ambiguous f64 integer must be rejected: {input}"
+            );
+        }
+
+        let args: Args =
+            serde_json::from_str(r#"{"file_path":"x","offset":4503599627370495.0}"#).unwrap();
+        assert_eq!(args.offset, Some(4_503_599_627_370_495));
     }
 
     #[tokio::test]
@@ -589,6 +648,29 @@ mod tests {
             .await;
         assert!(r.is_error);
         assert!(r.content.contains("no such file"), "{}", r.content);
+    }
+
+    /// `read_file` is the single biggest source of not-found failures in the field (234 in 14
+    /// days), for the same reason as grep/glob: a guessed path with no clue about where the
+    /// tree actually stops.
+    #[tokio::test]
+    async fn missing_file_error_carries_the_nearest_existing_ancestor() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("app")).unwrap();
+        std::fs::write(d.path().join("app/build.gradle"), "").unwrap();
+        let r = ReadFileTool::default()
+            .execute(
+                r#"{"file_path":"app/src/main/AndroidManifest.xml"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(r.is_error, "{}", r.content);
+        assert!(
+            r.content.contains("Nearest existing directory"),
+            "{}",
+            r.content
+        );
+        assert!(r.content.contains("build.gradle"), "{}", r.content);
     }
 
     #[tokio::test]

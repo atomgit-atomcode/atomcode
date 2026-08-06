@@ -44,13 +44,14 @@ pub(crate) fn is_attempt_metadata_event(event: &StreamEvent) -> bool {
 
 /// How long an idle keep-alive connection may sit in the pool before we drop
 /// it. reqwest's default is 90s; gateway load balancers commonly close idle
-/// connections sooner (≈60s), so the default lets us reuse a connection the
-/// server has already closed — surfacing as "error sending request"
-/// (`ConnectionReset`). Dropping our side at 30s keeps us under typical LB
-/// windows; the broadened retry classifier ([`is_retryable_reqwest_error`])
-/// is the correctness backstop if a stale connection is reused anyway. Only
-/// affects *idle* connections — an active stream is never reaped.
-pub(crate) const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// connections sooner. 30s proved too generous against a real gateway — half-open
+/// reuse there surfaced as hyper `IncompleteMessage` (see
+/// [`chain_has_incomplete_message`]), a class the old classifier hard-failed.
+/// 15s stays well under observed LB windows while keeping reuse for the
+/// back-to-back requests of a tool loop (their gaps are far below 15s).
+/// The broadened classifier + pool rebuild remain the correctness backstop.
+/// Only affects *idle* connections — an active stream is never reaped.
+pub(crate) const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Retry configuration for the open call.
 #[derive(Debug, Clone)]
@@ -110,10 +111,15 @@ pub(crate) fn should_retry_open_status(code: u16, owner: RateLimitRetryOwner) ->
 /// hard-failed (the user-reported "open failed" that `/login` "fixed" by
 /// rebuilding the client's pool). We now also walk the source chain for a
 /// transient transport `io::Error` so the open loop reconnects transparently.
+///
+/// The same drop can also surface WITHOUT an io cause — as hyper's
+/// `IncompleteMessage` ("connection closed before message completed"), which
+/// [`chain_has_incomplete_message`] covers; both forms are unified under
+/// [`is_stale_connection_error`].
 pub(crate) fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
     err.is_timeout()
         || err.is_connect()
-        || chain_has_transient_io(err)
+        || is_stale_connection_error(err)
         || chain_has_tls_corruption(err)
 }
 
@@ -187,6 +193,40 @@ pub(crate) fn chain_has_tls_corruption(err: &(dyn std::error::Error + 'static)) 
     false
 }
 
+/// True if any error in `err`'s `source()` chain is a hyper `IncompleteMessage` —
+/// the server (or an LB in front of it) closed the connection before the response
+/// message completed. This class does NOT wrap an `io::Error`, so
+/// [`chain_has_transient_io`] cannot see it, and `is_timeout()`/`is_connect()` are
+/// both false for it; it surfaced as a hard-failed
+/// `open failed: … connection closed before message completed` with ZERO retries.
+///
+/// CAUTION: this does not prove the server never processed the request — see the
+/// replay-risk note on [`is_stale_connection_error`].
+pub(crate) fn chain_has_incomplete_message(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if let Some(h) = e.downcast_ref::<hyper::Error>() {
+            if h.is_incomplete_message() {
+                return true;
+            }
+        }
+        cur = e.source();
+    }
+    false
+}
+
+/// A pooled connection the peer had already closed (half-open reuse). Rebuilding the
+/// client's connection pool is the ONLY effective remedy — retrying without a rebuild
+/// just grabs another dead socket from the same pool.
+///
+/// REPLAY RISK: neither form proves the server failed to receive or process the
+/// request. Retrying may cause a duplicate inference (and duplicate billing). This is
+/// accepted deliberately — the alternative is a hard failure after the user already
+/// waited minutes — but callers must NOT describe it as a safe/idempotent replay.
+pub(crate) fn is_stale_connection_error(err: &reqwest::Error) -> bool {
+    chain_has_transient_io(err) || chain_has_incomplete_message(err)
+}
+
 /// Render an error plus its full `source()` chain as `top: cause: root`.
 /// reqwest's Display for a transport failure is only the opaque shell
 /// ("error sending request for url (…)"); the actionable cause
@@ -215,7 +255,9 @@ pub(crate) fn stream_read_error_message(
     err: &(dyn std::error::Error + 'static),
     recovery: StreamReadRecovery,
 ) -> String {
-    if chain_has_transient_io(err) {
+    // `IncompleteMessage` (connection closed before message completed) belongs to the
+    // same transport class: it is a dropped connection, not a malformed body.
+    if chain_has_transient_io(err) || chain_has_incomplete_message(err) {
         // Each recovery mode owns its full lead sentence — the PartialResponse
         // case is NOT a bare connection drop (we kept output), so it must not be
         // wrapped in the "网络连接中断" framing that fits RetryExhausted.
@@ -801,5 +843,57 @@ mod tests {
             name: None,
             arguments: "{".into(),
         }));
+    }
+
+    /// Spin up a server that reads the request then closes the connection immediately,
+    /// reproducing the real shape of `connection closed before message completed`.
+    /// A hand-built `reqwest::Error` cannot reproduce hyper's internal kind.
+    async fn incomplete_message_error() -> reqwest::Error {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+            }
+        });
+        reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .body("{}")
+            .send()
+            .await
+            .expect_err("the server closes the connection, so this must be an Err")
+    }
+
+    #[tokio::test]
+    async fn incomplete_message_is_retryable_and_stale() {
+        let e = incomplete_message_error().await;
+        // Precondition — the ROOT CAUSE of the bug: none of the three existing
+        // predicates can see this error.
+        assert!(!e.is_timeout());
+        assert!(!e.is_connect());
+        assert!(!chain_has_transient_io(&e));
+        // The new predicates must.
+        assert!(chain_has_incomplete_message(&e));
+        assert!(is_retryable_reqwest_error(&e));
+        assert!(is_stale_connection_error(&e));
+    }
+
+    #[tokio::test]
+    async fn connection_refused_is_not_classified_as_incomplete_message() {
+        let e = reqwest::Client::new()
+            .post("http://127.0.0.1:1/nothing")
+            .body("{}")
+            .send()
+            .await
+            .expect_err("connection refused");
+        // A refused connection also has is_request() == true — which is exactly why
+        // is_request() cannot be used as the predicate.
+        assert!(e.is_request());
+        assert!(!chain_has_incomplete_message(&e));
+        // It stays covered by is_connect(); behavior unchanged.
+        assert!(e.is_connect());
+        assert!(is_retryable_reqwest_error(&e));
     }
 }

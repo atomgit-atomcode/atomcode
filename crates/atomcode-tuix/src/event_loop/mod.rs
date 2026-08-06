@@ -61,6 +61,15 @@ fn runtime_mode(mode: crate::state::AgentMode) -> atomcode_coding::RuntimeMode {
     }
 }
 
+fn startup_bypass_mode(
+    dangerously_skip_permissions: bool,
+) -> Option<(crate::state::AgentMode, atomcode_coding::RuntimeMode)> {
+    dangerously_skip_permissions.then_some((
+        crate::state::AgentMode::Auto,
+        atomcode_coding::RuntimeMode::Auto,
+    ))
+}
+
 fn runtime_user_input(text: String, images: Vec<ImageContent>) -> atomcode_coding::UserInput {
     atomcode_coding::UserInput { text, images }
 }
@@ -98,6 +107,7 @@ fn reload_runtime_provider_from(
     }
     let mut agent_cfg = config.agent_config();
     agent_cfg.round_cap_checkpoint = true; // TUI implements the checkpoint panel (Task 3+)
+    agent_cfg.next_prompt_suggestions = true;
     ctx.runtime.reload_provider(
         agent_cfg,
         ctx.foreground_runtime_id,
@@ -189,7 +199,8 @@ fn decode_cf_dib_to_rgba(dib: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     if dib.len() < INFO_HEADER_SIZE as usize {
         return None;
     }
-    let u32_at = |at: usize| u32::from_le_bytes(dib[at..at + 4].try_into().expect("bounds checked"));
+    let u32_at =
+        |at: usize| u32::from_le_bytes(dib[at..at + 4].try_into().expect("bounds checked"));
     let header_size = u64::from(u32_at(0));
     if header_size < INFO_HEADER_SIZE || header_size > dib.len() as u64 {
         return None;
@@ -313,7 +324,8 @@ fn try_paste_clipboard_image() -> Option<(ImageContent, u64)> {
             // before giving up. The error is otherwise swallowed, so log it too.
             crate::tuix_trace!("IMG", "arboard get_image failed: {_e}");
             #[cfg(windows)]
-            if let Some((w, h, rgba)) = read_raw_cf_dib().and_then(|dib| decode_cf_dib_to_rgba(&dib))
+            if let Some((w, h, rgba)) =
+                read_raw_cf_dib().and_then(|dib| decode_cf_dib_to_rgba(&dib))
             {
                 let hash = rgba_fingerprint(w as usize, h as usize, &rgba);
                 if let Some(png_data) = encode_rgba_to_png(w, h, &rgba) {
@@ -537,7 +549,7 @@ pub(crate) fn echo_text_with_image_markers(text: String, image_count: usize) -> 
 /// "未配置". Shared by every gate that surfaces the rejection to the user.
 fn image_attach_reject_line(config: &Config, model: &str) -> Option<String> {
     use atomcode_config::config::ImageAttachSupport as S;
-    match config.image_attach_support() {
+    match config.image_attach_support_for_model(model) {
         S::Supported => None,
         S::Unconfigured => {
             Some(crate::i18n::t(crate::i18n::Msg::ModelNoImageSupport { model }).into_owned())
@@ -740,6 +752,61 @@ fn try_attach_image_from_path(text: &str) -> Option<(ImageContent, u64)> {
     ))
 }
 
+/// Resolve an explicit `@image` reference against the same path roots users
+/// see elsewhere in the TUI. Unlike a bare relative `snap.png` (ambiguous
+/// prose), the leading `@` is an explicit attachment intent, so project-relative
+/// paths are safe to resolve against `working_dir`. `~/...` uses AtomCode's
+/// platform-aware real home directory rather than the process environment.
+fn resolve_at_image_path(
+    token: &str,
+    working_dir: &std::path::Path,
+    home_dir: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let referenced = token.trim().strip_prefix('@')?;
+    if referenced.is_empty() || referenced.contains(char::is_whitespace) {
+        return None;
+    }
+    if referenced == "~" {
+        return home_dir.map(std::path::Path::to_path_buf);
+    }
+    if let Some(rest) = referenced
+        .strip_prefix("~/")
+        .or_else(|| referenced.strip_prefix("~\\"))
+    {
+        return home_dir.map(|home| home.join(rest));
+    }
+    let path = std::path::Path::new(referenced);
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_dir.join(path)
+    })
+}
+
+/// Load an image named through an explicit `@path` mention. The final image
+/// validation and encoding stays centralized in `try_attach_image_from_path`,
+/// so paste, drag-and-drop, and @-mention attachments share MIME/size rules.
+fn try_attach_at_image_from_path(
+    token: &str,
+    working_dir: &std::path::Path,
+) -> Option<(ImageContent, u64)> {
+    let path = resolve_at_image_path(
+        token,
+        working_dir,
+        crate::platform::home_dir().as_deref(),
+    )?;
+    try_attach_image_from_path(path.to_str()?)
+}
+
+/// Whether the outgoing text contains an explicit `@path` that resolves to a
+/// valid local image. Used before the input buffer is cleared so an unsupported
+/// image route can fail visibly without losing the user's prompt.
+fn contains_attachable_at_image(text: &str, working_dir: &std::path::Path) -> bool {
+    text.split_whitespace()
+        .filter(|token| token.starts_with('@'))
+        .any(|token| try_attach_at_image_from_path(token, working_dir).is_some())
+}
+
 #[cfg(test)]
 mod image_path_tests {
     use super::*;
@@ -833,7 +900,10 @@ mod image_path_tests {
 
     fn decoded_pixels(dib: &[u8]) -> (u32, u32, Vec<[u8; 4]>) {
         let (w, h, rgba) = decode_cf_dib_to_rgba(dib).expect("DIB must decode");
-        let px = rgba.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
+        let px = rgba
+            .chunks_exact(4)
+            .map(|c| [c[0], c[1], c[2], c[3]])
+            .collect();
         (w, h, px)
     }
 
@@ -1057,6 +1127,61 @@ mod image_path_tests {
             try_attach_image_from_path(p.to_str().unwrap()).is_none(),
             "files over MAX_PATH_IMAGE_BYTES must be rejected before read"
         );
+    }
+
+    #[test]
+    fn at_absolute_image_path_is_recognised() {
+        let dir = tempdir().unwrap();
+        let p = write_tmp_file(&dir, "absolute.png", b"stub");
+        let token = format!("@{}", p.display());
+        let resolved = resolve_at_image_path(&token, dir.path(), None).unwrap();
+        assert_eq!(resolved, p);
+        assert!(try_attach_at_image_from_path(&token, dir.path()).is_some());
+    }
+
+    #[test]
+    fn at_tilde_image_path_resolves_against_explicit_home() {
+        let home = tempdir().unwrap();
+        let p = write_tmp_file(&home, "desktop.png", b"stub");
+        let resolved = resolve_at_image_path("@~/desktop.png", home.path(), Some(home.path()))
+            .expect("tilde @ reference must resolve");
+        assert_eq!(resolved, p);
+        assert!(try_attach_image_from_path(resolved.to_str().unwrap()).is_some());
+    }
+
+    #[test]
+    fn at_relative_image_path_resolves_against_working_directory() {
+        let project = tempdir().unwrap();
+        let p = write_tmp_file(&project, "diagram.webp", b"stub");
+        let resolved = resolve_at_image_path("@diagram.webp", project.path(), None)
+            .expect("relative @ reference must resolve");
+        assert_eq!(resolved, p);
+        assert!(try_attach_at_image_from_path("@diagram.webp", project.path()).is_some());
+    }
+
+    #[test]
+    fn at_non_image_keeps_normal_file_reference_behavior() {
+        let project = tempdir().unwrap();
+        let p = write_tmp_file(&project, "notes.md", b"hello");
+        let resolved = resolve_at_image_path("@notes.md", project.path(), None).unwrap();
+        assert_eq!(resolved, p);
+        assert!(try_attach_image_from_path(resolved.to_str().unwrap()).is_none());
+        assert!(resolve_at_image_path("notes.md", project.path(), None).is_none());
+    }
+
+    #[test]
+    fn detects_attachable_at_image_without_matching_normal_file_mentions() {
+        let project = tempdir().unwrap();
+        write_tmp_file(&project, "logo.png", b"stub");
+        write_tmp_file(&project, "notes.md", b"hello");
+        assert!(contains_attachable_at_image(
+            "请看 @logo.png 这是什么",
+            project.path()
+        ));
+        assert!(!contains_attachable_at_image(
+            "请看 @notes.md 写了什么",
+            project.path()
+        ));
     }
 }
 
@@ -2629,6 +2754,11 @@ impl RuntimeControl {
         }
     }
 
+    fn has_active_turn(&self) -> bool {
+        self.active_handle()
+            .is_some_and(|handle| phase_has_active_turn(handle.status().phase))
+    }
+
     pub fn detach_delivery_event_tx(&self) {
         if let Self::Ready(ready) = self {
             ready
@@ -3025,6 +3155,13 @@ impl RuntimeControl {
             Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
         }
     }
+}
+
+fn phase_has_active_turn(phase: atomcode_coding::RuntimePhase) -> bool {
+    matches!(
+        phase,
+        atomcode_coding::RuntimePhase::InTurn | atomcode_coding::RuntimePhase::WaitingApproval
+    )
 }
 
 impl From<CodingRuntimeHandle> for RuntimeControl {
@@ -3474,9 +3611,10 @@ pub struct LoopCtx {
     pub working_dir: PathBuf,
     pub previous_dir: Option<PathBuf>,
     /// Recently visited project directories, most recent first (max 5).
-    /// Persisted to `~/.atomcode/recent_dirs.txt`. Drives the `/cd`
-    /// picker when invoked with no argument and is updated whenever
-    /// the working directory changes (via slash command or agent tool).
+    /// Persisted to `~/.atomcode/recent_dirs.txt` and used as an ordering hint
+    /// by `/cd`; the picker supplements it with the complete native catalog.
+    /// Updated whenever the working directory changes (via slash command or
+    /// agent tool).
     pub recent_dirs: Vec<PathBuf>,
     pub history: History,
     pub input_rx: mpsc::UnboundedReceiver<InputEvent>,
@@ -3869,6 +4007,20 @@ impl Buffer {
     /// searching.
     pub fn search_query(&self) -> &str {
         &self.search_query
+    }
+
+    /// Accept an ephemeral next-prompt suggestion into an empty draft. The
+    /// caller owns visibility/lifecycle; the buffer only performs the atomic
+    /// text+cursor transition used by Right Arrow.
+    fn accept_next_prompt_suggestion(&mut self, suggestion: &str) -> bool {
+        if !self.text.is_empty() || suggestion.trim().is_empty() || self.searching {
+            return false;
+        }
+        self.text = suggestion.to_string();
+        self.cursor = self.text.len();
+        self.history_idx = None;
+        self.menu_suppressed = false;
+        true
     }
 
     /// The index into history of the entry currently being displayed,
@@ -4516,6 +4668,21 @@ mod buffer_tests {
         );
     }
 
+    #[test]
+    fn persistence_warning_does_not_replace_or_dismiss_footer_report() {
+        let mut state = UiState::new();
+        state.footer_command_output = Some("usage report".into());
+        state.footer_persistence_warning = Some("⚠ transcript unavailable".into());
+
+        assert_eq!(
+            footer_command_output(&state).as_deref(),
+            Some("usage report\n⚠ transcript unavailable")
+        );
+        assert!(dismiss_footer_command_output(&mut state));
+        assert!(state.footer_persistence_warning.is_none());
+        assert_eq!(state.footer_command_output.as_deref(), Some("usage report"));
+    }
+
     fn empty_usage_panel() -> crate::modals::usage::UsageModal {
         crate::modals::usage::UsageModal::new(crate::modals::usage::UsageData {
             window: None,
@@ -5096,6 +5263,25 @@ mod buffer_tests {
     }
 
     #[test]
+    fn next_prompt_suggestion_accepts_into_empty_buffer_without_submitting() {
+        let mut b = Buffer::new();
+
+        assert!(b.accept_next_prompt_suggestion("继续审计代码改动"));
+        assert_eq!(b.text, "继续审计代码改动");
+        assert_eq!(b.cursor, b.text.len());
+    }
+
+    #[test]
+    fn next_prompt_suggestion_does_not_replace_a_draft() {
+        let mut b = Buffer::new();
+        b.text = "已有草稿".to_string();
+        b.cursor = b.text.len();
+
+        assert!(!b.accept_next_prompt_suggestion("继续审计代码改动"));
+        assert_eq!(b.text, "已有草稿");
+    }
+
+    #[test]
     fn restore_cancelled_text_prepends_before_existing_draft() {
         let mut b = Buffer::new();
         // User started typing a new message while the previous turn ran.
@@ -5645,7 +5831,11 @@ mod menu_tests {
         let custom = CustomCommandRegistry::empty();
         let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:atomcode-smoke-test", "smoke", true));
-        skills.register(skill_fixture("skills:delegating-to-atomcode", "delegate", true));
+        skills.register(skill_fixture(
+            "skills:delegating-to-atomcode",
+            "delegate",
+            true,
+        ));
         let lock = std::sync::RwLock::new(skills);
 
         // `/skills atom smoke` keeps the menu OPEN and narrows to the one skill
@@ -5753,7 +5943,11 @@ mod menu_tests {
         // hyphenated name is reachable by typing loose fragments of it.
         let mut skills = atomcode_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:atomcode-smoke-test", "smoke", true));
-        skills.register(skill_fixture("skills:delegating-to-atomcode", "delegate", true));
+        skills.register(skill_fixture(
+            "skills:delegating-to-atomcode",
+            "delegate",
+            true,
+        ));
         let lock = std::sync::RwLock::new(skills);
 
         // Single fragment `atomcode` matches BOTH (substring), like the menu today.
@@ -5946,7 +6140,10 @@ mod menu_tests {
         // NEWER "git stash", so the jump lands on the newest match.
         let _ = buf.apply(Action::Backspace, &history, &reg);
         assert_eq!(buf.search_query(), "sta");
-        assert_eq!(buf.text, "git stash", "back to newest entry containing 'sta'");
+        assert_eq!(
+            buf.text, "git stash",
+            "back to newest entry containing 'sta'"
+        );
 
         // Backspace again keeps the newest match ("git stash" still
         // contains "st").
@@ -6055,7 +6252,10 @@ mod menu_tests {
         let _ = buf.apply(Action::HistorySearch, &history, &reg);
 
         let result = buf.apply(Action::Submit, &history, &reg);
-        assert!(matches!(result, BufferResult::Redraw), "Enter accepts, not commits");
+        assert!(
+            matches!(result, BufferResult::Redraw),
+            "Enter accepts, not commits"
+        );
         assert!(!buf.is_searching(), "search mode ends on Enter");
         assert_eq!(buf.text, "fix the build", "match stays in the buffer");
         assert_eq!(
@@ -7633,6 +7833,9 @@ fn intercept_empty_bare_esc(
 /// this before their normal Esc action; `true` means the key was fully handled
 /// and must not reach turn cancellation or double-Esc undo.
 fn dismiss_footer_command_output(state: &mut UiState) -> bool {
+    if state.footer_persistence_warning.take().is_some() {
+        return true;
+    }
     // Drop the panel alongside the text so a stale tab key can't steer a
     // report that's no longer on screen.
     state.footer_usage = None;
@@ -7771,8 +7974,18 @@ pub(crate) fn handle_loop_decision(
 
 pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<ExitReason> {
     let mut app = App::new(&ctx.caps);
-    if ctx.dangerously_skip_permissions {
-        app.state.agent_mode = crate::state::AgentMode::Auto;
+    if let Some((agent_mode, runtime_mode)) = startup_bypass_mode(ctx.dangerously_skip_permissions)
+    {
+        // `-y` is a process-start execution mode, not merely a TUI badge. Keep
+        // all three projections aligned before the first turn: local UI state,
+        // the runtime-owned permission policy, and the daemon live mirror used
+        // by shared TUI/WebUI sessions. `/auto` already follows this same path
+        // through `set_agent_mode`; startup must not leave the daemon in Build.
+        app.state.agent_mode = agent_mode;
+        ctx.runtime
+            .dispatch(atomcode_coding::DriverCommand::SetMode(runtime_mode))
+            .ok();
+        atomcode_daemon::live_set_mode(agent_mode);
     }
 
     crate::tuix_trace!(
@@ -9352,7 +9565,11 @@ mod external_config_tests {
     fn manual_reload_updates_the_pinned_new_schema_model_without_switching_it() {
         let current = new_schema_config("account/old");
         let mut persisted = new_schema_config("account/new");
-        persisted.models.get_mut("account/old").unwrap().context_window = 64_000;
+        persisted
+            .models
+            .get_mut("account/old")
+            .unwrap()
+            .context_window = 64_000;
 
         let merged = merge_persisted_config_preserving_active(&current, persisted, true);
 
@@ -9435,7 +9652,11 @@ mod external_config_tests {
         let persisted = new_schema_config("account/new");
         let mut desired = new_schema_config("account/old");
         desired.models.remove("account/new");
-        desired.models.get_mut("account/old").unwrap().context_window = 64_000;
+        desired
+            .models
+            .get_mut("account/old")
+            .unwrap()
+            .context_window = 64_000;
         desired.language = Some(atomcode_config::locale::Locale::ZhCn);
 
         let saved = config_for_persistence(&desired, &persisted, false);
@@ -10442,11 +10663,13 @@ fn attach_image_to_input(
 /// fumble with `OpenFile` / `Bash dir` / base64 to read the bytes.
 ///
 /// Scan the outgoing `text` for whitespace-separated tokens that resolve to a
-/// real local image file (same strict checks as the paste path: absolute +
-/// known image extension + existing file ≤ `MAX_PATH_IMAGE_BYTES`), read them
-/// as image attachments, and replace the path token with an `[Image #N]`
-/// marker so the payload matches the paste/drag flow. No-op when the model
-/// can't take images — the path is left as text for the model to handle.
+/// real local image file. Bare paths keep the paste path's strict absolute-path
+/// rule; explicit `@path` references additionally support `~/...` and paths
+/// relative to the current working directory. All forms share the same image
+/// extension, existence, and `MAX_PATH_IMAGE_BYTES` checks. Recognised paths
+/// become image attachments plus an `[Image #N]` marker, so text-only models
+/// enter the configured VL preprocessor instead of asking `read_file` to decode
+/// a binary. No-op when no image-capable route exists.
 fn attach_typed_image_paths(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -10454,19 +10677,21 @@ fn attach_typed_image_paths(
     images: &mut Vec<ImageContent>,
     kept_markers: &mut Vec<usize>,
 ) {
-    if !ctx.config.can_handle_attached_images() {
+    if image_attach_reject_line(&ctx.config, &ctx.model_name).is_some() {
         return;
     }
-    // Snapshot tokens before mutating `text`. The `/` `\` pre-filter avoids a
-    // filesystem stat on every word of a long message — an absolute path
-    // always carries a separator.
+    // Snapshot tokens before mutating `text`. The `/` `\` / `@` pre-filter
+    // avoids a filesystem stat on every word of a long message while keeping
+    // separator-free project references such as `@logo.png` discoverable.
     let tokens: Vec<String> = text
         .split_whitespace()
-        .filter(|t| t.contains('/') || t.contains('\\'))
+        .filter(|t| t.starts_with('@') || t.contains('/') || t.contains('\\'))
         .map(str::to_string)
         .collect();
     for tok in tokens {
-        let Some((img, _hash)) = try_attach_image_from_path(&tok) else {
+        let attachment = try_attach_image_from_path(&tok)
+            .or_else(|| try_attach_at_image_from_path(&tok, &ctx.working_dir));
+        let Some((img, _hash)) = attachment else {
             continue;
         };
         app.state.session_image_count += 1;
@@ -10697,6 +10922,7 @@ fn handle_input(
             // No modal: paste goes into the type-ahead buffer just like
             // keyboard input (Idle or Streaming, both consume it).
             if matches!(app.state.phase, UiPhase::Idle | UiPhase::Streaming) {
+                app.state.next_prompt_suggestion = None;
                 // Image-paste detection — two parallel providers, mutually
                 // exclusive on `text` shape:
                 //   * `text` empty → terminal sent bracketed paste with
@@ -11439,7 +11665,10 @@ fn handle_idle_key(
             && modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
         let is_bare_esc = code == KeyCode::Esc && app.buf.text.is_empty();
         if is_ctrl_c || is_bare_esc {
-            cancel_active_turn(ctx);
+            let has_active_turn = ctx.runtime.has_active_turn();
+            if cancel_active_turn(ctx) && has_active_turn {
+                app.interrupt_drain_pending = true;
+            }
             clear_capturing_modal_on_cancel(app);
             crate::tuix_trace!(
                 "KEY",
@@ -11978,6 +12207,19 @@ fn handle_idle_key(
 
     let action = classify(code, modifiers);
 
+    if action == Action::CursorRight && modifiers.is_empty() && app.buf.text.is_empty() {
+        if let Some(suggestion) = app.state.next_prompt_suggestion.clone() {
+            if app.buf.accept_next_prompt_suggestion(&suggestion) {
+                app.state.next_prompt_suggestion = None;
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                return Ok(());
+            }
+        }
+    }
+    if !matches!(action, Action::NoOp | Action::ToggleToolOutput) {
+        app.state.next_prompt_suggestion = None;
+    }
+
     let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
     sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
     crate::tuix_trace!(
@@ -12049,6 +12291,18 @@ fn handle_idle_key(
                 renderer.flush();
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
+            }
+            // An explicit @image is attachment intent, not ordinary file prose.
+            // Reject before clearing the editor when neither the live model nor
+            // a configured VL preprocessor can consume it; otherwise the raw
+            // path reaches the model and it falls back to a futile read_file.
+            if let Some(reject) = image_attach_reject_line(&ctx.config, &ctx.model_name) {
+                if contains_attachable_at_image(&line, &ctx.working_dir) {
+                    renderer.render(UiLine::Error(reject));
+                    renderer.flush();
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                    return Ok(());
+                }
             }
             renderer.render(UiLine::ClearTransient);
             app.buf.text.clear();
@@ -12632,12 +12886,33 @@ fn midturn_submit_route(streaming: bool) -> SubmitRoute {
 
 #[cfg(test)]
 mod midturn_submit_route_tests {
-    use super::{midturn_submit_route, SubmitRoute};
+    use super::{midturn_submit_route, phase_has_active_turn, SubmitRoute};
 
     #[test]
     fn midturn_submit_steers_native_runtime() {
         assert_eq!(midturn_submit_route(true), SubmitRoute::SteerNow);
         assert_eq!(midturn_submit_route(false), SubmitRoute::SendIdle);
+    }
+
+    #[test]
+    fn idle_cancel_only_waits_for_a_real_active_turn() {
+        use atomcode_coding::RuntimePhase;
+
+        assert!(phase_has_active_turn(RuntimePhase::InTurn));
+        assert!(phase_has_active_turn(RuntimePhase::WaitingApproval));
+        for phase in [
+            RuntimePhase::Ready,
+            RuntimePhase::Reconfiguring,
+            RuntimePhase::AwaitingProvider,
+            RuntimePhase::ShuttingDown,
+            RuntimePhase::Stopped,
+            RuntimePhase::Failed,
+        ] {
+            assert!(
+                !phase_has_active_turn(phase),
+                "unexpected active phase: {phase:?}"
+            );
+        }
     }
 }
 
@@ -13843,6 +14118,9 @@ fn handle_streaming_key(
     // want queued messages to auto-fire after the current one dies.
     if code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
         let send_ok = cancel_active_turn(ctx);
+        if send_ok {
+            app.interrupt_drain_pending = true;
+        }
         clear_capturing_modal_on_cancel(app);
         crate::tuix_trace!(
             "KEY",
@@ -13903,6 +14181,9 @@ fn handle_streaming_key(
             modifiers.is_empty(),
             !app.state.pending_steers.is_empty(),
         ) && stage_pending_steers_for_interrupt(app);
+        if send_ok {
+            app.interrupt_drain_pending = true;
+        }
         clear_capturing_modal_on_cancel(app);
         crate::tuix_trace!(
             "KEY",
@@ -14285,7 +14566,7 @@ fn handle_streaming_key(
                 // queued message re-expands its folded paste (#843).
                 pastes: app.buf.pastes.clone(),
             });
-            match midturn_submit_route(true) {
+            match midturn_submit_route(!app.interrupt_drain_pending) {
                 SubmitRoute::SteerNow => {
                     // Steer into the running turn and retain an exact recovery copy.
                     // The footer panel owns the acknowledgement; do not write a
@@ -14348,7 +14629,9 @@ fn handle_streaming_key(
         BufferResult::Exit => {
             // Ctrl+C on empty buf during streaming — treat as cancel
             // (consistent with the explicit Ctrl+C branch above).
-            cancel_active_turn(ctx);
+            if cancel_active_turn(ctx) {
+                app.interrupt_drain_pending = true;
+            }
             clear_capturing_modal_on_cancel(app);
             restore_cancelled_message_to_buf(app, renderer, ctx);
         }
@@ -14645,7 +14928,9 @@ fn bypass_approval_choice() -> ApprovalChoice {
 
 #[cfg(test)]
 mod bypass_approval_tests {
-    use super::{approval_choice_to_decision, bypass_approval_choice, ApprovalChoice};
+    use super::{
+        approval_choice_to_decision, bypass_approval_choice, startup_bypass_mode, ApprovalChoice,
+    };
     use atomcode_capabilities::tools::approval::PermissionDecision;
 
     // The auto-approve invariant now lives on `approval_should_auto_bypass(mode)`
@@ -14663,6 +14948,14 @@ mod bypass_approval_tests {
             matches!(decision, PermissionDecision::AllowOnce),
             "BYPASS must auto-approve with AllowOnce, got {decision:?}"
         );
+    }
+
+    #[test]
+    fn startup_y_selects_auto_for_ui_and_runtime() {
+        let (ui_mode, runtime_mode) = startup_bypass_mode(true).expect("-y enables bypass");
+        assert_eq!(ui_mode, crate::state::AgentMode::Auto);
+        assert_eq!(runtime_mode, atomcode_coding::RuntimeMode::Auto);
+        assert!(startup_bypass_mode(false).is_none());
     }
 
     // The full command↔decision contract used by sync-mode `deliver_approval`.
@@ -14962,6 +15255,10 @@ mod user_input_key_tests {
     fn navigation_keys_do_not_resolve() {
         assert!(user_input_response_for(&panel(UserInputMode::Single), KeyCode::Up).is_none());
         assert!(user_input_response_for(&panel(UserInputMode::Single), KeyCode::Down).is_none());
+        assert!(user_input_response_for(&panel(UserInputMode::Single), KeyCode::PageUp).is_none());
+        assert!(
+            user_input_response_for(&panel(UserInputMode::Single), KeyCode::PageDown).is_none()
+        );
         assert!(
             user_input_response_for(&panel(UserInputMode::Multiple), KeyCode::Char(' ')).is_none()
         );
@@ -15485,6 +15782,16 @@ fn handle_user_input_key(
                 p.move_down();
             }
         }
+        (_, KeyCode::PageUp) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                p.page_up();
+            }
+        }
+        (_, KeyCode::PageDown) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                p.page_down();
+            }
+        }
         // Number keys 1..9: select the Nth navigable row (concrete options 1..N,
         // then "Other" as N+1). Single → move the cursor there (cursor is the
         // radio). Multiple → toggle that concrete row's checkbox, OR move the
@@ -15507,12 +15814,16 @@ fn handle_user_input_key(
                     match p.mode {
                         UserInputMode::Multiple => p.toggle_index(idx),
                         // Single: cursor-as-radio — move to it (this IS selecting it).
-                        _ => p.cursor = idx,
+                        _ => {
+                            p.cursor = idx;
+                            p.scroll_offset = 0;
+                        }
                     }
                 } else if idx == p.other_index() && p.custom {
                     // Number key for the Other row (only when offered): move cursor to it
                     // (focus for typing). Inclusion is text-derived, not toggled by a number.
                     p.cursor = p.other_index();
+                    p.scroll_offset = 0;
                 }
             }
         }
@@ -15652,6 +15963,12 @@ fn handle_user_input_batch_key(
         (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Down) => {
             app.state.user_input_batch.as_mut().unwrap().questions[cur].move_down();
         }
+        (_, KeyCode::PageUp) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].page_up();
+        }
+        (_, KeyCode::PageDown) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].page_down();
+        }
         // Number keys 1..9: select the Nth navigable row (concrete options, then "Other").
         (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Char(c))
             if c.is_ascii_digit()
@@ -15663,10 +15980,14 @@ fn handle_user_input_batch_key(
             if idx < p.options.len() {
                 match p.mode {
                     UserInputMode::Multiple => p.toggle_index(idx),
-                    _ => p.cursor = idx,
+                    _ => {
+                        p.cursor = idx;
+                        p.scroll_offset = 0;
+                    }
                 }
             } else if idx == p.other_index() && p.custom {
                 p.cursor = p.other_index();
+                p.scroll_offset = 0;
             }
         }
         (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Backspace) => {
@@ -17844,6 +18165,7 @@ fn handle_runtime_event(
                     return;
                 }
                 CodingRuntimeEvent::RuntimeStopped(_) => {
+                    state.next_prompt_suggestion = None;
                     ctx.pending_runtime_request_id = None;
                     if matches!(
                         state.phase,
@@ -17916,6 +18238,7 @@ fn handle_runtime_event(
                     return;
                 }
                 CodingRuntimeEvent::SessionChanged(changed) => {
+                    state.next_prompt_suggestion = None;
                     if let Some(session_id) = changed.session_id.clone() {
                         if ctx.pending_session_resume.as_ref().is_some_and(|pending| {
                             pending.session.id == session_id
@@ -17958,11 +18281,32 @@ fn handle_runtime_event(
                     );
                     return;
                 }
+                CodingRuntimeEvent::NextPromptSuggested {
+                    generation,
+                    session_id,
+                    turn_id: _,
+                    text,
+                } => {
+                    let current_session_matches = session_id
+                        .as_deref()
+                        .is_none_or(|id| id == ctx.current_session.id.as_str());
+                    if ctx.runtime.current_generation() == Some(generation)
+                        && current_session_matches
+                        && matches!(state.phase, UiPhase::Idle)
+                        && buf.text.is_empty()
+                        && state.pending_images.is_empty()
+                    {
+                        state.next_prompt_suggestion = Some(text);
+                        redraw_idle_plain(buf, state, ctx, renderer);
+                    }
+                    return;
+                }
                 CodingRuntimeEvent::GoalChanged(progress) => {
                     handle_agent_event(
                         AgentEvent::GoalUpdate {
                             active: progress.active,
                             terminal: progress.terminal,
+                            phase: progress.phase,
                             round: progress.round,
                             elapsed_secs: progress.elapsed_secs,
                             condition: progress.condition,
@@ -18002,6 +18346,14 @@ fn handle_runtime_event(
                 CodingRuntimeEvent::ControllerWarning(message) => {
                     renderer.render(UiLine::Warning(message));
                     renderer.flush();
+                    return;
+                }
+                CodingRuntimeEvent::PersistenceWarning(message) => {
+                    // Auxiliary persistence failures are diagnostics, not model
+                    // output. Keep a single replaceable footer notice instead of
+                    // appending a permanent transcript row. The authoritative
+                    // turn terminal that follows owns the normal idle redraw.
+                    state.footer_persistence_warning = Some(format!("⚠ {message}"));
                     return;
                 }
                 CodingRuntimeEvent::VisionPreprocessSuccess {
@@ -18183,6 +18535,7 @@ fn handle_runtime_event(
                     return;
                 }
                 CodingRuntimeEvent::ProviderChanged { provider, model } => {
+                    state.next_prompt_suggestion = None;
                     // Ready and deferred runtimes forward ProviderChanged and the
                     // awaitable reload terminal through different tasks, so their
                     // arrival order is not a commit contract. Sequenced observations
@@ -19553,10 +19906,22 @@ fn goal_terminal_is_met(terminal: Option<atomcode_coding::GoalTerminal>) -> bool
     terminal == Some(atomcode_coding::GoalTerminal::Met)
 }
 
+/// Whether the per-turn stats separator should be DEFERRED (buffered) rather than
+/// rendered now, on account of an active goal. It is deferred ONLY while the goal
+/// is still `Pursuing` (a mid-goal round whose separator the next round banner or
+/// the goal-end flush will render). Once the goal reaches a terminal/paused phase
+/// (`Satisfied`/`PausedAtCap`/`Ended`) the round is over and the separator must
+/// render immediately: a persistent goal keeps `goal_condition` set through the
+/// terminal `TurnComplete`, and the goal-end `GoalChanged` (processed first) already
+/// ran its flush against an empty buffer — deferring here would orphan the stats line.
+fn goal_defers_turn_separator(goal_condition_set: bool, phase: atomcode_coding::GoalPhase) -> bool {
+    goal_condition_set && matches!(phase, atomcode_coding::GoalPhase::Pursuing)
+}
+
 #[cfg(test)]
 mod goal_end_tests {
-    use super::goal_terminal_is_met;
-    use atomcode_coding::GoalTerminal;
+    use super::{goal_defers_turn_separator, goal_terminal_is_met};
+    use atomcode_coding::{GoalPhase, GoalTerminal};
 
     #[test]
     fn only_explicit_met_terminal_is_successful() {
@@ -19565,6 +19930,21 @@ mod goal_end_tests {
         assert!(!goal_terminal_is_met(Some(GoalTerminal::Stopped)));
         assert!(!goal_terminal_is_met(Some(GoalTerminal::Cancelled)));
         assert!(!goal_terminal_is_met(None));
+    }
+
+    // Regression: a persistent goal keeps `goal_condition` set through the
+    // terminal TurnComplete. The stats separator must only be DEFERRED while the
+    // goal is still Pursuing; once it reaches Satisfied/PausedAtCap/Ended the round
+    // is over and the separator must render immediately (deferring orphans it,
+    // because the goal-end flush already ran empty before this TurnComplete).
+    #[test]
+    fn separator_defers_only_while_pursuing() {
+        assert!(goal_defers_turn_separator(true, GoalPhase::Pursuing));
+        assert!(!goal_defers_turn_separator(true, GoalPhase::Satisfied));
+        assert!(!goal_defers_turn_separator(true, GoalPhase::PausedAtCap));
+        assert!(!goal_defers_turn_separator(true, GoalPhase::Ended));
+        // No goal at all → never defer (render directly).
+        assert!(!goal_defers_turn_separator(false, GoalPhase::Pursuing));
     }
 }
 
@@ -20202,7 +20582,10 @@ fn handle_agent_event(
             // /bg resume path).
             redraw_idle_plain(buf, state, ctx, renderer);
         }
-        AgentEvent::PhaseChange(AgentPhase::Thinking) => state.on_thinking(),
+        AgentEvent::PhaseChange(AgentPhase::Thinking) => {
+            state.footer_persistence_warning = None;
+            state.on_thinking();
+        }
         AgentEvent::PhaseChange(AgentPhase::CallingTool(name)) => {
             state.on_tool_call_streaming(&display_tool_name(&name));
         }
@@ -20262,11 +20645,14 @@ fn handle_agent_event(
             } else {
                 (total_tokens, None)
             };
-            if state.goal_condition.is_some() {
-                // A /goal is active: DEFER the separator so the next event can
-                // choose its form — a `✓ Goal met` banner ABOVE a stats-only
-                // line when the goal ends (GoalUpdate active=false), or the
+            if goal_defers_turn_separator(state.goal_condition.is_some(), state.goal_phase) {
+                // A /goal is actively PURSUING more rounds: DEFER the separator so
+                // the next event can choose its form — a `✓ Goal met` banner ABOVE a
+                // stats-only line when the goal ends (GoalUpdate active=false), or the
                 // `↻ goal round N` banner mid-goal (flushed by should_flush_now).
+                // Once the goal is Satisfied/PausedAtCap/Ended the round is over, so
+                // we fall through to render the separator directly (persistence keeps
+                // `goal_condition` set, but the goal-end flush already ran empty).
                 // `errored` rides along as a defensive fallback.
                 state.pending_separator = Some(crate::state::PendingSeparator {
                     duration,
@@ -20873,49 +21259,92 @@ fn handle_agent_event(
         AgentEvent::GoalUpdate {
             active,
             terminal,
+            phase,
             round,
             condition,
             last_reason,
             ..
         } => {
             if active {
+                // Pursuing: update live badge state.
                 state.goal_condition = Some(condition);
                 state.goal_round = round;
+                state.goal_phase = atomcode_coding::GoalPhase::Pursuing;
                 if state.goal_started_at.is_none() {
                     state.goal_started_at = Some(std::time::Instant::now());
                 }
             } else {
-                // Goal ended. Render order: banner (CommandOutput, bypasses
-                // markdown) ABOVE a stats-only separator. The user wanted
-                // the verdict to read top-down: assistant output → ✓ Goal
-                // met → quiet horizontal line with timing. The earlier
-                // TurnComplete buffered its stats into `pending_separator`
-                // precisely so we could re-render them in this stripped
-                // form here.
-                if state.goal_condition.is_some() {
-                    if let Some(reason) = last_reason.as_deref() {
-                        let banner = if terminal == Some(atomcode_coding::GoalTerminal::Cancelled) {
-                            // Cancel already gets its own UiLine via
-                            // TurnCancelled — skip to avoid double banner.
-                            None
-                        } else if goal_terminal_is_met(terminal) {
-                            Some(format!("  ✓ Goal met: {reason}\n"))
-                        } else {
-                            Some(format!("  ⚠ Goal stopped: {reason}\n"))
-                        };
-                        if let Some(line) = banner {
-                            renderer.render(UiLine::CommandOutput(line));
-                            renderer.flush();
+                match phase {
+                    atomcode_coding::GoalPhase::Satisfied => {
+                        // Goal met: render the banner once, but KEEP the badge
+                        // visible so the user sees it was achieved.
+                        if state.goal_condition.is_some() {
+                            if let Some(reason) = last_reason.as_deref() {
+                                renderer.render(UiLine::CommandOutput(format!(
+                                    "  ✓ Goal met: {reason}\n"
+                                )));
+                                renderer.flush();
+                            }
                         }
+                        state.goal_phase = atomcode_coding::GoalPhase::Satisfied;
+                        flush_pending_separator(state, renderer, /* as_goal_end */ true);
+                    }
+                    atomcode_coding::GoalPhase::PausedAtCap => {
+                        // Round/time cap reached: render a paused note once using
+                        // the authoritative last_reason set by pause_at_cap() so the
+                        // scrollback banner, ControllerWarning, and badge stay
+                        // consistent (mirrors Satisfied/Ended arms' pattern).
+                        // KEEP the badge — it will resume on the next Submit.
+                        if state.goal_condition.is_some() {
+                            if let Some(reason) = last_reason.as_deref() {
+                                renderer.render(UiLine::CommandOutput(format!(
+                                    "  ⏸ Goal stopped: {reason}\n"
+                                )));
+                                renderer.flush();
+                            }
+                        }
+                        state.goal_phase = atomcode_coding::GoalPhase::PausedAtCap;
+                        flush_pending_separator(state, renderer, /* as_goal_end */ true);
+                    }
+                    atomcode_coding::GoalPhase::Ended
+                    // Pursuing with active==false is unreachable by invariant
+                    // (active == (phase == Pursuing)), but listed here to keep
+                    // the match exhaustive and prevent silent falls-through if a
+                    // future phase variant is added.
+                    | atomcode_coding::GoalPhase::Pursuing => {
+                        // Ended (cancel / fail / clear / supersede): render a
+                        // verdict banner (if applicable) then tear down the badge.
+                        // Render order: banner ABOVE the stats separator so the
+                        // user reads top-down: assistant output → verdict → ─── line.
+                        if state.goal_condition.is_some() {
+                            if let Some(reason) = last_reason.as_deref() {
+                                let banner =
+                                    if terminal == Some(atomcode_coding::GoalTerminal::Cancelled) {
+                                        // Cancel already gets its own UiLine via
+                                        // TurnCancelled — skip to avoid double banner.
+                                        None
+                                    } else if goal_terminal_is_met(terminal) {
+                                        Some(format!("  ✓ Goal met: {reason}\n"))
+                                    } else {
+                                        Some(format!("  ⚠ Goal stopped: {reason}\n"))
+                                    };
+                                if let Some(line) = banner {
+                                    renderer.render(UiLine::CommandOutput(line));
+                                    renderer.flush();
+                                }
+                            }
+                        }
+                        state.goal_condition = None;
+                        state.goal_round = 0;
+                        state.goal_started_at = None;
+                        // Reflect the true terminal state (not a lying "Pursuing").
+                        // The next goal's active=true update resets this to Pursuing;
+                        // `goal_defers_turn_separator` gates on goal_condition first, so
+                        // this only guards future readers of goal_phase.
+                        state.goal_phase = atomcode_coding::GoalPhase::Ended;
+                        flush_pending_separator(state, renderer, /* as_goal_end */ true);
                     }
                 }
-                state.goal_condition = None;
-                state.goal_round = 0;
-                state.goal_started_at = None;
-                // Now flush the buffered separator as a stats-only line —
-                // the verdict above already conveys what happened, the
-                // separator just visually closes the turn.
-                flush_pending_separator(state, renderer, /* as_goal_end */ true);
             }
         }
         AgentEvent::LoopUpdate {
@@ -21095,6 +21524,22 @@ fn handle_agent_event(
                 attachments: markers,
             });
             renderer.flush();
+        }
+        AgentEvent::SharedRequestResolved { request_id, kind } => {
+            // The live hub publishes this only after the runtime accepted a peer's
+            // response. Correlate by id so a delayed terminal from an older prompt
+            // cannot dismiss a newer request already displayed by this TUI.
+            if ctx.pending_runtime_request_id != Some(request_id) {
+                return;
+            }
+            ctx.pending_runtime_request_id = None;
+            if kind == atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND {
+                state.on_user_input_resolved();
+                redraw_idle_plain(buf, state, ctx, renderer);
+            } else if kind == atomcode_capabilities::tools::APPROVAL_KIND {
+                state.on_approval_resolved();
+                redraw_idle_plain(buf, state, ctx, renderer);
+            }
         }
         AgentEvent::PeerBusy(running) => {
             // Live-sync: mirror the peer's busy state so TUI input is
@@ -21780,6 +22225,18 @@ mod status_context_usage_tests {
     }
 }
 
+fn footer_command_output(state: &UiState) -> Option<String> {
+    match (
+        state.footer_command_output.as_deref(),
+        state.footer_persistence_warning.as_deref(),
+    ) {
+        (None, None) => None,
+        (Some(report), None) => Some(report.to_string()),
+        (None, Some(warning)) => Some(warning.to_string()),
+        (Some(report), Some(warning)) => Some(format!("{report}\n{warning}")),
+    }
+}
+
 pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::StatusLine {
     let cwd = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
     // Priority:
@@ -22013,6 +22470,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
                 .goal_started_at
                 .map(|t| t.elapsed().as_secs())
                 .unwrap_or(0),
+            phase: state.goal_phase,
         });
     // Active /loop → the dedicated footer loop row. Mirrors GoalStatus exactly,
     // using the loop label as the condition equivalent. Goal takes priority if
@@ -22064,6 +22522,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             text: p.text.clone(),
             custom_text: p.custom_text.clone(),
             custom: p.custom,
+            scroll_offset: p.scroll_offset,
             batch: Some(crate::render::UserInputBatchMeta {
                 total,
                 // 1-based current question; clamped so the Submit stop (current==total)
@@ -22088,6 +22547,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
                 text: p.text.clone(),
                 custom_text: p.custom_text.clone(),
                 custom: p.custom,
+                scroll_offset: p.scroll_offset,
                 batch: None,
             })
     };
@@ -22101,7 +22561,8 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             .collect(),
         history: None,
         search: None,
-        command_output: state.footer_command_output.clone(),
+        next_prompt_suggestion: None,
+        command_output: footer_command_output(state),
         ctx_used,
         ctx_window,
         hint,
@@ -22151,6 +22612,15 @@ fn round_cap_stats(state: &crate::state::UiState) -> String {
 
 fn build_input_status(state: &UiState, ctx: &LoopCtx, buf: &Buffer) -> crate::render::StatusLine {
     let mut status = build_status(state, ctx);
+    status.next_prompt_suggestion = if matches!(state.phase, UiPhase::Idle)
+        && buf.text.is_empty()
+        && state.pending_images.is_empty()
+        && !buf.is_searching()
+    {
+        state.next_prompt_suggestion.clone()
+    } else {
+        None
+    };
     if buf.is_searching() {
         // Ctrl+R reverse-i-search takes over the top-rule indicator;
         // the History N/N position is hidden while searching.

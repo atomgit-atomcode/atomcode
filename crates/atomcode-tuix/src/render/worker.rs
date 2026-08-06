@@ -39,6 +39,7 @@
 // explicit Shutdown gives clean "process the last queued line + flush"
 // semantics rather than "drop whatever is still in flight".
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -270,7 +271,16 @@ fn run_worker(
     flush_pending: Arc<AtomicBool>,
 ) {
     use std::time::Instant;
-    while let Ok(cmd) = cmd_rx.recv() {
+    const RESIZE_REFLOW_DEBOUNCE: Duration = Duration::from_millis(75);
+    let mut pending_cmds = VecDeque::new();
+    loop {
+        let cmd = match pending_cmds.pop_front() {
+            Some(cmd) => cmd,
+            None => match cmd_rx.recv() {
+                Ok(cmd) => cmd,
+                Err(_) => break,
+            },
+        };
         // Measure the wall-clock time each terminal I/O takes so the log
         // shows where Mac Terminal.app / iTerm2 / etc. actually spend time.
         // Big `flush` durations = kernel pipe backpressure from a slow
@@ -303,7 +313,39 @@ fn run_worker(
                     crate::tuix_trace!("REN", "FlushDeferred deferred={}µs", d.as_micros());
                 }
             }
-            RenderCmd::Resize(cols, rows) => {
+            RenderCmd::Resize(mut cols, mut rows) => {
+                // Rebuild only after the terminal has stopped reporting
+                // intermediate geometries. Besides avoiding redundant work,
+                // this keeps large ANSI reflow writes out of conhost's
+                // mid-resize buffer update window.
+                let mut deadline = Instant::now() + RESIZE_REFLOW_DEBOUNCE;
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match cmd_rx.recv_timeout(remaining) {
+                        Ok(RenderCmd::Resize(next_cols, next_rows)) => {
+                            cols = next_cols;
+                            rows = next_rows;
+                            deadline = Instant::now() + RESIZE_REFLOW_DEBOUNCE;
+                        }
+                        Ok(cmd @ RenderCmd::Ack { .. }) => {
+                            // Lifecycle ACKs are FIFO barriers. Never inspect
+                            // or coalesce commands queued after one.
+                            pending_cmds.push_back(cmd);
+                            break;
+                        }
+                        Ok(other) => {
+                            // Preserve FIFO ordering for normal render/lifecycle
+                            // work, but keep listening for a later resize until
+                            // the trailing quiet period expires.
+                            pending_cmds.push_back(other);
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                        | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
                 let t0 = Instant::now();
                 inner.on_resize(cols, rows);
                 crate::tuix_trace!(
@@ -452,6 +494,8 @@ mod tests {
         deferred: usize,
         begin_syncs: usize,
         end_syncs: usize,
+        resizes: Vec<(u16, u16)>,
+        calls: Vec<&'static str>,
     }
 
     struct TestRenderer {
@@ -469,7 +513,9 @@ mod tests {
             self.counts.lock().unwrap().shutdowns += 1;
         }
         fn reset(&mut self) {
-            self.counts.lock().unwrap().resets += 1;
+            let mut counts = self.counts.lock().unwrap();
+            counts.resets += 1;
+            counts.calls.push("reset");
         }
         fn clear_screen(&mut self) {
             self.counts.lock().unwrap().clear_screens += 1;
@@ -488,6 +534,11 @@ mod tests {
         }
         fn end_sync(&mut self) {
             self.counts.lock().unwrap().end_syncs += 1;
+        }
+        fn on_resize(&mut self, cols: u16, rows: u16) {
+            let mut counts = self.counts.lock().unwrap();
+            counts.resizes.push((cols, rows));
+            counts.calls.push("resize");
         }
     }
 
@@ -587,5 +638,29 @@ mod tests {
         // to observe it deterministically.
         r.reset();
         assert_eq!(counts.lock().unwrap().deferred, 1);
+    }
+
+    #[test]
+    fn resize_burst_is_coalesced_to_latest_geometry() {
+        let (mut r, counts) = setup();
+        r.on_resize(80, 24);
+        r.on_resize(100, 30);
+        r.on_resize(120, 40);
+        // ACK fences the fire-and-forget resize commands.
+        r.reset();
+        assert_eq!(counts.lock().unwrap().resizes, vec![(120, 40)]);
+    }
+
+    #[test]
+    fn lifecycle_ack_is_a_resize_coalescing_barrier() {
+        let (mut r, counts) = setup();
+        r.on_resize(80, 24);
+        r.reset();
+        r.on_resize(120, 40);
+        r.reset();
+
+        let counts = counts.lock().unwrap();
+        assert_eq!(counts.resizes, vec![(80, 24), (120, 40)]);
+        assert_eq!(counts.calls, vec!["resize", "reset", "resize", "reset"]);
     }
 }

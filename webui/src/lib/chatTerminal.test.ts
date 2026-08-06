@@ -10,6 +10,7 @@ import {
   liveSnapshotQueueDisposition,
   reduceChatRecovery,
   reduceLiveLifecycle,
+  resolveUserInputRequest,
   restoreLiveSnapshot,
   syncAttachDisposition,
 } from './chatTerminal.ts';
@@ -195,4 +196,11 @@ test('late chat events are rejected by request and session generation', () => {
   assert.equal(isCurrentChatStream('request-a', 3, 'request-b', 3, false), false);
   assert.equal(isCurrentChatStream('request-a', 3, 'request-a', 4, false), false);
   assert.equal(isCurrentChatStream('request-a', 3, 'request-a', 3, true), false);
+});
+
+test('a live user-input terminal clears only its matching prompt', () => {
+  const current = { request_id: 42, question: 'Pick one' };
+  assert.equal(resolveUserInputRequest(current, 42), null);
+  assert.equal(resolveUserInputRequest(current, 41), current);
+  assert.equal(resolveUserInputRequest(null, 42), null);
 });

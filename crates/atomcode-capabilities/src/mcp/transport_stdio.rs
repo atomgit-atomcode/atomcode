@@ -15,7 +15,9 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
 use super::client::McpClient;
-use super::types::{CallToolResult, InitializeResult, ListToolsResult, ServerStatus};
+use super::types::{
+    initialize_params, CallToolResult, InitializeResult, ListToolsResult, ServerStatus,
+};
 
 /// Default timeout for MCP operations (30 seconds).
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -264,18 +266,8 @@ impl StdioClient {
         self.start().await?;
         self.drain_startup_messages().await?;
 
-        let params = serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {
-                "tools": {}
-            },
-            "clientInfo": {
-                "name": "atomcode",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        });
         let result: InitializeResult = serde_json::from_value(
-            self.send_request("initialize", Some(params))
+            self.send_request("initialize", Some(initialize_params()))
                 .await
                 .map_err(|attempt| attempt.error)?,
         )

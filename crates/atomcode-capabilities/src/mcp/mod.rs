@@ -42,7 +42,7 @@ pub use oauth::{
     McpOAuthToken, McpTokenStore,
 };
 pub use registry::{project_trust_key, McpConnectEvent, McpRegistry};
-pub use tool::McpToolAdapter;
+pub use tool::{mcp_tool_full_name, sanitize_name_segment, McpToolAdapter};
 pub use types::*;
 
 /// Default bound used by callers that explicitly require initial MCP readiness.

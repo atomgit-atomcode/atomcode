@@ -207,6 +207,7 @@ export interface ChatState {
   locale?: string;
   approvalMode: ApprovalMode;
   approvalModePending: boolean;
+  persistenceWarning?: string;
 }
 
 export type SessionTerminalState =
@@ -229,6 +230,7 @@ export type ChatAction =
   | { type: 'TOOL_PROGRESS'; id: string; progress: string }
   | { type: 'TOOL_RESULT'; id: string; name: string; output: string; success: boolean; durationMs: number }
   | { type: 'STREAM_WARNING'; message: string }
+  | { type: 'SET_PERSISTENCE_WARNING'; message?: string }
   | { type: 'STREAM_RATE_LIMITED'; message: string; retryAfterSeconds?: number; attempt?: number; maxAttempts?: number }
   | { type: 'STREAM_IDLE_NOTICE'; message: string }
   | { type: 'ARTIFACT_START'; id: string; artifactType: string; language?: string; title?: string }
@@ -283,6 +285,7 @@ export type ExtensionMessage =
   | { type: 'toolProgress'; id: string; progress: string }
   | { type: 'toolResult'; id?: string; name: string; output: string; success: boolean; durationMs: number }
   | { type: 'warning'; message: string }
+  | { type: 'persistenceWarning'; message: string }
   | { type: 'rateLimited'; message: string; retryAfterSeconds?: number; attempt?: number; maxAttempts?: number }
   | { type: 'artifactStart'; id: string; artifactType: string; language?: string; title?: string }
   | { type: 'artifactContent'; id: string; content: string }

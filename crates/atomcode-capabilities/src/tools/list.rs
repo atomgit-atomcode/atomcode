@@ -1,7 +1,7 @@
 //! `list_directory` — recursive, indented directory tree (build/VCS/cache dirs
 //! skipped). Non-destructive ⇒ always `Safe`.
 
-use super::{err, is_skip_dir, ok, resolve_path};
+use super::{err, is_skip_dir, not_found_hint, ok, resolve_path};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
 use serde::Deserialize;
@@ -70,8 +70,9 @@ impl Tool for ListDirTool {
             }
             Err(_) => {
                 return err(format!(
-                    "Directory not found: {}",
-                    crate::pathnorm::to_display(&root)
+                    "Directory not found: {}{}",
+                    crate::pathnorm::to_display(&root),
+                    not_found_hint(&root, &ctx.working_dir).await
                 ))
             }
         }
@@ -187,5 +188,23 @@ mod tests {
             .await;
         assert!(r.is_error);
         assert!(r.content.contains("Directory not found"), "{}", r.content);
+    }
+
+    /// Still an error, but it must carry the recovery clue — otherwise the model just guesses
+    /// a different wrong path next turn (see `not_found_hint`).
+    #[tokio::test]
+    async fn missing_dir_error_carries_the_nearest_existing_ancestor() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("settings.gradle"), "").unwrap();
+        let r = ListDirTool
+            .execute(r#"{"path":"app/src/main"}"#, &ctx(d.path()))
+            .await;
+        assert!(r.is_error);
+        assert!(
+            r.content.contains("Nearest existing directory"),
+            "{}",
+            r.content
+        );
+        assert!(r.content.contains("settings.gradle"), "{}", r.content);
     }
 }

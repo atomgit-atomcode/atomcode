@@ -44,45 +44,23 @@ use atomcode_config::config::is_codingplan_provider_name;
 use atomcode_config::config::provider::ProviderConfig;
 use atomcode_config::config::Config;
 
-/// Default LLM gateway base URL for CodingPlan-managed providers when
-/// the `models-v2` payload doesn't carry a per-model `base_url`. Used
-/// only inside [`codingplan_llm_base_url`] — call that, not this.
+/// Resolve the LLM gateway base URL for CodingPlan-managed providers, used
+/// when the `models-v2` payload doesn't carry a per-model `base_url`.
 ///
-/// The signed gateway. `coding_plan::crypto::is_atomgit_gateway` matches
-/// `llm-api.atomgit.com`, `pre-llm-api-cce.atomgit.com`, and the legacy
-/// `api-ai.gitcode.com` host (see the host whitelist at `crypto.rs`), so
-/// codingplan request signing engages for all three.
-const DEFAULT_CODINGPLAN_LLM_BASE_URL: &str = "https://llm-api.atomgit.com/v1";
-
-/// Resolve the LLM gateway base URL for CodingPlan-managed providers.
+/// Resolved by [`atomcode_config::endpoints::codingplan_llm_base_url`]: the
+/// `ATOMCODE_CODINGPLAN_LLM_BASE_URL` override, else the deployment profile's
+/// default. Cached there, so every provider registered by
+/// `step_models_and_register` lands on the same host even if the env changes
+/// mid-flight.
 ///
-/// Read order:
-///   1. `ATOMCODE_CODINGPLAN_LLM_BASE_URL` env var (trimmed, trailing
-///      `/` stripped, empty value treated as unset). Set this when
-///      pointing the client at a staging gateway.
-///   2. [`DEFAULT_CODINGPLAN_LLM_BASE_URL`].
+/// Whether requests to this gateway are *signed* is a separate question owned
+/// by `gateway_crypto::is_atomgit_gateway` — signing engages only for the
+/// vendor gateway hosts and only in an official build.
 ///
-/// Cached once at first call via `OnceLock` — same shape as
-/// [`auth::oauth::platform_base_url`] — so every provider registered
-/// by `step_models_and_register` lands on the same host even if the
-/// env var changes mid-flight, and the per-provider build cost is
-/// one atomic read after the first call.
-///
-/// Returns `String` rather than `&'static str` because the cached
-/// value's lifetime is tied to the `OnceLock`; callers that need an
-/// owned URL (e.g. `ProviderConfig::base_url: Option<String>`) get
-/// one without an extra clone.
+/// Returns `String` because callers need an owned URL
+/// (e.g. `ProviderConfig::base_url: Option<String>`).
 fn codingplan_llm_base_url() -> String {
-    use std::sync::OnceLock;
-    static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| {
-        std::env::var("ATOMCODE_CODINGPLAN_LLM_BASE_URL")
-            .ok()
-            .map(|v| v.trim().trim_end_matches('/').to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| DEFAULT_CODINGPLAN_LLM_BASE_URL.to_string())
-    })
-    .clone()
+    atomcode_config::endpoints::codingplan_llm_base_url().to_string()
 }
 
 /// Provider type for the AtomGit LLM gateway (it's OpenAI-compatible).
@@ -95,8 +73,12 @@ const PROVIDER_TYPE: &str = "openai";
 /// window (e.g. Claude's 200k) is kept as-is.
 const MIN_CONTEXT_WINDOW: usize = 128_000;
 
-/// Prefix used for every coding-plan-managed provider name.
-const PROVIDER_PREFIX: &str = "AtomGit";
+/// Prefix used for every coding-plan-managed provider name. Resolved by
+/// `atomcode_config` so the write side and the recognition side
+/// (`is_codingplan_provider_name`) can never disagree about it.
+fn provider_prefix() -> &'static str {
+    atomcode_config::endpoints::codingplan_provider_prefix()
+}
 
 /// Result of one orchestrator step. Distinct from `Result` because
 /// "already done / idempotent skip" is a first-class outcome, not an
@@ -1073,7 +1055,7 @@ fn refreshed_default_provider(
     provider_names
         .first()
         .cloned()
-        .unwrap_or_else(|| PROVIDER_PREFIX.to_string())
+        .unwrap_or_else(|| provider_prefix().to_string())
 }
 
 /// Merge a successful catalog refresh into the latest disk snapshot.
@@ -1277,11 +1259,11 @@ pub fn format_duration_secs(secs: i64) -> String {
 /// `AtomGit-{name with / replaced by -}`.
 fn provider_names_for(model_names: &[String]) -> Vec<String> {
     if model_names.len() == 1 {
-        vec![PROVIDER_PREFIX.to_string()]
+        vec![provider_prefix().to_string()]
     } else {
         model_names
             .iter()
-            .map(|m| format!("{}-{}", PROVIDER_PREFIX, sanitize_model_for_name(m)))
+            .map(|m| format!("{}-{}", provider_prefix(), sanitize_model_for_name(m)))
             .collect()
     }
 }
@@ -1299,9 +1281,11 @@ fn sanitize_model_for_name(model: &str) -> String {
 /// context window is floored at [`MIN_CONTEXT_WINDOW`], so older `models-v2`
 /// payloads without the new columns continue to work without code changes.
 ///
-/// `api_key` stays `None` regardless — `create_provider()` loads the
-/// OAuth token at runtime via `auth.toml` so we never persist it into
-/// the user's `config.toml`.
+/// `api_key` is carried through only when the payload supplies one, for a
+/// gateway that authenticates with a key instead of the OAuth bearer. Absent —
+/// the case for every model the hosted service returns — it stays `None` and
+/// `create_provider()` loads the OAuth token at runtime via `auth.toml`, so the
+/// login token is still never written into the user's `config.toml`.
 fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
     ProviderConfig {
         provider_type: entry
@@ -1309,7 +1293,10 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
             .clone()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| PROVIDER_TYPE.to_string()),
-        api_key: None,
+        api_key: entry
+            .api_key
+            .clone()
+            .filter(|key| !key.trim().is_empty()),
         model: entry.display_model_name.clone(),
         base_url: Some(
             entry
@@ -1568,6 +1555,7 @@ mod tests {
             context_window: Some(128_000),
             plan_available: true,
             capable_model: None,
+            api_key: None,
         };
         let p = build_codingplan_provider(&e);
         assert_eq!(p.model, "GLM-5.1");
@@ -2590,6 +2578,132 @@ mod tests {
         assert!(!latest.providers.contains_key("AtomGit"));
         // The user's concurrent non-CodingPlan default is untouched.
         assert_eq!(latest.default_model, None);
+    }
+
+    /// A user who ran the public build before switching to one with a different
+    /// prefix arrives with `AtomGit-*` keys in `config.toml`. Login must adopt
+    /// them rather than leaving a dead entry selected.
+    ///
+    /// Driven through `refreshed_default_provider` with a hand-built key list,
+    /// because the prefix resolves once per process: in-test it is the default,
+    /// so a full `run_register` would write `AtomGit-*` again and the two
+    /// prefixes could never differ. The list here is what a build carrying a
+    /// different prefix would generate.
+    ///
+    /// This is what recognising the historical prefix buys. `is_codingplan_
+    /// provider_name` gates both the `retain` that wipes stale entries and the
+    /// branch below that re-points by model name; without it the old key
+    /// survives the wipe *and* stays the default, pointing at the previous
+    /// gateway.
+    #[test]
+    fn a_default_written_under_the_historical_prefix_repoints_by_model_name() {
+        let mut config = blank_config();
+        config.providers.insert(
+            "AtomGit-GLM-5.2".into(),
+            build_codingplan_provider(&entry("GLM-5.2")),
+        );
+
+        let model_names = vec!["GLM-5.2".to_string(), "Qwen".to_string()];
+        let provider_names = vec![
+            "Longyuan-GLM-5.2".to_string(),
+            "Longyuan-Qwen".to_string(),
+        ];
+
+        let resolved = refreshed_default_provider(
+            &config,
+            "AtomGit-GLM-5.2",
+            Some("GLM-5.2"),
+            &model_names,
+            &provider_names,
+        );
+        assert_eq!(resolved, "Longyuan-GLM-5.2");
+    }
+
+    /// The model the user was on is gone from the new catalogue — fall to the
+    /// first entry rather than keeping a key that no longer resolves.
+    #[test]
+    fn a_historical_default_whose_model_vanished_falls_to_the_first_entry() {
+        let config = blank_config();
+        let resolved = refreshed_default_provider(
+            &config,
+            "AtomGit-Retired",
+            Some("Retired"),
+            &["GLM-5.2".to_string()],
+            &["Longyuan-GLM-5.2".to_string()],
+        );
+        assert_eq!(resolved, "Longyuan-GLM-5.2");
+    }
+
+    /// A user's own non-CodingPlan default is never touched by any of this.
+    #[test]
+    fn a_custom_default_survives_the_refresh() {
+        let mut config = blank_config();
+        config
+            .providers
+            .insert("my-ollama".into(), build_codingplan_provider(&entry("llama")));
+        let resolved = refreshed_default_provider(
+            &config,
+            "my-ollama",
+            Some("llama"),
+            &["GLM-5.2".to_string()],
+            &["Longyuan-GLM-5.2".to_string()],
+        );
+        assert_eq!(resolved, "my-ollama");
+    }
+
+    #[test]
+    fn model_without_a_key_persists_none_so_the_oauth_token_is_used() {
+        // The hosted service sends no `api_key`, and the login token must keep
+        // out of `config.toml`.
+        assert_eq!(build_codingplan_provider(&entry("GLM-5.2")).api_key, None);
+    }
+
+    #[test]
+    fn model_with_a_key_carries_it_onto_the_provider() {
+        // A gateway that authenticates with a key rather than the OAuth bearer.
+        let keyed = super::super::types::ModelEntry {
+            api_key: Some("sk-gateway".into()),
+            ..entry("GLM-5.2")
+        };
+        assert_eq!(
+            build_codingplan_provider(&keyed).api_key.as_deref(),
+            Some("sk-gateway")
+        );
+    }
+
+    #[test]
+    fn an_env_reference_is_stored_verbatim_for_later_expansion() {
+        // `resolved_api_key` expands `$VAR` at request time, so a payload can
+        // point at a variable instead of writing the secret to disk.
+        let keyed = super::super::types::ModelEntry {
+            api_key: Some("$LLM_GATEWAY_KEY".into()),
+            ..entry("GLM-5.2")
+        };
+        assert_eq!(
+            build_codingplan_provider(&keyed).api_key.as_deref(),
+            Some("$LLM_GATEWAY_KEY")
+        );
+    }
+
+    #[test]
+    fn a_blank_key_is_treated_as_absent() {
+        // An empty column would otherwise persist `Some("")`, which reads as
+        // "configured" downstream and suppresses the OAuth path.
+        for blank in ["", "   "] {
+            let keyed = super::super::types::ModelEntry {
+                api_key: Some(blank.into()),
+                ..entry("GLM-5.2")
+            };
+            assert_eq!(build_codingplan_provider(&keyed).api_key, None, "{blank:?}");
+        }
+    }
+
+    #[test]
+    fn a_payload_without_the_key_column_still_deserializes() {
+        // Older / hosted `models-v2` responses have no such field.
+        let e: super::super::types::ModelEntry =
+            serde_json::from_value(serde_json::json!({"display_model_name": "GLM-5.2"})).unwrap();
+        assert_eq!(e.api_key, None);
     }
 
     #[test]

@@ -400,6 +400,7 @@ dependencies = [
  "globset",
  "grep",
  "httpdate",
+ "hyper",
  "ignore",
  "libc",
  "regex",
@@ -482,6 +483,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "tracing",
  "uuid",
 ]
 

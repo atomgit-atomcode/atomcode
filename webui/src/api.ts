@@ -18,6 +18,7 @@ export function getToken(): string {
 
 export type SSEEvent =
   | { type: 'runtime_info'; provider: string; model: string }
+  | { type: 'session_assigned'; session_id: string }
   | { type: 'text'; content: string }
   | { type: 'reasoning'; content: string }
   | { type: 'tool_start'; id: string; name: string; arguments: unknown }
@@ -31,6 +32,7 @@ export type SSEEvent =
   | { type: 'stopped' }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
+  | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
   // Artifact events: the daemon's ArtifactDetector strips fenced code blocks from
   // TextDelta and emits them as separate artifact_start / artifact_content / artifact_end
@@ -696,7 +698,7 @@ export type LiveWireEvent =
   | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; mode: ApprovalMode }
   | { type: 'provider'; provider: string }
   | { type: 'mode'; mode: ApprovalMode }
-  | { type: 'user'; text: string; images?: ImageData[] }
+  | { type: 'user'; text: string; images?: ImageData[]; client_input_id?: string }
   | { type: 'text'; content: string }
   | { type: 'reasoning'; content: string }
   | { type: 'tool_start'; id: string; name: string; arguments: string }
@@ -707,9 +709,12 @@ export type LiveWireEvent =
   | { type: 'state'; running: boolean; stop_reason?: string; message?: string }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
+  | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
   | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string }
   | { type: 'user_input_request'; request_id: number; header: string; question: string; mode: 'single' | 'multiple' | 'text'; options: { label: string; description?: string }[] }
+  | { type: 'user_input_resolved'; request_id: number }
+  | { type: 'steered'; count: number; inputs: { text: string; images: ImageData[] }[]; client_input_ids: Array<string | null> }
   | { type: 'session_switched'; session_id: string }
   | { type: 'session_renamed'; session_id: string; name: string }
   | { type: 'working_dir'; working_dir: string }
@@ -751,7 +756,8 @@ export async function postLiveMessage(
   images?: ImageData[],
   provider?: string,
   sessionId?: string | null,
-): Promise<void> {
+  clientInputId?: string,
+): Promise<{ disposition: 'started' | 'steered'; generation: number; turn_id: number }> {
   const resp = await fetch('/live/message', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
@@ -760,11 +766,36 @@ export async function postLiveMessage(
       ...(images && images.length ? { images } : {}),
       ...(provider ? { provider } : {}),
       ...(sessionId ? { session_id: sessionId } : {}),
+      ...(clientInputId ? { client_input_id: clientInputId } : {}),
     }),
   });
   if (!resp.ok) throw new Error(`send live message failed: ${resp.status}`);
-  const body = await resp.json() as { accepted?: boolean; error?: string };
+  const body = await resp.json() as {
+    accepted?: boolean;
+    disposition?: 'started' | 'steered';
+    generation?: number;
+    turn_id?: number;
+    error?: string;
+  };
   if (!body.accepted) throw new Error(body.error ?? 'live runtime rejected the message');
+  // Compatibility with a daemon from before typed submit receipts. The old
+  // response only said `accepted:true`; treating it as started avoids rolling
+  // back an input the server has already accepted and duplicating it on retry.
+  if (body.disposition === undefined) {
+    return { disposition: 'started', generation: 0, turn_id: 0 };
+  }
+  if (
+    (body.disposition !== 'started' && body.disposition !== 'steered') ||
+    typeof body.generation !== 'number' ||
+    typeof body.turn_id !== 'number'
+  ) {
+    throw new Error('live runtime returned an invalid submit receipt');
+  }
+  return {
+    disposition: body.disposition,
+    generation: body.generation,
+    turn_id: body.turn_id,
+  };
 }
 
 export async function postLiveStop(): Promise<void> {

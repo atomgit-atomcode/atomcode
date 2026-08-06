@@ -19,7 +19,7 @@ pub mod skill;
 pub mod use_skill;
 
 pub use catalog_hook::SkillCatalogHook;
-pub use registry::{standard_skill_dirs, SkillRegistry};
+pub use registry::{runtime_skill_dirs, standard_skill_dirs, SkillRegistry};
 pub use render::{render_skill_catalog, CatalogEntry};
 pub use skill::Skill;
 pub use use_skill::{ListSkillsTool, UseSkillTool};

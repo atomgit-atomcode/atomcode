@@ -19,9 +19,11 @@ use atomcode_kernel::agent::{Agent, AutoRespond};
 use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
 use atomcode_kernel::hook::LifecycleHooks;
 use atomcode_kernel::message::Conversation;
+use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
+use atomcode_kernel::request::RequestCtx;
 use atomcode_kernel::stream::{ProviderError, StreamEvent};
 use atomcode_kernel::testkit::{AlwaysStopProvider, EchoTool, MockProvider, ScriptedProvider};
-use atomcode_kernel::tool::{ToolCall, ToolRegistry};
+use atomcode_kernel::tool::{Tool, ToolCall, ToolRegistry};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,6 +42,57 @@ fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {
         name: name.into(),
         arguments: args.into(),
     }
+}
+
+struct TerminalDeny;
+
+#[async_trait]
+impl ToolMiddleware for TerminalDeny {
+    async fn before(
+        &self,
+        call: &mut ToolCall,
+        _tool: &Arc<dyn Tool>,
+        _rt: &RequestCtx,
+    ) -> BeforeOutcome {
+        if call.id == "c2" {
+            BeforeOutcome::deny_turn("credential policy denied; do not retry")
+        } else {
+            BeforeOutcome::Proceed
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_policy_denial_pairs_batch_and_stops_before_retry() {
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            StreamEvent::ToolCall(tool_call("c1", "echo", r#"{"text":"first"}"#)),
+            StreamEvent::ToolCall(tool_call("c2", "echo", r#"{"text":"second"}"#)),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::ToolCall(tool_call("c3", "echo", r#"{"text":"retry"}"#)),
+            StreamEvent::Done { truncated: false },
+        ],
+    ]));
+    let agent = Agent::builder()
+        .provider(provider)
+        .tools(echo_tools())
+        .middleware(Arc::new(TerminalDeny))
+        .build();
+
+    let outcome = agent.run_to_completion("go", AutoRespond::AllowAll).await;
+
+    assert_eq!(outcome.stop, StopReason::PolicyDenied);
+    assert_eq!(outcome.tool_results.len(), 2);
+    assert_eq!(
+        outcome.tool_results[0].content,
+        "blocked: another call in this batch terminated the turn by policy"
+    );
+    assert_eq!(
+        outcome.tool_results[1].content,
+        "blocked: credential policy denied; do not retry"
+    );
 }
 
 // ── A normal turn ends with StopReason::Stopped ──────────────────────────────

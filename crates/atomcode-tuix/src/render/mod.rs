@@ -444,6 +444,9 @@ pub enum MenuKind {
         row_prefix: &'static str,
         selected_marker: &'static str,
     },
+    /// `/cd` project list. Uses two-column rows with a dynamic 4..=8 item
+    /// viewport and a sticky `+ N more…` fold row.
+    DirectoryList,
     /// Plugin manager list: 2-line rendering per item.
     /// Row 1: Plugin Name + Marketplace + Installation Status
     /// Row 2: Description
@@ -469,6 +472,7 @@ impl MenuKind {
             MenuKind::Skill | MenuKind::Action | MenuKind::TwoColumn { .. } => {
                 item_count.min((screen_height / 2).max(4))
             }
+            MenuKind::DirectoryList => directory_window(item_count, 0, screen_height).1,
             MenuKind::Plugin | MenuKind::SessionList => {
                 let plugin_count = item_count.saturating_sub(3);
                 let max_plugins = (screen_height / 4).max(2);
@@ -484,6 +488,23 @@ impl MenuKind {
             MenuKind::PluginInfo => item_count,
         }
     }
+}
+
+/// Return `(start, visible_count, hidden_count)` for the `/cd` project list.
+pub(crate) fn directory_window(
+    item_count: usize,
+    selected: usize,
+    screen_height: usize,
+) -> (usize, usize, usize) {
+    let cap = (screen_height / 2).clamp(4, 8).min(item_count);
+    if item_count <= cap {
+        return (0, item_count, 0);
+    }
+    let selected = selected.min(item_count.saturating_sub(1));
+    let start = selected
+        .saturating_sub(cap.saturating_sub(1))
+        .min(item_count - cap);
+    (start, cap, item_count - cap)
 }
 
 /// Slash-command palette payload: filtered entries + which one is selected.
@@ -558,6 +579,9 @@ pub struct StatusLine {
     /// Active Ctrl+R reverse-i-search state, shown on the input box's
     /// top rule while searching. `None` outside search mode.
     pub search: Option<SearchState>,
+    /// Ephemeral text rendered faintly inside an otherwise-empty composer.
+    /// Right Arrow acceptance belongs to the input driver, not the renderer.
+    pub next_prompt_suggestion: Option<String>,
     /// Optional read-only command report rendered as a transient multi-line
     /// footer panel directly below the input box. It never enters scrollback.
     pub command_output: Option<String>,
@@ -690,6 +714,9 @@ pub struct UserInputPanelView {
     pub custom_text: String,
     /// Whether to render the "Other" free-text row (mirrors `UserInputPanel.custom`).
     pub custom: bool,
+    /// Signed PageUp/PageDown displacement from the automatically selected
+    /// viewport. Kept in TUI state; it is not part of the tool wire protocol.
+    pub scroll_offset: isize,
     /// Batch navigator context. `None` = a standalone single question (rendered
     /// byte-identically to before, no chrome). `Some` = this is one question inside
     /// a multi-question batch, so the renderer adds a `Question i/N` navigator and a
@@ -742,6 +769,7 @@ pub fn round_cap_view(cap: u32, base: u32, cursor: usize, stats: &str) -> UserIn
         text: String::new(),
         custom_text: String::new(),
         custom: false,
+        scroll_offset: 0,
         batch: None,
     }
 }
@@ -815,6 +843,12 @@ pub struct GoalStatus {
     pub round: u32,
     /// Wall-clock seconds since the goal was set.
     pub elapsed_secs: u64,
+    /// Current phase of the goal (Pursuing / PausedAtCap / Satisfied / Ended).
+    /// Drives badge rendering: Pursuing → live progress; PausedAtCap → paused
+    /// badge with resume hint; Satisfied → achieved badge. Ended is never stored
+    /// (the goal row is hidden by clearing `goal_condition` before this is
+    /// constructed).
+    pub phase: atomcode_coding::GoalPhase,
 }
 
 /// Live status of an active `/loop`, rendered on the dedicated footer loop row.
@@ -988,6 +1022,14 @@ mod tests {
         // At the cap boundary.
         assert_eq!(k.max_visible_rows(40, 20), 20);
         assert_eq!(k.max_visible_rows(40, 19), 19);
+    }
+
+    #[test]
+    fn directory_window_keeps_more_visible_across_terminal_heights() {
+        assert_eq!(directory_window(12, 0, 10), (0, 5, 7));
+        assert_eq!(directory_window(12, 9, 10), (5, 5, 7));
+        assert_eq!(directory_window(12, 9, 40), (2, 8, 4));
+        assert_eq!(MenuKind::DirectoryList.max_visible_rows(10, 12), 5);
     }
 
     #[test]

@@ -66,6 +66,10 @@ pub struct AnthropicConfig {
     /// Per-chunk stream-idle watchdog: no bytes for this long ⇒ terminal error.
     pub idle_timeout: Duration,
     pub connect_timeout: Duration,
+    /// Per-ATTEMPT first-byte (TTFB) watchdog for the OPEN call — see the matching
+    /// field on `OpenAiCompatConfig`. A gateway that accepts the connection but never
+    /// responds would otherwise hang forever. A timeout is classified retryable.
+    pub open_timeout: Duration,
     /// Retry policy for the OPEN call only (mid-stream errors are never retried).
     pub retry: RetryPolicy,
     /// User-Agent sent on every request. `None` ⇒ [`super::DEFAULT_USER_AGENT`]; the
@@ -93,6 +97,7 @@ impl AnthropicConfig {
             thinking: false,
             send_sampling_params: false,
             idle_timeout: Duration::from_secs(120),
+            open_timeout: Duration::from_secs(90),
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
             user_agent: None,
@@ -174,6 +179,7 @@ impl LlmProvider for AnthropicProvider {
         // Snapshot the session id once; reused across the open and any mid-stream reopen.
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
+        let open_timeout = self.cfg.open_timeout;
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
         let resp = open_stream(
             &client,
@@ -184,6 +190,7 @@ impl LlmProvider for AnthropicProvider {
             &session_id,
             &policy,
             rate_limit_retry_owner,
+            open_timeout,
         )
         .await?;
 
@@ -236,7 +243,7 @@ impl LlmProvider for AnthropicProvider {
                                 // immediate retry does not slam a gateway resetting under load.
                                 tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
                                 if let Ok(fresh) =
-                                    open_stream(&client, &url, &body, &api_key, &anthropic_version, &session_id, &policy, rate_limit_retry_owner).await
+                                    open_stream(&client, &url, &body, &api_key, &anthropic_version, &session_id, &policy, rate_limit_retry_owner, open_timeout).await
                                 {
                                     stream_attempt += 1;
                                     resp = fresh;
@@ -300,6 +307,7 @@ async fn open_stream(
     session_id: &str,
     policy: &RetryPolicy,
     rate_limit_retry_owner: atomcode_kernel::provider::RateLimitRetryOwner,
+    open_timeout: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
     loop {
@@ -312,7 +320,26 @@ async fn open_stream(
         if !session_id.is_empty() {
             req = req.header("x-atomcode-session-id", session_id);
         }
-        let send = req.send().await;
+        // TTFB watchdog for THIS attempt (mirrors openai_compat): bounds only the
+        // silent-gateway wait, never a slow streaming body.
+        let send = match tokio::time::timeout(open_timeout, req.send()).await {
+            Ok(r) => r,
+            Err(_elapsed) => {
+                if attempt < policy.max_attempts {
+                    tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(ProviderError {
+                    retryable: true,
+                    message: format!(
+                        "open failed: 等待首字节超过 {}s(网关无响应)",
+                        open_timeout.as_secs()
+                    ),
+                    ..Default::default()
+                });
+            }
+        };
         match send {
             Ok(resp) => {
                 let code = resp.status().as_u16();
@@ -395,16 +422,29 @@ fn build_request_body(
             body.insert("temperature".into(), json!(t));
         }
     }
-    match options.tool_choice {
+    let forces_tool_use = matches!(
+        &options.tool_choice,
+        ToolChoice::Required | ToolChoice::Specific(_)
+    );
+    match &options.tool_choice {
         ToolChoice::Auto => {} // omit → byte-identical to "no opinion"
         ToolChoice::Required => {
             body.insert("tool_choice".into(), json!({ "type": "any" }));
+        }
+        ToolChoice::Specific(name) => {
+            body.insert(
+                "tool_choice".into(),
+                json!({ "type": "tool", "name": name }),
+            );
         }
         ToolChoice::None => {
             body.insert("tool_choice".into(), json!({ "type": "none" }));
         }
     }
-    if cfg.thinking {
+    // Anthropic rejects extended/adaptive thinking combined with forced tool use.
+    // Suppress thinking for this one request; the session config remains unchanged,
+    // so the following round resumes thinking automatically.
+    if cfg.thinking && !forces_tool_use {
         body.insert("thinking".into(), json!({ "type": "adaptive" }));
     }
     if let Some(effort) = options.reasoning_effort {
@@ -1311,13 +1351,30 @@ mod tests {
             "sampling params omitted by default (Opus 4.7+ reject temperature)"
         );
         assert_eq!(body["tool_choice"], json!({"type":"any"}), "Required → any");
-        assert_eq!(body["thinking"], json!({"type":"adaptive"}));
+        assert!(
+            body.get("thinking").is_none(),
+            "forced tool use must suppress incompatible thinking for this request"
+        );
         assert_eq!(body["output_config"]["effort"], "high");
         // tools use input_schema, NOT function.parameters.
         assert_eq!(
             body["tools"][0],
             json!({"name":"read","description":"d","input_schema":{"type":"object"}})
         );
+    }
+
+    #[test]
+    fn specific_tool_choice_uses_anthropic_tool_shape() {
+        let mut c = cfg();
+        c.thinking = true;
+        let opts = ChatOptions {
+            tool_choice: ToolChoice::Specific("todowrite".into()),
+            ..Default::default()
+        };
+        let body = build_request_body("claude-opus-4-8", &[Message::user("hi")], &[], &opts, &c);
+        assert_eq!(body["tool_choice"]["type"], "tool");
+        assert_eq!(body["tool_choice"]["name"], "todowrite");
+        assert!(body.get("thinking").is_none());
     }
 
     #[test]

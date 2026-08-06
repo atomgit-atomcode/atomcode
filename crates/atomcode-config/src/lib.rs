@@ -17,8 +17,12 @@ pub mod util;
 /// apply this policy to their own reqwest builders.
 pub mod proxy;
 
+/// Every server address the client talks to, each overridable by env with
+/// today's value as the default.
+pub mod endpoints;
+
 /// TLS-version policy for the explicit process-wide env ceiling and the
-/// endpoint-scoped AtomGit fallback latch. Pure URL/env/atomic logic; HTTP
+/// endpoint-scoped first-party fallback latch. Pure URL/env/atomic logic; HTTP
 /// clients remain in their owning leaf/provider crates.
 pub mod tls;
 

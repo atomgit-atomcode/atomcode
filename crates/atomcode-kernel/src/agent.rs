@@ -139,6 +139,18 @@ const MAX_STREAM_RETRIES: u32 = 5;
 /// 40-minute hang from a broken hook, far past the 300s `stream_timeout`).
 const MAX_RATE_LIMIT_WAITS: u32 = 5;
 
+/// The FIRST transient 429 of a turn that has NO host verdict and NO server
+/// `Retry-After` is almost always a momentary burst over a per-second gateway
+/// limit that clears immediately. Retry it QUIETLY after this short wait — without
+/// emitting a `RateLimited` banner — so a one-off blip does not spam the UI (the
+/// pre-consolidation behaviour that transparently absorbed such 429s). A SUSTAINED
+/// limit re-trips on the retry and surfaces normally from the SECOND wait onward
+/// (escalating countdown + `MAX_RATE_LIMIT_WAITS` fuse). Mirrors opencode's silent
+/// low-level retries before it shows a retry status. Only the FALLBACK path is
+/// affected: a host-supplied verdict (CodingPlan window) or a server `Retry-After`
+/// is always honoured and surfaced.
+const SILENT_FIRST_RATE_LIMIT_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// How many times the agent loop re-issues a round after the provider returns a
 /// COMPLETELY EMPTY but otherwise-successful completion (a 200 with no text, no
 /// tool calls, no reasoning). This is a DISTINCT tier from `MAX_PROVIDER_RETRIES`
@@ -498,7 +510,10 @@ enum CallPlan {
     Skip,
     /// A ready-to-apply result: mode-B stub, middleware `blocked:` error, or an
     /// unknown/unmounted-tool error. Applied verbatim in Phase ③ (no execute).
-    Result(ToolResult),
+    Result {
+        result: ToolResult,
+        terminate_turn: bool,
+    },
     /// Run this tool in Phase ②. `parallel_safe` is captured at classification
     /// time (Task 3 uses it to decide concurrency).
     Execute {
@@ -1414,7 +1429,18 @@ impl RunningAgent {
                 _ = &mut turn => break,
                 maybe = cmd_rx.recv() => match maybe {
                     Some(AgentCommand::Respond { id, value }) => self.rt.resolve(id, value),
-                    Some(AgentCommand::Shutdown) => { shutdown = true; break; }
+                    Some(AgentCommand::Shutdown) => {
+                        // Shutdown during a live turn is a cooperative terminal, not
+                        // permission to drop the `run_turn` future. Dropping it bypasses
+                        // `finish_cancelled`, `turn_complete`, and the session snapshot
+                        // hook, so a provider/model rebuild can resume from an older
+                        // canonical snapshot. Cancel the turn and wait for its normal
+                        // terminal funnel instead.
+                        shutdown = true;
+                        turn_token.cancel();
+                        self.rt.cancel_pending();
+                        steer.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                    }
                     Some(AgentCommand::Cancel) => {
                         // Cancel both halves of a parked turn: the token covers the
                         // stream/between-tools checkpoints; flushing pending requests
@@ -1462,6 +1488,9 @@ impl RunningAgent {
                 }
             }
         }
+        // Release run_turn's mutable conversation borrow before the shutdown
+        // checkpoint below reads the now-finalized conversation.
+        drop(turn);
         // Leftover steer buffer: any steer that arrived too late to be drained by
         // run_turn (e.g. Task 2 not yet implemented, or a very late arrival) falls
         // back to the pending deque so the user's prompt is NOT silently lost.
@@ -1469,6 +1498,14 @@ impl RunningAgent {
             pending.push_back(AgentCommand::SendMessage {
                 text: s.text,
                 images: s.images,
+            });
+        }
+        if shutdown {
+            // The owner that requested shutdown may be replacing this agent. Give
+            // it the exact post-cancel in-memory conversation so replacement never
+            // has to guess from a potentially older disk checkpoint.
+            self.rt.emit(AgentEvent::Snapshot {
+                snapshot: self.capture_snapshot(convo),
             });
         }
         shutdown
@@ -1835,6 +1872,16 @@ impl RunningAgent {
             }
             let mut messages = convo.messages.clone();
             self.hooks.pre_request(&mut messages, &turn_ctx).await;
+            // Record hook-contract violations BEFORE normalization changes the
+            // ephemeral projection. The warning must blame the hook output, not
+            // the kernel's provider-safety repair below.
+            let mut appended_only = messages.len() >= convo.messages.len()
+                && messages[..convo.messages.len()] == convo.messages[..];
+            // Normalize every projection before it participates in token-window
+            // decisions. Otherwise an orphan result that will never reach the
+            // provider can spuriously compact persistent conversation state, while
+            // synthesized results can make the final wire larger than estimated.
+            Conversation::repair_pairing(&mut messages);
             // PRE-SEND EMERGENCY COMPACTION: if the estimated outgoing request already
             // meets/exceeds the model window, COMPACT before sending rather than firing a
             // doomed over-window request. This is the case the between-turn `should_compact`
@@ -1873,6 +1920,9 @@ impl RunningAgent {
                     }
                     messages = convo.messages.clone();
                     self.hooks.pre_request(&mut messages, &turn_ctx).await;
+                    appended_only &= messages.len() >= convo.messages.len()
+                        && messages[..convo.messages.len()] == convo.messages[..];
+                    Conversation::repair_pairing(&mut messages);
                 }
             }
             // PRE-SEND over-window advisory (at most ONCE per turn — the
@@ -1899,8 +1949,6 @@ impl RunningAgent {
             // tests can't see that for a third-party hook; surface it at runtime as a
             // Warning. Cheap: compares the post-hook prefix against the untouched stored
             // `convo.messages` (no extra clone); short-circuits on a shrink (no panic).
-            let appended_only = messages.len() >= convo.messages.len()
-                && messages[..convo.messages.len()] == convo.messages[..];
             if !appended_only {
                 self.rt.emit(AgentEvent::Warning(format!(
                     "pre_request is not append-only: the outgoing prefix diverges from the \
@@ -1915,6 +1963,9 @@ impl RunningAgent {
             // cannot mutate the wire (mutation is pre_request's job above).
             let mut request_options = self.chat_options.clone();
             request_options.rate_limit_retry_owner = crate::provider::RateLimitRetryOwner::Kernel;
+            self.hooks
+                .pre_request_options(&messages, &mut request_options, &turn_ctx)
+                .await;
             self.hooks
                 .on_request(&messages, &defs, &request_options, &turn_ctx)
                 .await;
@@ -1982,14 +2033,18 @@ impl RunningAgent {
                         attempt: rate_limit_waits.saturating_add(1),
                     };
                     let server_message = rate_limit_server_message(&e);
-                    let decision = if hint.terminal {
-                        crate::hook::RateLimitDecision::from_hint(&hint)
+                    // Distinguish a HOST verdict from the `from_hint` FALLBACK: only the
+                    // fallback (no host opinion) is eligible for the quiet-first retry.
+                    let host_verdict = if hint.terminal {
+                        None
                     } else {
-                        self.hooks
-                            .on_rate_limit(&hint)
-                            .await
-                            .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint))
+                        self.hooks.on_rate_limit(&hint).await
                     };
+                    let quiet_first_eligible = host_verdict.is_none()
+                        && hint.retry_after_secs.is_none()
+                        && !hint.terminal;
+                    let decision = host_verdict
+                        .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint));
                     match decision {
                         crate::hook::RateLimitDecision::WaitAndRetry { secs } => {
                             rate_limit_waits += 1;
@@ -2009,20 +2064,28 @@ impl RunningAgent {
                                     .await;
                                 return;
                             }
-                            self.rt.emit(AgentEvent::RateLimited {
-                                reset_at_display: String::new(),
-                                reset_label: String::new(),
-                                secs_until_reset: Some(secs),
-                                auto_resuming: true,
-                                server_message: None, // auto-retrying: no user-facing reason line
-                            });
+                            // QUIET-FIRST: a one-off transient 429 (fallback path, no
+                            // Retry-After) recovers silently — no banner spam. Sustained
+                            // limits re-trip and surface from the second wait onward.
+                            let wait = if quiet_first_eligible && rate_limit_waits == 1 {
+                                SILENT_FIRST_RATE_LIMIT_RETRY
+                            } else {
+                                self.rt.emit(AgentEvent::RateLimited {
+                                    reset_at_display: String::new(),
+                                    reset_label: String::new(),
+                                    secs_until_reset: Some(secs),
+                                    auto_resuming: true,
+                                    server_message: None, // auto-retrying: no user-facing reason line
+                                });
+                                std::time::Duration::from_secs(secs)
+                            };
                             tokio::select! {
                                 biased;
                                 _ = cancel.cancelled() => {
                                     self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
                                     return;
                                 }
-                                _ = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {}
+                                _ = tokio::time::sleep(wait) => {}
                             }
                             provider_retry = 0; // 429 must not consume the generic transient-retry budget
                             round -= 1; // re-issue this round, not a new one
@@ -2331,14 +2394,18 @@ impl RunningAgent {
                             attempt: rate_limit_waits.saturating_add(1),
                         };
                         let server_message = rate_limit_server_message(&e);
-                        let decision = if hint.terminal {
-                            crate::hook::RateLimitDecision::from_hint(&hint)
+                        // Distinguish a HOST verdict from the `from_hint` FALLBACK: only the
+                        // fallback (no host opinion) is eligible for the quiet-first retry.
+                        let host_verdict = if hint.terminal {
+                            None
                         } else {
-                            self.hooks
-                                .on_rate_limit(&hint)
-                                .await
-                                .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint))
+                            self.hooks.on_rate_limit(&hint).await
                         };
+                        let quiet_first_eligible = host_verdict.is_none()
+                            && hint.retry_after_secs.is_none()
+                            && !hint.terminal;
+                        let decision = host_verdict
+                            .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint));
                         // Once any model content has reached the driver, replaying the
                         // request can duplicate text/reasoning/tool calls that cannot be
                         // retracted from the live UI. Keep the clean RateLimited terminal,
@@ -2391,20 +2458,28 @@ impl RunningAgent {
                                         .await;
                                     return;
                                 }
-                                self.rt.emit(AgentEvent::RateLimited {
-                                    reset_at_display: String::new(),
-                                    reset_label: String::new(),
-                                    secs_until_reset: Some(secs),
-                                    auto_resuming: true,
-                                    server_message: None,
-                                });
+                                // QUIET-FIRST (mirrors the OPEN path): a one-off transient
+                                // 429 before any content, with no host verdict and no
+                                // Retry-After, recovers silently.
+                                let wait = if quiet_first_eligible && rate_limit_waits == 1 {
+                                    SILENT_FIRST_RATE_LIMIT_RETRY
+                                } else {
+                                    self.rt.emit(AgentEvent::RateLimited {
+                                        reset_at_display: String::new(),
+                                        reset_label: String::new(),
+                                        secs_until_reset: Some(secs),
+                                        auto_resuming: true,
+                                        server_message: None,
+                                    });
+                                    std::time::Duration::from_secs(secs)
+                                };
                                 tokio::select! {
                                     biased;
                                     _ = cancel.cancelled() => {
                                         self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
                                         return;
                                     }
-                                    _ = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {}
+                                    _ = tokio::time::sleep(wait) => {}
                                 }
                                 provider_retry = 0; // 429 must not consume the generic transient-retry budget
                                 retry_this_round = true;
@@ -2849,6 +2924,7 @@ impl RunningAgent {
                 return;
             }
             let mut plans: Vec<CallPlan> = Vec::with_capacity(pending_calls.len());
+            let mut terminal_policy_denial_seen = false;
             for mut call in pending_calls {
                 // ── DUPLICATE TOOL-CALL DEDUP GATE ──
                 // Some (esp. thinking-mode / weak) models emit the SAME tool_call
@@ -2876,6 +2952,25 @@ impl RunningAgent {
                     continue;
                 }
 
+                // A hard policy denial suppresses every other call in the same
+                // model-emitted batch. Pair each id with an explicit result, but
+                // do not allow sibling side effects to run before termination.
+                if terminal_policy_denial_seen {
+                    result_ids.insert(call.id.clone());
+                    plans.push(CallPlan::Result {
+                        result: ToolResult {
+                            call_id: call.id,
+                            content:
+                                "blocked: another call in this batch terminated the turn by policy"
+                                    .into(),
+                            is_error: true,
+                            images: vec![],
+                        },
+                        terminate_turn: false,
+                    });
+                    continue;
+                }
+
                 // (2) SAME (name, arguments) with a NEW id (mode B — carry
                 // production runner.rs:933-942): do NOT re-execute. Push a stub
                 // result so this distinct id STILL gets exactly one result (parity
@@ -2891,7 +2986,10 @@ impl RunningAgent {
                         images: vec![],
                     };
                     result_ids.insert(call.id.clone());
-                    plans.push(CallPlan::Result(result));
+                    plans.push(CallPlan::Result {
+                        result,
+                        terminate_turn: false,
+                    });
                     continue;
                 }
 
@@ -2901,19 +2999,22 @@ impl RunningAgent {
                         // id (mode A) but NOT the (name,args) key — a later distinct
                         // id may legitimately retry once the tool is mounted.
                         result_ids.insert(call.id.clone());
-                        plans.push(CallPlan::Result(ToolResult {
-                            call_id: call.id.clone(),
-                            content: format!("unknown or unmounted tool: {}", call.name),
-                            is_error: true,
-                            images: vec![],
-                        }));
+                        plans.push(CallPlan::Result {
+                            result: ToolResult {
+                                call_id: call.id.clone(),
+                                content: format!("unknown or unmounted tool: {}", call.name),
+                                is_error: true,
+                                images: vec![],
+                            },
+                            terminate_turn: false,
+                        });
                     }
                     Some(tool) => {
                         // ToolMiddleware before-chain: may rewrite the call (&mut),
                         // round-trip via rt (approval), and returns a BeforeOutcome
                         // GATE decision. Runs after lookup; ToolStarted fires only for
                         // a tool that executes (no ghost row for blocked tools).
-                        let mut blocked: Option<String> = None;
+                        let mut blocked: Option<(String, bool)> = None;
                         for mw in &self.middlewares {
                             match mw.before(&mut call, &tool, &self.rt).await {
                                 BeforeOutcome::Proceed => {}
@@ -2934,22 +3035,47 @@ impl RunningAgent {
                                 // bypasses the permission system).
                                 BeforeOutcome::Allow { .. } => break,
                                 BeforeOutcome::Deny { reason } => {
-                                    blocked = Some(reason);
+                                    blocked = Some((reason, false));
+                                    break;
+                                }
+                                BeforeOutcome::DenyTurn { reason } => {
+                                    blocked = Some((reason, true));
                                     break;
                                 }
                             }
                         }
-                        if let Some(reason) = blocked {
+                        if let Some((reason, terminate_turn)) = blocked {
                             // Middleware-blocked: a ready error result. Record the id
                             // (mode A) but NOT the (name,args) key — a later distinct
                             // id may legitimately RETRY a previously blocked call.
                             result_ids.insert(call.id.clone());
-                            plans.push(CallPlan::Result(ToolResult {
-                                call_id: call.id.clone(),
-                                content: format!("blocked: {reason}"),
-                                is_error: true,
-                                images: vec![],
-                            }));
+                            plans.push(CallPlan::Result {
+                                result: ToolResult {
+                                    call_id: call.id.clone(),
+                                    content: format!("blocked: {reason}"),
+                                    is_error: true,
+                                    images: vec![],
+                                },
+                                terminate_turn,
+                            });
+                            if terminate_turn {
+                                terminal_policy_denial_seen = true;
+                                for prior in &mut plans {
+                                    if let CallPlan::Execute { call, .. } = prior {
+                                        let call_id = call.id.clone();
+                                        *prior = CallPlan::Result {
+                                            result: ToolResult {
+                                                call_id,
+                                                content: "blocked: another call in this batch terminated the turn by policy"
+                                                    .into(),
+                                                is_error: true,
+                                                images: vec![],
+                                            },
+                                            terminate_turn: false,
+                                        };
+                                    }
+                                }
+                            }
                         } else {
                             // Executes in Phase ②. Record BOTH dedup keys NOW so a
                             // later call in THIS batch that repeats the id classifies as
@@ -2998,7 +3124,7 @@ impl RunningAgent {
             let mut results: Vec<Option<ExecutedCallResult>> =
                 (0..plans.len()).map(|_| None).collect();
             for (i, plan) in plans.iter().enumerate() {
-                if let CallPlan::Result(r) = plan {
+                if let CallPlan::Result { result: r, .. } = plan {
                     results[i] = Some(ExecutedCallResult {
                         result: r.clone(),
                         effective_cwd: None,
@@ -3146,6 +3272,7 @@ impl RunningAgent {
                         )
                     }));
             let mut loop_calls = Vec::with_capacity(plans.len());
+            let mut policy_denied = false;
             for (plan, result_slot) in plans.iter().zip(results.iter_mut()) {
                 let Some(ExecutedCallResult {
                     mut result,
@@ -3219,6 +3346,15 @@ impl RunningAgent {
                     &result.content,
                     result.is_error,
                 ));
+                if matches!(
+                    plan,
+                    CallPlan::Result {
+                        terminate_turn: true,
+                        ..
+                    }
+                ) {
+                    policy_denied = true;
+                }
                 // CC PostToolUse `decision: "block"`: feed the reason back to the
                 // model so it can course-correct. Hard turn-termination (stop before
                 // the next model call) needs a dedicated StopReason and lands with the
@@ -3266,6 +3402,11 @@ impl RunningAgent {
                     total: total_non_dup,
                     elapsed_ms: started_at.elapsed().as_millis() as u64,
                 });
+            }
+            if policy_denied {
+                self.finish_turn(convo, StopReason::PolicyDenied, &turn_ctx)
+                    .await;
+                return;
             }
             // VISION: surface any images this batch's tools produced to the model via a
             // SINGLE follow-up user message (collected above). Pushed AFTER all
@@ -4240,7 +4381,11 @@ mod partial_stream_persistence_tests {
         let assistant = &convo.messages[1];
         assert_eq!(assistant.text, "partial text");
         assert_eq!(assistant.reasoning.as_deref(), Some("partial reasoning"));
-        assert_eq!(assistant.tool_calls.len(), 1, "same call_id is persisted once");
+        assert_eq!(
+            assistant.tool_calls.len(),
+            1,
+            "same call_id is persisted once"
+        );
 
         let result = &convo.messages[2];
         assert_eq!(result.role, Role::Tool);
@@ -4570,6 +4715,101 @@ mod steer_buffer_tests {
             }],
             "one folded prompt → Steered {{ count: 1 }}"
         );
+    }
+}
+
+#[cfg(test)]
+mod provider_message_pairing_tests {
+    use super::*;
+    use crate::hook::{LifecycleHooks, TurnCtx};
+    use crate::message::{Role, SessionSnapshot};
+    use crate::testkit::RecordingProvider;
+    use crate::tool::{ToolCall, ToolRegistry};
+
+    struct OrphanResultHook;
+
+    #[async_trait::async_trait]
+    impl LifecycleHooks for OrphanResultHook {
+        async fn pre_request(&self, messages: &mut Vec<Message>, _ctx: &TurnCtx) {
+            messages.retain(|message| message.tool_calls.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_boundary_repairs_hook_created_orphan_without_mutating_storage() {
+        let stored = vec![
+            Message::user("previous task"),
+            Message::assistant(
+                "calling",
+                vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "noop".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            Message::tool_result("call-1", "x".repeat(20_000), false),
+        ];
+        let provider = Arc::new(
+            RecordingProvider::new(vec![vec![
+                StreamEvent::TextDelta("ok".into()),
+                StreamEvent::Done { truncated: false },
+            ]])
+            .with_ctx_window(1_000),
+        );
+        let calls = provider.calls();
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(ToolRegistry::new().mount(&[]))
+            .hooks(Arc::new(OrphanResultHook))
+            .resume(SessionSnapshot::new(stored.clone()))
+            .build()
+            .spawn();
+
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "continue".into(),
+                images: vec![],
+            })
+            .unwrap();
+        let mut warnings = Vec::new();
+        while let Some(event) = handle.events.recv().await {
+            match event {
+                AgentEvent::Warning(warning) => warnings.push(warning),
+                AgentEvent::TurnComplete { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.contains("exceeds the model input limit")),
+            "a dropped orphan must not trigger an over-window advisory: {warnings:?}"
+        );
+
+        let recorded = calls.lock().unwrap();
+        let outgoing = &recorded[0].0;
+        assert!(
+            outgoing.iter().all(|message| message.role != Role::Tool),
+            "the provider must not receive the hook-created orphan result"
+        );
+        drop(recorded);
+
+        handle.commands.send(AgentCommand::Snapshot).unwrap();
+        let snapshot = loop {
+            match handle.events.recv().await {
+                Some(AgentEvent::Snapshot { snapshot }) => break snapshot,
+                Some(_) => {}
+                None => panic!("agent stopped before returning its snapshot"),
+            }
+        };
+        assert_eq!(
+            &snapshot.messages[..stored.len()],
+            stored.as_slice(),
+            "outbound repair must not rewrite persisted conversation history"
+        );
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
     }
 }
 

@@ -9,11 +9,27 @@
 
 use atomcode_kernel::agent::{Agent, AgentHandle};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
+use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
+use atomcode_kernel::message::Message;
 use atomcode_kernel::provider::{ChatOptions, RateLimitRetryOwner, ReasoningEffort, ToolChoice};
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::{EchoTool, RecordingProvider};
 use atomcode_kernel::tool::ToolRegistry;
 use std::sync::Arc;
+
+struct SpecificToolHook;
+
+#[async_trait::async_trait]
+impl LifecycleHooks for SpecificToolHook {
+    async fn pre_request_options(
+        &self,
+        _messages: &[Message],
+        options: &mut ChatOptions,
+        _ctx: &TurnCtx,
+    ) {
+        options.tool_choice = ToolChoice::Specific("echo".into());
+    }
+}
 
 const PERSONA: &str = "you are a neutral test agent";
 
@@ -114,4 +130,29 @@ async fn default_agent_sends_neutral_options() {
         calls[0].2, expected,
         "an agent built without chat_options must keep neutral model knobs"
     );
+}
+
+#[tokio::test]
+async fn request_options_hook_overrides_the_outgoing_call() {
+    let provider = Arc::new(RecordingProvider::new(vec![vec![
+        StreamEvent::TextDelta("ok".into()),
+        StreamEvent::Done { truncated: false },
+    ]]));
+    let calls = provider.calls();
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(EchoTool));
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["echo"]))
+        .persona(PERSONA)
+        .hook(Arc::new(SpecificToolHook))
+        .build()
+        .spawn();
+
+    drive_one_turn(&mut handle, "go").await;
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls[0].2.tool_choice, ToolChoice::Specific("echo".into()));
 }

@@ -206,8 +206,19 @@ pub trait LifecycleHooks: Send + Sync {
 
     /// Before EACH LLM request (every round). Mutate the OUTGOING messages.
     /// EPHEMERAL: operates on a per-request clone, NOT stored — projections never
-    /// poison the prefix cache. `ctx` carries round / max_rounds.
+    /// poison the prefix cache. `ctx` carries round / max_rounds. Provider-side
+    /// request options are mutated separately by `pre_request_options`.
     async fn pre_request(&self, _messages: &mut Vec<Message>, _ctx: &TurnCtx) {}
+
+    /// Mutate the per-call provider options after message projection. EPHEMERAL:
+    /// the session's configured defaults are cloned before this hook runs.
+    async fn pre_request_options(
+        &self,
+        _messages: &[Message],
+        _options: &mut ChatOptions,
+        _ctx: &TurnCtx,
+    ) {
+    }
 
     /// READ-ONLY wire observation, fired AFTER `pre_request` projects and just
     /// BEFORE the provider call — so the observer sees the EXACT FINAL outgoing
@@ -216,7 +227,8 @@ pub trait LifecycleHooks: Send + Sync {
     /// project's telemetry / datalog / prefix-cache-RCA discipline (e.g. hash the
     /// prefix, dump the bytes). It is `&` (read-only) ON PURPOSE: it MUST NOT mutate
     /// the outgoing wire — mutation is `pre_request`'s job (the ephemeral clone),
-    /// which keeps the prefix-cache contract owned by exactly one seam.
+    /// which keeps the prefix-cache contract owned by exactly one message seam;
+    /// sideband option mutation belongs to `pre_request_options`.
     async fn on_request(
         &self,
         _messages: &[Message],
@@ -389,6 +401,17 @@ impl LifecycleHooks for HookChain {
     async fn pre_request(&self, messages: &mut Vec<Message>, ctx: &TurnCtx) {
         for h in &self.hooks {
             h.pre_request(messages, ctx).await;
+        }
+    }
+
+    async fn pre_request_options(
+        &self,
+        messages: &[Message],
+        options: &mut ChatOptions,
+        ctx: &TurnCtx,
+    ) {
+        for h in &self.hooks {
+            h.pre_request_options(messages, options, ctx).await;
         }
     }
 

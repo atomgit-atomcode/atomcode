@@ -109,7 +109,12 @@ impl ToolMiddleware for TurnExecutionPolicy {
 pub(crate) fn execution_policy_for_messages(messages: &[Message]) -> ExecutionPolicy {
     messages
         .iter()
-        .rfind(|message| message.role == Role::User && !message.synthetic)
+        .rfind(|message| {
+            // An empty-text user message (e.g. an image-only steer whose text was moved
+            // out for vision preprocessing) expresses no execution intent, so skip it and
+            // keep the restriction from the last message that actually said something.
+            message.role == Role::User && !message.synthetic && !message.text.trim().is_empty()
+        })
         .map(|message| execution_policy_from_text(&message.text))
         .unwrap_or_default()
 }
@@ -454,6 +459,22 @@ mod tests {
         assert!(policy.current().contains(NO_SHELL));
         policy.update_from_user_text("现在可以运行验证了");
         assert!(policy.current().is_default());
+    }
+
+    #[test]
+    fn an_empty_follow_up_message_does_not_clear_the_active_restriction() {
+        // An image-only steer arrives as a non-synthetic user message whose text was
+        // moved out for vision preprocessing, so it is empty. The per-turn policy must
+        // still derive from the last user message that actually expressed intent — the
+        // restriction set earlier in the turn survives rather than being silently dropped.
+        let messages = vec![
+            Message::user("最后只改代码，禁止编译和执行脚本"),
+            Message::user(""),
+        ];
+        assert!(
+            !execution_policy_for_messages(&messages).is_default(),
+            "an empty image-only follow-up must not drop the active restriction"
+        );
     }
 
     #[test]

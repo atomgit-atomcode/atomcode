@@ -43,6 +43,7 @@ pub mod atomgit_bash_gate;
 pub mod bash;
 pub mod bash_workspace_gate;
 pub mod cd;
+pub mod credential_bash_gate;
 pub mod edit;
 pub mod glob;
 pub mod grep;
@@ -94,13 +95,15 @@ pub use bash::{
 };
 pub use bash_workspace_gate::BashWorkspaceGate;
 pub use cd::ChangeDirTool;
+pub use credential_bash_gate::CredentialBashGate;
 pub use edit::EditFileTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use list::ListDirTool;
 pub use open_file::{OpenFileTool, OpenFileWorkspaceGate};
 pub use output_artifact::{
-    artifact_id, ArtifactMiddleware, ArtifactStore, FetchOutputTool, THRESHOLD_BYTES,
+    artifact_id, ArtifactMiddleware, ArtifactStore, FetchOutputTool,
+    ARTIFACT_TRUNCATION_MARKER_PREFIX, THRESHOLD_BYTES,
 };
 pub use parallel_edit::ParallelEditTool;
 pub use read::ReadFileTool;
@@ -274,6 +277,103 @@ pub(crate) fn resolve_path(raw: &str, working_dir: &Path) -> PathBuf {
     } else {
         working_dir.join(raw)
     }
+}
+
+/// Max entries listed in a not-found hint before it is truncated.
+const HINT_MAX_ENTRIES: usize = 40;
+
+/// Explain a not-found path by naming the deepest ancestor that DOES exist and listing what
+/// is in it. Returns `""` when there is nothing safe or useful to say.
+///
+/// Why: `path not found: <abs path>` tells the model only that it was wrong, not where the
+/// tree actually stops — so it guesses again, deeper (`app/src` → `app/src/main/java`), and
+/// burns a turn per guess. The nearest existing ancestor plus its entries is the one fact
+/// that ends the loop, and it is a fact we can prove by reading the directory (nothing here
+/// asserts anything about what the model was *trying* to find).
+///
+/// SAFETY: the walk stops at the workspace boundary. These tools deliberately do NOT enforce
+/// containment (see the module trust-model note), so a model may pass any absolute path; a
+/// hint that listed whatever lies outside would turn a typo into "enumerate the user's home
+/// directory into model context".
+///
+/// HANG-SAFE: the blocking `canonicalize`/`read_dir` run OFF the async runtime thread and are
+/// bounded by [`GATE_FS_TIMEOUT`] (a workspace on a stalled network mount can wedge these for
+/// minutes — the same reason the permission gate uses [`run_bounded`]). A timeout degrades to
+/// no hint, never a frozen turn loop. Centralized here so no call site can forget it.
+pub(crate) async fn not_found_hint(missing: &Path, working_dir: &Path) -> String {
+    let missing = missing.to_path_buf();
+    let working_dir = working_dir.to_path_buf();
+    run_bounded(GATE_FS_TIMEOUT, String::new(), move || {
+        not_found_hint_blocking(&missing, &working_dir)
+    })
+    .await
+}
+
+/// Pure, blocking core of [`not_found_hint`] (kept separate so the boundary logic is unit-
+/// testable without a runtime). MUST run off the async worker — see the wrapper.
+fn not_found_hint_blocking(missing: &Path, working_dir: &Path) -> String {
+    let Ok(root) = crate::pathnorm::canonicalize(working_dir) else {
+        return String::new();
+    };
+    // Walk up from the parent — `missing` itself is the thing that does not exist.
+    let mut cur = missing.parent();
+    while let Some(candidate) = cur {
+        // `canonicalize` succeeds only for paths that exist, so this doubles as the
+        // existence test for each ancestor.
+        if let Ok(real) = crate::pathnorm::canonicalize(candidate) {
+            if !real.starts_with(&root) {
+                return String::new(); // left the workspace — say nothing
+            }
+            if !real.is_dir() {
+                return String::new(); // an ancestor is a FILE; there is nothing to list
+            }
+            return render_dir_hint(&real);
+        }
+        cur = candidate.parent();
+    }
+    String::new()
+}
+
+/// Render `dir`'s entries for a not-found hint: directories first (trailing `/`), then files,
+/// each group sorted by name so the text is deterministic. Build/VCS/cache dirs are dropped —
+/// the same noise the walkers skip.
+fn render_dir_hint(dir: &Path) -> String {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return String::new();
+    };
+    let mut names: Vec<(bool, String)> = Vec::new();
+    for ent in read.flatten() {
+        let name = ent.file_name().to_string_lossy().into_owned();
+        // Same filter the walkers use (`is_skip_dir` also drops `.venv-*`), so the hint
+        // never surfaces noise the tools would otherwise skip.
+        if is_skip_dir(&name) {
+            continue;
+        }
+        let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        names.push((is_dir, name));
+    }
+    if names.is_empty() {
+        return format!(
+            "\nNearest existing directory: {} (it is empty).",
+            crate::pathnorm::to_display(dir)
+        );
+    }
+    names.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+    let total = names.len();
+    let mut shown: Vec<String> = names
+        .iter()
+        .take(HINT_MAX_ENTRIES)
+        .map(|(is_dir, n)| if *is_dir { format!("{n}/") } else { n.clone() })
+        .collect();
+    if total > HINT_MAX_ENTRIES {
+        shown.push(format!("… (+{} more)", total - HINT_MAX_ENTRIES));
+    }
+    format!(
+        "\nNearest existing directory: {} — contains: {}",
+        crate::pathnorm::to_display(dir),
+        shown.join(", ")
+    )
 }
 
 /// Coerce every line ending in `s` to `eol` (`"\n"` or `"\r\n"`): collapse any `\r\n`
@@ -465,6 +565,103 @@ mod tests {
             resolve_path("src/main.rs", wd),
             PathBuf::from("/work/proj/src/main.rs")
         );
+    }
+
+    /// A model that guesses a conventional layout (`app/src/main/java` for a Gradle project)
+    /// gets `path not found` and nothing else — so it guesses again, deeper. The hint gives it
+    /// the one fact that ends the guessing: where the path stops existing, and what is actually
+    /// there.
+    #[test]
+    fn not_found_hint_names_nearest_existing_ancestor_and_its_entries() {
+        let d = tempfile::tempdir().unwrap();
+        let wd = d.path();
+        std::fs::create_dir(wd.join("app")).unwrap();
+        std::fs::write(wd.join("app").join("build.gradle"), "").unwrap();
+        std::fs::create_dir(wd.join("app").join("libs")).unwrap();
+
+        // The model guessed two levels past where the tree actually stops.
+        let hint = not_found_hint_blocking(&wd.join("app/src/main/java"), wd);
+
+        assert!(hint.contains("app"), "{hint}");
+        assert!(hint.contains("build.gradle"), "{hint}");
+        assert!(hint.contains("libs/"), "directories are marked: {hint}");
+    }
+
+    /// The tools deliberately do NOT enforce workspace containment (see the module trust-model
+    /// note), so a model can hand in any absolute path. Listing a directory outside the
+    /// workspace would pull the user's home — or anything else on disk — into model context as
+    /// a side effect of a typo. The hint stays inside the workspace or says nothing.
+    #[test]
+    fn not_found_hint_never_lists_outside_the_working_dir() {
+        let d = tempfile::tempdir().unwrap();
+        let wd = d.path().join("workspace");
+        std::fs::create_dir(&wd).unwrap();
+        // A sibling of the workspace, holding something we must never enumerate.
+        let outside = d.path().join("elsewhere");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("id_rsa"), "").unwrap();
+
+        let hint = not_found_hint_blocking(&outside.join("nope/deeper"), &wd);
+
+        assert!(
+            hint.is_empty(),
+            "must not enumerate outside the workspace: {hint}"
+        );
+    }
+
+    /// The HARD escape the boundary actually defends: a symlink INSIDE the workspace that
+    /// points OUT of it. A byte-prefix check on the un-resolved path would pass
+    /// (`<wd>/link/...` starts with `<wd>`) and leak the target's contents; the guard is only
+    /// sound because it canonicalizes both sides (resolving the symlink) before comparing. This
+    /// pins that — if `pathnorm::canonicalize` were ever swapped for a lexical normalizer, the
+    /// leak would come back and this test would catch it. (Unix-only: reliable symlink creation.)
+    #[cfg(unix)]
+    #[test]
+    fn not_found_hint_does_not_follow_a_symlink_out_of_the_workspace() {
+        let d = tempfile::tempdir().unwrap();
+        let wd = d.path().join("workspace");
+        std::fs::create_dir(&wd).unwrap();
+        let outside = d.path().join("secrets");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("id_rsa"), "").unwrap();
+        // A symlink inside the workspace pointing at the secret dir outside it.
+        std::os::unix::fs::symlink(&outside, wd.join("link")).unwrap();
+
+        // The model asks for a missing path UNDER the escaping symlink.
+        let hint = not_found_hint_blocking(&wd.join("link/nope"), &wd);
+
+        assert!(
+            hint.is_empty() && !hint.contains("id_rsa"),
+            "a symlink escaping the workspace must not be enumerated: {hint}"
+        );
+    }
+
+    /// `..` traversal that climbs out of the workspace is resolved by canonicalize and rejected,
+    /// same as the symlink case.
+    #[test]
+    fn not_found_hint_rejects_dotdot_escape() {
+        let d = tempfile::tempdir().unwrap();
+        let wd = d.path().join("workspace");
+        std::fs::create_dir(&wd).unwrap();
+        let outside = d.path().join("secrets");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("id_rsa"), "").unwrap();
+
+        let hint = not_found_hint_blocking(&wd.join("../secrets/nope"), &wd);
+
+        assert!(hint.is_empty(), "a `..` escape must say nothing: {hint}");
+    }
+
+    /// The workspace root itself is a valid nearest-existing ancestor — that is the common
+    /// case for a first-turn guess like `src/` in a project that has no `src/`.
+    #[test]
+    fn not_found_hint_accepts_the_working_dir_itself_as_the_ancestor() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("main.py"), "").unwrap();
+
+        let hint = not_found_hint_blocking(&d.path().join("src"), d.path());
+
+        assert!(hint.contains("main.py"), "{hint}");
     }
 
     /// The canonical list of tool names `register_coding_tools` and

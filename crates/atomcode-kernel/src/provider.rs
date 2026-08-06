@@ -90,13 +90,15 @@ impl ReasoningEffort {
 /// NEUTRAL tool-use directive for one call. The provider adapter maps it onto the
 /// backend's tool-choice field (e.g. OpenAI's `tool_choice: "auto"|"required"|
 /// "none"`, Anthropic's `tool_choice` object); an adapter MAY ignore it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolChoice {
     /// No opinion — the model decides whether to call a tool. The neutral default.
     #[default]
     Auto,
     /// The model MUST call at least one tool this call.
     Required,
+    /// The model MUST call the named tool this call.
+    Specific(String),
     /// The model must NOT call a tool this call.
     None,
 }
@@ -239,6 +241,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ToolChoice::None).unwrap(),
             "\"None\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ToolChoice::Specific("todowrite".into())).unwrap(),
+            r#"{"Specific":"todowrite"}"#
         );
     }
 }

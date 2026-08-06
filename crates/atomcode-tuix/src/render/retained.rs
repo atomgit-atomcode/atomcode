@@ -34,6 +34,7 @@ use super::{
 use crate::i18n::{t, Msg};
 use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
+use atomcode_coding;
 use crossterm::style::Color;
 
 const PAD_COL: usize = 2;
@@ -41,6 +42,11 @@ const PAD_COL: usize = 2;
 /// Max body_lines kept in the in-app scrollback buffer (matches alt-screen).
 /// Bounded so memory doesn't grow without limit on long sessions.
 pub const MAX_SCROLLBACK_ROWS: usize = 5000;
+
+/// Match Codex's conservative fallback for unidentified terminals. Classic
+/// conhost cannot usefully retain an unbounded resize replay and may fastfail
+/// on very large ANSI bursts.
+const LEGACY_CONHOST_REFLOW_MAX_ROWS: usize = 1000;
 
 /// Hard cap on the partial-line buffer for streaming assistant text. It's
 /// normally drained per newline; this bounds a pathological newline-less stream
@@ -55,6 +61,63 @@ fn append_stream_chunk(buffer: &mut String, chunk: &str) -> Option<String> {
     buffer.push_str(chunk);
     let split_at = buffered_len + last_newline? + 1;
     Some(buffer.drain(..split_at).collect())
+}
+
+/// Word-aware display-width wrapping for human-facing prompt prose. English
+/// breaks at spaces; oversized tokens and CJK fall back to grapheme-safe wrap.
+fn wrap_prompt_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for token in text.split_whitespace() {
+        let token_width = crate::width::display_width(token);
+        if token_width > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            let mut chunks = crate::width::wrap_line_to_width(token, width);
+            if let Some(last) = chunks.pop() {
+                lines.extend(chunks);
+                current_width = crate::width::display_width(&last);
+                current = last;
+            }
+            continue;
+        }
+        let separator = usize::from(!current.is_empty());
+        if current_width + separator + token_width > width {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(token);
+            current_width = token_width;
+        } else {
+            if separator == 1 {
+                current.push(' ');
+            }
+            current.push_str(token);
+            current_width += separator + token_width;
+        }
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+struct UserInputRows {
+    rows: Vec<Vec<Cell>>,
+    /// Full rendered range belonging to the active option/input/submit row.
+    active: std::ops::Range<usize>,
+}
+
+impl std::ops::Deref for UserInputRows {
+    type Target = [Vec<Cell>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.rows
+    }
 }
 
 /// Hard cap on how many rows the input box may DISPLAY before it scrolls
@@ -157,6 +220,62 @@ fn format_goal_row(
 ) -> String {
     let (marker, cond, meta) = goal_row_parts(condition, round, elapsed_secs, max_cols, unicode);
     format!("{marker}{cond}{meta}")
+}
+
+/// Phase-aware version of `goal_row_parts`: returns `(marker, body, meta)` for
+/// the three badge states (Pursuing / PausedAtCap / Satisfied). The caller
+/// styles each segment independently; joining them reproduces the full row text.
+///
+/// - **Pursuing**: delegates to `goal_row_parts` (condition + round + elapsed).
+/// - **PausedAtCap**: `⏸ goal 暂停 · 已达 {round} 轮 · 继续对话即推进`.
+/// - **Satisfied**: `✓ goal 已达成 · /goal clear 结束`.
+fn goal_row_parts_phase(
+    condition: &str,
+    round: u32,
+    elapsed_secs: u64,
+    max_cols: usize,
+    unicode: bool,
+    phase: atomcode_coding::GoalPhase,
+) -> (&'static str, String, String) {
+    match phase {
+        atomcode_coding::GoalPhase::Pursuing => {
+            goal_row_parts(condition, round, elapsed_secs, max_cols, unicode)
+        }
+        atomcode_coding::GoalPhase::PausedAtCap => {
+            let marker = if unicode { "⏸ " } else { "* " };
+            // Fixed text — no truncation needed for typical terminal widths.
+            let body = "goal 暂停".to_string();
+            let meta = format!(" · 已达 {round} 轮 · 继续对话即推进");
+            (marker, body, meta)
+        }
+        atomcode_coding::GoalPhase::Satisfied => {
+            let marker = if unicode { "✓ " } else { "* " };
+            let body = "goal 已达成".to_string();
+            let meta = " · /goal clear 结束".to_string();
+            (marker, body, meta)
+        }
+        atomcode_coding::GoalPhase::Ended => {
+            // Ended rows are never constructed (goal_condition is cleared first),
+            // but fall back to Pursuing display defensively.
+            goal_row_parts(condition, round, elapsed_secs, max_cols, unicode)
+        }
+    }
+}
+
+/// Phase-aware full goal-row text. Thin wrapper over [`goal_row_parts_phase`]
+/// for tests; the renderer uses `goal_row_parts_phase` directly for styling.
+#[cfg(test)]
+fn format_goal_row_phase(
+    condition: &str,
+    round: u32,
+    elapsed_secs: u64,
+    max_cols: usize,
+    unicode: bool,
+    phase: atomcode_coding::GoalPhase,
+) -> String {
+    let (marker, body, meta) =
+        goal_row_parts_phase(condition, round, elapsed_secs, max_cols, unicode, phase);
+    format!("{marker}{body}{meta}")
 }
 
 /// Loop marker: `⚡` (Lightning, U+26A1, Miscellaneous Symbols) when unicode is
@@ -756,6 +875,17 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// one older middle row with the newest permanent tail. A following
     /// permanent push must restore the continuous body before emitting LF.
     live_spinner_tail_compacted: bool,
+    /// True while a `request_user_input` footer temporarily shows the newest
+    /// transcript tail in the smaller body viewport. This is a display-only
+    /// projection: `scrolled_off` and `body_lines` remain unchanged. Before a
+    /// permanent body row is emitted, the continuous projection is restored so
+    /// the terminal LF promotes the same row that `scrolled_off` records.
+    user_input_tail_compacted: bool,
+    /// One-frame guard used while restoring a compacted user-input projection
+    /// before a permanent append. Without it, `paint_frame` would immediately
+    /// select the compacted projection again while the footer panel is still
+    /// present.
+    force_continuous_body_projection: bool,
     /// Set by `emit_body_line_inner` when an overflow LF scrolled the whole
     /// viewport (footer included) up one row; consumed (cleared) by
     /// `take_pending_scroll_flush` so the render worker repaints the footer
@@ -965,6 +1095,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             live_spinner_active: false,
             live_spinner_spacer_active: false,
             live_spinner_tail_compacted: false,
+            user_input_tail_compacted: false,
+            force_continuous_body_projection: false,
             pending_scroll_flush: false,
             in_sync_batch: false,
             inflight_tool: None,
@@ -1010,14 +1142,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
-    /// Background style for the user-input block. `bg` comes from the
-    /// theme-aware `Role::PanelBg` (dark 236 / light 254); `fg` stays `None`
-    /// so the text keeps the terminal's default foreground. Returns
-    /// `bg: None` when colours are disabled — the caller treats that as
+    /// Paired foreground/background style for the user-input block.
+    ///
+    /// Both channels are explicit because Windows cannot currently answer the
+    /// automatic background probe. If `Auto` falls back to the dark palette
+    /// while the terminal is actually light, inheriting its dark default
+    /// foreground would make the prompt unreadable on `PanelBg`.
+    /// Returns `bg: None` when colours are disabled — the caller treats that as
     /// "no block, use the plain layout".
     fn style_panel_bg(&self) -> CellStyle {
         CellStyle {
-            fg: None,
+            fg: role(self.caps, Role::PanelFg),
             bg: role(self.caps, Role::PanelBg),
             bold: false,
             reverse: false,
@@ -1092,7 +1227,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 } else {
                     0
                 };
-                if has_hint {
+                if m.kind == super::MenuKind::DirectoryList && m.items.len() > base {
+                    base + 1
+                } else if has_hint {
                     base + 1 + extra
                 } else {
                     base + extra
@@ -1813,6 +1950,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
         row
     }
 
+    fn build_ghost_middle_row(&self, line: &str, is_first: bool) -> Vec<Cell> {
+        let mut row = Vec::new();
+        if is_first {
+            push_str_cells(
+                &mut row,
+                self.caps.prompt_chevron(),
+                &self.style_for(Role::Accent),
+            );
+        } else {
+            push_str_cells(&mut row, "  ", &CellStyle::default());
+        }
+        push_str_cells(&mut row, line, &self.style_faint(Role::Muted));
+        row
+    }
+
     fn build_menu_row(
         &self,
         name: &str,
@@ -1871,10 +2023,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     format!("  {}  {}", padded, desc)
                 }
             }
-            super::MenuKind::TwoColumn {
-                row_prefix,
-                selected_marker,
-            } => {
+            kind @ (super::MenuKind::TwoColumn { .. } | super::MenuKind::DirectoryList) => {
+                let (row_prefix, selected_marker) = match kind {
+                    super::MenuKind::TwoColumn {
+                        row_prefix,
+                        selected_marker,
+                    } => (row_prefix, selected_marker),
+                    super::MenuKind::DirectoryList => ("", "▸"),
+                    _ => unreachable!(),
+                };
                 // Name left-aligned, desc right-aligned. Rows fill the
                 // full screen width so pad_row_to_width adds no trailing
                 // spaces.  Optional selected_marker (show marker + space
@@ -2513,18 +2670,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
         row
     }
 
-    /// Build the dedicated goal row (one full-width line, shown only while a
-    /// `/goal` loop is active). Sits directly above the status line: the `◎`
-    /// marker, the condition, and the ` · round N · elapsed` meta.
+    /// Build the dedicated goal row (one full-width line, shown while a `/goal`
+    /// is Pursuing, PausedAtCap, or Satisfied). Three badge states drive the
+    /// marker and text via `goal_row_parts_phase`.
     fn build_goal_row(&self, goal: &crate::render::GoalStatus, rule_width: usize) -> Vec<Cell> {
-        let (marker, condition, meta) = goal_row_parts(
+        let (marker, body, meta) = goal_row_parts_phase(
             &scrub_controls(&goal.condition),
             goal.round,
             goal.elapsed_secs,
             rule_width.max(1),
             self.caps.unicode_symbols,
+            goal.phase,
         );
-        self.build_marker_row(marker, &condition, &meta)
+        self.build_marker_row(marker, &body, &meta)
     }
 
     /// Build the dedicated loop row (one full-width line, shown only while a
@@ -3035,42 +3193,74 @@ impl<W: Write + Send> RetainedRenderer<W> {
         out
     }
 
-    /// Rows the `request_user_input` panel occupies. Mirrors
-    /// `approval_panel_row_count`: 1 header (the question) + the mode body
-    /// (single/multiple = one row per option; text = one `> {buffer}` row) + 1
-    /// hint row. Must equal `build_user_input_rows(..).len()`.
-    fn user_input_panel_row_count(&self, panel: &crate::render::UserInputPanelView) -> usize {
-        use atomcode_capabilities::tools::request_user_input::UserInputMode;
-        match panel.mode {
-            UserInputMode::Single | UserInputMode::Multiple => {
-                // header chip + blank + question + blank
-                let mut n = 4;
-                // Each concrete option: 1 label row + (1 description row if present).
-                for (_, desc) in &panel.options {
-                    n += 1;
-                    if desc
-                        .as_deref()
-                        .map(|d| !d.trim().is_empty())
-                        .unwrap_or(false)
-                    {
-                        n += 1;
-                    }
-                }
-                // Custom-answer ("Other") row: 1 inline input line — only when offered.
-                if panel.custom {
-                    n += 1;
-                }
-                // Multiple: a blank spacer + the Submit row.
-                if matches!(panel.mode, UserInputMode::Multiple) {
-                    n += 2;
-                }
-                // blank + hint
-                n += 2;
-                n
-            }
-            // Text: header chip + blank + question + blank + input row + hint.
-            UserInputMode::Text => 6,
+    /// Keep an oversized question panel usable on short terminals. The active
+    /// option stays in a moving window and omitted rows are counted explicitly.
+    fn fit_user_input_rows(
+        &self,
+        built: UserInputRows,
+        screen_height: usize,
+        scroll_offset: isize,
+    ) -> Vec<Vec<Cell>> {
+        let UserInputRows { rows, active } = built;
+        let max_rows = screen_height.saturating_sub(1);
+        if max_rows == 0 {
+            return Vec::new();
         }
+        if rows.len() <= max_rows {
+            return rows;
+        }
+
+        let hint = rows.last().cloned().unwrap_or_default();
+        let content_len = rows.len().saturating_sub(1);
+        let active_start = active.start.min(content_len.saturating_sub(1));
+        let active_end = active.end.max(active_start + 1).min(content_len);
+        if max_rows < 4 {
+            let mut compact = vec![rows[active_start].clone()];
+            if max_rows > 1 {
+                compact.push(hint);
+            }
+            compact.truncate(max_rows);
+            return compact;
+        }
+
+        let body_budget = max_rows.saturating_sub(3).max(1);
+        let active_len = active_end.saturating_sub(active_start);
+        let automatic_start = if active_len >= body_budget {
+            active_start
+        } else {
+            active_start.saturating_sub((body_budget - active_len) / 2)
+        }
+        .min(content_len.saturating_sub(body_budget));
+        let max_start = content_len.saturating_sub(body_budget);
+        let mut start = if scroll_offset < 0 {
+            automatic_start.saturating_sub(scroll_offset.unsigned_abs())
+        } else {
+            automatic_start.saturating_add(scroll_offset as usize)
+        };
+        start = start.min(max_start);
+        let end = (start + body_budget).min(content_len);
+        let style = self.style_faint(Role::Muted);
+        let indicator = |direction: &str, hidden: usize| {
+            let mut row = Vec::new();
+            push_str_cells(&mut row, "  ", &style);
+            push_str_cells(
+                &mut row,
+                &format!("{direction} {hidden} hidden lines · PgUp/PgDn"),
+                &style,
+            );
+            row
+        };
+
+        let mut fitted = Vec::with_capacity(max_rows);
+        if start > 0 {
+            fitted.push(indicator("\u{2191}", start));
+        }
+        fitted.extend(rows[start..end].iter().cloned());
+        if end < content_len {
+            fitted.push(indicator("\u{2193}", content_len - end));
+        }
+        fitted.push(hint);
+        fitted
     }
 
     /// Build the compact footer `request_user_input` panel.
@@ -3081,30 +3271,32 @@ impl<W: Write + Send> RetainedRenderer<W> {
     ///     multiple adds `[x]`/`[ ]` checkboxes; the cursor label is emphasized
     ///     in the orange highlight colour.
     ///   - Text: a single `> {buffer}` input row.
-    /// `user_input_panel_row_count` MUST equal `build_user_input_rows(..).len()`.
+    /// The caller measures returned rows directly because wrapping makes height
+    /// dependent on terminal width.
     fn build_user_input_rows(
         &self,
         panel: &crate::render::UserInputPanelView,
         rule_width: usize,
         screen_width: usize,
-    ) -> Vec<Vec<Cell>> {
+    ) -> UserInputRows {
         use atomcode_capabilities::tools::request_user_input::UserInputMode;
         let unicode = self.caps.unicode_symbols;
         let mut out: Vec<Vec<Cell>> = Vec::new();
+        let mut active = 0..1;
 
         // A blank spacer row (empty cells).
         let blank_row = |out: &mut Vec<Vec<Cell>>| out.push(Vec::new());
-        // Emit a 2-space-indented styled text line, width-truncated.
+        // Emit display-width wrapped text; terminal autowrap is unreliable in
+        // a retained footer and previously made the rest silently disappear.
         let push_line = |out: &mut Vec<Vec<Cell>>, text: &str, style: &CellStyle| {
             let raw = crate::glyph::downgrade_glyphs(text, unicode);
-            let body = crate::width::truncate_with_ellipsis(
-                &scrub_controls(&raw),
-                rule_width.saturating_sub(2),
-            );
-            let mut row = Vec::new();
-            push_str_cells(&mut row, "  ", style);
-            push_str_cells(&mut row, &body, style);
-            out.push(row);
+            let safe = scrub_controls(&raw);
+            for body in wrap_prompt_text(&safe, rule_width.saturating_sub(2)) {
+                let mut row = Vec::new();
+                push_str_cells(&mut row, "  ", style);
+                push_str_cells(&mut row, &body, style);
+                out.push(row);
+            }
         };
 
         match panel.mode {
@@ -3125,12 +3317,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 // Emit one navigable option row (label) + optional description.
                 // `number` is the 1-based display index; `label`/`desc` its text.
                 let emit_option = |out: &mut Vec<Vec<Cell>>,
+                                   active: &mut std::ops::Range<usize>,
                                    idx: usize,
                                    number: usize,
                                    label: &str,
                                    desc: Option<&str>,
                                    checked: bool| {
                     let on_cursor = idx == panel.cursor;
+                    let option_start = out.len();
                     // Marker: `❯ ` on the cursor row, else two spaces.
                     let marker = if on_cursor {
                         if unicode {
@@ -3167,15 +3361,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         + crate::width::display_width(checkbox)
                         + crate::width::display_width(&num);
                     let budget = rule_width.saturating_sub(prefix_width);
-                    let lbl = crate::width::truncate_with_ellipsis(&scrub_controls(label), budget);
-                    let mut row = Vec::new();
-                    push_str_cells(&mut row, marker, &chrome_style);
-                    if multiple {
-                        push_str_cells(&mut row, checkbox, &chrome_style);
+                    let label_lines = wrap_prompt_text(&scrub_controls(label), budget.max(1));
+                    for (line_idx, lbl) in label_lines.iter().enumerate() {
+                        let mut row = Vec::new();
+                        if line_idx == 0 {
+                            push_str_cells(&mut row, marker, &chrome_style);
+                            if multiple {
+                                push_str_cells(&mut row, checkbox, &chrome_style);
+                            }
+                            push_str_cells(&mut row, &num, &chrome_style);
+                        } else {
+                            push_str_cells(&mut row, &" ".repeat(prefix_width), &chrome_style);
+                        }
+                        push_str_cells(&mut row, lbl, &label_style);
+                        out.push(row);
                     }
-                    push_str_cells(&mut row, &num, &chrome_style);
-                    push_str_cells(&mut row, &lbl, &label_style);
-                    out.push(row);
                     // Description: a faint second line, indented under the label.
                     if let Some(d) = desc {
                         let dtrim = d.trim();
@@ -3183,21 +3383,30 @@ impl<W: Write + Send> RetainedRenderer<W> {
                             let indent = " ".repeat(prefix_width);
                             let dbudget = rule_width.saturating_sub(prefix_width);
                             let draw = crate::glyph::downgrade_glyphs(dtrim, unicode);
-                            let dtext = crate::width::truncate_with_ellipsis(
-                                &scrub_controls(&draw),
-                                dbudget,
-                            );
-                            let mut drow = Vec::new();
-                            push_str_cells(&mut drow, &indent, &desc_style);
-                            push_str_cells(&mut drow, &dtext, &desc_style);
-                            out.push(drow);
+                            for dtext in wrap_prompt_text(&scrub_controls(&draw), dbudget.max(1)) {
+                                let mut drow = Vec::new();
+                                push_str_cells(&mut drow, &indent, &desc_style);
+                                push_str_cells(&mut drow, &dtext, &desc_style);
+                                out.push(drow);
+                            }
                         }
+                    }
+                    if on_cursor {
+                        *active = option_start..out.len().max(option_start + 1);
                     }
                 };
 
                 for (i, (label, desc)) in panel.options.iter().enumerate() {
                     let checked = panel.checked.get(i).copied().unwrap_or(false);
-                    emit_option(&mut out, i, i + 1, label, desc.as_deref(), checked);
+                    emit_option(
+                        &mut out,
+                        &mut active,
+                        i,
+                        i + 1,
+                        label,
+                        desc.as_deref(),
+                        checked,
+                    );
                 }
 
                 // The custom-answer ("Other") row (index = options.len()): a ONE-LINE
@@ -3205,6 +3414,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 // "Other" label, no subtitle; the cursor indicator and typed text (or
                 // faint placeholder) are rendered directly on this row.
                 if panel.custom {
+                    let custom_start = out.len();
                     let idx = other_index;
                     let number = other_index + 1;
                     let on_cursor = idx == panel.cursor;
@@ -3297,6 +3507,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         }
                     }
                     out.push(row);
+                    if on_cursor {
+                        active = custom_start..out.len();
+                    }
                 }
 
                 // Multiple mode: a blank spacer, then a navigable Submit row. The
@@ -3337,6 +3550,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     push_str_cells(&mut row, marker, &chrome_style);
                     push_str_cells(&mut row, &lbl, &label_style);
                     out.push(row);
+                    if on_cursor {
+                        active = out.len().saturating_sub(1)..out.len();
+                    }
                 }
             }
             UserInputMode::Text => {
@@ -3361,6 +3577,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     push_str_cells(&mut row, &" ".repeat(pad), &style);
                 }
                 out.push(row);
+                active = out.len().saturating_sub(1)..out.len();
             }
         }
 
@@ -3394,7 +3611,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         push_str_cells(&mut hint_row, &hint_truncated, &hint_style);
         out.push(hint_row);
 
-        out
+        UserInputRows { rows: out, active }
     }
 
     /// Batch-aware wrapper over [`Self::build_user_input_rows`]. A standalone question
@@ -3407,13 +3624,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         view: &crate::render::UserInputPanelView,
         rule_width: usize,
         screen_width: usize,
+        screen_height: usize,
     ) -> Vec<Vec<Cell>> {
         let meta = match &view.batch {
             Some(m) if m.total > 1 => m,
-            _ => return self.build_user_input_rows(view, rule_width, screen_width),
+            _ => {
+                let rows = self.build_user_input_rows(view, rule_width, screen_width);
+                return self.fit_user_input_rows(rows, screen_height, view.scroll_offset);
+            }
         };
         let unicode = self.caps.unicode_symbols;
         let mut out: Vec<Vec<Cell>> = Vec::new();
+        let mut active = 0..1;
         let push_line = |out: &mut Vec<Vec<Cell>>, text: &str, style: &CellStyle| {
             let raw = crate::glyph::downgrade_glyphs(text, unicode);
             let body = crate::width::truncate_with_ellipsis(
@@ -3474,6 +3696,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 meta.total
             ); // 已答
             push_line(&mut out, &submit, &self.style_bold(Role::Plan));
+            active = out.len().saturating_sub(1)..out.len();
             out.push(Vec::new()); // blank
                                   // Enter 提交 · Tab/Shift+Tab 切换问题 · Esc 放弃
             let hint = "Enter \u{63d0}\u{4ea4} \u{00b7} Tab/Shift+Tab \u{5207}\u{6362}\u{95ee}\u{9898} \u{00b7} Esc \u{653e}\u{5f03}";
@@ -3484,28 +3707,31 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // advances; submitting is a separate stop) — and replace it with one accurate
             // batch hint.
             let mut q = self.build_user_input_rows(view, rule_width, screen_width);
-            q.pop(); // the per-question hint (always the last row of build_user_input_rows)
-            out.extend(q);
+            q.rows.pop(); // the per-question hint (always the last row)
+            active = (out.len() + q.active.start)..(out.len() + q.active.end);
+            out.extend(q.rows);
             // 作答 · Tab/Shift+Tab 切换问题 · 到提交行 Enter 交全部 · Esc 放弃
             let hint = "\u{4f5c}\u{7b54} \u{00b7} Tab/Shift+Tab \u{5207}\u{6362}\u{95ee}\u{9898} \u{00b7} \u{5230}\u{63d0}\u{4ea4}\u{884c} Enter \u{4ea4}\u{5168}\u{90e8} \u{00b7} Esc \u{653e}\u{5f03}";
             push_line(&mut out, hint, &hint_style);
         }
-        out
+        self.fit_user_input_rows(
+            UserInputRows { rows: out, active },
+            screen_height,
+            if meta.on_submit {
+                0
+            } else {
+                view.scroll_offset
+            },
+        )
     }
 
     /// Row count matching [`Self::build_user_input_panel_view`].
     fn user_input_panel_view_row_count(&self, view: &crate::render::UserInputPanelView) -> usize {
-        match &view.batch {
-            Some(m) if m.total > 1 => {
-                if m.on_submit {
-                    5 // nav + blank + submit + blank + hint
-                } else {
-                    // nav + blank + <single-question rows minus its own hint> + batch hint
-                    self.user_input_panel_row_count(view) + 2
-                }
-            }
-            _ => self.user_input_panel_row_count(view),
-        }
+        let screen_width = self.screen.width() as usize;
+        let screen_height = self.screen.height() as usize;
+        let rule_width = screen_width.saturating_sub(PAD_COL * 2);
+        self.build_user_input_panel_view(view, rule_width, screen_width, screen_height)
+            .len()
     }
 
     /// Paint the full footer into `self.screen`. Layout (top to bottom):
@@ -3543,7 +3769,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let text_budget = input_rule_width.saturating_sub(prefix_and_reserve);
 
         // Wrap input + locate cursor in wrapped layout.
-        let safe = scrub_controls(&self.input_buf);
+        let ghost_active = self.input_buf.is_empty()
+            && self
+                .status
+                .next_prompt_suggestion
+                .as_deref()
+                .is_some_and(|text| !text.is_empty());
+        let safe = if ghost_active {
+            scrub_controls(
+                self.status
+                    .next_prompt_suggestion
+                    .as_deref()
+                    .unwrap_or_default(),
+            )
+        } else {
+            scrub_controls(&self.input_buf)
+        };
         let (mut lines, cursor_row_in_middle, cursor_col_in_row) = if text_budget == 0 {
             (vec![String::new()], 0usize, 0usize)
         } else {
@@ -3568,6 +3809,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let len = m.items.len();
             if len == 0 {
                 (Vec::<(String, String)>::new(), None, 0)
+            } else if menu_kind == super::MenuKind::DirectoryList {
+                let (offset, visible, hidden) =
+                    super::directory_window(len, m.selected, h);
+                let end = offset + visible;
+                let mut items = m.items[offset..end].to_vec();
+                if hidden > 0 {
+                    items.push((format!("+ {hidden} more…"), String::new()));
+                }
+                let selected = (m.selected >= offset && m.selected < end)
+                    .then_some(m.selected - offset);
+                (items, selected, offset)
             } else if matches!(
                 menu_kind,
                 super::MenuKind::Plugin
@@ -3932,7 +4184,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let middle_cells: Vec<Vec<Cell>> = lines[input_view_start..input_view_start + middle_rows]
             .iter()
             .enumerate()
-            .map(|(i, line)| self.build_middle_row(line, input_view_start + i == 0, shell))
+            .map(|(i, line)| {
+                let first = input_view_start + i == 0;
+                if ghost_active {
+                    self.build_ghost_middle_row(line, first)
+                } else {
+                    self.build_middle_row(line, first, shell)
+                }
+            })
             .collect();
         // When the input is scrolled (windowed), show "+N more lines" on the
         // bottom rule so it's visible that content is hidden, not lost.
@@ -3974,9 +4233,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let approval_cells: Vec<Vec<Cell>> = if let Some(p) = status_clone.approval.as_ref() {
             self.build_approval_rows(p, rule_width, w)
         } else if let Some(p) = status_clone.user_input.as_ref() {
-            self.build_user_input_panel_view(p, rule_width, w)
+            self.build_user_input_panel_view(p, rule_width, w, h)
         } else if let Some(p) = status_clone.round_cap_panel.as_ref() {
-            self.build_user_input_panel_view(p, rule_width, w)
+            self.build_user_input_panel_view(p, rule_width, w, h)
         } else {
             Vec::new()
         };
@@ -4583,7 +4842,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // matches the actual render (else body_bottom is off by a row).
         let prefix_and_reserve = if self.caps.jediterm { 3 } else { 2 };
         let text_budget = (self.screen.width() as usize).saturating_sub(prefix_and_reserve);
-        let safe = scrub_controls(&self.input_buf);
+        let safe = if self.input_buf.is_empty() {
+            self.status
+                .next_prompt_suggestion
+                .as_deref()
+                .map(scrub_controls)
+                .unwrap_or_default()
+        } else {
+            scrub_controls(&self.input_buf)
+        };
         let middle_rows = if text_budget == 0 {
             1
         } else {
@@ -5096,6 +5363,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let permanent_visible = permanent_end.saturating_sub(self.scrolled_off);
         self.live_spinner_tail_compacted =
             transient_rows > 0 && permanent_visible > permanent_slots;
+        let compact_for_user_input = self.status.user_input.is_some()
+            && !self.force_continuous_body_projection
+            && transient_rows == 0
+            && permanent_visible > permanent_slots;
+        self.user_input_tail_compacted = compact_for_user_input;
 
         // Clone before drawing — `screen.draw_row` takes &mut self.screen
         // and direct iteration would otherwise double-borrow.
@@ -5114,7 +5386,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.body_lines[self.scrolled_off..permanent_end].to_vec()
         } else if permanent_slots == 0 {
             Vec::new()
-        } else if transient_rows == 0 {
+        } else if transient_rows == 0 && !compact_for_user_input {
             let continuous_end = self
                 .scrolled_off
                 .saturating_add(permanent_slots)
@@ -5220,6 +5492,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
     fn emit_body_line_inner(&mut self, row: &[Cell], _bottom: u16) {
         if self.skip_body_scroll_count > 0 {
             self.skip_body_scroll_count -= 1;
+        }
+        // A legacy-conhost resize first rebuilds the retained model without
+        // terminal I/O. A bounded physical-row suffix is emitted once after
+        // the semantic replay completes.
+        if self.replaying && self.caps.legacy_conhost {
+            return;
         }
         let h = self.screen.height() as usize;
         let footer_rows = self.current_footer_rows();
@@ -5440,6 +5718,25 @@ impl<W: Write + Send> RetainedRenderer<W> {
         cleared
     }
 
+    /// Restore the continuous permanent-body projection before an append.
+    ///
+    /// A tall `request_user_input` footer can temporarily pin the logical top
+    /// row while showing the newest transcript tail. That projection is safe
+    /// for display, but an append may emit an LF and promote physical row 0 to
+    /// native scrollback. Repaint the continuous projection first so physical
+    /// and logical scroll ownership remain aligned. This does not mutate the
+    /// transcript or advance `scrolled_off`.
+    fn restore_user_input_projection_before_permanent_body(&mut self) {
+        if !self.user_input_tail_compacted {
+            return;
+        }
+        self.force_continuous_body_projection = true;
+        self.paint_frame();
+        self.flush_frame();
+        self.force_continuous_body_projection = false;
+        self.user_input_tail_compacted = false;
+    }
+
     /// Lift the live in-flight tool-call strip off the body tail — the multi-line mirror of
     /// [`clear_live_spinner`]. Pops the strip's `inflight_tool_rows` rows so a following
     /// `push_body_row` appends CLEANLY at the tail instead of burying the strip mid-buffer.
@@ -5506,6 +5803,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 }
             }
         }
+        self.restore_user_input_projection_before_permanent_body();
         // Diagnostic trace for the user-reported "duplicate rows in
         // scrollback" bug — every push goes through here, so a single
         // log point captures the full sequence. Enable via
@@ -6541,6 +6839,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.live_spinner_active = false;
         self.live_spinner_spacer_active = false;
         self.live_spinner_tail_compacted = false;
+        self.user_input_tail_compacted = false;
+        self.force_continuous_body_projection = false;
         self.last_mark_was_assistant = false;
         self.skip_body_scroll_count = 0;
         // Take the log out so `render()` can borrow `self` mutably; the
@@ -6552,6 +6852,28 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         self.replaying = false;
         self.body_log = log;
+    }
+
+    /// Rebuild a bounded suffix of the retained body into native scrollback.
+    /// The complete model remains available for marks and later rendering.
+    fn replay_legacy_conhost_scrollback(&mut self) {
+        let full_body = std::mem::take(&mut self.body_lines);
+        let suffix_start = full_body
+            .len()
+            .saturating_sub(LEGACY_CONHOST_REFLOW_MAX_ROWS);
+        let retained_rows: Vec<Vec<Cell>> = full_body[suffix_start..].to_vec();
+
+        self.scrolled_off = 0;
+        for row in retained_rows {
+            if self.next_body_emit_row() > 0 {
+                self.emit_body_line_inner(&row, 0);
+            }
+            self.body_lines.push(row);
+        }
+
+        let visible_rows = self.body_lines.len().saturating_sub(self.scrolled_off);
+        self.body_lines = full_body;
+        self.scrolled_off = self.body_lines.len().saturating_sub(visible_rows);
     }
 
     fn reflow_welcome_prefix(&mut self) {
@@ -6613,8 +6935,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // bg so the colour sits behind the whole block.
         let mut accent = self.style_bold(Role::Accent);
         accent.bg = bg.bg;
-        let mut text_style = CellStyle::default();
-        text_style.bg = bg.bg;
+        let text_style = bg.clone();
         let mut muted = self.style_for(Role::Muted);
         muted.bg = bg.bg;
 
@@ -7844,6 +8165,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         self.assistant_line_buf.clear();
         self.reasoning_line_buf.clear();
         self.md_state.reset();
+        self.user_input_tail_compacted = false;
+        self.force_continuous_body_projection = false;
         self.last_painted_footer_rows = 0;
         // Drop the reflow log too: the body it described is gone, so a
         // later resize must not replay it. The `/resume` / `/clear`
@@ -8318,20 +8641,19 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // re-assert suppression so the `flush_frame` render_diff below paints
         // inside the outer envelope without emitting a nested one.
         self.screen.set_sync_suppressed(true);
-        // Mark physical state unknown so the upcoming paint_frame's
-        // render_diff cold-starts with a per-row CUP+EL preamble — exactly
-        // like reset() (:~3627) and resume_from_external() (:~3732), which
-        // rebuild the Screen the same way. Without this, `screen.resize`
-        // leaves `physical_dirty = false` + blank `prev_cells`, so the diff
-        // emits only cell patches and never clears the OLD footer rows. The
-        // per-row CUP+EL wipe above masks that on Unix / Windows Terminal,
-        // but legacy conhost is forced down to a single ED2 (to dodge the
-        // 0xc0000409 fastfail), and ED2 doesn't reliably clear the final
-        // geometry mid-drag — so the stale footer survives and the new
-        // footer stacks on top of it (the Windows resize footer-duplication
-        // bug). invalidate() must run AFTER resize so its sentinel rows are
-        // sized to the new width.
-        self.screen.invalidate();
+        // Re-sync the diff cache after the terminal-side wipe. Other hosts use
+        // the existing defensive cold-start because their row-local wipe is
+        // known to tolerate CUP+EL. Legacy conhost has already received ED2,
+        // so its physical state is known blank and only the cell repaint is
+        // needed; requesting another per-row clear here would recreate the
+        // resize-time burst that can trigger 0xc0000409.
+        if self.caps.legacy_conhost {
+            // ED2 above already left a known-blank display. Avoid following
+            // it with invalidate()'s per-row CUP+EL cold-start burst.
+            self.screen.invalidate_after_full_clear();
+        } else {
+            self.screen.invalidate();
+        }
         // ── Preserve streaming parser state across the reflow. Issue
         // #950: resize during a streaming turn must not reset mid-stream
         // markdown parsing (code blocks lose their fence context). The
@@ -8364,6 +8686,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // overflow into scrollback at the new width via its append-only
         // LFs, completing the `\x1b[3J` rebuild above.
         self.reflow_body_to_current_width();
+        if self.caps.legacy_conhost {
+            self.replay_legacy_conhost_scrollback();
+        }
 
         // ── Restore saved state so subsequent streaming events continue
         // correctly after the reflow ──
@@ -8617,6 +8942,61 @@ mod tests {
     }
 
     #[test]
+    fn goal_row_pursuing_shows_condition_and_round_non_empty() {
+        // Pursuing phase: same as existing behaviour — condition + round + elapsed.
+        let row = format_goal_row_phase(
+            "fix all tests",
+            3,
+            30,
+            80,
+            true,
+            atomcode_coding::GoalPhase::Pursuing,
+        );
+        assert!(!row.is_empty(), "pursuing row must be non-empty: {row}");
+        assert!(row.contains("fix all tests"), "condition present: {row}");
+        assert!(row.contains("round 3"), "round present: {row}");
+    }
+
+    #[test]
+    fn goal_row_paused_at_cap_shows_pause_text_non_empty() {
+        // PausedAtCap phase: shows 暂停 and 继续对话即推进.
+        let row = format_goal_row_phase(
+            "fix all tests",
+            5,
+            60,
+            80,
+            true,
+            atomcode_coding::GoalPhase::PausedAtCap,
+        );
+        assert!(!row.is_empty(), "paused row must be non-empty: {row}");
+        assert!(row.contains("暂停"), "pause text present: {row}");
+        assert!(
+            row.contains("继续对话即推进"),
+            "resume hint present: {row}"
+        );
+        assert!(row.contains("已达 5 轮"), "round substitution locked: {row}");
+    }
+
+    #[test]
+    fn goal_row_satisfied_shows_achieved_text_non_empty() {
+        // Satisfied phase: shows 已达成.
+        let row = format_goal_row_phase(
+            "fix all tests",
+            7,
+            120,
+            80,
+            true,
+            atomcode_coding::GoalPhase::Satisfied,
+        );
+        assert!(!row.is_empty(), "satisfied row must be non-empty: {row}");
+        assert!(row.contains("已达成"), "achieved text present: {row}");
+        assert!(
+            row.contains("/goal clear 结束"),
+            "actionable hint locked: {row}"
+        );
+    }
+
+    #[test]
     fn loop_row_shows_label_round_and_elapsed() {
         let row = format_loop_row("检查构建状态", 3, 133, 80, true);
 
@@ -8841,6 +9221,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
             round_cap_panel: None,
         }
     }
@@ -9211,6 +9592,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
             round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, false);
@@ -9266,6 +9648,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
             round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, /* shell */ true);
@@ -9340,6 +9723,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
             round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, false);
@@ -9390,6 +9774,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
             round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, false);
@@ -9444,6 +9829,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
             round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, false);
@@ -9498,6 +9884,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
             round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, false);
@@ -9536,6 +9923,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
             round_cap_panel: None,
         };
         let row = r.build_status_row(&status, 60, false);
@@ -15410,6 +15798,7 @@ mod tests {
             condition: "finish the audit".into(),
             round: 2,
             elapsed_secs: 12,
+            phase: atomcode_coding::GoalPhase::Pursuing,
         });
         status.subtasks = Some(SubtaskProgress {
             call_id: "call-task".into(),
@@ -15488,6 +15877,7 @@ mod tests {
             condition: "finish".into(),
             round: 1,
             elapsed_secs: 1,
+            phase: atomcode_coding::GoalPhase::Pursuing,
         });
         status.subtasks = Some(SubtaskProgress {
             call_id: "call-task".into(),
@@ -15678,17 +16068,13 @@ mod tests {
                 text: String::new(),
                 custom_text: String::new(),
                 custom: true,
+                scroll_offset: 0,
                 batch: None,
             };
             // Row count: header + blank + question + blank
             //   + opt1 label + opt1 desc + opt2 label (no desc)
             //   + custom inline row (1 line) + blank + hint.
-            assert_eq!(r.user_input_panel_row_count(&view), 4 + 3 + 1 + 2);
-            assert_eq!(
-                r.build_user_input_rows(&view, 78, 80).len(),
-                r.user_input_panel_row_count(&view),
-                "row_count must equal build_user_input_rows().len()"
-            );
+            assert_eq!(r.build_user_input_rows(&view, 78, 80).len(), 4 + 3 + 1 + 2);
             status.user_input = Some(view);
             r.render(UiLine::InputPrompt {
                 buf: String::new(),
@@ -15764,13 +16150,10 @@ mod tests {
                 text: String::new(),
                 custom_text: "Zig".into(),
                 custom: true,
+                scroll_offset: 0,
                 batch: None,
             };
-            assert_eq!(
-                r.build_user_input_rows(&view, 78, 80).len(),
-                r.user_input_panel_row_count(&view),
-                "row_count must equal build_user_input_rows().len()"
-            );
+            assert_eq!(r.build_user_input_rows(&view, 78, 80).len(), 12);
             status.user_input = Some(view);
             r.render(UiLine::InputPrompt {
                 buf: String::new(),
@@ -15830,15 +16213,11 @@ mod tests {
                 text: "atomcode".into(),
                 custom_text: String::new(),
                 custom: true,
+                scroll_offset: 0,
                 batch: None,
             };
             // header + blank + question + blank + input + hint = 6.
-            assert_eq!(r.user_input_panel_row_count(&view), 6, "text panel rows");
-            assert_eq!(
-                r.build_user_input_rows(&view, 78, 80).len(),
-                r.user_input_panel_row_count(&view),
-                "row_count must equal build_user_input_rows().len()"
-            );
+            assert_eq!(r.build_user_input_rows(&view, 78, 80).len(), 6);
             status.user_input = Some(view);
             r.render(UiLine::InputPrompt {
                 buf: String::new(),
@@ -15882,6 +16261,7 @@ mod tests {
             text: String::new(),
             custom_text: String::new(), // empty → placeholder shown
             custom: true,
+            scroll_offset: 0,
             batch: None,
         };
         status.user_input = Some(view);
@@ -15911,6 +16291,86 @@ mod tests {
     }
 
     #[test]
+    fn long_user_input_wraps_and_short_terminals_follow_cursor() {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        let (r, _buf) = new_capturing(42, 12);
+        let view = crate::render::UserInputPanelView {
+            header: "Versioning scope".into(),
+            question: "Which versioning strategy should business users choose without touching git directly?".into(),
+            mode: UserInputMode::Single,
+            options: vec![
+                ("Per-workspace git repository with an intentionally long label".into(),
+                 Some("Wrap git commands behind a Python API so business users never invoke git directly.".into())),
+                ("Python snapshot archive with complete release history".into(),
+                 Some("Copy workspace state into a versioned archive for every release and draft checkpoint.".into())),
+                ("Change log plus content hash manifest".into(),
+                 Some("Record every modification without taking full-file snapshots.".into())),
+            ],
+            cursor: 1,
+            checked: vec![false; 4],
+            text: String::new(),
+            custom_text: String::new(),
+            custom: true,
+            scroll_offset: 0,
+            batch: None,
+        };
+
+        let full = r.build_user_input_rows(&view, 40, 42);
+        let full_dump = full.iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .collect::<Vec<_>>().join("\n");
+        assert!(full.len() > 11);
+        assert!(full_dump.contains("directly?")
+            && full_dump.contains("intentionally long label")
+            && full_dump.contains("draft checkpoint.")
+            && full_dump.contains("taking full-file snapshots."),
+            "wrapped text lost its tail:\n{full_dump}");
+
+        let fitted = r.build_user_input_panel_view(&view, 40, 42, 12);
+        let dump = fitted.iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .collect::<Vec<_>>().join("\n");
+        assert!(fitted.len() <= 11);
+        assert!(dump.contains("Python snapshot"), "cursor option missing:\n{dump}");
+        assert!(dump.contains("hidden lines"), "overflow was silently clipped:\n{dump}");
+
+        let mut scrollable = view.clone();
+        scrollable.options[1].1 = Some(
+            (1..=30)
+                .map(|i| format!("detail-{i:02}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        let dump_rows = |rows: &[Vec<Cell>]| {
+            rows.iter()
+                .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let before = r.build_user_input_panel_view(&scrollable, 40, 42, 12);
+        scrollable.scroll_offset = 5;
+        let after = r.build_user_input_panel_view(&scrollable, 40, 42, 12);
+        assert_ne!(dump_rows(&before), dump_rows(&after));
+        assert!(
+            dump_rows(&after).contains("detail-20"),
+            "PageDown did not expose later continuation lines:\n{}",
+            dump_rows(&after)
+        );
+
+        for height in 0usize..=4 {
+            let tiny = r.build_user_input_panel_view(&view, 40, 42, height);
+            assert!(tiny.len() <= height.saturating_sub(1));
+            if height >= 2 {
+                assert!(
+                    dump_rows(&tiny).contains("Python snapshot"),
+                    "height {height} lost the active option:\n{}",
+                    dump_rows(&tiny)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn user_input_batch_navigator_and_parity() {
         use crate::render::{UserInputBatchMeta, UserInputPanelView};
         use atomcode_capabilities::tools::request_user_input::UserInputMode;
@@ -15926,6 +16386,7 @@ mod tests {
             text: String::new(),
             custom_text: String::new(),
             custom: true,
+            scroll_offset: 0,
             batch,
         };
 
@@ -15940,7 +16401,7 @@ mod tests {
             on_submit: false,
         }));
         assert_eq!(
-            r.build_user_input_panel_view(&one, 78, 80).len(),
+            r.build_user_input_panel_view(&one, 78, 80, 24).len(),
             single_rows,
             "total==1 delegates to the single renderer"
         );
@@ -15952,7 +16413,7 @@ mod tests {
             answered: vec![false, false],
             on_submit: false,
         }));
-        let q_rows = r.build_user_input_panel_view(&q, 78, 80);
+        let q_rows = r.build_user_input_panel_view(&q, 78, 80, 24);
         assert_eq!(
             q_rows.len(),
             r.user_input_panel_view_row_count(&q),
@@ -15968,13 +16429,24 @@ mod tests {
             answered: vec![true, false],
             on_submit: true,
         }));
-        let sub_rows = r.build_user_input_panel_view(&sub, 78, 80);
+        let sub_rows = r.build_user_input_panel_view(&sub, 78, 80, 24);
         assert_eq!(
             sub_rows.len(),
             r.user_input_panel_view_row_count(&sub),
             "row_count invariant (submit)"
         );
         assert_eq!(sub_rows.len(), 5);
+        let tiny_submit = r.build_user_input_panel_view(&sub, 78, 80, 3);
+        let tiny_dump = tiny_submit
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compact_dump = tiny_dump.replace(' ', "");
+        assert!(
+            compact_dump.contains("提交全部") || tiny_dump.contains("Submit all"),
+            "tiny batch viewport lost its active submit row:\n{tiny_dump}"
+        );
     }
 
     /// Round-cap checkpoint: `round_cap_view` produces a Single-mode
@@ -16360,14 +16832,15 @@ mod tests {
         }
     }
 
-    /// User-message text stays the terminal's default foreground (no fixed
-    /// colour) — the colour lives only on the `❯` Accent marker, mirroring
-    /// opencode (`<text fg={theme.text}>` + a coloured left border). The old
-    /// `!267` styling painted the whole sentence bright magenta, which read as
-    /// too vivid; this locks the text back to default fg.
+    /// User-message text uses the foreground paired with its explicit panel
+    /// background. Inheriting the terminal default is unsafe on Windows where
+    /// `Auto` may fall back to a dark panel inside an actually-light terminal.
     #[test]
-    fn retained_user_message_text_is_default_fg() {
+    fn retained_user_message_text_uses_panel_foreground() {
+        let _theme = crate::highlight::theme::test_lock();
+        crate::highlight::theme::set_theme_mode(false);
         let (mut r, _buf) = new_capturing(80, 24);
+        let expected_fg = crate::render::theme::role(r.caps, crate::render::theme::Role::PanelFg);
         r.render(UiLine::User("hello".into()));
 
         let mut found = false;
@@ -16378,13 +16851,13 @@ mod tests {
             }
             found = true;
             // The text glyphs (the alphabetic cells; the chevron is a glyph/space)
-            // must carry NO fixed fg — they inherit the terminal default.
+            // must carry the foreground selected for the panel background.
             for cell in row {
                 if cell.ch.is_alphabetic() {
                     assert_eq!(
-                        cell.style.fg, None,
-                        "user text cell '{}' must be default fg (None), got {:?}",
-                        cell.ch, cell.style.fg,
+                        cell.style.fg, expected_fg,
+                        "user text cell '{}' must use panel fg {:?}, got {:?}",
+                        cell.ch, expected_fg, cell.style.fg,
                     );
                 }
             }
@@ -19495,20 +19968,10 @@ mod tests {
         );
     }
 
-    /// On legacy conhost the resize wipe is forced down to a single ED2 (to
-    /// dodge the 0xc0000409 fastfail), so it emits NO per-row CUP+EL. The
-    /// body re-emit only covers body rows. That leaves the cold-start as the
-    /// ONLY thing that clears the FOOTER rows. Without `invalidate()`,
-    /// `physical_dirty` stays false, `render_diff` skips the cold-start, the
-    /// old footer rows are never cleared, and the new footer stacks on top
-    /// of them (the user-reported Windows resize corruption).
-    ///
-    /// We exercise the conhost path on purpose: on other terminals the
-    /// per-row CUP+EL wipe clears every row regardless, masking a missing
-    /// invalidate() — which is exactly why the bug is conhost-only and why a
-    /// default-path test wouldn't distinguish fixed from broken.
+    /// Legacy conhost uses ED2 for the resize wipe. The final diff must not
+    /// add a second full-screen per-row CUP+EL cold-start afterward.
     #[test]
-    fn on_resize_cold_starts_in_legacy_conhost() {
+    fn on_resize_legacy_conhost_avoids_second_full_screen_clear() {
         let w: u16 = 40;
         let h: u16 = 12;
         let (mut r, buf) = new_capturing(w, h);
@@ -19527,30 +19990,65 @@ mod tests {
         r.flush_deferred();
         buf.lock().unwrap().clear();
 
-        // Shrink height → footer moves up; the old footer rows must be
-        // cleared. on_resize repaints internally (paint_frame → render_diff),
-        // so the cold-start (if any) lands in `buf` during this call.
         let new_h: u16 = h - 3;
         r.on_resize(w, new_h);
 
         let out_bytes = buf.lock().unwrap().clone();
         let out = String::from_utf8_lossy(&out_bytes);
-        // ED2 emits no per-row CUP+EL and the body re-emit only covers body
-        // rows, so per-row CUP+EL for EVERY row 1..=new_h can only come from
-        // the render_diff cold-start — which fires only if on_resize
-        // invalidated the screen.
-        for row in 1..=(new_h as usize) {
-            let needle = format!("\x1b[{};1H\x1b[K", row);
-            assert!(
-                out.contains(&needle),
-                "on_resize must cold-start (per-row CUP+EL) for row {} on legacy \
-                 conhost; without screen.invalidate() the footer rows are never \
-                 cleared and the old footer ghosts under the new one (Windows \
-                 resize footer-stacking bug).\nbytes: {:?}",
-                row,
-                out
-            );
+        assert!(out.contains("\x1b[2J\x1b[H"), "legacy resize must use ED2: {out:?}");
+        let cleared_rows = (1..=(new_h as usize))
+            .filter(|row| {
+                let needle = format!("\x1b[{};1H\x1b[K", row);
+                out.contains(&needle)
+            })
+            .count();
+        assert!(
+            cleared_rows < new_h as usize,
+            "legacy resize must not append a second full-screen CUP+EL clear: {out:?}"
+        );
+        assert!(
+            out.contains("pre-resize") && out.contains("content"),
+            "the final viewport repaint must preserve transcript content: {out:?}"
+        );
+    }
+
+    #[test]
+    fn on_resize_legacy_conhost_caps_scrollback_replay_rows() {
+        let (mut r, buf) = new_capturing(40, 12);
+        r.caps.legacy_conhost = true;
+        let mut transcript = String::new();
+        for i in 0..(LEGACY_CONHOST_REFLOW_MAX_ROWS + 100) {
+            use std::fmt::Write;
+            let _ = writeln!(transcript, "ROW{i:04}");
         }
+        r.render(UiLine::CommandOutput(transcript));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        buf.lock().unwrap().clear();
+
+        r.on_resize(41, 12);
+
+        let out = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        let replayed_rows = out.matches("\x1b[K").count();
+        assert!(
+            replayed_rows <= LEGACY_CONHOST_REFLOW_MAX_ROWS,
+            "legacy resize emitted {replayed_rows} row clears, cap is {}",
+            LEGACY_CONHOST_REFLOW_MAX_ROWS
+        );
+        assert!(
+            !out.contains("ROW0000"),
+            "rows older than the bounded suffix must not be replayed"
+        );
+        assert!(
+            out.contains("ROW1099"),
+            "the newest transcript row must remain in the replay"
+        );
     }
 
     #[test]
@@ -19939,6 +20437,186 @@ mod tests {
         }
     }
 
+    #[test]
+    fn request_user_input_footer_keeps_latest_transcript_tail_visible() {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+
+        const W: u16 = 80;
+        const H: u16 = 24;
+        let (mut r, buf) = new_capturing(W, H);
+        let mut vterm = crate::test_term::VirtualTerminal::new(W, H);
+        let status = status_basic();
+
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let normal_capacity = (H as usize).saturating_sub(r.current_footer_rows());
+        for i in 0..normal_capacity {
+            let mut row = Vec::new();
+            push_str_cells(
+                &mut row,
+                &format!("transcript-{i:02}"),
+                &CellStyle::default(),
+            );
+            r.push_body_row(row);
+        }
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let scrolled_before = r.scrolled_off;
+
+        let mut modal_status = status.clone();
+        modal_status.user_input = Some(crate::render::UserInputPanelView {
+            header: "Choose".into(),
+            question: "How should I continue?".into(),
+            mode: UserInputMode::Single,
+            options: vec![
+                ("First".into(), Some("first description".into())),
+                ("Second".into(), Some("second description".into())),
+            ],
+            cursor: 0,
+            checked: vec![false; 3],
+            text: String::new(),
+            custom_text: String::new(),
+            custom: true,
+            scroll_offset: 0,
+            batch: None,
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: modal_status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        assert!(r.user_input_tail_compacted);
+        assert_eq!(
+            r.scrolled_off, scrolled_before,
+            "display-only compaction must not advance native scrollback ownership"
+        );
+        assert!(
+            vterm.any_row(|row| row.contains(&format!("transcript-{:02}", normal_capacity - 1))),
+            "the newest model output must remain visible above the question panel\n{}",
+            vterm.dump()
+        );
+
+        // Closing the panel is a pure layout change. The normal viewport can
+        // show the complete body again and must not replay any row.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(!r.user_input_tail_compacted);
+        assert_eq!(r.scrolled_off, scrolled_before);
+        assert!(
+            vterm.any_row(|row| row.contains(&format!("transcript-{:02}", normal_capacity - 1)))
+        );
+    }
+
+    #[test]
+    fn permanent_append_restores_user_input_projection_before_scrolling() {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+
+        const W: u16 = 80;
+        const H: u16 = 20;
+        let (mut r, buf) = new_capturing(W, H);
+        let mut vterm = crate::test_term::VirtualTerminal::new(W, H);
+        let status = status_basic();
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        let normal_capacity = (H as usize).saturating_sub(r.current_footer_rows());
+        for i in 0..normal_capacity {
+            let mut row = Vec::new();
+            push_str_cells(&mut row, &format!("owned-{i:02}"), &CellStyle::default());
+            r.push_body_row(row);
+        }
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let mut modal_status = status;
+        modal_status.user_input = Some(crate::render::UserInputPanelView {
+            header: "Choose".into(),
+            question: "Continue?".into(),
+            mode: UserInputMode::Text,
+            options: Vec::new(),
+            cursor: 0,
+            checked: Vec::new(),
+            text: String::new(),
+            custom_text: String::new(),
+            custom: false,
+            scroll_offset: 0,
+            batch: None,
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: modal_status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(r.user_input_tail_compacted);
+
+        let before = r.scrolled_off;
+        let mut row = Vec::new();
+        push_str_cells(&mut row, "after-answer", &CellStyle::default());
+        r.push_body_row(row);
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        assert!(
+            r.scrolled_off > before,
+            "the append must make forward progress"
+        );
+        let terminal_rows = vterm
+            .scrollback_texts()
+            .into_iter()
+            .chain((0..H as usize).map(|y| vterm.row_text(y)))
+            .collect::<Vec<_>>();
+        for i in 0..normal_capacity {
+            let marker = format!("owned-{i:02}");
+            let count = terminal_rows
+                .iter()
+                .filter(|line| line.contains(&marker))
+                .count();
+            assert_eq!(
+                count,
+                1,
+                "{marker} must exist exactly once\n{}",
+                vterm.dump()
+            );
+        }
+        assert_eq!(
+            terminal_rows
+                .iter()
+                .filter(|line| line.contains("after-answer"))
+                .count(),
+            1,
+            "new output must exist exactly once\n{}",
+            vterm.dump()
+        );
+    }
+
     /// Repro: user runs `/whoami` AFTER the body has already overflowed
     /// once (screen full from a previous large response). The command
     /// output is a single `UiLine::CommandOutput` whose payload is a
@@ -20311,6 +20989,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn empty_input_renders_next_prompt_as_faint_ghost_text() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+
+        let row = r.build_ghost_middle_row("继续审计代码改动", true);
+        let chevron_cells = r.caps.prompt_chevron().chars().count();
+        let ghost_cells = &row[chevron_cells..];
+
+        assert_eq!(
+            ghost_cells
+                .iter()
+                .filter(|cell| cell.width > 0)
+                .map(|cell| cell.ch)
+                .collect::<String>(),
+            "继续审计代码改动"
+        );
+        assert!(
+            ghost_cells
+                .iter()
+                .filter(|cell| cell.width > 0)
+                .all(|cell| cell.style.faint),
+            "recommendation text must use terminal-theme-aware faint styling"
+        );
+    }
+
     /// The footer height reported by `current_footer_rows()` must equal the
     /// height that `paint_footer` actually uses — the critical mirror invariant.
     ///
@@ -20352,6 +21057,7 @@ mod tests {
             approval: None,
             user_input: None,
             pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
             round_cap_panel: None,
         };
         status.approval = Some(crate::render::ApprovalPanelView {

@@ -157,6 +157,17 @@ pub struct ModelEntry {
     /// models is server-driven and needs no client release.
     #[serde(default)]
     pub capable_model: Option<i64>,
+    /// Credential for gateways that authenticate with an API key rather than
+    /// the OAuth bearer. `None` ⇒ the model keeps today's behaviour: no key is
+    /// persisted and the gateway is reached with the login token.
+    ///
+    /// Prefer sending an env reference (`"$LLM_GATEWAY_KEY"`) over a literal.
+    /// The value lands in the user's `config.toml`, and
+    /// [`ProviderConfig::resolved_api_key`](atomcode_config::config::provider::ProviderConfig::resolved_api_key)
+    /// expands `$VAR` at request time — so a reference keeps the secret out of
+    /// a file that is read, copied and pasted into bug reports.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 /// One rate-limit window entry from the new `rate_limit_windows`

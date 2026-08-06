@@ -30,9 +30,9 @@ pub const SUBAGENT_ACTIVITY_MARKER: char = '\u{1e}';
 /// Hard-denies any child tool call that references a sensitive path (credentials, `~/.ssh`,
 /// `.env`, cloud creds). Mounted on every subagent child. Unlike the parent's
 /// `SensitivePathGate` — which PROMPTS — this DENIES outright, because a subagent runs
-/// `AutoRespond::AllowAll`, so a prompt would just auto-approve itself. Only the file tools'
-/// path args are inspected; `bash` retains the user's authority (the worker dispatch itself
-/// is Risky and user-approved — the same trust as approving a bash command in the main loop).
+/// `AutoRespond::AllowAll`, so a prompt would just auto-approve itself. The generic credential
+/// bash gate runs immediately before this one; this guard terminates any remaining sensitive
+/// path access rather than letting a child repeatedly rephrase it.
 struct DenySensitivePaths;
 
 #[async_trait]
@@ -44,7 +44,7 @@ impl ToolMiddleware for DenySensitivePaths {
         _rt: &RequestCtx,
     ) -> BeforeOutcome {
         if crate::tools::references_sensitive_path(&call.arguments) {
-            return BeforeOutcome::deny(format!(
+            return BeforeOutcome::deny_turn(format!(
                 "subagent may not touch sensitive paths (credentials / ~/.ssh / .env): {}",
                 call.name
             ));
@@ -246,16 +246,20 @@ impl ToolMiddleware for WorkerScopeGate {
     }
 }
 
-/// The middleware stack for a subagent child: `DenySensitivePaths` for everyone, the
-/// feature-enabled AtomGit bash guard, plus a `WorkerScopeGate` confining a `worker`'s writes
-/// to its `scope`. `explore` children mount only read tools, so the latter gate is unnecessary.
+/// The middleware stack for a subagent child: terminal credential/sensitive-path guards for
+/// everyone, the feature-enabled AtomGit bash guard, plus a `WorkerScopeGate` confining a
+/// `worker`'s writes to its `scope`. `explore` children mount only read tools, so the latter
+/// gate is unnecessary.
 fn child_middlewares(
     is_worker: bool,
     scope: &[String],
     working_dir: &Path,
     inherited_worker_middlewares: &[Arc<dyn ToolMiddleware>],
 ) -> Vec<Arc<dyn ToolMiddleware>> {
-    let mut mw: Vec<Arc<dyn ToolMiddleware>> = vec![Arc::new(DenySensitivePaths)];
+    let mut mw: Vec<Arc<dyn ToolMiddleware>> = vec![
+        Arc::new(super::CredentialBashGate::new()),
+        Arc::new(DenySensitivePaths),
+    ];
     if is_worker {
         mw.extend(inherited_worker_middlewares.iter().cloned());
     }
@@ -1773,9 +1777,9 @@ mod tests {
         use super::{child_middlewares, DenySensitivePaths};
         use std::path::Path;
         #[cfg(feature = "atomgit")]
-        let base = 2; // DenySensitivePaths + AtomgitBashGate.
+        let base = 3; // DenySensitivePaths + CredentialBashGate + AtomgitBashGate.
         #[cfg(not(feature = "atomgit"))]
-        let base = 1; // DenySensitivePaths.
+        let base = 2; // DenySensitivePaths + CredentialBashGate.
         assert_eq!(
             child_middlewares(false, &[], Path::new("/w"), &[]).len(),
             base
@@ -1801,5 +1805,23 @@ mod tests {
             base + 2,
             "worker receives inherited policy plus its scope gate"
         );
+    }
+
+    #[tokio::test]
+    async fn child_sensitive_path_denial_is_terminal() {
+        let gate = DenySensitivePaths;
+        let tool: Arc<dyn Tool> = Arc::new(super::super::BashTool);
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let rt = RequestCtx::new(events, None);
+        let mut call = ToolCall {
+            id: "sensitive-1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({ "command": "cat .env" }).to_string(),
+        };
+
+        assert!(matches!(
+            gate.before(&mut call, &tool, &rt).await,
+            BeforeOutcome::DenyTurn { .. }
+        ));
     }
 }

@@ -290,6 +290,7 @@ pub(crate) fn chat_runtime_config(
             None,
             config.language,
         )),
+        todo: config.tools.todo.clone(),
         provider_name: provider_name.to_string(),
         working_dir: working_dir.to_path_buf(),
         context_window: p.map(|p| p.context_window as u32).unwrap_or(128_000),
@@ -327,6 +328,9 @@ pub(crate) fn chat_runtime_config(
         subagent_config: Some(Arc::new(config.clone())),
         // Daemon path has no TUI checkpoint picker; keep the hard round-cap.
         round_cap_checkpoint: false,
+        // WebUI/daemon projection is intentionally deferred; avoid a hidden
+        // auxiliary model request until that driver renders the suggestion.
+        next_prompt_suggestions: false,
         pricing: p.and_then(|provider| {
             atomcode_coding::resolve_provider_pricing(provider_name, provider)
         }),
@@ -645,6 +649,8 @@ pub(crate) enum LiveWireEvent {
     UserMessage {
         text: String,
         images: Vec<crate::ImageData>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        client_input_id: Option<String>,
     },
     #[serde(rename = "text")]
     TextDelta { content: String },
@@ -686,6 +692,10 @@ pub(crate) enum LiveWireEvent {
     /// `Error` so a client can render it as a muted notice instead of a red error.
     #[serde(rename = "warning")]
     Warning { message: String },
+    /// Auxiliary session persistence failed. Kept distinct from conversational
+    /// warnings so browser clients render it outside the message timeline.
+    #[serde(rename = "persistence_warning")]
+    PersistenceWarning { message: String },
     #[serde(rename = "permission_request")]
     PermissionRequest {
         tool_name: String,
@@ -706,6 +716,17 @@ pub(crate) enum LiveWireEvent {
         questions: Option<Vec<serde_json::Value>>,
         /// Whether to offer the "type your own answer" row (single question). Default true.
         custom: bool,
+    },
+    #[serde(rename = "user_input_resolved")]
+    UserInputResolved { request_id: u64 },
+    /// One or more live inputs were folded into the active turn. The exact
+    /// payload lets browser clients acknowledge their FIFO pending-steer UI
+    /// without guessing from text deltas or turn terminals.
+    #[serde(rename = "steered")]
+    Steered {
+        count: usize,
+        inputs: Vec<atomcode_kernel::event::SteeredInput>,
+        client_input_ids: Vec<Option<String>>,
     },
     #[serde(rename = "session_switched")]
     SessionSwitched { session_id: String },
@@ -754,7 +775,10 @@ impl NativeLiveWireProjector {
             crate::live_hub::LiveViewEvent::CommandOutput(text) => {
                 LiveWireEvent::CommandOutput { text }
             }
-            crate::live_hub::LiveViewEvent::InputAccepted(input) => LiveWireEvent::UserMessage {
+            crate::live_hub::LiveViewEvent::InputAccepted {
+                input,
+                client_input_id,
+            } => LiveWireEvent::UserMessage {
                 text: input.text,
                 images: input
                     .images
@@ -765,7 +789,25 @@ impl NativeLiveWireProjector {
                         missing: false,
                     })
                     .collect(),
+                client_input_id,
             },
+            crate::live_hub::LiveViewEvent::Steered {
+                count,
+                inputs,
+                client_input_ids,
+            } => LiveWireEvent::Steered {
+                count,
+                inputs,
+                client_input_ids,
+            },
+            crate::live_hub::LiveViewEvent::RequestResolved { request_id, kind } => {
+                if kind == atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND
+                {
+                    LiveWireEvent::UserInputResolved { request_id }
+                } else {
+                    return None;
+                }
+            }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::Agent(event)) => match event {
                 Kernel::TurnStarted => LiveWireEvent::State {
                     running: true,
@@ -829,10 +871,10 @@ impl NativeLiveWireProjector {
                 | Kernel::Snapshot { .. }
                 | Kernel::TurnComplete { .. }
                 | Kernel::Cancelled
-                | Kernel::Steered { .. }
                 | Kernel::CompactionStarted { .. }
                 | Kernel::Compacted { .. }
                 | Kernel::CompactionFailed { .. } => return None,
+                Kernel::Steered { .. } => return None,
                 _ => return None,
             },
             crate::live_hub::LiveViewEvent::Runtime(Runtime::Request(request)) => {
@@ -931,6 +973,9 @@ impl NativeLiveWireProjector {
             },
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ControllerWarning(message)) => {
                 LiveWireEvent::Warning { message }
+            }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::PersistenceWarning(message)) => {
+                LiveWireEvent::PersistenceWarning { message }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::RuntimeStopped(exit)) => {
                 self.tools.clear();
@@ -1145,6 +1190,10 @@ pub(crate) async fn live_stream(
 #[derive(serde::Deserialize)]
 pub(crate) struct LiveMessageReq {
     pub message: String,
+    /// Opaque browser-generated correlation id. It is projected back on input
+    /// echo and steer acknowledgement, but never enters model context.
+    #[serde(default)]
+    pub client_input_id: Option<String>,
     #[serde(default)]
     pub images: Vec<crate::ImageInput>,
     /// webui 选中的模型（provider 名）。Some 时切换当前绑定 runtime。
@@ -1421,8 +1470,31 @@ pub(crate) async fn live_message(
         &original_images,
     );
     let (runtime_input, echo_input) = split_live_inputs(req.message, original_images, runtime_text);
-    match crate::native_live::submit_confirmed_with_echo(runtime_input, echo_input).await {
-        Ok(_) => Json(serde_json::json!({ "accepted": true })),
+    match crate::native_live::submit_confirmed_with_echo(
+        runtime_input,
+        echo_input,
+        req.client_input_id,
+    )
+    .await
+    {
+        Ok(atomcode_coding::SubmitReceipt::Started {
+            generation,
+            turn_id,
+        }) => Json(serde_json::json!({
+            "accepted": true,
+            "disposition": "started",
+            "generation": generation,
+            "turn_id": turn_id,
+        })),
+        Ok(atomcode_coding::SubmitReceipt::Steered {
+            generation,
+            turn_id,
+        }) => Json(serde_json::json!({
+            "accepted": true,
+            "disposition": "steered",
+            "generation": generation,
+            "turn_id": turn_id,
+        })),
         Err(error) => Json(serde_json::json!({
             "accepted": false,
             "error": format!("live submit rejected: {error:?}"),
@@ -2664,6 +2736,44 @@ mod tests {
                 CodingRuntimeEvent::Request(unknown),
             ))
             .is_none());
+
+        let resolved = projector
+            .project(crate::live_hub::LiveViewEvent::RequestResolved {
+                request_id: 42,
+                kind: REQUEST_USER_INPUT_KIND.into(),
+            })
+            .expect("typed request terminal must reach the live wire");
+        assert_eq!(
+            serde_json::to_string(&resolved).unwrap(),
+            r#"{"type":"user_input_resolved","request_id":42}"#
+        );
+        assert!(projector
+            .project(crate::live_hub::LiveViewEvent::RequestResolved {
+                request_id: 43,
+                kind: "unknown_future_kind".into(),
+            })
+            .is_none());
+    }
+
+    #[test]
+    fn native_live_projector_exposes_exact_steered_inputs() {
+        let mut projector = NativeLiveWireProjector::default();
+        let wire = projector
+            .project(crate::live_hub::LiveViewEvent::Steered {
+                count: 1,
+                inputs: vec![atomcode_kernel::event::SteeredInput {
+                    text: "use the smaller fix".into(),
+                    images: Vec::new(),
+                }],
+                client_input_ids: vec![Some("web-1".into())],
+            })
+            .expect("steer acknowledgement must reach the live wire");
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "steered");
+        assert_eq!(json["count"], 1);
+        assert_eq!(json["inputs"][0]["text"], "use the smaller fix");
+        assert_eq!(json["inputs"][0]["images"], serde_json::json!([]));
+        assert_eq!(json["client_input_ids"][0], "web-1");
     }
 
     #[test]

@@ -32,7 +32,7 @@ use atomcode_capabilities::session::{
     SnapshotHook, StatusReminderHook, StorageOwner, TranscriptHook,
 };
 use atomcode_capabilities::skills::{
-    register_skill_tools, standard_skill_dirs, SkillCatalogHook, SkillRegistry,
+    register_skill_tools, runtime_skill_dirs, SkillCatalogHook, SkillRegistry,
 };
 use atomcode_capabilities::tools::{
     register_coding_tools_with_vision, ApprovalMiddleware, ArtifactMiddleware, ArtifactStore,
@@ -169,6 +169,10 @@ impl Drop for McpWorkGuard {
 pub struct CodingParts {
     registry: ToolRegistry,
     tool_names: Vec<String>,
+    /// Capability-graph decision made at prepare time. Like request-user-input,
+    /// changing the master switch requires a capability reprepare; provider-only
+    /// reassembly must not advertise a tool absent from the mounted catalog.
+    todo_enabled: bool,
     request_user_input_enabled: bool,
     mcp_tool_names: Arc<std::sync::RwLock<Vec<String>>>,
     mounted_tools: Option<MountedTools>,
@@ -291,6 +295,10 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     );
     let request_user_input_enabled =
         opts.request_user_input && crate::persona::request_user_input_switch_enabled();
+    let todo_enabled = crate::persona::todo_switch_enabled_for(cfg.todo.enabled);
+    if !todo_enabled {
+        names.retain(|name| name != "todowrite");
+    }
     if !request_user_input_enabled {
         names.retain(|name| name != "request_user_input");
     }
@@ -458,7 +466,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // Skills: standard home+project precedence unless the caller supplied dirs.
     let skill_dirs = opts.skill_dirs.clone().unwrap_or_else(|| {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        standard_skill_dirs(&home, &cfg.working_dir)
+        runtime_skill_dirs(&home, &cfg.working_dir)
     });
     // Plugin-contributed skills: each (dir, namespace) pair registered as
     // `<namespace>:<skill-name>`, matching the slash-menu's core registry
@@ -653,7 +661,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // production registration of TodoHook — every real entrypoint (CLI, daemon, clix) goes
     // through prepare()/assemble() here; `assemble.rs::build_coding_agent` (which also registers
     // it) is reachable only from tests + examples, so there is no double-registration.
-    if crate::persona::todo_switch_enabled() {
+    if crate::persona::todo_switch_enabled_for(cfg.todo.enabled) {
         hooks.push(Arc::new(crate::todo::TodoHook));
     }
     // DeepSeek-only opening-turn skill-first reminder. A weak model (deepseek) skips
@@ -728,6 +736,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         ),
         registry,
         tool_names: names,
+        todo_enabled,
         request_user_input_enabled,
         mcp_tool_names: Arc::new(std::sync::RwLock::new(Vec::new())),
         mounted_tools: None,
@@ -793,6 +802,12 @@ fn session_lease(
 }
 
 impl CodingParts {
+    /// The host-owned CodingPlan quota source, if any. Used at `/goal` start to
+    /// size the round budget from the live request quota.
+    pub(crate) fn rate_limit_source(&self) -> Option<&Arc<dyn RateLimitWindowSource>> {
+        self.rate_limit_source.as_ref()
+    }
+
     pub(crate) fn take_snapshot_persistence_uncertain(&self) -> Option<String> {
         self.snapshot_persistence_status
             .as_ref()
@@ -995,15 +1010,18 @@ impl CodingParts {
     }
 
     pub(crate) fn mcp_tools_for_server(&self, server: &str) -> Vec<String> {
-        let prefix = format!("mcp__{server}__");
         let names = match self.mcp_tool_names.read() {
             Ok(names) => names,
             Err(poisoned) => poisoned.into_inner(),
         };
-        names
-            .iter()
-            .filter(|name| name.starts_with(&prefix))
-            .cloned()
+        let Some(registry) = self.mcp_registry.as_ref() else {
+            return Vec::new();
+        };
+        let published: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+        registry
+            .tool_aliases_for_server(server)
+            .into_iter()
+            .filter(|alias| published.contains(alias.as_str()))
             .collect()
     }
 
@@ -1049,11 +1067,14 @@ async fn publish_ready_mcp_tools(
     };
     let adapters: Vec<Arc<dyn atomcode_kernel::tool::Tool>> = tool_infos
         .into_iter()
-        .map(|info| {
-            Arc::new(atomcode_capabilities::mcp::McpToolAdapter::new(
-                mcp_registry.clone(),
-                info,
-            )) as Arc<dyn atomcode_kernel::tool::Tool>
+        .filter_map(|info| {
+            match atomcode_capabilities::mcp::McpToolAdapter::new(mcp_registry.clone(), info) {
+                Ok(adapter) => Some(Arc::new(adapter) as Arc<dyn atomcode_kernel::tool::Tool>),
+                Err(error) => {
+                    eprintln!("[mcp] tool publication skipped: {error}");
+                    None
+                }
+            }
         })
         .collect();
     // Serialize only the in-memory commit. Re-check after locking because a
@@ -1095,11 +1116,14 @@ async fn publish_connected_mcp_server(
     };
     let adapters: Vec<Arc<dyn atomcode_kernel::tool::Tool>> = tool_infos
         .into_iter()
-        .map(|info| {
-            Arc::new(atomcode_capabilities::mcp::McpToolAdapter::new(
-                Arc::clone(&mcp_registry),
-                info,
-            )) as Arc<dyn atomcode_kernel::tool::Tool>
+        .filter_map(|info| {
+            match atomcode_capabilities::mcp::McpToolAdapter::new(Arc::clone(&mcp_registry), info) {
+                Ok(adapter) => Some(Arc::new(adapter) as Arc<dyn atomcode_kernel::tool::Tool>),
+                Err(error) => {
+                    eprintln!("[mcp] tool publication skipped: {error}");
+                    None
+                }
+            }
         })
         .collect();
     let _publish_guard = publish_lock.lock().await;
@@ -1169,6 +1193,7 @@ pub fn assemble(
                 reconcile_coding_persona(
                     &mut snap,
                     cfg,
+                    parts.todo_enabled,
                     parts.request_user_input_enabled,
                     parts.review_provider.is_some(),
                 );
@@ -1289,7 +1314,7 @@ pub fn assemble(
         .persona(coding_persona_with_capabilities(
             &cfg.model,
             cfg.preferred_language,
-            crate::persona::todo_switch_enabled(),
+            parts.todo_enabled,
             parts.request_user_input_enabled,
             parts.review_provider.is_some(),
         ))
@@ -1357,6 +1382,13 @@ pub fn assemble(
         // that keeps a user's external-model 429 from being mislabelled as a CodingPlan quota;
         // a prepare-frozen base_url would defeat it after a model switch.
         .hook(rate_limit_hook)
+        // Credentials are a product-wide security boundary, independent of whether
+        // the optional AtomGit integration is compiled in. It must run before the
+        // approval-oriented SensitivePathGate so an explicit extraction cannot be
+        // downgraded from terminal denial into a retryable approval denial.
+        .middleware(Arc::new(
+            atomcode_capabilities::tools::CredentialBashGate::new(),
+        ))
         // Sensitive-path read gate: read tools are Safe (skip approval), so without this an
         // agent could silently read ~/.ssh / .env / creds and leak them to the provider.
         // Acts ONLY on Safe tools touching a sensitive path → one approval round-trip.
@@ -1455,6 +1487,17 @@ pub fn assemble(
     for h in &parts.hooks {
         builder = builder.hook(h.clone());
     }
+    // Eagerness is generation-scoped: `/model` reuses CodingParts and re-runs only
+    // `assemble`, so deriving this hook in `prepare` would freeze Auto/eagerness against the
+    // session's original model generation. TodoHook itself is model-neutral and remains
+    // in the reusable parts chain above.
+    if parts.todo_enabled {
+        builder = builder.hook(Arc::new(crate::todo::TodoEagerHook::new(
+            &cfg.model,
+            &cfg.provider_type,
+            cfg.todo.eager,
+        )));
+    }
     if let Some(datalog) = datalog {
         // Register last in both chains: the lifecycle observer sees the final prompt/request
         // after product hooks, and the tool observer sees the final middleware-transformed
@@ -1518,6 +1561,7 @@ pub fn assemble(
         reconcile_coding_persona(
             &mut snapshot,
             cfg,
+            parts.todo_enabled,
             parts.request_user_input_enabled,
             parts.review_provider.is_some(),
         );
@@ -1566,13 +1610,14 @@ fn persona_model(text: &str) -> Option<&str> {
 fn reconcile_coding_persona(
     snapshot: &mut SessionSnapshot,
     cfg: &CodingAgentConfig,
+    todo_enabled: bool,
     request_user_input_enabled: bool,
     review_enabled: bool,
 ) {
     let persona = coding_persona_with_capabilities(
         &cfg.model,
         cfg.preferred_language,
-        crate::persona::todo_switch_enabled(),
+        todo_enabled,
         request_user_input_enabled,
         review_enabled,
     );
@@ -1780,6 +1825,7 @@ mod tests {
             &agent_config("deepseek-v4-flash"),
             true,
             true,
+            true,
         );
 
         assert!(snapshot.messages[0]
@@ -1787,6 +1833,19 @@ mod tests {
             .contains("running the deepseek-v4-flash model"));
         assert_eq!(snapshot.messages[1].text, "SESSION CONTEXT");
         assert_eq!(snapshot.cache_epoch, 1);
+    }
+
+    #[test]
+    fn provider_reassemble_keeps_the_prepared_todo_capability_gate() {
+        let mut snapshot = SessionSnapshot::new(vec![Message::system("SESSION CONTEXT")]);
+        let cfg = agent_config("deepseek-v4-flash");
+
+        reconcile_coding_persona(&mut snapshot, &cfg, false, true, true);
+
+        assert!(!snapshot.messages[0].text.contains("## TASK TRACKING"));
+        assert!(snapshot.messages[0]
+            .text
+            .contains("running the deepseek-v4-flash model"));
     }
 
     #[test]
@@ -1809,6 +1868,7 @@ mod tests {
         reconcile_coding_persona(
             &mut snapshot,
             &agent_config("deepseek-v4-flash"),
+            true,
             true,
             true,
         );
@@ -1854,8 +1914,8 @@ mod tests {
             Message::assistant("I am model-a", vec![]),
         ]);
 
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true);
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-c"), true, true);
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true);
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-c"), true, true, true);
 
         let transitions: Vec<_> = snapshot
             .messages
@@ -1892,6 +1952,7 @@ mod tests {
             &agent_config("deepseek-v4-flash"),
             true,
             true,
+            true,
         );
 
         assert_eq!(snapshot.messages[0].text, persona);
@@ -1916,7 +1977,7 @@ mod tests {
         let mut cfg = agent_config("model-a");
         cfg.preferred_language = Some(Locale::ZhCn);
 
-        reconcile_coding_persona(&mut snapshot, &cfg, true, true);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true);
 
         assert!(snapshot.messages[0]
             .text
@@ -1943,12 +2004,12 @@ mod tests {
             )),
             Message::assistant("I am model-a", vec![]),
         ]);
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true);
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true);
         let transition = snapshot.messages.last().cloned().unwrap();
         let mut cfg = agent_config("model-b");
         cfg.preferred_language = Some(Locale::ZhCn);
 
-        reconcile_coding_persona(&mut snapshot, &cfg, true, true);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true);
 
         assert_eq!(snapshot.messages.last(), Some(&transition));
         assert_eq!(
@@ -2026,6 +2087,29 @@ mod tests {
 
         assert!(mounted.get("mcp__test__echo").is_none());
         assert!(parts.mcp_tool_names.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_for_server_uses_exact_alias_ownership() {
+        let project = tempfile::tempdir().unwrap();
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        let mut parts = prepare(&cfg, io_free_opts()).await.unwrap();
+        let registry = Arc::new(McpRegistry::new());
+        let info = atomcode_capabilities::mcp::McpToolInfo {
+            server_name: "docs space".into(),
+            tool_name: "read.file".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+            read_only: false,
+        };
+        let adapter =
+            atomcode_capabilities::mcp::McpToolAdapter::new(registry.clone(), info).unwrap();
+        let alias = atomcode_kernel::tool::Tool::name(&adapter).to_string();
+        parts.mcp_registry = Some(registry);
+        parts.mcp_tool_names.write().unwrap().push(alias.clone());
+
+        assert_eq!(parts.mcp_tools_for_server("docs space"), vec![alias]);
+        assert!(parts.mcp_tools_for_server("docs-space").is_empty());
     }
 
     /// `prepare` with all optional capabilities OFF — keeps the call I/O-free (no MCP

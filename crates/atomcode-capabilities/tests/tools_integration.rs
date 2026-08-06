@@ -27,13 +27,48 @@ fn full_toolset_registers_and_mounts() {
     register_coding_tools(&mut reg);
     let mounted = reg.mount(coding_tool_names());
     let names: Vec<String> = mounted.defs().into_iter().map(|d| d.name).collect();
-    for expected in coding_tool_names() {
+
+    // `coding_tool_names()` is deliberately a SUPERSET of what `register_coding_tools`
+    // installs: `fetch_output` is wired only when a session exists (never by this
+    // function), and `todowrite` / `request_user_input` / `memory` sit behind env gates.
+    // `mount()` silently drops names with no registration, so the invariant is
+    // "mounted == the registered subset", not "mounted == every name".
+    let registered: Vec<&str> = coding_tool_names()
+        .iter()
+        .copied()
+        .filter(|name| !reg.mount(&[name]).defs().is_empty())
+        .collect();
+
+    for expected in &registered {
         assert!(
             names.iter().any(|n| n == expected),
-            "{expected} should be mounted; got {names:?}"
+            "{expected} is registered but did not mount; got {names:?}"
         );
     }
-    assert_eq!(names.len(), coding_tool_names().len());
+    assert_eq!(
+        names.len(),
+        registered.len(),
+        "mount() must yield exactly the registered subset; mounted {names:?}, registered {registered:?}"
+    );
+
+    // The reason this test exists: the unconditional core toolset is never gated away.
+    for core in [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_directory",
+        "open_file",
+        "bash",
+        "grep",
+        "glob",
+        "search_replace",
+        "ast_grep",
+    ] {
+        assert!(
+            names.iter().any(|n| n == core),
+            "{core} is unconditional and must always mount; got {names:?}"
+        );
+    }
 }
 
 #[tokio::test]

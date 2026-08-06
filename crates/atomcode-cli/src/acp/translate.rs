@@ -75,7 +75,7 @@ pub fn stop_reason(r: KStop) -> Result<AcpStop, &'static str> {
         | KStop::RepeatLoop
         | KStop::ToolLoopDetected => Ok(AcpStop::MaxTurnRequests),
         KStop::Cancelled => Ok(AcpStop::Cancelled),
-        KStop::PromptRejected => Ok(AcpStop::Refusal),
+        KStop::PromptRejected | KStop::PolicyDenied => Ok(AcpStop::Refusal),
         KStop::ProviderError => Err("provider error"),
         KStop::Timeout => Err("turn timed out"),
         _ => Err("turn ended abnormally"),
@@ -172,6 +172,7 @@ mod tests {
         assert_eq!(stop_reason(K::RepeatLoop).unwrap(), Acp::MaxTurnRequests);
         assert_eq!(stop_reason(K::Cancelled).unwrap(), Acp::Cancelled);
         assert_eq!(stop_reason(K::PromptRejected).unwrap(), Acp::Refusal);
+        assert_eq!(stop_reason(K::PolicyDenied).unwrap(), Acp::Refusal);
         assert!(stop_reason(K::ProviderError).is_err());
         assert!(stop_reason(K::Timeout).is_err());
     }

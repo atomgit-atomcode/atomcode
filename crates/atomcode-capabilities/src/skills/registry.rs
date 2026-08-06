@@ -149,7 +149,7 @@ impl SkillRegistry {
     pub fn reload(&mut self, working_dir: &Path) -> Vec<String> {
         self.skills.clear();
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        for dir in standard_skill_dirs(&home, working_dir) {
+        for dir in runtime_skill_dirs(&home, working_dir) {
             self.load_dir(&dir, Some("skills"));
         }
         Vec::new()
@@ -217,6 +217,22 @@ pub fn standard_skill_dirs(home: &Path, project: &Path) -> Vec<PathBuf> {
         project.join(".agents/skills"),
         project.join(".atomcode/skills"),
     ]
+}
+
+/// The standard skill directories with the user-level `.atomcode` root resolved
+/// from `ATOMCODE_HOME` when it is set. `ATOMCODE_HOME` is the config root (the
+/// equivalent of `~/.atomcode`), so only the user-level AtomCode skill directory
+/// moves; project-local `.atomcode/skills` remains relative to `project`.
+pub fn runtime_skill_dirs(home: &Path, project: &Path) -> Vec<PathBuf> {
+    let mut dirs = standard_skill_dirs(home, project);
+    let Some(atomcode_home) = std::env::var_os("ATOMCODE_HOME") else {
+        return dirs;
+    };
+    let default_user_skills = home.join(".atomcode/skills");
+    if let Some(dir) = dirs.iter_mut().find(|dir| **dir == default_user_skills) {
+        *dir = PathBuf::from(atomcode_home).join("skills");
+    }
+    dirs
 }
 
 #[cfg(test)]
@@ -374,6 +390,41 @@ mod tests {
         assert!(pos(home.join(".agents/skills")) < pos(home.join(".atomcode/skills")));
         assert!(pos(project.join(".claude/skills")) < pos(project.join(".agents/skills")));
         assert!(pos(project.join(".agents/skills")) < pos(project.join(".atomcode/skills")));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn runtime_dirs_honor_atomcode_home_for_duplicate_directory_skills() {
+        let home = tempfile::tempdir().unwrap();
+        let config_root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ATOMCODE_HOME");
+        std::env::set_var("ATOMCODE_HOME", config_root.path());
+
+        let skill_root = config_root.path().join("skills");
+        for (dir, body) in [("dedup-a", "from A"), ("dedup-b", "from B")] {
+            let skill_dir = skill_root.join(dir);
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: dedup-skill\ndescription: duplicate\n---\n{body}\n"),
+            )
+            .unwrap();
+        }
+
+        let dirs = runtime_skill_dirs(home.path(), project.path());
+        match previous {
+            Some(value) => std::env::set_var("ATOMCODE_HOME", value),
+            None => std::env::remove_var("ATOMCODE_HOME"),
+        }
+        let user_skills = dirs
+            .iter()
+            .find(|dir| *dir == &skill_root)
+            .cloned()
+            .expect("ATOMCODE_HOME skills directory should be scanned");
+        let reg = SkillRegistry::load(&[user_skills]);
+        assert_eq!(reg.len(), 1, "same-name skills must collapse to one entry");
+        assert!(reg.get("dedup-skill").is_some());
     }
 
     #[test]

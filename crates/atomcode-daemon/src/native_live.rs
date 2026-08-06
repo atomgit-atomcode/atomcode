@@ -146,9 +146,10 @@ pub async fn submit_confirmed(
 pub async fn submit_confirmed_with_echo(
     runtime_input: UserInput,
     echo_input: UserInput,
+    client_input_id: Option<String>,
 ) -> Result<atomcode_coding::SubmitReceipt, HubError> {
     hub()
-        .submit_confirmed_with_echo(runtime_input, echo_input)
+        .submit_confirmed_with_echo(runtime_input, echo_input, client_input_id)
         .await
 }
 

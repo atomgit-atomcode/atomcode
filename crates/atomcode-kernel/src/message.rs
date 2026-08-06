@@ -461,48 +461,48 @@ impl Conversation {
     /// danglings are trailing so an end-append is fine there and existing tests stay
     /// green.)
     ///
-    /// Two passes, ordering-preserving:
-    ///   (a) ORPHAN SCRUB — collect the set of LIVE `tool_calls[].id` across all
-    ///       messages (as OWNED `String`s, to avoid a borrow conflict with the
-    ///       following rebuild), then `retain` only the `Role::Tool` messages whose
-    ///       `tool_call_id` is in that set.
-    ///   (b) DANGLING REPAIR — rebuild the Vec: push each message, then for any of
-    ///       its assistant `tool_calls` whose id has NO matching surviving result,
-    ///       push a synthetic `(cancelled)` result right after it.
+    /// Sequential state machine: an assistant with tool calls opens one result
+    /// window. Only the immediately following tool messages may satisfy that
+    /// window, each call id at most once. Missing results are synthesized before
+    /// the next non-tool message; results outside a live window are orphans and
+    /// are dropped. This also handles reused ids across turns without pairing an
+    /// earlier result to a later call.
     pub fn repair_pairing(msgs: &mut Vec<Message>) {
-        // (a) ORPHAN SCRUB. Collect OWNED live call ids first to release the borrow
-        // before the mutating `retain`.
-        let live_call_ids: std::collections::HashSet<String> = msgs
-            .iter()
-            .flat_map(|m| m.tool_calls.iter().map(|tc| tc.id.clone()))
-            .collect();
-        msgs.retain(|m| match (&m.role, &m.tool_call_id) {
-            // A tool RESULT survives only if its id matches a live tool_call.
-            (Role::Tool, Some(id)) => live_call_ids.contains(id),
-            // Non-result messages (and the degenerate Tool-without-id) pass through.
-            _ => true,
-        });
+        let input = std::mem::take(msgs);
+        let mut rebuilt = Vec::with_capacity(input.len());
+        let mut input = input.into_iter().peekable();
+        while let Some(message) = input.next() {
+            if message.role != Role::Assistant || message.tool_calls.is_empty() {
+                if message.role != Role::Tool {
+                    rebuilt.push(message);
+                }
+                continue;
+            }
 
-        // The set of result ids that NOW survive (after the scrub) — these are the
-        // calls that are already paired.
-        let result_ids: std::collections::HashSet<String> =
-            msgs.iter().filter_map(|m| m.tool_call_id.clone()).collect();
+            let pending: Vec<String> = message
+                .tool_calls
+                .iter()
+                .map(|call| call.id.clone())
+                .collect();
+            rebuilt.push(message);
 
-        // (b) DANGLING REPAIR. Rebuild, inserting each missing result right after
-        // its assistant message so the result FOLLOWS its call.
-        let mut rebuilt: Vec<Message> = Vec::with_capacity(msgs.len());
-        for m in msgs.drain(..) {
-            let stubs: Vec<Message> = if m.role == Role::Assistant {
-                m.tool_calls
-                    .iter()
-                    .filter(|tc| !result_ids.contains(&tc.id))
-                    .map(|tc| Message::tool_result(tc.id.clone(), "(cancelled)", true))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            rebuilt.push(m);
-            rebuilt.extend(stubs);
+            let mut resolved = std::collections::HashSet::new();
+            while input.peek().is_some_and(|message| message.role == Role::Tool) {
+                let result = input.next().expect("peeked tool result must exist");
+                if let Some(id) = result.tool_call_id.as_ref() {
+                    if pending.iter().any(|pending_id| pending_id == id)
+                        && resolved.insert(id.clone())
+                    {
+                        rebuilt.push(result);
+                    }
+                }
+            }
+
+            for id in pending {
+                if resolved.insert(id.clone()) {
+                    rebuilt.push(Message::tool_result(id, "(cancelled)", true));
+                }
+            }
         }
         *msgs = rebuilt;
     }
@@ -1832,6 +1832,32 @@ mod tests {
             msgs, valid,
             "repair_pairing must be a no-op on an already-valid history"
         );
+    }
+
+    #[test]
+    fn repair_pairing_enforces_immediate_order_and_drops_duplicates() {
+        let mut msgs = vec![
+            Message::tool_result("reuse", "too early", false),
+            Message::assistant("call", vec![call("reuse", "echo"), call("other", "echo")]),
+            Message::user("interleaved"),
+            Message::tool_result("reuse", "too late", false),
+            Message::assistant("call again", vec![call("reuse", "echo")]),
+            Message::tool_result("reuse", "current", false),
+            Message::tool_result("reuse", "duplicate", false),
+        ];
+
+        Conversation::repair_pairing(&mut msgs);
+
+        assert_eq!(msgs[0].role, Role::Assistant);
+        assert_eq!(msgs[1].tool_call_id.as_deref(), Some("reuse"));
+        assert_eq!(msgs[1].text, "(cancelled)");
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("other"));
+        assert_eq!(msgs[2].text, "(cancelled)");
+        assert_eq!(msgs[3].role, Role::User);
+        assert_eq!(msgs[4].role, Role::Assistant);
+        assert_eq!(msgs[5].tool_call_id.as_deref(), Some("reuse"));
+        assert_eq!(msgs[5].text, "current");
+        assert_eq!(msgs.len(), 6, "early, late, and duplicate results are dropped");
     }
 
     // ── BLOCKER 2 — rewrites respect the sacred floor ────────────────────────

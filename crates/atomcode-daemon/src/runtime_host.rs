@@ -65,6 +65,7 @@ impl RateLimitWindowSource for CodingPlanRateLimitSource {
                     reset_at_display: window.reset_at_display,
                     seconds_until_reset: window.seconds_until_reset,
                     reset_label: window.reset_label,
+                    call_limit: window.call_limit,
                 })
                 .collect())
         })

@@ -19,7 +19,7 @@
 // Modals open by pushing `Some(Box::new(...))` into `active_modal` — the
 // handler arms for `/model`, `/resume`, `/provider` show the pattern.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{
     apply_persisted_config, bg_runtime, deactivate_runtime_provider_after_logout,
@@ -41,7 +41,10 @@ use atomcode_config::config::Config;
 
 use crate::markdown::{fence_start, is_closing_fence};
 
-/// Maximum recent project dirs we keep in memory + persist to disk.
+/// Maximum manual MRU project dirs we keep in memory + persist to disk.
+///
+/// This is only an ordering hint for `/cd`; the picker also includes every
+/// valid working directory found in the native session catalog.
 const MAX_RECENT_DIRS: usize = 5;
 
 fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
@@ -551,20 +554,33 @@ fn render_context_file_status_block(working_dir: &std::path::Path) -> String {
 }
 
 /// 将当前 TUI Coding Runtime 绑定到 live hub，供 `/webui` 和 `/sync` 共用。
+fn live_provider_selection(config: &Config) -> Result<String, String> {
+    let selection = super::resolved_provider_and_model(config).0;
+    if selection.is_empty() {
+        Err("no model is configured; run /login or /provider first".into())
+    } else {
+        Ok(selection)
+    }
+}
+
 pub(crate) fn attach_live_runtime(
     ctx: &mut LoopCtx,
     mode: AgentMode,
     renderer: &mut dyn Renderer,
 ) -> Result<(), String> {
     let snapshot = ctx.current_session.to_conversation_snapshot();
-    let provider_fingerprint = atomcode_daemon::native_live::provider_fingerprint(
-        &ctx.config,
-        &ctx.config.default_provider,
-    )?;
+    // The running TUI resolves `default_model` before the legacy
+    // `default_provider`, with a catalog fallback when both raw fields are
+    // empty. Reuse that exact selection for the live binding. In particular,
+    // first login can leave `default_provider == ""` while the runtime already
+    // runs the newly published CodingPlan model.
+    let provider_selection = live_provider_selection(&ctx.config)?;
+    let provider_fingerprint =
+        atomcode_daemon::native_live::provider_fingerprint(&ctx.config, &provider_selection)?;
     let binding = atomcode_daemon::native_live::register_embedded_runtime(
         ctx.current_session.id.to_string(),
         ctx.working_dir.clone(),
-        ctx.config.default_provider.clone(),
+        provider_selection,
         provider_fingerprint,
         snapshot,
         std::sync::Arc::new(ctx.runtime.clone()),
@@ -602,26 +618,17 @@ pub(crate) fn attach_live_runtime(
         let runtime_id = ctx.foreground_runtime_id;
         ctx.live_observation_task = Some(tokio::spawn(async move {
             while let Ok(observation) = receiver.recv().await {
-                if let atomcode_daemon::live_hub::LiveViewEvent::InputAccepted(input) =
-                    observation.event
+                let Some(event) = project_live_view_event(observation.event) else {
+                    continue;
+                };
+                if event_tx
+                    .send(super::bg_runtime::RuntimeEvent {
+                        runtime_id,
+                        event: super::bg_runtime::RuntimeEventPayload::Ui(event),
+                    })
+                    .is_err()
                 {
-                    // Re-attach `[Image #N]` markers dropped by the text-only echo:
-                    // a webui submit keeps images separate (`input.images`) with no
-                    // inline markers, so without this the synchronized TUI echoes an
-                    // image-bearing message with an empty attachment row (the empty
-                    // box under the user text).
-                    let echo = super::echo_text_with_image_markers(input.text, input.images.len());
-                    if event_tx
-                        .send(super::bg_runtime::RuntimeEvent {
-                            runtime_id,
-                            event: super::bg_runtime::RuntimeEventPayload::Ui(
-                                super::ui_event::UiEvent::UserEcho(echo),
-                            ),
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
+                    break;
                 }
             }
         }));
@@ -630,6 +637,23 @@ pub(crate) fn attach_live_runtime(
         "已共享当前会话（与浏览器实时互通）".to_string(),
     ));
     Ok(())
+}
+
+fn project_live_view_event(
+    event: atomcode_daemon::live_hub::LiveViewEvent,
+) -> Option<super::ui_event::UiEvent> {
+    match event {
+        atomcode_daemon::live_hub::LiveViewEvent::InputAccepted { input, .. } => {
+            // Re-attach `[Image #N]` markers dropped by the text-only echo: a webui
+            // submit keeps images separate (`input.images`) with no inline markers.
+            let echo = super::echo_text_with_image_markers(input.text, input.images.len());
+            Some(super::ui_event::UiEvent::UserEcho(echo))
+        }
+        atomcode_daemon::live_hub::LiveViewEvent::RequestResolved { request_id, kind } => {
+            Some(super::ui_event::UiEvent::SharedRequestResolved { request_id, kind })
+        }
+        _ => None,
+    }
 }
 
 fn detach_live_runtime(ctx: &mut LoopCtx) -> Result<bool, String> {
@@ -2117,7 +2141,7 @@ fn execute_slash_command_impl(
                     }
                 }
                 None => t(Msg::DesktopNotInstalled {
-                    url: super::desktop::DOWNLOAD_URL,
+                    url: super::desktop::download_url(),
                 })
                 .into_owned(),
             };
@@ -2130,6 +2154,16 @@ fn execute_slash_command_impl(
             // 区别：① 不开浏览器，吐终端二维码；② 本机 server 走 daemon 模式
             // （无 token，仅回环绑定），鉴权边界落在中继的 route token。
             //
+            // 远程访问要连中继、并从中继的发布地址下载 relay-client 二进制。
+            // 没有自己中继的部署可设 ATOMCODE_ENABLE_RELAY=0 关掉整条链路。
+            if !atomcode_config::endpoints::relay_enabled() {
+                renderer.render(UiLine::CommandOutput(
+                    "远程访问在本部署中未启用（ATOMCODE_ENABLE_RELAY=0）。".to_string(),
+                ));
+                renderer.flush();
+                return Ok(());
+            }
+
             // 中继地址 → (ws 拨号 URL, App 用的 https 根)。
             fn derive_relay_urls(base: &str) -> (String, String) {
                 let trimmed = base.trim().trim_end_matches('/');
@@ -2190,15 +2224,10 @@ fn execute_slash_command_impl(
                 }
                 output
             } else {
-                // 官方生产中继。用户直接敲 `/app` 即可，无需选择/配置中继地址；
-                // 命令参数与 ATOMCODE_APP_RELAY 环境变量仅留作内部联调覆盖用。
-                const APP_DEFAULT_RELAY: &str = "https://relay-atomcode.atomgit.com";
-                // 中继地址：命令参数 > ATOMCODE_APP_RELAY 环境变量 > 生产默认。
+                // 部署默认中继。用户直接敲 `/app` 即可，无需选择/配置中继地址。
+                // 中继地址：命令参数 > endpoints（含 ATOMCODE_APP_RELAY 覆盖）。
                 let relay_base = if a.is_empty() {
-                    std::env::var("ATOMCODE_APP_RELAY")
-                        .ok()
-                        .filter(|s| !s.is_empty())
-                        .or_else(|| Some(APP_DEFAULT_RELAY.to_string()))
+                    Some(atomcode_config::endpoints::relay_url().to_string())
                 } else {
                     Some(a.trim_start_matches("--relay").trim().to_string())
                 };
@@ -2456,22 +2485,15 @@ fn execute_slash_command_impl(
             }
         }
         "cd" => {
-            // Bare `/cd` — open the interactive history picker (matches legacy
-            // TUI behaviour). The picker's Enter-handler invokes `apply_cd`
-            // itself, so there's nothing else to do here.
+            // Bare `/cd` opens a searchable project picker. The complete native
+            // session catalog is the durable source; the small recent-dir ring
+            // only biases its ordering. The picker's Enter-handler invokes
+            // `apply_cd` itself, so there is nothing else to do here.
             if arg.is_empty() {
-                if ctx.recent_dirs.is_empty() {
-                    let cwd = ctx.working_dir.display().to_string();
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::CdWorkingDir { cwd: &cwd }).into_owned(),
-                    ));
-                    renderer.flush();
-                } else {
-                    *active_modal = Some(Box::new(DirPicker::open(
-                        ctx.recent_dirs.clone(),
-                        ctx.working_dir.clone(),
-                    )));
-                }
+                *active_modal = Some(Box::new(DirPicker::open(
+                    load_cd_picker_dirs(&ctx.working_dir, &ctx.recent_dirs),
+                    ctx.working_dir.clone(),
+                )));
                 return Ok(());
             }
             let new_dir = resolve_cd(arg, &ctx.working_dir, ctx.previous_dir.as_deref());
@@ -5519,6 +5541,66 @@ pub(crate) fn save_recent_dirs(dirs: &[PathBuf]) {
     let _ = std::fs::write(&path, content);
 }
 
+/// Build the complete `/cd` project list. Catalog projects retain newest-session
+/// order. A current directory with no history is prepended so it remains visible;
+/// MRU-only directories follow the catalog. Invalid/deleted paths are omitted and
+/// Windows case/verbatim aliases collapse to one row.
+pub(crate) fn load_cd_picker_dirs(current: &Path, recent: &[PathBuf]) -> Vec<PathBuf> {
+    let scan = atomcode_capabilities::session::SessionManager::scan_catalog(
+        &atomcode_capabilities::session::SessionManager::sessions_root(),
+    );
+    merge_cd_picker_dirs(
+        current,
+        recent,
+        scan.entries.into_iter().map(|entry| entry.working_dir),
+        |path| path.is_dir(),
+    )
+}
+
+fn merge_cd_picker_dirs<I, F>(
+    current: &Path,
+    recent: &[PathBuf],
+    catalog_dirs: I,
+    mut is_dir: F,
+) -> Vec<PathBuf>
+where
+    I: IntoIterator<Item = PathBuf>,
+    F: FnMut(&Path) -> bool,
+{
+    let current = atomcode_capabilities::pathnorm::strip_verbatim_path(current);
+    let mut catalog_seen = std::collections::HashSet::new();
+    let catalog_dirs = catalog_dirs
+        .into_iter()
+        .map(|path| atomcode_capabilities::pathnorm::strip_verbatim_path(&path))
+        .filter(|path| {
+            catalog_seen.insert(atomcode_capabilities::pathnorm::path_case_key(path))
+        })
+        .filter(|path| is_dir(path))
+        .collect::<Vec<_>>();
+    let current_key = atomcode_capabilities::pathnorm::path_case_key(&current);
+    let current_in_catalog = catalog_dirs
+        .iter()
+        .any(|path| atomcode_capabilities::pathnorm::path_case_key(path) == current_key);
+    let mut seen = std::collections::HashSet::new();
+    let mut dirs = Vec::new();
+    if !current_in_catalog && is_dir(&current) && seen.insert(current_key) {
+        dirs.push(current);
+    }
+    for path in catalog_dirs {
+        if seen.insert(atomcode_capabilities::pathnorm::path_case_key(&path)) {
+            dirs.push(path);
+        }
+    }
+    for path in recent {
+        let path = atomcode_capabilities::pathnorm::strip_verbatim_path(path);
+        let key = atomcode_capabilities::pathnorm::path_case_key(&path);
+        if seen.insert(key) && is_dir(&path) {
+            dirs.push(path);
+        }
+    }
+    dirs
+}
+
 pub(crate) fn resolve_cd(
     arg: &str,
     cwd: &std::path::Path,
@@ -7336,6 +7418,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn live_request_resolution_projects_to_correlated_tui_event() {
+        let event =
+            project_live_view_event(atomcode_daemon::live_hub::LiveViewEvent::RequestResolved {
+                request_id: 42,
+                kind: atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND
+                    .into(),
+            })
+            .expect("request terminal must reach the TUI");
+
+        assert!(matches!(
+            event,
+            crate::event_loop::ui_event::UiEvent::SharedRequestResolved {
+                request_id: 42,
+                ref kind,
+            } if kind
+                == atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND
+        ));
+    }
+
+    fn new_schema_config(default_model: Option<&str>) -> Config {
+        serde_json::from_value(serde_json::json!({
+            "default_provider": "",
+            "default_model": default_model,
+            "provider_accounts": {
+                "AtomGit": {
+                    "provider": "openai",
+                    "base_url": "https://llm-api.atomgit.com/v1"
+                }
+            },
+            "models": {
+                "AtomGit-Qwen": {
+                    "account": "AtomGit",
+                    "model": "Qwen3-VL-8B-Instruct",
+                    "context_window": 131072
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn live_provider_selection_uses_default_model_when_legacy_default_is_empty() {
+        let config = new_schema_config(Some("AtomGit-Qwen"));
+        assert_eq!(live_provider_selection(&config).unwrap(), "AtomGit-Qwen");
+    }
+
+    #[test]
+    fn live_provider_selection_matches_runtime_catalog_fallback() {
+        let config = new_schema_config(None);
+        assert_eq!(live_provider_selection(&config).unwrap(), "AtomGit-Qwen");
+    }
+
+    #[test]
+    fn live_provider_selection_reports_missing_catalog_without_empty_provider_error() {
+        let config = Config::default();
+        let error = live_provider_selection(&config).unwrap_err();
+        assert!(error.contains("no model is configured"));
+        assert!(!error.contains("provider \"\" not found"));
+    }
+
+    #[test]
     fn review_prompt_uses_explicit_tool_scopes() {
         assert!(review_prompt("").contains(
             r#"{"scope":{"kind":"working_tree"}}"#
@@ -7503,6 +7646,53 @@ mod tests {
             vec![PathBuf::from("/Users/danan")],
             "same dir in two cases must collapse, keeping the first"
         );
+    }
+
+    #[test]
+    fn cd_picker_dirs_merge_current_recent_and_complete_catalog() {
+        let current = PathBuf::from("/current");
+        let recent = vec![PathBuf::from("/recent"), PathBuf::from("/current")];
+        let catalog = vec![
+            PathBuf::from("/catalog-new"),
+            PathBuf::from("/recent"),
+            PathBuf::from("/catalog-old"),
+        ];
+        let dirs = merge_cd_picker_dirs(&current, &recent, catalog, |_| true);
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/current"),
+                PathBuf::from("/catalog-new"),
+                PathBuf::from("/recent"),
+                PathBuf::from("/catalog-old"),
+            ]
+        );
+    }
+
+    #[test]
+    fn cd_picker_dirs_drop_missing_catalog_projects_without_truncating() {
+        let catalog = (0..12).map(|n| PathBuf::from(format!("/project-{n}")));
+        let dirs = merge_cd_picker_dirs(Path::new("/current"), &[], catalog, |path| {
+            path != Path::new("/project-5")
+        });
+        assert_eq!(dirs.len(), 12, "current plus 11 live catalog projects");
+        assert!(!dirs.contains(&PathBuf::from("/project-5")));
+        assert!(dirs.contains(&PathBuf::from("/project-11")));
+    }
+
+    #[test]
+    fn cd_picker_checks_each_catalog_directory_once() {
+        let checks = std::cell::Cell::new(0usize);
+        let catalog = vec![
+            PathBuf::from("/same"),
+            PathBuf::from("/same"),
+            PathBuf::from("/other"),
+        ];
+        let _ = merge_cd_picker_dirs(Path::new("/same"), &[], catalog, |_| {
+            checks.set(checks.get() + 1);
+            true
+        });
+        assert_eq!(checks.get(), 2, "one liveness check per unique catalog dir");
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]

@@ -206,3 +206,12 @@ export function liveDetachDisposition(running: boolean): LiveDetachDisposition {
 export function liveSessionSwitchDisposition(running: boolean): LiveDetachDisposition {
   return running ? { allowed: false, reason: 'active_turn' } : { allowed: true };
 }
+
+/** Clear only the structured-input prompt whose native request was resolved.
+ * A late terminal for an older request must never dismiss a newer prompt. */
+export function resolveUserInputRequest<T extends { request_id: number }>(
+  current: T | null,
+  resolvedRequestId: number,
+): T | null {
+  return current?.request_id === resolvedRequestId ? null : current;
+}

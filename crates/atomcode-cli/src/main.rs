@@ -1349,6 +1349,18 @@ async fn run() -> Result<i32> {
                 .await
                 .map(|_| 0);
             }
+            Commands::Schedule(sub) => {
+                // Handled here (not via the generic `other` arm) so the executor's
+                // exit code survives: `schedule run` returns 0/1/130 and the OS
+                // scheduler keys failure detection on it. The generic arm collapses
+                // every Ok to 0, which would report every scheduled run as success.
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let code = schedule_cmd::handle_schedule(sub).await?;
+                telemetry
+                    .shutdown(std::time::Duration::from_millis(500))
+                    .await;
+                return Ok(code);
+            }
             other => {
                 let result = handle_command(other, &telemetry).await.map(|_| 0);
                 // Flush any events emitted by the subcommand (e.g. login_success)
@@ -1496,7 +1508,7 @@ async fn run() -> Result<i32> {
         total_ms = run_start.elapsed().as_millis() as u64,
         "optional metadata refresh detached from startup"
     );
-    let runtime_cfg = runtime_config_from(
+    let mut runtime_cfg = runtime_config_from(
         &config,
         &working_dir,
         cli.provider.as_deref(),
@@ -1506,6 +1518,7 @@ async fn run() -> Result<i32> {
         // fail-closed timeout so an unanswered approval can't park the run forever.
         !is_headless,
     );
+    runtime_cfg.next_prompt_suggestions = !is_headless;
     let model_name = runtime_cfg.model.clone();
     let provider_bootstrap = if is_headless {
         atomcode_coding::ProviderBootstrap::Required
@@ -1595,6 +1608,7 @@ async fn run() -> Result<i32> {
                 // event loop). `spawn_deferred_tui_runtime` is only ever the
                 // in-TUI respawn factory, so this is never a headless path.
                 runtime_cfg.round_cap_checkpoint = true;
+                runtime_cfg.next_prompt_suggestions = true;
                 spawn_deferred_tui_runtime(runtime_cfg, session)
             },
         )
@@ -2330,7 +2344,10 @@ pub(crate) async fn run_native_headless(
                 exit_code = 1;
             }
             CodingRuntimeEvent::Agent(KernelEvent::Warning(message))
-            | CodingRuntimeEvent::ControllerWarning(message) => eprintln!("[warning] {message}"),
+            | CodingRuntimeEvent::ControllerWarning(message)
+            | CodingRuntimeEvent::PersistenceWarning(message) => {
+                eprintln!("[warning] {message}")
+            }
             CodingRuntimeEvent::Agent(KernelEvent::RateLimited {
                 reset_at_display,
                 reset_label,
@@ -2683,8 +2700,8 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             unreachable!("completion is handled before runtime startup")
         }
         Commands::Hooks(subcmd) => handle_hooks(subcmd).await,
-        Commands::Schedule(sub) => {
-            schedule_cmd::handle_schedule(sub).await.map(|_| ())
+        Commands::Schedule(_) => {
+            unreachable!("Schedule is handled inline in run() so its exit code survives")
         }
         Commands::Askpass { .. } => {
             unreachable!("__askpass is handled early in run() before handle_command")
