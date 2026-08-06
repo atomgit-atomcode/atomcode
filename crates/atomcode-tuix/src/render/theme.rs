@@ -110,9 +110,13 @@ impl Palette {
     /// is unavailable (notably Windows): a light terminal may otherwise put
     /// its dark default text on our dark fallback panel.
     pub const PANEL_FG_LIGHT: Color = Color::Black;
-    /// Foreground paired with [`Role::PanelBg`] on a dark palette. SGR 37 is
-    /// interpreted by the terminal palette as its readable light foreground.
-    pub const PANEL_FG_DARK: Color = Color::Grey;
+    /// Foreground paired with [`Role::PanelBg`] on a dark palette. Bright white
+    /// (SGR 97): the panel bg is `AnsiValue(236)` (#303030), and a dim ANSI-7 grey
+    /// (SGR 37) reads as low-contrast on it in many dark themes — the echoed user
+    /// prompt looked washed out. Bright white keeps it legible on the block while
+    /// staying explicit (safe for the Windows dark-fallback case, where inheriting a
+    /// light terminal's dark default fg would be invisible on this dark panel).
+    pub const PANEL_FG_DARK: Color = Color::White;
 
     /// Colour for the **Plan mode badge** (⏸ plan). Orange (`AnsiValue(208)` ≈
     /// `#ff8700`) — deliberately distinct from the periwinkle MODE color used by
@@ -402,6 +406,17 @@ mod tests {
         );
         assert_eq!(role(caps(true), Role::PanelBg), Some(Color::AnsiValue(254)));
 
+        md_theme::set_theme_mode(false);
+    }
+
+    #[test]
+    fn panel_fg_on_dark_is_bright_for_contrast_over_the_grey_block() {
+        // The dark panel bg is AnsiValue(236) (#303030). A dim ANSI-7 grey fg reads as
+        // low-contrast on it — the user-input echo looked washed out. Keep the paired
+        // dark fg a bright white so the echoed prompt stays legible on the block.
+        let _theme = md_theme::test_lock();
+        md_theme::set_theme_mode(false);
+        assert_eq!(role(caps(true), Role::PanelFg), Some(Color::White));
         md_theme::set_theme_mode(false);
     }
 
