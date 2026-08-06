@@ -203,6 +203,16 @@ impl GoalState {
             .then(|| Instant::now() + Duration::from_secs(self.max_duration_secs));
     }
 
+    /// Resume an explicit user pause without granting a fresh round/time budget.
+    pub fn resume_paused(&mut self) {
+        debug_assert_eq!(self.phase, GoalPhase::Paused);
+        self.cancel = CancellationToken::new();
+        self.active = true;
+        self.phase = GoalPhase::Pursuing;
+        self.terminal = None;
+        self.last_reason = None;
+    }
+
     /// Adjust only the round budget (0 = unlimited), leaving the round counter,
     /// activity, phase, and deadline untouched. Used to apply a live per-plan quota
     /// that is resolved asynchronously after the goal has already started, so goal
@@ -860,6 +870,26 @@ mod tests {
         // Minor fix 3: terminal and last_reason cleared by resume
         assert_eq!(g2.terminal, None);
         assert!(g2.last_reason.is_none());
+    }
+
+    #[test]
+    fn explicit_pause_resume_preserves_progress_and_budget() {
+        let mut goal = GoalState::new(3, "finish".into(), 10, 600);
+        goal.round = 4;
+        goal.unproductive = 2;
+        let deadline = goal.deadline;
+
+        goal.pause("paused by user");
+        assert!(goal.cancel.is_cancelled());
+        goal.resume_paused();
+
+        assert_eq!(goal.phase, GoalPhase::Pursuing);
+        assert!(goal.active);
+        assert_eq!(goal.round, 4);
+        assert_eq!(goal.unproductive, 2);
+        assert_eq!(goal.max_rounds, Some(10));
+        assert_eq!(goal.deadline, deadline);
+        assert!(!goal.cancel.is_cancelled());
     }
 
     #[test]

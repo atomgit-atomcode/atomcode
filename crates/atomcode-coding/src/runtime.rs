@@ -3108,11 +3108,16 @@ fn spawn_runtime_owner_with_optional_agent(
                         };
                         if let Some(new_condition) = reengage_decision {
                             if let Some(state) = goal.as_mut() {
+                                let was_user_paused = state.phase == GoalPhase::Paused;
                                 if let Some(condition) = new_condition {
                                     state.condition = condition;
                                 }
-                                let keep = state.max_rounds.unwrap_or(0);
-                                state.resume(keep);
+                                if was_user_paused {
+                                    state.resume_paused();
+                                } else {
+                                    let keep = state.max_rounds.unwrap_or(0);
+                                    state.resume(keep);
+                                }
                                 let _ = runtime_event_tx
                                     .send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
@@ -3545,6 +3550,23 @@ fn spawn_runtime_owner_with_optional_agent(
                             );
                             let _ = done.send(Ok(()));
                         } else if active_turn.is_none() {
+                            if let Some(mut state) = goal.take() {
+                                state.cancel.cancel();
+                                state.finish(GoalTerminal::Cancelled, "cancelled by user");
+                                let _ = runtime_event_tx
+                                    .send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                            }
+                            if let Some(mut state) = loop_state.take() {
+                                state.cancel.cancel();
+                                state.active = false;
+                                state.last_reason = Some("cancelled by user".into());
+                                let _ = runtime_event_tx
+                                    .send(CodingRuntimeEvent::LoopChanged(state.progress()));
+                            }
+                            if let Some(runtime) = resources.as_ref() {
+                                runtime.loop_active.store(false, Ordering::Release);
+                            }
+                            pending_wakeup = None;
                             cancel_pending = false;
                             let _ = done.send(Ok(()));
                         } else {
@@ -8653,6 +8675,43 @@ mod tests {
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { text, .. }) if text == "continue"
+        ));
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_clears_a_paused_goal_without_an_active_turn() {
+        let (
+            handle,
+            _kernel_commands,
+            _kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
+
+        handle.start_goal("finish the task").await.unwrap();
+        let _ = runtime_events.recv().await;
+        handle.pause_goal().await.unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                phase: GoalPhase::Paused,
+                ..
+            }))
+        ));
+
+        handle.cancel().await.unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                active: false,
+                phase: GoalPhase::Ended,
+                terminal: Some(GoalTerminal::Cancelled),
+                ..
+            }))
         ));
 
         handle.shutdown().await.unwrap();

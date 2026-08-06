@@ -234,7 +234,7 @@ fn format_goal_row(
 }
 
 /// Phase-aware version of `goal_row_parts`: returns `(marker, body, meta)` for
-/// the three badge states (Pursuing / PausedAtCap / Satisfied). The caller
+/// the four badge states. The caller
 /// styles each segment independently; joining them reproduces the full row text.
 ///
 /// - **Pursuing**: delegates to `goal_row_parts` (condition + round + elapsed).
@@ -254,24 +254,21 @@ fn goal_row_parts_phase(
         }
         atomcode_coding::GoalPhase::Paused => {
             let marker = if unicode { "⏸ " } else { "* " };
-            (
+            fit_fixed_goal_row(
                 marker,
-                "goal 已暂停".to_string(),
-                " · 继续对话即恢复 · /goal stop 结束".to_string(),
+                "goal 已暂停",
+                " · 继续对话即恢复 · /goal stop 结束",
+                max_cols,
             )
         }
         atomcode_coding::GoalPhase::PausedAtCap => {
             let marker = if unicode { "⏸ " } else { "* " };
-            // Fixed text — no truncation needed for typical terminal widths.
-            let body = "goal 暂停".to_string();
             let meta = format!(" · 已达 {round} 轮 · 继续对话即推进");
-            (marker, body, meta)
+            fit_fixed_goal_row(marker, "goal 暂停", &meta, max_cols)
         }
         atomcode_coding::GoalPhase::Satisfied => {
             let marker = if unicode { "✓ " } else { "* " };
-            let body = "goal 已达成".to_string();
-            let meta = " · /goal clear 结束".to_string();
-            (marker, body, meta)
+            fit_fixed_goal_row(marker, "goal 已达成", " · /goal clear 结束", max_cols)
         }
         atomcode_coding::GoalPhase::Ended => {
             // Ended rows are never constructed (goal_condition is cleared first),
@@ -279,6 +276,28 @@ fn goal_row_parts_phase(
             goal_row_parts(condition, round, elapsed_secs, max_cols, unicode)
         }
     }
+}
+
+fn fit_fixed_goal_row(
+    marker: &'static str,
+    body: &str,
+    meta: &str,
+    max_cols: usize,
+) -> (&'static str, String, String) {
+    let budget = max_cols.saturating_sub(crate::width::display_width(marker));
+    let body_width = crate::width::display_width(body);
+    if body_width >= budget {
+        return (
+            marker,
+            crate::width::truncate_with_ellipsis(body, budget),
+            String::new(),
+        );
+    }
+    (
+        marker,
+        body.to_string(),
+        crate::width::truncate_with_ellipsis(meta, budget - body_width),
+    )
 }
 
 /// Phase-aware full goal-row text. Thin wrapper over [`goal_row_parts_phase`]
@@ -9135,6 +9154,21 @@ mod tests {
         assert!(row.contains("已暂停"), "pause state present: {row}");
         assert!(row.contains("继续对话即恢复"), "resume hint present: {row}");
         assert!(row.contains("/goal stop"), "stop action present: {row}");
+    }
+
+    #[test]
+    fn fixed_goal_phase_rows_fit_narrow_terminals() {
+        for phase in [
+            atomcode_coding::GoalPhase::Paused,
+            atomcode_coding::GoalPhase::PausedAtCap,
+            atomcode_coding::GoalPhase::Satisfied,
+        ] {
+            let row = format_goal_row_phase("unused", 25, 12, 18, true, phase);
+            assert!(
+                crate::width::display_width(&row) <= 18,
+                "{phase:?} row overflowed: {row}"
+            );
+        }
     }
 
     #[test]
