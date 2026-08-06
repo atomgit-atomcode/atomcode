@@ -45,6 +45,7 @@ pub mod bash_workspace_gate;
 pub mod cd;
 pub mod credential_bash_gate;
 pub mod edit;
+pub mod encoding;
 pub mod glob;
 pub mod grep;
 pub mod list;

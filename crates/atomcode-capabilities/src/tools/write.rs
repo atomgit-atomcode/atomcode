@@ -76,6 +76,12 @@ impl Tool for WriteFileTool {
         // Model-facing paths use forward slashes on Windows so the model can paste
         // them into a subsequent bash (Git Bash) command without `\` being eaten.
         let disp = crate::pathnorm::to_display(&path);
+        // write_file always writes UTF-8, intentionally: it does a WHOLE-file overwrite
+        // (usually a create), so there is no original encoding to preserve. Unlike
+        // `edit_file` — which decodes a GBK/GB18030 file, edits in place, and re-encodes
+        // back to the original encoding (see tools::encoding) — overwriting an existing
+        // GBK file here converts it to UTF-8. That asymmetry is deliberate; steer legacy-
+        // encoding-preserving changes through `edit_file`.
         if let Err(e) = tokio::fs::write(&path, &a.content).await {
             return err(format!("write_file: failed to write {disp}: {e}"));
         }

@@ -248,7 +248,7 @@ impl Tool for ReadFileTool {
         // treat it as binary and hand back a recovery hint.
         let text: std::borrow::Cow<str> = match std::str::from_utf8(&bytes) {
             Ok(s) => std::borrow::Cow::Borrowed(s),
-            Err(_) => match decode_non_utf8_text(&path, &bytes) {
+            Err(_) => match crate::tools::encoding::decode_non_utf8_text(&path, &bytes) {
                 Some(s) => std::borrow::Cow::Owned(s),
                 None => {
                     return ok(format!(
@@ -303,39 +303,6 @@ impl Tool for ReadFileTool {
     }
 }
 
-/// Text-ish extensions worth trying a GBK/GB18030 decode for when UTF-8 fails.
-/// A binary file with one of these would already have tripped `looks_binary`,
-/// so this gate just avoids feeding genuine binary blobs to the decoder.
-const GBK_CANDIDATE_EXTENSIONS: &[&str] = &[
-    "txt", "md", "markdown", "csv", "tsv", "log", "sql", "ini", "conf", "cfg", "toml", "yaml",
-    "yml", "html", "htm", "xml", "json", "js", "ts", "css", "py", "rb", "go", "rs", "c", "h",
-    "cpp", "hpp", "java", "kt", "sh", "bat", "ps1",
-];
-
-fn has_text_extension(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| {
-            let e = e.to_ascii_lowercase();
-            GBK_CANDIDATE_EXTENSIONS.iter().any(|t| *t == e)
-        })
-        .unwrap_or(false)
-}
-
-/// Attempt to decode a file that failed UTF-8 validation. Tries GB18030 (superset of
-/// GBK/GB2312) only, and only for text-ish extensions — that's ~100% of the real-world
-/// miss we've seen on Chinese Windows `.txt`. Returns `None` for everything else so the
-/// caller emits the recovery hint instead of mojibake.
-fn decode_non_utf8_text(path: &std::path::Path, bytes: &[u8]) -> Option<String> {
-    if !has_text_extension(path) {
-        return None;
-    }
-    let (decoded, _, had_errors) = encoding_rs::GB18030.decode(bytes);
-    if had_errors {
-        return None;
-    }
-    Some(decoded.into_owned())
-}
 
 /// Build a recovery hint for a file that couldn't be decoded as text. Lets the model
 /// pivot to an external converter (pandoc / pdftotext / unzip for .docx) on the first
