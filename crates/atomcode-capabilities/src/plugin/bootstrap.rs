@@ -69,17 +69,17 @@ fn log_to_file(msg: &str) {
 /// To add another default marketplace in a future release, append its
 /// URL to the list and bump BOOTSTRAP_MARKER_FILENAME so existing users
 /// re-bootstrap.
-pub const DEFAULT_SKILLS_URLS: &[&str] = &[
-    "https://atomgit.com/atomgit_atomcode/atomcode-plugins-official.git",
-    "https://atomgit.com/atomgit_atomcode/atomcode-skills.git",
-];
+pub fn default_skills_urls() -> &'static [String] {
+    atomcode_config::endpoints::plugin_marketplaces()
+}
 
-/// Subset of [`DEFAULT_SKILLS_URLS`]: only plugins from marketplaces
+/// Subset of [`default_skills_urls`]: only plugins from marketplaces
 /// listed here are auto-installed (both on fresh bootstrap and after
 /// post-upgrade `git pull`). `atomcode-plugins-official` is purposely
 /// excluded — it is registered for discoverability, not force-installed.
-const DEFAULT_AUTO_INSTALL_URLS: &[&str] =
-    &["https://atomgit.com/atomgit_atomcode/atomcode-skills.git"];
+fn default_auto_install_urls() -> &'static [String] {
+    atomcode_config::endpoints::plugin_auto_install()
+}
 
 /// Versioned bootstrap marker. Bumped v1 → v2 when the default
 /// marketplace was repointed from the legacy `atomcode-skills` bag to the
@@ -151,14 +151,14 @@ fn touch_marker() {
 }
 
 fn should_auto_install(source_url: &str) -> bool {
-    DEFAULT_AUTO_INSTALL_URLS
+    default_auto_install_urls()
         .iter()
         .any(|u| u.eq_ignore_ascii_case(source_url))
 }
 
 /// Plan A: clone the default plugin marketplaces into
 /// `$ATOMCODE_HOME/plugins/marketplaces/<name>/` and install every
-/// plugin listed in their manifests. Iterates [`DEFAULT_SKILLS_URLS`].
+/// plugin listed in their manifests. Iterates [`default_skills_urls`].
 /// After this attempt — successful or not — the marker is written so
 /// the next startup doesn't try again.
 ///
@@ -184,7 +184,7 @@ fn maybe_install_default_skills() -> Vec<PluginJobEvent> {
 
     let mut events = Vec::new();
 
-    for url in DEFAULT_SKILLS_URLS {
+    for url in default_skills_urls() {
         // Marketplace already installed? Use the existing entry.
         let already = installed
             .iter()
