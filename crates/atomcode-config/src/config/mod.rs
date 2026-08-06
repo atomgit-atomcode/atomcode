@@ -1087,6 +1087,12 @@ fn project_legacy_model(account_id: &str, p: &ProviderConfig) -> ModelProfileCon
 }
 
 /// Controls the per-turn markdown datalog writer.
+///
+/// Privacy: datalog files contain the full request body (system prompt, messages,
+/// tools). On Unix they are created private (0o700/0o600); Windows has no equivalent
+/// create-mode bit, so files inherit the parent directory's ACLs — safe under the
+/// default per-user `dir`, but not if `dir` points at a world-readable location on a
+/// shared machine. Keep `dir` inside your user profile when enabling this.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatalogConfig {
     /// When false, `DatalogWriter` becomes a no-op and no files are created.

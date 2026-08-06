@@ -2,6 +2,15 @@
 //!
 //! The writer is observation-only: it records the final neutral request seen by
 //! [`LifecycleHooks::on_request`] and never mutates or owns runtime state.
+//!
+//! Privacy note: records include the full request body (system prompt, messages,
+//! tools). On Unix the output directory and files are created private (0o700/0o600).
+//! On Windows there is no equivalent mode bit, so files are created with the
+//! directory's inherited ACLs — which already deny other standard users when the
+//! datalog lives under the user profile (`$ATOMCODE_HOME`, the default). If a
+//! Windows user points `datalog.dir` at a world-readable location on a shared
+//! machine, the request bodies are readable by other local users. The feature is
+//! opt-in and disabled by default; keep `datalog.dir` inside your user profile.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -508,6 +517,9 @@ fn set_private_create_mode(options: &mut OpenOptions) {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
+    // Non-Unix (Windows) has no create-mode bit here: the file inherits the parent
+    // directory's ACLs. See the module-header privacy note — this is safe under the
+    // default per-user `$ATOMCODE_HOME`, not for a world-readable `datalog.dir`.
     #[cfg(not(unix))]
     let _ = options;
 }
