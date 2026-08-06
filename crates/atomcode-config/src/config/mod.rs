@@ -474,21 +474,15 @@ impl Config {
         matches!(self.image_attach_support(), ImageAttachSupport::Supported)
     }
 
-    /// Resolved reason behind [`Self::can_handle_attached_images`] so the paste
-    /// gate can distinguish "nothing configured" from "preprocessor configured
-    /// but unresolvable" (a typo) and message accordingly.
-    pub fn image_attach_support(&self) -> ImageAttachSupport {
-        // Route through the single resolution boundary (§14.1) so both schemas
-        // work and the active model matches what the runtime builds.
-        let active_accepts = self
-            .resolve_model(None)
-            .map(|r| crate::util::model_name_suggests_vision(&r.model))
-            .unwrap_or(false);
-        if active_accepts {
+    /// Like [`Self::image_attach_support`], but uses the model that the live
+    /// runtime actually selected instead of resolving the persisted default.
+    /// Drivers with a runtime-local `/model` / `--provider` override must use
+    /// this form or they can accept images for a text-only model (or reject
+    /// them for a vision model) based on stale configuration.
+    pub fn image_attach_support_for_model(&self, active_model: &str) -> ImageAttachSupport {
+        if crate::util::model_name_suggests_vision(active_model) {
             return ImageAttachSupport::Supported;
         }
-        // `vision_preprocessor_provider` is a model-selection id (legacy provider
-        // names still resolve via projection, §14.3): valid iff it resolves.
         match self.vision_preprocessor_provider.as_deref() {
             Some(k) if !k.is_empty() => {
                 if self.resolve_model(Some(k)).is_ok() {
@@ -499,6 +493,19 @@ impl Config {
             }
             _ => ImageAttachSupport::Unconfigured,
         }
+    }
+
+    /// Resolved reason behind [`Self::can_handle_attached_images`] so the paste
+    /// gate can distinguish "nothing configured" from "preprocessor configured
+    /// but unresolvable" (a typo) and message accordingly.
+    pub fn image_attach_support(&self) -> ImageAttachSupport {
+        // Route through the single resolution boundary (§14.1) so both schemas
+        // work and the active model matches what the runtime builds.
+        let active_model = self
+            .resolve_model(None)
+            .map(|r| r.model)
+            .unwrap_or_default();
+        self.image_attach_support_for_model(&active_model)
     }
 }
 
@@ -2691,6 +2698,25 @@ model = "missing-type"
             },
         );
         assert!(cfg.can_handle_attached_images());
+    }
+
+    #[test]
+    fn explicit_runtime_model_overrides_persisted_default_for_image_support() {
+        use super::ImageAttachSupport as S;
+
+        let vision_default = cfg_with("claude-sonnet-4-5", None);
+        assert_eq!(
+            vision_default.image_attach_support_for_model("deepseek-v4-flash"),
+            S::Unconfigured,
+            "a text-only runtime must not inherit vision support from the default"
+        );
+
+        let text_default = cfg_with("deepseek-v4-flash", None);
+        assert_eq!(
+            text_default.image_attach_support_for_model("qwen3-vl-plus"),
+            S::Supported,
+            "a vision runtime must not be rejected because the default is text-only"
+        );
     }
 }
 

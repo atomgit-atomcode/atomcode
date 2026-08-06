@@ -104,6 +104,16 @@ impl Palette {
     pub const DIFF_REMOVE_DARK: Color = Color::Red; // SGR 91
     pub const CODE: Color = Color::Cyan; // bright cyan (96)
 
+    /// Foreground paired with [`Role::PanelBg`] on a light palette.
+    /// User-message panels paint an explicit background, so inheriting the
+    /// terminal's default foreground is unsafe when automatic theme detection
+    /// is unavailable (notably Windows): a light terminal may otherwise put
+    /// its dark default text on our dark fallback panel.
+    pub const PANEL_FG_LIGHT: Color = Color::Black;
+    /// Foreground paired with [`Role::PanelBg`] on a dark palette. SGR 37 is
+    /// interpreted by the terminal palette as its readable light foreground.
+    pub const PANEL_FG_DARK: Color = Color::Grey;
+
     /// Colour for the **Plan mode badge** (⏸ plan). Orange (`AnsiValue(208)` ≈
     /// `#ff8700`) — deliberately distinct from the periwinkle MODE color used by
     /// AcceptEdits, so the two non-default approval modes are visually separable.
@@ -213,6 +223,13 @@ pub fn role(caps: TerminalCaps, role: Role) -> Option<Color> {
         Role::DiffAdd => Some(diff_add_for_current_theme()),
         Role::DiffRemove => Some(diff_remove_for_current_theme()),
         Role::ToolName => None,
+        Role::PanelFg => {
+            if md_theme::is_light_for_render() {
+                Some(Palette::PANEL_FG_LIGHT)
+            } else {
+                Some(Palette::PANEL_FG_DARK)
+            }
+        }
         Role::PanelBg => {
             if md_theme::is_light_for_render() {
                 Some(Color::AnsiValue(254)) // Light gray for light theme
@@ -240,6 +257,7 @@ pub enum Role {
     DiffAdd,
     DiffRemove,
     ToolName,
+    PanelFg,
     PanelBg,
 }
 
@@ -364,6 +382,27 @@ mod tests {
         // foreground — they should return None even when colours are on.
         assert!(role(caps(true), Role::Secondary).is_none());
         assert!(role(caps(true), Role::ToolName).is_none());
+    }
+
+    #[test]
+    fn panel_foreground_and_background_are_paired_for_both_themes() {
+        let _theme = md_theme::test_lock();
+
+        md_theme::set_theme_mode(false);
+        assert_eq!(
+            role(caps(true), Role::PanelFg),
+            Some(Palette::PANEL_FG_DARK)
+        );
+        assert_eq!(role(caps(true), Role::PanelBg), Some(Color::AnsiValue(236)));
+
+        md_theme::set_theme_mode(true);
+        assert_eq!(
+            role(caps(true), Role::PanelFg),
+            Some(Palette::PANEL_FG_LIGHT)
+        );
+        assert_eq!(role(caps(true), Role::PanelBg), Some(Color::AnsiValue(254)));
+
+        md_theme::set_theme_mode(false);
     }
 
     #[test]
