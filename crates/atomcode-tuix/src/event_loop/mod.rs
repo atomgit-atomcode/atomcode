@@ -61,6 +61,15 @@ fn runtime_mode(mode: crate::state::AgentMode) -> atomcode_coding::RuntimeMode {
     }
 }
 
+fn startup_bypass_mode(
+    dangerously_skip_permissions: bool,
+) -> Option<(crate::state::AgentMode, atomcode_coding::RuntimeMode)> {
+    dangerously_skip_permissions.then_some((
+        crate::state::AgentMode::Auto,
+        atomcode_coding::RuntimeMode::Auto,
+    ))
+}
+
 fn runtime_user_input(text: String, images: Vec<ImageContent>) -> atomcode_coding::UserInput {
     atomcode_coding::UserInput { text, images }
 }
@@ -7965,8 +7974,18 @@ pub(crate) fn handle_loop_decision(
 
 pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<ExitReason> {
     let mut app = App::new(&ctx.caps);
-    if ctx.dangerously_skip_permissions {
-        app.state.agent_mode = crate::state::AgentMode::Auto;
+    if let Some((agent_mode, runtime_mode)) = startup_bypass_mode(ctx.dangerously_skip_permissions)
+    {
+        // `-y` is a process-start execution mode, not merely a TUI badge. Keep
+        // all three projections aligned before the first turn: local UI state,
+        // the runtime-owned permission policy, and the daemon live mirror used
+        // by shared TUI/WebUI sessions. `/auto` already follows this same path
+        // through `set_agent_mode`; startup must not leave the daemon in Build.
+        app.state.agent_mode = agent_mode;
+        ctx.runtime
+            .dispatch(atomcode_coding::DriverCommand::SetMode(runtime_mode))
+            .ok();
+        atomcode_daemon::live_set_mode(agent_mode);
     }
 
     crate::tuix_trace!(
@@ -14909,7 +14928,9 @@ fn bypass_approval_choice() -> ApprovalChoice {
 
 #[cfg(test)]
 mod bypass_approval_tests {
-    use super::{approval_choice_to_decision, bypass_approval_choice, ApprovalChoice};
+    use super::{
+        approval_choice_to_decision, bypass_approval_choice, startup_bypass_mode, ApprovalChoice,
+    };
     use atomcode_capabilities::tools::approval::PermissionDecision;
 
     // The auto-approve invariant now lives on `approval_should_auto_bypass(mode)`
@@ -14927,6 +14948,14 @@ mod bypass_approval_tests {
             matches!(decision, PermissionDecision::AllowOnce),
             "BYPASS must auto-approve with AllowOnce, got {decision:?}"
         );
+    }
+
+    #[test]
+    fn startup_y_selects_auto_for_ui_and_runtime() {
+        let (ui_mode, runtime_mode) = startup_bypass_mode(true).expect("-y enables bypass");
+        assert_eq!(ui_mode, crate::state::AgentMode::Auto);
+        assert_eq!(runtime_mode, atomcode_coding::RuntimeMode::Auto);
+        assert!(startup_bypass_mode(false).is_none());
     }
 
     // The full command↔decision contract used by sync-mode `deliver_approval`.
