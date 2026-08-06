@@ -113,9 +113,13 @@ pub struct UserInputPanel {
     /// Free-text buffer for the always-appended "Other" row in single/multiple
     /// mode. Distinct from `text` (which is the standalone text-mode input).
     pub custom_text: String,
-    /// Whether the "Other" free-text row is offered (mirrors `UserInputRequest.custom`).
-    /// When false, the Other row does not exist — indices below account for its absence.
+    /// Whether the "Other" free-text row is offered. Human-authored choice
+    /// questions always set this; internal fixed checkpoints may disable it.
     pub custom: bool,
+    /// User-controlled vertical offset from the renderer's automatic viewport.
+    /// PageUp/PageDown adjust it so wrapped prose longer than the viewport can
+    /// still be read. Moving to another choice resets it to zero.
+    pub scroll_offset: isize,
 }
 
 impl UserInputPanel {
@@ -128,9 +132,16 @@ impl UserInputPanel {
             .iter()
             .map(|o| (o.label.clone(), o.description.clone()))
             .collect();
-        // One checkbox slot per concrete option PLUS the trailing "Other" row —
-        // but only when custom answers are offered.
-        let checked = vec![false; options.len() + r.custom as usize];
+        // Human-facing choice questions always retain a free-form answer row.
+        // `custom:false` is accepted on old wire payloads, but no longer grants
+        // the model authority to remove that escape hatch. Internal fixed
+        // checkpoints build their renderer view directly and remain unaffected.
+        let custom = matches!(
+            r.mode,
+            atomcode_capabilities::tools::request_user_input::UserInputMode::Single
+                | atomcode_capabilities::tools::request_user_input::UserInputMode::Multiple
+        );
+        let checked = vec![false; options.len() + custom as usize];
         Self {
             request_id,
             header: r.header.clone(),
@@ -141,7 +152,8 @@ impl UserInputPanel {
             checked,
             text: String::new(),
             custom_text: String::new(),
-            custom: r.custom,
+            custom,
+            scroll_offset: 0,
         }
     }
     /// Index of the always-appended "Other" free-text row (`options.len()`).
@@ -189,12 +201,20 @@ impl UserInputPanel {
     pub fn move_up(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
+            self.scroll_offset = 0;
         }
     }
     pub fn move_down(&mut self) {
         if self.cursor < self.last_row() {
             self.cursor += 1;
+            self.scroll_offset = 0;
         }
+    }
+    pub fn page_up(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(5);
+    }
+    pub fn page_down(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_add(5);
     }
     /// Select/toggle the option under the cursor. Single mode is exclusive:
     /// the cursor IS the radio selection, so this only clears the custom text
@@ -488,7 +508,7 @@ mod user_input_custom_tests {
     }
 
     #[test]
-    fn single_last_row_gates_on_custom() {
+    fn single_legacy_custom_false_still_keeps_other_row() {
         let with = UserInputPanel::new(1, &req(UserInputMode::Single, true));
         assert_eq!(
             with.last_row(),
@@ -496,11 +516,20 @@ mod user_input_custom_tests {
             "single, custom → Other row is last (idx 2)"
         );
         let without = UserInputPanel::new(1, &req(UserInputMode::Single, false));
-        assert_eq!(
-            without.last_row(),
-            1,
-            "single, no custom → last option (idx 1)"
-        );
+        assert_eq!(without.last_row(), 2);
+        assert!(without.custom);
+    }
+
+    #[test]
+    fn page_scroll_is_signed_and_choice_navigation_resets_it() {
+        let mut panel = UserInputPanel::new(1, &req(UserInputMode::Single, true));
+        panel.page_down();
+        panel.page_down();
+        assert_eq!(panel.scroll_offset, 10);
+        panel.page_up();
+        assert_eq!(panel.scroll_offset, 5);
+        panel.move_down();
+        assert_eq!(panel.scroll_offset, 0);
     }
 
     #[test]
@@ -564,7 +593,7 @@ mod user_input_custom_tests {
     }
 
     #[test]
-    fn multiple_submit_index_and_checked_gate_on_custom() {
+    fn multiple_legacy_custom_false_still_keeps_other_row() {
         let with = UserInputPanel::new(1, &req(UserInputMode::Multiple, true));
         assert_eq!(with.submit_index(), Some(3), "custom → other@2, submit@3");
         assert_eq!(
@@ -573,16 +602,9 @@ mod user_input_custom_tests {
             "custom → Other checkbox slot present"
         );
         let without = UserInputPanel::new(1, &req(UserInputMode::Multiple, false));
-        assert_eq!(
-            without.submit_index(),
-            Some(2),
-            "no custom → submit right after options@2"
-        );
-        assert_eq!(
-            without.checked.len(),
-            2,
-            "no custom → no Other checkbox slot"
-        );
+        assert_eq!(without.submit_index(), Some(3));
+        assert_eq!(without.checked.len(), 3);
+        assert!(without.custom);
     }
 }
 

@@ -714,6 +714,9 @@ pub struct UserInputPanelView {
     pub custom_text: String,
     /// Whether to render the "Other" free-text row (mirrors `UserInputPanel.custom`).
     pub custom: bool,
+    /// Signed PageUp/PageDown displacement from the automatically selected
+    /// viewport. Kept in TUI state; it is not part of the tool wire protocol.
+    pub scroll_offset: isize,
     /// Batch navigator context. `None` = a standalone single question (rendered
     /// byte-identically to before, no chrome). `Some` = this is one question inside
     /// a multi-question batch, so the renderer adds a `Question i/N` navigator and a
@@ -766,6 +769,7 @@ pub fn round_cap_view(cap: u32, base: u32, cursor: usize, stats: &str) -> UserIn
         text: String::new(),
         custom_text: String::new(),
         custom: false,
+        scroll_offset: 0,
         batch: None,
     }
 }
