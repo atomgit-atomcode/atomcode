@@ -184,10 +184,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
   ── 输入 ──
     Enter                            发送消息
     \ 后接 Enter                     插入换行（所有终端通用）
-    Alt+Enter                        插入换行 *
-    Shift+Enter                      插入换行 **
+    Shift / Alt / Ctrl+Enter         插入换行 *
+    Ctrl+J                           插入换行 *
     /                                打开斜杠命令菜单
-    Tab                              自动补全
+    Tab                              接受斜杠菜单、文件路径等补全
     Backspace / Ctrl+H               删除上一个字符
     Delete / Ctrl+?                  删除下一个字符
     Ctrl+W                           删除前一个单词
@@ -198,36 +198,48 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     Left / Right                     光标左右移动
 
   ── 历史 ──
-    Up                               上一条输入
-    Down                             下一条输入
+    Up / Down                        上一条 / 下一条输入
+    Ctrl+R                           反向搜索；再次按下继续向前查找
+    Right                            接受下一步建议（不会自动发送）
+
+  ── 模式与模型 ──
+    Tab / Shift+Tab                  无补全菜单时切换下一个 / 上一个执行模式
+    F2 / Shift+F2                    下一个 / 上一个模型（Mac：Fn+F2 / Fn+Shift+F2）
+    Ctrl+T                           切换 reasoning_effort
 
   ── 翻看输出 ──
-    用终端原生 scrollback（cmd+↑/↓、鼠标滚轮、tmux copy-mode 等都生效）
-    鼠标拖选 + Ctrl+C                复制（atomcode 不接管鼠标）
+    Shift+Up / Shift+Down            向上 / 向下滚动一行
+    PageUp / PageDown                向上 / 向下滚动 10 行
+    Alt+Up / Alt+Down                跳到上一条 / 下一条消息
+    Ctrl+Up / Ctrl+Down              跳到上一条 / 下一条用户消息
+    Home / End                       空输入时跳到对话顶部 / 底部
+    鼠标滚轮                         滚动聊天区
+    鼠标拖选                         选择文本
+    Shift+鼠标拖选                   使用终端原生文本选择
+    Ctrl+Shift+C                     复制 AtomCode 选区
 
-  ── 会话 ──
-    F2 / Shift+F2                    下一个 / 上一个模型
-    Ctrl+C                           取消当前轮 / 关闭弹层
-    Esc Esc                          撤销上一轮
-    Ctrl+D                           退出 atomcode
-    Ctrl+L                           清屏
+  ── 流程控制 ──
+    Esc                              清空输入 / 关闭弹层 / 取消当前操作
+    Esc Esc                          空闲且输入为空时撤销上一轮
+    Ctrl+C                           取消当前操作；空闲时再次按下退出
     Ctrl+O                           切换工具实时输出
-    Ctrl+V                           粘贴（文本 + 图片）
+    Ctrl+V / Ctrl+Alt+V              粘贴文本或图片 **
 
   ── 斜杠菜单 / 弹层导航 ──
     Up / Down                        移动选择
     Enter                            确认
     Esc                              取消 / 关闭弹层
-    Tab                              插入当前高亮命令
+    Tab                              在斜杠菜单中插入当前高亮命令
+    1..9                             审批 / 交互提问中选择对应选项
+    y / a / n                        审批时允许一次 / 始终允许 / 拒绝
 
-  * Alt+Enter 在多数终端可用；macOS Apple Terminal 需在
-    Settings → Profiles → Keyboard 启用 "Use Option as Meta key"
-    才会发送换行。
-  ** Shift+Enter 需要终端区分该按键，目前已知支持的有：
+  * 组合键需要终端能区分修饰键。目前已知支持的有：
      Kitty / WezTerm / iTerm2（启用 Report Modifiers）/
      Windows Terminal / Ghostty / Warp。其他终端（包括 macOS
      Apple Terminal、默认 xterm、GNOME Terminal、VS Code 集成
      终端）不区分 Shift+Enter 与 Enter，请用 \ + Enter。
+  ** Ctrl+Alt+V 是终端拦截 Ctrl+V 时的备用键；Ctrl+Shift+V
+     保留给终端原生纯文本粘贴。
 
   提示：输入 /help 查看完整斜杠命令列表。
 "#.into(),
@@ -432,6 +444,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("> {buffer}_  [Enter: 确认, Esc: 取消]").into(),
 
         // ── 目录选择器 ──
+        Msg::DirPickerTitle { n, total } =>
+            format!("切换工作目录（{n}/{total}）").into(),
+        Msg::DirPickerHint =>
+            "↑↓ 移动 · Tab 补全 · Enter 进入 · 输入内容搜索/路径 · Esc 取消".into(),
+        Msg::DirPickerEmptyPath { query } =>
+            format!("没有匹配的历史目录「{query}」· Enter 按路径进入").into(),
         Msg::DirCurrent => "当前".into(),
         Msg::DirNotExists { path } =>
             format!("目录已不存在：{path}").into(),

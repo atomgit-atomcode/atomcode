@@ -76,8 +76,8 @@ impl Tool for EditFileTool {
             );
         }
         let path = resolve_path(&a.file_path, &ctx.working_dir);
-        let content = match tokio::fs::read_to_string(&path).await {
-            Ok(c) => c,
+        let raw = match tokio::fs::read(&path).await {
+            Ok(b) => b,
             Err(e) => {
                 return err(format!(
                     "edit_file: cannot read {}: {e}",
@@ -85,6 +85,21 @@ impl Tool for EditFileTool {
                 ))
             }
         };
+        // Decode to UTF-8 for matching, remembering the on-disk encoding so the edit is
+        // written back in the SAME encoding. A GBK/GB18030 file (Chinese Windows) is
+        // edited in place; an ambiguous non-UTF-8 file is refused, not corrupted.
+        let decoded = match crate::tools::encoding::decode_for_edit(&path, &raw) {
+            Some(d) => d,
+            None => {
+                return err(format!(
+                    "edit_file: cannot read {} as UTF-8 or a supported legacy text encoding \
+                     (GBK/GB18030). Convert it to UTF-8 first. The file was NOT modified.",
+                    crate::pathnorm::to_display(&path)
+                ))
+            }
+        };
+        let content = decoded.text;
+        let file_encoding = decoded.encoding;
 
         // Line-ending tolerance: read_file shows the model LF-normalized text (it does
         // `str::lines()`, which strips the `\r` from every `\r\n`), but the file on disk
@@ -126,11 +141,8 @@ impl Tool for EditFileTool {
                             .to_string(),
                     );
                 }
-                if let Err(e) = tokio::fs::write(&path, &fuzzy_result).await {
-                    return err(format!(
-                        "edit_file: failed to write {}: {e}",
-                        crate::pathnorm::to_display(&path)
-                    ));
+                if let Err(msg) = write_encoded(&path, &fuzzy_result, file_encoding).await {
+                    return err(msg);
                 }
                 let diff = build_compact_diff(&content, &fuzzy_result);
                 return ok(format!(
@@ -147,11 +159,8 @@ impl Tool for EditFileTool {
                 try_block_anchor_replace(&content, &a.old_string, &a.new_string)
             {
                 if anchor_result != content {
-                    if let Err(e) = tokio::fs::write(&path, &anchor_result).await {
-                        return err(format!(
-                            "edit_file: failed to write {}: {e}",
-                            crate::pathnorm::to_display(&path)
-                        ));
+                    if let Err(msg) = write_encoded(&path, &anchor_result, file_encoding).await {
+                        return err(msg);
                     }
                     let diff = build_compact_diff(&content, &anchor_result);
                     return ok(format!(
@@ -190,11 +199,8 @@ impl Tool for EditFileTool {
         } else {
             content.replacen(&old_match, &new_match, 1)
         };
-        if let Err(e) = tokio::fs::write(&path, &updated).await {
-            return err(format!(
-                "edit_file: failed to write {}: {e}",
-                crate::pathnorm::to_display(&path)
-            ));
+        if let Err(msg) = write_encoded(&path, &updated, file_encoding).await {
+            return err(msg);
         }
         let replaced = if a.replace_all { count } else { 1 };
         let diff = build_compact_diff(&content, &updated);
@@ -205,6 +211,29 @@ impl Tool for EditFileTool {
             diff,
         ))
     }
+}
+
+/// Write edited text back to `path` in its original on-disk `encoding`. Refuses (Err
+/// with a user-facing message) rather than write replacement bytes if the text cannot
+/// be represented — so a failed re-encode leaves the file untouched, never corrupted.
+async fn write_encoded(
+    path: &std::path::Path,
+    text: &str,
+    encoding: crate::tools::encoding::FileEncoding,
+) -> Result<(), String> {
+    let bytes = crate::tools::encoding::encode(text, encoding).ok_or_else(|| {
+        format!(
+            "edit_file: cannot re-encode the edit to {}'s original encoding; the file was \
+             NOT modified. Convert it to UTF-8 first.",
+            crate::pathnorm::to_display(path)
+        )
+    })?;
+    tokio::fs::write(path, bytes).await.map_err(|e| {
+        format!(
+            "edit_file: failed to write {}: {e}",
+            crate::pathnorm::to_display(path)
+        )
+    })
 }
 
 /// A compact GIT UNIFIED DIFF (`@@` hunks, 3 lines of context) between the OLD
@@ -457,6 +486,60 @@ mod tests {
             progress: atomcode_kernel::tool::ProgressSink::noop(),
             requester: None,
         }
+    }
+
+    #[tokio::test]
+    async fn gbk_file_edits_in_place_and_stays_gbk() {
+        // A GBK/GB18030-encoded file (common on Chinese Windows) must be editable
+        // directly — matched in UTF-8 space, then written back in its ORIGINAL encoding,
+        // never silently converted to UTF-8.
+        let d = tempfile::tempdir().unwrap();
+        let (gbk, _, had_err) = encoding_rs::GB18030.encode("第一行\n第二行\n第三行\n");
+        assert!(!had_err);
+        std::fs::write(d.path().join("notes.txt"), &gbk[..]).unwrap();
+
+        let r = EditFileTool
+            .execute(
+                r#"{"file_path":"notes.txt","old_string":"第二行","new_string":"改过的第二行"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+
+        let on_disk = std::fs::read(d.path().join("notes.txt")).unwrap();
+        // Still GBK: the Chinese bytes are not valid UTF-8, and decode as GB18030.
+        assert!(
+            std::str::from_utf8(&on_disk).is_err(),
+            "file must stay GBK, not be converted to UTF-8"
+        );
+        let (decoded, _, had_err) = encoding_rs::GB18030.decode(&on_disk);
+        assert!(!had_err);
+        assert_eq!(decoded, "第一行\n改过的第二行\n第三行\n");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_non_utf8_file_is_refused_and_left_untouched() {
+        // A non-UTF-8 file that does not losslessly round-trip as GB18030 (here a stray
+        // 0x80 byte) must be refused rather than corrupted — the file stays byte-identical.
+        let d = tempfile::tempdir().unwrap();
+        let mut bytes = b"plain text\n".to_vec();
+        bytes.push(0x80);
+        bytes.extend_from_slice(b"\n");
+        std::fs::write(d.path().join("weird.txt"), &bytes).unwrap();
+
+        let r = EditFileTool
+            .execute(
+                r#"{"file_path":"weird.txt","old_string":"plain","new_string":"changed"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(r.is_error, "{}", r.content);
+        assert!(r.content.contains("UTF-8"), "{}", r.content);
+        assert_eq!(
+            std::fs::read(d.path().join("weird.txt")).unwrap(),
+            bytes,
+            "refused edit must leave the file byte-identical"
+        );
     }
 
     #[tokio::test]

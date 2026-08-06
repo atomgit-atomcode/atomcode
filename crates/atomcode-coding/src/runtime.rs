@@ -17,6 +17,7 @@ use atomcode_capabilities::session::{
 };
 #[cfg(test)]
 use atomcode_capabilities::session::{PresentationFile, SessionMeta, StorageOwner};
+use atomcode_capabilities::tools::{ApprovalResponse, APPROVAL_KIND};
 use atomcode_kernel::agent::AgentHandle;
 use atomcode_kernel::checkpoint::CompactionCheckpointError;
 use atomcode_kernel::event::{AgentCommand, AgentEvent, RequestId, StopReason};
@@ -29,9 +30,9 @@ use atomcode_kernel::provider::LlmProvider;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::controllers::{
-    evaluate_goal, goal_continuation_message, summarize_for_goal, EvalOutcome, GoalProgress,
-    GoalResult, GoalState, GoalTerminal, LoopProgress, LoopState, ScheduleWakeupTool,
-    WakeupRequest, MAX_UNPRODUCTIVE,
+    classify_followup, evaluate_goal, goal_cap_stop_note, goal_continuation_message,
+    summarize_for_goal, EvalOutcome, FollowupClass, GoalPhase, GoalProgress, GoalResult, GoalState,
+    GoalTerminal, LoopProgress, LoopState, ScheduleWakeupTool, WakeupRequest, MAX_UNPRODUCTIVE,
 };
 use crate::parts::prepare_with_plugin_hook_source_reusing_lease;
 #[cfg(test)]
@@ -91,6 +92,15 @@ pub enum CodingRuntimeEvent {
     SessionNameSuggested {
         name: String,
     },
+    /// Ephemeral composer suggestion sampled after a naturally completed turn.
+    /// It is not part of the conversation or session persistence. Drivers must
+    /// discard it when the correlated generation/session/turn is no longer current.
+    NextPromptSuggested {
+        generation: RuntimeGeneration,
+        session_id: Option<String>,
+        turn_id: u64,
+        text: String,
+    },
     SessionChanged(SessionChanged),
     WorkingDirectoryChanged(std::path::PathBuf),
     GoalChanged(GoalProgress),
@@ -107,6 +117,10 @@ pub enum CodingRuntimeEvent {
     ProviderReloadFinished(Result<RuntimeGeneration, RuntimeError>),
     ProviderDeactivationFinished(Result<RuntimeGeneration, RuntimeError>),
     ControllerWarning(String),
+    /// Non-fatal failure of an auxiliary persistence surface such as the raw
+    /// per-turn transcript. Drivers must present this outside the conversation;
+    /// it is not model output and does not change the turn terminal.
+    PersistenceWarning(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -399,6 +413,7 @@ pub enum DriverCommand {
         value: serde_json::Value,
     },
     Cancel,
+    PauseGoal,
     Compact(Option<String>),
     SetMode(RuntimeMode),
     QueueLocalContext(LocalContextInput),
@@ -637,6 +652,14 @@ struct RuntimeResources {
     wakeup_tx: mpsc::UnboundedSender<WakeupRequest>,
     loop_active: Arc<std::sync::atomic::AtomicBool>,
     image_preprocessor: Option<Arc<dyn ImagePreprocessor>>,
+}
+
+struct NextPromptSuggestionOutcome {
+    generation: u64,
+    revision: u64,
+    session_id: Option<String>,
+    turn_id: u64,
+    text: String,
 }
 
 /// A native coding runtime. Dropping `events` causes a fail-closed shutdown.
@@ -1024,6 +1047,10 @@ impl CodingRuntimeHandle {
                 let (done, _result) = oneshot::channel();
                 CodingRuntimeControl::Cancel { generation, done }
             }
+            DriverCommand::PauseGoal => {
+                let (done, _result) = oneshot::channel();
+                CodingRuntimeControl::PauseGoal { generation, done }
+            }
             DriverCommand::Compact(focus) => CodingRuntimeControl::Compact { generation, focus },
             DriverCommand::SetMode(mode) => {
                 let (done, _result) = oneshot::channel();
@@ -1084,6 +1111,7 @@ impl CodingRuntimeHandle {
                     generation,
                     condition,
                     done,
+                    recovery_tx: self.tx.clone(),
                 }
             }
             DriverCommand::StopGoal => {
@@ -1159,6 +1187,18 @@ impl CodingRuntimeHandle {
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::Cancel {
+                generation: runtime_state_generation(state),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    pub async fn pause_goal(&self) -> Result<(), RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::PauseGoal {
                 generation: runtime_state_generation(state),
                 done,
             })
@@ -1550,6 +1590,7 @@ impl CodingRuntimeHandle {
                 generation: runtime_state_generation(state),
                 condition: condition.into(),
                 done,
+                recovery_tx: self.tx.clone(),
             })
             .map_err(|_| RuntimeError::Unavailable)?;
         result.await.map_err(|_| RuntimeError::Unavailable)?
@@ -1939,6 +1980,10 @@ pub enum CodingRuntimeControl {
         generation: u64,
         done: oneshot::Sender<Result<(), RuntimeError>>,
     },
+    PauseGoal {
+        generation: u64,
+        done: oneshot::Sender<Result<(), RuntimeError>>,
+    },
     SetMode {
         generation: u64,
         mode: RuntimeMode,
@@ -2024,6 +2069,18 @@ pub enum CodingRuntimeControl {
         generation: u64,
         condition: String,
         done: oneshot::Sender<Result<(), RuntimeError>>,
+        /// Self-send channel so the owner loop can post an [`AdjustGoalRounds`] once
+        /// the live per-plan round budget has been resolved off the loop.
+        recovery_tx: mpsc::UnboundedSender<CodingRuntimeControl>,
+    },
+    /// Self-sent from a background task after goal start: applies the live per-plan
+    /// round budget that was resolved off the owner loop, so goal start never blocks
+    /// the loop on a quota round-trip. A no-op if the target goal is gone or a newer
+    /// generation/controller has taken over.
+    AdjustGoalRounds {
+        generation: u64,
+        controller_id: u64,
+        max_rounds: u32,
     },
     StopGoal {
         generation: u64,
@@ -2400,6 +2457,8 @@ fn spawn_runtime_owner_with_optional_agent(
     let (goal_eval_tx, mut goal_eval_rx) = mpsc::unbounded_channel::<EvalOutcome>();
     let (loop_fire_tx, mut loop_fire_rx) = mpsc::unbounded_channel::<(u64, u64, WakeupRequest)>();
     let (session_name_tx, mut session_name_rx) = mpsc::unbounded_channel::<(u64, String)>();
+    let (next_prompt_tx, mut next_prompt_rx) =
+        mpsc::unbounded_channel::<NextPromptSuggestionOutcome>();
     let mut generation = 0;
     let event_generation = Arc::new(AtomicU64::new(generation));
     let runtime_event_tx = RuntimeEventEmitter {
@@ -2437,8 +2496,14 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut snapshot_waiters: Vec<RuntimeSnapshotWaiter> = Vec::new();
         let mut snapshot_in_flight = false;
         let mut terminal_reason = None;
+        // A cancel is not complete when the command is merely delivered. Keep the
+        // runtime closed to new submits until the cancelled conversation snapshot
+        // arrives, otherwise a prompt can be accepted as a steer and then cleared by
+        // the kernel's cancel path.
+        let mut cancel_pending = false;
         let mut turn_stats = RuntimeTurnStats::default();
         let mut turn_started_at: Option<std::time::Instant> = None;
+        let mut next_prompt_task: Option<tokio::task::JoinHandle<()>> = None;
         let mut pending_local_context = Vec::new();
         let mut next_controller_id = 0u64;
         let mut goal: Option<GoalState> = None;
@@ -2728,6 +2793,22 @@ fn spawn_runtime_owner_with_optional_agent(
                         );
                     }
                 }
+                suggestion = next_prompt_rx.recv(), if native_protocol => {
+                    let Some(suggestion) = suggestion else { continue };
+                    if suggestion.generation == generation
+                        && suggestion.revision == conversation_revision
+                        && active_turn.is_none()
+                    {
+                        let _ = runtime_event_tx.send(
+                            CodingRuntimeEvent::NextPromptSuggested {
+                                generation: RuntimeGeneration(suggestion.generation),
+                                session_id: suggestion.session_id,
+                                turn_id: suggestion.turn_id,
+                                text: suggestion.text,
+                            },
+                        );
+                    }
+                }
                 outcome = goal_eval_rx.recv(), if native_protocol => {
                     let Some(outcome) = outcome else { continue };
                     if outcome.generation != generation
@@ -2743,13 +2824,17 @@ fn spawn_runtime_owner_with_optional_agent(
                     }
                     let mut finish_reason = None;
                     let mut continuation = None;
+                    // Only GoalResult::Met keeps the goal registered after the turn ends.
+                    // All other finish_reason paths (e.g. evaluator Error) must still clear it.
+                    let mut keep_goal_on_eval = false;
                     match outcome.result {
                         GoalResult::Met(verdict) => {
                             if let Some(state) = goal.as_mut() {
-                                state.finish(GoalTerminal::Met, verdict);
+                                state.mark_satisfied(verdict);
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
                             finish_reason = Some(StopReason::Stopped);
+                            keep_goal_on_eval = true;
                         }
                         GoalResult::NotMet(verdict) => {
                             if let Some(state) = goal.as_mut() {
@@ -2774,7 +2859,12 @@ fn spawn_runtime_owner_with_optional_agent(
                     if let Some(reason) = finish_reason {
                         if let Some((turn_id, _held_reason, snapshot, stats)) = held_turn.take() {
                             active_turn = None;
-                            goal = None;
+                            // GoalResult::Met keeps the goal registered (phase=Satisfied);
+                            // other finish_reason paths (e.g. evaluator Error) still clear
+                            // via keep_goal_on_eval=false.
+                            if !keep_goal_on_eval {
+                                goal = None;
+                            }
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { turn_id, reason, snapshot, stats }));
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
                         }
@@ -2941,15 +3031,115 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(error));
                             continue;
                         }
+                        if cancel_pending {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        // A persistent goal (paused at its round cap, OR already
+                        // satisfied) re-engages on the next user message: resume it
+                        // into Pursuing so the follow-up advances the goal and the
+                        // badge shows `◎ <cond> · round 1` again rather than a stale
+                        // "已达成". Only `/goal clear` (or a superseding `/goal`, or an
+                        // error) removes it. Ended/Pursuing are untouched.
+                        //
+                        // Reuse the budget already derived at goal-START time (stored
+                        // in state.max_rounds): the 5h rolling window can't meaningfully
+                        // change between keypresses, and the extra network round-trip
+                        // (~3 s) blocked the event loop.
+                        // Decide whether/how to re-engage a persistent goal on this
+                        // user message. PausedAtCap (not yet done) always continues its
+                        // original condition. For a Satisfied (done) goal, ask the model
+                        // whether the follow-up CONTINUES it, is a NEW goal, or is just
+                        // chit-chat (NotAGoal → don't re-engage). `decision`: None = leave
+                        // the goal as-is; Some(None) = resume keeping the condition;
+                        // Some(Some(text)) = resume RE-TASKED to the new message.
+                        let reengage_decision: Option<Option<String>> = match goal
+                            .as_ref()
+                            .map(|state| state.phase)
+                        {
+                            // PausedAtCap intentionally resumes even on an empty submit:
+                            // it isn't done, so any nudge should let it keep going. The
+                            // Satisfied arm below deliberately does NOT — a done goal must
+                            // not be re-tasked by an empty message.
+                            Some(GoalPhase::Paused | GoalPhase::PausedAtCap) => Some(None),
+                            Some(GoalPhase::Satisfied) if input.text.trim().is_empty() => {
+                                // Fast-path: an empty / whitespace-only submit obviously
+                                // isn't a new goal — don't spend a classifier call (or
+                                // block the loop) on it; leave the goal Satisfied.
+                                None
+                            }
+                            Some(GoalPhase::Satisfied) => {
+                                let condition =
+                                    goal.as_ref().map(|s| s.condition.clone()).unwrap_or_default();
+                                let cancel = goal.as_ref().map(|s| s.cancel.clone());
+                                let provider = resources.as_ref().and_then(|runtime| {
+                                    let session_id = runtime
+                                        .parts
+                                        .session
+                                        .as_ref()
+                                        .map(|binding| binding.id.as_str());
+                                    build_goal_evaluator_provider(
+                                        &runtime.provider_factory,
+                                        &runtime.config,
+                                        session_id,
+                                    )
+                                    .ok()
+                                });
+                                match (provider, cancel) {
+                                    (Some(p), Some(c)) => {
+                                        // Awaited inline, so bound it tightly (the classify
+                                        // is a short reply); any timeout/failure resolves to
+                                        // Continuation so a hiccup never drops the goal.
+                                        let classified = tokio::time::timeout(
+                                            std::time::Duration::from_secs(4),
+                                            classify_followup(p, condition, input.text.clone(), c),
+                                        )
+                                        .await
+                                        .unwrap_or(FollowupClass::Continuation);
+                                        match classified {
+                                            FollowupClass::Continuation => Some(None),
+                                            FollowupClass::NewGoal => Some(Some(input.text.clone())),
+                                            FollowupClass::NotAGoal => None,
+                                        }
+                                    }
+                                    _ => Some(None),
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some(new_condition) = reengage_decision {
+                            if let Some(state) = goal.as_mut() {
+                                let was_user_paused = state.phase == GoalPhase::Paused;
+                                if let Some(condition) = new_condition {
+                                    state.condition = condition;
+                                }
+                                if was_user_paused {
+                                    state.resume_paused();
+                                } else {
+                                    let keep = state.max_rounds.unwrap_or(0);
+                                    state.resume(keep);
+                                }
+                                let _ = runtime_event_tx
+                                    .send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                            }
+                        }
+                        if let Some(task) = next_prompt_task.take() {
+                            task.abort();
+                        }
                         // The real-user submit boundary owns per-turn execution intent.
                         // Update before forwarding (including steer) so a newly received
                         // "do not compile/run scripts" instruction blocks later Bash calls
                         // from an already-active turn without waiting for another LLM round.
+                        // Skip an empty-text submit (e.g. an image-only steer): it carries no
+                        // new intent and must not clear a restriction the user set earlier in
+                        // this turn.
                         if let Some(runtime) = resources.as_ref() {
-                            runtime
-                                .parts
-                                .turn_execution_policy
-                                .update_from_user_text(&input.text);
+                            if !input.text.trim().is_empty() {
+                                runtime
+                                    .parts
+                                    .turn_execution_policy
+                                    .update_from_user_text(&input.text);
+                            }
                         }
                         let receipt = if let Some(turn_id) = active_turn {
                             SubmitReceipt::Steered { generation, turn_id }
@@ -3174,6 +3364,9 @@ fn spawn_runtime_owner_with_optional_agent(
                             }));
                             continue;
                         }
+                        if let Some(task) = next_prompt_task.take() {
+                            task.abort();
+                        }
                         controls.state.store(
                             runtime_phase_state(generation, RuntimePhase::Reconfiguring),
                             Ordering::Release,
@@ -3343,6 +3536,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                             pending_wakeup = None;
                             active_turn = None;
+                            cancel_pending = false;
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(
                                 TurnCompletion::Completed {
                                     turn_id,
@@ -3357,6 +3551,24 @@ fn spawn_runtime_owner_with_optional_agent(
                             );
                             let _ = done.send(Ok(()));
                         } else if active_turn.is_none() {
+                            if let Some(mut state) = goal.take() {
+                                state.cancel.cancel();
+                                state.finish(GoalTerminal::Cancelled, "cancelled by user");
+                                let _ = runtime_event_tx
+                                    .send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                            }
+                            if let Some(mut state) = loop_state.take() {
+                                state.cancel.cancel();
+                                state.active = false;
+                                state.last_reason = Some("cancelled by user".into());
+                                let _ = runtime_event_tx
+                                    .send(CodingRuntimeEvent::LoopChanged(state.progress()));
+                            }
+                            if let Some(runtime) = resources.as_ref() {
+                                runtime.loop_active.store(false, Ordering::Release);
+                            }
+                            pending_wakeup = None;
+                            cancel_pending = false;
                             let _ = done.send(Ok(()));
                         } else {
                             if let Some(mut state) = goal.take() {
@@ -3381,13 +3593,90 @@ fn spawn_runtime_owner_with_optional_agent(
                                 });
                             }
                             pending_requests.clear();
-                            if send_agent_command(&agent, AgentCommand::Cancel) {
+                            // Queue Snapshot immediately after Cancel. Mid-turn the kernel
+                            // drains it after the cancelled turn; if Cancel races with an
+                            // already-idle kernel, Snapshot still supplies the terminal
+                            // acknowledgement that the runtime needs to leave InTurn.
+                            if request_cancel_snapshot(&agent) {
+                                cancel_pending = true;
+                                snapshot_in_flight = true;
                                 controls.state.store(
                                     runtime_phase_state(generation, RuntimePhase::InTurn),
                                     Ordering::Release,
                                 );
                                 let _ = done.send(Ok(()));
                             } else {
+                                agent_available = false;
+                                controls.state.store(
+                                    runtime_phase_state(generation, RuntimePhase::Failed),
+                                    Ordering::Release,
+                                );
+                                let _ = done.send(Err(RuntimeError::DeliveryFailed));
+                            }
+                        }
+                    }
+                    Some(CodingRuntimeControl::PauseGoal {
+                        generation: request_generation,
+                        done,
+                    }) => {
+                        if !native_protocol || request_generation != generation || !agent_available {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        }
+                        let Some(state) = goal.as_mut() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        state.pause("paused by user; continue the conversation to resume");
+                        let _ = runtime_event_tx
+                            .send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                        pending_wakeup = None;
+
+                        if let Some((turn_id, _, snapshot, stats)) = held_turn.take() {
+                            active_turn = None;
+                            cancel_pending = false;
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(
+                                TurnCompletion::Completed {
+                                    turn_id,
+                                    reason: StopReason::Cancelled,
+                                    snapshot,
+                                    stats,
+                                },
+                            ));
+                            controls.state.store(
+                                runtime_phase_state(generation, RuntimePhase::Ready),
+                                Ordering::Release,
+                            );
+                            let _ = done.send(Ok(()));
+                        } else if active_turn.is_none() {
+                            cancel_pending = false;
+                            let _ = done.send(Ok(()));
+                        } else {
+                            for id in pending_requests.iter().copied() {
+                                let _ = send_agent_command(&agent, AgentCommand::Respond {
+                                    id,
+                                    value: serde_json::Value::Null,
+                                });
+                            }
+                            pending_requests.clear();
+                            if request_cancel_snapshot(&agent) {
+                                cancel_pending = true;
+                                snapshot_in_flight = true;
+                                controls.state.store(
+                                    runtime_phase_state(generation, RuntimePhase::InTurn),
+                                    Ordering::Release,
+                                );
+                                let _ = done.send(Ok(()));
+                            } else {
+                                if let Some(mut state) = goal.take() {
+                                    state.finish(
+                                        GoalTerminal::Failed,
+                                        "pause failed: cancel delivery failed",
+                                    );
+                                    let _ = runtime_event_tx.send(
+                                        CodingRuntimeEvent::GoalChanged(state.progress()),
+                                    );
+                                }
                                 agent_available = false;
                                 controls.state.store(
                                     runtime_phase_state(generation, RuntimePhase::Failed),
@@ -3620,6 +3909,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                         };
 
+                        if let Some(task) = next_prompt_task.take() {
+                            task.abort();
+                        }
+
                         controls.state.store(
                             runtime_phase_state(generation, RuntimePhase::Reconfiguring),
                             Ordering::Release,
@@ -3633,6 +3926,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut pending_requests,
                             active_turn.is_some(),
                         );
+                        let had_active_turn = active_turn.is_some();
                         let stop_report = stop_current_agent(
                             &mut agent,
                             &mut compactions,
@@ -3642,6 +3936,32 @@ fn spawn_runtime_owner_with_optional_agent(
                             runtime.parts.snapshot_persistence_status(),
                         )
                         .await;
+                        if stop_report.forced
+                            && had_active_turn
+                            && !stop_report.has_verified_turn_terminal()
+                        {
+                            let message = "provider reconfiguration timed out while stopping the active agent; the latest conversation snapshot could not be verified".to_string();
+                            fail_close_after_forced_provider_stop(
+                                &message,
+                                Some(&runtime),
+                                &mut goal,
+                                &mut loop_state,
+                                &mut pending_wakeup,
+                                &mut held_turn,
+                                &mut active_turn,
+                                &mut terminal_reason,
+                                &mut turn_stats,
+                                &mut conversation_revision,
+                                &mut snapshot_waiters,
+                                &mut agent_available,
+                                controls.state.as_ref(),
+                                generation,
+                                &runtime_event_tx,
+                            );
+                            resources = Some(runtime);
+                            let _ = done.send(Err(RuntimeError::ReconfigureFailed(message)));
+                            continue;
+                        }
                         finish_stopped_native_turn(
                             &stop_report,
                             Some(&runtime),
@@ -3693,8 +4013,12 @@ fn spawn_runtime_owner_with_optional_agent(
                                 agent_available = true;
                                 provider_unavailable_reason = None;
                                 controls.provider_unavailable_reason.store(0, Ordering::Release);
-                                observed_tokens = None;
+                                // Reassembly restores the same conversation snapshot. Keep the
+                                // last observed usage until the replacement provider reports a
+                                // fresh value, otherwise callers briefly see an empty context and
+                                // may mistake a model switch for conversation loss.
                                 snapshot_in_flight = false;
+                                cancel_pending = false;
                                 compaction_suspended = false;
                                 let provider = runtime.config.provider_name.clone();
                                 let model = runtime.config.model.clone();
@@ -3796,6 +4120,10 @@ fn spawn_runtime_owner_with_optional_agent(
                         if !agent_available && provider_unavailable_reason == Some(reason) {
                             let _ = done.send(Ok(RuntimeGeneration(generation)));
                             continue;
+                        }
+
+                        if let Some(task) = next_prompt_task.take() {
+                            task.abort();
                         }
 
                         controls.state.store(
@@ -3951,6 +4279,9 @@ fn spawn_runtime_owner_with_optional_agent(
                             resources = Some(runtime);
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
+                        }
+                        if let Some(task) = next_prompt_task.take() {
+                            task.abort();
                         }
                         if withdraws_mcp {
                             // Config, trust, and auth are mutable security inputs.
@@ -4202,6 +4533,9 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
+                        if let Some(task) = next_prompt_task.take() {
+                            task.abort();
+                        }
                         let undo_sidecars = match persist_runtime_undo(
                             &mut runtime,
                             Some(original.as_ref()),
@@ -4399,6 +4733,9 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
+                        if let Some(task) = next_prompt_task.take() {
+                            task.abort();
+                        }
                         controls.state.store(
                             runtime_phase_state(generation, RuntimePhase::Reconfiguring),
                             Ordering::Release,
@@ -4571,7 +4908,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                         }
                     }
-                    Some(CodingRuntimeControl::StartGoal { generation: request_generation, condition, done }) => {
+                    Some(CodingRuntimeControl::StartGoal { generation: request_generation, condition, done, recovery_tx }) => {
                         if !native_protocol || request_generation != generation || compaction_suspended {
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
@@ -4600,8 +4937,14 @@ fn spawn_runtime_owner_with_optional_agent(
                         );
                         if let Some(runtime) = resources.as_ref() {
                             next_controller_id = next_controller_id.wrapping_add(1);
+                            let controller_id = next_controller_id;
+                            // Start immediately on the configured default so goal start never
+                            // blocks the owner loop on a network round-trip. The round budget
+                            // scales per plan (Pro 1000 → 300, Lite 800 → 240) from the account's
+                            // live request quota, resolved OFF the loop and applied via a self-sent
+                            // AdjustGoalRounds; env override wins and any miss keeps the default.
                             let next = GoalState::new(
-                                next_controller_id,
+                                controller_id,
                                 condition,
                                 runtime.config.goal_max_rounds,
                                 runtime.config.goal_max_duration_secs,
@@ -4609,6 +4952,39 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(next.progress()));
                             goal = Some(next);
                             let _ = done.send(Ok(()));
+                            // Only spawn the quota fetch when it could actually change the cap:
+                            // an env override short-circuits to the default, and with no live
+                            // rate-limit source there is nothing to derive from.
+                            if crate::config::goal_max_rounds_env().is_none() {
+                                if let Some(source) = runtime.parts.rate_limit_source().cloned() {
+                                    let default = runtime.config.goal_max_rounds;
+                                    let tx = recovery_tx.clone();
+                                    tokio::spawn(async move {
+                                        let max_rounds = resolve_goal_round_cap(Some(&source), default).await;
+                                        if max_rounds != default {
+                                            let _ = tx.send(CodingRuntimeControl::AdjustGoalRounds {
+                                                generation: request_generation,
+                                                controller_id,
+                                                max_rounds,
+                                            });
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    Some(CodingRuntimeControl::AdjustGoalRounds { generation: request_generation, controller_id, max_rounds }) => {
+                        // Apply the live per-plan round budget resolved off the loop. Ignore
+                        // it if a newer generation took over, the goal is gone, a different
+                        // controller now owns it, or it already stopped.
+                        if request_generation == generation {
+                            if let Some(state) = goal.as_mut() {
+                                if state.id == controller_id && state.active {
+                                    state.set_round_cap(max_rounds);
+                                    let _ = runtime_event_tx
+                                        .send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                }
+                            }
                         }
                     }
                     Some(CodingRuntimeControl::StopGoal { generation: request_generation, done }) => {
@@ -4621,13 +4997,23 @@ fn spawn_runtime_owner_with_optional_agent(
                             current.finish(GoalTerminal::Cancelled, "cleared by user");
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(current.progress()));
                         }
-                        if active_turn.is_some() { let _ = send_agent_command(&agent, AgentCommand::Cancel); }
                         if let Some((turn_id, _, snapshot, stats)) = held_turn.take() {
                             active_turn = None;
+                            cancel_pending = false;
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
                                 turn_id, reason: StopReason::Cancelled, snapshot, stats,
                             }));
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
+                        } else if active_turn.is_some() {
+                            if request_cancel_snapshot(&agent) {
+                                cancel_pending = true;
+                                snapshot_in_flight = true;
+                            } else {
+                                agent_available = false;
+                                controls.state.store(runtime_phase_state(generation, RuntimePhase::Failed), Ordering::Release);
+                                let _ = done.send(Err(RuntimeError::DeliveryFailed));
+                                continue;
+                            }
                         }
                         let _ = done.send(Ok(()));
                     }
@@ -4682,17 +5068,30 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         if let Some(runtime) = resources.as_ref() { runtime.loop_active.store(false, Ordering::Release); }
                         pending_wakeup = None;
-                        if active_turn.is_some() { let _ = send_agent_command(&agent, AgentCommand::Cancel); }
                         if let Some((turn_id, _, snapshot, stats)) = held_turn.take() {
                             active_turn = None;
+                            cancel_pending = false;
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
                                 turn_id, reason: StopReason::Cancelled, snapshot, stats,
                             }));
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
+                        } else if active_turn.is_some() {
+                            if request_cancel_snapshot(&agent) {
+                                cancel_pending = true;
+                                snapshot_in_flight = true;
+                            } else {
+                                agent_available = false;
+                                controls.state.store(runtime_phase_state(generation, RuntimePhase::Failed), Ordering::Release);
+                                let _ = done.send(Err(RuntimeError::DeliveryFailed));
+                                continue;
+                            }
                         }
                         let _ = done.send(Ok(()));
                     }
                     Some(CodingRuntimeControl::Shutdown { generation: request_generation }) => {
+                        if let Some(task) = next_prompt_task.take() {
+                            task.abort();
+                        }
                         if request_generation == generation {
                             controls.state.store(
                                 runtime_phase_state(generation, RuntimePhase::ShuttingDown),
@@ -4891,6 +5290,29 @@ fn spawn_runtime_owner_with_optional_agent(
                                 ));
                             }
                             AgentEvent::Request { id, kind, payload } => {
+                                // Auto is a runtime-owned execution mode, so approval bypass
+                                // belongs at this common request boundary rather than in each
+                                // driver. Do not publish an approval that has already been
+                                // answered: otherwise WebUI/TUI/ACP can briefly render a stale
+                                // prompt. Non-approval requests (notably request_user_input)
+                                // must still round-trip through the driver.
+                                let bypass_approval = kind == APPROVAL_KIND
+                                    && resources.as_ref().is_some_and(|runtime| {
+                                        runtime.parts.bypass_mode.load(Ordering::Acquire)
+                                    });
+                                if bypass_approval {
+                                    let value = serde_json::to_value(ApprovalResponse::allow())
+                                        .unwrap_or(serde_json::Value::Null);
+                                    if send_agent_command(
+                                        &agent,
+                                        AgentCommand::Respond { id, value },
+                                    ) {
+                                        continue;
+                                    }
+                                    // Preserve the request if delivery failed. Normal owner
+                                    // teardown will fail it closed; never claim success for a
+                                    // response that did not reach the kernel.
+                                }
                                 pending_requests.insert(id);
                                 controls.state.store(
                                     runtime_phase_state(
@@ -5057,7 +5479,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                             AgentEvent::Snapshot { snapshot } => {
                                 snapshot_in_flight = false;
-                                if terminal_reason.is_some() {
+                                if terminal_reason.is_some() || cancel_pending {
                                     conversation_revision = conversation_revision.wrapping_add(1);
                                 }
                                 if let Some(runtime) = resources.as_mut() {
@@ -5078,7 +5500,11 @@ fn spawn_runtime_owner_with_optional_agent(
                                         revision: conversation_revision,
                                     }));
                                 }
-                                if let Some(reason) = terminal_reason.take() {
+                                if let Some(reason) = terminal_reason
+                                    .take()
+                                    .or_else(|| cancel_pending.then_some(StopReason::Cancelled))
+                                {
+                                    cancel_pending = false;
                                     pending_requests.clear();
                                     let stats = std::mem::take(&mut turn_stats);
                                     let turn_id = active_turn.unwrap_or_default();
@@ -5150,18 +5576,22 @@ fn spawn_runtime_owner_with_optional_agent(
                                             reason,
                                             StopReason::Timeout | StopReason::ProviderError
                                         );
+                                        let mut keep_goal_registered = false;
                                         if let Some(why) = stop_reason {
-                                            state.finish(
-                                                GoalTerminal::Stopped,
-                                                format!("stopped: {why}"),
-                                            );
+                                            // A cap fired (round budget, or the optional time cap).
+                                            // This is "ran out of budget", NOT "the evaluator judged
+                                            // the work unfinished" — the note names the budget and
+                                            // how to continue, and never claims "goal not met".
+                                            let note = goal_cap_stop_note(why, state.max_rounds);
+                                            state.pause_at_cap(note.clone());
+                                            keep_goal_registered = true;
                                             completion_reason = match why {
                                                 "round limit" => StopReason::MaxRounds,
                                                 "time limit" => StopReason::Timeout,
                                                 _ => StopReason::ProviderError,
                                             };
                                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
-                                            let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!("goal stopped: {why} — goal not met; run /goal again to continue")));
+                                            let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!("goal {note}")));
                                         } else if evaluate {
                                             state.unproductive = 0;
                                             let condition = state.condition.clone();
@@ -5272,7 +5702,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                             );
                                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                         }
-                                        goal = None;
+                                        if !keep_goal_registered {
+                                            goal = None;
+                                        }
                                     } else if let Some(state) = loop_state.as_mut().filter(|state| state.active) {
                                         if reason == StopReason::Stopped {
                                             if let Some(wakeup) = pending_wakeup.take() {
@@ -5302,6 +5734,52 @@ fn spawn_runtime_owner_with_optional_agent(
                                         loop_state = None;
                                     }
                                     active_turn = None;
+                                    if completion_reason == StopReason::Stopped
+                                        && resources.as_ref().is_some_and(|runtime| {
+                                            runtime.config.next_prompt_suggestions
+                                        })
+                                    {
+                                        if let Some(task) = next_prompt_task.take() {
+                                            task.abort();
+                                        }
+                                        let provider = resources.as_ref().and_then(|runtime| {
+                                            let session_id = runtime
+                                                .parts
+                                                .session
+                                                .as_ref()
+                                                .map(|binding| binding.id.as_str());
+                                            runtime
+                                                .provider_factory
+                                                .build(&runtime.config, session_id)
+                                                .ok()
+                                        });
+                                        if let Some(provider) = provider {
+                                            let tx = next_prompt_tx.clone();
+                                            let messages = snapshot.messages.clone();
+                                            let suggestion_generation = generation;
+                                            let suggestion_revision = conversation_revision;
+                                            let suggestion_session_id = resources
+                                                .as_ref()
+                                                .and_then(|runtime| runtime.parts.session.as_ref())
+                                                .map(|binding| binding.id.clone());
+                                            next_prompt_task = Some(tokio::spawn(async move {
+                                                if let Some(text) = crate::next_prompt_suggestion::generate_next_prompt_suggestion(
+                                                    provider,
+                                                    &messages,
+                                                )
+                                                .await
+                                                {
+                                                    let _ = tx.send(NextPromptSuggestionOutcome {
+                                                        generation: suggestion_generation,
+                                                        revision: suggestion_revision,
+                                                        session_id: suggestion_session_id,
+                                                        turn_id,
+                                                        text,
+                                                    });
+                                                }
+                                            }));
+                                        }
+                                    }
                                     let _ = runtime_event_tx.send(
                                         CodingRuntimeEvent::TurnFinished(
                                             TurnCompletion::Completed {
@@ -5403,6 +5881,9 @@ fn spawn_runtime_owner_with_optional_agent(
                 },
             }
         }
+        if let Some(task) = next_prompt_task.take() {
+            task.abort();
+        }
         controls.state.store(
             runtime_phase_state(generation, RuntimePhase::Stopped),
             Ordering::Release,
@@ -5501,11 +5982,14 @@ fn reject_runtime_control(
             emit_compaction_interrupted(runtime_event_tx, CompactTrigger::Manual { focus }, reason)
         }
         CodingRuntimeControl::Shutdown { .. } => {}
+        // Fire-and-forget self-send with no waiter: nothing to fail-close.
+        CodingRuntimeControl::AdjustGoalRounds { .. } => {}
         CodingRuntimeControl::Submit { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::Respond { done, .. }
         | CodingRuntimeControl::Cancel { done, .. }
+        | CodingRuntimeControl::PauseGoal { done, .. }
         | CodingRuntimeControl::SetMode { done, .. }
         | CodingRuntimeControl::WaitMcpReady { done, .. }
         | CodingRuntimeControl::QueueLocalContext { done, .. } => {
@@ -5580,6 +6064,11 @@ fn send_agent_command(agent: &Option<AgentHandle>, command: AgentCommand) -> boo
     agent
         .as_ref()
         .is_some_and(|agent| agent.commands.send(command).is_ok())
+}
+
+fn request_cancel_snapshot(agent: &Option<AgentHandle>) -> bool {
+    send_agent_command(agent, AgentCommand::Cancel)
+        && send_agent_command(agent, AgentCommand::Snapshot)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6252,8 +6741,15 @@ struct StopReport {
     forced: bool,
     reason: Option<StopReason>,
     snapshot: Option<SessionSnapshot>,
+    snapshot_after_turn_terminal: bool,
     conversation_changed: bool,
     persistence_failure: Option<String>,
+}
+
+impl StopReport {
+    fn has_verified_turn_terminal(&self) -> bool {
+        self.reason.is_some() && self.snapshot_after_turn_terminal
+    }
 }
 
 fn record_stopped_conversation_event(report: &mut StopReport, event: &AgentEvent) {
@@ -6318,6 +6814,7 @@ async fn stop_current_agent(
                         }
                         Some(AgentEvent::Snapshot { snapshot }) => {
                             report.snapshot = Some(snapshot);
+                            report.snapshot_after_turn_terminal = report.reason.is_some();
                         }
                         _ => {}
                     }
@@ -6340,7 +6837,10 @@ async fn stop_current_agent(
                 *observed_tokens = Some(meta.used_tokens as usize);
             }
             Some(AgentEvent::TurnComplete { reason }) => report.reason = Some(reason),
-            Some(AgentEvent::Snapshot { snapshot }) => report.snapshot = Some(snapshot),
+            Some(AgentEvent::Snapshot { snapshot }) => {
+                report.snapshot = Some(snapshot);
+                report.snapshot_after_turn_terminal = report.reason.is_some();
+            }
             _ => {}
         }
     }
@@ -6359,7 +6859,7 @@ fn emit_terminal_persistence_warnings(
         return;
     };
     if let Some(warning) = status.take_auxiliary_warning() {
-        let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(warning));
+        let _ = runtime_event_tx.send(CodingRuntimeEvent::PersistenceWarning(warning));
     }
     if let Some(warning) = status.take_cost_warning() {
         let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(warning));
@@ -6518,6 +7018,74 @@ fn fail_close_after_stopped_persistence(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn fail_close_after_forced_provider_stop(
+    message: &str,
+    resources: Option<&RuntimeResources>,
+    goal: &mut Option<GoalState>,
+    loop_state: &mut Option<LoopState>,
+    pending_wakeup: &mut Option<WakeupRequest>,
+    held_turn: &mut Option<(u64, StopReason, Arc<SessionSnapshot>, RuntimeTurnStats)>,
+    active_turn: &mut Option<u64>,
+    terminal_reason: &mut Option<StopReason>,
+    turn_stats: &mut RuntimeTurnStats,
+    conversation_revision: &mut u64,
+    snapshot_waiters: &mut Vec<RuntimeSnapshotWaiter>,
+    agent_available: &mut bool,
+    state: &AtomicU64,
+    generation: u64,
+    runtime_event_tx: &RuntimeEventEmitter,
+) {
+    *conversation_revision =
+        (*conversation_revision).wrapping_add(u64::from(active_turn.is_some()));
+    let unavailable = RuntimeError::SnapshotUnavailable(message.to_string());
+    for waiter in snapshot_waiters.drain(..) {
+        let _ = waiter.send(Err(unavailable.clone()));
+    }
+    if let Some(turn_id) = active_turn.take() {
+        let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(
+            TurnCompletion::SnapshotUnavailable {
+                turn_id,
+                reason: StopReason::ProviderError,
+                error: RuntimeSnapshotError {
+                    message: message.to_string(),
+                },
+                stats: std::mem::take(turn_stats),
+            },
+        ));
+    }
+    if let Some(mut current) = goal.take() {
+        current.cancel.cancel();
+        current.finish(
+            GoalTerminal::Failed,
+            "ended: active agent did not stop safely",
+        );
+        let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(current.progress()));
+    }
+    if let Some(mut current) = loop_state.take() {
+        current.cancel.cancel();
+        current.active = false;
+        current.last_reason = Some("ended: active agent did not stop safely".into());
+        let _ = runtime_event_tx.send(CodingRuntimeEvent::LoopChanged(current.progress()));
+    }
+    if let Some(runtime) = resources {
+        runtime.loop_active.store(false, Ordering::Release);
+    }
+    *pending_wakeup = None;
+    *held_turn = None;
+    *terminal_reason = None;
+    *agent_available = false;
+    state.store(
+        runtime_phase_state(generation, RuntimePhase::Failed),
+        Ordering::Release,
+    );
+    let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(AgentEvent::Error {
+        message: message.to_string(),
+        http_status: None,
+        code: None,
+    }));
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cancel_controllers_and_finish_held(
     goal: &mut Option<GoalState>,
     loop_state: &mut Option<LoopState>,
@@ -6609,9 +7177,102 @@ impl fmt::Display for RuntimeUnavailable {
 
 impl Error for RuntimeUnavailable {}
 
+/// Resolve the `/goal` round cap at goal start. An explicit `ATOMCODE_GOAL_MAX_ROUNDS`
+/// wins and skips the network (its value is already baked into `config_default`).
+/// Otherwise size the budget from the account's live request quota — a share of the
+/// tightest rolling window's `call_limit` — fetched best-effort through the host
+/// source with a short timeout. Any miss (no source, fetch error/timeout, no usable
+/// window, non-CodingPlan user) falls back to `config_default` so `/goal` never blocks.
+async fn resolve_goal_round_cap(
+    rate_limit_source: Option<&Arc<dyn crate::rate_limit::RateLimitWindowSource>>,
+    config_default: u32,
+) -> u32 {
+    if crate::config::goal_max_rounds_env().is_some() {
+        return config_default;
+    }
+    let call_limit = match rate_limit_source {
+        Some(source) => match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            source.fetch_windows(),
+        )
+        .await
+        {
+            Ok(Ok(windows)) => crate::rate_limit::binding_window_call_limit(&windows),
+            _ => None,
+        },
+        None => None,
+    };
+    match call_limit {
+        Some(limit) => crate::config::derive_goal_max_rounds(None, Some(limit)),
+        None => config_default,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct FakeQuotaSource {
+        result: Result<Vec<crate::rate_limit::RateLimitWindow>, String>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::rate_limit::RateLimitWindowSource for FakeQuotaSource {
+        fn applies_to(&self, _base_url: &str) -> bool {
+            true
+        }
+        async fn fetch_windows(
+            &self,
+        ) -> Result<Vec<crate::rate_limit::RateLimitWindow>, String> {
+            self.result.clone()
+        }
+    }
+
+    fn quota_window(call_limit: i64) -> crate::rate_limit::RateLimitWindow {
+        crate::rate_limit::RateLimitWindow {
+            window_size_seconds: 18_000,
+            quota_exhausted: false,
+            reset_at_display: "18:09".into(),
+            seconds_until_reset: 7200,
+            reset_label: "5h".into(),
+            call_limit,
+        }
+    }
+
+    // NOTE: assumes ATOMCODE_GOAL_MAX_ROUNDS is unset (same assumption as
+    // `config::tests::round_caps_have_generous_defaults`); an env override would
+    // short-circuit to the config default.
+    #[tokio::test]
+    async fn goal_round_cap_derives_from_live_plan_quota() {
+        // Pro window (call_limit 1000) → 30% = 300, overriding the passed default.
+        let pro: Arc<dyn crate::rate_limit::RateLimitWindowSource> =
+            Arc::new(FakeQuotaSource {
+                result: Ok(vec![quota_window(1000)]),
+            });
+        assert_eq!(resolve_goal_round_cap(Some(&pro), 777).await, 300);
+        // Lite window (800) → 240.
+        let lite: Arc<dyn crate::rate_limit::RateLimitWindowSource> =
+            Arc::new(FakeQuotaSource {
+                result: Ok(vec![quota_window(800)]),
+            });
+        assert_eq!(resolve_goal_round_cap(Some(&lite), 777).await, 240);
+    }
+
+    #[tokio::test]
+    async fn goal_round_cap_falls_back_when_quota_unavailable() {
+        // No source, a fetch error, and empty windows all fall back to the config
+        // default instead of blocking /goal or inventing a number.
+        assert_eq!(resolve_goal_round_cap(None, 777).await, 777);
+        let err: Arc<dyn crate::rate_limit::RateLimitWindowSource> =
+            Arc::new(FakeQuotaSource {
+                result: Err("status_v2 unavailable".into()),
+            });
+        assert_eq!(resolve_goal_round_cap(Some(&err), 777).await, 777);
+        let empty: Arc<dyn crate::rate_limit::RateLimitWindowSource> =
+            Arc::new(FakeQuotaSource { result: Ok(vec![]) });
+        assert_eq!(resolve_goal_round_cap(Some(&empty), 777).await, 777);
+    }
 
     #[test]
     fn terminal_persistence_warnings_are_emitted_once() {
@@ -6630,7 +7291,7 @@ mod tests {
 
         assert!(matches!(
             events.try_recv(),
-            Ok(CodingRuntimeEvent::ControllerWarning(message))
+            Ok(CodingRuntimeEvent::PersistenceWarning(message))
                 if message == "transcript write failed"
         ));
         assert!(matches!(
@@ -7014,6 +7675,58 @@ mod tests {
                     atomcode_kernel::stream::StreamEvent::Done { truncated: false },
                 ],
             ])))
+        }
+    }
+
+    /// A provider that answers the goal EVALUATOR with `Verdict: yes` (so a goal reaches
+    /// Satisfied) but the follow-up CLASSIFIER with a configured `Class:` line —
+    /// distinguished by the system prompt. Lets a test drive to Satisfied and then
+    /// exercise a specific classifier verdict on the next submit.
+    struct ClassifierProvider {
+        class_line: &'static str,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for ClassifierProvider {
+        fn model_name(&self) -> &str {
+            "classifier-test-provider"
+        }
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _tools: &[atomcode_kernel::tool::ToolDef],
+            _options: &atomcode_kernel::provider::ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            use atomcode_kernel::stream::StreamEvent;
+            let is_classifier = messages
+                .first()
+                .map(|m| m.text.contains("classify"))
+                .unwrap_or(false);
+            let reply = if is_classifier {
+                self.class_line
+            } else {
+                "Verdict: yes goal met"
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                StreamEvent::TextDelta(reply.into()),
+                StreamEvent::Done { truncated: false },
+            ])))
+        }
+    }
+    struct ClassifierProviderFactory {
+        class_line: &'static str,
+    }
+    impl CodingProviderFactory for ClassifierProviderFactory {
+        fn build(
+            &self,
+            _config: &CodingAgentConfig,
+            _session_id: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+            Ok(Arc::new(ClassifierProvider {
+                class_line: self.class_line,
+            }))
         }
     }
 
@@ -7834,6 +8547,195 @@ mod tests {
                 reason: StopReason::Stopped,
                 ..
             }
+        ));
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_waits_for_snapshot_and_rejects_a_racing_submit() {
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
+
+        handle.start_goal("finish the task").await.unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                active: true,
+                ..
+            }))
+        ));
+        handle
+            .submit(UserInput::from("long running goal"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+
+        handle.cancel().await.unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Cancel)
+        ));
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        assert_eq!(
+            handle
+                .submit(UserInput::from("must not become a lost steer"))
+                .await,
+            Err(RuntimeError::Busy)
+        );
+
+        let retained = SessionSnapshot::new(vec![
+            Message::user("long running goal"),
+            Message::assistant("completed work before interruption", vec![]),
+        ]);
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: retained.clone(),
+            })
+            .unwrap();
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::TurnFinished(completion)) => break completion,
+                    Some(_) => {}
+                    None => panic!("runtime events closed before cancel terminal"),
+                }
+            }
+        })
+        .await
+        .expect("cancel snapshot did not produce a terminal");
+        assert!(matches!(
+            terminal,
+            TurnCompletion::Completed {
+                reason: StopReason::Cancelled,
+                snapshot,
+                ..
+            } if snapshot.as_ref() == &retained
+        ));
+        assert_eq!(handle.status().phase, RuntimePhase::Ready);
+
+        handle
+            .submit(UserInput::from("continue after cancel"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { text, .. }) if text == "continue after cancel"
+        ));
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pause_goal_cancels_only_the_turn_and_next_submit_resumes_goal() {
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
+
+        handle.start_goal("finish the task").await.unwrap();
+        let _ = runtime_events.recv().await;
+        handle.submit(UserInput::from("start work")).await.unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+
+        handle.pause_goal().await.unwrap();
+        assert!(matches!(kernel_commands.recv().await, Some(AgentCommand::Cancel)));
+        assert!(matches!(kernel_commands.recv().await, Some(AgentCommand::Snapshot)));
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                active: false,
+                phase: GoalPhase::Paused,
+                terminal: None,
+                ..
+            }))
+        ));
+
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::user("start work")]),
+            })
+            .unwrap();
+        loop {
+            if matches!(
+                runtime_events.recv().await,
+                Some(CodingRuntimeEvent::TurnFinished(_))
+            ) {
+                break;
+            }
+        }
+
+        handle.submit(UserInput::from("continue")).await.unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                active: true,
+                phase: GoalPhase::Pursuing,
+                condition,
+                ..
+            })) if condition == "finish the task"
+        ));
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { text, .. }) if text == "continue"
+        ));
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_clears_a_paused_goal_without_an_active_turn() {
+        let (
+            handle,
+            _kernel_commands,
+            _kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
+
+        handle.start_goal("finish the task").await.unwrap();
+        let _ = runtime_events.recv().await;
+        handle.pause_goal().await.unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                phase: GoalPhase::Paused,
+                ..
+            }))
+        ));
+
+        handle.cancel().await.unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                active: false,
+                phase: GoalPhase::Ended,
+                terminal: Some(GoalTerminal::Cancelled),
+                ..
+            }))
         ));
 
         handle.shutdown().await.unwrap();
@@ -10455,10 +11357,7 @@ mod tests {
                 }
             ))
         ));
-        assert!(matches!(
-            kernel_commands.recv().await,
-            Some(AgentCommand::Cancel)
-        ));
+        assert!(kernel_commands.try_recv().is_err());
         assert_eq!(handle.status().phase, RuntimePhase::Ready);
 
         assert!(runtime_events.try_recv().is_err());
@@ -10571,6 +11470,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_auto_mode_answers_only_approval_requests_without_prompting_driver() {
+        let (agent, mut kernel_commands, kernel_events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (runtime_tx, mut runtime_events) = mpsc::unbounded_channel();
+        let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
+        let start = native_start(false);
+        let parts = prepare_with_plugin_hook_source(
+            &start.agent,
+            start.prepare.clone(),
+            start.plugin_hooks.as_ref(),
+        )
+        .await
+        .unwrap();
+        let resources = RuntimeResources {
+            config: start.agent,
+            prepare: start.prepare,
+            provider_factory: start.provider_factory,
+            plugin_hooks: start.plugin_hooks,
+            parts,
+            wakeup_tx,
+            loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            image_preprocessor: None,
+        };
+        let _adapter = spawn_runtime_owner_with_protocol(
+            agent,
+            controls,
+            runtime_tx,
+            true,
+            true,
+            None,
+            Some(resources),
+            Some(wakeup_rx),
+        );
+
+        handle.set_mode(RuntimeMode::Auto).await.unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::ModeChanged {
+                mode: RuntimeMode::Auto
+            })
+        ));
+        handle.submit(UserInput::from("auto turn")).await.unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+
+        kernel_events
+            .send(AgentEvent::Request {
+                id: 42,
+                kind: APPROVAL_KIND.into(),
+                payload: serde_json::json!({"tool": "task"}),
+            })
+            .unwrap();
+        let expected = serde_json::to_value(ApprovalResponse::allow()).unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Respond { id: 42, value }) if value == expected
+        ));
+        assert_eq!(handle.status().phase, RuntimePhase::InTurn);
+        assert!(runtime_events.try_recv().is_err());
+
+        kernel_events
+            .send(AgentEvent::Request {
+                id: 43,
+                kind: "request_user_input".into(),
+                payload: serde_json::json!({"question": "choose"}),
+            })
+            .unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::Request(RuntimeRequest {
+                id: 43,
+                ref kind,
+                ..
+            })) if kind == "request_user_input"
+        ));
+        assert_eq!(handle.status().phase, RuntimePhase::WaitingApproval);
+
+        handle.respond(43, serde_json::Value::Null).await.unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Respond { id: 43, .. })
+        ));
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn provider_reassemble_commits_one_generation_and_tags_events_at_emit_time() {
         let mut runtime = CodingRuntime::start(native_start(false)).await.unwrap();
         let mut next = CodingAgentConfig::new(
@@ -10619,6 +11606,146 @@ mod tests {
         runtime.handle.shutdown().await.unwrap();
     }
 
+    async fn hanging_provider_reassemble_runtime(
+        emit_verified_terminal: bool,
+    ) -> (
+        CodingRuntimeHandle,
+        mpsc::UnboundedReceiver<CodingRuntimeEvent>,
+        KernelRuntimeAdapter,
+    ) {
+        let (commands, mut command_rx) = mpsc::unbounded_channel();
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            while let Some(command) = command_rx.recv().await {
+                if matches!(command, AgentCommand::Shutdown) {
+                    if emit_verified_terminal {
+                        let _ = event_tx.send(AgentEvent::TurnComplete {
+                            reason: StopReason::Cancelled,
+                        });
+                        let _ = event_tx.send(AgentEvent::Snapshot {
+                            snapshot: SessionSnapshot::new(vec![Message::user(
+                                "verified interrupted turn",
+                            )]),
+                        });
+                    }
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+        let agent = AgentHandle {
+            commands,
+            events,
+            task,
+        };
+        let (handle, controls) = coding_runtime_control_channel();
+        let (runtime_tx, runtime_events) = mpsc::unbounded_channel();
+        let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
+        let start = native_start(false);
+        let parts = prepare_with_plugin_hook_source(
+            &start.agent,
+            start.prepare.clone(),
+            start.plugin_hooks.as_ref(),
+        )
+        .await
+        .unwrap();
+        let resources = RuntimeResources {
+            config: start.agent,
+            prepare: start.prepare,
+            provider_factory: start.provider_factory,
+            plugin_hooks: start.plugin_hooks,
+            parts,
+            wakeup_tx,
+            loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            image_preprocessor: None,
+        };
+        let adapter = spawn_runtime_owner_with_protocol(
+            agent,
+            controls,
+            runtime_tx,
+            true,
+            true,
+            None,
+            Some(resources),
+            Some(wakeup_rx),
+        );
+        (handle, runtime_events, adapter)
+    }
+
+    #[tokio::test]
+    async fn provider_reassemble_fails_closed_when_the_active_agent_cannot_stop() {
+        let (handle, mut runtime_events, _adapter) =
+            hanging_provider_reassemble_runtime(false).await;
+
+        handle
+            .submit(UserInput::from("unfinished turn"))
+            .await
+            .unwrap();
+        let next = CodingAgentConfig::new(
+            "next-key",
+            "https://next.example.test/v1",
+            "next-model",
+            ".",
+        );
+        assert!(matches!(
+            handle.reassemble_provider(next).await,
+            Err(RuntimeError::ReconfigureFailed(message))
+                if message.contains("latest conversation snapshot could not be verified")
+        ));
+        assert_eq!(handle.status().phase, RuntimePhase::Failed);
+
+        let mut saw_unavailable_terminal = false;
+        while let Ok(event) = runtime_events.try_recv() {
+            match event {
+                CodingRuntimeEvent::TurnFinished(TurnCompletion::SnapshotUnavailable {
+                    ..
+                }) => {
+                    saw_unavailable_terminal = true;
+                }
+                CodingRuntimeEvent::ProviderChanged { .. }
+                | CodingRuntimeEvent::Reconfigured { .. } => {
+                    panic!("a forced stop must not publish provider reconfigure success")
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_unavailable_terminal);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_reassemble_accepts_a_verified_terminal_before_forced_cleanup() {
+        let (handle, mut runtime_events, _adapter) =
+            hanging_provider_reassemble_runtime(true).await;
+        handle
+            .submit(UserInput::from("unfinished turn"))
+            .await
+            .unwrap();
+        let next = CodingAgentConfig::new(
+            "next-key",
+            "https://next.example.test/v1",
+            "next-model",
+            ".",
+        );
+
+        assert_eq!(
+            handle.reassemble_provider(next).await.unwrap(),
+            RuntimeGeneration(1)
+        );
+        assert_eq!(handle.status().phase, RuntimePhase::Ready);
+        let mut changed = false;
+        while let Ok(event) = runtime_events.try_recv() {
+            if matches!(event, CodingRuntimeEvent::ProviderChanged { .. }) {
+                changed = true;
+            }
+            assert!(!matches!(
+                event,
+                CodingRuntimeEvent::TurnFinished(TurnCompletion::SnapshotUnavailable { .. })
+            ));
+        }
+        assert!(changed);
+        handle.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
     async fn provider_reassemble_updates_cost_attribution_and_failed_reload_keeps_current_model() {
@@ -10641,6 +11768,8 @@ mod tests {
             .await
             .unwrap();
         wait_for_turn_finished(&mut runtime).await;
+        let model_a_context = runtime.handle.context_stats().await.unwrap();
+        assert!(model_a_context.used_tokens > 0);
 
         let mut model_b =
             CodingAgentConfig::new("key", "https://example.test/v1", "model-b", project.path());
@@ -10650,6 +11779,9 @@ mod tests {
             .reassemble_provider(model_b.clone())
             .await
             .unwrap();
+        let reassembled_context = runtime.handle.context_stats().await.unwrap();
+        assert_eq!(reassembled_context.model, "model-b");
+        assert_eq!(reassembled_context.used_tokens, model_a_context.used_tokens);
         runtime
             .handle
             .submit(UserInput::from("model b turn"))
@@ -11275,7 +12407,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
-    #[ignore = "workspace Rewind is intentionally disabled in v5.0.4"]
+    #[ignore = "workspace Rewind is intentionally disabled in v5.0.5"]
     async fn code_only_rewind_restores_workspace_but_keeps_conversation() {
         let (_home, _project, generated, runtime, point) = mutating_rewind_runtime(false).await;
 
@@ -11306,7 +12438,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
-    #[ignore = "workspace Rewind is intentionally disabled in v5.0.4"]
+    #[ignore = "workspace Rewind is intentionally disabled in v5.0.5"]
     async fn combined_rewind_restores_workspace_and_conversation() {
         let (_home, _project, generated, runtime, point) = mutating_rewind_runtime(false).await;
 
@@ -11340,7 +12472,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
-    #[ignore = "workspace Rewind is intentionally disabled in v5.0.4"]
+    #[ignore = "workspace Rewind is intentionally disabled in v5.0.5"]
     async fn code_rewind_preserves_workspace_changes_made_after_the_turn() {
         let (_home, _project, generated, runtime, point) = mutating_rewind_runtime(false).await;
         std::fs::write(&generated, "user changed this after the turn\n").unwrap();
@@ -11362,7 +12494,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
-    #[ignore = "workspace Rewind is intentionally disabled in v5.0.4"]
+    #[ignore = "workspace Rewind is intentionally disabled in v5.0.5"]
     async fn combined_rewind_compensates_workspace_when_agent_rebuild_fails() {
         let (_home, _project, generated, runtime, point) = mutating_rewind_runtime(true).await;
 
@@ -11392,7 +12524,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
-    #[ignore = "workspace Rewind is intentionally disabled in v5.0.4"]
+    #[ignore = "workspace Rewind is intentionally disabled in v5.0.5"]
     async fn cancelled_rewind_transaction_compensates_and_releases_runtime() {
         let (_home, _project, generated, runtime, point) = mutating_rewind_runtime(false).await;
         let catalog = runtime.handle.rewind_points().await.unwrap();
@@ -11437,7 +12569,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
-    #[ignore = "workspace Rewind is intentionally disabled in v5.0.4"]
+    #[ignore = "workspace Rewind is intentionally disabled in v5.0.5"]
     async fn cancelled_begin_receiver_is_recovered_by_runtime_owner() {
         let (_home, _project, generated, runtime, point) = mutating_rewind_runtime(false).await;
         let catalog = runtime.handle.rewind_points().await.unwrap();
@@ -11479,7 +12611,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
-    #[ignore = "workspace Rewind is intentionally disabled in v5.0.4"]
+    #[ignore = "workspace Rewind is intentionally disabled in v5.0.5"]
     async fn abandoned_rewind_recovers_after_undo_advances_generation() {
         let (_home, _project, _generated, runtime, point) = mutating_rewind_runtime(false).await;
         let catalog = runtime.handle.rewind_points().await.unwrap();
@@ -11531,7 +12663,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
-    #[ignore = "workspace Rewind is intentionally disabled in v5.0.4"]
+    #[ignore = "workspace Rewind is intentionally disabled in v5.0.5"]
     async fn rewind_from_stale_catalog_is_not_reinterpreted_against_live_state() {
         let (_home, _project, _generated, runtime, point) = mutating_rewind_runtime(false).await;
         let mut stale = runtime.handle.rewind_points().await.unwrap();
@@ -12166,5 +13298,661 @@ mod tests {
             .messages
             .iter()
             .any(|message| message.text.contains("anchored summary")));
+    }
+
+    // After the evaluator returns Met, the runtime must keep the goal registered
+    // with phase=Satisfied (not clear it).  The last GoalChanged event must carry
+    // phase==Satisfied and active==false.
+    //
+    // NOTE: This test validates the *event contract only* — it observes the
+    // GoalChanged(phase=Satisfied) event, which fires before any potential
+    // goal=None clearing, so it was green even before the keep-goal-on-Met fix
+    // and does NOT falsify the in-memory keep-goal change.  The falsifying
+    // coverage (confirming a still-registered goal after Met) arrives in Task 4
+    // (Submit-while-Satisfied), which can only succeed if `goal` is still set.
+    #[tokio::test]
+    async fn met_goal_keeps_goal_registered_with_phase_satisfied() {
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(GoalMetProviderFactory)).await;
+
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await; // GoalChanged(active=true)
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("done", vec![])]),
+            })
+            .unwrap();
+
+        // Drain events until TurnFinished; collect the last GoalChanged seen.
+        let mut last_goal_progress: Option<GoalProgress> = None;
+        let _terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::GoalChanged(p)) => last_goal_progress = Some(p),
+                    Some(CodingRuntimeEvent::TurnFinished(completion)) => break completion,
+                    Some(_) => {}
+                    None => panic!("runtime events closed before met terminal"),
+                }
+            }
+        })
+        .await
+        .expect("met goal did not produce a turn terminal");
+
+        let progress = last_goal_progress.expect("no GoalChanged event was emitted after Met");
+        assert_eq!(
+            progress.phase,
+            GoalPhase::Satisfied,
+            "goal phase must be Satisfied after Met; got {:?}",
+            progress.phase
+        );
+        assert!(!progress.active, "goal must be inactive after Met");
+        assert_eq!(
+            progress.terminal,
+            Some(GoalTerminal::Met),
+            "goal terminal must be Met"
+        );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    // After a round-cap fires, the runtime must keep the goal registered with
+    // phase=PausedAtCap (not clear it).  The last GoalChanged event must carry
+    // phase==PausedAtCap and active==false.
+    #[tokio::test]
+    async fn cap_goal_keeps_goal_registered_with_phase_paused_at_cap() {
+        let mut config = native_start(false).agent;
+        config.goal_max_rounds = 1;
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime_with_config(
+            Arc::new(GoalNotMetProviderFactory::default()),
+            config,
+        )
+        .await;
+
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await; // GoalChanged(active=true)
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        let _ = kernel_commands.recv().await;
+
+        for attempt in 0..2 {
+            kernel_events
+                .send(AgentEvent::TurnComplete {
+                    reason: StopReason::Stopped,
+                })
+                .unwrap();
+            assert!(matches!(
+                kernel_commands.recv().await,
+                Some(AgentCommand::Snapshot)
+            ));
+            kernel_events
+                .send(AgentEvent::Snapshot {
+                    snapshot: SessionSnapshot::new(vec![Message::assistant("not done", vec![])]),
+                })
+                .unwrap();
+            if attempt == 0 {
+                // First round: evaluator says NotMet → continuation dispatched.
+                assert!(matches!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        kernel_commands.recv()
+                    )
+                    .await
+                    .expect("first goal continuation was not dispatched"),
+                    Some(AgentCommand::SendSyntheticMessage { .. })
+                ));
+            }
+        }
+
+        // Drain events until TurnFinished; collect the last GoalChanged seen.
+        let mut last_goal_progress: Option<GoalProgress> = None;
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::GoalChanged(p)) => last_goal_progress = Some(p),
+                    Some(CodingRuntimeEvent::TurnFinished(completion)) => break completion,
+                    Some(_) => {}
+                    None => panic!("runtime events closed before cap terminal"),
+                }
+            }
+        })
+        .await
+        .expect("goal round cap did not produce a turn terminal");
+
+        assert!(matches!(
+            terminal,
+            TurnCompletion::Completed {
+                reason: StopReason::MaxRounds,
+                ..
+            }
+        ));
+
+        let progress = last_goal_progress
+            .expect("no GoalChanged event was emitted after round cap");
+        assert_eq!(
+            progress.phase,
+            GoalPhase::PausedAtCap,
+            "goal phase must be PausedAtCap after round cap; got {:?}",
+            progress.phase
+        );
+        assert!(!progress.active, "goal must be inactive after round cap");
+        assert_eq!(
+            progress.terminal,
+            Some(GoalTerminal::Stopped),
+            "goal terminal must be Stopped after round cap"
+        );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    // When the goal is PausedAtCap and the user submits, the runtime must:
+    // 1. Emit GoalChanged with phase==Pursuing (round reset to 0)
+    // 2. Deliver the submitted input as the normal user message (SendMessage)
+    #[tokio::test]
+    async fn submit_while_paused_at_cap_resumes_goal_and_delivers_message() {
+        let mut config = native_start(false).agent;
+        config.goal_max_rounds = 1;
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime_with_config(
+            Arc::new(GoalNotMetProviderFactory::default()),
+            config,
+        )
+        .await;
+
+        // --- Drive the goal to PausedAtCap ---
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await; // GoalChanged(active=true)
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        let _ = kernel_commands.recv().await; // SendMessage
+
+        for attempt in 0..2 {
+            kernel_events
+                .send(AgentEvent::TurnComplete {
+                    reason: StopReason::Stopped,
+                })
+                .unwrap();
+            assert!(matches!(
+                kernel_commands.recv().await,
+                Some(AgentCommand::Snapshot)
+            ));
+            kernel_events
+                .send(AgentEvent::Snapshot {
+                    snapshot: SessionSnapshot::new(vec![Message::assistant("not done", vec![])]),
+                })
+                .unwrap();
+            if attempt == 0 {
+                // First round: evaluator says NotMet → continuation dispatched.
+                assert!(matches!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        kernel_commands.recv()
+                    )
+                    .await
+                    .expect("first goal continuation was not dispatched"),
+                    Some(AgentCommand::SendSyntheticMessage { .. })
+                ));
+            }
+        }
+
+        // Wait until we see TurnFinished (goal capped) - drain GoalChanged events.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::TurnFinished(_)) => break,
+                    Some(_) => {}
+                    None => panic!("events closed before cap terminal"),
+                }
+            }
+        })
+        .await
+        .expect("cap turn did not finish");
+
+        // --- Goal is now PausedAtCap; submit new message ---
+        let submit_text = "please continue";
+        handle
+            .submit(UserInput::from(submit_text))
+            .await
+            .unwrap();
+
+        // Collect events until we see SendMessage or timeout.
+        let mut saw_goal_changed_pursuing = false;
+        let mut saw_send_message_with_input = false;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    // biased; ensures runtime_events is drained before
+                    // kernel_commands, matching the emission order (GoalChanged
+                    // is enqueued before SendMessage) and preventing CI flakes.
+                    biased;
+                    event = runtime_events.recv() => {
+                        match event {
+                            Some(CodingRuntimeEvent::GoalChanged(p)) => {
+                                if p.phase == GoalPhase::Pursuing && p.round == 0 {
+                                    saw_goal_changed_pursuing = true;
+                                }
+                            }
+                            Some(_) => {}
+                            None => break,
+                        }
+                    }
+                    cmd = kernel_commands.recv() => {
+                        match cmd {
+                            Some(AgentCommand::SendMessage { text, .. }) => {
+                                if text == submit_text {
+                                    saw_send_message_with_input = true;
+                                }
+                                break;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("submit after PausedAtCap did not deliver message within timeout");
+
+        assert!(
+            saw_goal_changed_pursuing,
+            "submit while PausedAtCap must emit GoalChanged(phase=Pursuing, round=0)"
+        );
+        assert!(
+            saw_send_message_with_input,
+            "submit while PausedAtCap must deliver the input as a user message"
+        );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    // When the goal is Satisfied and the user submits a follow-up, the runtime must
+    // RE-ENGAGE the goal (same as PausedAtCap): resume it into Pursuing (round 0) and
+    // deliver the input as the resumed goal round's user message.
+    #[tokio::test]
+    async fn submit_while_satisfied_reengages_goal_and_delivers_message() {
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(GoalMetProviderFactory)).await;
+
+        // --- Drive the goal to Satisfied ---
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await; // GoalChanged(active=true)
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("done", vec![])]),
+            })
+            .unwrap();
+
+        // Wait until TurnFinished (goal Met/Satisfied).
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::TurnFinished(_)) => break,
+                    Some(_) => {}
+                    None => panic!("events closed before met terminal"),
+                }
+            }
+        })
+        .await
+        .expect("satisfied turn did not finish");
+
+        // --- Goal is now Satisfied; submit new message ---
+        let submit_text = "follow-up question";
+        handle
+            .submit(UserInput::from(submit_text))
+            .await
+            .unwrap();
+
+        // Collect until SendMessage; assert no GoalChanged(Pursuing) seen.
+        let mut saw_goal_changed_pursuing = false;
+        let mut saw_send_message_with_input = false;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    // biased: GoalChanged(Pursuing) is emitted before SendMessage.
+                    biased;
+                    event = runtime_events.recv() => {
+                        match event {
+                            Some(CodingRuntimeEvent::GoalChanged(p)) => {
+                                if p.phase == GoalPhase::Pursuing && p.round == 0 {
+                                    saw_goal_changed_pursuing = true;
+                                }
+                            }
+                            Some(_) => {}
+                            None => break,
+                        }
+                    }
+                    cmd = kernel_commands.recv() => {
+                        match cmd {
+                            Some(AgentCommand::SendMessage { text, .. }) => {
+                                if text == submit_text {
+                                    saw_send_message_with_input = true;
+                                }
+                                break;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("submit after Satisfied did not deliver message within timeout");
+
+        assert!(
+            saw_goal_changed_pursuing,
+            "submit while Satisfied must RE-ENGAGE the goal (GoalChanged Pursuing, round=0)"
+        );
+        assert!(
+            saw_send_message_with_input,
+            "submit while Satisfied must deliver the input as the resumed goal round's message"
+        );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    // Classifier says NEW-GOAL: the satisfied goal re-engages AND re-tasks its
+    // condition to the follow-up (badge shows the NEW question · round 1).
+    #[tokio::test]
+    async fn submit_while_satisfied_new_goal_retasks_condition() {
+        let (handle, mut kernel_commands, kernel_events, mut runtime_events, _w, _l, _a) =
+            controller_test_runtime(Arc::new(ClassifierProviderFactory {
+                class_line: "Class: new-goal",
+            }))
+            .await;
+        // --- Drive the goal to Satisfied ---
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await; // GoalChanged(active=true)
+        handle.submit(UserInput::from("initial turn")).await.unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        kernel_events
+            .send(AgentEvent::TurnComplete { reason: StopReason::Stopped })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("done", vec![])]),
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::TurnFinished(_)) => break,
+                    Some(_) => {}
+                    None => panic!("events closed before met terminal"),
+                }
+            }
+        })
+        .await
+        .expect("satisfied turn did not finish");
+
+        let submit_text = "an entirely different task";
+        handle.submit(UserInput::from(submit_text)).await.unwrap();
+
+        let mut saw_retasked_pursuing = false;
+        let mut saw_send_message = false;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    event = runtime_events.recv() => match event {
+                        Some(CodingRuntimeEvent::GoalChanged(p)) => {
+                            if p.phase == GoalPhase::Pursuing
+                                && p.round == 0
+                                && p.condition == submit_text
+                            {
+                                saw_retasked_pursuing = true;
+                            }
+                        }
+                        Some(_) => {}
+                        None => break,
+                    },
+                    cmd = kernel_commands.recv() => match cmd {
+                        Some(AgentCommand::SendMessage { text, .. }) => {
+                            saw_send_message = text == submit_text;
+                            break;
+                        }
+                        _ => break,
+                    },
+                }
+            }
+        })
+        .await
+        .expect("new-goal submit did not deliver within timeout");
+
+        assert!(
+            saw_retasked_pursuing,
+            "new-goal must resume Pursuing AND re-task the condition to the new message"
+        );
+        assert!(saw_send_message, "the new message must be delivered");
+        handle.shutdown().await.unwrap();
+    }
+
+    // Classifier says NOT-A-GOAL (chit-chat): the goal is NOT re-engaged — the message
+    // runs as an ordinary turn and no GoalChanged(Pursuing) is emitted.
+    #[tokio::test]
+    async fn submit_while_satisfied_not_a_goal_does_not_reengage() {
+        let (handle, mut kernel_commands, kernel_events, mut runtime_events, _w, _l, _a) =
+            controller_test_runtime(Arc::new(ClassifierProviderFactory {
+                class_line: "Class: not-a-goal",
+            }))
+            .await;
+        // --- Drive the goal to Satisfied ---
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await; // GoalChanged(active=true)
+        handle.submit(UserInput::from("initial turn")).await.unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        kernel_events
+            .send(AgentEvent::TurnComplete { reason: StopReason::Stopped })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("done", vec![])]),
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::TurnFinished(_)) => break,
+                    Some(_) => {}
+                    None => panic!("events closed before met terminal"),
+                }
+            }
+        })
+        .await
+        .expect("satisfied turn did not finish");
+
+        let submit_text = "thanks!";
+        handle.submit(UserInput::from(submit_text)).await.unwrap();
+
+        let mut saw_goal_changed_pursuing = false;
+        let mut saw_send_message = false;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    event = runtime_events.recv() => match event {
+                        Some(CodingRuntimeEvent::GoalChanged(p)) => {
+                            if p.phase == GoalPhase::Pursuing {
+                                saw_goal_changed_pursuing = true;
+                            }
+                        }
+                        Some(_) => {}
+                        None => break,
+                    },
+                    cmd = kernel_commands.recv() => match cmd {
+                        Some(AgentCommand::SendMessage { text, .. }) => {
+                            saw_send_message = text == submit_text;
+                            break;
+                        }
+                        _ => break,
+                    },
+                }
+            }
+        })
+        .await
+        .expect("not-a-goal submit did not deliver within timeout");
+
+        assert!(saw_send_message, "the message must run as an ordinary turn");
+        assert!(
+            !saw_goal_changed_pursuing,
+            "not-a-goal must NOT re-engage the goal (no GoalChanged Pursuing)"
+        );
+        handle.shutdown().await.unwrap();
+    }
+
+    // Fast-path: an empty / whitespace-only submit after a Satisfied goal skips the
+    // classifier entirely and does NOT re-engage — no GoalChanged(Pursuing).
+    #[tokio::test]
+    async fn submit_while_satisfied_empty_input_skips_classifier() {
+        let (handle, mut kernel_commands, kernel_events, mut runtime_events, _w, _l, _a) =
+            controller_test_runtime(Arc::new(GoalMetProviderFactory)).await;
+
+        // --- Drive the goal to Satisfied ---
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await; // GoalChanged(active=true)
+        handle.submit(UserInput::from("initial turn")).await.unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        kernel_events
+            .send(AgentEvent::TurnComplete { reason: StopReason::Stopped })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("done", vec![])]),
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::TurnFinished(_)) => break,
+                    Some(_) => {}
+                    None => panic!("events closed before met terminal"),
+                }
+            }
+        })
+        .await
+        .expect("satisfied turn did not finish");
+
+        // Whitespace-only submit → fast-path, no classifier, no re-engage.
+        handle.submit(UserInput::from("   ")).await.unwrap();
+        let mut saw_goal_changed_pursuing = false;
+        let mut saw_send_message = false;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    event = runtime_events.recv() => match event {
+                        Some(CodingRuntimeEvent::GoalChanged(p)) => {
+                            if p.phase == GoalPhase::Pursuing {
+                                saw_goal_changed_pursuing = true;
+                            }
+                        }
+                        Some(_) => {}
+                        None => break,
+                    },
+                    cmd = kernel_commands.recv() => match cmd {
+                        Some(AgentCommand::SendMessage { .. }) => {
+                            saw_send_message = true;
+                            break;
+                        }
+                        _ => break,
+                    },
+                }
+            }
+        })
+        .await
+        .expect("empty submit did not deliver within timeout");
+
+        assert!(saw_send_message, "the (empty) message still runs as an ordinary turn");
+        assert!(
+            !saw_goal_changed_pursuing,
+            "empty input must NOT re-engage the goal (classifier skipped)"
+        );
+        handle.shutdown().await.unwrap();
     }
 }

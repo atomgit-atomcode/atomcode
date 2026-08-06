@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-5.0.4-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-5.0.5-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS%20PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -340,16 +340,20 @@ atomcode --prompt-file task.md
 | `Enter` | 发送消息 |
 | `Shift+Enter` | 换行（需要终端支持 Kitty 键盘协议） |
 | `Ctrl+Enter` | 换行（需要终端支持 Kitty 键盘协议） |
+| `Ctrl+J` | 换行（终端能区分该组合键时） |
 | `Alt+Enter` | 换行（多数终端可用，见下方兼容性说明） |
 | `\` + `Enter` | 换行（所有终端通用——输入一个 `\` 后按回车，`\` 会被自动删除） |
 | `Esc` | 清空输入 / 取消流式输出 |
 | `Esc` ×2 | 撤销上一轮 |
 | `Up/Down` | 浏览输入历史 |
-| `Tab` | 接受补全 |
+| `Tab / Shift+Tab` | 有菜单时接受补全；无菜单时切换下一个 / 上一个执行模式 |
+| `F2 / Shift+F2` | 切换下一个 / 上一个模型（Mac 通常按 `Fn+F2 / Fn+Shift+F2`） |
+| `Ctrl+R` | 反向搜索输入历史 |
+| `Ctrl+T` | 切换 `reasoning_effort` |
 | `Ctrl+U` | 清空当前行 |
 | `Ctrl+W` | 删除一个单词 |
 | `Ctrl+K` | 删除到行尾 |
-| `Ctrl+V` | 从剪贴板粘贴图片（Windows 下请改用 `/paste`，见下方说明） |
+| `Ctrl+V / Ctrl+Alt+V` | 从剪贴板粘贴文本或图片（Windows 也可用 `/paste`） |
 
 > **换行快捷键的终端兼容性：**
 > - `Shift+Enter`、`Ctrl+Enter` 需要终端支持 Kitty 键盘协议 — kitty、WezTerm、Alacritty、iTerm2 ≥3.5、Windows Terminal ≥1.21。不支持的终端（以及 Windows，atomcode 在其上不启用该协议）会把它们退化成普通 `Enter`（直接发送消息）—— 请改用 `\` + `Enter`，它在所有终端都生效。
@@ -367,9 +371,11 @@ atomcode --prompt-file task.md
 
 | 键位 | 动作 |
 |-----|--------|
-| `Ctrl+Up/Down` | 滚动聊天区（3 行） |
-| `PageUp/PageDown` | 滚动聊天区（一页） |
-| `Ctrl+L` | 清空对话 |
+| `Shift+Up/Down` | 滚动聊天区（一行） |
+| `PageUp/PageDown` | 滚动聊天区（10 行） |
+| `Alt+Up/Down` | 跳到上一条 / 下一条消息 |
+| `Ctrl+Up/Down` | 跳到上一条 / 下一条用户消息 |
+| 空输入时 `Home/End` | 跳到对话顶部 / 底部 |
 | `Ctrl+Shift+C` | 复制选中内容 |
 | `Ctrl+C` | 取消当前操作（连按两次退出） |
 

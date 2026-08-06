@@ -273,17 +273,32 @@ fn wildcard_match(pattern: &str, s: &str) -> bool {
     true
 }
 
-/// A lockfile / dependency manifest — low review value (formatters/tools own it, "no finding"
-/// is expected). Single source of truth reused by the impact plan (skip as a review target)
-/// and the CLI coverage backstop (don't re-review). Union of the common ecosystems.
+/// A lockfile / dependency manifest / markdown doc / recipe scaffold — low review value
+/// (formatters/tools own it, or prose/metadata with no executable logic). "No finding" is
+/// expected. Single source of truth reused by the impact plan (skip as a review target) and
+/// the CLI coverage backstop (don't re-review). Aligns with service DefaultIgnorePatterns.
 pub fn is_low_signal_file(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    lower.ends_with(".lock")            // Cargo.lock, poetry.lock, Gemfile.lock, …
+    let base = lower.rsplit('/').next().unwrap_or(&lower);
+    lower.ends_with(".lock") // Cargo.lock, poetry.lock, Gemfile.lock, …
         || lower.ends_with("cargo.lock")
         || lower.ends_with("go.sum")
         || lower.ends_with("package-lock.json")
         || lower.ends_with("pnpm-lock.yaml")
         || lower.ends_with("yarn.lock")
+        // Docs / scaffold: not executable logic; reviewing them inflates rules injection.
+        || lower.ends_with(".md")
+        || lower.ends_with(".markdown")
+        || lower.ends_with(".txt")
+        || lower.ends_with(".rst")
+        || lower.ends_with(".adoc")
+        || base == "commands.json"
+        || base == "manifest.yml"
+        || base == "manifest.yaml"
+        || base == ".audit-result.json"
+        || base == ".feedback-state.json"
+        || base == ".submit-state.json"
+        || base == ".packaged"
 }
 
 #[cfg(test)]
@@ -299,10 +314,28 @@ mod tests {
             "pnpm-lock.yaml",
             "yarn.lock",
             "poetry.lock",
+            "README.md",
+            "docs/notes.MD",
+            "guide.markdown",
+            "archives/g/pkg/commands.json",
+            "pkg/test_package/MANIFEST.yml",
+            "pkg/1.0/manifest.yaml",
+            "pkg/MANIFEST.yaml",
+            "pkg/.audit-result.json",
+            "pkg/.packaged",
         ] {
             assert!(is_low_signal_file(p), "{p} should be low-signal");
         }
-        for p in ["src/main.rs", "pkg/a.go", "go.mod", "README.md"] {
+        for p in [
+            "src/main.rs",
+            "pkg/a.go",
+            "go.mod",
+            "conanfile.py",
+            "config.yaml",
+            "conandata.yml",
+            "patches/0001-fix.patch",
+            "test_package/test.c",
+        ] {
             assert!(!is_low_signal_file(p), "{p} should NOT be low-signal");
         }
     }

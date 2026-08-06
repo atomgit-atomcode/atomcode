@@ -759,7 +759,7 @@ impl ToolMiddleware for CCExternalHooks {
                 }
             }
 
-            if matches!(gate, BeforeOutcome::Deny { .. }) {
+            if gate.is_deny() {
                 break; // deny is final.
             }
         }
@@ -777,7 +777,7 @@ impl ToolMiddleware for CCExternalHooks {
         // Remember this call's tool name for PostToolUse `after` (kernel hands it no tool
         // name), but ONLY for a call that will actually run — a Deny here means the tool is
         // blocked, so its PostToolUse must not fire. `after` removes the entry.
-        if self.has_post_tool_hooks && !matches!(gate, BeforeOutcome::Deny { .. }) {
+        if self.has_post_tool_hooks && !gate.is_deny() {
             if let Ok(mut m) = self.call_tools.lock() {
                 m.insert(call.id.clone(), call.name.clone());
             }
@@ -845,6 +845,7 @@ fn stronger(a: BeforeOutcome, b: BeforeOutcome) -> BeforeOutcome {
             BeforeOutcome::Allow { .. } => 1,
             BeforeOutcome::Ask { .. } => 2,
             BeforeOutcome::Deny { .. } => 3,
+            BeforeOutcome::DenyTurn { .. } => 4,
         }
     }
     if rank(&b) >= rank(&a) {

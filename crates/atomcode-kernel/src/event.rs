@@ -57,6 +57,9 @@ pub enum StopReason {
     Cancelled,
     /// A `user_prompt_submit` hook rejected the prompt — no turn ran.
     PromptRejected,
+    /// A tool middleware enforced a hard policy boundary. The blocked tool
+    /// result was persisted before the turn terminated, so provider pairing is valid.
+    PolicyDenied,
     /// The provider returned 429 and the host chose to PAUSE (reset too far to
     /// wait out). Not a failure — already-produced content is preserved.
     RateLimited,
@@ -181,7 +184,7 @@ pub enum AgentEvent {
     /// TERMINAL turn event. `reason` (FAILURE PERCEPTION) says WHY the turn ended —
     /// `Stopped` (normal) vs a failure/fuse (`ProviderError`/`Timeout`/`MaxRounds`/
     /// `MaxContinuations`/`RepeatLoop`/`ToolLoopDetected`/`Cancelled`/
-    /// `PromptRejected`). A driver can no longer mistake a failed turn for an empty
+    /// `PromptRejected`/`PolicyDenied`). A driver can no longer mistake a failed turn for an empty
     /// success.
     TurnComplete {
         reason: StopReason,

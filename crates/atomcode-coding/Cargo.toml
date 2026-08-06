@@ -48,6 +48,7 @@ chrono = "0.4"
 # check from a read-only `ls`/`git diff` dodge (discipline/verify.rs).
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
 
 [dev-dependencies]
 # in-memory capturing Telemetry for the TelemetryHook test.

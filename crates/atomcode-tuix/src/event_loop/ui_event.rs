@@ -137,6 +137,7 @@ pub enum UiEvent {
     GoalUpdate {
         active: bool,
         terminal: Option<atomcode_coding::GoalTerminal>,
+        phase: atomcode_coding::GoalPhase,
         round: u32,
         elapsed_secs: u64,
         condition: String,
@@ -165,6 +166,13 @@ pub enum UiEvent {
         system_prompt: String,
     },
     UserEcho(String),
+    /// Another live view answered a runtime-owned interactive request. The TUI
+    /// uses this driver-local terminal to dismiss only the matching panel; it
+    /// is presentation coordination, not a second runtime request terminal.
+    SharedRequestResolved {
+        request_id: atomcode_kernel::event::RequestId,
+        kind: String,
+    },
     PeerBusy(bool),
     ProviderChanged(String),
     ModeChanged {

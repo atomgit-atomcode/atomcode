@@ -289,6 +289,16 @@ impl BackgroundSlots {
                     .push(RuntimeEventPayload::Ui(event.clone()));
                 false
             }
+            AgentEvent::SharedRequestResolved { request_id, .. } => {
+                if bg
+                    .pending_request
+                    .as_ref()
+                    .is_some_and(|request| request.id == *request_id)
+                {
+                    bg.pending_request = None;
+                }
+                false
+            }
             _ => false,
         }
     }
@@ -763,6 +773,12 @@ impl BgRuntimeManager {
                 self.apply_background_session_name(runtime_id, name);
                 false
             }
+            RuntimeEventPayload::Native(event @ CodingRuntimeEvent::NextPromptSuggested { .. }) => {
+                if let Some(bg) = self.backgrounds.slot_mut_for_runtime_id(runtime_id) {
+                    bg.buffered_events.push(RuntimeEventPayload::Native(event));
+                }
+                false
+            }
             RuntimeEventPayload::Native(CodingRuntimeEvent::Agent(event)) => {
                 if let Some(bg) = self.backgrounds.slot_mut_for_runtime_id(runtime_id) {
                     if !matches!(
@@ -1108,6 +1124,30 @@ mod tests {
     }
 
     #[test]
+    fn a_new_background_turn_drops_the_previous_prompt_suggestion() {
+        let mut events = vec![
+            RuntimeEventPayload::Native(CodingRuntimeEvent::SessionNameSuggested {
+                name: "kept title".into(),
+            }),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::NextPromptSuggested {
+                generation: atomcode_coding::RuntimeGeneration(1),
+                session_id: Some("session-1".into()),
+                turn_id: 7,
+                text: "stale suggestion".into(),
+            }),
+        ];
+
+        retain_session_replay_events(&mut events);
+
+        assert!(matches!(
+            events.as_slice(),
+            [RuntimeEventPayload::Native(
+                CodingRuntimeEvent::SessionNameSuggested { name }
+            )] if name == "kept title"
+        ));
+    }
+
+    #[test]
     fn background_current_replaces_foreground_and_adds_slot() {
         let mut manager =
             BgRuntimeManager::new_for_test(Session::default_session(PathBuf::from("/tmp/project")));
@@ -1422,6 +1462,42 @@ mod tests {
     }
 
     #[test]
+    fn shared_resolution_prevents_background_request_from_reappearing_on_resume() {
+        let mut manager =
+            BgRuntimeManager::new_for_test(Session::default_session(PathBuf::from("/tmp/project")));
+        manager
+            .push_test_background(session("interactive task"), RuntimeState::Running)
+            .unwrap();
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::Request(
+                atomcode_coding::RuntimeRequest {
+                    id: 42,
+                    kind: atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND
+                        .into(),
+                    payload: serde_json::json!({}),
+                    snapshot: None,
+                },
+            )),
+        );
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Ui(AgentEvent::SharedRequestResolved {
+                request_id: 42,
+                kind: atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND
+                    .into(),
+            }),
+        );
+
+        let resumed = manager.resume_slot(1, RuntimeState::Idle).unwrap();
+        assert!(resumed.replay_events.iter().all(|event| !matches!(
+            event,
+            RuntimeEventPayload::Native(CodingRuntimeEvent::Request(request))
+                if request.id == 42
+        )));
+    }
+
+    #[test]
     fn background_session_name_is_persisted_before_updating_the_mirror() {
         let mut manager =
             BgRuntimeManager::new_for_test(Session::default_session(PathBuf::from("/tmp/project")));
@@ -1518,6 +1594,7 @@ mod tests {
             StopReason::ProviderError,
             StopReason::Timeout,
             StopReason::PromptRejected,
+            StopReason::PolicyDenied,
             StopReason::RateLimited,
         ] {
             let mut manager = BgRuntimeManager::new_for_test(Session::default_session(

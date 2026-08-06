@@ -79,6 +79,9 @@ pub async fn check(mw: Arc<dyn ToolMiddleware>) -> ConformanceReport {
                 BeforeOutcome::Allow { .. } => "Allow — force-approved".to_string(),
                 BeforeOutcome::Ask { .. } => "Ask — approval requested".to_string(),
                 BeforeOutcome::Deny { reason } => format!("Deny — blocked: {reason}"),
+                BeforeOutcome::DenyTurn { reason } => {
+                    format!("DenyTurn — blocked and turn terminated: {reason}")
+                }
             },
         ),
         Ok(Err(p)) => r.record(

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -44,8 +44,26 @@ pub struct LiveBinding {
 
 #[derive(Clone, Debug)]
 pub enum LiveViewEvent {
-    InputAccepted(UserInput),
+    InputAccepted {
+        input: UserInput,
+        client_input_id: Option<String>,
+    },
+    /// Browser-facing correlation for a kernel steer acknowledgement. The raw
+    /// runtime event is still published for embedded drivers such as the TUI;
+    /// this additive projection keeps transport identity out of the kernel.
+    Steered {
+        count: usize,
+        inputs: Vec<atomcode_kernel::event::SteeredInput>,
+        client_input_ids: Vec<Option<String>>,
+    },
     CommandOutput(String),
+    /// A driver successfully delivered the response for a previously published
+    /// runtime request. This is view coordination owned by the live hub, not a
+    /// second runtime terminal: peers use it to dismiss the matching prompt.
+    RequestResolved {
+        request_id: RequestId,
+        kind: String,
+    },
     Runtime(CodingRuntimeEvent),
 }
 
@@ -103,6 +121,48 @@ struct HubState {
     pending_requests: HashMap<RequestId, String>,
     turn_active: bool,
     last_runtime_sequence: Option<u64>,
+    pending_web_steers: VecDeque<PendingWebSteer>,
+}
+
+#[derive(Clone)]
+struct PendingWebSteer {
+    runtime_input: UserInput,
+    client_input_id: String,
+}
+
+fn remove_pending_web_steer_locked(state: &mut HubState, client_input_id: Option<&str>) {
+    let Some(client_input_id) = client_input_id else {
+        return;
+    };
+    if let Some(index) = state
+        .pending_web_steers
+        .iter()
+        .position(|pending| pending.client_input_id == client_input_id)
+    {
+        state.pending_web_steers.remove(index);
+    }
+}
+
+fn correlate_web_steers_locked(
+    state: &mut HubState,
+    inputs: &[atomcode_kernel::event::SteeredInput],
+) -> Vec<Option<String>> {
+    inputs
+        .iter()
+        .map(|input| {
+            let matches_front = state.pending_web_steers.front().is_some_and(|pending| {
+                pending.runtime_input.text == input.text
+                    && pending.runtime_input.images == input.images
+            });
+            matches_front.then(|| {
+                state
+                    .pending_web_steers
+                    .pop_front()
+                    .expect("front was checked above")
+                    .client_input_id
+            })
+        })
+        .collect()
 }
 
 pub struct LiveViewHub {
@@ -183,6 +243,7 @@ impl LiveViewHub {
         state.snapshot_error = None;
         state.replay.clear();
         state.pending_requests.clear();
+        state.pending_web_steers.clear();
         state.turn_active = false;
         state.last_runtime_sequence = None;
         Ok(identity)
@@ -231,8 +292,12 @@ impl LiveViewHub {
 
     pub fn unbind(&self, binding: &LiveBinding) -> Result<(), HubError> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let current = state.binding.as_ref().ok_or(HubError::Unbound)?;
-        if current.identity.id != binding.id {
+        let current_binding_id = state
+            .binding
+            .as_ref()
+            .map(|current| current.identity.id)
+            .ok_or(HubError::Unbound)?;
+        if current_binding_id != binding.id {
             return Err(HubError::StaleBinding);
         }
         if state.turn_active {
@@ -243,6 +308,7 @@ impl LiveViewHub {
         state.snapshot_error = None;
         state.replay.clear();
         state.pending_requests.clear();
+        state.pending_web_steers.clear();
         state.last_runtime_sequence = None;
         Ok(())
     }
@@ -288,6 +354,7 @@ impl LiveViewHub {
         state.snapshot_error = None;
         state.replay.clear();
         state.pending_requests.clear();
+        state.pending_web_steers.clear();
         state.turn_active = false;
         state.last_runtime_sequence = None;
         if announce {
@@ -312,15 +379,28 @@ impl LiveViewHub {
         if !state.turn_active {
             state.replay.clear();
             state.pending_requests.clear();
+            state.pending_web_steers.clear();
         }
         state.turn_active = true;
-        self.publish_view_locked(&mut state, LiveViewEvent::InputAccepted(input), true);
+        self.publish_view_locked(
+            &mut state,
+            LiveViewEvent::InputAccepted {
+                input,
+                client_input_id: None,
+            },
+            true,
+        );
         Ok(())
     }
 
     pub async fn submit_confirmed(&self, input: UserInput) -> Result<SubmitReceipt, HubError> {
         let echo = input.clone();
-        self.submit_confirmed_with_echo(input, echo).await
+        self.submit_confirmed_with_echo(input, echo, None).await
+    }
+
+    fn remove_pending_web_steer(&self, client_input_id: Option<&str>) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        remove_pending_web_steer_locked(&mut state, client_input_id);
     }
 
     /// Like [`Self::submit_confirmed`], but the view echo — what every subscribed
@@ -335,33 +415,77 @@ impl LiveViewHub {
         &self,
         runtime_input: UserInput,
         echo_input: UserInput,
+        client_input_id: Option<String>,
     ) -> Result<SubmitReceipt, HubError> {
         let (binding, handle) = self.bound_handle()?;
+        let correlation_registered = if let Some(client_input_id) = client_input_id.clone() {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let current = state.binding.as_ref().ok_or(HubError::Unbound)?;
+            if current.identity.id != binding.id {
+                return Err(HubError::StaleBinding);
+            }
+            if state.turn_active {
+                state.pending_web_steers.push_back(PendingWebSteer {
+                    runtime_input: runtime_input.clone(),
+                    client_input_id,
+                });
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         let receipt = handle
             .submit(runtime_input)
             .await
-            .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
+            .map_err(|error| {
+                if correlation_registered {
+                    self.remove_pending_web_steer(client_input_id.as_deref());
+                }
+                HubError::RuntimeRejected(error.to_string())
+            })?;
         let receipt_generation = match receipt {
             SubmitReceipt::Started { generation, .. }
             | SubmitReceipt::Steered { generation, .. } => generation,
         };
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let current = state.binding.as_ref().ok_or(HubError::Unbound)?;
-        if current.identity.id != binding.id {
+        let (current_binding_id, current_generation) = state
+            .binding
+            .as_ref()
+            .map(|current| (current.identity.id, current.identity.generation))
+            .ok_or(HubError::Unbound)?;
+        if current_binding_id != binding.id {
+            if correlation_registered {
+                remove_pending_web_steer_locked(&mut state, client_input_id.as_deref());
+            }
             return Err(HubError::StaleBinding);
         }
-        if current.identity.generation != receipt_generation {
+        if current_generation != receipt_generation {
+            if correlation_registered {
+                remove_pending_web_steer_locked(&mut state, client_input_id.as_deref());
+            }
             return Err(HubError::RuntimeGenerationChanged {
                 expected: receipt_generation,
-                actual: current.identity.generation,
+                actual: current_generation,
             });
         }
         if matches!(receipt, SubmitReceipt::Started { .. }) {
             state.replay.clear();
             state.pending_requests.clear();
+            if correlation_registered {
+                remove_pending_web_steer_locked(&mut state, client_input_id.as_deref());
+            }
         }
         state.turn_active = true;
-        self.publish_view_locked(&mut state, LiveViewEvent::InputAccepted(echo_input), true);
+        self.publish_view_locked(
+            &mut state,
+            LiveViewEvent::InputAccepted {
+                input: echo_input,
+                client_input_id,
+            },
+            true,
+        );
         Ok(receipt)
     }
 
@@ -380,10 +504,18 @@ impl LiveViewHub {
         }
         if !state.turn_active {
             state.replay.clear();
+            state.pending_web_steers.clear();
         }
         state.turn_active = true;
         state.pending_requests.clear();
-        self.publish_view_locked(&mut state, LiveViewEvent::InputAccepted(input), true);
+        self.publish_view_locked(
+            &mut state,
+            LiveViewEvent::InputAccepted {
+                input,
+                client_input_id: None,
+            },
+            true,
+        );
         Ok(())
     }
 
@@ -535,7 +667,7 @@ impl LiveViewHub {
             return Err(HubError::UnknownRequest(id));
         }
         Self::dispatch_locked(&state, DriverCommand::Respond { id, value })?;
-        state.pending_requests.remove(&id);
+        self.resolve_request_locked(&mut state, id)?;
         Ok(())
     }
 
@@ -560,8 +692,15 @@ impl LiveViewHub {
         if current.identity.id != binding.id {
             return Err(HubError::StaleBinding);
         }
-        if current.identity.generation == binding.generation {
-            state.pending_requests.remove(&id);
+        // The accepted response can immediately resume and finish the turn. Its
+        // terminal event clears `pending_requests` concurrently while this async
+        // method is reacquiring the hub lock. That is already a successful
+        // resolution, not an UnknownRequest failure; publish the peer terminal
+        // only while the request is still present in this generation.
+        if current.identity.generation == binding.generation
+            && state.pending_requests.contains_key(&id)
+        {
+            self.resolve_request_locked(&mut state, id)?;
         }
         Ok(())
     }
@@ -578,7 +717,7 @@ impl LiveViewHub {
             .find_map(|(id, pending_kind)| (pending_kind == kind).then_some(*id))
             .ok_or(HubError::UnknownRequest(0))?;
         Self::dispatch_locked(&state, DriverCommand::Respond { id, value })?;
-        state.pending_requests.remove(&id);
+        self.resolve_request_locked(&mut state, id)?;
         Ok(id)
     }
 
@@ -645,12 +784,21 @@ impl LiveViewHub {
             current.identity.generation = envelope.generation;
             state.replay.clear();
             state.pending_requests.clear();
+            state.pending_web_steers.clear();
             state.turn_active = false;
             state.snapshot_error = None;
         }
         state.last_runtime_sequence = Some(envelope.sequence);
 
         let event = envelope.event;
+        let mapped_steer = match &event {
+            CodingRuntimeEvent::Agent(AgentEvent::Steered { count, inputs }) => Some((
+                *count,
+                inputs.clone(),
+                correlate_web_steers_locked(&mut state, inputs),
+            )),
+            _ => None,
+        };
         let mut replay = state.turn_active;
         match &event {
             CodingRuntimeEvent::Agent(AgentEvent::TurnStarted) => {
@@ -669,6 +817,7 @@ impl LiveViewHub {
                 state.snapshot_error = None;
                 state.replay.clear();
                 state.pending_requests.clear();
+                state.pending_web_steers.clear();
                 state.turn_active = false;
                 replay = false;
             }
@@ -677,12 +826,14 @@ impl LiveViewHub {
             }) => {
                 state.snapshot_error = Some(error.message.clone());
                 state.pending_requests.clear();
+                state.pending_web_steers.clear();
                 state.turn_active = false;
                 replay = false;
             }
             CodingRuntimeEvent::RuntimeStopped(_) => {
                 state.snapshot_error = Some("runtime stopped".into());
                 state.pending_requests.clear();
+                state.pending_web_steers.clear();
                 state.turn_active = false;
                 replay = false;
             }
@@ -704,6 +855,7 @@ impl LiveViewHub {
                     state.snapshot_error = Some("session snapshot pending".into());
                     state.replay.clear();
                     state.pending_requests.clear();
+                    state.pending_web_steers.clear();
                     state.turn_active = false;
                 }
             }
@@ -721,6 +873,17 @@ impl LiveViewHub {
             _ => {}
         }
         self.publish_view_locked(&mut state, LiveViewEvent::Runtime(event), replay);
+        if let Some((count, inputs, client_input_ids)) = mapped_steer {
+            self.publish_view_locked(
+                &mut state,
+                LiveViewEvent::Steered {
+                    count,
+                    inputs,
+                    client_input_ids,
+                },
+                replay,
+            );
+        }
         Ok(())
     }
 
@@ -836,6 +999,7 @@ impl LiveViewHub {
             current.identity.generation = generation.0;
             state.replay.clear();
             state.pending_requests.clear();
+            state.pending_web_steers.clear();
             state.turn_active = false;
             state.last_runtime_sequence = None;
         }
@@ -881,6 +1045,32 @@ impl LiveViewHub {
         }
         let _ = self.events.send(observation);
     }
+
+    /// Resolve one pending request after its response has been accepted by the
+    /// runtime command boundary. Remove the original request from replay before
+    /// broadcasting the terminal so a reconnect cannot resurrect a stale prompt.
+    fn resolve_request_locked(&self, state: &mut HubState, id: RequestId) -> Result<(), HubError> {
+        let kind = state
+            .pending_requests
+            .remove(&id)
+            .ok_or(HubError::UnknownRequest(id))?;
+        state.replay.retain(|observation| {
+            !matches!(
+                &observation.event,
+                LiveViewEvent::Runtime(CodingRuntimeEvent::Request(request))
+                    if request.id == id
+            )
+        });
+        self.publish_view_locked(
+            state,
+            LiveViewEvent::RequestResolved {
+                request_id: id,
+                kind,
+            },
+            false,
+        );
+        Ok(())
+    }
 }
 
 fn map_session_transition_error(error: atomcode_coding::RuntimeError) -> HubError {
@@ -912,9 +1102,33 @@ mod tests {
     use atomcode_kernel::message::{Message, SessionSnapshot};
 
     use super::{
-        map_session_transition_error, session_change_is_noop, HubError, LiveBinding,
-        LiveRuntimeControl, LiveViewEvent, LiveViewHub,
+        correlate_web_steers_locked, map_session_transition_error, session_change_is_noop,
+        HubError, HubState, LiveBinding, LiveRuntimeControl, LiveViewEvent, LiveViewHub,
+        PendingWebSteer,
     };
+
+    #[test]
+    fn web_steer_correlation_uses_runtime_payload_and_returns_client_identity() {
+        let runtime_input = UserInput {
+            text: "look\n\n[图片内容（由 vl 识别）]\na cat".into(),
+            images: Vec::new(),
+        };
+        let mut state = HubState::default();
+        state.pending_web_steers.push_back(PendingWebSteer {
+            runtime_input: runtime_input.clone(),
+            client_input_id: "web-1".into(),
+        });
+        let folded = vec![atomcode_kernel::event::SteeredInput {
+            text: runtime_input.text,
+            images: runtime_input.images,
+        }];
+
+        assert_eq!(
+            correlate_web_steers_locked(&mut state, &folded),
+            vec![Some("web-1".into())]
+        );
+        assert!(state.pending_web_steers.is_empty());
+    }
 
     #[derive(Clone)]
     struct FakeControl {
@@ -1085,6 +1299,11 @@ mod tests {
             },
         )
         .unwrap();
+        let mut live = hub.join().unwrap();
+        assert!(live.replay.iter().any(|observation| matches!(
+            &observation.event,
+            LiveViewEvent::Runtime(CodingRuntimeEvent::Request(request)) if request.id == 42
+        )));
 
         assert_eq!(
             hub.respond(7, serde_json::Value::Null).unwrap_err(),
@@ -1100,6 +1319,28 @@ mod tests {
             commands.lock().unwrap().as_slice(),
             [DriverCommand::Respond { id: 42, .. }]
         ));
+        let resolved = live
+            .receiver
+            .try_recv()
+            .expect("peer sees request terminal");
+        assert!(matches!(
+            resolved.event,
+            LiveViewEvent::RequestResolved {
+                request_id: 42,
+                ref kind,
+            } if kind == "approval"
+        ));
+        assert!(
+            hub.join()
+                .unwrap()
+                .replay
+                .iter()
+                .all(|observation| !matches!(
+                    &observation.event,
+                    LiveViewEvent::Runtime(CodingRuntimeEvent::Request(request)) if request.id == 42
+                )),
+            "a reconnect must not replay an already-resolved request"
+        );
     }
 
     #[test]
@@ -1414,7 +1655,7 @@ mod tests {
         assert!(matches!(
             join.replay.as_slice(),
             [observation]
-                if matches!(&observation.event, LiveViewEvent::InputAccepted(input)
+                if matches!(&observation.event, LiveViewEvent::InputAccepted { input, .. }
                     if input.text == "typed in tui")
         ));
     }

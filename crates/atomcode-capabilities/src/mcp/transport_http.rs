@@ -13,7 +13,9 @@ use tokio::time::timeout;
 use super::client::McpClient;
 use super::config::McpHttpAuthConfig;
 use super::oauth::{refresh_mcp_oauth_token, token_is_expired, McpTokenStore};
-use super::types::{CallToolResult, InitializeResult, ListToolsResult, ServerStatus};
+use super::types::{
+    initialize_params, CallToolResult, InitializeResult, ListToolsResult, ServerStatus,
+};
 
 /// Default timeout for HTTP operations (30 seconds).
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -21,6 +23,11 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// Streamable HTTP / SSE-style MCP endpoints (e.g. Playwright) reject requests unless
 /// `Accept` advertises both JSON and event-stream; see MCP HTTP transport guidance.
 const MCP_HTTP_ACCEPT: &str = "application/json, text/event-stream";
+
+/// Since protocol revision `2025-06-18` the HTTP transport REQUIRES every request that
+/// follows `initialize` to carry the negotiated revision in this header; a server that
+/// enforces it rejects unlabelled requests with HTTP 400.
+const MCP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 
 /// HTTP-based MCP client.
 pub struct HttpClient {
@@ -36,6 +43,10 @@ pub struct HttpClient {
     /// `Mcp-Session-Id` on the `initialize` response and REJECT later requests that
     /// don't echo it; we capture it from every response and replay it on every request.
     session_id: Arc<Mutex<Option<String>>>,
+    /// Protocol revision the server agreed to in its `initialize` result — the value
+    /// every later request must echo in `MCP-Protocol-Version`. `None` until the
+    /// handshake completes, which is exactly when the spec says not to send the header.
+    negotiated_version: Arc<Mutex<Option<String>>>,
 }
 
 impl HttpClient {
@@ -64,12 +75,28 @@ impl HttpClient {
             next_id: AtomicU64::new(1),
             client,
             session_id: Arc::new(Mutex::new(None)),
+            negotiated_version: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Current Streamable-HTTP session id, if the server handed one out.
     async fn session_id(&self) -> Option<String> {
         self.session_id.lock().await.clone()
+    }
+
+    /// Value to send in `MCP-Protocol-Version`, or `None` when the header must be
+    /// omitted: before `initialize` has negotiated a revision (the spec scopes the
+    /// header to *subsequent* requests), or when the user pinned the header themselves.
+    async fn protocol_version_header(&self) -> Option<String> {
+        if self
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case(MCP_PROTOCOL_VERSION_HEADER))
+        {
+            return None;
+        }
+        let negotiated = self.negotiated_version.lock().await.clone();
+        negotiated.filter(|v| !v.is_empty())
     }
 
     /// Capture the `Mcp-Session-Id` response header (case-insensitive) so it can be
@@ -144,6 +171,10 @@ impl HttpClient {
             if let Some(sid) = self.session_id().await {
                 req = req.header("Mcp-Session-Id", sid);
             }
+        }
+
+        if let Some(version) = self.protocol_version_header().await {
+            req = req.header(MCP_PROTOCOL_VERSION_HEADER, version);
         }
 
         let timeout_duration = Duration::from_millis(self.timeout_ms);
@@ -290,6 +321,10 @@ impl HttpClient {
             }
         }
 
+        if let Some(version) = self.protocol_version_header().await {
+            req = req.header(MCP_PROTOCOL_VERSION_HEADER, version);
+        }
+
         // Fire and forget — ignore response
         let _ = req.send().await;
         Ok(())
@@ -315,11 +350,18 @@ impl Drop for HttpClient {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        // A session only exists post-handshake, so the negotiated revision is set by
+        // now; `try_lock` failing just means the DELETE goes out unlabelled (advisory).
+        let version = self
+            .negotiated_version
+            .try_lock()
+            .ok()
+            .and_then(|v| v.clone());
         let client = self.client.clone();
         let url = self.url.clone();
         let headers = self.headers.clone();
         handle.spawn(async move {
-            delete_http_session(client, url, headers, session).await;
+            delete_http_session(client, url, headers, session, version).await;
         });
     }
 }
@@ -333,16 +375,25 @@ async fn delete_http_session(
     url: String,
     headers: BTreeMap<String, String>,
     session: String,
+    protocol_version: Option<String>,
 ) {
     let user_has_session = headers
         .keys()
         .any(|k| k.eq_ignore_ascii_case("mcp-session-id"));
+    let user_has_version = headers
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case(MCP_PROTOCOL_VERSION_HEADER));
     let mut req = client.delete(&url);
     for (key, value) in &headers {
         req = req.header(key, value);
     }
     if !user_has_session {
         req = req.header("Mcp-Session-Id", session);
+    }
+    if !user_has_version {
+        if let Some(version) = protocol_version.filter(|v| !v.is_empty()) {
+            req = req.header(MCP_PROTOCOL_VERSION_HEADER, version);
+        }
     }
     let _ = req.send().await;
 }
@@ -354,21 +405,19 @@ impl McpClient for HttpClient {
         *status = ServerStatus::Connecting;
         drop(status);
 
-        let params = serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {
-                "tools": {}
-            },
-            "clientInfo": {
-                "name": "atomcode",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        });
-
-        let result = self.send_request("initialize", Some(params)).await?;
+        let result = self
+            .send_request("initialize", Some(initialize_params()))
+            .await?;
 
         let init_result: InitializeResult =
             serde_json::from_value(result).context("Failed to parse initialize result")?;
+
+        // Record what the server actually agreed to speak. Every request from here on
+        // must label itself with THIS value (not what we asked for) — an older server
+        // negotiates itself down and would reject its own revision being misreported.
+        if !init_result.protocol_version.is_empty() {
+            *self.negotiated_version.lock().await = Some(init_result.protocol_version.clone());
+        }
 
         // Send initialized notification (MCP spec requirement — fire and forget)
         let _ = self.send_notification("notifications/initialized").await;
@@ -573,6 +622,7 @@ mod sse_tests {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+    use crate::mcp::types::MCP_PROTOCOL_VERSION;
     use reqwest::header::HeaderMap;
 
     fn client() -> HttpClient {
@@ -599,6 +649,57 @@ mod session_tests {
             c.session_id().await.as_deref(),
             Some("abc-123"),
             "captured + replayable"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_protocol_version_header_before_handshake() {
+        let c = client();
+        assert!(
+            c.protocol_version_header().await.is_none(),
+            "the header is scoped to requests AFTER initialize; sending it on the \
+             handshake itself claims a revision that was never negotiated"
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_version_header_echoes_what_the_server_agreed_to() {
+        let c = client();
+        // Server negotiated itself DOWN from what we asked for.
+        *c.negotiated_version.lock().await = Some("2024-11-05".to_string());
+        assert_eq!(
+            c.protocol_version_header().await.as_deref(),
+            Some("2024-11-05"),
+            "must echo the server's revision, not MCP_PROTOCOL_VERSION"
+        );
+        assert_ne!(MCP_PROTOCOL_VERSION, "2024-11-05", "test would be vacuous");
+    }
+
+    #[tokio::test]
+    async fn empty_negotiated_version_sends_no_header() {
+        let c = client();
+        *c.negotiated_version.lock().await = Some(String::new());
+        assert!(
+            c.protocol_version_header().await.is_none(),
+            "an empty value must not become an empty header"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_pinned_protocol_version_header_is_not_overridden() {
+        let mut headers = BTreeMap::new();
+        headers.insert("mcp-protocol-version".to_string(), "2025-06-18".to_string());
+        let c = HttpClient::new(
+            "t".into(),
+            "http://localhost/mcp".into(),
+            headers,
+            None,
+            Some(1000),
+        );
+        *c.negotiated_version.lock().await = Some("2025-11-25".to_string());
+        assert!(
+            c.protocol_version_header().await.is_none(),
+            "a user-pinned header wins; we must not emit a second one"
         );
     }
 

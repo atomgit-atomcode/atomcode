@@ -80,6 +80,8 @@ pub struct CodingAgentConfig {
     /// Preferred language for natural-language commit subjects and bodies.
     /// `None` means follow the current conversation language.
     pub preferred_language: Option<Locale>,
+    /// Resolved `[tools.todo]` policy for this runtime generation.
+    pub todo: atomcode_config::config::TodoToolConfig,
     /// Stable config/provider registry key exposed to drivers. This is distinct
     /// from `provider_type`, which selects the adapter implementation.
     pub provider_name: String,
@@ -111,6 +113,12 @@ pub struct CodingAgentConfig {
     /// When true, the kernel turns the `max_rounds` cap into an interactive
     /// checkpoint (see AgentBuilder). Default false; only the TUI driver sets it.
     pub round_cap_checkpoint: bool,
+    /// Generate an ephemeral next-prompt suggestion after a naturally completed
+    /// turn. The coding runtime owns the auxiliary request and cancellation;
+    /// drivers only project the resulting neutral event. Default false so
+    /// headless/daemon/ACP paths do not incur a hidden model request before they
+    /// implement the corresponding UI. The interactive TUI opts in explicitly.
+    pub next_prompt_suggestions: bool,
     /// Immutable price snapshot for this runtime generation. `None` means the
     /// configured model's price is unknown.
     pub pricing: Option<atomcode_capabilities::session::ModelPricing>,
@@ -205,6 +213,7 @@ pub struct CodingRuntimeConfig {
     pub base_url: String,
     pub model: String,
     pub preferred_language: Option<Locale>,
+    pub todo: atomcode_config::config::TodoToolConfig,
     pub provider_name: String,
     pub working_dir: PathBuf,
     pub context_window: u32,
@@ -232,6 +241,9 @@ pub struct CodingRuntimeConfig {
     /// must stay `false` for headless / ACP / daemon runtimes (there is no
     /// requester to answer the Request → the kernel fail-closes to a stop).
     pub round_cap_checkpoint: bool,
+    /// Driver opt-in for ephemeral next-prompt sampling. Default false;
+    /// currently only the interactive TUI renders and accepts the result.
+    pub next_prompt_suggestions: bool,
     pub pricing: Option<atomcode_capabilities::session::ModelPricing>,
 }
 
@@ -272,6 +284,7 @@ impl CodingRuntimeConfig {
                 None,
                 config.language,
             )),
+            todo: config.tools.todo.clone(),
             provider_name: r.map(|r| r.selection_id.clone()).unwrap_or_default(),
             working_dir: working_dir.to_path_buf(),
             context_window: r.map(|r| r.context_window as u32).unwrap_or(128_000),
@@ -304,6 +317,7 @@ impl CodingRuntimeConfig {
             // Default off; only the interactive TUI opts in (see the CLI's
             // TUI spawn sites and `event_loop::reload_runtime_provider_from`).
             round_cap_checkpoint: false,
+            next_prompt_suggestions: false,
             pricing,
         }
     }
@@ -317,6 +331,7 @@ impl CodingRuntimeConfig {
         );
         config.context_window = self.context_window;
         config.preferred_language = self.preferred_language;
+        config.todo = self.todo.clone();
         config.provider_name = self.provider_name.clone();
         config.chat_options.max_tokens = self.max_tokens;
         config.telemetry = self.telemetry.clone();
@@ -340,6 +355,7 @@ impl CodingRuntimeConfig {
         }
         config.keep_interrupted_context = self.keep_interrupted_context;
         config.round_cap_checkpoint = self.round_cap_checkpoint;
+        config.next_prompt_suggestions = self.next_prompt_suggestions;
         config.pricing = self.pricing;
         config
     }
@@ -484,11 +500,45 @@ fn default_stream_timeout() -> Duration {
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(300))
 }
-fn default_goal_max_rounds() -> u32 {
+/// Share of the CodingPlan 5h rolling `call_limit` a single `/goal` may consume
+/// (percent). A goal that eats more than this starves the user's interactive work
+/// and other controllers within the same rolling window.
+const GOAL_ROUND_SHARE_PERCENT: i64 = 30;
+/// Floor so a micro plan still yields a usable goal budget.
+const GOAL_ROUND_FLOOR: u32 = 50;
+/// Fallback when there is no CodingPlan `call_limit` to derive from
+/// (non-CodingPlan provider, offline, pre-login) and no explicit env override.
+const GOAL_ROUND_FALLBACK: u32 = 300;
+
+/// Explicit `ATOMCODE_GOAL_MAX_ROUNDS` override, if set and parseable.
+pub fn goal_max_rounds_env() -> Option<u32> {
     std::env::var("ATOMCODE_GOAL_MAX_ROUNDS")
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(200)
+}
+
+/// Resolve the `/goal` round cap. Precedence: explicit env override → a share of
+/// the CodingPlan binding-window `call_limit` (Pro 1000 → 300, Lite 800 → 240) →
+/// a flat fallback. Pure so the host can call it once `call_limit` is known
+/// without threading config plumbing.
+pub fn derive_goal_max_rounds(env_override: Option<u32>, call_limit: Option<i64>) -> u32 {
+    if let Some(explicit) = env_override {
+        return explicit;
+    }
+    match call_limit {
+        Some(limit) if limit > 0 => {
+            u32::try_from(limit.saturating_mul(GOAL_ROUND_SHARE_PERCENT) / 100)
+                .unwrap_or(GOAL_ROUND_FALLBACK)
+                .max(GOAL_ROUND_FLOOR)
+        }
+        _ => GOAL_ROUND_FALLBACK,
+    }
+}
+
+fn default_goal_max_rounds() -> u32 {
+    // Construction happens before CodingPlan `call_limit` is known; the host
+    // re-derives with the real limit after login via `derive_goal_max_rounds`.
+    derive_goal_max_rounds(goal_max_rounds_env(), None)
 }
 fn default_turn_max_rounds() -> u32 {
     std::env::var("ATOMCODE_TURN_MAX_ROUNDS")
@@ -531,10 +581,15 @@ fn resolve_tool_loop_policy(
     )
 }
 fn default_goal_max_duration_secs() -> u64 {
+    // Wall-clock is a poor bound for an autonomous goal: it kills slow-but-productive
+    // work and lets fast runaways burn a full window well inside the limit, and it is
+    // only checked between rounds so a single long round sails past it. Default OFF
+    // (0 = disabled); the goal is bounded by the round cap + evaluator. Re-enable
+    // explicitly via ATOMCODE_GOAL_MAX_DURATION_SECS if a hard time cap is ever wanted.
     std::env::var("ATOMCODE_GOAL_MAX_DURATION_SECS")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(7200)
+        .unwrap_or(0)
 }
 fn default_loop_max_rounds() -> u32 {
     resolve_loop_max_rounds(
@@ -579,6 +634,7 @@ impl CodingAgentConfig {
             provider_name: model.clone(),
             model,
             preferred_language: None,
+            todo: Default::default(),
             working_dir: working_dir.into(),
             context_window: 128_000,
             stream_timeout: default_stream_timeout(),
@@ -586,6 +642,7 @@ impl CodingAgentConfig {
             max_continuations: 50,
             max_rounds: default_turn_max_rounds(),
             round_cap_checkpoint: false,
+            next_prompt_suggestions: false,
             pricing: None,
             tool_loop_policy: default_tool_loop_policy(),
             goal_max_rounds: default_goal_max_rounds(),
@@ -619,8 +676,54 @@ mod tests {
     fn round_caps_have_generous_defaults() {
         let c = CodingAgentConfig::new("k", "https://x/v1", "m", "/tmp");
         assert_eq!(c.max_rounds, 200);
-        assert_eq!(c.goal_max_rounds, 200);
-        assert_eq!(c.goal_max_duration_secs, 7200);
+        // No CodingPlan info at construction → the non-CodingPlan fallback.
+        assert_eq!(c.goal_max_rounds, 300);
+        // The wall-clock cap is OFF by default (0 = disabled); the goal is bounded
+        // by the round cap + evaluator instead. Re-enable via env if ever needed.
+        assert_eq!(c.goal_max_duration_secs, 0);
+    }
+
+    #[test]
+    fn derive_goal_rounds_scales_with_plan_call_limit() {
+        // 30% of the binding 5h window's call_limit. Pro=1000 → 300, Lite=800 → 240.
+        assert_eq!(derive_goal_max_rounds(None, Some(1000)), 300);
+        assert_eq!(derive_goal_max_rounds(None, Some(800)), 240);
+    }
+
+    #[test]
+    fn derive_goal_rounds_env_override_wins_over_plan() {
+        // An explicit ATOMCODE_GOAL_MAX_ROUNDS is the user's word — it beats the
+        // plan-derived value regardless of call_limit.
+        assert_eq!(derive_goal_max_rounds(Some(150), Some(1000)), 150);
+        assert_eq!(derive_goal_max_rounds(Some(1), None), 1);
+    }
+
+    #[test]
+    fn derive_goal_rounds_falls_back_without_plan() {
+        // Non-CodingPlan / offline / unknown call_limit → flat fallback, never a
+        // hardcoded 200 tied to one plan tier.
+        assert_eq!(derive_goal_max_rounds(None, None), 300);
+        assert_eq!(derive_goal_max_rounds(None, Some(0)), 300);
+        assert_eq!(derive_goal_max_rounds(None, Some(-5)), 300);
+    }
+
+    #[test]
+    fn derive_goal_rounds_floors_tiny_plans() {
+        // A micro window (30% = 30) must still leave a usable goal budget.
+        assert_eq!(derive_goal_max_rounds(None, Some(100)), 50);
+    }
+
+    // Fix #4: saturating_mul prevents a debug-panic on adversarial i64::MAX
+    // call_limit (plain * would overflow in debug builds). After saturation the
+    // i64→u32 try_from fails and falls back to GOAL_ROUND_FALLBACK (300).
+    #[test]
+    fn derive_goal_rounds_saturating_mul_no_panic_on_i64_max() {
+        // Must not panic in debug builds, and must return GOAL_ROUND_FALLBACK.
+        let result = derive_goal_max_rounds(None, Some(i64::MAX));
+        assert_eq!(
+            result, 300,
+            "i64::MAX call_limit must fall back to GOAL_ROUND_FALLBACK (300)"
+        );
     }
 
     #[test]
@@ -663,6 +766,29 @@ mod tests {
         assert_eq!(
             runtime.agent_config().datalog.dir.as_deref(),
             Some("/var/tmp/atomcode-datalog")
+        );
+    }
+
+    #[test]
+    fn runtime_config_passes_todo_policy_to_agent() {
+        let mut source = atomcode_config::config::Config::default();
+        source.tools.todo.enabled = false;
+        source.tools.todo.eager = atomcode_config::config::TodoEagerness::Always;
+        let runtime = CodingRuntimeConfig::from_config(
+            &source,
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            true,
+        );
+
+        assert!(!runtime.todo.enabled);
+        let agent = runtime.agent_config();
+        assert!(!agent.todo.enabled);
+        assert_eq!(
+            agent.todo.eager,
+            atomcode_config::config::TodoEagerness::Always
         );
     }
 

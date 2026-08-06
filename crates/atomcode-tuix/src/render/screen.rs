@@ -364,6 +364,19 @@ impl Screen {
         self.last_cursor_visible = None;
     }
 
+    /// Force a full repaint after the caller has already erased the complete
+    /// physical display with ED2. Unlike `invalidate`, this does not request
+    /// the per-row CUP+EL cold-start because the terminal is known to be blank.
+    pub fn invalidate_after_full_clear(&mut self) {
+        let blank_row = vec![Cell::blank(); self.width as usize];
+        for row in &mut self.prev_cells {
+            *row = blank_row.clone();
+        }
+        self.physical_dirty = false;
+        self.last_cursor = None;
+        self.last_cursor_visible = None;
+    }
+
     /// Blank `prev_cells` for rows `[start_row, height)`. Used by callers
     /// that wrote `\x1b[0J` (erase-to-end-of-display) directly to stdout
     /// from `start_row` down: the physical terminal is now blank in that
@@ -620,6 +633,25 @@ mod tests {
             !out.contains("\x1b[1;1H\x1b[K"),
             "no cold-start CUP+EL on second frame after one-shot invalidate: {:?}",
             out
+        );
+    }
+
+    #[test]
+    fn invalidate_after_full_clear_skips_per_row_cold_start() {
+        let mut s = Screen::new(10, 3);
+        let mut cells = Vec::new();
+        push_str_cells(&mut cells, "hi", &CellStyle::default());
+        s.draw_row(0, 0, &cells);
+        let _ = s.render_diff();
+
+        s.invalidate_after_full_clear();
+        s.draw_row(0, 0, &cells);
+        let out = String::from_utf8(s.render_diff()).unwrap();
+
+        assert!(out.contains("hi"), "visible content must repaint: {out:?}");
+        assert!(
+            !out.contains("\x1b[1;1H\x1b[K"),
+            "known-blank repaint must not emit the per-row clear burst: {out:?}"
         );
     }
 

@@ -380,6 +380,75 @@ async fn cancel_command_ends_turn() {
     );
 }
 
+#[tokio::test]
+async fn shutdown_during_turn_emits_cancel_terminal_and_latest_snapshot() {
+    let observed = Arc::new(AtomicBool::new(false));
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(BlockUntilCancelTool {
+        observed_cancel: observed.clone(),
+    }));
+    let provider = Arc::new(RecordingProvider::new(vec![vec![
+        StreamEvent::ToolCall(tool_call("c_shutdown", "block_until_cancel", "{}")),
+        StreamEvent::Done { truncated: false },
+    ]]));
+    let mut handle = atomcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["block_until_cancel"]))
+        .keep_interrupted_context(true)
+        .build()
+        .spawn();
+
+    let commands = handle.commands.clone();
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "retain work before model switch".into(),
+            images: vec![],
+        })
+        .unwrap();
+
+    let mut cancelled = false;
+    let mut completed = false;
+    let mut snapshot = None;
+    while let Some(event) = handle.events.recv().await {
+        match event {
+            AgentEvent::ToolStarted { .. } => {
+                commands.send(AgentCommand::Shutdown).unwrap();
+            }
+            AgentEvent::Cancelled => cancelled = true,
+            AgentEvent::TurnComplete {
+                reason: StopReason::Cancelled,
+            } => completed = true,
+            AgentEvent::Snapshot { snapshot: current } => {
+                snapshot = Some(current);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let _ = handle.task.await;
+
+    assert!(cancelled, "shutdown must use the normal cancel terminal");
+    assert!(
+        completed,
+        "shutdown must emit TurnComplete before its snapshot"
+    );
+    assert!(
+        observed.load(Ordering::SeqCst),
+        "the running tool must observe cooperative shutdown cancellation"
+    );
+    let snapshot = snapshot.expect("shutdown must expose the latest in-memory snapshot");
+    assert!(
+        snapshot
+            .messages
+            .iter()
+            .any(|message| message.text.contains("retain work before model switch")),
+        "the replacement snapshot must retain the interrupted turn: {:?}",
+        snapshot.messages
+    );
+    assert_no_dangling_tool_calls(&snapshot.messages);
+}
+
 /// Assert every assistant tool_call in `messages` has a matching tool-result
 /// (paired by id) — the no-dangling invariant the API requires after a cancel.
 fn assert_no_dangling_tool_calls(messages: &[Message]) {

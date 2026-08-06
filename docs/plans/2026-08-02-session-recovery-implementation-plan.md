@@ -33,4 +33,4 @@
   before allowing operators to remove historical objects; never retain that
   checkpoint for ordinary turn capture.
 - Document that historical Rewind objects require explicit operator cleanup and
-  that synthesized JSONL is intentionally outside the v5.0.4 repair path.
+  that synthesized JSONL is intentionally outside the v5.0.5 repair path.

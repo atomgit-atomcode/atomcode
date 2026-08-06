@@ -73,7 +73,7 @@ async fn registry_connect_discover_and_call_echo() {
     assert_eq!(infos.len(), 1, "test server exposes exactly one tool");
     assert_eq!(infos[0].tool_name, "echo");
 
-    let adapter = McpToolAdapter::new(registry, infos.into_iter().next().unwrap());
+    let adapter = McpToolAdapter::new(registry, infos.into_iter().next().unwrap()).unwrap();
     assert_eq!(adapter.name(), "mcp__testsrv__echo");
     assert_eq!(
         adapter.risk("{}"),
@@ -272,7 +272,7 @@ async fn adapter_maps_bad_arguments_to_tool_error() {
         .expect("stdio MCP server should connect");
     let registry = registry.share();
     let infos = registry.list_all_tools().await;
-    let adapter = McpToolAdapter::new(registry, infos.into_iter().next().unwrap());
+    let adapter = McpToolAdapter::new(registry, infos.into_iter().next().unwrap()).unwrap();
 
     let result = adapter.execute("not json", &ctx()).await;
     assert!(
@@ -294,10 +294,8 @@ async fn adapter_passes_kernel_tool_conformance() {
         .expect("stdio MCP server should connect");
     let registry = registry.share();
     let infos = registry.list_all_tools().await;
-    let adapter: Arc<dyn Tool> = Arc::new(McpToolAdapter::new(
-        registry,
-        infos.into_iter().next().unwrap(),
-    ));
+    let adapter: Arc<dyn Tool> =
+        Arc::new(McpToolAdapter::new(registry, infos.into_iter().next().unwrap()).unwrap());
 
     let report = conformance::tool::check(adapter, &[r#"{"message":"x"}"#]).await;
     report.assert_conformant();
@@ -351,7 +349,7 @@ async fn background_registry_reads_project_mcp_json() {
         .list_all_tools()
         .await
         .into_iter()
-        .map(|info| Arc::new(McpToolAdapter::new(registry.clone(), info)) as Arc<dyn Tool>)
+        .map(|info| Arc::new(McpToolAdapter::new(registry.clone(), info).unwrap()) as Arc<dyn Tool>)
         .collect();
 
     let names: Vec<String> = adapters.iter().map(|a| a.name().to_string()).collect();

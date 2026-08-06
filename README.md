@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-5.0.4-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-5.0.5-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS%20PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -347,16 +347,20 @@ Then just type what you want:
 | `Enter` | Send message |
 | `Shift+Enter` | New line (requires Kitty keyboard protocol) |
 | `Ctrl+Enter` | New line (requires Kitty keyboard protocol) |
+| `Ctrl+J` | New line (when the terminal distinguishes the chord) |
 | `Alt+Enter` | New line (most terminals; see compatibility note below) |
 | `\` + `Enter` | New line (works on all terminals — type a `\` and press Enter; the `\` is consumed) |
 | `Esc` | Clear input / Cancel stream |
 | `Esc` ×2 | Undo the previous turn |
 | `Up/Down` | Browse input history |
-| `Tab` | Accept suggestion |
+| `Tab / Shift+Tab` | Accept completion when a menu is open; otherwise cycle next / previous mode |
+| `F2 / Shift+F2` | Switch to next / previous model (usually `Fn+F2 / Fn+Shift+F2` on Mac) |
+| `Ctrl+R` | Reverse-search input history |
+| `Ctrl+T` | Cycle `reasoning_effort` |
 | `Ctrl+U` | Clear line |
 | `Ctrl+W` | Delete word |
 | `Ctrl+K` | Delete to end of line |
-| `Ctrl+V` | Paste image from clipboard (Windows: use `/paste`, see below) |
+| `Ctrl+V / Ctrl+Alt+V` | Paste text or image from clipboard (Windows can also use `/paste`) |
 
 > **Terminal compatibility for newline chords:**
 > - `Shift+Enter` and `Ctrl+Enter` need a terminal that speaks the Kitty keyboard protocol — kitty, WezTerm, Alacritty, iTerm2 ≥3.5, Windows Terminal ≥1.21. Older terminals (and Windows, where atomcode doesn't enable the protocol) collapse them to plain `Enter` (which sends the message) — use `\` + `Enter`, which works everywhere.
@@ -374,9 +378,11 @@ Then just type what you want:
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+Up/Down` | Scroll chat (3 lines) |
-| `PageUp/PageDown` | Scroll chat (page) |
-| `Ctrl+L` | Clear conversation |
+| `Shift+Up/Down` | Scroll chat one line |
+| `PageUp/PageDown` | Scroll chat 10 lines |
+| `Alt+Up/Down` | Jump to previous / next message |
+| `Ctrl+Up/Down` | Jump to previous / next user message |
+| Empty input + `Home/End` | Jump to top / bottom of conversation |
 | `Ctrl+Shift+C` | Copy selection |
 | `Ctrl+C` | Cancel operation (double-tap to exit) |
 

@@ -11,13 +11,16 @@ test('postLiveMessage does not send approval_mode because live mode is global', 
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
     calls.push({ url: String(url), init });
-    return new Response('{"accepted":true}', { status: 200 });
+    return new Response(
+      '{"accepted":true,"disposition":"steered","generation":3,"turn_id":7}',
+      { status: 200 },
+    );
   }) as typeof fetch;
 
   try {
     const { postLiveMessage } = await import('./api.ts');
 
-    await postLiveMessage('hello', undefined, undefined, 'session-1', 'plan');
+    const receipt = await postLiveMessage('hello', undefined, undefined, 'session-1', 'input-1');
 
     assert.equal(calls.length, 1);
     assert.equal(calls[0].url, '/live/message');
@@ -25,6 +28,23 @@ test('postLiveMessage does not send approval_mode because live mode is global', 
     assert.deepEqual(body, {
       message: 'hello',
       session_id: 'session-1',
+      client_input_id: 'input-1',
+    });
+    assert.deepEqual(receipt, { disposition: 'steered', generation: 3, turn_id: 7 });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('postLiveMessage accepts the legacy accepted-only receipt without retrying', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('{"accepted":true}', { status: 200 })) as typeof fetch;
+  try {
+    const { postLiveMessage } = await import('./api.ts');
+    assert.deepEqual(await postLiveMessage('hello'), {
+      disposition: 'started',
+      generation: 0,
+      turn_id: 0,
     });
   } finally {
     globalThis.fetch = originalFetch;

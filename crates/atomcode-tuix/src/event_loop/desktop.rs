@@ -5,8 +5,10 @@
 use std::path::{Path, PathBuf};
 
 /// Releases page for the desktop app (old "Air" + new "Desktop" builds).
-pub const DOWNLOAD_URL: &str =
-    "https://atomgit.com/atomgit_atomcode/atomCode-air-releases/releases";
+/// Follows the deployment profile; see `atomcode_config::endpoints`.
+pub fn download_url() -> &'static str {
+    atomcode_config::endpoints::desktop_download_url()
+}
 
 /// How to launch a resolved candidate.
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -118,8 +118,10 @@ interface SessionRuntime {
   terminal?: SessionTerminal;
   recoveryLocked?: boolean;
   messages?: MessageInfo[];
+  // 进行中的活跃会话轮询句柄，用于去重避免双重轮询
+  pollHandle?: { cancelled: boolean };
   eventBuffer: Array<{
-    type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolProgress' | 'toolResult' | 'permissionRequest' | 'artifactStart' | 'artifactContent' | 'artifactEnd' | 'warning' | 'rateLimited' | 'tokens';
+    type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolProgress' | 'toolResult' | 'permissionRequest' | 'artifactStart' | 'artifactContent' | 'artifactEnd' | 'warning' | 'persistenceWarning' | 'rateLimited' | 'tokens';
     data: any;
   }>;
 }
@@ -357,7 +359,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._focusedPanelId = undefined;
     }
 
-    if (rt) rt.queuedMessages = [];
+    // 保留 queuedMessages：窗口关闭不应丢弃排队中的请求。
+    // 队列在以下场景被显式清空：
+    //   - stopGeneration（用户主动停止）
+    //   - _deleteSessionInternal（会话被删除）
+    //   - onDone with !completedNormally（异常终止）
+    //   - onStopped / onError（流终止/出错）
     if (rt?.isGenerating || rt?.recoveryLocked) {
       rt.terminalSeen = true;
       rt.isGenerating = false;
@@ -1130,18 +1137,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const activeSessions = await this._client.activeSessions();
         if (!ownerStillBound()) return;
         if (activeSessions.includes(sid)) {
-          this._postMessageForSession(sid, {
-            type: 'error',
-            message: 'The previous turn is still active, but this window cannot reattach to its stream. Stop it before starting another turn.',
+          // 旧回合仍在 daemon 运行 → 入队等待，而非报错丢弃。
+          rt.queuedMessages.push({
+            text: trimmed,
+            context,
+            images: attachedImages,
+            clientMessageId,
+            approvalMode,
           });
+          if (clientMessageId) {
+            this._postMessageForSession(sid, { type: 'queuedMessageSent', id: clientMessageId });
+          }
           return;
         }
         rt.recoveryLocked = false;
       } catch {
-        this._postMessageForSession(sid, {
-          type: 'error',
-          message: 'Unable to verify whether the previous turn stopped. Stop it before starting another turn.',
+        // daemon 不可达 → 入队等待重试，而非报错丢弃。
+        rt.queuedMessages.push({
+          text: trimmed,
+          context,
+          images: attachedImages,
+          clientMessageId,
+          approvalMode,
         });
+        if (clientMessageId) {
+          this._postMessageForSession(sid, { type: 'queuedMessageSent', id: clientMessageId });
+        }
         return;
       }
     }
@@ -1340,6 +1361,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         srt.eventBuffer.push({ type: 'warning', data: { message } });
         this._postStreamEventIfReady(streamSessionId, { type: 'warning', message });
       },
+      onPersistenceWarning: (message) => {
+        const srt = runtimeForStream();
+        if (!srt) return;
+        srt.eventBuffer.push({ type: 'persistenceWarning', data: { message } });
+        this._postStreamEventIfReady(streamSessionId, { type: 'persistenceWarning', message });
+      },
       onRateLimited: (event) => {
         const srt = runtimeForStream();
         if (!srt) return;
@@ -1499,6 +1526,59 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     } catch {
       // Keep the recovery lock when daemon truth cannot be read. A later send
       // re-checks /chat/active and refuses to overlap an unknown live turn.
+    }
+  }
+
+  /// 重开窗口后，daemon 侧旧回合仍在运行但 VSCode 已无法 reattach 流。
+  /// 通过轮询 /chat/active 检测旧回合是否结束：
+  ///   - 已结束 → 重置 isGenerating，触发队列重放
+  ///   - 仍在运行 → 保持 isGenerating = true，新消息走入队路径
+  /// 首次轮询 500ms（重开窗口后快速检测），后续退避至 2s。
+  /// 超时（5 分钟）后不强制重置，保持状态由用户决定后续操作。
+  private async _pollActiveSessionRecovery(sessionId: string, generation: number): Promise<void> {
+    // 去重：若已有进行中的轮询，不重复启动
+    const existing = this._sessionRuntimes.get(sessionId);
+    if (existing?.pollHandle && !existing.pollHandle.cancelled) return;
+
+    const handle = { cancelled: false };
+    const rt0 = this._sessionRuntimes.get(sessionId);
+    if (rt0) rt0.pollHandle = handle;
+
+    const FIRST_POLL_MS = 500;
+    const POLL_INTERVAL_MS = 2000;
+    const MAX_POLLS = 150; // 首次 500ms + 149 次 * 2s ≈ 5 分钟
+
+    for (let i = 0; i < MAX_POLLS; i++) {
+      await delay(i === 0 ? FIRST_POLL_MS : POLL_INTERVAL_MS);
+      if (handle.cancelled) return;
+
+      const rt = this._sessionRuntimes.get(sessionId);
+      if (!rt || rt.streamGeneration !== generation) return; // 已被新回合取代
+      if (!rt.isGenerating) return; // 已被其他路径重置
+
+      try {
+        const activeSessions = await this._client.activeSessions();
+        if (handle.cancelled) return;
+        if (!activeSessions.includes(sessionId)) {
+          // 旧回合已结束 → 重置状态，触发队列重放
+          rt.isGenerating = false;
+          rt.recoveryLocked = false;
+          rt.terminal = undefined;
+          rt.pollHandle = undefined;
+          this._postMessageForSession(sessionId, { type: 'generationStopped' });
+          void this._sendNextQueuedMessage(sessionId);
+          return;
+        }
+        // 仍在运行 → 继续轮询
+      } catch {
+        // daemon 不可达 → 继续轮询，保持 isGenerating = true
+      }
+    }
+
+    // 超时：不强制重置，保持 isGenerating = true 由用户决定后续操作
+    const rtFinal = this._sessionRuntimes.get(sessionId);
+    if (rtFinal && rtFinal.streamGeneration === generation && rtFinal.pollHandle === handle) {
+      rtFinal.pollHandle = undefined;
     }
   }
 
@@ -1682,12 +1762,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         try {
           const activeSessions = await this._client.activeSessions();
           if (activeSessions.includes(sid)) {
-            beforeActiveCheck.recoveryLocked = true;
-            beforeActiveCheck.terminal = {
-              type: 'error',
-              generation: beforeActiveCheck.streamGeneration ?? 0,
-              message: 'This turn is still active in the daemon, but this window cannot reattach to its stream. Stop it before continuing.',
-            };
+            // 重开窗口检测到 daemon 侧仍有活跃回合：
+            // 标记 isGenerating = true 使后续 _handleSend 走正常入队路径，
+            // 并启动轮询以在旧回合结束后触发队列重放。
+            beforeActiveCheck.isGenerating = true;
+            beforeActiveCheck.recoveryLocked = false;
+            beforeActiveCheck.terminal = undefined;
+            this._postMessageForSession(sid, { type: 'generationStarted' });
+            void this._pollActiveSessionRecovery(sid, beforeActiveCheck.streamGeneration ?? 0);
           } else if (beforeActiveCheck.recoveryLocked) {
             beforeActiveCheck.recoveryLocked = false;
           }
@@ -2280,6 +2362,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'warning':
           post({ type: 'warning', message: evt.data.message });
+          break;
+        case 'persistenceWarning':
+          post({ type: 'persistenceWarning', message: evt.data.message });
           break;
         case 'rateLimited':
           post({

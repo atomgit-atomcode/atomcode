@@ -61,7 +61,7 @@ pub trait ToolMiddleware: Send + Sync {
 /// gate decision only.
 ///
 /// FOLD across the chain (see the run loop): the first [`Deny`](BeforeOutcome::Deny)
-/// blocks (exact parity with the former `Err`); an [`Allow`](BeforeOutcome::Allow)
+/// or [`DenyTurn`](BeforeOutcome::DenyTurn) blocks; an [`Allow`](BeforeOutcome::Allow)
 /// force-approves THIS call and bypasses the remaining `before` gates;
 /// [`Ask`](BeforeOutcome::Ask) requests an approval prompt; [`Proceed`](BeforeOutcome::Proceed)
 /// defers to the next middleware / the normal approval flow.
@@ -79,6 +79,10 @@ pub enum BeforeOutcome {
     /// Block the call; `reason` is surfaced to the model and the driver.
     /// (Former `Err(reason)`.)
     Deny { reason: String },
+    /// Block the call and terminate the turn after every call in the current
+    /// assistant tool batch has received a paired result. Reserved for hard
+    /// policy boundaries where retrying through another shell spelling is unsafe.
+    DenyTurn { reason: String },
 }
 
 impl BeforeOutcome {
@@ -88,14 +92,25 @@ impl BeforeOutcome {
             reason: reason.into(),
         }
     }
-    /// True iff this is a [`Deny`](BeforeOutcome::Deny).
+    /// Block a call and terminate the current turn after preserving tool pairing.
+    pub fn deny_turn(reason: impl Into<String>) -> Self {
+        BeforeOutcome::DenyTurn {
+            reason: reason.into(),
+        }
+    }
+    /// True iff this is a blocking decision.
     pub fn is_deny(&self) -> bool {
-        matches!(self, BeforeOutcome::Deny { .. })
+        matches!(
+            self,
+            BeforeOutcome::Deny { .. } | BeforeOutcome::DenyTurn { .. }
+        )
     }
     /// The deny reason, if this is a [`Deny`](BeforeOutcome::Deny).
     pub fn deny_reason(&self) -> Option<&str> {
         match self {
-            BeforeOutcome::Deny { reason } => Some(reason.as_str()),
+            BeforeOutcome::Deny { reason } | BeforeOutcome::DenyTurn { reason } => {
+                Some(reason.as_str())
+            }
             _ => None,
         }
     }

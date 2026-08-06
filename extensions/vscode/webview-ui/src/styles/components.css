@@ -10,6 +10,30 @@
   flex-shrink: 0;
 }
 
+.persistence-warning {
+  flex-shrink: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0 12px 6px;
+  padding: 7px 10px;
+  border-radius: var(--corner-radius-small);
+  color: var(--app-warning-accent);
+  background: color-mix(in srgb, var(--app-warning-accent), transparent 88%);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.persistence-warning button {
+  margin-left: auto;
+  padding: 0 2px;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+}
+
 .ghost-btn {
   width: 28px;
   height: 28px;

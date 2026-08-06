@@ -306,6 +306,173 @@ async fn empty_mid_stream_429_uses_one_turn_owned_fuse() {
     );
 }
 
+// ── quiet-first: a one-off transient 429 with NO host verdict and NO Retry-After
+//    is retried SILENTLY (no banner) so a momentary burst does not spam the UI. ──
+
+/// A host that offers NO rate-limit opinion, so the kernel uses its `from_hint`
+/// fallback — the exact path a generic gateway 429 (no CodingPlan window data)
+/// takes. `on_rate_limit` defaults to `None`.
+struct NoVerdictHook;
+
+#[async_trait]
+impl LifecycleHooks for NoVerdictHook {}
+
+#[tokio::test]
+async fn first_fallback_429_retries_silently_without_banner() {
+    let provider = Arc::new(Once429Provider::new());
+    let handle = spawn_agent(provider.clone(), Arc::new(NoVerdictHook));
+    handle.commands.send(send("go")).unwrap();
+
+    let mut events = handle.events;
+    let mut collected: Vec<AgentEvent> = Vec::new();
+    while let Some(ev) = events.recv().await {
+        let done = matches!(ev, AgentEvent::TurnComplete { .. });
+        collected.push(ev);
+        if done {
+            break;
+        }
+    }
+
+    // The FIRST transient 429 (no host verdict, no server Retry-After) must be
+    // retried QUIETLY — no rate-limit banner for a one-off blip.
+    assert!(
+        !collected
+            .iter()
+            .any(|e| matches!(e, AgentEvent::RateLimited { .. })),
+        "first fallback 429 must retry silently (no banner): {collected:?}"
+    );
+    // …but the turn still recovers and completes normally.
+    assert!(
+        collected
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TextDelta(t) if t.contains("ok"))),
+        "turn must resume after the silent retry: {collected:?}"
+    );
+    assert!(
+        collected.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnComplete {
+                reason: StopReason::Stopped
+            }
+        )),
+        "turn must end Stopped after the silent retry: {collected:?}"
+    );
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        2,
+        "must retry exactly once after the silent wait"
+    );
+}
+
+#[tokio::test]
+async fn host_verdict_429_still_surfaces_banner_on_first_occurrence() {
+    // Quiet-first is scoped to the from_hint FALLBACK. When a host supplies a
+    // verdict (e.g. CodingPlan window data), its WaitAndRetry must STILL surface
+    // the banner on the first occurrence — the quiet path must not swallow it.
+    let provider = Arc::new(Once429Provider::new());
+    let hook = Arc::new(ScriptedRateLimitHook::new(
+        RateLimitDecision::WaitAndRetry { secs: 0 },
+    ));
+    let handle = spawn_agent(provider, hook);
+    handle.commands.send(send("go")).unwrap();
+
+    let mut events = handle.events;
+    let mut collected: Vec<AgentEvent> = Vec::new();
+    while let Some(ev) = events.recv().await {
+        let done = matches!(ev, AgentEvent::TurnComplete { .. });
+        collected.push(ev);
+        if done {
+            break;
+        }
+    }
+
+    assert!(
+        collected.iter().any(|e| matches!(
+            e,
+            AgentEvent::RateLimited {
+                auto_resuming: true,
+                ..
+            }
+        )),
+        "a host-supplied WaitAndRetry must still show the banner: {collected:?}"
+    );
+}
+
+/// First OPEN → 429 with NO Retry-After (silent-first eligible); second OPEN →
+/// 429 that DOES carry `Retry-After: 0` (surfaces + waits 0s, keeping the test
+/// fast); third OPEN → success. Proves the first blip is silent but a subsequent
+/// 429 still surfaces the banner — i.e. quiet-first does not swallow the sequence.
+struct Twice429ThenOkProvider {
+    calls: AtomicU32,
+}
+
+#[async_trait]
+impl LlmProvider for Twice429ThenOkProvider {
+    fn model_name(&self) -> &str {
+        "twice-429-then-ok"
+    }
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDef],
+        _options: &ChatOptions,
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => Err(ProviderError {
+                retryable: true,
+                http_status: Some(429),
+                message: "rate limited".into(),
+                ..Default::default()
+            }),
+            1 => Err(ProviderError {
+                retryable: true,
+                http_status: Some(429),
+                message: "rate limited again".into(),
+                retry_after_secs: Some(0),
+                ..Default::default()
+            }),
+            _ => Ok(Box::pin(futures::stream::iter(vec![
+                StreamEvent::TextDelta("ok".into()),
+                StreamEvent::Done { truncated: false },
+            ]))),
+        }
+    }
+}
+
+#[tokio::test]
+async fn second_fallback_429_surfaces_after_a_silent_first() {
+    let provider = Arc::new(Twice429ThenOkProvider {
+        calls: AtomicU32::new(0),
+    });
+    let handle = spawn_agent(provider.clone(), Arc::new(NoVerdictHook));
+    handle.commands.send(send("go")).unwrap();
+
+    let mut events = handle.events;
+    let mut collected: Vec<AgentEvent> = Vec::new();
+    while let Some(ev) = events.recv().await {
+        let done = matches!(ev, AgentEvent::TurnComplete { .. });
+        collected.push(ev);
+        if done {
+            break;
+        }
+    }
+
+    // Exactly ONE banner: the first 429 was silent, the second surfaced.
+    let banners = collected
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::RateLimited { .. }))
+        .count();
+    assert_eq!(
+        banners, 1,
+        "first 429 silent, second surfaces exactly one banner: {collected:?}"
+    );
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        3,
+        "two 429s then success"
+    );
+}
+
 // ── test 2: WaitAndRetry{secs:0} → re-issues round, turn succeeds with "ok" ─
 
 #[tokio::test]

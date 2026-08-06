@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.4</span>
+    <span class="dhdr-ver">v5.0.5</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -89,11 +89,13 @@
           <tr><td><code>Alt+Enter</code></td><td>Insert newline (most terminals; macOS Apple Terminal needs "Use Option as Meta key" enabled under Settings → Profiles → Keyboard; Windows Terminal reserves it by default — release in settings)</td></tr>
           <tr><td><code>Shift+Enter</code></td><td>Insert newline (only terminals that disambiguate the modifier: Kitty / WezTerm / iTerm2 with Report Modifiers / Windows Terminal / Ghostty / Warp. Apple Terminal, xterm, GNOME Terminal, VS Code integrated terminal all collapse it to Enter — use <code>\</code> + <code>Enter</code> instead)</td></tr>
           <tr><td><code>Ctrl+Enter</code></td><td>Insert newline (requires a Kitty-keyboard-protocol terminal such as Kitty or WezTerm)</td></tr>
+          <tr><td><code>Ctrl+J</code></td><td>Insert newline when the terminal distinguishes the chord</td></tr>
           <tr><td><code>Esc</code></td><td>Clear current input / interrupt streaming output</td></tr>
           <tr><td><code>Esc Esc</code></td><td>Undo the previous turn when the prompt is idle and empty</td></tr>
           <tr><td><code>↑ / ↓</code></td><td>Browse input history</td></tr>
+          <tr><td><code>→</code></td><td>Fill a faint next-prompt suggestion into an empty input (press <code>Enter</code> separately to send)</td></tr>
           <tr><td><code>Ctrl+R</code></td><td>Reverse-search input history (type to filter live; <code>Ctrl+R</code> again jumps to the next older match; <code>Enter</code> accepts into the input, <code>Esc</code> cancels)</td></tr>
-          <tr><td><code>Tab</code></td><td>Accept completion (slash-command menu, file paths, etc.)</td></tr>
+          <tr><td><code>Tab / Shift+Tab</code></td><td>Accept completion when a menu is open; otherwise cycle next / previous execution mode (also works while streaming)</td></tr>
           <tr><td><code>Ctrl+U</code></td><td>Clear entire line</td></tr>
           <tr><td><code>Ctrl+W</code></td><td>Delete a word</td></tr>
           <tr><td><code>Ctrl+K</code></td><td>Delete from cursor to end of line</td></tr>
@@ -114,7 +116,6 @@
           <tr><td><code>Ctrl+↑ / Ctrl+↓</code></td><td>Jump to previous / next <strong>user</strong> message</td></tr>
           <tr><td><code>Home / End</code></td><td>Jump to top / bottom of the conversation</td></tr>
           <tr><td>Mouse wheel</td><td>Scroll inside the chat area (atomcode captures the wheel)</td></tr>
-          <tr><td><code>Ctrl+L</code></td><td>Clear the current session's messages</td></tr>
         </tbody>
       </table>
 
@@ -137,10 +138,10 @@
           <tr><th>Key</th><th>Action</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>F2 / Shift+F2</code></td><td>Switch to the next / previous configured model</td></tr>
+          <tr><td><code>F2 / Shift+F2</code></td><td>Switch to the next / previous configured model; Mac keyboards usually require <code>Fn+F2 / Fn+Shift+F2</code></td></tr>
+          <tr><td><code>Ctrl+T</code></td><td>Cycle the active model's <code>reasoning_effort</code></td></tr>
           <tr><td><code>Esc</code></td><td>Cancel the in-progress tool call or streaming output</td></tr>
           <tr><td><code>Ctrl+C</code></td><td>First press cancels the current action; second consecutive press exits</td></tr>
-          <tr><td><code>Ctrl+D</code></td><td>Exits when the input box is empty</td></tr>
         </tbody>
       </table>
 

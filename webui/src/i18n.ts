@@ -124,6 +124,9 @@ const zh = {
   'chat.send': '发送',
   'chat.queue': '排队发送（当前回合结束后自动发送）',
   'chat.queued': '排队中',
+  'chat.steer': '插话（将在当前工具完成后应用）',
+  'chat.steerPending': '{count} 条插话已接收，等待应用到当前回合',
+  'chat.steerRecovered': '当前回合在插话确认前结束，内容已恢复到输入框，请确认后重发。',
   'chat.removeQueued': '移除',
   'chat.jumpToBottom': '回到底部',
   'chat.error': '[错误: {msg}]',
@@ -266,6 +269,7 @@ const zh = {
   // User input card
   'userInput.submit': '提交',
   'userInput.skip': '跳过',
+  'userInput.close': '关闭并跳过',
   'userInput.other': 'Other',
   'userInput.error': '提交失败，请重试',
 
@@ -453,6 +457,9 @@ const en: Record<MsgKey, string> = {
   'chat.send': 'Send',
   'chat.queue': 'Queue message (sent after the current turn finishes)',
   'chat.queued': 'Queued',
+  'chat.steer': 'Steer this turn (applied after the current tool finishes)',
+  'chat.steerPending': '{count} steer message(s) accepted and waiting to be applied',
+  'chat.steerRecovered': 'The turn ended before the steer was confirmed. Its content was restored to the input.',
   'chat.removeQueued': 'Remove',
   'chat.jumpToBottom': 'Jump to bottom',
   'chat.error': '[Error: {msg}]',
@@ -588,6 +595,7 @@ const en: Record<MsgKey, string> = {
   // User input card
   'userInput.submit': 'Submit',
   'userInput.skip': 'Skip',
+  'userInput.close': 'Close and skip',
   'userInput.other': 'Other',
   'userInput.error': 'Submit failed, please retry',
 

@@ -31,9 +31,16 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
-pub const MANIFEST_URL: &str =
-    "https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/latest.json";
-pub const DOWNLOAD_BASE: &str = "https://atomgit.com/atomgit_atomcode/atomcode/releases/download";
+/// Version manifest URL for self-update. A function rather than a const because
+/// the address follows the deployment profile; see `atomcode_config::endpoints`.
+pub fn manifest_url() -> &'static str {
+    atomcode_config::endpoints::update_manifest_url()
+}
+
+/// Base for release binary downloads; [`binary_url`] appends `/<version>/<asset>`.
+pub fn download_base() -> &'static str {
+    atomcode_config::endpoints::update_download_base()
+}
 
 /// User-Agent for the update HTTP client. Lowercase `atomcode/<version>` is
 /// deliberate (the gateway UA filter hijacks capital-A `AtomCode`). Vendored here so
@@ -178,7 +185,7 @@ pub fn binary_filename(version: &str, target: &str) -> String {
 pub fn binary_url(version: &str, target: &str) -> String {
     format!(
         "{}/{}/{}",
-        DOWNLOAD_BASE,
+        download_base(),
         version,
         binary_filename(version, target)
     )
@@ -254,7 +261,7 @@ pub async fn fetch_manifest() -> Result<Manifest> {
         .user_agent(ATOMCODE_USER_AGENT)
         .build()?;
     let resp = client
-        .get(MANIFEST_URL)
+        .get(manifest_url())
         .send()
         .await
         .context("failed to fetch latest.json")?;
@@ -1284,7 +1291,7 @@ mod tests {
     fn is_newer_semver() {
         assert!(is_newer("v4.19.0", "v4.18.2")); // latest, current
         assert!(is_newer("v4.19.0", "v4.18.9"));
-        assert!(is_newer("v5.0.4", "v4.99.99"));
+        assert!(is_newer("v5.0.5", "v4.99.99"));
         assert!(!is_newer("v4.19.0", "v4.19.0"));
         assert!(!is_newer("v4.18.0", "v4.19.0")); // latest is older than current
     }

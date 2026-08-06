@@ -19,10 +19,15 @@
 /// `todowrite` tool/hook gate: `ATOMCODE_TODO` env (0/false/off) overrides the
 /// default-on config. Keeping ALL call sites on this one helper guarantees the
 /// system-prompt guidance and the mounted tool never disagree.
+#[cfg(test)]
 pub(crate) fn todo_switch_enabled() -> bool {
+    todo_switch_enabled_for(true)
+}
+
+pub(crate) fn todo_switch_enabled_for(configured: bool) -> bool {
     atomcode_config::config::todo_enabled_from_env(
         std::env::var("ATOMCODE_TODO").ok().as_deref(),
-        true,
+        configured,
     )
 }
 
@@ -419,8 +424,8 @@ tools live under `Scripts\\` (not `bin/`).";
 /// on small edits. Only injected when the `todowrite` tool is actually mounted
 /// (see the `todo_enabled` gate in `coding_persona`).
 const TODO_USAGE: &str = "\n\n## TASK TRACKING:\n\
-When a task spans three or more distinct steps (count steps, not tool calls), touches \
-multiple files, or bundles several user requests, call `todowrite` FIRST with the full list to \
+When a task has multiple requests, phases, files, dependencies, ambiguity, or requires \
+investigation followed by changes, call `todowrite` FIRST with the full list to \
 lay out the steps. Then keep it current by calling `todowrite` ONE item at a time — NOT by \
 resending the whole list: `todowrite {\"action\":\"update\",\"id\":N,\"status\":\"in_progress\"}` \
 when you start item #N, and `status\":\"completed\"` the moment it is actually verified. Keep exactly one item \
@@ -785,11 +790,10 @@ mod tests {
             "enabled → guidance present"
         );
         assert!(on.contains("todowrite"), "enabled → names the tool: {on}");
-        // Threshold disambiguation: count steps, not tool calls (fixes weak-model
-        // miscounting that made GLM under-trigger).
+        // Semantic triggers avoid brittle step counting, which weak models under-count.
         assert!(
-            on.contains("count steps, not tool calls"),
-            "guidance must disambiguate steps from tool calls: {on}"
+            on.contains("multiple requests, phases, files, dependencies, ambiguity"),
+            "guidance must use semantic complexity triggers: {on}"
         );
 
         let off = coding_persona("glm-5.2", false, false);

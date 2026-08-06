@@ -18,7 +18,13 @@ use std::process::{Command, Output};
 use std::sync::{Mutex, MutexGuard};
 
 const STORE_VERSION: &str = "atomcode-rewind-v1";
-pub(crate) const LEDGER_VERSION: u32 = 1;
+/// Bumped to 2 in v5.0.5: `before_tree`/`after_tree` became optional (a
+/// conversation-only point omits them), a shape an older binary's required-`String`
+/// fields cannot deserialize. Writing version 2 makes such a binary reject the whole
+/// ledger with a clear "unsupported version" instead of an opaque serde error. We
+/// still accept any version in `1..=LEDGER_VERSION` so ledgers written by older
+/// binaries remain readable after an upgrade.
+pub(crate) const LEDGER_VERSION: u32 = 2;
 pub(crate) const TRANSACTION_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,7 +35,9 @@ pub(crate) struct RewindLedger {
 
 impl RewindLedger {
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.version != LEDGER_VERSION {
+        // Accept any version up to ours so an upgraded binary still reads older
+        // ledgers; only an unknown-newer (or zero) version is rejected.
+        if self.version == 0 || self.version > LEDGER_VERSION {
             return Err(format!(
                 "unsupported version {} (maximum {LEDGER_VERSION})",
                 self.version
@@ -72,7 +80,7 @@ pub struct RewindPoint {
     pub prompt_preview: String,
     /// Workspace trees are optional so conversation-only Rewind points do not
     /// require a filesystem snapshot. Older ledgers deserialize their string
-    /// values as `Some`, while v5.0.4 writes `None` for both fields.
+    /// values as `Some`, while v5.0.5 writes `None` for both fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_tree: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -218,7 +226,7 @@ impl WorkspaceCheckpoint {
 
     /// Open an already-existing v1 store only for crash recovery. This never
     /// initializes a Git directory or publishes new checkpoint objects, so the
-    /// v5.0.4 safety stop remains in force for ordinary turns.
+    /// v5.0.5 safety stop remains in force for ordinary turns.
     pub(crate) fn for_session_recovery(
         worktree: &Path,
         session_id: &str,
@@ -963,6 +971,42 @@ mod tests {
         legacy.validate().unwrap();
         assert!(legacy.points[0].before_tree.is_some());
         assert!(legacy.points[0].after_tree.is_some());
+    }
+
+    #[test]
+    fn ledger_version_bump_preserves_backward_read_and_rejects_future() {
+        // The optional-tree wire change (String -> Option, skip_if_none) can produce a
+        // point an older binary's required-String field cannot deserialize. v5.0.5 bumps
+        // the ledger version so an older binary rejects new ledgers with a clear
+        // "unsupported version" instead of an opaque serde error.
+        assert_eq!(LEDGER_VERSION, 2);
+
+        // A ledger written by an older binary (v1, required string trees) must still load.
+        let v1: RewindLedger = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "points": [{
+                "turn_id": 1,
+                "prompt_number": 1,
+                "prompt_preview": "legacy",
+                "before_tree": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "after_tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "files": []
+            }]
+        }))
+        .unwrap();
+        v1.validate()
+            .expect("a v1 ledger must remain readable after the bump");
+
+        // The current version validates; a future version is rejected.
+        RewindLedger { version: LEDGER_VERSION, points: vec![] }
+            .validate()
+            .unwrap();
+        assert!(RewindLedger { version: LEDGER_VERSION + 1, points: vec![] }
+            .validate()
+            .is_err());
+        assert!(RewindLedger { version: 0, points: vec![] }
+            .validate()
+            .is_err());
     }
 
     #[test]

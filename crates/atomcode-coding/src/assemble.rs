@@ -64,12 +64,13 @@ pub fn build_coding_agent(cfg: CodingAgentConfig) -> Result<Agent, String> {
 /// explicit persona warning. New callers that need startup failure propagation should use
 /// [`try_build_coding_agent_with`].
 pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmProvider>) -> Agent {
-    match mount_coding_tools(model_suggests_vision(&cfg.model)) {
+    let todo_enabled = crate::persona::todo_switch_enabled_for(cfg.todo.enabled);
+    match mount_coding_tools(model_suggests_vision(&cfg.model), todo_enabled) {
         Ok(tools) => build_coding_agent_from_tools(cfg, provider, tools, None),
         Err(_error) => build_coding_agent_from_tools(
             cfg,
             provider,
-            mount_base_coding_tools(model_suggests_vision(&cfg.model)),
+            mount_base_coding_tools(model_suggests_vision(&cfg.model), todo_enabled),
             Some("AtomGit tools are unavailable because capability setup failed.".to_string()),
         ),
     }
@@ -81,7 +82,10 @@ pub fn try_build_coding_agent_with(
     cfg: &CodingAgentConfig,
     provider: Arc<dyn LlmProvider>,
 ) -> Result<Agent, String> {
-    let tools = mount_coding_tools(model_suggests_vision(&cfg.model))?;
+    let tools = mount_coding_tools(
+        model_suggests_vision(&cfg.model),
+        crate::persona::todo_switch_enabled_for(cfg.todo.enabled),
+    )?;
     Ok(build_coding_agent_from_tools(cfg, provider, tools, None))
 }
 
@@ -97,7 +101,7 @@ fn build_coding_agent_from_tools(
                                              // TodoHook below, so the system prompt never tells the model to use `todowrite`
                                              // when the tool + hook aren't mounted (and vice-versa). The `todowrite` TOOL
                                              // itself is registered on the same env gate in `atomcode-capabilities`.
-    let todo_enabled = crate::persona::todo_switch_enabled();
+    let todo_enabled = crate::persona::todo_switch_enabled_for(cfg.todo.enabled);
     let mut persona = coding_persona_with_language(
         &cfg.model,
         cfg.preferred_language,
@@ -110,13 +114,23 @@ fn build_coding_agent_from_tools(
         persona.push_str("</system-reminder>");
     }
     let turn_execution_policy = Arc::new(TurnExecutionPolicy::new());
-    let mut builder = Agent::builder()
+    let builder = Agent::builder()
         .provider(provider)
         .tools(tools)
         .persona(persona)
         // Repair model-produced arguments before approval inspects them.
         .middleware(Arc::new(RepairToolArgsMiddleware))
         .middleware(turn_execution_policy.clone())
+        // Keep hard credential policy ahead of every middleware that may return
+        // `Allow` and short-circuit the remaining before-chain.
+        .middleware(Arc::new(
+            atomcode_capabilities::tools::CredentialBashGate::new(),
+        ));
+    #[cfg(feature = "atomgit")]
+    let builder = builder.middleware(Arc::new(
+        atomcode_capabilities::tools::AtomgitBashGate::new(),
+    ));
+    let mut builder = builder
         // Auto-approve in-workspace open_file (it's Risky → would otherwise prompt on every
         // preview). This path pins an immutable working_dir, so the gate pins the same root.
         // BEFORE approval so its `Allow` short-circuits the prompt.
@@ -172,16 +186,14 @@ fn build_coding_agent_from_tools(
     // the env var ATOMCODE_TODO=0 / =false / =off can disable it without a config change.
     if todo_enabled {
         builder = builder.hook(Arc::new(crate::todo::TodoHook));
+        builder = builder.hook(Arc::new(crate::todo::TodoEagerHook::new(
+            &cfg.model,
+            &cfg.provider_type,
+            cfg.todo.eager,
+        )));
     }
-    // NOTE: this function is reachable only from tests/examples (see the `parts.rs::assemble`
-    // header). The PRODUCTION mount of this middleware lives in `parts::assemble`; keep both in
-    // sync — mounting it ONLY here (as was originally done) means it never runs for a real
-    // session (terminal/daemon/webui all build their agent through `parts::assemble`).
     #[cfg(feature = "atomgit")]
     {
-        builder = builder.middleware(Arc::new(
-            atomcode_capabilities::tools::AtomgitBashGate::new(),
-        ));
         builder = builder.middleware(Arc::new(
             atomcode_capabilities::tools::GitPushLabelMiddleware::new(cfg.working_dir.clone()),
         ));
@@ -191,8 +203,8 @@ fn build_coding_agent_from_tools(
 
 /// Register the neutral coding tools + codeintel into a fresh registry and mount the
 /// union (everything visible to the model).
-fn mount_coding_tools(vision: bool) -> Result<MountedTools, String> {
-    let (registry, names) = base_coding_tools(vision);
+fn mount_coding_tools(vision: bool, todo_enabled: bool) -> Result<MountedTools, String> {
+    let (registry, names) = base_coding_tools(vision, todo_enabled);
     #[cfg(feature = "atomgit")]
     let (registry, names) = {
         let (mut registry, mut names) = (registry, names);
@@ -203,18 +215,19 @@ fn mount_coding_tools(vision: bool) -> Result<MountedTools, String> {
     Ok(registry.mount(&refs))
 }
 
-fn mount_base_coding_tools(vision: bool) -> MountedTools {
-    let (registry, names) = base_coding_tools(vision);
+fn mount_base_coding_tools(vision: bool, todo_enabled: bool) -> MountedTools {
+    let (registry, names) = base_coding_tools(vision, todo_enabled);
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     registry.mount(&refs)
 }
 
-fn base_coding_tools(vision: bool) -> (ToolRegistry, Vec<String>) {
+fn base_coding_tools(vision: bool, todo_enabled: bool) -> (ToolRegistry, Vec<String>) {
     let mut registry = ToolRegistry::new();
     register_coding_tools_with_vision(&mut registry, vision);
     register_codeintel_tools(&mut registry);
     let names: Vec<String> = coding_tool_names()
         .iter()
+        .filter(|name| todo_enabled || **name != "todowrite")
         .chain(codeintel_tool_names().iter())
         .map(|name| (*name).to_string())
         .collect();
@@ -243,4 +256,19 @@ pub(crate) fn register_atomgit_capabilities(
     register_atomgit_tools(registry, Arc::new(client));
     names.extend(atomgit_tool_names().iter().map(|name| (*name).to_string()));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mount_base_coding_tools;
+
+    #[test]
+    fn disabled_todo_is_not_exposed_to_the_model() {
+        let names: Vec<String> = mount_base_coding_tools(false, false)
+            .defs()
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        assert!(!names.iter().any(|name| name == "todowrite"));
+    }
 }

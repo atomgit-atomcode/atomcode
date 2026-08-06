@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.4</span>
+    <span class="dhdr-ver">v5.0.5</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -97,7 +97,7 @@ base_url = "https://api.deepseek.com/v1"
 context_window = 64000</code></pre>
       <p>This config is enough to launch atomcode and start chatting with DeepSeek.</p>
       <div class="callout callout-info">
-        <strong>Provider management in v5.0.4</strong>
+        <strong>Provider management in v5.0.5</strong>
         <p>The recommended path is <code>/provider</code>: add a provider account, then add one or more models under it. Protocol, base URL, and API key are shared by the account; model name and context window are stored per model. Legacy <code>[providers.*]</code> entries remain supported and are projected automatically.</p>
       </div>
 
@@ -269,6 +269,12 @@ base_url = "http://localhost:11434"</code></pre>
       <pre><code>[coding]
 max_rounds = 200</code></pre>
       <p>When the limit is reached, the TUI asks whether to continue or stop instead of dropping the task. Set it to <code>0</code> for no limit.</p>
+
+      <h2>Todo eagerness</h2>
+      <pre><code>[tools.todo]
+enabled = true
+eager = "auto"</code></pre>
+      <p><code>eager</code> accepts <code>auto</code>, <code>preferred</code>, or <code>always</code>. Auto adds a stronger first-round reminder for DeepSeek V4 Flash while preserving the normal behavior for other models. Preferred applies that reminder to every model. Always requests <code>todowrite</code> as the first tool of a new task when no active list exists; OpenAI-compatible and Anthropic providers enforce the named choice, while adapters without named-tool selection still receive the imperative reminder. Set <code>enabled = false</code> to remove the tool, prompt guidance, and todo hooks together; restart the current runtime after changing this master switch. <code>ATOMCODE_TODO</code> remains an environment override.</p>
 
       <h2 id="vision-preprocessor">Vision preprocessor</h2>
       <p>When the active provider's model can't read images (text-only models like DeepSeek-V3 / Kimi) and the user <a href="./basic-usage.html#image-attach">attaches an image</a>, AtomCode doesn't refuse — it forwards the image to a separate "vision preprocessor" provider for OCR + description, then splices the resulting text into the user message before sending to the main model.</p>

@@ -151,8 +151,15 @@ struct ReviewArgs {
     /// since their O(repo) tree-sitter graph build blows the wall-clock budget on huge repos for
     /// no measured quality gain. Omit ⇒ UNLIMITED (always mount — bare-CLI default). Engineering
     /// callers reviewing huge repos (e.g. a kernel on NFS) set e.g. `--graph-max-files 8000`.
+    /// Pass `0` to never mount the graph (force grep-only).
     #[arg(long)]
     graph_max_files: Option<u32>,
+    /// Skip the coverage re-review pass (second agent pass over changed files that got zero
+    /// findings). Engineering callers use this for isolated monorepo recipe PRs where a second
+    /// pass mostly re-reads scaffold and burns the wall-clock budget. Default: coverage stays
+    /// on after a finished first pass.
+    #[arg(long)]
+    no_coverage: bool,
     /// Load skill tools (`use_skill` / `list_skills`) from this directory. Repeatable
     /// (LOW→HIGH priority; later dirs override earlier on name collision). Each dir is
     /// scanned for `SKILL.md` (directory skill with bundled `scripts/` / `references/`)
@@ -432,7 +439,15 @@ async fn review(args: ReviewArgs) -> Result<()> {
     // files that got zero findings (scoped sub-diff) once and merge — a deterministic guard the
     // model can't skip. Gated to diff mode with a known changed set (annotated_diff empty ⇒
     // task/custom mode, nothing to backstop). Lockfiles are already excluded by uncovered_files.
-    if !annotated_diff.is_empty() {
+    //
+    // Skip when:
+    // - `--no-coverage` (engineering opt-out, e.g. isolated recipe monorepo PRs)
+    // - initial pass cut short (Cancelled / Timeout / MaxRounds / …): a second agent only burns
+    //   the shared --max-duration budget (observed: both Cancelled on 5min recipe runs)
+    // - after priority / scaffold filter, nothing high-signal left
+    if args.no_coverage {
+        eprintln!("[coverage] skipped — --no-coverage");
+    } else if !annotated_diff.is_empty() && incomplete_reasons.is_empty() {
         let uncovered = uncovered_files(&changed_files, &findings);
         let sub = sub_diff_for_files(&annotated_diff, &uncovered);
         if !sub.trim().is_empty() {
@@ -469,7 +484,18 @@ async fn review(args: ReviewArgs) -> Result<()> {
             drop_out_of_scope(&mut extra, &changed_files);
             let added = merge_findings(&mut findings, extra);
             eprintln!("[coverage] recovered {added} finding(s) from the re-review");
+        } else if !changed_files.is_empty() {
+            eprintln!(
+                "[coverage] skipped — no high-signal uncovered files after filter \
+                 (first_pass_findings={})",
+                findings.len()
+            );
         }
+    } else if !annotated_diff.is_empty() && !incomplete_reasons.is_empty() {
+        eprintln!(
+            "[coverage] skipped — initial pass incomplete ({})",
+            incomplete_reasons.join("; ")
+        );
     }
 
     // Drain telemetry to disk AFTER all LLM work (first pass + any coverage re-review).
@@ -993,21 +1019,119 @@ fn drop_out_of_scope(findings: &mut Vec<Finding>, changed_files: &[String]) -> u
     before - findings.len()
 }
 
+/// Hard cap on coverage re-review fan-out. Wide monorepo-style PRs otherwise re-review nearly
+/// every file and roughly double wall-clock. High-signal paths (source / build recipes) first.
+const MAX_COVERAGE_REREVIEW_FILES: usize = 8;
+
+/// Priority for coverage re-review (higher first). Scaffold scores low so a capped second pass
+/// still spends budget on real code when the first pass already found issues.
+fn coverage_priority(path: &str) -> i32 {
+    let lower = path.to_ascii_lowercase();
+    let base = lower.rsplit('/').next().unwrap_or(&lower);
+    if is_coverage_scaffold_file(path) {
+        return 10;
+    }
+    const SRC: &[&str] = &[
+        ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".go", ".rs", ".py", ".java", ".kt",
+        ".swift", ".ts", ".tsx", ".js", ".jsx", ".m", ".mm", ".cs", ".rb", ".php", ".scala",
+    ];
+    for ext in SRC {
+        if lower.ends_with(ext) {
+            if base == "conanfile.py" || base == "cmakelists.txt" {
+                return 95;
+            }
+            return 100;
+        }
+    }
+    if base == "cmakelists.txt"
+        || base.starts_with("dockerfile")
+        || base == "makefile"
+        || base == "meson.build"
+        || base == "build.gradle"
+        || base == "build.gradle.kts"
+    {
+        return 95;
+    }
+    if lower.ends_with(".patch") || lower.ends_with(".diff") {
+        if base.contains("tests-t") || lower.contains("/tests-") || lower.contains("-tests-") {
+            return 30;
+        }
+        return 75;
+    }
+    if base == "conandata.yml" || base == "conandata.yaml" {
+        return 70;
+    }
+    if lower.ends_with(".yml")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".toml")
+        || lower.ends_with(".json")
+        || lower.ends_with(".sh")
+    {
+        return 55;
+    }
+    if lower.ends_with(".md") {
+        return 40;
+    }
+    50
+}
+
+/// Recipe bookkeeping that rarely needs a second pass once the first pass already reported
+/// on real recipe code (conanfile / patches / tests).
+fn is_coverage_scaffold_file(path: &str) -> bool {
+    let base = path
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        "notes.md"
+            | "commands.json"
+            | "manifest.yml"
+            | "manifest.yaml"
+            | "readme.md"
+            | "changelog.md"
+    )
+}
+
 /// Changed files that received ZERO findings and are worth a focused second look. Drives the
 /// coverage backstop: on a wide diff the reviewer sometimes declares "done" having only
 /// reported on some files (observed: umi-ocr left 3/10 files unreviewed). Re-reviewing just
-/// these recovers the gap. Lockfiles/manifests are excluded (a clean lockfile is expected).
+/// these recovers the gap.
 ///
-/// Expects `findings` already scope-filtered to `changed_files` (see [`drop_out_of_scope`]),
-/// so a finding's `file_path` equals its changed-file entry. Empty `changed_files` (task mode,
-/// unknown set) yields none — nothing to backstop.
+/// Filters:
+/// - lockfiles / low-signal (`is_low_signal_file`)
+/// - when first pass already has findings: drop scaffold (notes/commands/manifest)
+/// - cap to [`MAX_COVERAGE_REREVIEW_FILES`] by priority (source / recipe first)
+///
+/// Expects `findings` already scope-filtered to `changed_files` (see [`drop_out_of_scope`]).
+/// Empty `changed_files` (task mode) yields none.
 fn uncovered_files(changed_files: &[String], findings: &[Finding]) -> Vec<String> {
-    changed_files
+    let first_pass_had_findings = !findings.is_empty();
+    let mut files: Vec<String> = changed_files
         .iter()
         .filter(|c| !atomcode_review::is_low_signal_file(c))
         .filter(|c| !findings.iter().any(|f| &f.file_path == *c))
+        .filter(|c| !(first_pass_had_findings && is_coverage_scaffold_file(c)))
         .cloned()
-        .collect()
+        .collect();
+    if files.is_empty() {
+        return files;
+    }
+    if files.len() <= MAX_COVERAGE_REREVIEW_FILES {
+        return files;
+    }
+    files.sort_by(|a, b| {
+        coverage_priority(b)
+            .cmp(&coverage_priority(a))
+            .then_with(|| a.cmp(b))
+    });
+    let dropped = files.len() - MAX_COVERAGE_REREVIEW_FILES;
+    files.truncate(MAX_COVERAGE_REREVIEW_FILES);
+    eprintln!(
+        "[coverage] capped re-review to {MAX_COVERAGE_REREVIEW_FILES} highest-priority file(s); dropped {dropped} lower-priority uncovered file(s)"
+    );
+    files
 }
 
 /// Fold `extra` findings into `findings`, skipping duplicates (same file + start line +
@@ -1234,6 +1358,51 @@ mod tests {
     fn uncovered_empty_when_changed_set_unknown() {
         // No changed set (task mode) → nothing to backstop.
         assert!(uncovered_files(&[], &[finding_in("x.go")]).is_empty());
+    }
+
+    #[test]
+    fn uncovered_drops_scaffold_when_first_pass_already_found_issues() {
+        // First pass found something on conanfile → don't re-review notes/commands.
+        let changed = vec![
+            "pkg/conanfile.py".to_string(),
+            "pkg/notes.md".to_string(),
+            "pkg/commands.json".to_string(),
+            "pkg/util.c".to_string(),
+        ];
+        let fs = vec![finding_in("pkg/conanfile.py")];
+        let mut got = uncovered_files(&changed, &fs);
+        got.sort();
+        assert_eq!(got, vec!["pkg/util.c".to_string()]);
+    }
+
+    #[test]
+    fn uncovered_keeps_scaffold_when_first_pass_found_nothing() {
+        // 0 findings overall: still allow scaffold into the pool (may be filtered by cap).
+        let changed = vec!["pkg/notes.md".to_string(), "pkg/conanfile.py".to_string()];
+        let fs: Vec<Finding> = vec![];
+        let mut got = uncovered_files(&changed, &fs);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "pkg/conanfile.py".to_string(),
+                "pkg/notes.md".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn uncovered_caps_and_prefers_source() {
+        let mut changed: Vec<String> = (1..=10)
+            .map(|i| format!("patches/00{i:02}-tests-t{i:04}.pl.patch"))
+            .collect();
+        changed.push("src/core.go".to_string());
+        changed.push("conanfile.py".to_string());
+        let fs: Vec<Finding> = vec![];
+        let got = uncovered_files(&changed, &fs);
+        assert_eq!(got.len(), MAX_COVERAGE_REREVIEW_FILES);
+        assert!(got.contains(&"src/core.go".to_string()), "{got:?}");
+        assert!(got.contains(&"conanfile.py".to_string()), "{got:?}");
     }
 
     const TWO_FILE_DIFF: &str = "diff --git a/a.go b/a.go\n\

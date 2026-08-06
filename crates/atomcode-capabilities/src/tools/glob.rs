@@ -3,7 +3,7 @@
 //! does not) via `globset` with `literal_separator(true)`. Build/VCS/cache dirs are
 //! skipped; results sorted, capped at 100.
 
-use super::{err, is_absolute_path, is_skip_dir, ok, resolve_path};
+use super::{err, is_absolute_path, is_skip_dir, not_found_hint, ok, resolve_path};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
 use globset::GlobBuilder;
@@ -75,8 +75,9 @@ impl Tool for GlobTool {
             Ok(m) if m.is_dir() => {}
             _ => {
                 return err(format!(
-                    "glob: base directory does not exist: {}",
-                    crate::pathnorm::to_display(&base)
+                    "glob: base directory does not exist: {}{}",
+                    crate::pathnorm::to_display(&base),
+                    not_found_hint(&base, &ctx.working_dir).await
                 ))
             }
         }
@@ -233,6 +234,28 @@ mod tests {
             progress: atomcode_kernel::tool::ProgressSink::noop(),
             requester: None,
         }
+    }
+
+    /// Same recovery clue as `grep`/`list_directory` — glob failed on the identical guessed
+    /// path in the reported session.
+    #[tokio::test]
+    async fn missing_base_dir_error_carries_the_nearest_existing_ancestor() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("app")).unwrap();
+        std::fs::write(d.path().join("app/build.gradle"), "").unwrap();
+        let r = GlobTool
+            .execute(
+                r#"{"pattern":"**/*.java","path":"app/src/main/java"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(r.is_error, "{}", r.content);
+        assert!(
+            r.content.contains("Nearest existing directory"),
+            "{}",
+            r.content
+        );
+        assert!(r.content.contains("build.gradle"), "{}", r.content);
     }
 
     #[tokio::test]

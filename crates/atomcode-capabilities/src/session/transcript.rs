@@ -177,8 +177,12 @@ impl TranscriptHook {
         // failure must not fail the turn. It must still be visible to the driver:
         // silently dropping ENOSPC here made missing history look successful.
         if let Err(error) = self.append(&record) {
-            let warning =
-                format!("session transcript was not saved; check available disk space: {error}");
+            let guidance = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                "check file permissions, read-only attributes, security software, and whether another AtomCode process is using the file"
+            } else {
+                "check available disk space and file permissions"
+            };
+            let warning = format!("session transcript was not saved; {guidance}: {error}");
             eprintln!("[TranscriptHook] {warning}");
             if let Some(status) = &self.persistence_status {
                 status.report_auxiliary_warning(warning);

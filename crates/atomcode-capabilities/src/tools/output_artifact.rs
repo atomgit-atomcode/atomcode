@@ -74,6 +74,9 @@ impl ArtifactStore {
 }
 
 pub const THRESHOLD_BYTES: usize = 16 * 1024;
+/// Stable prefix embedded in a conversation-visible result when the complete
+/// tool output was replaced by an artifact-backed head/tail preview.
+pub const ARTIFACT_TRUNCATION_MARKER_PREFIX: &str = "[atomcode: output truncated";
 const PREVIEW_HALF: usize = 4 * 1024;
 const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 

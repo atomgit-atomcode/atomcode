@@ -444,6 +444,9 @@ pub enum MenuKind {
         row_prefix: &'static str,
         selected_marker: &'static str,
     },
+    /// `/cd` project list. Uses `/resume`-style title/search/hint chrome with
+    /// single-line directory rows, capped to roughly half the terminal height.
+    DirectoryList,
     /// Plugin manager list: 2-line rendering per item.
     /// Row 1: Plugin Name + Marketplace + Installation Status
     /// Row 2: Description
@@ -468,6 +471,12 @@ impl MenuKind {
             MenuKind::SlashCommand | MenuKind::AtMention => item_count.min(4),
             MenuKind::Skill | MenuKind::Action | MenuKind::TwoColumn { .. } => {
                 item_count.min((screen_height / 2).max(4))
+            }
+            // Leave one row for the surrounding footer rule/status chrome so
+            // the complete `/cd` surface, not just its menu payload, stays at
+            // roughly half of the terminal.
+            MenuKind::DirectoryList => {
+                item_count.min((screen_height / 2).saturating_sub(1).max(1))
             }
             MenuKind::Plugin | MenuKind::SessionList => {
                 let plugin_count = item_count.saturating_sub(3);
@@ -558,6 +567,9 @@ pub struct StatusLine {
     /// Active Ctrl+R reverse-i-search state, shown on the input box's
     /// top rule while searching. `None` outside search mode.
     pub search: Option<SearchState>,
+    /// Ephemeral text rendered faintly inside an otherwise-empty composer.
+    /// Right Arrow acceptance belongs to the input driver, not the renderer.
+    pub next_prompt_suggestion: Option<String>,
     /// Optional read-only command report rendered as a transient multi-line
     /// footer panel directly below the input box. It never enters scrollback.
     pub command_output: Option<String>,
@@ -690,6 +702,9 @@ pub struct UserInputPanelView {
     pub custom_text: String,
     /// Whether to render the "Other" free-text row (mirrors `UserInputPanel.custom`).
     pub custom: bool,
+    /// Signed PageUp/PageDown displacement from the automatically selected
+    /// viewport. Kept in TUI state; it is not part of the tool wire protocol.
+    pub scroll_offset: isize,
     /// Batch navigator context. `None` = a standalone single question (rendered
     /// byte-identically to before, no chrome). `Some` = this is one question inside
     /// a multi-question batch, so the renderer adds a `Question i/N` navigator and a
@@ -742,6 +757,7 @@ pub fn round_cap_view(cap: u32, base: u32, cursor: usize, stats: &str) -> UserIn
         text: String::new(),
         custom_text: String::new(),
         custom: false,
+        scroll_offset: 0,
         batch: None,
     }
 }
@@ -815,6 +831,12 @@ pub struct GoalStatus {
     pub round: u32,
     /// Wall-clock seconds since the goal was set.
     pub elapsed_secs: u64,
+    /// Current phase of the goal (Pursuing / PausedAtCap / Satisfied / Ended).
+    /// Drives badge rendering: Pursuing → live progress; PausedAtCap → paused
+    /// badge with resume hint; Satisfied → achieved badge. Ended is never stored
+    /// (the goal row is hidden by clearing `goal_condition` before this is
+    /// constructed).
+    pub phase: atomcode_coding::GoalPhase,
 }
 
 /// Live status of an active `/loop`, rendered on the dedicated footer loop row.
@@ -988,6 +1010,13 @@ mod tests {
         // At the cap boundary.
         assert_eq!(k.max_visible_rows(40, 20), 20);
         assert_eq!(k.max_visible_rows(40, 19), 19);
+    }
+
+    #[test]
+    fn directory_list_uses_half_screen_row_budget() {
+        assert_eq!(MenuKind::DirectoryList.max_visible_rows(10, 20), 4);
+        assert_eq!(MenuKind::DirectoryList.max_visible_rows(40, 30), 19);
+        assert_eq!(MenuKind::DirectoryList.max_visible_rows(40, 8), 8);
     }
 
     #[test]

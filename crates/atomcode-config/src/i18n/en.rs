@@ -199,10 +199,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
   ── Input ──
     Enter                            Send message
     \ then Enter                     Insert newline (works in every terminal)
-    Alt+Enter                        Insert newline *
-    Shift+Enter                      Insert newline **
+    Shift / Alt / Ctrl+Enter         Insert newline *
+    Ctrl+J                           Insert newline *
     /                                Open slash command menu
-    Tab                              Autocomplete
+    Tab                              Accept slash-command or file completion
     Backspace / Ctrl+H               Delete previous char
     Delete / Ctrl+?                  Delete next char
     Ctrl+W                           Delete word backward
@@ -213,38 +213,49 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Left / Right                     Move cursor
 
   ── History ──
-    Up                               Previous input
-    Down                             Next input
+    Up / Down                        Previous / next input
+    Ctrl+R                           Reverse-search; press again for older match
+    Right                            Accept next-prompt suggestion (does not send)
 
-  ── Scrollback ──
-    Use the host terminal's native scrollback (cmd+↑/↓, mouse wheel,
-    tmux copy-mode — whatever your terminal already provides).
-    Drag + Ctrl+C                    Copy text (atomcode does not capture the mouse)
+  ── Mode and model ──
+    Tab / Shift+Tab                  Without a menu, cycle next / previous mode
+    F2 / Shift+F2                    Next / previous model (Mac: Fn+F2 / Fn+Shift+F2)
+    Ctrl+T                           Cycle reasoning_effort
 
-  ── Session ──
-    F2 / Shift+F2                    Next / previous model
-    Ctrl+C                           Cancel current turn / dismiss modal
-    Esc Esc                          Undo the previous turn
-    Ctrl+D                           Exit AtomCode
-    Ctrl+L                           Clear screen
+  ── Browse output ──
+    Shift+Up / Shift+Down            Scroll up / down one line
+    PageUp / PageDown                Scroll up / down 10 lines
+    Alt+Up / Alt+Down                Jump to previous / next message
+    Ctrl+Up / Ctrl+Down              Jump to previous / next user message
+    Home / End                       With empty input, jump to top / bottom
+    Mouse wheel                      Scroll the chat area
+    Mouse drag                       Select text
+    Shift+mouse drag                 Use the terminal's native selection
+    Ctrl+Shift+C                     Copy the AtomCode selection
+
+  ── Control flow ──
+    Esc                              Clear input / close modal / cancel action
+    Esc Esc                          Undo previous turn when idle with empty input
+    Ctrl+C                           Cancel action; press again while idle to exit
     Ctrl+O                           Toggle tool real-time output
-    Ctrl+V                           Paste (text + image)
+    Ctrl+V / Ctrl+Alt+V              Paste text or image **
 
   ── Slash menu / modal navigation ──
     Up / Down                        Move selection
     Enter                            Confirm
     Esc                              Cancel / close modal
-    Tab                              Insert highlighted command
+    Tab                              Insert highlighted slash command
+    1..9                             Pick an approval / question option
+    y / a / n                        Approval: allow once / always / deny
 
-  * Alt+Enter works in most terminals; macOS Apple Terminal users
-    must enable "Use Option as Meta key" under Settings → Profiles
-    → Keyboard for the keystroke to register as a newline.
-  ** Shift+Enter requires a terminal that disambiguates the modifier.
+  * Modified Enter requires a terminal that disambiguates modifiers.
      Known-supported: Kitty / WezTerm / iTerm2 (with Report Modifiers
      enabled) / Windows Terminal / Ghostty / Warp. Other terminals
      (macOS Apple Terminal, default xterm, GNOME Terminal, VS Code's
      integrated terminal) collapse Shift+Enter into plain Enter —
      use \ + Enter instead.
+  ** Ctrl+Alt+V is the fallback when the terminal intercepts Ctrl+V;
+     Ctrl+Shift+V remains the terminal's plain-text paste shortcut.
 
   Tip: run /help for the full slash command list.
 "#.into(),
@@ -456,6 +467,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("> {buffer}_  [Enter: confirm, Esc: cancel]").into(),
 
         // ── Dir picker ──
+        Msg::DirPickerTitle { n, total } =>
+            format!("Change working directory ({n}/{total})").into(),
+        Msg::DirPickerHint =>
+            "↑↓ move · Tab complete · Enter open · Type to search/path · Esc cancel".into(),
+        Msg::DirPickerEmptyPath { query } =>
+            format!("No saved project matches \"{query}\" · Enter to open it as a path").into(),
         Msg::DirCurrent => "current".into(),
         Msg::DirNotExists { path } =>
             format!("directory no longer exists: {path}").into(),

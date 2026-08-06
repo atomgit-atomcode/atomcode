@@ -6,7 +6,7 @@
 //! row. Any error (network, parse, non-matching format) silently returns
 //! `None` — this feature must never be noisy.
 
-use atomcode_updater::{Manifest, MANIFEST_URL};
+use atomcode_updater::{manifest_url, Manifest};
 
 /// Compare a `latest.json` body against the current compiled-in version.
 ///
@@ -79,7 +79,7 @@ pub async fn check_latest(current: &str) -> Option<String> {
         .user_agent(atomcode_auth::ATOMCODE_USER_AGENT)
         .build()
         .ok()?;
-    let resp = client.get(MANIFEST_URL).send().await.ok()?;
+    let resp = client.get(manifest_url()).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -117,8 +117,8 @@ mod tests {
     #[test]
     fn newer_major_version_returns_some() {
         assert_eq!(
-            parse_and_compare("v4.15.3", &manifest_body("v5.0.4")),
-            Some("v5.0.4".to_string())
+            parse_and_compare("v4.15.3", &manifest_body("v5.0.5")),
+            Some("v5.0.5".to_string())
         );
     }
 
