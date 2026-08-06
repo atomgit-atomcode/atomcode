@@ -19918,10 +19918,34 @@ fn goal_defers_turn_separator(goal_condition_set: bool, phase: atomcode_coding::
     goal_condition_set && matches!(phase, atomcode_coding::GoalPhase::Pursuing)
 }
 
+/// Whether the goal badge's elapsed clock should reset. It resets when the goal
+/// (re-)enters `Pursuing` from a non-Pursuing state — a fresh `/goal`, or re-engaging
+/// a `Satisfied`/`PausedAtCap` goal — or on the very first update (clock unset). It
+/// deliberately does NOT reset on a mid-Pursuing update that also carries `round == 0`
+/// (e.g. the async `AdjustGoalRounds` budget correction), which would otherwise rewind
+/// a fresh goal's clock mid-first-turn. `entering_from_pursuing` = the badge was
+/// already showing a Pursuing goal before this update.
+fn goal_clock_should_reset(entering_from_pursuing: bool, clock_unset: bool) -> bool {
+    !entering_from_pursuing || clock_unset
+}
+
 #[cfg(test)]
 mod goal_end_tests {
-    use super::{goal_defers_turn_separator, goal_terminal_is_met};
+    use super::{goal_clock_should_reset, goal_defers_turn_separator, goal_terminal_is_met};
     use atomcode_coding::{GoalPhase, GoalTerminal};
+
+    #[test]
+    fn goal_clock_resets_on_reengage_not_on_mid_pursuit_update() {
+        // Fresh /goal (badge not yet Pursuing, clock unset) → reset.
+        assert!(goal_clock_should_reset(false, true));
+        // Re-engage a Satisfied/PausedAtCap goal (badge was not Pursuing) → reset.
+        assert!(goal_clock_should_reset(false, false));
+        // Mid-Pursuing update — AdjustGoalRounds (round==0) or a mid-goal round — must
+        // NOT rewind the clock.
+        assert!(!goal_clock_should_reset(true, false));
+        // Defensive: already Pursuing but clock somehow unset → set it.
+        assert!(goal_clock_should_reset(true, true));
+    }
 
     #[test]
     fn only_explicit_met_terminal_is_successful() {
@@ -21266,15 +21290,22 @@ fn handle_agent_event(
             ..
         } => {
             if active {
+                // Whether the badge was ALREADY a live Pursuing goal before this
+                // update — captured before we overwrite goal_phase below. `goal_phase`
+                // defaults to Pursuing with no condition, so require goal_condition too.
+                let entering_from_pursuing = state.goal_phase
+                    == atomcode_coding::GoalPhase::Pursuing
+                    && state.goal_condition.is_some();
                 // Pursuing: update live badge state.
                 state.goal_condition = Some(condition);
                 state.goal_round = round;
                 state.goal_phase = atomcode_coding::GoalPhase::Pursuing;
-                // Reset the elapsed clock on a fresh start OR a resume (round 0, e.g.
-                // re-engaging a Satisfied/PausedAtCap goal) so the badge reads
-                // `round 1 · <fresh time>`. Keep it across mid-goal rounds (round > 0)
-                // so a single pursuit's total time still accumulates.
-                if round == 0 || state.goal_started_at.is_none() {
+                // Reset the elapsed clock only when (re-)entering Pursuing from a
+                // non-Pursuing state (fresh /goal, or re-engaging a Satisfied/PausedAtCap
+                // goal) so the badge reads `round 1 · <fresh time>` — NOT on mid-Pursuing
+                // updates that also carry round==0 (e.g. AdjustGoalRounds), which would
+                // otherwise rewind a fresh goal's clock mid-first-turn.
+                if goal_clock_should_reset(entering_from_pursuing, state.goal_started_at.is_none()) {
                     state.goal_started_at = Some(std::time::Instant::now());
                 }
             } else {
