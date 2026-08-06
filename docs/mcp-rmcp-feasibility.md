@@ -1,7 +1,7 @@
 # rmcp 替换可行性评估
 
 **评估对象：** 用官方 Rust SDK [`rmcp` 3.1.0](https://crates.io/crates/rmcp)（2026-07-31 发布，MSRV 1.88，Apache-2.0）替换 `crates/atomcode-capabilities/src/mcp/` 里手写的 MCP 客户端。
-**评估日期：** 2026-08-04（分支 `release/v5.0.4`）
+**评估日期：** 2026-08-04（分支 `release/v5.0.5`）
 **证据基础：** rmcp 3.1.0 crate 源码本地解包逐文件读；并在 `scratchpad/rmcp-probe` 里用 **260 行**在 rmcp 上重新实现了我们全部 `McpClient` trait（stdio 全量 + HTTP 连接），`cargo check` 通过。下文所有结论都带 `文件:行号`。
 
 ---

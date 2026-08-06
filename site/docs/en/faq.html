@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.4</span>
+    <span class="dhdr-ver">v5.0.5</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -104,7 +104,7 @@
       <ul>
         <li>First check that <code>base_url</code> in <code>~/.atomcode/config.toml</code> is reachable — <code>curl</code> the matching <code>/v1/models</code> endpoint;</li>
         <li>On corporate networks it's usually a proxy issue — set <code>HTTPS_PROXY</code> and retry;</li>
-        <li>On Windows, v5.0.4 uses the system SChannel certificate store by default, including enterprise roots. If it still fails, check the system certificate, proxy, and overrides such as <code>SSL_CERT_FILE</code> separately;</li>
+        <li>On Windows, v5.0.5 uses the system SChannel certificate store by default, including enterprise roots. If it still fails, check the system certificate, proxy, and overrides such as <code>SSL_CERT_FILE</code> separately;</li>
         <li>If you're in mainland China hitting an overseas model, verify your egress network. You can run <code>/model</code> to switch to AtomGit's official channel first to prove the whole pipeline works.</li>
       </ul>
 

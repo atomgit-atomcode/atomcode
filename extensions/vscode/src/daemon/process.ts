@@ -59,8 +59,8 @@ export class DaemonProcess {
       }
 
       // Same-version daemon builds can expose different config/runtime schemas.
-      // Compare the executable hash as well so an older 5.0.4 process cannot
-      // survive an extension update that bundles a newer 5.0.4 daemon.
+      // Compare the executable hash as well so an older 5.0.5 process cannot
+      // survive an extension update that bundles a newer 5.0.5 daemon.
       console.log(
         `[AtomCode] Daemon identity mismatch: running=${health.version}/${health.binary_hash || 'unknown'}, `
         + `expected=${expected.version || 'any'}/${expected.binaryHash || 'any'}. Restarting...`,

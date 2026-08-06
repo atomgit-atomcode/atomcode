@@ -6,7 +6,7 @@ Replace the unsafe “double Esc immediately runs `/undo`” gesture with an exp
 Rewind workflow that restores conversation state to a selected prompt boundary.
 The picker opens on `(current)`, so an accidental double Esc plus Enter is a no-op.
 
-> **v5.0.4 safety status:** Workspace/code restoration is disabled. The original
+> **v5.0.5 safety status:** Workspace/code restoration is disabled. The original
 > per-session shadow-Git implementation had no disk quota or object collection and
 > could exhaust the system disk. Rewind points now persist independently of Git
 > trees, so conversation Rewind remains available without creating
@@ -28,7 +28,7 @@ second per-turn state machine is introduced. The kernel remains neutral and
 unchanged.
 
 The following historical v1 workspace layout is retained only for compatibility
-and cleanup; v5.0.4 does not initialize or write it:
+and cleanup; v5.0.5 does not initialize or write it:
 
 ```text
 ~/.atomcode/rewind/<project-hash>/
@@ -37,7 +37,7 @@ and cleanup; v5.0.4 does not initialize or write it:
 Existing code must not treat the presence of an old object store as evidence that
 code restoration is available.
 
-v5.0.4 intentionally does not delete an existing store automatically. On the
+v5.0.5 intentionally does not delete an existing store automatically. On the
 first affected-session load it uses an existing store only to finish compensation
 for an interrupted v5.0.3 code-Rewind transaction, then drops the backend again.
 Operators must preserve the store whenever AtomCode reports a pending-Rewind
@@ -59,7 +59,7 @@ conversation revision/boundary
 `turn_start` records prompt metadata without scanning the worktree.
 `turn_complete`, including cancelled and failed turns, persists the conversation
 point with absent workspace-tree fields. Older ledgers containing Git tree IDs
-remain readable, but v5.0.4 does not offer code scopes against them.
+remain readable, but v5.0.5 does not offer code scopes against them.
 
 ## Rewind transaction
 
@@ -100,4 +100,4 @@ Tests cover picker default/current behavior, Esc cancellation isolation, target
 selection, conversation-point creation without workspace trees, explicit code
 scope rejection, stale generation/revision rejection, session resume, and TUI
 transcript repaint. Historical workspace tests remain as compatibility coverage;
-they do not imply that v5.0.4 enables the backend.
+they do not imply that v5.0.5 enables the backend.

@@ -123,7 +123,7 @@ struct PendingRewindPoint {
 }
 
 const CODE_REWIND_DISABLED_REASON: &str =
-    "Code Rewind is temporarily disabled in v5.0.4 to protect disk space; conversation Rewind remains available.";
+    "Code Rewind is temporarily disabled in v5.0.5 to protect disk space; conversation Rewind remains available.";
 
 #[derive(Clone, Debug)]
 pub struct RewindTransactionReceipt {
@@ -162,7 +162,7 @@ impl SnapshotHook {
     ) -> Self {
         let session_id = session_id.into();
         let working_dir = working_dir.into();
-        // v5.0.4 safety stop: the per-session shadow Git store could grow without
+        // v5.0.5 safety stop: the per-session shadow Git store could grow without
         // a quota or object collection and exhaust the system disk. Keep the
         // conversation checkpoint ledger active, but do not initialize or write
         // a workspace object database until the bounded shared-store design lands.
@@ -603,7 +603,7 @@ impl SnapshotHook {
             } else {
                 self.replace_rewind_points_locked(&mut rewind, journal.previous_points)?;
                 if let Some(tree) = journal.recovery_tree.as_deref() {
-                    // v5.0.4 disables the live workspace backend, but an
+                    // v5.0.5 disables the live workspace backend, but an
                     // interrupted v5.0.3 transaction may have already changed
                     // files. Open its existing store only long enough to
                     // compensate; never retain it for future turn capture.

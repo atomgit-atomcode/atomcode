@@ -1,7 +1,7 @@
 # Rewind Implementation Plan
 
-> **v5.0.4 status override:** Tasks below describe the original implementation.
-> Workspace/code Rewind is disabled in v5.0.4 after the per-session Git object
+> **v5.0.5 status override:** Tasks below describe the original implementation.
+> Workspace/code Rewind is disabled in v5.0.5 after the per-session Git object
 > stores were found able to exhaust the system disk. Current production behavior
 > records conversation-only points with optional/absent workspace trees, keeps
 > conversation Rewind available, and rejects code-only or combined scopes with an
@@ -11,10 +11,10 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Original goal (superseded for v5.0.4):** Add a safe Claude-style Rewind picker
+**Original goal (superseded for v5.0.5):** Add a safe Claude-style Rewind picker
 with conversation-only, code-only, and combined restoration.
 
-**Original architecture (workspace portion disabled for v5.0.4):** Extend the
+**Original architecture (workspace portion disabled for v5.0.5):** Extend the
 existing native session `SnapshotHook` with a separate-Git-dir workspace
 checkpoint service, persist compact per-turn rewind metadata, and expose one
 runtime-owned rewind operation. The TUI is a pure selector/projection and

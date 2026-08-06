@@ -67,7 +67,7 @@ fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
 /// modal (or a "no rewind points" notice) via `install_pending_rewind_modal`.
 /// Idle-only: rewinding mutates conversation history, so it must not race a
 /// running turn (mirrors the double-Esc gate and `dispatch_undo`). Workspace/code
-/// Rewind is disabled in v5.0.4.
+/// Rewind is disabled in v5.0.5.
 pub(super) fn dispatch_rewind(state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
     if state.phase != crate::state::UiPhase::Idle {
         renderer.render(UiLine::CommandOutput(t(Msg::CmdRewindBusy).into_owned()));
@@ -7486,9 +7486,9 @@ mod tests {
         assert!(review_prompt("staged").contains(
             r#"{"scope":{"kind":"staged"}}"#
         ));
-        let range = review_prompt("release/v5.0.4");
+        let range = review_prompt("release/v5.0.5");
         assert!(range.contains(
-            r#"{"scope":{"kind":"range","base":"release/v5.0.4","head":"HEAD"}}"#
+            r#"{"scope":{"kind":"range","base":"release/v5.0.5","head":"HEAD"}}"#
         ));
         assert!(!range.contains(r#"{"base":"#));
     }

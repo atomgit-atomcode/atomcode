@@ -80,7 +80,7 @@ pub struct RewindPoint {
     pub prompt_preview: String,
     /// Workspace trees are optional so conversation-only Rewind points do not
     /// require a filesystem snapshot. Older ledgers deserialize their string
-    /// values as `Some`, while v5.0.4 writes `None` for both fields.
+    /// values as `Some`, while v5.0.5 writes `None` for both fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_tree: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -226,7 +226,7 @@ impl WorkspaceCheckpoint {
 
     /// Open an already-existing v1 store only for crash recovery. This never
     /// initializes a Git directory or publishes new checkpoint objects, so the
-    /// v5.0.4 safety stop remains in force for ordinary turns.
+    /// v5.0.5 safety stop remains in force for ordinary turns.
     pub(crate) fn for_session_recovery(
         worktree: &Path,
         session_id: &str,

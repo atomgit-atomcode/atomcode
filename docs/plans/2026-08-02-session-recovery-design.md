@@ -4,7 +4,7 @@
 
 Make disk-exhaustion failures visible and provide an explicit, conservative way
 to restore a native session whose committed snapshot is intact but whose
-presentation sidecar is missing. This complements the v5.0.4 safety stop for
+presentation sidecar is missing. This complements the v5.0.5 safety stop for
 workspace/code Rewind; it does not re-enable workspace snapshots.
 
 ## Ownership and recovery boundary
@@ -59,7 +59,7 @@ messages, and therefore do not change provider context or session state.
 
 ## JSONL recovery
 
-v5.0.4 does not synthesize canonical JSONL from snapshot. A compacted snapshot
+v5.0.5 does not synthesize canonical JSONL from snapshot. A compacted snapshot
 may omit old turns, and cannot reliably recover original timestamps, per-round
 usage, or the exact raw reasoning/tool transcript. Generating apparently complete
 records would create a second, misleading history owner.

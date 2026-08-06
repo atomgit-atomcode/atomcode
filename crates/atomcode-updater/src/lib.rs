@@ -1291,7 +1291,7 @@ mod tests {
     fn is_newer_semver() {
         assert!(is_newer("v4.19.0", "v4.18.2")); // latest, current
         assert!(is_newer("v4.19.0", "v4.18.9"));
-        assert!(is_newer("v5.0.4", "v4.99.99"));
+        assert!(is_newer("v5.0.5", "v4.99.99"));
         assert!(!is_newer("v4.19.0", "v4.19.0"));
         assert!(!is_newer("v4.18.0", "v4.19.0")); // latest is older than current
     }
