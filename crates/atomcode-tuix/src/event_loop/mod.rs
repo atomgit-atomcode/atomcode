@@ -21270,7 +21270,11 @@ fn handle_agent_event(
                 state.goal_condition = Some(condition);
                 state.goal_round = round;
                 state.goal_phase = atomcode_coding::GoalPhase::Pursuing;
-                if state.goal_started_at.is_none() {
+                // Reset the elapsed clock on a fresh start OR a resume (round 0, e.g.
+                // re-engaging a Satisfied/PausedAtCap goal) so the badge reads
+                // `round 1 · <fresh time>`. Keep it across mid-goal rounds (round > 0)
+                // so a single pursuit's total time still accumulates.
+                if round == 0 || state.goal_started_at.is_none() {
                     state.goal_started_at = Some(std::time::Instant::now());
                 }
             } else {

@@ -3013,16 +3013,22 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
-                        // If a goal is paused at its round cap, resume it so the
-                        // user's new message advances the goal into the next budget
-                        // window.  Satisfied / Pursuing / Ended goals are untouched.
+                        // A persistent goal (paused at its round cap, OR already
+                        // satisfied) re-engages on the next user message: resume it
+                        // into Pursuing so the follow-up advances the goal and the
+                        // badge shows `◎ <cond> · round 1` again rather than a stale
+                        // "已达成". Only `/goal clear` (or a superseding `/goal`, or an
+                        // error) removes it. Ended/Pursuing are untouched.
                         //
-                        // Reuse the budget that was already derived at goal-START
-                        // time (stored in state.max_rounds): the 5h rolling window
-                        // can't meaningfully change between keypresses, and the
-                        // extra network round-trip (~3 s) blocked the event loop.
+                        // Reuse the budget already derived at goal-START time (stored
+                        // in state.max_rounds): the 5h rolling window can't meaningfully
+                        // change between keypresses, and the extra network round-trip
+                        // (~3 s) blocked the event loop.
                         if let Some(state) = goal.as_mut() {
-                            if matches!(state.phase, GoalPhase::PausedAtCap) {
+                            if matches!(
+                                state.phase,
+                                GoalPhase::PausedAtCap | GoalPhase::Satisfied
+                            ) {
                                 let keep = state.max_rounds.unwrap_or(0);
                                 state.resume(keep);
                                 let _ = runtime_event_tx
@@ -13159,11 +13165,11 @@ mod tests {
         handle.shutdown().await.unwrap();
     }
 
-    // When the goal is Satisfied and the user submits, the runtime must:
-    // 1. Deliver the input as a normal user message (SendMessage)
-    // 2. NOT emit any GoalChanged(phase==Pursuing) event (goal untouched)
+    // When the goal is Satisfied and the user submits a follow-up, the runtime must
+    // RE-ENGAGE the goal (same as PausedAtCap): resume it into Pursuing (round 0) and
+    // deliver the input as the resumed goal round's user message.
     #[tokio::test]
-    async fn submit_while_satisfied_delivers_message_without_resuming_goal() {
+    async fn submit_while_satisfied_reengages_goal_and_delivers_message() {
         let (
             handle,
             mut kernel_commands,
@@ -13226,10 +13232,12 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 tokio::select! {
+                    // biased: GoalChanged(Pursuing) is emitted before SendMessage.
+                    biased;
                     event = runtime_events.recv() => {
                         match event {
                             Some(CodingRuntimeEvent::GoalChanged(p)) => {
-                                if p.phase == GoalPhase::Pursuing {
+                                if p.phase == GoalPhase::Pursuing && p.round == 0 {
                                     saw_goal_changed_pursuing = true;
                                 }
                             }
@@ -13255,12 +13263,12 @@ mod tests {
         .expect("submit after Satisfied did not deliver message within timeout");
 
         assert!(
-            saw_send_message_with_input,
-            "submit while Satisfied must deliver input as a normal user message"
+            saw_goal_changed_pursuing,
+            "submit while Satisfied must RE-ENGAGE the goal (GoalChanged Pursuing, round=0)"
         );
         assert!(
-            !saw_goal_changed_pursuing,
-            "submit while Satisfied must NOT resume the goal (no GoalChanged Pursuing)"
+            saw_send_message_with_input,
+            "submit while Satisfied must deliver the input as the resumed goal round's message"
         );
 
         handle.shutdown().await.unwrap();
