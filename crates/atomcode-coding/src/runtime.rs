@@ -29,9 +29,9 @@ use atomcode_kernel::provider::LlmProvider;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::controllers::{
-    evaluate_goal, goal_cap_stop_note, goal_continuation_message, summarize_for_goal, EvalOutcome,
-    GoalPhase, GoalProgress, GoalResult, GoalState, GoalTerminal, LoopProgress, LoopState,
-    ScheduleWakeupTool, WakeupRequest, MAX_UNPRODUCTIVE,
+    classify_followup, evaluate_goal, goal_cap_stop_note, goal_continuation_message,
+    summarize_for_goal, EvalOutcome, FollowupClass, GoalPhase, GoalProgress, GoalResult, GoalState,
+    GoalTerminal, LoopProgress, LoopState, ScheduleWakeupTool, WakeupRequest, MAX_UNPRODUCTIVE,
 };
 use crate::parts::prepare_with_plugin_hook_source_reusing_lease;
 #[cfg(test)]
@@ -3024,11 +3024,61 @@ fn spawn_runtime_owner_with_optional_agent(
                         // in state.max_rounds): the 5h rolling window can't meaningfully
                         // change between keypresses, and the extra network round-trip
                         // (~3 s) blocked the event loop.
-                        if let Some(state) = goal.as_mut() {
-                            if matches!(
-                                state.phase,
-                                GoalPhase::PausedAtCap | GoalPhase::Satisfied
-                            ) {
+                        // Decide whether/how to re-engage a persistent goal on this
+                        // user message. PausedAtCap (not yet done) always continues its
+                        // original condition. For a Satisfied (done) goal, ask the model
+                        // whether the follow-up CONTINUES it, is a NEW goal, or is just
+                        // chit-chat (NotAGoal → don't re-engage). `decision`: None = leave
+                        // the goal as-is; Some(None) = resume keeping the condition;
+                        // Some(Some(text)) = resume RE-TASKED to the new message.
+                        let reengage_decision: Option<Option<String>> = match goal
+                            .as_ref()
+                            .map(|state| state.phase)
+                        {
+                            Some(GoalPhase::PausedAtCap) => Some(None),
+                            Some(GoalPhase::Satisfied) => {
+                                let condition =
+                                    goal.as_ref().map(|s| s.condition.clone()).unwrap_or_default();
+                                let cancel = goal.as_ref().map(|s| s.cancel.clone());
+                                let provider = resources.as_ref().and_then(|runtime| {
+                                    let session_id = runtime
+                                        .parts
+                                        .session
+                                        .as_ref()
+                                        .map(|binding| binding.id.as_str());
+                                    build_goal_evaluator_provider(
+                                        &runtime.provider_factory,
+                                        &runtime.config,
+                                        session_id,
+                                    )
+                                    .ok()
+                                });
+                                match (provider, cancel) {
+                                    (Some(p), Some(c)) => {
+                                        // Bounded so a slow classifier can't park the loop;
+                                        // any timeout/failure resolves to Continuation.
+                                        let classified = tokio::time::timeout(
+                                            std::time::Duration::from_secs(10),
+                                            classify_followup(p, condition, input.text.clone(), c),
+                                        )
+                                        .await
+                                        .unwrap_or(FollowupClass::Continuation);
+                                        match classified {
+                                            FollowupClass::Continuation => Some(None),
+                                            FollowupClass::NewGoal => Some(Some(input.text.clone())),
+                                            FollowupClass::NotAGoal => None,
+                                        }
+                                    }
+                                    _ => Some(None),
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some(new_condition) = reengage_decision {
+                            if let Some(state) = goal.as_mut() {
+                                if let Some(condition) = new_condition {
+                                    state.condition = condition;
+                                }
                                 let keep = state.max_rounds.unwrap_or(0);
                                 state.resume(keep);
                                 let _ = runtime_event_tx
