@@ -21076,13 +21076,18 @@ fn handle_agent_event(
                         flush_pending_separator(state, renderer, /* as_goal_end */ true);
                     }
                     atomcode_coding::GoalPhase::PausedAtCap => {
-                        // Round cap reached: render a paused note once, but
+                        // Round/time cap reached: render a paused note once using
+                        // the authoritative last_reason set by pause_at_cap() so the
+                        // scrollback banner, ControllerWarning, and badge stay
+                        // consistent (mirrors Satisfied/Ended arms' pattern).
                         // KEEP the badge — it will resume on the next Submit.
                         if state.goal_condition.is_some() {
-                            renderer.render(UiLine::CommandOutput(
-                                "  ⏸ Goal 已达轮次上限，继续对话即推进\n".to_string(),
-                            ));
-                            renderer.flush();
+                            if let Some(reason) = last_reason.as_deref() {
+                                renderer.render(UiLine::CommandOutput(format!(
+                                    "  ⏸ Goal stopped: {reason}\n"
+                                )));
+                                renderer.flush();
+                            }
                         }
                         state.goal_phase = atomcode_coding::GoalPhase::PausedAtCap;
                         flush_pending_separator(state, renderer, /* as_goal_end */ true);

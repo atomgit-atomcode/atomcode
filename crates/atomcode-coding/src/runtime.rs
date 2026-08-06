@@ -3002,19 +3002,15 @@ fn spawn_runtime_owner_with_optional_agent(
                         // If a goal is paused at its round cap, resume it so the
                         // user's new message advances the goal into the next budget
                         // window.  Satisfied / Pursuing / Ended goals are untouched.
+                        //
+                        // Reuse the budget that was already derived at goal-START
+                        // time (stored in state.max_rounds): the 5h rolling window
+                        // can't meaningfully change between keypresses, and the
+                        // extra network round-trip (~3 s) blocked the event loop.
                         if let Some(state) = goal.as_mut() {
                             if matches!(state.phase, GoalPhase::PausedAtCap) {
-                                let cap = resolve_goal_round_cap(
-                                    resources
-                                        .as_ref()
-                                        .and_then(|r| r.parts.rate_limit_source()),
-                                    resources
-                                        .as_ref()
-                                        .map(|r| r.config.goal_max_rounds)
-                                        .unwrap_or(300),
-                                )
-                                .await;
-                                state.resume(cap);
+                                let keep = state.max_rounds.unwrap_or(0);
+                                state.resume(keep);
                                 let _ = runtime_event_tx
                                     .send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }

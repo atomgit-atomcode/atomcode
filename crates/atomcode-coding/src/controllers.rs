@@ -108,6 +108,8 @@ pub(crate) struct GoalState {
     deadline: Option<Instant>,
     pub unproductive: u32,
     pub cancel: CancellationToken,
+    /// Stored so `resume()` can refresh the wall-clock deadline after a pause.
+    max_duration_secs: u64,
 }
 
 impl GoalState {
@@ -128,6 +130,7 @@ impl GoalState {
                 .then(|| started_at + Duration::from_secs(max_duration_secs)),
             unproductive: 0,
             cancel: CancellationToken::new(),
+            max_duration_secs,
         }
     }
 
@@ -179,6 +182,13 @@ impl GoalState {
         self.max_rounds = (new_max_rounds != 0).then_some(new_max_rounds);
         self.terminal = None;
         self.last_reason = None;
+        // Reset no-progress counter so accumulated unproductive rounds before the
+        // cap don't immediately trip MAX_UNPRODUCTIVE on the first resumed round.
+        self.unproductive = 0;
+        // Refresh the wall-clock deadline so a time-capped goal gets a fresh
+        // window rather than re-pausing instantly on every resume.
+        self.deadline = (self.max_duration_secs != 0)
+            .then(|| Instant::now() + Duration::from_secs(self.max_duration_secs));
     }
 
     pub fn cap_reached(&self) -> Option<&'static str> {
@@ -724,5 +734,48 @@ mod tests {
         g3.finish(GoalTerminal::Met, "all good");
         assert_eq!(g3.phase, GoalPhase::Satisfied);
         assert!(!g3.active);
+    }
+
+    // Fix #1: resume() resets the no-progress counter so accumulated unproductive
+    // rounds before the cap don't immediately trip MAX_UNPRODUCTIVE after resume.
+    #[test]
+    fn resume_resets_unproductive_counter() {
+        let mut state = GoalState::new(1, "x".into(), 10, 0);
+        state.unproductive = 4;
+        state.pause_at_cap("已达轮数预算（10 轮）");
+        state.resume(10);
+        assert_eq!(
+            state.unproductive, 0,
+            "resume() must clear unproductive so the next window starts fresh"
+        );
+    }
+
+    // Fix #2: resume() refreshes the wall-clock deadline; a time-capped goal
+    // must not re-pause instantly on every resume.
+    #[test]
+    fn resume_refreshes_deadline_for_time_capped_goal() {
+        // With a 1-hour cap, after resume the deadline must be ~1h from now.
+        let mut g = GoalState::new(1, "x".into(), 0, 3600);
+        g.pause_at_cap("已达时间上限");
+        g.resume(0);
+        // Fresh 1h deadline → cap_reached() returns None (not expired yet).
+        assert_eq!(
+            g.cap_reached(),
+            None,
+            "resumed goal with 1h cap must not report cap_reached immediately"
+        );
+    }
+
+    #[test]
+    fn resume_leaves_deadline_none_when_no_time_cap() {
+        // max_duration_secs == 0 → deadline stays None after resume.
+        let mut g = GoalState::new(1, "x".into(), 0, 0);
+        g.pause_at_cap("已达轮数预算");
+        g.resume(0);
+        assert_eq!(
+            g.cap_reached(),
+            None,
+            "time-uncapped goal must have no time-limit cap after resume"
+        );
     }
 }

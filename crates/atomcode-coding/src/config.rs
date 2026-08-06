@@ -527,7 +527,7 @@ pub fn derive_goal_max_rounds(env_override: Option<u32>, call_limit: Option<i64>
     }
     match call_limit {
         Some(limit) if limit > 0 => {
-            u32::try_from(limit * GOAL_ROUND_SHARE_PERCENT / 100)
+            u32::try_from(limit.saturating_mul(GOAL_ROUND_SHARE_PERCENT) / 100)
                 .unwrap_or(GOAL_ROUND_FALLBACK)
                 .max(GOAL_ROUND_FLOOR)
         }
@@ -711,6 +711,19 @@ mod tests {
     fn derive_goal_rounds_floors_tiny_plans() {
         // A micro window (30% = 30) must still leave a usable goal budget.
         assert_eq!(derive_goal_max_rounds(None, Some(100)), 50);
+    }
+
+    // Fix #4: saturating_mul prevents a debug-panic on adversarial i64::MAX
+    // call_limit (plain * would overflow in debug builds). After saturation the
+    // i64→u32 try_from fails and falls back to GOAL_ROUND_FALLBACK (300).
+    #[test]
+    fn derive_goal_rounds_saturating_mul_no_panic_on_i64_max() {
+        // Must not panic in debug builds, and must return GOAL_ROUND_FALLBACK.
+        let result = derive_goal_max_rounds(None, Some(i64::MAX));
+        assert_eq!(
+            result, 300,
+            "i64::MAX call_limit must fall back to GOAL_ROUND_FALLBACK (300)"
+        );
     }
 
     #[test]
