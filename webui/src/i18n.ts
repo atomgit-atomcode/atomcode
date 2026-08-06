@@ -269,6 +269,7 @@ const zh = {
   // User input card
   'userInput.submit': '提交',
   'userInput.skip': '跳过',
+  'userInput.close': '关闭并跳过',
   'userInput.other': 'Other',
   'userInput.error': '提交失败，请重试',
 
@@ -594,6 +595,7 @@ const en: Record<MsgKey, string> = {
   // User input card
   'userInput.submit': 'Submit',
   'userInput.skip': 'Skip',
+  'userInput.close': 'Close and skip',
   'userInput.other': 'Other',
   'userInput.error': 'Submit failed, please retry',
 

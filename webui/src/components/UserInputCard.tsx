@@ -241,13 +241,25 @@ function CardShell({
   title,
   children,
   footer,
+  closing,
+  onClose,
 }: {
   title: string;
   children: preact.ComponentChildren;
   footer: preact.ComponentChildren;
+  closing: boolean;
+  onClose: () => void;
 }) {
+  const t = useT();
   return (
-    <div class="modal-overlay">
+    <div
+      class="modal-overlay"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) event.preventDefault();
+        event.stopPropagation();
+      }}
+      onClick={(event) => event.stopPropagation()}
+    >
       <div class="modal-card permission-card">
         <div class="modal-header permission-header">
           <span class="permission-logo" aria-hidden="true">
@@ -258,6 +270,16 @@ function CardShell({
             </svg>
           </span>
           <h3 class="permission-title">{title}</h3>
+          <button
+            type="button"
+            class="ghost-btn modal-close"
+            disabled={closing}
+            onClick={onClose}
+            aria-label={t('userInput.close')}
+            title={t('userInput.close')}
+          >
+            ×
+          </button>
         </div>
         <div class="modal-body">{children}</div>
         <div class="modal-footer permission-footer">{footer}</div>
@@ -285,7 +307,8 @@ function SingleCard({ req, onDone, submitAnswer }: UserInputCardProps) {
     setLoading(true);
     setError(null);
     try {
-      await submitAnswer({ request_id: req.request_id, ...buildAnswer(q, state) });
+      const result = await submitAnswer({ request_id: req.request_id, ...buildAnswer(q, state) });
+      if (!result.accepted) throw new Error('user input response was not accepted');
       onDone();
     } catch {
       setLoading(false);
@@ -297,7 +320,8 @@ function SingleCard({ req, onDone, submitAnswer }: UserInputCardProps) {
     setLoading(true);
     setError(null);
     try {
-      await submitAnswer({ request_id: req.request_id, ...declinedAnswer() });
+      const result = await submitAnswer({ request_id: req.request_id, ...declinedAnswer() });
+      if (!result.accepted) throw new Error('user input response was not accepted');
       onDone();
     } catch {
       setLoading(false);
@@ -308,6 +332,8 @@ function SingleCard({ req, onDone, submitAnswer }: UserInputCardProps) {
   return (
     <CardShell
       title={q.header}
+      closing={loading}
+      onClose={() => void skip()}
       footer={
         <>
           <button class="btn" disabled={loading} onClick={skip}>
@@ -355,7 +381,8 @@ function BatchCard({ req, onDone, submitAnswer }: UserInputCardProps) {
     setLoading(true);
     setError(null);
     try {
-      await submitAnswer({ request_id: req.request_id, responses: all });
+      const result = await submitAnswer({ request_id: req.request_id, responses: all });
+      if (!result.accepted) throw new Error('user input response was not accepted');
       onDone();
     } catch {
       setLoading(false);
@@ -379,7 +406,8 @@ function BatchCard({ req, onDone, submitAnswer }: UserInputCardProps) {
     setLoading(true);
     setError(null);
     try {
-      await submitAnswer({ request_id: req.request_id, responses: qs.map(declinedAnswer) });
+      const result = await submitAnswer({ request_id: req.request_id, responses: qs.map(declinedAnswer) });
+      if (!result.accepted) throw new Error('user input response was not accepted');
       onDone();
     } catch {
       setLoading(false);
@@ -392,6 +420,8 @@ function BatchCard({ req, onDone, submitAnswer }: UserInputCardProps) {
   return (
     <CardShell
       title={`${q.header} (${step + 1}/${qs.length})`}
+      closing={loading}
+      onClose={() => void skipAll()}
       footer={
         <>
           <button class="btn" disabled={loading} onClick={skipAll}>
