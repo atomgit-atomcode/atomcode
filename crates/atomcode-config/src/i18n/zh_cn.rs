@@ -432,6 +432,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("> {buffer}_  [Enter: 确认, Esc: 取消]").into(),
 
         // ── 目录选择器 ──
+        Msg::DirPickerTitle { n, total } =>
+            format!("切换工作目录（{n}/{total}）").into(),
+        Msg::DirPickerHint =>
+            "↑↓ 移动 · Tab 补全 · Enter 进入 · 输入内容搜索/路径 · Esc 取消".into(),
+        Msg::DirPickerEmptyPath { query } =>
+            format!("没有匹配的历史目录「{query}」· Enter 按路径进入").into(),
         Msg::DirCurrent => "当前".into(),
         Msg::DirNotExists { path } =>
             format!("目录已不存在：{path}").into(),

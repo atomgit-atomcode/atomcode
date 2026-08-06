@@ -1214,6 +1214,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.menu
             .as_ref()
             .map(|m| {
+                if m.kind == super::MenuKind::DirectoryList {
+                    // Header renders as 6 physical rows (title + blank + 3-row
+                    // search box + blank); the bottom legend adds a blank + hint.
+                    // Directory entries are one row each. Keep the complete modal
+                    // within half-screen, including on short terminals.
+                    let entry_count = m.items.len().saturating_sub(5);
+                    let natural = 8 + entry_count;
+                    // Reserve one row for the surrounding footer chrome; the
+                    // menu plus that row remains within the half-screen budget.
+                    let cap = (h / 2).saturating_sub(1).max(1);
+                    return natural.min(cap);
+                }
                 let base = m.kind.max_visible_rows(h, m.items.len());
                 let has_hint = m
                     .items
@@ -1227,9 +1239,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 } else {
                     0
                 };
-                if m.kind == super::MenuKind::DirectoryList && m.items.len() > base {
-                    base + 1
-                } else if has_hint {
+                if has_hint {
                     base + 1 + extra
                 } else {
                     base + extra
@@ -2112,6 +2122,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 | super::MenuKind::Marketplace
                 | super::MenuKind::PluginInfo
                 | super::MenuKind::SessionList
+                | super::MenuKind::DirectoryList
         );
         let mut style = if selected && !is_plugin_mgr {
             CellStyle {
@@ -2728,6 +2739,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     | super::MenuKind::Marketplace
                     | super::MenuKind::PluginInfo
                     | super::MenuKind::SessionList
+                    | super::MenuKind::DirectoryList
             )
         });
         let status_rows = usize::from(
@@ -3797,35 +3809,25 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Paginate menu using the kind-specific cap.
         let max_menu = self.max_menu_rows(h, 4);
         let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
-        // The `/resume` session list shares the plugin manager's chrome and
-        // layout (4-row header, bordered search box at idx 2, 2-line items from
-        // idx 4, bottom hint) — only the per-item leaf builder differs. Treat it
-        // as plugin-like everywhere layout math keys off `Plugin`.
+        // `/resume` and `/cd` share the plugin manager's 4-row payload header,
+        // bordered search box and sticky bottom hint. Their entry heights differ.
         let plugin_like = matches!(
             menu_kind,
-            super::MenuKind::Plugin | super::MenuKind::SessionList
+            super::MenuKind::Plugin
+                | super::MenuKind::SessionList
+                | super::MenuKind::DirectoryList
         );
         let (menu_items, selected_in_view, actual_offset) = if let Some(m) = self.menu.as_ref() {
             let len = m.items.len();
             if len == 0 {
                 (Vec::<(String, String)>::new(), None, 0)
-            } else if menu_kind == super::MenuKind::DirectoryList {
-                let (offset, visible, hidden) =
-                    super::directory_window(len, m.selected, h);
-                let end = offset + visible;
-                let mut items = m.items[offset..end].to_vec();
-                if hidden > 0 {
-                    items.push((format!("+ {hidden} more…"), String::new()));
-                }
-                let selected = (m.selected >= offset && m.selected < end)
-                    .then_some(m.selected - offset);
-                (items, selected, offset)
             } else if matches!(
                 menu_kind,
                 super::MenuKind::Plugin
                     | super::MenuKind::Marketplace
                     | super::MenuKind::PluginInfo
                     | super::MenuKind::SessionList
+                    | super::MenuKind::DirectoryList
             ) {
                 let header_h = if plugin_like { 4 } else { 2 };
                 if len < header_h {
@@ -3840,7 +3842,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         && m.items[len - 1].0.starts_with('—')
                         && m.items[len - 1].0.ends_with('—');
                     let hint_h = if has_hint { 1 } else { 0 };
-                    let header_row_h = if plugin_like { 6 } else { header_h };
+                    let header_row_h = if menu_kind == super::MenuKind::DirectoryList {
+                        // Include the blank inserted before the sticky hint so the
+                        // paginator cannot exceed the half-screen cap by one row.
+                        7
+                    } else if plugin_like {
+                        6
+                    } else {
+                        header_h
+                    };
                     let budget = max_menu.saturating_sub(header_row_h + hint_h);
                     let mut offset = header_h;
                     let mut end = offset;
@@ -3851,7 +3861,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                             && end < len - hint_h
                         {
                             Self::session_item_height(end)
-                        } else if plugin_like && end >= 4 && end < len - hint_h {
+                        } else if menu_kind == super::MenuKind::Plugin
+                            && end >= 4
+                            && end < len - hint_h
+                        {
                             self.plugin_item_height(&m.items[end].1, rule_width)
                         } else if menu_kind == super::MenuKind::Marketplace
                             && end >= 2
@@ -3888,7 +3901,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                                     && end < len - hint_h
                                 {
                                     Self::session_item_height(end)
-                                } else if plugin_like && end >= 4 && end < len - hint_h {
+                                } else if menu_kind == super::MenuKind::Plugin
+                                    && end >= 4
+                                    && end < len - hint_h
+                                {
                                     self.plugin_item_height(&m.items[end].1, rule_width)
                                 } else if menu_kind == super::MenuKind::Marketplace
                                     && end >= 2
@@ -4001,6 +4017,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     | super::MenuKind::Marketplace
                     | super::MenuKind::PluginInfo
                     | super::MenuKind::SessionList
+                    | super::MenuKind::DirectoryList
             );
             let mut sum = menu_items
                 .iter()
@@ -4040,7 +4057,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         // footer height — overlapping the goal/status rows onto
                         // the last card.
                         Self::session_item_height(orig_idx)
-                    } else if plugin_like
+                    } else if menu_kind == super::MenuKind::Plugin
                         && orig_idx >= 4
                         && orig_idx < m.items.len().saturating_sub(1)
                     {
@@ -4137,6 +4154,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 | super::MenuKind::Marketplace
                 | super::MenuKind::PluginInfo
                 | super::MenuKind::SessionList
+                | super::MenuKind::DirectoryList
         );
         let is_add_url = hide_input_box
             && menu_kind == super::MenuKind::Marketplace
@@ -4240,10 +4258,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
             Vec::new()
         };
         let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
-        // `/resume` session list shares the plugin manager's chrome/layout.
+        // `/resume` and `/cd` share the plugin manager's chrome/layout.
         let plugin_like = matches!(
             menu_kind,
-            super::MenuKind::Plugin | super::MenuKind::SessionList
+            super::MenuKind::Plugin
+                | super::MenuKind::SessionList
+                | super::MenuKind::DirectoryList
         );
         let mut menu_cells: Vec<Vec<Cell>> = Vec::new();
         let final_len = self.menu.as_ref().map(|m| m.items.len()).unwrap_or(0);
@@ -4253,6 +4273,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 | super::MenuKind::Marketplace
                 | super::MenuKind::PluginInfo
                 | super::MenuKind::SessionList
+                | super::MenuKind::DirectoryList
         );
         for (i, (name, desc)) in menu_items.iter().enumerate() {
             let orig_idx = if is_sticky {
@@ -4337,7 +4358,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 // session lands here): when focused, show the live query plus a
                 // cursor caret and drop the placeholder, so the user can see
                 // that typing edits THIS field.
-                let box_focused = selected && menu_kind == super::MenuKind::SessionList;
+                let box_focused = menu_kind == super::MenuKind::DirectoryList
+                    || (selected && menu_kind == super::MenuKind::SessionList);
                 if name.is_empty() && !box_focused {
                     let muted = self.style_for(Role::Muted);
                     // Locale-aware, menu-neutral: `Plugin` is shared by the plugin
@@ -4349,6 +4371,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
                             "搜索会话…"
                         } else {
                             "Search sessions..."
+                        }
+                    } else if menu_kind == super::MenuKind::DirectoryList {
+                        if zh {
+                            "搜索历史目录或输入路径…"
+                        } else {
+                            "Search saved directories or enter a path..."
                         }
                     } else if zh {
                         "输入以筛选…"
@@ -4662,11 +4690,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let menu_top = attach_top + attachment_rows;
         let is_search_box_focused = matches!(
             menu_kind,
-            super::MenuKind::Plugin | super::MenuKind::SessionList
+            super::MenuKind::Plugin
+                | super::MenuKind::SessionList
+                | super::MenuKind::DirectoryList
         ) && self
             .menu
             .as_ref()
-            .map(|m| m.selected == 2 && m.items.len() >= 3)
+            .map(|m| {
+                m.items.len() >= 3
+                    && (m.selected == 2 || menu_kind == super::MenuKind::DirectoryList)
+            })
             .unwrap_or(false);
         if is_add_url {
             let input_row_idx = menu_cells
@@ -4912,6 +4945,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 | super::MenuKind::Marketplace
                 | super::MenuKind::PluginInfo
                 | super::MenuKind::SessionList
+                | super::MenuKind::DirectoryList
         );
         self.footer_total_rows(
             capped_middle,
@@ -5310,6 +5344,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 | super::MenuKind::Marketplace
                 | super::MenuKind::PluginInfo
                 | super::MenuKind::SessionList
+                | super::MenuKind::DirectoryList
         );
         let has_trailing_empty = total > 0 && self.body_lines[total - 1].is_empty();
         let display_total = if hide_input_box && has_trailing_empty {
@@ -10294,6 +10329,47 @@ mod tests {
         assert!(open_cost < 2200, "retained open: {} B", open_cost);
         assert!(close_cost < 2200, "retained close: {} B", close_cost);
         assert!(nav_avg < 800, "retained nav: {} B", nav_avg);
+    }
+
+    #[test]
+    fn directory_picker_uses_resume_chrome_with_half_screen_pagination() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let mut items = vec![
+            ("Change working directory (11/20)".into(), String::new()),
+            (String::new(), String::new()),
+            ("project-10".into(), String::new()),
+            (String::new(), String::new()),
+        ];
+        items.extend((0..20).map(|n| (format!("~/projects/project-{n}"), String::new())));
+        items.push((
+            "— ↑↓ move · Tab complete · Enter open · Esc cancel —".into(),
+            String::new(),
+        ));
+        r.render(UiLine::InputPrompt {
+            buf: "project-10".into(),
+            cursor_byte: "project-10".len(),
+            menu: Some(MenuPayload {
+                items,
+                selected: 4 + 10,
+                kind: crate::render::MenuKind::DirectoryList,
+            }),
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let dump = vterm.dump();
+        assert!(dump.contains("Change working directory (11/20)"));
+        assert!(dump.contains("project-10"));
+        assert!(dump.contains("~/projects/project-10"));
+        assert!(dump.contains("Tab complete"));
+        assert!(
+            r.current_footer_rows() <= 12,
+            "directory modal should stay near half of a 24-row terminal: {}\n{dump}",
+            r.current_footer_rows()
+        );
     }
 
     /// Streaming delta byte cost: scenario mirrors agent_events

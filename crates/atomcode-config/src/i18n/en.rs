@@ -456,6 +456,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("> {buffer}_  [Enter: confirm, Esc: cancel]").into(),
 
         // ── Dir picker ──
+        Msg::DirPickerTitle { n, total } =>
+            format!("Change working directory ({n}/{total})").into(),
+        Msg::DirPickerHint =>
+            "↑↓ move · Tab complete · Enter open · Type to search/path · Esc cancel".into(),
+        Msg::DirPickerEmptyPath { query } =>
+            format!("No saved project matches \"{query}\" · Enter to open it as a path").into(),
         Msg::DirCurrent => "current".into(),
         Msg::DirNotExists { path } =>
             format!("directory no longer exists: {path}").into(),

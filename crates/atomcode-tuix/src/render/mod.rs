@@ -444,8 +444,8 @@ pub enum MenuKind {
         row_prefix: &'static str,
         selected_marker: &'static str,
     },
-    /// `/cd` project list. Uses two-column rows with a dynamic 4..=8 item
-    /// viewport and a sticky `+ N more…` fold row.
+    /// `/cd` project list. Uses `/resume`-style title/search/hint chrome with
+    /// single-line directory rows, capped to roughly half the terminal height.
     DirectoryList,
     /// Plugin manager list: 2-line rendering per item.
     /// Row 1: Plugin Name + Marketplace + Installation Status
@@ -472,7 +472,12 @@ impl MenuKind {
             MenuKind::Skill | MenuKind::Action | MenuKind::TwoColumn { .. } => {
                 item_count.min((screen_height / 2).max(4))
             }
-            MenuKind::DirectoryList => directory_window(item_count, 0, screen_height).1,
+            // Leave one row for the surrounding footer rule/status chrome so
+            // the complete `/cd` surface, not just its menu payload, stays at
+            // roughly half of the terminal.
+            MenuKind::DirectoryList => {
+                item_count.min((screen_height / 2).saturating_sub(1).max(1))
+            }
             MenuKind::Plugin | MenuKind::SessionList => {
                 let plugin_count = item_count.saturating_sub(3);
                 let max_plugins = (screen_height / 4).max(2);
@@ -488,23 +493,6 @@ impl MenuKind {
             MenuKind::PluginInfo => item_count,
         }
     }
-}
-
-/// Return `(start, visible_count, hidden_count)` for the `/cd` project list.
-pub(crate) fn directory_window(
-    item_count: usize,
-    selected: usize,
-    screen_height: usize,
-) -> (usize, usize, usize) {
-    let cap = (screen_height / 2).clamp(4, 8).min(item_count);
-    if item_count <= cap {
-        return (0, item_count, 0);
-    }
-    let selected = selected.min(item_count.saturating_sub(1));
-    let start = selected
-        .saturating_sub(cap.saturating_sub(1))
-        .min(item_count - cap);
-    (start, cap, item_count - cap)
 }
 
 /// Slash-command palette payload: filtered entries + which one is selected.
@@ -1025,11 +1013,10 @@ mod tests {
     }
 
     #[test]
-    fn directory_window_keeps_more_visible_across_terminal_heights() {
-        assert_eq!(directory_window(12, 0, 10), (0, 5, 7));
-        assert_eq!(directory_window(12, 9, 10), (5, 5, 7));
-        assert_eq!(directory_window(12, 9, 40), (2, 8, 4));
-        assert_eq!(MenuKind::DirectoryList.max_visible_rows(10, 12), 5);
+    fn directory_list_uses_half_screen_row_budget() {
+        assert_eq!(MenuKind::DirectoryList.max_visible_rows(10, 20), 4);
+        assert_eq!(MenuKind::DirectoryList.max_visible_rows(40, 30), 19);
+        assert_eq!(MenuKind::DirectoryList.max_visible_rows(40, 8), 8);
     }
 
     #[test]

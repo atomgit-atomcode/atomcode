@@ -2,10 +2,8 @@
 //
 // `/cd` (no argument) modal — searchable project-directory picker.
 //
-// Shows one list built from current/MRU/catalog directories. The regular TUI
-// input rules form the search/path field above it. Up/Down navigates, Tab
-// completes a project or filesystem directory, Enter commits via `apply_cd`,
-// and Esc cancels.
+// Shows current/MRU/catalog directories in `/resume`-style half-screen chrome:
+// title, bordered search/path box, scrollable list, and bottom key legend.
 
 use std::path::PathBuf;
 
@@ -25,11 +23,10 @@ pub struct DirPicker {
     /// The working dir at open time — used to label the matching entry
     /// as `(current)` so users can tell which one they're already on.
     pub current: PathBuf,
-    /// Index into `dirs`.
+    /// Index into the filtered directory list.
     pub selected: usize,
-    /// Free-text path the user has typed. When non-empty, Enter jumps to THIS
-    /// path (resolved like `/cd <path>`) instead of the highlighted recent dir —
-    /// so a directory that isn't in the recent list can still be entered directly.
+    /// Search text or a new path. Enter opens the selected match when one exists;
+    /// only a zero-match query is resolved as a literal `/cd <path>` target.
     pub query: String,
     tab_matches: Vec<String>,
     tab_index: usize,
@@ -179,44 +176,23 @@ impl Modal for DirPicker {
             }
             KeyCode::Enter => {
                 let filt = self.filtered();
-                match resolve_enter_path(
+                let path = match resolve_enter_target(
+                    &filt,
+                    self.selected,
                     &self.query,
                     &ctx.working_dir,
                     ctx.previous_dir.as_deref(),
-                    !filt.is_empty(),
                 ) {
-                    Ok(Some(path)) => {
-                        if !crate::event_loop::commands::paths_same(&path, &ctx.working_dir) {
-                            match apply_cd(ctx, path) {
-                                Ok(_) => renderer.render(UiLine::CommandOutput(
-                                    crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending)
-                                        .into_owned(),
-                                )),
-                                Err(error) => renderer.render(UiLine::Error(error)),
-                            }
-                        }
-                        renderer.flush();
-                        return Ok(ModalAction::Close);
-                    }
-                    Ok(None) if self.query.trim().is_empty() && filt.is_empty() => {
-                        return Ok(ModalAction::Continue);
-                    }
-                    Ok(None) => {}
+                    Ok(Some(path)) => path,
+                    Ok(None) => return Ok(ModalAction::Continue),
                     Err(error) => {
-                        // A typo in an explicit path shouldn't dismiss the picker. Plain
-                        // search text may still select a matching recent project below.
+                        // Invalid ad-hoc paths stay editable in the modal.
                         renderer.render(UiLine::Error(error));
                         self.draw(buf, state, ctx, renderer);
                         return Ok(ModalAction::Continue);
                     }
-                }
-                // A recent dir is highlighted in the filtered list — cd to it.
-                let Some(path) = filt.get(self.selected).cloned() else {
-                    return Ok(ModalAction::Continue);
                 };
                 if crate::event_loop::commands::paths_same(&path, &ctx.working_dir) {
-                    // No-op cd: skip the agent round-trip but still close
-                    // the picker so the user isn't stuck inside it.
                     return Ok(ModalAction::Close);
                 }
                 if !path.is_dir() {
@@ -225,13 +201,17 @@ impl Modal for DirPicker {
                         crate::i18n::t(crate::i18n::Msg::DirNotExists { path: &p }).into_owned(),
                     ));
                     renderer.flush();
-                    return Ok(ModalAction::Close);
+                    return Ok(ModalAction::Continue);
                 }
                 match apply_cd(ctx, path) {
                     Ok(_) => renderer.render(UiLine::CommandOutput(
                         crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned(),
                     )),
-                    Err(error) => renderer.render(UiLine::Error(error)),
+                    Err(error) => {
+                        renderer.render(UiLine::Error(error));
+                        self.draw(buf, state, ctx, renderer);
+                        return Ok(ModalAction::Continue);
+                    }
                 }
                 renderer.flush();
                 Ok(ModalAction::Close)
@@ -279,9 +259,32 @@ impl Modal for DirPicker {
 
 fn build_menu_payload(p: &DirPicker) -> MenuPayload {
     let filtered = p.filtered();
-    let items: Vec<(String, String)> = filtered
-        .iter()
-        .map(|d| {
+    let pos = if filtered.is_empty() {
+        0
+    } else {
+        p.selected + 1
+    };
+    let title = crate::i18n::t(crate::i18n::Msg::DirPickerTitle {
+        n: pos,
+        total: p.dirs.len(),
+    })
+    .into_owned();
+    let hint = crate::i18n::t(crate::i18n::Msg::DirPickerHint).into_owned();
+    // Same fixed chrome contract as `/resume`: title, blank, bordered query,
+    // blank, scrollable entries, and a sticky bottom hint.
+    let mut items = vec![(title, String::new()), (String::new(), String::new())];
+    items.push((p.query.clone(), String::new()));
+    items.push((String::new(), String::new()));
+    if filtered.is_empty() && !p.query.trim().is_empty() {
+        items.push((
+            crate::i18n::t(crate::i18n::Msg::DirPickerEmptyPath {
+                query: p.query.trim(),
+            })
+            .into_owned(),
+            String::new(),
+        ));
+    } else {
+        items.extend(filtered.iter().map(|d| {
             let name = crate::platform::collapse_home(&d.to_string_lossy());
             let desc = if crate::event_loop::commands::paths_same(d, &p.current) {
                 crate::i18n::t(crate::i18n::Msg::DirCurrent).into_owned()
@@ -289,14 +292,21 @@ fn build_menu_payload(p: &DirPicker) -> MenuPayload {
                 String::new()
             };
             (name, desc)
-        })
-        .collect();
+        }));
+    }
+    items.push((format!("— {hint} —"), String::new()));
     MenuPayload {
         items,
-        selected: p.selected,
+        selected: if filtered.is_empty() {
+            usize::MAX
+        } else {
+            DIR_HEADER_ROWS + p.selected
+        },
         kind: crate::render::MenuKind::DirectoryList,
     }
 }
+
+pub(crate) const DIR_HEADER_ROWS: usize = 4;
 
 fn looks_like_path(query: &str) -> bool {
     let q = query.trim();
@@ -309,24 +319,27 @@ fn looks_like_path(query: &str) -> bool {
         || q.contains('\\')
 }
 
-/// Resolve Enter without allowing a fuzzy project match to override a real path.
-/// A plain search term that is not a directory falls through to the highlighted
-/// recent project; an explicit path (or an unmatched query) keeps resolve errors.
-fn resolve_enter_path(
+fn resolve_enter_target(
+    filtered: &[PathBuf],
+    selected: usize,
     query: &str,
     cwd: &std::path::Path,
     previous_dir: Option<&std::path::Path>,
-    has_filtered_match: bool,
 ) -> Result<Option<PathBuf>, String> {
     let query = query.trim();
     if query.is_empty() {
-        return Ok(None);
+        return Ok(filtered.get(selected).cloned());
     }
-    match crate::event_loop::commands::resolve_cd(query, cwd, previous_dir) {
-        Ok(path) => Ok(Some(path)),
-        Err(error) if looks_like_path(query) || !has_filtered_match => Err(error),
-        Err(_) => Ok(None),
+    // An explicit path is an instruction, not a fuzzy-search hint. Resolve it
+    // before consulting saved projects so `/tmp/app` cannot be shadowed by a
+    // historical `/tmp/app-old` match.
+    if looks_like_path(query) {
+        return crate::event_loop::commands::resolve_cd(query, cwd, previous_dir).map(Some);
     }
+    if let Some(path) = filtered.get(selected) {
+        return Ok(Some(path.clone()));
+    }
+    crate::event_loop::commands::resolve_cd(query, cwd, previous_dir).map(Some)
 }
 
 fn directory_completions(query: &str, cwd: &std::path::Path) -> Vec<String> {
@@ -516,31 +529,51 @@ mod tests {
     }
 
     #[test]
-    fn enter_prefers_real_typed_path_over_fuzzy_recent_match() {
+    fn enter_prefers_explicit_typed_path_over_fuzzy_saved_match() {
         let root = tempfile::tempdir().unwrap();
         let desktop = root.path().join("Desktop");
         std::fs::create_dir(&desktop).unwrap();
-        std::fs::create_dir(desktop.join("app")).unwrap();
+        let app = desktop.join("app");
+        std::fs::create_dir(&app).unwrap();
 
         let query = desktop.to_string_lossy();
-        let resolved = resolve_enter_path(&query, root.path(), None, true)
-            .expect("typed directory resolves")
-            .expect("typed directory wins over the matching recent project");
+        let resolved = resolve_enter_target(&[app], 0, &query, root.path(), None)
+            .expect("typed path resolves")
+            .expect("typed path is selected");
         assert_eq!(resolved, desktop.canonicalize().unwrap());
     }
 
     #[test]
-    fn enter_plain_search_falls_through_to_recent_selection() {
+    fn enter_plain_search_uses_selected_saved_directory() {
         let root = tempfile::tempdir().unwrap();
-        let resolved = resolve_enter_path("project-name", root.path(), None, true)
-            .expect("plain search is not a path error");
-        assert_eq!(resolved, None);
+        let app = root.path().join("project-name");
+        std::fs::create_dir(&app).unwrap();
+        let resolved = resolve_enter_target(&[app.clone()], 0, "project", root.path(), None)
+            .expect("plain search resolves")
+            .expect("saved directory is selected");
+        assert_eq!(resolved, app);
     }
 
     #[test]
-    fn enter_invalid_explicit_path_keeps_resolve_error() {
+    fn enter_zero_match_resolves_query_as_new_path() {
         let root = tempfile::tempdir().unwrap();
-        let result = resolve_enter_path("./missing/project", root.path(), None, true);
+        let target = root.path().join("new-project");
+        std::fs::create_dir(&target).unwrap();
+        let resolved = resolve_enter_target(
+            &[],
+            0,
+            target.to_str().unwrap(),
+            root.path(),
+            None,
+        )
+        .expect("zero-match path resolves");
+        assert_eq!(resolved, Some(target.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn enter_zero_match_invalid_path_returns_error() {
+        let root = tempfile::tempdir().unwrap();
+        let result = resolve_enter_target(&[], 0, "./missing/project", root.path(), None);
         assert!(result.is_err());
     }
 
@@ -550,8 +583,8 @@ mod tests {
         crate::i18n::set_locale(crate::i18n::Locale::En);
         let p = DirPicker::open(vec![pb("/a"), pb("/b")], pb("/b"));
         let payload = build_menu_payload(&p);
-        assert_eq!(payload.items[0].1, "");
-        assert_eq!(payload.items[1].1, "current");
+        assert_eq!(payload.items[DIR_HEADER_ROWS].1, "");
+        assert_eq!(payload.items[DIR_HEADER_ROWS + 1].1, "current");
     }
 
     #[test]
@@ -560,8 +593,8 @@ mod tests {
         let mut p = DirPicker::open(dirs, pb("/p0"));
         p.selected = 9;
         let payload = build_menu_payload(&p);
-        assert_eq!(payload.items.len(), 12);
-        assert_eq!(payload.selected, 9);
+        assert_eq!(payload.items.len(), DIR_HEADER_ROWS + 12 + 1);
+        assert_eq!(payload.selected, DIR_HEADER_ROWS + 9);
         assert_eq!(payload.kind, crate::render::MenuKind::DirectoryList);
     }
 
