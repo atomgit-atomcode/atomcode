@@ -11658,25 +11658,32 @@ fn handle_idle_key(
     // rounds. From Idle, Esc/Ctrl+C otherwise just clear the input / arm exit —
     // they never reach the cancel path (that lives in `handle_streaming_key`),
     // which is why a goal felt uninterruptible. When a goal is active, route
-    // Ctrl+C and a bare Esc (empty buffer — don't steal Esc from clearing a
-    // draft the user is editing to nudge the goal) to `Cancel`: the runtime
-    // turns that into "clear the goal + cancel the running turn", and the
-    // follow-up GoalUpdate(active=false) resets the local goal state. Belt and
-    // suspenders alongside `on_thinking` keeping the TUI in Streaming.
+    // Ctrl+C to full `Cancel`, while a bare Esc (empty buffer — don't steal Esc
+    // from clearing a draft) pauses the goal and cancels only its current round.
+    // The runtime owns both transitions so pending requests, snapshots, and the
+    // next-submit resume stay synchronized.
     if app.state.goal_condition.is_some() {
         let is_ctrl_c = code == KeyCode::Char('c')
             && modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
         let is_bare_esc = code == KeyCode::Esc && app.buf.text.is_empty();
-        if is_ctrl_c || is_bare_esc {
+        let should_pause = is_bare_esc
+            && app.state.goal_phase == atomcode_coding::GoalPhase::Pursuing;
+        if is_ctrl_c || should_pause {
             let has_active_turn = ctx.runtime.has_active_turn();
-            if cancel_active_turn(ctx) && has_active_turn {
+            let sent = if is_ctrl_c {
+                cancel_active_turn(ctx)
+            } else {
+                pause_active_goal(ctx)
+            };
+            if sent && has_active_turn {
                 app.interrupt_drain_pending = true;
             }
             clear_capturing_modal_on_cancel(app);
             crate::tuix_trace!(
                 "KEY",
-                "idle goal-active {} -> Cancel",
-                if is_ctrl_c { "Ctrl+C" } else { "Esc" }
+                "idle goal-active {} -> {}",
+                if is_ctrl_c { "Ctrl+C" } else { "Esc" },
+                if is_ctrl_c { "Cancel" } else { "PauseGoal" }
             );
             return Ok(());
         }
@@ -14173,12 +14180,18 @@ fn handle_streaming_key(
         return Ok(());
     }
 
-    // Esc also cancels a running turn (CC-style). Placed before the
-    // menu-nav block so Streaming + menu-open Esc still cancels the
-    // stream — mid-stream the higher-value action is "stop the agent",
-    // not "clear an unsubmitted slash token" (users can Ctrl+U for that).
+    // Esc interrupts the running turn. For an active goal it preserves the
+    // controller in Paused; ordinary turns keep the existing cancel behavior.
+    // Placed before menu navigation because stopping the stream is the higher
+    // value action mid-turn (Ctrl+U remains available for clearing input).
     if code == KeyCode::Esc {
-        let send_ok = cancel_active_turn(ctx);
+        let send_ok = if app.state.goal_condition.is_some()
+            && app.state.goal_phase == atomcode_coding::GoalPhase::Pursuing
+        {
+            pause_active_goal(ctx)
+        } else {
+            cancel_active_turn(ctx)
+        };
         let interrupt_and_send = should_stage_interrupt(
             send_ok,
             modifiers.is_empty(),
@@ -14190,7 +14203,14 @@ fn handle_streaming_key(
         clear_capturing_modal_on_cancel(app);
         crate::tuix_trace!(
             "KEY",
-            "streaming Esc -> Cancel send_ok={} interrupt_and_send={} spinner={:?}",
+            "streaming Esc -> {} send_ok={} interrupt_and_send={} spinner={:?}",
+            if app.state.goal_condition.is_some()
+                && app.state.goal_phase == atomcode_coding::GoalPhase::Pursuing
+            {
+                "PauseGoal"
+            } else {
+                "Cancel"
+            },
             send_ok,
             interrupt_and_send,
             app.state.spinner_label
@@ -14702,6 +14722,15 @@ fn cancel_active_turn(ctx: &LoopCtx) -> bool {
         ctx.runtime
             .dispatch(atomcode_coding::DriverCommand::Cancel)
             .is_ok()
+    }
+}
+
+fn pause_active_goal(ctx: &LoopCtx) -> bool {
+    let command = atomcode_coding::DriverCommand::PauseGoal;
+    if ctx.live_binding.is_some() {
+        atomcode_daemon::native_live::dispatch(command).is_ok()
+    } else {
+        ctx.runtime.dispatch(command).is_ok()
     }
 }
 
@@ -21352,6 +21381,16 @@ fn handle_agent_event(
                             }
                         }
                         state.goal_phase = atomcode_coding::GoalPhase::PausedAtCap;
+                        flush_pending_separator(state, renderer, /* as_goal_end */ true);
+                    }
+                    atomcode_coding::GoalPhase::Paused => {
+                        if state.goal_condition.is_some() {
+                            renderer.render(UiLine::CommandOutput(
+                                "  ⏸ Goal paused; continue the conversation to resume, or use /goal stop to end.\n".into(),
+                            ));
+                            renderer.flush();
+                        }
+                        state.goal_phase = atomcode_coding::GoalPhase::Paused;
                         flush_pending_separator(state, renderer, /* as_goal_end */ true);
                     }
                     atomcode_coding::GoalPhase::Ended

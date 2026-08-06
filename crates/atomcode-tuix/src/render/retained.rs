@@ -184,6 +184,7 @@ fn goal_row_parts(
     max_cols: usize,
     unicode: bool,
 ) -> (&'static str, String, String) {
+    let condition = goal_condition_preview(condition);
     let marker = goal_marker(unicode);
     let m = elapsed_secs / 60;
     let s = elapsed_secs % 60;
@@ -203,8 +204,18 @@ fn goal_row_parts(
         let meta_only = crate::width::truncate_to_width(&bare, max_cols.saturating_sub(icon_w));
         return (marker, String::new(), meta_only);
     }
-    let cond = crate::width::truncate_with_ellipsis(condition, cond_budget);
+    let cond = crate::width::truncate_with_ellipsis(&condition, cond_budget);
     (marker, cond, meta)
+}
+
+fn goal_condition_preview(condition: &str) -> String {
+    let mut lines = condition.lines().map(str::trim).filter(|line| !line.is_empty());
+    let first = lines.next().unwrap_or_default();
+    if lines.next().is_some() {
+        format!("{first}…")
+    } else {
+        first.to_string()
+    }
 }
 
 /// Full goal-row text (marker + condition + meta joined). Thin wrapper over
@@ -240,6 +251,14 @@ fn goal_row_parts_phase(
     match phase {
         atomcode_coding::GoalPhase::Pursuing => {
             goal_row_parts(condition, round, elapsed_secs, max_cols, unicode)
+        }
+        atomcode_coding::GoalPhase::Paused => {
+            let marker = if unicode { "⏸ " } else { "* " };
+            (
+                marker,
+                "goal 已暂停".to_string(),
+                " · 继续对话即恢复 · /goal stop 结束".to_string(),
+            )
         }
         atomcode_coding::GoalPhase::PausedAtCap => {
             let marker = if unicode { "⏸ " } else { "* " };
@@ -9040,6 +9059,20 @@ mod tests {
     }
 
     #[test]
+    fn goal_row_summarizes_multiline_condition_without_flattening_details() {
+        let row = format_goal_row(
+            "查询长沙未来30天的天气预报\n1、表格展示\n2、华氏温度展示",
+            1,
+            5,
+            100,
+            true,
+        );
+        assert!(row.contains("查询长沙未来30天的天气预报…"), "first line: {row}");
+        assert!(!row.contains("表格展示"), "details stay out of footer: {row}");
+        assert!(!row.contains('\n'), "footer preview is one line: {row}");
+    }
+
+    #[test]
     fn goal_row_degrades_to_round_elapsed_when_too_narrow() {
         // No room for any condition → drop it, keep marker + round/elapsed.
         let row = format_goal_row("some long condition", 2, 9, 14, true);
@@ -9087,6 +9120,21 @@ mod tests {
             "resume hint present: {row}"
         );
         assert!(row.contains("已达 5 轮"), "round substitution locked: {row}");
+    }
+
+    #[test]
+    fn goal_row_user_paused_shows_resume_and_stop_actions() {
+        let row = format_goal_row_phase(
+            "fix all tests",
+            2,
+            12,
+            100,
+            true,
+            atomcode_coding::GoalPhase::Paused,
+        );
+        assert!(row.contains("已暂停"), "pause state present: {row}");
+        assert!(row.contains("继续对话即恢复"), "resume hint present: {row}");
+        assert!(row.contains("/goal stop"), "stop action present: {row}");
     }
 
     #[test]

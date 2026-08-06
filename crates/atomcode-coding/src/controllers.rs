@@ -69,6 +69,9 @@ pub enum GoalTerminal {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GoalPhase {
     Pursuing,
+    /// Explicitly paused by the user. The goal remains registered and resumes
+    /// on the next user submit; unlike `PausedAtCap`, no budget was exhausted.
+    Paused,
     PausedAtCap,
     Satisfied,
     /// Terminal state for cancel / fail / clear paths.  Not persisted: the UI
@@ -137,8 +140,8 @@ impl GoalState {
     pub fn progress(&self) -> GoalProgress {
         GoalProgress {
             active: self.active,
-            terminal: if self.active {
-                None
+            terminal: if self.active || self.phase == GoalPhase::Paused {
+                self.terminal
             } else {
                 Some(self.terminal.unwrap_or(GoalTerminal::Failed))
             },
@@ -175,7 +178,16 @@ impl GoalState {
         self.last_reason = Some(note.into());
     }
 
+    pub fn pause(&mut self, note: impl Into<String>) {
+        self.cancel.cancel();
+        self.active = false;
+        self.phase = GoalPhase::Paused;
+        self.terminal = None;
+        self.last_reason = Some(note.into());
+    }
+
     pub fn resume(&mut self, new_max_rounds: u32) {
+        self.cancel = CancellationToken::new();
         self.active = true;
         self.phase = GoalPhase::Pursuing;
         self.round = 0;

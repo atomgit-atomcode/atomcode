@@ -412,6 +412,7 @@ pub enum DriverCommand {
         value: serde_json::Value,
     },
     Cancel,
+    PauseGoal,
     Compact(Option<String>),
     SetMode(RuntimeMode),
     QueueLocalContext(LocalContextInput),
@@ -1045,6 +1046,10 @@ impl CodingRuntimeHandle {
                 let (done, _result) = oneshot::channel();
                 CodingRuntimeControl::Cancel { generation, done }
             }
+            DriverCommand::PauseGoal => {
+                let (done, _result) = oneshot::channel();
+                CodingRuntimeControl::PauseGoal { generation, done }
+            }
             DriverCommand::Compact(focus) => CodingRuntimeControl::Compact { generation, focus },
             DriverCommand::SetMode(mode) => {
                 let (done, _result) = oneshot::channel();
@@ -1181,6 +1186,18 @@ impl CodingRuntimeHandle {
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::Cancel {
+                generation: runtime_state_generation(state),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    pub async fn pause_goal(&self) -> Result<(), RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::PauseGoal {
                 generation: runtime_state_generation(state),
                 done,
             })
@@ -1959,6 +1976,10 @@ pub enum CodingRuntimeControl {
         done: oneshot::Sender<Result<RuntimeSnapshotReceipt, RuntimeError>>,
     },
     Cancel {
+        generation: u64,
+        done: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    PauseGoal {
         generation: u64,
         done: oneshot::Sender<Result<(), RuntimeError>>,
     },
@@ -3039,7 +3060,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             // it isn't done, so any nudge should let it keep going. The
                             // Satisfied arm below deliberately does NOT — a done goal must
                             // not be re-tasked by an empty message.
-                            Some(GoalPhase::PausedAtCap) => Some(None),
+                            Some(GoalPhase::Paused | GoalPhase::PausedAtCap) => Some(None),
                             Some(GoalPhase::Satisfied) if input.text.trim().is_empty() => {
                                 // Fast-path: an empty / whitespace-only submit obviously
                                 // isn't a new goal — don't spend a classifier call (or
@@ -3562,6 +3583,77 @@ fn spawn_runtime_owner_with_optional_agent(
                                 );
                                 let _ = done.send(Ok(()));
                             } else {
+                                agent_available = false;
+                                controls.state.store(
+                                    runtime_phase_state(generation, RuntimePhase::Failed),
+                                    Ordering::Release,
+                                );
+                                let _ = done.send(Err(RuntimeError::DeliveryFailed));
+                            }
+                        }
+                    }
+                    Some(CodingRuntimeControl::PauseGoal {
+                        generation: request_generation,
+                        done,
+                    }) => {
+                        if !native_protocol || request_generation != generation || !agent_available {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        }
+                        let Some(state) = goal.as_mut() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        state.pause("paused by user; continue the conversation to resume");
+                        let _ = runtime_event_tx
+                            .send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                        pending_wakeup = None;
+
+                        if let Some((turn_id, _, snapshot, stats)) = held_turn.take() {
+                            active_turn = None;
+                            cancel_pending = false;
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(
+                                TurnCompletion::Completed {
+                                    turn_id,
+                                    reason: StopReason::Cancelled,
+                                    snapshot,
+                                    stats,
+                                },
+                            ));
+                            controls.state.store(
+                                runtime_phase_state(generation, RuntimePhase::Ready),
+                                Ordering::Release,
+                            );
+                            let _ = done.send(Ok(()));
+                        } else if active_turn.is_none() {
+                            cancel_pending = false;
+                            let _ = done.send(Ok(()));
+                        } else {
+                            for id in pending_requests.iter().copied() {
+                                let _ = send_agent_command(&agent, AgentCommand::Respond {
+                                    id,
+                                    value: serde_json::Value::Null,
+                                });
+                            }
+                            pending_requests.clear();
+                            if request_cancel_snapshot(&agent) {
+                                cancel_pending = true;
+                                snapshot_in_flight = true;
+                                controls.state.store(
+                                    runtime_phase_state(generation, RuntimePhase::InTurn),
+                                    Ordering::Release,
+                                );
+                                let _ = done.send(Ok(()));
+                            } else {
+                                if let Some(mut state) = goal.take() {
+                                    state.finish(
+                                        GoalTerminal::Failed,
+                                        "pause failed: cancel delivery failed",
+                                    );
+                                    let _ = runtime_event_tx.send(
+                                        CodingRuntimeEvent::GoalChanged(state.progress()),
+                                    );
+                                }
                                 agent_available = false;
                                 controls.state.store(
                                     runtime_phase_state(generation, RuntimePhase::Failed),
@@ -5851,6 +5943,7 @@ fn reject_runtime_control(
         }
         CodingRuntimeControl::Respond { done, .. }
         | CodingRuntimeControl::Cancel { done, .. }
+        | CodingRuntimeControl::PauseGoal { done, .. }
         | CodingRuntimeControl::SetMode { done, .. }
         | CodingRuntimeControl::WaitMcpReady { done, .. }
         | CodingRuntimeControl::QueueLocalContext { done, .. } => {
@@ -8497,6 +8590,71 @@ mod tests {
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { text, .. }) if text == "continue after cancel"
         ));
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pause_goal_cancels_only_the_turn_and_next_submit_resumes_goal() {
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
+
+        handle.start_goal("finish the task").await.unwrap();
+        let _ = runtime_events.recv().await;
+        handle.submit(UserInput::from("start work")).await.unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+
+        handle.pause_goal().await.unwrap();
+        assert!(matches!(kernel_commands.recv().await, Some(AgentCommand::Cancel)));
+        assert!(matches!(kernel_commands.recv().await, Some(AgentCommand::Snapshot)));
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                active: false,
+                phase: GoalPhase::Paused,
+                terminal: None,
+                ..
+            }))
+        ));
+
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::user("start work")]),
+            })
+            .unwrap();
+        loop {
+            if matches!(
+                runtime_events.recv().await,
+                Some(CodingRuntimeEvent::TurnFinished(_))
+            ) {
+                break;
+            }
+        }
+
+        handle.submit(UserInput::from("continue")).await.unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                active: true,
+                phase: GoalPhase::Pursuing,
+                condition,
+                ..
+            })) if condition == "finish the task"
+        ));
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { text, .. }) if text == "continue"
+        ));
+
         handle.shutdown().await.unwrap();
     }
 
