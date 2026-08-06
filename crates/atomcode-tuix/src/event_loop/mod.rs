@@ -21308,7 +21308,11 @@ fn handle_agent_event(
                         state.goal_condition = None;
                         state.goal_round = 0;
                         state.goal_started_at = None;
-                        state.goal_phase = atomcode_coding::GoalPhase::Pursuing;
+                        // Reflect the true terminal state (not a lying "Pursuing").
+                        // The next goal's active=true update resets this to Pursuing;
+                        // `goal_defers_turn_separator` gates on goal_condition first, so
+                        // this only guards future readers of goal_phase.
+                        state.goal_phase = atomcode_coding::GoalPhase::Ended;
                         flush_pending_separator(state, renderer, /* as_goal_end */ true);
                     }
                 }

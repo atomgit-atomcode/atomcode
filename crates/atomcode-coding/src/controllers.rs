@@ -751,18 +751,26 @@ mod tests {
     }
 
     // Fix #2: resume() refreshes the wall-clock deadline; a time-capped goal
-    // must not re-pause instantly on every resume.
+    // must not re-pause instantly on every resume. Falsifying: the deadline is
+    // forced into the PAST first, so cap_reached() reports the time limit BEFORE
+    // resume and (only if resume refreshes the deadline) clears AFTER.
     #[test]
     fn resume_refreshes_deadline_for_time_capped_goal() {
-        // With a 1-hour cap, after resume the deadline must be ~1h from now.
         let mut g = GoalState::new(1, "x".into(), 0, 3600);
+        // Simulate the 1h cap having already elapsed.
+        g.deadline = Some(Instant::now() - Duration::from_secs(1));
         g.pause_at_cap("已达时间上限");
+        assert_eq!(
+            g.cap_reached(),
+            Some("time limit"),
+            "an expired deadline must report the time-limit cap before resume"
+        );
         g.resume(0);
-        // Fresh 1h deadline → cap_reached() returns None (not expired yet).
+        // resume() must refresh the deadline to a fresh 1h window → no longer expired.
         assert_eq!(
             g.cap_reached(),
             None,
-            "resumed goal with 1h cap must not report cap_reached immediately"
+            "resume must refresh the deadline so the time cap no longer fires"
         );
     }
 
