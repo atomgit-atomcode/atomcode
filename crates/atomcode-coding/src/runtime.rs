@@ -3036,6 +3036,12 @@ fn spawn_runtime_owner_with_optional_agent(
                             .map(|state| state.phase)
                         {
                             Some(GoalPhase::PausedAtCap) => Some(None),
+                            Some(GoalPhase::Satisfied) if input.text.trim().is_empty() => {
+                                // Fast-path: an empty / whitespace-only submit obviously
+                                // isn't a new goal — don't spend a classifier call (or
+                                // block the loop) on it; leave the goal Satisfied.
+                                None
+                            }
                             Some(GoalPhase::Satisfied) => {
                                 let condition =
                                     goal.as_ref().map(|s| s.condition.clone()).unwrap_or_default();
@@ -3055,10 +3061,11 @@ fn spawn_runtime_owner_with_optional_agent(
                                 });
                                 match (provider, cancel) {
                                     (Some(p), Some(c)) => {
-                                        // Bounded so a slow classifier can't park the loop;
-                                        // any timeout/failure resolves to Continuation.
+                                        // Awaited inline, so bound it tightly (the classify
+                                        // is a short reply); any timeout/failure resolves to
+                                        // Continuation so a hiccup never drops the goal.
                                         let classified = tokio::time::timeout(
-                                            std::time::Duration::from_secs(10),
+                                            std::time::Duration::from_secs(4),
                                             classify_followup(p, condition, input.text.clone(), c),
                                         )
                                         .await
@@ -13535,6 +13542,83 @@ mod tests {
         assert!(
             !saw_goal_changed_pursuing,
             "not-a-goal must NOT re-engage the goal (no GoalChanged Pursuing)"
+        );
+        handle.shutdown().await.unwrap();
+    }
+
+    // Fast-path: an empty / whitespace-only submit after a Satisfied goal skips the
+    // classifier entirely and does NOT re-engage — no GoalChanged(Pursuing).
+    #[tokio::test]
+    async fn submit_while_satisfied_empty_input_skips_classifier() {
+        let (handle, mut kernel_commands, kernel_events, mut runtime_events, _w, _l, _a) =
+            controller_test_runtime(Arc::new(GoalMetProviderFactory)).await;
+
+        // --- Drive the goal to Satisfied ---
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await; // GoalChanged(active=true)
+        handle.submit(UserInput::from("initial turn")).await.unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        kernel_events
+            .send(AgentEvent::TurnComplete { reason: StopReason::Stopped })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("done", vec![])]),
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::TurnFinished(_)) => break,
+                    Some(_) => {}
+                    None => panic!("events closed before met terminal"),
+                }
+            }
+        })
+        .await
+        .expect("satisfied turn did not finish");
+
+        // Whitespace-only submit → fast-path, no classifier, no re-engage.
+        handle.submit(UserInput::from("   ")).await.unwrap();
+        let mut saw_goal_changed_pursuing = false;
+        let mut saw_send_message = false;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    event = runtime_events.recv() => match event {
+                        Some(CodingRuntimeEvent::GoalChanged(p)) => {
+                            if p.phase == GoalPhase::Pursuing {
+                                saw_goal_changed_pursuing = true;
+                            }
+                        }
+                        Some(_) => {}
+                        None => break,
+                    },
+                    cmd = kernel_commands.recv() => match cmd {
+                        Some(AgentCommand::SendMessage { .. }) => {
+                            saw_send_message = true;
+                            break;
+                        }
+                        _ => break,
+                    },
+                }
+            }
+        })
+        .await
+        .expect("empty submit did not deliver within timeout");
+
+        assert!(saw_send_message, "the (empty) message still runs as an ordinary turn");
+        assert!(
+            !saw_goal_changed_pursuing,
+            "empty input must NOT re-engage the goal (classifier skipped)"
         );
         handle.shutdown().await.unwrap();
     }
