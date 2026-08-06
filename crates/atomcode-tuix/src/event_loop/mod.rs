@@ -15226,6 +15226,10 @@ mod user_input_key_tests {
     fn navigation_keys_do_not_resolve() {
         assert!(user_input_response_for(&panel(UserInputMode::Single), KeyCode::Up).is_none());
         assert!(user_input_response_for(&panel(UserInputMode::Single), KeyCode::Down).is_none());
+        assert!(user_input_response_for(&panel(UserInputMode::Single), KeyCode::PageUp).is_none());
+        assert!(
+            user_input_response_for(&panel(UserInputMode::Single), KeyCode::PageDown).is_none()
+        );
         assert!(
             user_input_response_for(&panel(UserInputMode::Multiple), KeyCode::Char(' ')).is_none()
         );
@@ -15749,6 +15753,16 @@ fn handle_user_input_key(
                 p.move_down();
             }
         }
+        (_, KeyCode::PageUp) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                p.page_up();
+            }
+        }
+        (_, KeyCode::PageDown) => {
+            if let Some(p) = app.state.user_input_panel.as_mut() {
+                p.page_down();
+            }
+        }
         // Number keys 1..9: select the Nth navigable row (concrete options 1..N,
         // then "Other" as N+1). Single → move the cursor there (cursor is the
         // radio). Multiple → toggle that concrete row's checkbox, OR move the
@@ -15771,12 +15785,16 @@ fn handle_user_input_key(
                     match p.mode {
                         UserInputMode::Multiple => p.toggle_index(idx),
                         // Single: cursor-as-radio — move to it (this IS selecting it).
-                        _ => p.cursor = idx,
+                        _ => {
+                            p.cursor = idx;
+                            p.scroll_offset = 0;
+                        }
                     }
                 } else if idx == p.other_index() && p.custom {
                     // Number key for the Other row (only when offered): move cursor to it
                     // (focus for typing). Inclusion is text-derived, not toggled by a number.
                     p.cursor = p.other_index();
+                    p.scroll_offset = 0;
                 }
             }
         }
@@ -15916,6 +15934,12 @@ fn handle_user_input_batch_key(
         (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Down) => {
             app.state.user_input_batch.as_mut().unwrap().questions[cur].move_down();
         }
+        (_, KeyCode::PageUp) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].page_up();
+        }
+        (_, KeyCode::PageDown) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].page_down();
+        }
         // Number keys 1..9: select the Nth navigable row (concrete options, then "Other").
         (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Char(c))
             if c.is_ascii_digit()
@@ -15927,10 +15951,14 @@ fn handle_user_input_batch_key(
             if idx < p.options.len() {
                 match p.mode {
                     UserInputMode::Multiple => p.toggle_index(idx),
-                    _ => p.cursor = idx,
+                    _ => {
+                        p.cursor = idx;
+                        p.scroll_offset = 0;
+                    }
                 }
             } else if idx == p.other_index() && p.custom {
                 p.cursor = p.other_index();
+                p.scroll_offset = 0;
             }
         }
         (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Backspace) => {
@@ -22461,6 +22489,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             text: p.text.clone(),
             custom_text: p.custom_text.clone(),
             custom: p.custom,
+            scroll_offset: p.scroll_offset,
             batch: Some(crate::render::UserInputBatchMeta {
                 total,
                 // 1-based current question; clamped so the Submit stop (current==total)
@@ -22485,6 +22514,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
                 text: p.text.clone(),
                 custom_text: p.custom_text.clone(),
                 custom: p.custom,
+                scroll_offset: p.scroll_offset,
                 batch: None,
             })
     };

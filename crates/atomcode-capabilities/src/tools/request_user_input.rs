@@ -35,9 +35,9 @@ pub struct UserInputRequest {
     pub mode: UserInputMode,
     #[serde(default)]
     pub options: Vec<UserInputOption>,
-    /// Whether the auto "type your own answer" free-text row is offered
-    /// (single/multiple). Default true (absent ⇒ true) — backward compatible.
-    /// Set false when `options` are exhaustive.
+    /// Legacy wire field retained for backward-compatible deserialization.
+    /// Model-authored requests are normalized to true so choice questions
+    /// always offer a free-form answer.
     #[serde(default = "default_true")]
     pub custom: bool,
 }
@@ -76,8 +76,11 @@ fn validate_question(req: &UserInputRequest) -> Result<(), String> {
 /// Parse raw tool args into a `UserInputRequest`. Rejects choice modes with no options.
 /// Returns a human message on failure (never panics).
 pub fn parse_args(args: &str) -> Result<UserInputRequest, String> {
-    let req: UserInputRequest = serde_json::from_str(args)
+    let mut req: UserInputRequest = serde_json::from_str(args)
         .map_err(|e| format!("invalid request_user_input arguments: {e}"))?;
+    // Keep accepting the legacy field for wire compatibility, but a
+    // human-facing question must always leave the user a free-form escape hatch.
+    req.custom = true;
     validate_question(&req)?;
     Ok(req)
 }
@@ -94,8 +97,9 @@ pub fn parse_batch(args: &str) -> Result<(Vec<UserInputRequest>, bool), String> 
         }
         let mut out = Vec::new();
         for q in qs.iter().take(MAX_QUESTIONS) {
-            let req: UserInputRequest = serde_json::from_value(q.clone())
+            let mut req: UserInputRequest = serde_json::from_value(q.clone())
                 .map_err(|e| format!("invalid question in `questions`: {e}"))?;
+            req.custom = true;
             validate_question(&req)?;
             out.push(req);
         }
@@ -223,9 +227,8 @@ impl Tool for RequestUserInputTool {
          (\"single\"=pick one, \"multiple\"=pick any, \"text\"=free-form) and `options` \
          (non-empty for single/multiple). To ask up to 4 related questions answered in ONE \
          interaction, pass a `questions` array of those same objects instead. A free-text \
-         \"type your own answer\" row is added automatically for single/multiple unless you set \
-         `custom` to false — so do NOT add your own \"Other\"/catch-all option; set \
-         `custom:false` when your options already cover every case. Keep each \
+         \"type your own answer\" row is always added automatically for single/multiple, so do \
+         NOT add your own \"Other\"/catch-all option. Keep each \
          `header` short (a few words)."
     }
 
@@ -248,8 +251,7 @@ impl Tool for RequestUserInputTool {
                             "description": {"type": "string"}
                         }
                     }
-                },
-                "custom": {"type": "boolean", "description": "Offer a free-text 'type your own answer' row (default true). Set false when your options are exhaustive."}
+                }
             }
         });
         serde_json::json!({
@@ -477,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_custom_defaults_true_and_reads_false() {
+    fn legacy_custom_false_is_accepted_but_normalized_true() {
         let r = parse_args(
             r#"{"header":"H","question":"Q?","mode":"single","options":[{"label":"A"}]}"#,
         )
@@ -487,7 +489,15 @@ mod tests {
             r#"{"header":"H","question":"Q?","mode":"single","options":[{"label":"A"}],"custom":false}"#,
         )
         .unwrap();
-        assert!(!r2.custom, "custom:false parsed");
+        assert!(
+            r2.custom,
+            "legacy custom:false must not remove the user's free-form escape hatch"
+        );
+        let schema = RequestUserInputTool.parameters_schema();
+        assert!(
+            schema["properties"].get("custom").is_none(),
+            "the model-facing schema must not expose the legacy switch"
+        );
     }
 
     #[test]

@@ -63,6 +63,63 @@ fn append_stream_chunk(buffer: &mut String, chunk: &str) -> Option<String> {
     Some(buffer.drain(..split_at).collect())
 }
 
+/// Word-aware display-width wrapping for human-facing prompt prose. English
+/// breaks at spaces; oversized tokens and CJK fall back to grapheme-safe wrap.
+fn wrap_prompt_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for token in text.split_whitespace() {
+        let token_width = crate::width::display_width(token);
+        if token_width > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            let mut chunks = crate::width::wrap_line_to_width(token, width);
+            if let Some(last) = chunks.pop() {
+                lines.extend(chunks);
+                current_width = crate::width::display_width(&last);
+                current = last;
+            }
+            continue;
+        }
+        let separator = usize::from(!current.is_empty());
+        if current_width + separator + token_width > width {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(token);
+            current_width = token_width;
+        } else {
+            if separator == 1 {
+                current.push(' ');
+            }
+            current.push_str(token);
+            current_width += separator + token_width;
+        }
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+struct UserInputRows {
+    rows: Vec<Vec<Cell>>,
+    /// Full rendered range belonging to the active option/input/submit row.
+    active: std::ops::Range<usize>,
+}
+
+impl std::ops::Deref for UserInputRows {
+    type Target = [Vec<Cell>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.rows
+    }
+}
+
 /// Hard cap on how many rows the input box may DISPLAY before it scrolls
 /// internally. Bounds the footer so a long paste / typed text can't grow it
 /// past the screen height (the overflow bug). This caps DISPLAY only — the
@@ -3136,42 +3193,74 @@ impl<W: Write + Send> RetainedRenderer<W> {
         out
     }
 
-    /// Rows the `request_user_input` panel occupies. Mirrors
-    /// `approval_panel_row_count`: 1 header (the question) + the mode body
-    /// (single/multiple = one row per option; text = one `> {buffer}` row) + 1
-    /// hint row. Must equal `build_user_input_rows(..).len()`.
-    fn user_input_panel_row_count(&self, panel: &crate::render::UserInputPanelView) -> usize {
-        use atomcode_capabilities::tools::request_user_input::UserInputMode;
-        match panel.mode {
-            UserInputMode::Single | UserInputMode::Multiple => {
-                // header chip + blank + question + blank
-                let mut n = 4;
-                // Each concrete option: 1 label row + (1 description row if present).
-                for (_, desc) in &panel.options {
-                    n += 1;
-                    if desc
-                        .as_deref()
-                        .map(|d| !d.trim().is_empty())
-                        .unwrap_or(false)
-                    {
-                        n += 1;
-                    }
-                }
-                // Custom-answer ("Other") row: 1 inline input line — only when offered.
-                if panel.custom {
-                    n += 1;
-                }
-                // Multiple: a blank spacer + the Submit row.
-                if matches!(panel.mode, UserInputMode::Multiple) {
-                    n += 2;
-                }
-                // blank + hint
-                n += 2;
-                n
-            }
-            // Text: header chip + blank + question + blank + input row + hint.
-            UserInputMode::Text => 6,
+    /// Keep an oversized question panel usable on short terminals. The active
+    /// option stays in a moving window and omitted rows are counted explicitly.
+    fn fit_user_input_rows(
+        &self,
+        built: UserInputRows,
+        screen_height: usize,
+        scroll_offset: isize,
+    ) -> Vec<Vec<Cell>> {
+        let UserInputRows { rows, active } = built;
+        let max_rows = screen_height.saturating_sub(1);
+        if max_rows == 0 {
+            return Vec::new();
         }
+        if rows.len() <= max_rows {
+            return rows;
+        }
+
+        let hint = rows.last().cloned().unwrap_or_default();
+        let content_len = rows.len().saturating_sub(1);
+        let active_start = active.start.min(content_len.saturating_sub(1));
+        let active_end = active.end.max(active_start + 1).min(content_len);
+        if max_rows < 4 {
+            let mut compact = vec![rows[active_start].clone()];
+            if max_rows > 1 {
+                compact.push(hint);
+            }
+            compact.truncate(max_rows);
+            return compact;
+        }
+
+        let body_budget = max_rows.saturating_sub(3).max(1);
+        let active_len = active_end.saturating_sub(active_start);
+        let automatic_start = if active_len >= body_budget {
+            active_start
+        } else {
+            active_start.saturating_sub((body_budget - active_len) / 2)
+        }
+        .min(content_len.saturating_sub(body_budget));
+        let max_start = content_len.saturating_sub(body_budget);
+        let mut start = if scroll_offset < 0 {
+            automatic_start.saturating_sub(scroll_offset.unsigned_abs())
+        } else {
+            automatic_start.saturating_add(scroll_offset as usize)
+        };
+        start = start.min(max_start);
+        let end = (start + body_budget).min(content_len);
+        let style = self.style_faint(Role::Muted);
+        let indicator = |direction: &str, hidden: usize| {
+            let mut row = Vec::new();
+            push_str_cells(&mut row, "  ", &style);
+            push_str_cells(
+                &mut row,
+                &format!("{direction} {hidden} hidden lines · PgUp/PgDn"),
+                &style,
+            );
+            row
+        };
+
+        let mut fitted = Vec::with_capacity(max_rows);
+        if start > 0 {
+            fitted.push(indicator("\u{2191}", start));
+        }
+        fitted.extend(rows[start..end].iter().cloned());
+        if end < content_len {
+            fitted.push(indicator("\u{2193}", content_len - end));
+        }
+        fitted.push(hint);
+        fitted
     }
 
     /// Build the compact footer `request_user_input` panel.
@@ -3182,30 +3271,32 @@ impl<W: Write + Send> RetainedRenderer<W> {
     ///     multiple adds `[x]`/`[ ]` checkboxes; the cursor label is emphasized
     ///     in the orange highlight colour.
     ///   - Text: a single `> {buffer}` input row.
-    /// `user_input_panel_row_count` MUST equal `build_user_input_rows(..).len()`.
+    /// The caller measures returned rows directly because wrapping makes height
+    /// dependent on terminal width.
     fn build_user_input_rows(
         &self,
         panel: &crate::render::UserInputPanelView,
         rule_width: usize,
         screen_width: usize,
-    ) -> Vec<Vec<Cell>> {
+    ) -> UserInputRows {
         use atomcode_capabilities::tools::request_user_input::UserInputMode;
         let unicode = self.caps.unicode_symbols;
         let mut out: Vec<Vec<Cell>> = Vec::new();
+        let mut active = 0..1;
 
         // A blank spacer row (empty cells).
         let blank_row = |out: &mut Vec<Vec<Cell>>| out.push(Vec::new());
-        // Emit a 2-space-indented styled text line, width-truncated.
+        // Emit display-width wrapped text; terminal autowrap is unreliable in
+        // a retained footer and previously made the rest silently disappear.
         let push_line = |out: &mut Vec<Vec<Cell>>, text: &str, style: &CellStyle| {
             let raw = crate::glyph::downgrade_glyphs(text, unicode);
-            let body = crate::width::truncate_with_ellipsis(
-                &scrub_controls(&raw),
-                rule_width.saturating_sub(2),
-            );
-            let mut row = Vec::new();
-            push_str_cells(&mut row, "  ", style);
-            push_str_cells(&mut row, &body, style);
-            out.push(row);
+            let safe = scrub_controls(&raw);
+            for body in wrap_prompt_text(&safe, rule_width.saturating_sub(2)) {
+                let mut row = Vec::new();
+                push_str_cells(&mut row, "  ", style);
+                push_str_cells(&mut row, &body, style);
+                out.push(row);
+            }
         };
 
         match panel.mode {
@@ -3226,12 +3317,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 // Emit one navigable option row (label) + optional description.
                 // `number` is the 1-based display index; `label`/`desc` its text.
                 let emit_option = |out: &mut Vec<Vec<Cell>>,
+                                   active: &mut std::ops::Range<usize>,
                                    idx: usize,
                                    number: usize,
                                    label: &str,
                                    desc: Option<&str>,
                                    checked: bool| {
                     let on_cursor = idx == panel.cursor;
+                    let option_start = out.len();
                     // Marker: `❯ ` on the cursor row, else two spaces.
                     let marker = if on_cursor {
                         if unicode {
@@ -3268,15 +3361,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         + crate::width::display_width(checkbox)
                         + crate::width::display_width(&num);
                     let budget = rule_width.saturating_sub(prefix_width);
-                    let lbl = crate::width::truncate_with_ellipsis(&scrub_controls(label), budget);
-                    let mut row = Vec::new();
-                    push_str_cells(&mut row, marker, &chrome_style);
-                    if multiple {
-                        push_str_cells(&mut row, checkbox, &chrome_style);
+                    let label_lines = wrap_prompt_text(&scrub_controls(label), budget.max(1));
+                    for (line_idx, lbl) in label_lines.iter().enumerate() {
+                        let mut row = Vec::new();
+                        if line_idx == 0 {
+                            push_str_cells(&mut row, marker, &chrome_style);
+                            if multiple {
+                                push_str_cells(&mut row, checkbox, &chrome_style);
+                            }
+                            push_str_cells(&mut row, &num, &chrome_style);
+                        } else {
+                            push_str_cells(&mut row, &" ".repeat(prefix_width), &chrome_style);
+                        }
+                        push_str_cells(&mut row, lbl, &label_style);
+                        out.push(row);
                     }
-                    push_str_cells(&mut row, &num, &chrome_style);
-                    push_str_cells(&mut row, &lbl, &label_style);
-                    out.push(row);
                     // Description: a faint second line, indented under the label.
                     if let Some(d) = desc {
                         let dtrim = d.trim();
@@ -3284,21 +3383,30 @@ impl<W: Write + Send> RetainedRenderer<W> {
                             let indent = " ".repeat(prefix_width);
                             let dbudget = rule_width.saturating_sub(prefix_width);
                             let draw = crate::glyph::downgrade_glyphs(dtrim, unicode);
-                            let dtext = crate::width::truncate_with_ellipsis(
-                                &scrub_controls(&draw),
-                                dbudget,
-                            );
-                            let mut drow = Vec::new();
-                            push_str_cells(&mut drow, &indent, &desc_style);
-                            push_str_cells(&mut drow, &dtext, &desc_style);
-                            out.push(drow);
+                            for dtext in wrap_prompt_text(&scrub_controls(&draw), dbudget.max(1)) {
+                                let mut drow = Vec::new();
+                                push_str_cells(&mut drow, &indent, &desc_style);
+                                push_str_cells(&mut drow, &dtext, &desc_style);
+                                out.push(drow);
+                            }
                         }
+                    }
+                    if on_cursor {
+                        *active = option_start..out.len().max(option_start + 1);
                     }
                 };
 
                 for (i, (label, desc)) in panel.options.iter().enumerate() {
                     let checked = panel.checked.get(i).copied().unwrap_or(false);
-                    emit_option(&mut out, i, i + 1, label, desc.as_deref(), checked);
+                    emit_option(
+                        &mut out,
+                        &mut active,
+                        i,
+                        i + 1,
+                        label,
+                        desc.as_deref(),
+                        checked,
+                    );
                 }
 
                 // The custom-answer ("Other") row (index = options.len()): a ONE-LINE
@@ -3306,6 +3414,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 // "Other" label, no subtitle; the cursor indicator and typed text (or
                 // faint placeholder) are rendered directly on this row.
                 if panel.custom {
+                    let custom_start = out.len();
                     let idx = other_index;
                     let number = other_index + 1;
                     let on_cursor = idx == panel.cursor;
@@ -3398,6 +3507,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         }
                     }
                     out.push(row);
+                    if on_cursor {
+                        active = custom_start..out.len();
+                    }
                 }
 
                 // Multiple mode: a blank spacer, then a navigable Submit row. The
@@ -3438,6 +3550,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     push_str_cells(&mut row, marker, &chrome_style);
                     push_str_cells(&mut row, &lbl, &label_style);
                     out.push(row);
+                    if on_cursor {
+                        active = out.len().saturating_sub(1)..out.len();
+                    }
                 }
             }
             UserInputMode::Text => {
@@ -3462,6 +3577,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     push_str_cells(&mut row, &" ".repeat(pad), &style);
                 }
                 out.push(row);
+                active = out.len().saturating_sub(1)..out.len();
             }
         }
 
@@ -3495,7 +3611,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         push_str_cells(&mut hint_row, &hint_truncated, &hint_style);
         out.push(hint_row);
 
-        out
+        UserInputRows { rows: out, active }
     }
 
     /// Batch-aware wrapper over [`Self::build_user_input_rows`]. A standalone question
@@ -3508,13 +3624,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         view: &crate::render::UserInputPanelView,
         rule_width: usize,
         screen_width: usize,
+        screen_height: usize,
     ) -> Vec<Vec<Cell>> {
         let meta = match &view.batch {
             Some(m) if m.total > 1 => m,
-            _ => return self.build_user_input_rows(view, rule_width, screen_width),
+            _ => {
+                let rows = self.build_user_input_rows(view, rule_width, screen_width);
+                return self.fit_user_input_rows(rows, screen_height, view.scroll_offset);
+            }
         };
         let unicode = self.caps.unicode_symbols;
         let mut out: Vec<Vec<Cell>> = Vec::new();
+        let mut active = 0..1;
         let push_line = |out: &mut Vec<Vec<Cell>>, text: &str, style: &CellStyle| {
             let raw = crate::glyph::downgrade_glyphs(text, unicode);
             let body = crate::width::truncate_with_ellipsis(
@@ -3575,6 +3696,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 meta.total
             ); // 已答
             push_line(&mut out, &submit, &self.style_bold(Role::Plan));
+            active = out.len().saturating_sub(1)..out.len();
             out.push(Vec::new()); // blank
                                   // Enter 提交 · Tab/Shift+Tab 切换问题 · Esc 放弃
             let hint = "Enter \u{63d0}\u{4ea4} \u{00b7} Tab/Shift+Tab \u{5207}\u{6362}\u{95ee}\u{9898} \u{00b7} Esc \u{653e}\u{5f03}";
@@ -3585,28 +3707,31 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // advances; submitting is a separate stop) — and replace it with one accurate
             // batch hint.
             let mut q = self.build_user_input_rows(view, rule_width, screen_width);
-            q.pop(); // the per-question hint (always the last row of build_user_input_rows)
-            out.extend(q);
+            q.rows.pop(); // the per-question hint (always the last row)
+            active = (out.len() + q.active.start)..(out.len() + q.active.end);
+            out.extend(q.rows);
             // 作答 · Tab/Shift+Tab 切换问题 · 到提交行 Enter 交全部 · Esc 放弃
             let hint = "\u{4f5c}\u{7b54} \u{00b7} Tab/Shift+Tab \u{5207}\u{6362}\u{95ee}\u{9898} \u{00b7} \u{5230}\u{63d0}\u{4ea4}\u{884c} Enter \u{4ea4}\u{5168}\u{90e8} \u{00b7} Esc \u{653e}\u{5f03}";
             push_line(&mut out, hint, &hint_style);
         }
-        out
+        self.fit_user_input_rows(
+            UserInputRows { rows: out, active },
+            screen_height,
+            if meta.on_submit {
+                0
+            } else {
+                view.scroll_offset
+            },
+        )
     }
 
     /// Row count matching [`Self::build_user_input_panel_view`].
     fn user_input_panel_view_row_count(&self, view: &crate::render::UserInputPanelView) -> usize {
-        match &view.batch {
-            Some(m) if m.total > 1 => {
-                if m.on_submit {
-                    5 // nav + blank + submit + blank + hint
-                } else {
-                    // nav + blank + <single-question rows minus its own hint> + batch hint
-                    self.user_input_panel_row_count(view) + 2
-                }
-            }
-            _ => self.user_input_panel_row_count(view),
-        }
+        let screen_width = self.screen.width() as usize;
+        let screen_height = self.screen.height() as usize;
+        let rule_width = screen_width.saturating_sub(PAD_COL * 2);
+        self.build_user_input_panel_view(view, rule_width, screen_width, screen_height)
+            .len()
     }
 
     /// Paint the full footer into `self.screen`. Layout (top to bottom):
@@ -4108,9 +4233,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let approval_cells: Vec<Vec<Cell>> = if let Some(p) = status_clone.approval.as_ref() {
             self.build_approval_rows(p, rule_width, w)
         } else if let Some(p) = status_clone.user_input.as_ref() {
-            self.build_user_input_panel_view(p, rule_width, w)
+            self.build_user_input_panel_view(p, rule_width, w, h)
         } else if let Some(p) = status_clone.round_cap_panel.as_ref() {
-            self.build_user_input_panel_view(p, rule_width, w)
+            self.build_user_input_panel_view(p, rule_width, w, h)
         } else {
             Vec::new()
         };
@@ -15943,17 +16068,13 @@ mod tests {
                 text: String::new(),
                 custom_text: String::new(),
                 custom: true,
+                scroll_offset: 0,
                 batch: None,
             };
             // Row count: header + blank + question + blank
             //   + opt1 label + opt1 desc + opt2 label (no desc)
             //   + custom inline row (1 line) + blank + hint.
-            assert_eq!(r.user_input_panel_row_count(&view), 4 + 3 + 1 + 2);
-            assert_eq!(
-                r.build_user_input_rows(&view, 78, 80).len(),
-                r.user_input_panel_row_count(&view),
-                "row_count must equal build_user_input_rows().len()"
-            );
+            assert_eq!(r.build_user_input_rows(&view, 78, 80).len(), 4 + 3 + 1 + 2);
             status.user_input = Some(view);
             r.render(UiLine::InputPrompt {
                 buf: String::new(),
@@ -16029,13 +16150,10 @@ mod tests {
                 text: String::new(),
                 custom_text: "Zig".into(),
                 custom: true,
+                scroll_offset: 0,
                 batch: None,
             };
-            assert_eq!(
-                r.build_user_input_rows(&view, 78, 80).len(),
-                r.user_input_panel_row_count(&view),
-                "row_count must equal build_user_input_rows().len()"
-            );
+            assert_eq!(r.build_user_input_rows(&view, 78, 80).len(), 12);
             status.user_input = Some(view);
             r.render(UiLine::InputPrompt {
                 buf: String::new(),
@@ -16095,15 +16213,11 @@ mod tests {
                 text: "atomcode".into(),
                 custom_text: String::new(),
                 custom: true,
+                scroll_offset: 0,
                 batch: None,
             };
             // header + blank + question + blank + input + hint = 6.
-            assert_eq!(r.user_input_panel_row_count(&view), 6, "text panel rows");
-            assert_eq!(
-                r.build_user_input_rows(&view, 78, 80).len(),
-                r.user_input_panel_row_count(&view),
-                "row_count must equal build_user_input_rows().len()"
-            );
+            assert_eq!(r.build_user_input_rows(&view, 78, 80).len(), 6);
             status.user_input = Some(view);
             r.render(UiLine::InputPrompt {
                 buf: String::new(),
@@ -16147,6 +16261,7 @@ mod tests {
             text: String::new(),
             custom_text: String::new(), // empty → placeholder shown
             custom: true,
+            scroll_offset: 0,
             batch: None,
         };
         status.user_input = Some(view);
@@ -16176,6 +16291,86 @@ mod tests {
     }
 
     #[test]
+    fn long_user_input_wraps_and_short_terminals_follow_cursor() {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        let (r, _buf) = new_capturing(42, 12);
+        let view = crate::render::UserInputPanelView {
+            header: "Versioning scope".into(),
+            question: "Which versioning strategy should business users choose without touching git directly?".into(),
+            mode: UserInputMode::Single,
+            options: vec![
+                ("Per-workspace git repository with an intentionally long label".into(),
+                 Some("Wrap git commands behind a Python API so business users never invoke git directly.".into())),
+                ("Python snapshot archive with complete release history".into(),
+                 Some("Copy workspace state into a versioned archive for every release and draft checkpoint.".into())),
+                ("Change log plus content hash manifest".into(),
+                 Some("Record every modification without taking full-file snapshots.".into())),
+            ],
+            cursor: 1,
+            checked: vec![false; 4],
+            text: String::new(),
+            custom_text: String::new(),
+            custom: true,
+            scroll_offset: 0,
+            batch: None,
+        };
+
+        let full = r.build_user_input_rows(&view, 40, 42);
+        let full_dump = full.iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .collect::<Vec<_>>().join("\n");
+        assert!(full.len() > 11);
+        assert!(full_dump.contains("directly?")
+            && full_dump.contains("intentionally long label")
+            && full_dump.contains("draft checkpoint.")
+            && full_dump.contains("taking full-file snapshots."),
+            "wrapped text lost its tail:\n{full_dump}");
+
+        let fitted = r.build_user_input_panel_view(&view, 40, 42, 12);
+        let dump = fitted.iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .collect::<Vec<_>>().join("\n");
+        assert!(fitted.len() <= 11);
+        assert!(dump.contains("Python snapshot"), "cursor option missing:\n{dump}");
+        assert!(dump.contains("hidden lines"), "overflow was silently clipped:\n{dump}");
+
+        let mut scrollable = view.clone();
+        scrollable.options[1].1 = Some(
+            (1..=30)
+                .map(|i| format!("detail-{i:02}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        let dump_rows = |rows: &[Vec<Cell>]| {
+            rows.iter()
+                .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let before = r.build_user_input_panel_view(&scrollable, 40, 42, 12);
+        scrollable.scroll_offset = 5;
+        let after = r.build_user_input_panel_view(&scrollable, 40, 42, 12);
+        assert_ne!(dump_rows(&before), dump_rows(&after));
+        assert!(
+            dump_rows(&after).contains("detail-20"),
+            "PageDown did not expose later continuation lines:\n{}",
+            dump_rows(&after)
+        );
+
+        for height in 0usize..=4 {
+            let tiny = r.build_user_input_panel_view(&view, 40, 42, height);
+            assert!(tiny.len() <= height.saturating_sub(1));
+            if height >= 2 {
+                assert!(
+                    dump_rows(&tiny).contains("Python snapshot"),
+                    "height {height} lost the active option:\n{}",
+                    dump_rows(&tiny)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn user_input_batch_navigator_and_parity() {
         use crate::render::{UserInputBatchMeta, UserInputPanelView};
         use atomcode_capabilities::tools::request_user_input::UserInputMode;
@@ -16191,6 +16386,7 @@ mod tests {
             text: String::new(),
             custom_text: String::new(),
             custom: true,
+            scroll_offset: 0,
             batch,
         };
 
@@ -16205,7 +16401,7 @@ mod tests {
             on_submit: false,
         }));
         assert_eq!(
-            r.build_user_input_panel_view(&one, 78, 80).len(),
+            r.build_user_input_panel_view(&one, 78, 80, 24).len(),
             single_rows,
             "total==1 delegates to the single renderer"
         );
@@ -16217,7 +16413,7 @@ mod tests {
             answered: vec![false, false],
             on_submit: false,
         }));
-        let q_rows = r.build_user_input_panel_view(&q, 78, 80);
+        let q_rows = r.build_user_input_panel_view(&q, 78, 80, 24);
         assert_eq!(
             q_rows.len(),
             r.user_input_panel_view_row_count(&q),
@@ -16233,13 +16429,24 @@ mod tests {
             answered: vec![true, false],
             on_submit: true,
         }));
-        let sub_rows = r.build_user_input_panel_view(&sub, 78, 80);
+        let sub_rows = r.build_user_input_panel_view(&sub, 78, 80, 24);
         assert_eq!(
             sub_rows.len(),
             r.user_input_panel_view_row_count(&sub),
             "row_count invariant (submit)"
         );
         assert_eq!(sub_rows.len(), 5);
+        let tiny_submit = r.build_user_input_panel_view(&sub, 78, 80, 3);
+        let tiny_dump = tiny_submit
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compact_dump = tiny_dump.replace(' ', "");
+        assert!(
+            compact_dump.contains("提交全部") || tiny_dump.contains("Submit all"),
+            "tiny batch viewport lost its active submit row:\n{tiny_dump}"
+        );
     }
 
     /// Round-cap checkpoint: `round_cap_view` produces a Single-mode
@@ -20278,6 +20485,7 @@ mod tests {
             text: String::new(),
             custom_text: String::new(),
             custom: true,
+            scroll_offset: 0,
             batch: None,
         });
         r.render(UiLine::InputPrompt {
@@ -20355,6 +20563,7 @@ mod tests {
             text: String::new(),
             custom_text: String::new(),
             custom: false,
+            scroll_offset: 0,
             batch: None,
         });
         r.render(UiLine::InputPrompt {
