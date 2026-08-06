@@ -1349,6 +1349,18 @@ async fn run() -> Result<i32> {
                 .await
                 .map(|_| 0);
             }
+            Commands::Schedule(sub) => {
+                // Handled here (not via the generic `other` arm) so the executor's
+                // exit code survives: `schedule run` returns 0/1/130 and the OS
+                // scheduler keys failure detection on it. The generic arm collapses
+                // every Ok to 0, which would report every scheduled run as success.
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let code = schedule_cmd::handle_schedule(sub).await?;
+                telemetry
+                    .shutdown(std::time::Duration::from_millis(500))
+                    .await;
+                return Ok(code);
+            }
             other => {
                 let result = handle_command(other, &telemetry).await.map(|_| 0);
                 // Flush any events emitted by the subcommand (e.g. login_success)
@@ -2688,8 +2700,8 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             unreachable!("completion is handled before runtime startup")
         }
         Commands::Hooks(subcmd) => handle_hooks(subcmd).await,
-        Commands::Schedule(sub) => {
-            schedule_cmd::handle_schedule(sub).await.map(|_| ())
+        Commands::Schedule(_) => {
+            unreachable!("Schedule is handled inline in run() so its exit code survives")
         }
         Commands::Askpass { .. } => {
             unreachable!("__askpass is handled early in run() before handle_command")
