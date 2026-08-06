@@ -40,17 +40,42 @@ pub fn schedules_root() -> PathBuf {
     crate::config::Config::config_dir().join("schedules")
 }
 
-fn task_path_in(root: &std::path::Path, id: &str) -> PathBuf { root.join(format!("{id}.json")) }
+/// A task id is used verbatim to build its on-disk `<id>.json` path, so it must
+/// not be able to escape the schedules directory. Ids minted by `build_task`
+/// (slug + uuid) are always in-shape, but `load`/`remove`/`enable`/`disable`/`run`
+/// take an id straight from an untrusted CLI argument. Accept only a conservative
+/// filename-safe alphabet and explicitly reject path separators and `..`.
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id != ".."
+        && !id.contains("..")
+        && !id.contains('/')
+        && !id.contains('\\')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+fn task_path_in(root: &std::path::Path, id: &str) -> std::io::Result<PathBuf> {
+    if !valid_id(id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid scheduled task id {id:?}"),
+        ));
+    }
+    Ok(root.join(format!("{id}.json")))
+}
 
 fn save_in(root: &std::path::Path, task: &ScheduleTask) -> std::io::Result<()> {
+    let path = task_path_in(root, &task.id)?;
     std::fs::create_dir_all(root)?;
     let bytes = serde_json::to_vec_pretty(task)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(task_path_in(root, &task.id), bytes)
+    std::fs::write(path, bytes)
 }
 
 fn load_in(root: &std::path::Path, id: &str) -> std::io::Result<ScheduleTask> {
-    let bytes = std::fs::read(task_path_in(root, id))?;
+    let bytes = std::fs::read(task_path_in(root, id)?)?;
     serde_json::from_slice(&bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
@@ -72,7 +97,7 @@ fn list_in(root: &std::path::Path) -> Vec<ScheduleTask> {
 }
 
 fn remove_in(root: &std::path::Path, id: &str) -> std::io::Result<()> {
-    match std::fs::remove_file(task_path_in(root, id)) {
+    match std::fs::remove_file(task_path_in(root, id)?) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -150,6 +175,47 @@ mod tests {
         assert_eq!(list_in(root).len(), 1);
         remove_in(root, "t1").unwrap();
         assert!(list_in(root).is_empty());
+    }
+
+    #[test]
+    fn store_rejects_ids_that_escape_the_schedules_dir() {
+        use std::io::ErrorKind;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for bad in ["../evil", "a/b", "a\\b", "foo/../bar", "..", ""] {
+            // remove/enable/disable/run and save all flow through these helpers,
+            // so a crafted id must be rejected before it can touch the filesystem.
+            assert_eq!(
+                remove_in(root, bad).unwrap_err().kind(),
+                ErrorKind::InvalidInput,
+                "remove should reject id {bad:?}"
+            );
+            assert_eq!(
+                load_in(root, bad).unwrap_err().kind(),
+                ErrorKind::InvalidInput,
+                "load should reject id {bad:?}"
+            );
+            let mut task = sample();
+            task.id = bad.to_string();
+            assert_eq!(
+                save_in(root, &task).unwrap_err().kind(),
+                ErrorKind::InvalidInput,
+                "save should reject id {bad:?}"
+            );
+        }
+        // A traversal id must not have written anything outside the store.
+        assert!(!tmp.path().parent().unwrap().join("evil.json").exists());
+    }
+
+    #[test]
+    fn store_accepts_slug_and_uuid_shaped_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut task = sample();
+        task.id = "daily-brief_2026.01-9f8e7d6c".into();
+        save_in(root, &task).unwrap();
+        assert_eq!(load_in(root, &task.id).unwrap().id, task.id);
+        remove_in(root, &task.id).unwrap();
     }
 
     #[test]
