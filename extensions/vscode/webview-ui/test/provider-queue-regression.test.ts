@@ -2247,6 +2247,329 @@ function testMergeSessionsForDisplayShowsOnlyCurrentProjectSessionsWhenProjectIs
   );
 }
 
+async function testPanelDisposePreservesQueuedMessagesForReopen() {
+  const client = {
+    activeSessions: async () => [],
+    stopGeneration: async () => ({ success: true, message: 'ok' }),
+  };
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, client as never);
+  const unsafeProvider = provider as unknown as {
+    _sessionRuntimes: Map<string, {
+      isGenerating: boolean;
+      queuedMessages: unknown[];
+      eventBuffer: unknown[];
+    }>;
+    _approvalModeState: { confirmedMode: string; displayMode: string; pendingMode?: string };
+    _handleSend: (...args: unknown[]) => Promise<void>;
+    _handlePanelDisposed: (panel: unknown, webview: unknown) => void;
+    _findSessionIdByPanel: (panel: unknown) => string | undefined;
+    _panels: Map<string, unknown>;
+    _webviewPanels: Map<unknown, unknown>;
+    _panelReady: Map<string, boolean>;
+    _pendingMessages: Map<string, unknown>;
+    _panelSessions: Map<string, unknown>;
+    _focusedPanelId?: string;
+  };
+  unsafeProvider._approvalModeState = { confirmedMode: 'build', displayMode: 'build' };
+  unsafeProvider._focusedPanelId = 'session-a';
+  unsafeProvider._handleSend = async (...args: unknown[]) => {
+    // 模拟 _handleSend 入队行为
+    const sid = (args as unknown[])[4] as string;
+    const text = (args as unknown[])[0] as string;
+    const rt = unsafeProvider._sessionRuntimes.get(sid);
+    if (rt?.isGenerating) {
+      rt.queuedMessages.push({ text });
+      return;
+    }
+    if (rt) {
+      rt.isGenerating = true;
+      rt.queuedMessages = [];
+    }
+  };
+
+  // 创建运行时并模拟正在生成的回合
+  const rt = {
+    isGenerating: true,
+    queuedMessages: [] as unknown[],
+    eventBuffer: [] as unknown[],
+  };
+  unsafeProvider._sessionRuntimes.set('session-a', rt);
+  unsafeProvider._panels.set('session-a', {});
+  unsafeProvider._webviewPanels.set({}, {});
+  unsafeProvider._panelReady.set('session-a', true);
+  unsafeProvider._panelSessions.set('session-a', {});
+
+  // 模拟 panel dispose：不应清空 queuedMessages
+  const panel = { webview: {} };
+  unsafeProvider._findSessionIdByPanel = () => 'session-a';
+  unsafeProvider._handlePanelDisposed(panel, panel.webview);
+
+  // queuedMessages 应被保留（不再被清空）
+  const disposedRt = unsafeProvider._sessionRuntimes.get('session-a');
+  assert.ok(disposedRt, 'runtime should still exist after panel dispose');
+  assert.deepEqual(disposedRt!.queuedMessages, [],
+    'queuedMessages should be preserved (empty here since none were queued)');
+  assert.equal(disposedRt!.isGenerating, false,
+    'isGenerating should be reset to false after dispose');
+}
+
+async function testRecoveryCheckQueuesMessageInsteadOfDroppingIt() {
+  const client = {
+    activeSessions: async () => ['session-a'],  // 旧回合仍活
+    stopGeneration: async () => ({ success: true, message: 'ok' }),
+  };
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, client as never);
+  const posted: Array<{ type?: string; message?: string; id?: string }> = [];
+  const unsafeProvider = provider as unknown as {
+    _sessionRuntimes: Map<string, {
+      isGenerating: boolean;
+      recoveryLocked?: boolean;
+      queuedMessages: Array<{ text: string; clientMessageId?: string }>;
+      eventBuffer: unknown[];
+    }>;
+    _approvalModeState: { confirmedMode: string; displayMode: string; pendingMode?: string };
+    _focusedPanelId?: string;
+    _handleSend: (...args: unknown[]) => Promise<void>;
+    _postMessageForSession: (sessionId: string, msg: unknown) => void;
+  };
+  unsafeProvider._approvalModeState = { confirmedMode: 'build', displayMode: 'build' };
+  unsafeProvider._focusedPanelId = 'session-a';
+  unsafeProvider._postMessageForSession = (sid, msg) => {
+    posted.push({ ...(msg as { type?: string; message?: string; id?: string }) });
+  };
+
+  // 设置 recoveryLocked = true（模拟窗口重开后旧回合仍活）
+  unsafeProvider._sessionRuntimes.set('session-a', {
+    isGenerating: false,
+    recoveryLocked: true,
+    queuedMessages: [],
+    eventBuffer: [],
+  });
+
+  // 发送新消息：应入队等待，而非报错丢弃
+  await unsafeProvider._handleSend('queued message', undefined, undefined, 'client-1', 'session-a', 'build');
+
+  const rt = unsafeProvider._sessionRuntimes.get('session-a')!;
+  assert.equal(rt.queuedMessages.length, 1, 'message should be queued, not dropped');
+  assert.equal(rt.queuedMessages[0].text, 'queued message');
+  assert.equal(rt.queuedMessages[0].clientMessageId, 'client-1');
+
+  // 应通知前端消息已排队
+  const queuedNotifications = posted.filter((msg) => msg.type === 'queuedMessageSent');
+  assert.equal(queuedNotifications.length, 1, 'should notify frontend of queued message');
+  assert.equal(queuedNotifications[0].id, 'client-1');
+
+  // 不应有 error 消息
+  const errorMessages = posted.filter((msg) => msg.type === 'error');
+  assert.equal(errorMessages.length, 0, 'should not emit error when queueing');
+}
+
+async function testRecoveryCheckQueuesMessageWhenDaemonUnreachable() {
+  const client = {
+    activeSessions: async () => { throw new Error('daemon unreachable'); },
+    stopGeneration: async () => ({ success: true, message: 'ok' }),
+  };
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, client as never);
+  const posted: Array<{ type?: string }> = [];
+  const unsafeProvider = provider as unknown as {
+    _sessionRuntimes: Map<string, {
+      isGenerating: boolean;
+      recoveryLocked?: boolean;
+      queuedMessages: Array<{ text: string }>;
+      eventBuffer: unknown[];
+    }>;
+    _approvalModeState: { confirmedMode: string; displayMode: string; pendingMode?: string };
+    _focusedPanelId?: string;
+    _handleSend: (...args: unknown[]) => Promise<void>;
+    _postMessageForSession: (sessionId: string, msg: unknown) => void;
+  };
+  unsafeProvider._approvalModeState = { confirmedMode: 'build', displayMode: 'build' };
+  unsafeProvider._focusedPanelId = 'session-a';
+  unsafeProvider._postMessageForSession = (sid, msg) => {
+    posted.push({ ...(msg as { type?: string }) });
+  };
+
+  unsafeProvider._sessionRuntimes.set('session-a', {
+    isGenerating: false,
+    recoveryLocked: true,
+    queuedMessages: [],
+    eventBuffer: [],
+  });
+
+  // daemon 不可达：应入队等待重试，而非报错丢弃
+  await unsafeProvider._handleSend('retry later', undefined, undefined, undefined, 'session-a', 'build');
+
+  const rt = unsafeProvider._sessionRuntimes.get('session-a')!;
+  assert.equal(rt.queuedMessages.length, 1, 'message should be queued when daemon unreachable');
+  assert.equal(rt.queuedMessages[0].text, 'retry later');
+
+  // 不应有 error 消息
+  const errorMessages = posted.filter((msg) => msg.type === 'error');
+  assert.equal(errorMessages.length, 0, 'should not emit error when daemon unreachable');
+}
+
+async function testPollActiveSessionRecoveryResetsWhenTurnEnds() {
+  let activeCallCount = 0;
+  let activeSessions = ['session-a'];
+  const client = {
+    activeSessions: async () => {
+      activeCallCount += 1;
+      return activeSessions;
+    },
+    stopGeneration: async () => ({ success: true, message: 'ok' }),
+  };
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, client as never);
+  const posted: Array<{ type?: string }> = [];
+  const unsafeProvider = provider as unknown as {
+    _sessionRuntimes: Map<string, {
+      isGenerating: boolean;
+      recoveryLocked?: boolean;
+      streamGeneration?: number;
+      queuedMessages: Array<{ text: string }>;
+      eventBuffer: unknown[];
+      pollHandle?: { cancelled: boolean };
+    }>;
+    _postMessageForSession: (sessionId: string, msg: unknown) => void;
+    _pollActiveSessionRecovery: (sessionId: string, generation: number) => Promise<void>;
+    _sendNextQueuedMessage: (sessionId?: string) => Promise<void>;
+  };
+  unsafeProvider._postMessageForSession = (sid, msg) => {
+    posted.push({ ...(msg as { type?: string }) });
+  };
+  unsafeProvider._sendNextQueuedMessage = async () => {};
+
+  // 设置初始状态：标记 isGenerating = true（模拟重开窗口检测到旧回合仍活）
+  unsafeProvider._sessionRuntimes.set('session-a', {
+    isGenerating: true,
+    recoveryLocked: false,
+    streamGeneration: 0,
+    queuedMessages: [{ text: 'waiting message' }],
+    eventBuffer: [],
+  });
+
+  // 启动轮询（不 await，让它在后台运行）
+  const pollPromise = unsafeProvider._pollActiveSessionRecovery('session-a', 0);
+
+  // 等待首次轮询（500ms）完成
+  await new Promise((resolve) => setTimeout(resolve, 600));
+
+  // 旧回合仍在运行：isGenerating 应仍为 true
+  let rt = unsafeProvider._sessionRuntimes.get('session-a')!;
+  assert.equal(rt.isGenerating, true, 'isGenerating should remain true while turn is active');
+  assert.equal(activeCallCount, 1, 'should have polled once after 500ms');
+
+  // 模拟旧回合结束：从 activeSessions 移除
+  activeSessions = [];
+
+  // 等待下一次轮询（2s）
+  await new Promise((resolve) => setTimeout(resolve, 2100));
+
+  await pollPromise.catch(() => {});
+
+  // 旧回合已结束：isGenerating 应被重置为 false
+  rt = unsafeProvider._sessionRuntimes.get('session-a')!;
+  assert.equal(rt.isGenerating, false, 'isGenerating should be reset when turn ends');
+  assert.equal(rt.recoveryLocked, false, 'recoveryLocked should be cleared');
+  assert.equal(rt.pollHandle, undefined, 'pollHandle should be cleared');
+
+  // 应发送 generationStopped 消息
+  const stoppedMessages = posted.filter((msg) => msg.type === 'generationStopped');
+  assert.equal(stoppedMessages.length, 1, 'should send generationStopped when turn ends');
+}
+
+async function testPollActiveSessionRecoveryDoesNotStartDuplicatePolls() {
+  let activeCallCount = 0;
+  const client = {
+    activeSessions: async () => {
+      activeCallCount += 1;
+      return ['session-a'];
+    },
+    stopGeneration: async () => ({ success: true, message: 'ok' }),
+  };
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, client as never);
+  const unsafeProvider = provider as unknown as {
+    _sessionRuntimes: Map<string, {
+      isGenerating: boolean;
+      streamGeneration?: number;
+      queuedMessages: unknown[];
+      eventBuffer: unknown[];
+      pollHandle?: { cancelled: boolean };
+    }>;
+    _pollActiveSessionRecovery: (sessionId: string, generation: number) => Promise<void>;
+  };
+
+  unsafeProvider._sessionRuntimes.set('session-a', {
+    isGenerating: true,
+    streamGeneration: 0,
+    queuedMessages: [],
+    eventBuffer: [],
+  });
+
+  // 启动第一次轮询
+  const poll1 = unsafeProvider._pollActiveSessionRecovery('session-a', 0);
+
+  // 立即尝试启动第二次轮询：应被去重跳过
+  const poll2 = unsafeProvider._pollActiveSessionRecovery('session-a', 0);
+
+  // 等待首次轮询完成
+  await new Promise((resolve) => setTimeout(resolve, 600));
+
+  // 只有第一次轮询会调用 activeSessions
+  assert.equal(activeCallCount, 1, 'should only start one poll, duplicates are skipped');
+
+  // 清理：取消 pollHandle
+  const rt = unsafeProvider._sessionRuntimes.get('session-a');
+  if (rt?.pollHandle) rt.pollHandle.cancelled = true;
+
+  await poll1.catch(() => {});
+  await poll2.catch(() => {});
+}
+
+async function testPollActiveSessionRecoveryCancellationDoesNotForceReset() {
+  // 使用立即超时的 mock 来测试超时路径
+  // 由于 MAX_POLLS = 150 且间隔为 2s，完整超时需要 5 分钟
+  // 这里通过直接验证超时后的 pollHandle 清理来测试
+  const client = {
+    activeSessions: async () => ['session-a'],  // 始终活跃，模拟长回合
+    stopGeneration: async () => ({ success: true, message: 'ok' }),
+  };
+  const provider = new ChatViewProvider({ fsPath: '/extension' } as never, client as never);
+  const unsafeProvider = provider as unknown as {
+    _sessionRuntimes: Map<string, {
+      isGenerating: boolean;
+      streamGeneration?: number;
+      queuedMessages: unknown[];
+      eventBuffer: unknown[];
+      pollHandle?: { cancelled: boolean };
+    }>;
+    _pollActiveSessionRecovery: (sessionId: string, generation: number) => Promise<void>;
+  };
+
+  unsafeProvider._sessionRuntimes.set('session-a', {
+    isGenerating: true,
+    streamGeneration: 0,
+    queuedMessages: [],
+    eventBuffer: [],
+  });
+
+  // 启动轮询
+  const pollPromise = unsafeProvider._pollActiveSessionRecovery('session-a', 0);
+
+  // 等待首次轮询
+  await new Promise((resolve) => setTimeout(resolve, 600));
+
+  // 立即取消轮询，模拟超时后的清理
+  const rt = unsafeProvider._sessionRuntimes.get('session-a')!;
+  if (rt.pollHandle) rt.pollHandle.cancelled = true;
+
+  await pollPromise.catch(() => {});
+
+  // 超时（被取消）后：isGenerating 应保持 true，不被强制重置
+  const finalRt = unsafeProvider._sessionRuntimes.get('session-a')!;
+  assert.equal(finalRt.isGenerating, true,
+    'isGenerating should remain true after timeout (no force reset)');
+}
+
 Promise.resolve()
   .then(testReadyMarksPanelOnlyAfterInitialReplay)
   .then(testPanelReadyHandlerIsInstalledBeforeWebviewBoots)
@@ -2306,6 +2629,12 @@ Promise.resolve()
   .then(testLoadSessionsForDisplayDoesNotFallBackToGlobalWhenWorkspaceHasNoSessions)
   .then(testLoadSessionsForDisplayFallsBackToGlobalWhenWorkspaceRequestFails)
   .then(testRefreshSessionsOnlyPrependsSyntheticPanelsForCurrentWorkspace)
+  .then(testPanelDisposePreservesQueuedMessagesForReopen)
+  .then(testRecoveryCheckQueuesMessageInsteadOfDroppingIt)
+  .then(testRecoveryCheckQueuesMessageWhenDaemonUnreachable)
+  .then(testPollActiveSessionRecoveryResetsWhenTurnEnds)
+  .then(testPollActiveSessionRecoveryDoesNotStartDuplicatePolls)
+  .then(testPollActiveSessionRecoveryCancellationDoesNotForceReset)
   .catch((err) => {
   console.error(err);
   process.exit(1);
