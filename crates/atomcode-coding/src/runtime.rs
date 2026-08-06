@@ -17,6 +17,7 @@ use atomcode_capabilities::session::{
 };
 #[cfg(test)]
 use atomcode_capabilities::session::{PresentationFile, SessionMeta, StorageOwner};
+use atomcode_capabilities::tools::{ApprovalResponse, APPROVAL_KIND};
 use atomcode_kernel::agent::AgentHandle;
 use atomcode_kernel::checkpoint::CompactionCheckpointError;
 use atomcode_kernel::event::{AgentCommand, AgentEvent, RequestId, StopReason};
@@ -5289,6 +5290,29 @@ fn spawn_runtime_owner_with_optional_agent(
                                 ));
                             }
                             AgentEvent::Request { id, kind, payload } => {
+                                // Auto is a runtime-owned execution mode, so approval bypass
+                                // belongs at this common request boundary rather than in each
+                                // driver. Do not publish an approval that has already been
+                                // answered: otherwise WebUI/TUI/ACP can briefly render a stale
+                                // prompt. Non-approval requests (notably request_user_input)
+                                // must still round-trip through the driver.
+                                let bypass_approval = kind == APPROVAL_KIND
+                                    && resources.as_ref().is_some_and(|runtime| {
+                                        runtime.parts.bypass_mode.load(Ordering::Acquire)
+                                    });
+                                if bypass_approval {
+                                    let value = serde_json::to_value(ApprovalResponse::allow())
+                                        .unwrap_or(serde_json::Value::Null);
+                                    if send_agent_command(
+                                        &agent,
+                                        AgentCommand::Respond { id, value },
+                                    ) {
+                                        continue;
+                                    }
+                                    // Preserve the request if delivery failed. Normal owner
+                                    // teardown will fail it closed; never claim success for a
+                                    // response that did not reach the kernel.
+                                }
                                 pending_requests.insert(id);
                                 controls.state.store(
                                     runtime_phase_state(
@@ -11443,6 +11467,94 @@ mod tests {
             kernel_commands.recv().await,
             Some(AgentCommand::Shutdown)
         ));
+    }
+
+    #[tokio::test]
+    async fn native_auto_mode_answers_only_approval_requests_without_prompting_driver() {
+        let (agent, mut kernel_commands, kernel_events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (runtime_tx, mut runtime_events) = mpsc::unbounded_channel();
+        let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
+        let start = native_start(false);
+        let parts = prepare_with_plugin_hook_source(
+            &start.agent,
+            start.prepare.clone(),
+            start.plugin_hooks.as_ref(),
+        )
+        .await
+        .unwrap();
+        let resources = RuntimeResources {
+            config: start.agent,
+            prepare: start.prepare,
+            provider_factory: start.provider_factory,
+            plugin_hooks: start.plugin_hooks,
+            parts,
+            wakeup_tx,
+            loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            image_preprocessor: None,
+        };
+        let _adapter = spawn_runtime_owner_with_protocol(
+            agent,
+            controls,
+            runtime_tx,
+            true,
+            true,
+            None,
+            Some(resources),
+            Some(wakeup_rx),
+        );
+
+        handle.set_mode(RuntimeMode::Auto).await.unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::ModeChanged {
+                mode: RuntimeMode::Auto
+            })
+        ));
+        handle.submit(UserInput::from("auto turn")).await.unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+
+        kernel_events
+            .send(AgentEvent::Request {
+                id: 42,
+                kind: APPROVAL_KIND.into(),
+                payload: serde_json::json!({"tool": "task"}),
+            })
+            .unwrap();
+        let expected = serde_json::to_value(ApprovalResponse::allow()).unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Respond { id: 42, value }) if value == expected
+        ));
+        assert_eq!(handle.status().phase, RuntimePhase::InTurn);
+        assert!(runtime_events.try_recv().is_err());
+
+        kernel_events
+            .send(AgentEvent::Request {
+                id: 43,
+                kind: "request_user_input".into(),
+                payload: serde_json::json!({"question": "choose"}),
+            })
+            .unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::Request(RuntimeRequest {
+                id: 43,
+                ref kind,
+                ..
+            })) if kind == "request_user_input"
+        ));
+        assert_eq!(handle.status().phase, RuntimePhase::WaitingApproval);
+
+        handle.respond(43, serde_json::Value::Null).await.unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Respond { id: 43, .. })
+        ));
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
