@@ -61,13 +61,15 @@ fn runtime_mode(mode: crate::state::AgentMode) -> atomcode_coding::RuntimeMode {
     }
 }
 
-fn startup_bypass_mode(
+fn apply_startup_bypass(
     dangerously_skip_permissions: bool,
-) -> Option<(crate::state::AgentMode, atomcode_coding::RuntimeMode)> {
-    dangerously_skip_permissions.then_some((
-        crate::state::AgentMode::Auto,
-        atomcode_coding::RuntimeMode::Auto,
-    ))
+    ui_mode: &mut crate::state::AgentMode,
+    mut set_runtime_mode: impl FnMut(atomcode_coding::RuntimeMode),
+) {
+    if dangerously_skip_permissions {
+        *ui_mode = crate::state::AgentMode::Auto;
+        set_runtime_mode(atomcode_coding::RuntimeMode::Auto);
+    }
 }
 
 fn runtime_user_input(text: String, images: Vec<ImageContent>) -> atomcode_coding::UserInput {
@@ -7974,19 +7976,20 @@ pub(crate) fn handle_loop_decision(
 
 pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<ExitReason> {
     let mut app = App::new(&ctx.caps);
-    if let Some((agent_mode, runtime_mode)) = startup_bypass_mode(ctx.dangerously_skip_permissions)
-    {
-        // `-y` is a process-start execution mode, not merely a TUI badge. Keep
-        // all three projections aligned before the first turn: local UI state,
-        // the runtime-owned permission policy, and the daemon live mirror used
-        // by shared TUI/WebUI sessions. `/auto` already follows this same path
-        // through `set_agent_mode`; startup must not leave the daemon in Build.
-        app.state.agent_mode = agent_mode;
-        ctx.runtime
-            .dispatch(atomcode_coding::DriverCommand::SetMode(runtime_mode))
-            .ok();
-        atomcode_daemon::live_set_mode(agent_mode);
-    }
+    apply_startup_bypass(
+        ctx.dangerously_skip_permissions,
+        &mut app.state.agent_mode,
+        |runtime_mode| {
+            // The runtime command shares the same FIFO as Submit, so it is
+            // applied before the first turn can request an approval.
+            ctx.runtime
+                .dispatch(atomcode_coding::DriverCommand::SetMode(runtime_mode))
+                .ok();
+            // Keep the daemon projection used by shared TUI/WebUI sessions in
+            // lockstep with the UI and runtime-owned permission policy.
+            atomcode_daemon::live_set_mode(crate::state::AgentMode::Auto);
+        },
+    );
 
     crate::tuix_trace!(
         "SES",
@@ -14929,7 +14932,7 @@ fn bypass_approval_choice() -> ApprovalChoice {
 #[cfg(test)]
 mod bypass_approval_tests {
     use super::{
-        approval_choice_to_decision, bypass_approval_choice, startup_bypass_mode, ApprovalChoice,
+        apply_startup_bypass, approval_choice_to_decision, bypass_approval_choice, ApprovalChoice,
     };
     use atomcode_capabilities::tools::approval::PermissionDecision;
 
@@ -14951,11 +14954,21 @@ mod bypass_approval_tests {
     }
 
     #[test]
-    fn startup_y_selects_auto_for_ui_and_runtime() {
-        let (ui_mode, runtime_mode) = startup_bypass_mode(true).expect("-y enables bypass");
+    fn startup_y_applies_auto_to_ui_and_runtime_once() {
+        let mut ui_mode = crate::state::AgentMode::Build;
+        let mut runtime_modes = Vec::new();
+        apply_startup_bypass(true, &mut ui_mode, |mode| runtime_modes.push(mode));
         assert_eq!(ui_mode, crate::state::AgentMode::Auto);
-        assert_eq!(runtime_mode, atomcode_coding::RuntimeMode::Auto);
-        assert!(startup_bypass_mode(false).is_none());
+        assert_eq!(runtime_modes, vec![atomcode_coding::RuntimeMode::Auto]);
+    }
+
+    #[test]
+    fn startup_without_y_leaves_ui_and_runtime_unchanged() {
+        let mut ui_mode = crate::state::AgentMode::Build;
+        let mut runtime_modes = Vec::new();
+        apply_startup_bypass(false, &mut ui_mode, |mode| runtime_modes.push(mode));
+        assert_eq!(ui_mode, crate::state::AgentMode::Build);
+        assert!(runtime_modes.is_empty());
     }
 
     // The full command↔decision contract used by sync-mode `deliver_approval`.

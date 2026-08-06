@@ -12,7 +12,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
 use crate::event_loop::commands::apply_cd;
-use crate::event_loop::{Buffer, LoopCtx, build_status};
+use crate::event_loop::{build_status, Buffer, LoopCtx};
 use crate::render::{MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
 
@@ -559,14 +559,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let target = root.path().join("new-project");
         std::fs::create_dir(&target).unwrap();
-        let resolved = resolve_enter_target(
-            &[],
-            0,
-            target.to_str().unwrap(),
-            root.path(),
-            None,
-        )
-        .expect("zero-match path resolves");
+        let resolved = resolve_enter_target(&[], 0, target.to_str().unwrap(), root.path(), None)
+            .expect("zero-match path resolves");
         assert_eq!(resolved, Some(target.canonicalize().unwrap()));
     }
 
