@@ -1105,6 +1105,7 @@ impl CodingRuntimeHandle {
                     generation,
                     condition,
                     done,
+                    recovery_tx: self.tx.clone(),
                 }
             }
             DriverCommand::StopGoal => {
@@ -1571,6 +1572,7 @@ impl CodingRuntimeHandle {
                 generation: runtime_state_generation(state),
                 condition: condition.into(),
                 done,
+                recovery_tx: self.tx.clone(),
             })
             .map_err(|_| RuntimeError::Unavailable)?;
         result.await.map_err(|_| RuntimeError::Unavailable)?
@@ -2045,6 +2047,18 @@ pub enum CodingRuntimeControl {
         generation: u64,
         condition: String,
         done: oneshot::Sender<Result<(), RuntimeError>>,
+        /// Self-send channel so the owner loop can post an [`AdjustGoalRounds`] once
+        /// the live per-plan round budget has been resolved off the loop.
+        recovery_tx: mpsc::UnboundedSender<CodingRuntimeControl>,
+    },
+    /// Self-sent from a background task after goal start: applies the live per-plan
+    /// round budget that was resolved off the owner loop, so goal start never blocks
+    /// the loop on a quota round-trip. A no-op if the target goal is gone or a newer
+    /// generation/controller has taken over.
+    AdjustGoalRounds {
+        generation: u64,
+        controller_id: u64,
+        max_rounds: u32,
     },
     StopGoal {
         generation: u64,
@@ -3022,11 +3036,16 @@ fn spawn_runtime_owner_with_optional_agent(
                         // Update before forwarding (including steer) so a newly received
                         // "do not compile/run scripts" instruction blocks later Bash calls
                         // from an already-active turn without waiting for another LLM round.
+                        // Skip an empty-text submit (e.g. an image-only steer): it carries no
+                        // new intent and must not clear a restriction the user set earlier in
+                        // this turn.
                         if let Some(runtime) = resources.as_ref() {
-                            runtime
-                                .parts
-                                .turn_execution_policy
-                                .update_from_user_text(&input.text);
+                            if !input.text.trim().is_empty() {
+                                runtime
+                                    .parts
+                                    .turn_execution_policy
+                                    .update_from_user_text(&input.text);
+                            }
                         }
                         let receipt = if let Some(turn_id) = active_turn {
                             SubmitReceipt::Steered { generation, turn_id }
@@ -4707,7 +4726,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                         }
                     }
-                    Some(CodingRuntimeControl::StartGoal { generation: request_generation, condition, done }) => {
+                    Some(CodingRuntimeControl::StartGoal { generation: request_generation, condition, done, recovery_tx }) => {
                         if !native_protocol || request_generation != generation || compaction_suspended {
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
@@ -4736,23 +4755,54 @@ fn spawn_runtime_owner_with_optional_agent(
                         );
                         if let Some(runtime) = resources.as_ref() {
                             next_controller_id = next_controller_id.wrapping_add(1);
-                            // Size the round budget from the account's live request quota so it
-                            // scales per plan (Pro 1000 → 300, Lite 800 → 240) instead of a
-                            // hardcoded number; env override wins, any miss falls back cleanly.
-                            let max_rounds = resolve_goal_round_cap(
-                                runtime.parts.rate_limit_source(),
-                                runtime.config.goal_max_rounds,
-                            )
-                            .await;
+                            let controller_id = next_controller_id;
+                            // Start immediately on the configured default so goal start never
+                            // blocks the owner loop on a network round-trip. The round budget
+                            // scales per plan (Pro 1000 → 300, Lite 800 → 240) from the account's
+                            // live request quota, resolved OFF the loop and applied via a self-sent
+                            // AdjustGoalRounds; env override wins and any miss keeps the default.
                             let next = GoalState::new(
-                                next_controller_id,
+                                controller_id,
                                 condition,
-                                max_rounds,
+                                runtime.config.goal_max_rounds,
                                 runtime.config.goal_max_duration_secs,
                             );
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(next.progress()));
                             goal = Some(next);
                             let _ = done.send(Ok(()));
+                            // Only spawn the quota fetch when it could actually change the cap:
+                            // an env override short-circuits to the default, and with no live
+                            // rate-limit source there is nothing to derive from.
+                            if crate::config::goal_max_rounds_env().is_none() {
+                                if let Some(source) = runtime.parts.rate_limit_source().cloned() {
+                                    let default = runtime.config.goal_max_rounds;
+                                    let tx = recovery_tx.clone();
+                                    tokio::spawn(async move {
+                                        let max_rounds = resolve_goal_round_cap(Some(&source), default).await;
+                                        if max_rounds != default {
+                                            let _ = tx.send(CodingRuntimeControl::AdjustGoalRounds {
+                                                generation: request_generation,
+                                                controller_id,
+                                                max_rounds,
+                                            });
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    Some(CodingRuntimeControl::AdjustGoalRounds { generation: request_generation, controller_id, max_rounds }) => {
+                        // Apply the live per-plan round budget resolved off the loop. Ignore
+                        // it if a newer generation took over, the goal is gone, a different
+                        // controller now owns it, or it already stopped.
+                        if request_generation == generation {
+                            if let Some(state) = goal.as_mut() {
+                                if state.id == controller_id && state.active {
+                                    state.set_round_cap(max_rounds);
+                                    let _ = runtime_event_tx
+                                        .send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                }
+                            }
                         }
                     }
                     Some(CodingRuntimeControl::StopGoal { generation: request_generation, done }) => {
@@ -5727,6 +5777,8 @@ fn reject_runtime_control(
             emit_compaction_interrupted(runtime_event_tx, CompactTrigger::Manual { focus }, reason)
         }
         CodingRuntimeControl::Shutdown { .. } => {}
+        // Fire-and-forget self-send with no waiter: nothing to fail-close.
+        CodingRuntimeControl::AdjustGoalRounds { .. } => {}
         CodingRuntimeControl::Submit { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }

@@ -191,6 +191,14 @@ impl GoalState {
             .then(|| Instant::now() + Duration::from_secs(self.max_duration_secs));
     }
 
+    /// Adjust only the round budget (0 = unlimited), leaving the round counter,
+    /// activity, phase, and deadline untouched. Used to apply a live per-plan quota
+    /// that is resolved asynchronously after the goal has already started, so goal
+    /// start never blocks the owner loop on a network round-trip.
+    pub fn set_round_cap(&mut self, new_max_rounds: u32) {
+        self.max_rounds = (new_max_rounds != 0).then_some(new_max_rounds);
+    }
+
     pub fn cap_reached(&self) -> Option<&'static str> {
         if self.max_rounds.is_some_and(|max| self.round >= max) {
             return Some("round limit");
@@ -715,6 +723,23 @@ mod tests {
         // Minor fix 3: terminal and last_reason cleared by resume
         assert_eq!(g2.terminal, None);
         assert!(g2.last_reason.is_none());
+    }
+
+    #[test]
+    fn set_round_cap_updates_budget_without_disturbing_progress() {
+        // The live quota fetch that sizes a goal's round budget is now resolved off the
+        // owner loop and applied via set_round_cap, so it must adjust only the cap — not
+        // reset the round counter, activity, or phase of an already-running goal.
+        let mut g = GoalState::new(1, "cond".into(), 100, 0);
+        g.round = 7;
+        g.set_round_cap(300);
+        assert_eq!(g.max_rounds, Some(300));
+        assert_eq!(g.round, 7, "round counter must be untouched");
+        assert!(g.active);
+        assert_eq!(g.phase, GoalPhase::Pursuing);
+        // 0 means "unlimited".
+        g.set_round_cap(0);
+        assert_eq!(g.max_rounds, None);
     }
 
     #[test]
