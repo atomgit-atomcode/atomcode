@@ -341,7 +341,19 @@ fn resolve_enter_target(
     // before consulting saved projects so `/tmp/app` cannot be shadowed by a
     // historical `/tmp/app-old` match.
     if looks_like_path(query) {
-        return crate::event_loop::commands::resolve_cd(query, cwd, previous_dir).map(Some);
+        match crate::event_loop::commands::resolve_cd(query, cwd, previous_dir) {
+            // An explicit path that resolves wins outright.
+            Ok(path) => return Ok(Some(path)),
+            // The literal path doesn't resolve. If it was actually a search PREFIX that
+            // narrowed the list to a highlighted match (e.g. "~/Des" → "~/Desktop"), take
+            // that match; only surface the error when nothing is highlighted.
+            Err(e) => {
+                if let Some(path) = filtered.get(selected) {
+                    return Ok(Some(path.clone()));
+                }
+                return Err(e);
+            }
+        }
     }
     if let Some(path) = filtered.get(selected) {
         return Ok(Some(path.clone()));
@@ -548,6 +560,21 @@ mod tests {
             .expect("typed path resolves")
             .expect("typed path is selected");
         assert_eq!(resolved, desktop.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn enter_partial_path_prefix_falls_through_to_highlighted_match() {
+        // Typing a path-looking PREFIX that doesn't resolve (e.g. "~/Des" narrowing the
+        // list to "~/Desktop") must select the highlighted match, not error on the
+        // incomplete literal path.
+        let root = tempfile::tempdir().unwrap();
+        let desktop = root.path().join("Desktop");
+        std::fs::create_dir(&desktop).unwrap();
+        let partial = format!("{}/Des", root.path().display()); // path-looking, does NOT exist
+        let resolved = resolve_enter_target(&[desktop.clone()], 0, &partial, root.path(), None)
+            .expect("a partial path prefix must not error when a match is highlighted")
+            .expect("the highlighted match is selected");
+        assert_eq!(resolved, desktop);
     }
 
     #[test]
