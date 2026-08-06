@@ -182,6 +182,8 @@ pub async fn code(args: CodeArgs) -> Result<()> {
         // The `code` agent can also review the current changes in-session (the dedicated
         // `atomcodex review` subcommand still exists for headless/CI one-shots).
         review: true,
+        // Interactive clix code session can prompt the user; drivers without a channel set false.
+        request_user_input: true,
         // clix is intentionally core/bridge-free; external endpoints keep generic 429 handling.
         rate_limit_source: None,
     };
