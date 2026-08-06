@@ -551,11 +551,17 @@ fn parse_followup_class(text: &str) -> FollowupClass {
         .last()
         .unwrap_or("")
         .to_ascii_lowercase();
-    let rest = line.strip_prefix("class:").map(str::trim).unwrap_or("");
-    match rest {
-        "new-goal" => FollowupClass::NewGoal,
-        "not-a-goal" => FollowupClass::NotAGoal,
-        _ => FollowupClass::Continuation,
+    // Strip an optional `class:` label, then match the LEADING keyword — tolerant of
+    // trailing punctuation / an appended reason (`Class: new-goal.`). `not-a-goal` is
+    // checked first (shares no prefix with the rest). Trailing prose that merely
+    // mentions a class does not start with the keyword, so it stays Continuation.
+    let rest = line.strip_prefix("class:").map(str::trim).unwrap_or(line.as_str());
+    if rest.starts_with("not-a-goal") || rest.starts_with("not a goal") {
+        FollowupClass::NotAGoal
+    } else if rest.starts_with("new-goal") || rest.starts_with("new goal") {
+        FollowupClass::NewGoal
+    } else {
+        FollowupClass::Continuation
     }
 }
 
@@ -757,13 +763,26 @@ mod tests {
     }
 
     #[test]
-    fn followup_class_parser_is_strict_and_defaults_to_continuation() {
+    fn followup_class_parser_is_lenient_and_defaults_to_continuation() {
         use FollowupClass::*;
         assert!(matches!(parse_followup_class("noise\nClass: new-goal"), NewGoal));
         assert!(matches!(parse_followup_class("Class: not-a-goal"), NotAGoal));
         assert!(matches!(parse_followup_class("Class: continuation"), Continuation));
         // Case-insensitive on the last non-empty line.
         assert!(matches!(parse_followup_class("CLASS: NEW-GOAL"), NewGoal));
+        // Tolerant of trailing punctuation / an appended reason (models rarely emit
+        // the bare token) — a near-miss must NOT silently fall back to continuation
+        // and re-pursue the OLD goal on a genuinely new one.
+        assert!(matches!(parse_followup_class("Class: new-goal."), NewGoal));
+        assert!(matches!(parse_followup_class("Class: not-a-goal (chit-chat)"), NotAGoal));
+        assert!(matches!(parse_followup_class("Class: new goal"), NewGoal)); // space variant
+        // A bare leading keyword (no `Class:` prefix) still resolves.
+        assert!(matches!(parse_followup_class("new-goal"), NewGoal));
+        // Reasoning-style trailing prose that merely MENTIONS a class stays safe.
+        assert!(matches!(
+            parse_followup_class("The right label here is continuation"),
+            Continuation
+        ));
         // Unknown / garbage → default to Continuation (conservative: keep the goal).
         assert!(matches!(parse_followup_class("banana"), Continuation));
         assert!(matches!(parse_followup_class(""), Continuation));

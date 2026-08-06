@@ -7528,6 +7528,58 @@ mod tests {
         }
     }
 
+    /// A provider that answers the goal EVALUATOR with `Verdict: yes` (so a goal reaches
+    /// Satisfied) but the follow-up CLASSIFIER with a configured `Class:` line —
+    /// distinguished by the system prompt. Lets a test drive to Satisfied and then
+    /// exercise a specific classifier verdict on the next submit.
+    struct ClassifierProvider {
+        class_line: &'static str,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for ClassifierProvider {
+        fn model_name(&self) -> &str {
+            "classifier-test-provider"
+        }
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _tools: &[atomcode_kernel::tool::ToolDef],
+            _options: &atomcode_kernel::provider::ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            use atomcode_kernel::stream::StreamEvent;
+            let is_classifier = messages
+                .first()
+                .map(|m| m.text.contains("classify"))
+                .unwrap_or(false);
+            let reply = if is_classifier {
+                self.class_line
+            } else {
+                "Verdict: yes goal met"
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                StreamEvent::TextDelta(reply.into()),
+                StreamEvent::Done { truncated: false },
+            ])))
+        }
+    }
+    struct ClassifierProviderFactory {
+        class_line: &'static str,
+    }
+    impl CodingProviderFactory for ClassifierProviderFactory {
+        fn build(
+            &self,
+            _config: &CodingAgentConfig,
+            _session_id: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+            Ok(Arc::new(ClassifierProvider {
+                class_line: self.class_line,
+            }))
+        }
+    }
+
     impl CodingProviderFactory for TierRecordingFactory {
         fn build(
             &self,
@@ -13321,6 +13373,169 @@ mod tests {
             "submit while Satisfied must deliver the input as the resumed goal round's message"
         );
 
+        handle.shutdown().await.unwrap();
+    }
+
+    // Classifier says NEW-GOAL: the satisfied goal re-engages AND re-tasks its
+    // condition to the follow-up (badge shows the NEW question · round 1).
+    #[tokio::test]
+    async fn submit_while_satisfied_new_goal_retasks_condition() {
+        let (handle, mut kernel_commands, kernel_events, mut runtime_events, _w, _l, _a) =
+            controller_test_runtime(Arc::new(ClassifierProviderFactory {
+                class_line: "Class: new-goal",
+            }))
+            .await;
+        // --- Drive the goal to Satisfied ---
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await; // GoalChanged(active=true)
+        handle.submit(UserInput::from("initial turn")).await.unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        kernel_events
+            .send(AgentEvent::TurnComplete { reason: StopReason::Stopped })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("done", vec![])]),
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::TurnFinished(_)) => break,
+                    Some(_) => {}
+                    None => panic!("events closed before met terminal"),
+                }
+            }
+        })
+        .await
+        .expect("satisfied turn did not finish");
+
+        let submit_text = "an entirely different task";
+        handle.submit(UserInput::from(submit_text)).await.unwrap();
+
+        let mut saw_retasked_pursuing = false;
+        let mut saw_send_message = false;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    event = runtime_events.recv() => match event {
+                        Some(CodingRuntimeEvent::GoalChanged(p)) => {
+                            if p.phase == GoalPhase::Pursuing
+                                && p.round == 0
+                                && p.condition == submit_text
+                            {
+                                saw_retasked_pursuing = true;
+                            }
+                        }
+                        Some(_) => {}
+                        None => break,
+                    },
+                    cmd = kernel_commands.recv() => match cmd {
+                        Some(AgentCommand::SendMessage { text, .. }) => {
+                            saw_send_message = text == submit_text;
+                            break;
+                        }
+                        _ => break,
+                    },
+                }
+            }
+        })
+        .await
+        .expect("new-goal submit did not deliver within timeout");
+
+        assert!(
+            saw_retasked_pursuing,
+            "new-goal must resume Pursuing AND re-task the condition to the new message"
+        );
+        assert!(saw_send_message, "the new message must be delivered");
+        handle.shutdown().await.unwrap();
+    }
+
+    // Classifier says NOT-A-GOAL (chit-chat): the goal is NOT re-engaged — the message
+    // runs as an ordinary turn and no GoalChanged(Pursuing) is emitted.
+    #[tokio::test]
+    async fn submit_while_satisfied_not_a_goal_does_not_reengage() {
+        let (handle, mut kernel_commands, kernel_events, mut runtime_events, _w, _l, _a) =
+            controller_test_runtime(Arc::new(ClassifierProviderFactory {
+                class_line: "Class: not-a-goal",
+            }))
+            .await;
+        // --- Drive the goal to Satisfied ---
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await; // GoalChanged(active=true)
+        handle.submit(UserInput::from("initial turn")).await.unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        kernel_events
+            .send(AgentEvent::TurnComplete { reason: StopReason::Stopped })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("done", vec![])]),
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::TurnFinished(_)) => break,
+                    Some(_) => {}
+                    None => panic!("events closed before met terminal"),
+                }
+            }
+        })
+        .await
+        .expect("satisfied turn did not finish");
+
+        let submit_text = "thanks!";
+        handle.submit(UserInput::from(submit_text)).await.unwrap();
+
+        let mut saw_goal_changed_pursuing = false;
+        let mut saw_send_message = false;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    event = runtime_events.recv() => match event {
+                        Some(CodingRuntimeEvent::GoalChanged(p)) => {
+                            if p.phase == GoalPhase::Pursuing {
+                                saw_goal_changed_pursuing = true;
+                            }
+                        }
+                        Some(_) => {}
+                        None => break,
+                    },
+                    cmd = kernel_commands.recv() => match cmd {
+                        Some(AgentCommand::SendMessage { text, .. }) => {
+                            saw_send_message = text == submit_text;
+                            break;
+                        }
+                        _ => break,
+                    },
+                }
+            }
+        })
+        .await
+        .expect("not-a-goal submit did not deliver within timeout");
+
+        assert!(saw_send_message, "the message must run as an ordinary turn");
+        assert!(
+            !saw_goal_changed_pursuing,
+            "not-a-goal must NOT re-engage the goal (no GoalChanged Pursuing)"
+        );
         handle.shutdown().await.unwrap();
     }
 }
