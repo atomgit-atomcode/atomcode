@@ -221,23 +221,76 @@ pub fn standard_skill_dirs(home: &Path, project: &Path) -> Vec<PathBuf> {
 
 /// The standard skill directories with the user-level `.atomcode` root resolved
 /// from `ATOMCODE_HOME` when it is set. `ATOMCODE_HOME` is the config root (the
-/// equivalent of `~/.atomcode`), so only the user-level AtomCode skill directory
-/// moves; project-local `.atomcode/skills` remains relative to `project`.
+/// equivalent of `~/.atomcode`), so EVERY user-level `~/.atomcode/*` entry
+/// (`skills` AND `commands`) is rebased onto it; other products' dirs (`.claude`,
+/// `.agents`) and all project-relative dirs stay put. An empty `ATOMCODE_HOME` is
+/// treated as unset — mirroring [`atomcode_config`]'s `Config::config_dir` — so a
+/// stray `ATOMCODE_HOME=` never rebases skills onto a bogus relative `skills` path.
 pub fn runtime_skill_dirs(home: &Path, project: &Path) -> Vec<PathBuf> {
-    let mut dirs = standard_skill_dirs(home, project);
-    let Some(atomcode_home) = std::env::var_os("ATOMCODE_HOME") else {
+    let dirs = standard_skill_dirs(home, project);
+    let Some(atomcode_home) = std::env::var_os("ATOMCODE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+    else {
         return dirs;
     };
-    let default_user_skills = home.join(".atomcode/skills");
-    if let Some(dir) = dirs.iter_mut().find(|dir| **dir == default_user_skills) {
-        *dir = PathBuf::from(atomcode_home).join("skills");
-    }
-    dirs
+    let user_atomcode = home.join(".atomcode");
+    dirs.into_iter()
+        .map(|dir| match dir.strip_prefix(&user_atomcode) {
+            Ok(rest) => atomcode_home.join(rest),
+            Err(_) => dir,
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn runtime_dirs_redirect_every_user_atomcode_dir_and_leave_others() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let config_root = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("ATOMCODE_HOME");
+        std::env::set_var("ATOMCODE_HOME", config_root.path());
+        let dirs = runtime_skill_dirs(home.path(), project.path());
+        match prev {
+            Some(v) => std::env::set_var("ATOMCODE_HOME", v),
+            None => std::env::remove_var("ATOMCODE_HOME"),
+        }
+
+        // BOTH user-level `.atomcode/*` dirs (skills AND commands) move under ATOMCODE_HOME.
+        assert!(dirs.contains(&config_root.path().join("skills")));
+        assert!(dirs.contains(&config_root.path().join("commands")));
+        // The stale real-home `.atomcode/*` entries are gone.
+        assert!(!dirs.contains(&home.path().join(".atomcode/skills")));
+        assert!(!dirs.contains(&home.path().join(".atomcode/commands")));
+        // Other products' dirs (`.claude`, `.agents`) stay at real home; project dirs unchanged.
+        assert!(dirs.contains(&home.path().join(".claude/skills")));
+        assert!(dirs.contains(&home.path().join(".agents/skills")));
+        assert!(dirs.contains(&project.path().join(".atomcode/skills")));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn runtime_dirs_treat_empty_atomcode_home_as_unset() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("ATOMCODE_HOME");
+        std::env::set_var("ATOMCODE_HOME", "");
+        let dirs = runtime_skill_dirs(home.path(), project.path());
+        match prev {
+            Some(v) => std::env::set_var("ATOMCODE_HOME", v),
+            None => std::env::remove_var("ATOMCODE_HOME"),
+        }
+
+        // Empty ATOMCODE_HOME must be treated as unset — NOT redirected to a bogus
+        // relative `skills` path (regression: `PathBuf::from("").join("skills")`).
+        assert!(!dirs.iter().any(|d| d == std::path::Path::new("skills")));
+        assert_eq!(dirs, standard_skill_dirs(home.path(), project.path()));
+    }
 
     #[test]
     fn loads_flat_and_dir_skills_with_precedence() {
