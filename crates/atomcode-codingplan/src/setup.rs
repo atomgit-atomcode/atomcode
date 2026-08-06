@@ -1277,9 +1277,11 @@ fn sanitize_model_for_name(model: &str) -> String {
 /// context window is floored at [`MIN_CONTEXT_WINDOW`], so older `models-v2`
 /// payloads without the new columns continue to work without code changes.
 ///
-/// `api_key` stays `None` regardless — `create_provider()` loads the
-/// OAuth token at runtime via `auth.toml` so we never persist it into
-/// the user's `config.toml`.
+/// `api_key` is carried through only when the payload supplies one, for a
+/// gateway that authenticates with a key instead of the OAuth bearer. Absent —
+/// the case for every model the hosted service returns — it stays `None` and
+/// `create_provider()` loads the OAuth token at runtime via `auth.toml`, so the
+/// login token is still never written into the user's `config.toml`.
 fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
     ProviderConfig {
         provider_type: entry
@@ -1287,7 +1289,10 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
             .clone()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| PROVIDER_TYPE.to_string()),
-        api_key: None,
+        api_key: entry
+            .api_key
+            .clone()
+            .filter(|key| !key.trim().is_empty()),
         model: entry.display_model_name.clone(),
         base_url: Some(
             entry
@@ -1546,6 +1551,7 @@ mod tests {
             context_window: Some(128_000),
             plan_available: true,
             capable_model: None,
+            api_key: None,
         };
         let p = build_codingplan_provider(&e);
         assert_eq!(p.model, "GLM-5.1");
@@ -2568,6 +2574,61 @@ mod tests {
         assert!(!latest.providers.contains_key("AtomGit"));
         // The user's concurrent non-CodingPlan default is untouched.
         assert_eq!(latest.default_model, None);
+    }
+
+    #[test]
+    fn model_without_a_key_persists_none_so_the_oauth_token_is_used() {
+        // The hosted service sends no `api_key`, and the login token must keep
+        // out of `config.toml`.
+        assert_eq!(build_codingplan_provider(&entry("GLM-5.2")).api_key, None);
+    }
+
+    #[test]
+    fn model_with_a_key_carries_it_onto_the_provider() {
+        // A gateway that authenticates with a key rather than the OAuth bearer.
+        let keyed = super::super::types::ModelEntry {
+            api_key: Some("sk-gateway".into()),
+            ..entry("GLM-5.2")
+        };
+        assert_eq!(
+            build_codingplan_provider(&keyed).api_key.as_deref(),
+            Some("sk-gateway")
+        );
+    }
+
+    #[test]
+    fn an_env_reference_is_stored_verbatim_for_later_expansion() {
+        // `resolved_api_key` expands `$VAR` at request time, so a payload can
+        // point at a variable instead of writing the secret to disk.
+        let keyed = super::super::types::ModelEntry {
+            api_key: Some("$LLM_GATEWAY_KEY".into()),
+            ..entry("GLM-5.2")
+        };
+        assert_eq!(
+            build_codingplan_provider(&keyed).api_key.as_deref(),
+            Some("$LLM_GATEWAY_KEY")
+        );
+    }
+
+    #[test]
+    fn a_blank_key_is_treated_as_absent() {
+        // An empty column would otherwise persist `Some("")`, which reads as
+        // "configured" downstream and suppresses the OAuth path.
+        for blank in ["", "   "] {
+            let keyed = super::super::types::ModelEntry {
+                api_key: Some(blank.into()),
+                ..entry("GLM-5.2")
+            };
+            assert_eq!(build_codingplan_provider(&keyed).api_key, None, "{blank:?}");
+        }
+    }
+
+    #[test]
+    fn a_payload_without_the_key_column_still_deserializes() {
+        // Older / hosted `models-v2` responses have no such field.
+        let e: super::super::types::ModelEntry =
+            serde_json::from_value(serde_json::json!({"display_model_name": "GLM-5.2"})).unwrap();
+        assert_eq!(e.api_key, None);
     }
 
     #[test]
