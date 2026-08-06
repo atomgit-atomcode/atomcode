@@ -139,12 +139,14 @@ pub fn build_review_agent_with_cancel(
         .tools(tools)
         .persona(persona)
         .working_dir(cfg.working_dir.clone())
-        // Confine read-only tools to the repo: a model `grep /` / read outside the
-        // repo is blocked before it runs (prevents whole-container scans → OOM, and
-        // out-of-repo reads). Review-agent only; other specializations are untouched.
-        .middleware(Arc::new(crate::confine::PathConfineMiddleware::new(
-            cfg.working_dir.clone(),
-        )))
+        // Confine read-only tools to the repo (+ optional reviewable-file allowlist):
+        // a model `grep /` / read outside the repo is blocked before it runs; when
+        // `review_paths` is set, also block reads of files not in the review scope
+        // (e.g. notes.md dropped by ignore but still on disk). Review-agent only.
+        .middleware(Arc::new(
+            crate::confine::PathConfineMiddleware::new(cfg.working_dir.clone())
+                .with_allowlist(&cfg.review_paths),
+        ))
         .stream_timeout(cfg.stream_timeout)
         .request_timeout(cfg.request_timeout);
     if let Some(policy) = cfg.tool_loop_policy {

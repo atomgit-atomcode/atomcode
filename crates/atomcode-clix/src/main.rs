@@ -343,6 +343,10 @@ async fn review(args: ReviewArgs) -> Result<()> {
     cfg.max_rounds = args.max_rounds;
     cfg.max_turn_duration = args.max_duration.map(std::time::Duration::from_secs);
     cfg.no_web = args.no_web;
+    // Diff-mode: pin tools to the changed-file set so the model cannot read_file
+    // siblings already dropped from scope (notes.md / manifest after ignore).
+    // Task/custom mode leaves this empty → root-only confinement (legacy).
+    cfg.review_paths = changed_files.clone();
     // Omit ⇒ keep the config default (usize::MAX = never degrade). A bound enables auto-degrade.
     if let Some(n) = args.graph_max_files {
         cfg.graph_max_indexed_files = n as usize;
