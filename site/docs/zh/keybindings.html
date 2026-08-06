@@ -89,12 +89,13 @@
           <tr><td><code>Alt+Enter</code></td><td>换行(多数终端可用;macOS Apple Terminal 需在 Settings → Profiles → Keyboard 启用 "Use Option as Meta key";Windows Terminal 默认占用,可在设置里释放)</td></tr>
           <tr><td><code>Shift+Enter</code></td><td>换行(仅以下终端区分 <code>Shift+Enter</code> 与 <code>Enter</code>:Kitty / WezTerm / iTerm2(需启用 Report Modifiers)/ Windows Terminal / Ghostty / Warp。Apple Terminal、xterm、GNOME Terminal、VS Code 集成终端不支持,请用 <code>\</code> + <code>Enter</code>)</td></tr>
           <tr><td><code>Ctrl+Enter</code></td><td>换行(需启用 Kitty 键盘协议的终端,如 Kitty、WezTerm 等)</td></tr>
+          <tr><td><code>Ctrl+J</code></td><td>换行(终端能区分该组合键时)</td></tr>
           <tr><td><code>Esc</code></td><td>清空当前输入 / 打断正在流式输出的回复</td></tr>
           <tr><td><code>Esc Esc</code></td><td>输入框空闲且为空时撤销上一轮</td></tr>
           <tr><td><code>↑ / ↓</code></td><td>浏览输入历史</td></tr>
           <tr><td><code>→</code></td><td>将暗色的下一步提示填入空输入框(仍需单独按 <code>Enter</code> 发送)</td></tr>
           <tr><td><code>Ctrl+R</code></td><td>反向搜索输入历史(输入关键字实时过滤;再次按 <code>Ctrl+R</code> 跳到下一个更旧的匹配;<code>Enter</code> 选中填入,<code>Esc</code> 取消)</td></tr>
-          <tr><td><code>Tab</code></td><td>接受补全(斜杠命令菜单、文件路径等)</td></tr>
+          <tr><td><code>Tab / Shift+Tab</code></td><td>有补全菜单时接受补全;无菜单时切换下一个 / 上一个执行模式(流式输出期间也可切换)</td></tr>
           <tr><td><code>Ctrl+U</code></td><td>清空整行</td></tr>
           <tr><td><code>Ctrl+W</code></td><td>删除一个单词</td></tr>
           <tr><td><code>Ctrl+K</code></td><td>删除从光标到行尾的内容</td></tr>
@@ -115,7 +116,6 @@
           <tr><td><code>Ctrl+↑ / Ctrl+↓</code></td><td>跳到上 / 下一条<strong>自己发的</strong>消息</td></tr>
           <tr><td><code>Home / End</code></td><td>跳到对话最顶端 / 最底端</td></tr>
           <tr><td>鼠标滚轮</td><td>在聊天区上下滚(atomcode 接管)</td></tr>
-          <tr><td><code>Ctrl+L</code></td><td>清空当前会话的消息</td></tr>
         </tbody>
       </table>
 
@@ -138,10 +138,10 @@
           <tr><th>按键</th><th>动作</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>F2 / Shift+F2</code></td><td>切换到下一个 / 上一个已配置模型</td></tr>
+          <tr><td><code>F2 / Shift+F2</code></td><td>切换到下一个 / 上一个已配置模型;Mac 键盘通常按 <code>Fn+F2 / Fn+Shift+F2</code></td></tr>
+          <tr><td><code>Ctrl+T</code></td><td>循环切换当前模型的 <code>reasoning_effort</code></td></tr>
           <tr><td><code>Esc</code></td><td>取消当前正在进行的工具调用或流式输出</td></tr>
           <tr><td><code>Ctrl+C</code></td><td>第一次:取消当前操作;连按第二次:退出程序</td></tr>
-          <tr><td><code>Ctrl+D</code></td><td>在输入框为空时,等同退出</td></tr>
         </tbody>
       </table>
 

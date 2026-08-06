@@ -554,14 +554,31 @@ mod tests {
                 "CmdDescKeys ({locale:?}) must not be empty"
             );
             let body = crate::i18n::t(Msg::KeybindingsHelp);
-            assert!(
-                body.contains("Ctrl+C"),
-                "KeybindingsHelp ({locale:?}) must list Ctrl+C — got:\n{body}"
-            );
-            assert!(
-                body.contains("Enter"),
-                "KeybindingsHelp ({locale:?}) must list Enter — got:\n{body}"
-            );
+            for key in [
+                "Enter",
+                "Tab / Shift+Tab",
+                "F2 / Shift+F2",
+                "Ctrl+R",
+                "Ctrl+T",
+                "PageUp / PageDown",
+                "Ctrl+C",
+                "Ctrl+Alt+V",
+            ] {
+                assert!(
+                    body.contains(key),
+                    "KeybindingsHelp ({locale:?}) must list {key} — got:\n{body}"
+                );
+            }
+            for unsupported in [
+                "    Ctrl+D                           ",
+                "    Ctrl+L                           ",
+            ] {
+                assert!(
+                    !body.contains(unsupported),
+                    "KeybindingsHelp ({locale:?}) must not advertise unsupported {}",
+                    unsupported.trim()
+                );
+            }
         }
         crate::i18n::set_locale(prev);
     }
