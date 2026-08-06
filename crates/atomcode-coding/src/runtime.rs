@@ -3035,6 +3035,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             .as_ref()
                             .map(|state| state.phase)
                         {
+                            // PausedAtCap intentionally resumes even on an empty submit:
+                            // it isn't done, so any nudge should let it keep going. The
+                            // Satisfied arm below deliberately does NOT — a done goal must
+                            // not be re-tasked by an empty message.
                             Some(GoalPhase::PausedAtCap) => Some(None),
                             Some(GoalPhase::Satisfied) if input.text.trim().is_empty() => {
                                 // Fast-path: an empty / whitespace-only submit obviously
