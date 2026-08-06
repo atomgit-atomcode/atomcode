@@ -20,8 +20,13 @@
 //!
 //! # Scope
 //!
-//! Addresses, plus the one switch that only makes sense beside them
-//! ([`relay_enabled`], for a deployment with no relay to reach).
+//! Addresses, plus the two settings that only make sense beside them:
+//! [`relay_enabled`] (a deployment with no relay to reach) and
+//! [`codingplan_provider_prefix`] (the name its CodingPlan entries carry).
+//!
+//! Being one module is the point: a distribution retargets a build by
+//! replacing this file, so anything it needs to change belongs here rather
+//! than scattered across the crates that consume it.
 
 use std::sync::OnceLock;
 
@@ -44,6 +49,9 @@ pub const PLUGIN_AUTO_INSTALL_ENV: &str = "ATOMCODE_PLUGIN_AUTO_INSTALL";
 
 /// Whether `/app` remote access is offered. Defaults to on.
 pub const ENABLE_RELAY_ENV: &str = "ATOMCODE_ENABLE_RELAY";
+
+/// Overrides the prefix CodingPlan provider keys are written with.
+pub const CODINGPLAN_PROVIDER_PREFIX_ENV: &str = "ATOMCODE_CODINGPLAN_PROVIDER_PREFIX";
 
 /// Hosts to treat as first-party, comma-separated. **Replaces** the default
 /// set rather than adding to it: a deployment that has moved off the hosted
@@ -73,6 +81,10 @@ const HOSTED_MARKETPLACES: &[&str] = &[
 ];
 const HOSTED_AUTO_INSTALL: &[&str] = &["https://atomgit.com/atomgit_atomcode/atomcode-skills.git"];
 const HOSTED_TRUSTED_DOMAINS: &[&str] = &["atomgit.com", "gitcode.com"];
+/// Prefix for CodingPlan provider keys. User-visible: it is the selection id in
+/// the model picker's left column and the account label in its right one, so a
+/// build serving its own gateway wants it to say something else.
+const HOSTED_CODINGPLAN_PROVIDER_PREFIX: &str = "AtomGit";
 /// Narrower than [`HOSTED_TRUSTED_DOMAINS`], and deliberately so: the TLS-1.2
 /// fallback has only ever applied to `api.gitcode.com`, not to gitcode.com at
 /// large. Listing the full host here matches that exactly — it has no
@@ -195,6 +207,34 @@ pub fn relay_enabled() -> bool {
     *ON.get_or_init(|| env_bool(ENABLE_RELAY_ENV).unwrap_or(true))
 }
 
+/// Prefix that new CodingPlan entries are written with.
+///
+/// Recognition of already-written keys is a separate question owned by
+/// `config::is_codingplan_provider_name`, which keeps accepting the historical
+/// prefix whatever this returns — so changing it does not orphan an existing
+/// `config.toml`.
+pub fn codingplan_provider_prefix() -> &'static str {
+    static PREFIX: OnceLock<String> = OnceLock::new();
+    PREFIX.get_or_init(|| {
+        std::env::var(CODINGPLAN_PROVIDER_PREFIX_ENV)
+            .ok()
+            .and_then(|raw| normalize_codingplan_prefix(&raw))
+            .unwrap_or_else(|| HOSTED_CODINGPLAN_PROVIDER_PREFIX.to_string())
+    })
+}
+
+/// Accept only what survives as a TOML bare key, since the prefix becomes one.
+/// A rejected value falls back to the default rather than producing a config
+/// file that cannot be re-read.
+fn normalize_codingplan_prefix(raw: &str) -> Option<String> {
+    let prefix = raw.trim();
+    let is_bare_key = !prefix.is_empty()
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    is_bare_key.then(|| prefix.to_string())
+}
+
 /// Git URLs of the marketplaces registered on first run, in order.
 pub fn plugin_marketplaces() -> &'static [String] {
     static URLS: OnceLock<Vec<String>> = OnceLock::new();
@@ -295,6 +335,10 @@ mod tests {
         assert_eq!(relay_url(), HOSTED_RELAY_URL);
         assert_eq!(plugin_marketplaces(), HOSTED_MARKETPLACES);
         assert_eq!(plugin_auto_install(), HOSTED_AUTO_INSTALL);
+        assert_eq!(
+            codingplan_provider_prefix(),
+            HOSTED_CODINGPLAN_PROVIDER_PREFIX
+        );
         assert!(relay_enabled());
     }
 
@@ -365,6 +409,28 @@ mod tests {
             vec!["a.git".to_string(), "b.git".to_string()]
         );
         assert!(split_list("").is_empty());
+    }
+
+    #[test]
+    fn a_prefix_must_survive_as_a_toml_bare_key() {
+        assert_eq!(
+            normalize_codingplan_prefix("Longyuan").as_deref(),
+            Some("Longyuan")
+        );
+        assert_eq!(
+            normalize_codingplan_prefix("  Longyuan  ").as_deref(),
+            Some("Longyuan")
+        );
+        assert_eq!(normalize_codingplan_prefix("ly_gw-1").as_deref(), Some("ly_gw-1"));
+    }
+
+    #[test]
+    fn a_prefix_that_would_break_the_config_file_is_rejected() {
+        // Each would produce a key TOML cannot round-trip, leaving a config
+        // that no longer parses — fall back to the default instead.
+        for bad in ["", "   ", "Long Yuan", "long.yuan", "[ly]", "ly=1", "ly\"q"] {
+            assert_eq!(normalize_codingplan_prefix(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

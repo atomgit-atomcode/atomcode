@@ -73,8 +73,12 @@ const PROVIDER_TYPE: &str = "openai";
 /// window (e.g. Claude's 200k) is kept as-is.
 const MIN_CONTEXT_WINDOW: usize = 128_000;
 
-/// Prefix used for every coding-plan-managed provider name.
-const PROVIDER_PREFIX: &str = "AtomGit";
+/// Prefix used for every coding-plan-managed provider name. Resolved by
+/// `atomcode_config` so the write side and the recognition side
+/// (`is_codingplan_provider_name`) can never disagree about it.
+fn provider_prefix() -> &'static str {
+    atomcode_config::endpoints::codingplan_provider_prefix()
+}
 
 /// Result of one orchestrator step. Distinct from `Result` because
 /// "already done / idempotent skip" is a first-class outcome, not an
@@ -1051,7 +1055,7 @@ fn refreshed_default_provider(
     provider_names
         .first()
         .cloned()
-        .unwrap_or_else(|| PROVIDER_PREFIX.to_string())
+        .unwrap_or_else(|| provider_prefix().to_string())
 }
 
 /// Merge a successful catalog refresh into the latest disk snapshot.
@@ -1255,11 +1259,11 @@ pub fn format_duration_secs(secs: i64) -> String {
 /// `AtomGit-{name with / replaced by -}`.
 fn provider_names_for(model_names: &[String]) -> Vec<String> {
     if model_names.len() == 1 {
-        vec![PROVIDER_PREFIX.to_string()]
+        vec![provider_prefix().to_string()]
     } else {
         model_names
             .iter()
-            .map(|m| format!("{}-{}", PROVIDER_PREFIX, sanitize_model_for_name(m)))
+            .map(|m| format!("{}-{}", provider_prefix(), sanitize_model_for_name(m)))
             .collect()
     }
 }
@@ -2574,6 +2578,77 @@ mod tests {
         assert!(!latest.providers.contains_key("AtomGit"));
         // The user's concurrent non-CodingPlan default is untouched.
         assert_eq!(latest.default_model, None);
+    }
+
+    /// A user who ran the public build before switching to one with a different
+    /// prefix arrives with `AtomGit-*` keys in `config.toml`. Login must adopt
+    /// them rather than leaving a dead entry selected.
+    ///
+    /// Driven through `refreshed_default_provider` with a hand-built key list,
+    /// because the prefix resolves once per process: in-test it is the default,
+    /// so a full `run_register` would write `AtomGit-*` again and the two
+    /// prefixes could never differ. The list here is what a build carrying a
+    /// different prefix would generate.
+    ///
+    /// This is what recognising the historical prefix buys. `is_codingplan_
+    /// provider_name` gates both the `retain` that wipes stale entries and the
+    /// branch below that re-points by model name; without it the old key
+    /// survives the wipe *and* stays the default, pointing at the previous
+    /// gateway.
+    #[test]
+    fn a_default_written_under_the_historical_prefix_repoints_by_model_name() {
+        let mut config = blank_config();
+        config.providers.insert(
+            "AtomGit-GLM-5.2".into(),
+            build_codingplan_provider(&entry("GLM-5.2")),
+        );
+
+        let model_names = vec!["GLM-5.2".to_string(), "Qwen".to_string()];
+        let provider_names = vec![
+            "Longyuan-GLM-5.2".to_string(),
+            "Longyuan-Qwen".to_string(),
+        ];
+
+        let resolved = refreshed_default_provider(
+            &config,
+            "AtomGit-GLM-5.2",
+            Some("GLM-5.2"),
+            &model_names,
+            &provider_names,
+        );
+        assert_eq!(resolved, "Longyuan-GLM-5.2");
+    }
+
+    /// The model the user was on is gone from the new catalogue — fall to the
+    /// first entry rather than keeping a key that no longer resolves.
+    #[test]
+    fn a_historical_default_whose_model_vanished_falls_to_the_first_entry() {
+        let config = blank_config();
+        let resolved = refreshed_default_provider(
+            &config,
+            "AtomGit-Retired",
+            Some("Retired"),
+            &["GLM-5.2".to_string()],
+            &["Longyuan-GLM-5.2".to_string()],
+        );
+        assert_eq!(resolved, "Longyuan-GLM-5.2");
+    }
+
+    /// A user's own non-CodingPlan default is never touched by any of this.
+    #[test]
+    fn a_custom_default_survives_the_refresh() {
+        let mut config = blank_config();
+        config
+            .providers
+            .insert("my-ollama".into(), build_codingplan_provider(&entry("llama")));
+        let resolved = refreshed_default_provider(
+            &config,
+            "my-ollama",
+            Some("llama"),
+            &["GLM-5.2".to_string()],
+            &["Longyuan-GLM-5.2".to_string()],
+        );
+        assert_eq!(resolved, "my-ollama");
     }
 
     #[test]
