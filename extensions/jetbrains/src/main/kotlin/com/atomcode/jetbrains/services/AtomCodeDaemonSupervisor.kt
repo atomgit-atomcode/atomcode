@@ -4,6 +4,7 @@ import com.atomcode.jetbrains.daemon.AtomCodeDaemonClient
 import com.atomcode.jetbrains.daemon.AtomCodeDaemonProcess
 import com.atomcode.jetbrains.daemon.ConnectionErrorKind
 import com.atomcode.jetbrains.daemon.DaemonAuth
+import com.atomcode.jetbrains.daemon.DaemonTokenFile
 import com.atomcode.jetbrains.daemon.DaemonLaunchResult
 import com.atomcode.jetbrains.daemon.DaemonProcessExit
 import com.atomcode.jetbrains.daemon.DaemonProcessLauncher
@@ -154,7 +155,7 @@ internal class DaemonSupervisorEngine(
                             val startupControl = controlFactory.create(
                                 settings,
                                 DAEMON_STARTUP_PROBE_TIMEOUT_MS,
-                                auth,
+                                DaemonAuth(DaemonTokenFile.read(settings.port)),
                             )
                             awaitReady(
                                 key = key,
@@ -255,7 +256,11 @@ internal class DaemonSupervisorEngine(
                         "AtomCode daemon supervisor was disposed during startup.",
                     )
                 }
-                val control = controlFactory.create(settings, DAEMON_STARTUP_PROBE_TIMEOUT_MS, auth)
+                val control = controlFactory.create(
+                    settings,
+                    DAEMON_STARTUP_PROBE_TIMEOUT_MS,
+                    DaemonAuth(DaemonTokenFile.read(settings.port)),
+                )
                 awaitReady(
                     key = key,
                     control = control,
