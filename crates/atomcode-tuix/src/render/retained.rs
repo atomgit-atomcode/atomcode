@@ -3739,8 +3739,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     } else {
                         self.style_for(Role::Secondary)
                     };
-                    push_str_cells(&mut row, &visible_text, &text_style);
-                    push_str_cells(&mut row, caret, &border_style);
+                    // An empty field's insertion point is before its placeholder;
+                    // once text exists the caret follows the typed content.
+                    if panel.text.is_empty() {
+                        push_str_cells(&mut row, caret, &border_style);
+                        push_str_cells(&mut row, &visible_text, &text_style);
+                    } else {
+                        push_str_cells(&mut row, &visible_text, &text_style);
+                        push_str_cells(&mut row, caret, &border_style);
+                    }
                     let used = crate::width::display_width(prompt)
                         + crate::width::display_width(&visible_text)
                         + crate::width::display_width(caret);
@@ -16678,6 +16685,51 @@ mod tests {
         assert!(
             caret < placeholder,
             "caret ▏ must render BEFORE the placeholder (输入自己的答案…)\nrow={row:?}\n{dump}"
+        );
+    }
+
+    #[test]
+    fn empty_text_answer_cursor_renders_before_the_placeholder() {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+
+        let (mut r, buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let mut status = status_basic();
+        status.user_input = Some(crate::render::UserInputPanelView {
+            header: "Repository name".into(),
+            question: "What should the new repository be called?".into(),
+            mode: UserInputMode::Text,
+            options: Vec::new(),
+            cursor: 0,
+            checked: Vec::new(),
+            text: String::new(),
+            custom_text: String::new(),
+            custom: false,
+            scroll_offset: 0,
+            batch: None,
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let dump = vterm.dump();
+        let row = (0..24)
+            .map(|y| vterm.row_text(y))
+            .find(|row| row.contains('输'))
+            .unwrap_or_else(|| panic!("text-answer row not found\n{dump}"));
+        let caret = row
+            .find('\u{258f}')
+            .unwrap_or_else(|| panic!("caret ▏ not rendered\nrow={row:?}\n{dump}"));
+        let placeholder = row.find('输').expect("placeholder present");
+        assert!(
+            caret < placeholder,
+            "caret ▏ must render before the empty text placeholder\nrow={row:?}\n{dump}"
         );
     }
 
