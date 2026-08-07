@@ -1651,6 +1651,25 @@ fn hold_interrupt_wait_phase(state: &mut UiState, armed: bool) {
     }
 }
 
+/// A non-capturing modal can outlive the presentation terminal that was drawn
+/// before the runtime-owned `TurnFinished` reached this loop.  When there is no
+/// replay payload to protect and the runtime already reports no active turn,
+/// keeping the interrupt latch armed only strands the visible modal behind the
+/// Streaming key route (its Enter key appears to do nothing).
+fn should_release_stale_modal_interrupt_wait(
+    phase: UiPhase,
+    interrupt_armed: bool,
+    has_non_capturing_modal: bool,
+    runtime_has_active_turn: bool,
+    has_replay_payload: bool,
+) -> bool {
+    interrupt_armed
+        && matches!(phase, UiPhase::Streaming)
+        && has_non_capturing_modal
+        && !runtime_has_active_turn
+        && !has_replay_payload
+}
+
 /// What a runtime event is allowed to do to a fixed-interval prompt loop.
 /// A normal runtime-owned terminal releases the next scheduled iteration;
 /// every authoritative failure tears the loop down. Presentation-only natural
@@ -1932,6 +1951,42 @@ mod submit_hold_tests {
     }
 
     #[test]
+    fn visible_modal_releases_stale_interrupt_wait_after_runtime_is_ready() {
+        assert!(should_release_stale_modal_interrupt_wait(
+            UiPhase::Streaming,
+            true,
+            true,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn modal_never_bypasses_live_turn_or_pending_replay() {
+        assert!(!should_release_stale_modal_interrupt_wait(
+            UiPhase::Streaming,
+            true,
+            true,
+            true,
+            false,
+        ));
+        assert!(!should_release_stale_modal_interrupt_wait(
+            UiPhase::Streaming,
+            true,
+            true,
+            false,
+            true,
+        ));
+        assert!(!should_release_stale_modal_interrupt_wait(
+            UiPhase::Streaming,
+            true,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
     fn interrupt_staging_preserves_fifo_and_existing_type_ahead() {
         fn queued(text: &str, marker: usize) -> crate::state::QueuedMessage {
             crate::state::QueuedMessage {
@@ -1973,6 +2028,13 @@ mod submit_hold_tests {
         assert!(!should_stage_interrupt(true, false, true));
         assert!(!should_stage_interrupt(true, true, false));
         assert!(should_stage_interrupt(true, true, true));
+    }
+
+    #[test]
+    fn accepted_startup_cancel_does_not_wait_for_a_turn_terminal() {
+        assert!(!should_arm_interrupt_wait(true, false));
+        assert!(!should_arm_interrupt_wait(false, true));
+        assert!(should_arm_interrupt_wait(true, true));
     }
 
     #[test]
@@ -10970,6 +11032,26 @@ fn handle_input(
 ) -> Result<()> {
     use crate::modals::ModalAction;
 
+    let has_non_capturing_modal = app
+        .active_modal
+        .as_ref()
+        .is_some_and(|modal| !modal.captures_all_keys());
+    let has_replay_payload = !app.message_queue.is_empty() || !app.state.pending_steers.is_empty();
+    if should_release_stale_modal_interrupt_wait(
+        app.state.phase,
+        app.interrupt_drain_pending,
+        has_non_capturing_modal,
+        ctx.runtime.has_active_turn(),
+        has_replay_payload,
+    ) {
+        crate::tuix_trace!(
+            "KEY",
+            "release stale interrupt wait before routing visible modal"
+        );
+        app.interrupt_drain_pending = false;
+        app.state.phase = UiPhase::Idle;
+    }
+
     if matches!(app.state.phase, UiPhase::Idle)
         && app.active_modal.is_none()
         && poll_shared_state(ctx)
@@ -11865,7 +11947,7 @@ fn handle_idle_key(
             } else {
                 pause_active_goal(ctx)
             };
-            if sent && has_active_turn {
+            if should_arm_interrupt_wait(sent, has_active_turn) {
                 app.interrupt_drain_pending = true;
             }
             clear_capturing_modal_on_cancel(app);
@@ -14221,6 +14303,13 @@ fn should_stage_interrupt(send_ok: bool, bare_esc: bool, has_pending: bool) -> b
     send_ok && bare_esc && has_pending
 }
 
+/// A successfully queued Cancel is not necessarily waiting on a turn terminal:
+/// deferred runtimes deliberately accept Cancel while still starting.  Only a
+/// command sent while a turn is authoritative may arm the terminal drain latch.
+fn should_arm_interrupt_wait(command_sent: bool, had_active_turn: bool) -> bool {
+    command_sent && had_active_turn
+}
+
 /// Slash commands allowed to EXECUTE while a turn is running. Everything else is
 /// blocked with the "disabled while a turn is running" hint. Returns the
 /// `(command, args)` to run, or `None` to fall through to the block/queue.
@@ -14340,8 +14429,9 @@ fn handle_streaming_key(
     // the type-ahead queue: a user yanking the escape cord doesn't
     // want queued messages to auto-fire after the current one dies.
     if code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        let had_active_turn = ctx.runtime.has_active_turn();
         let send_ok = cancel_active_turn(ctx);
-        if send_ok {
+        if should_arm_interrupt_wait(send_ok, had_active_turn) {
             app.interrupt_drain_pending = true;
         }
         clear_capturing_modal_on_cancel(app);
@@ -14398,6 +14488,7 @@ fn handle_streaming_key(
     // Placed before menu navigation because stopping the stream is the higher
     // value action mid-turn (Ctrl+U remains available for clearing input).
     if code == KeyCode::Esc {
+        let had_active_turn = ctx.runtime.has_active_turn();
         let send_ok = if app.state.goal_condition.is_some()
             && app.state.goal_phase == atomcode_coding::GoalPhase::Pursuing
         {
@@ -14405,12 +14496,13 @@ fn handle_streaming_key(
         } else {
             cancel_active_turn(ctx)
         };
+        let waits_for_terminal = should_arm_interrupt_wait(send_ok, had_active_turn);
         let interrupt_and_send = should_stage_interrupt(
-            send_ok,
+            waits_for_terminal,
             modifiers.is_empty(),
             !app.state.pending_steers.is_empty(),
         ) && stage_pending_steers_for_interrupt(app);
-        if send_ok {
+        if waits_for_terminal {
             app.interrupt_drain_pending = true;
         }
         clear_capturing_modal_on_cancel(app);
@@ -14865,7 +14957,8 @@ fn handle_streaming_key(
         BufferResult::Exit => {
             // Ctrl+C on empty buf during streaming — treat as cancel
             // (consistent with the explicit Ctrl+C branch above).
-            if cancel_active_turn(ctx) {
+            let had_active_turn = ctx.runtime.has_active_turn();
+            if should_arm_interrupt_wait(cancel_active_turn(ctx), had_active_turn) {
                 app.interrupt_drain_pending = true;
             }
             clear_capturing_modal_on_cancel(app);
