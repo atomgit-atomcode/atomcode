@@ -58,11 +58,27 @@ pub use live_api::live_set_mode;
 pub use live_api::live_set_working_dir;
 pub use live_api::live_switch_session;
 pub mod auth_token;
+mod daemon_token_file;
 pub mod permission_bridge;
 mod telemetry_scope;
 pub mod webui;
 
 pub(crate) use telemetry_scope::daemon_scope;
+
+/// 解析 daemon 本地 token：`ATOMCODE_DAEMON_TOKEN`（非空则原样用）否则随机 mint。
+/// 无论哪种来源，都会登记进 `store` 使其有效，并返回 token 字符串。
+pub fn resolve_daemon_token(
+    env_token: Option<String>,
+    store: &auth_token::WebuiTokenStore,
+) -> String {
+    match env_token.filter(|s| !s.is_empty()) {
+        Some(t) => {
+            store.insert(t.clone());
+            t
+        }
+        None => store.mint(),
+    }
+}
 
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
@@ -7885,5 +7901,26 @@ mod channel_mode_tests {
         assert!(approval_mode_requires_responder(ApprovalMode::AcceptEdits));
         assert!(!approval_mode_requires_responder(ApprovalMode::Auto));
         assert!(!approval_mode_requires_responder(ApprovalMode::Plan));
+    }
+}
+
+#[cfg(test)]
+mod resolve_daemon_token_tests {
+    use super::*;
+
+    #[test]
+    fn env_token_takes_priority_and_registers() {
+        let store = auth_token::WebuiTokenStore::new();
+        let t = resolve_daemon_token(Some("env-tok".to_string()), &store);
+        assert_eq!(t, "env-tok");
+        assert!(store.is_valid("env-tok"));
+    }
+
+    #[test]
+    fn empty_env_falls_back_to_random_mint() {
+        let store = auth_token::WebuiTokenStore::new();
+        let t = resolve_daemon_token(None, &store);
+        assert!(!t.is_empty());
+        assert!(store.is_valid(&t));
     }
 }

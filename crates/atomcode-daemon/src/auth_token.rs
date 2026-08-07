@@ -61,6 +61,11 @@ impl WebuiTokenStore {
         token
     }
 
+    /// 登记一个已知 token 为有效（用于从 env/文件注入固定 token）。
+    pub fn insert(&self, token: String) {
+        self.inner.write().unwrap().insert(token);
+    }
+
     /// 校验 token 是否有效。空串始终无效。
     pub fn is_valid(&self, token: &str) -> bool {
         if token.is_empty() {
@@ -169,6 +174,19 @@ pub async fn require_app_user_id(
             actual,
         );
         Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+#[cfg(test)]
+mod token_store_tests {
+    use super::*;
+
+    #[test]
+    fn insert_makes_token_valid() {
+        let store = WebuiTokenStore::new();
+        assert!(!store.is_valid("known-token"));
+        store.insert("known-token".to_string());
+        assert!(store.is_valid("known-token"));
     }
 }
 
