@@ -1428,6 +1428,16 @@ pub enum Msg<'a> {
         reason: Option<&'a str>,
     },
 
+    /// Turn-end summary for a hard local security-policy denial. This is
+    /// intentionally distinct from cancellation and provider failure: the
+    /// runtime stopped the turn deliberately and preserved a valid transcript.
+    TurnSummaryPolicyDenied {
+        turn_count: usize,
+        tool_call_count: usize,
+        duration: &'a str,
+        total_tokens: usize,
+    },
+
     // ── OAuth login chrome (/login + /codingplan share these) ──
     /// Header above the QR block when scanning with WeChat is the
     /// expected flow. Includes the leading "  " indent and trailing

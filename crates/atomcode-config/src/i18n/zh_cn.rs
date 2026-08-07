@@ -1097,6 +1097,8 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             let cause = reason.map(|r| format!("：{r}")).unwrap_or_default();
             format!("✗ 已中断{cause} · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into()
         }
+        Msg::TurnSummaryPolicyDenied { turn_count, tool_call_count, duration, total_tokens } =>
+            format!("✗ 安全策略已终止本回合 · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into(),
         Msg::LoginQrHeader =>
             "  登录 AtomGit — 使用微信扫描下方二维码：\n\n".into(),
         Msg::LoginUrlAfterQr =>

@@ -16600,14 +16600,24 @@ pub(super) fn handle_upgrade_event(
 /// `flush_pending_separator` path so both stay localized and consistent.
 fn turn_summary_label(
     state: &mut UiState,
-    errored: bool,
+    stop_reason: ui_event::UiTurnStopReason,
     turn_count: usize,
     tool_call_count: usize,
     total_tokens: usize,
     cached_pct: Option<u8>,
     dur: &str,
 ) -> String {
-    if errored {
+    if matches!(stop_reason, ui_event::UiTurnStopReason::PolicyDenied) {
+        state.last_turn_error = None;
+        state.turn_error_line_shown = false;
+        crate::i18n::t(crate::i18n::Msg::TurnSummaryPolicyDenied {
+            turn_count,
+            tool_call_count,
+            duration: dur,
+            total_tokens,
+        })
+        .into_owned()
+    } else if turn_is_incomplete(stop_reason) {
         // FOLD the captured failure cause into the separator itself
         // (`✗ 已中断：账户余额不足（HTTP 402） · …`) so the reason rides the
         // always-visible summary — the standalone mid-turn red line is emitted
@@ -16856,7 +16866,15 @@ mod turn_error_reason_tests {
         let mut state = UiState::new();
         state.last_turn_error = Some("账户余额不足（HTTP 402）".to_string());
         assert!(!state.turn_error_line_shown);
-        let label = turn_summary_label(&mut state, true, 0, 0, 0, None, "3.2s");
+        let label = turn_summary_label(
+            &mut state,
+            ui_event::UiTurnStopReason::Error,
+            0,
+            0,
+            0,
+            None,
+            "3.2s",
+        );
         // Reason folded into the separator label (not a separate line).
         assert!(label.contains("账户余额不足（HTTP 402）"), "{label}");
         assert!(
@@ -16874,7 +16892,15 @@ mod turn_error_reason_tests {
         let mut state = UiState::new();
         state.last_turn_error = Some("API key 未授权或已失效（HTTP 401）".to_string());
         state.turn_error_line_shown = true;
-        let label = turn_summary_label(&mut state, true, 0, 0, 0, None, "697ms");
+        let label = turn_summary_label(
+            &mut state,
+            ui_event::UiTurnStopReason::Error,
+            0,
+            0,
+            0,
+            None,
+            "697ms",
+        );
         // Still an interrupted summary…
         assert!(
             label.contains("已中断") || label.contains("Stopped"),
@@ -16910,7 +16936,15 @@ mod turn_error_reason_tests {
 
         // Deferred flush restores the snapshot before building the summary.
         state.turn_error_line_shown = snapshot;
-        let label = turn_summary_label(&mut state, true, 0, 0, 0, None, "697ms");
+        let label = turn_summary_label(
+            &mut state,
+            ui_event::UiTurnStopReason::Error,
+            0,
+            0,
+            0,
+            None,
+            "697ms",
+        );
         assert!(
             !label.contains("401"),
             "deferred errored summary should dedup via snapshot: {label}"
@@ -16922,7 +16956,15 @@ mod turn_error_reason_tests {
         let mut state = UiState::new();
         // A stale reason from a prior no-summary error path.
         state.last_turn_error = Some("陈旧原因".to_string());
-        let label = turn_summary_label(&mut state, false, 1, 0, 0, None, "1s");
+        let label = turn_summary_label(
+            &mut state,
+            ui_event::UiTurnStopReason::Natural,
+            1,
+            0,
+            0,
+            None,
+            "1s",
+        );
         assert!(!label.contains("陈旧原因"), "{label}");
         // Cleared so it can't fold into a LATER errored summary.
         assert!(state.last_turn_error.is_none());
@@ -16937,6 +16979,26 @@ mod turn_error_reason_tests {
         // Multi-line collapses to the first line.
         assert_eq!(summary_reason_headline("头一行\n第二行"), "头一行");
     }
+
+    #[test]
+    fn policy_denial_has_a_distinct_security_terminal_label() {
+        let mut state = UiState::new();
+        let label = turn_summary_label(
+            &mut state,
+            ui_event::UiTurnStopReason::PolicyDenied,
+            4,
+            6,
+            31_340,
+            None,
+            "23.4s",
+        );
+        assert!(
+            label.contains("安全策略已终止本回合")
+                || label.contains("Turn stopped by security policy"),
+            "{label}"
+        );
+        assert!(!label.contains("已中断"), "{label}");
+    }
 }
 
 fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_goal_end: bool) {
@@ -16948,7 +17010,18 @@ fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_
         .cached_pct
         .map(|p| format!(" · {p}% cached"))
         .unwrap_or_default();
-    let label = if as_goal_end {
+    let label = if matches!(ps.stop_reason, ui_event::UiTurnStopReason::PolicyDenied) {
+        state.turn_error_line_shown = ps.error_line_shown;
+        turn_summary_label(
+            state,
+            ps.stop_reason,
+            ps.turn_count,
+            ps.tool_call_count,
+            ps.total_tokens,
+            ps.cached_pct,
+            &dur,
+        )
+    } else if as_goal_end {
         format!(
             "{} tools · {} · {} tokens{}",
             ps.tool_call_count,
@@ -16989,7 +17062,7 @@ fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_
         state.turn_error_line_shown = ps.error_line_shown;
         turn_summary_label(
             state,
-            ps.errored,
+            ps.stop_reason,
             ps.turn_count,
             ps.tool_call_count,
             ps.total_tokens,
@@ -17046,8 +17119,8 @@ mod approval_retract_tests {
 }
 
 /// Map the TUI turn-stop reason onto the notification layer's own
-/// `NotifyStopReason`. Total
-/// 1:1 mapping — the two enums mirror each other variant-for-variant.
+/// `NotifyStopReason`. The notification API has no policy-specific surface yet,
+/// so a hard policy denial remains a failed notification rather than success.
 fn notify_stop_reason(
     reason: ui_event::UiTurnStopReason,
 ) -> atomcode_capabilities::notify::NotifyStopReason {
@@ -17056,7 +17129,7 @@ fn notify_stop_reason(
     match reason {
         T::Natural => N::Natural,
         T::Cancelled => N::Cancelled,
-        T::Error => N::Error,
+        T::PolicyDenied | T::Error => N::Error,
         T::TurnLimit => N::TurnLimit,
         T::StepLimit => N::StepLimit,
     }
@@ -17685,6 +17758,7 @@ fn kernel_stop_reason(reason: atomcode_kernel::event::StopReason) -> ui_event::U
         Kernel::MaxRounds | Kernel::MaxContinuations => Core::TurnLimit,
         Kernel::RepeatLoop | Kernel::ToolLoopDetected => Core::StepLimit,
         Kernel::Cancelled => Core::Cancelled,
+        Kernel::PolicyDenied => Core::PolicyDenied,
         Kernel::ProviderError | Kernel::Timeout | Kernel::PromptRejected | Kernel::RateLimited => {
             Core::Error
         }
@@ -17716,12 +17790,20 @@ mod kernel_terminal_projection_tests {
     }
 
     #[test]
+    fn policy_denial_keeps_its_security_identity_in_the_tui() {
+        let reason = kernel_stop_reason(StopReason::PolicyDenied);
+        assert_eq!(reason, UiTurnStopReason::PolicyDenied);
+        assert!(turn_is_incomplete(reason));
+    }
+
+    #[test]
     fn every_non_natural_terminal_is_persisted_as_incomplete() {
         assert!(!turn_is_incomplete(UiTurnStopReason::Natural));
         for reason in [
             UiTurnStopReason::TurnLimit,
             UiTurnStopReason::StepLimit,
             UiTurnStopReason::Cancelled,
+            UiTurnStopReason::PolicyDenied,
             UiTurnStopReason::Error,
         ] {
             assert!(turn_is_incomplete(reason));
@@ -17735,6 +17817,7 @@ mod kernel_terminal_projection_tests {
             UiTurnStopReason::TurnLimit,
             UiTurnStopReason::StepLimit,
             UiTurnStopReason::Cancelled,
+            UiTurnStopReason::PolicyDenied,
             UiTurnStopReason::Error,
         ] {
             assert!(!should_run_setup_post_turn(reason));
@@ -20908,7 +20991,6 @@ fn handle_agent_event(
             }
             renderer.render(UiLine::AssistantLineBreak);
             pending_tools.clear();
-            let errored = turn_is_incomplete(stop_reason);
             // Footer token count: bill output + UNCACHED input (re-reading the
             // cached prefix each round is near-free). The event's `total_tokens`
             // is the v2 gross sum (prompt+completion per round) which overstates
@@ -20940,7 +21022,7 @@ fn handle_agent_event(
                     total_tokens,
                     was_goal_round: true,
                     was_loop_round: false,
-                    errored,
+                    stop_reason,
                     error_line_shown: state.turn_error_line_shown,
                     cached_pct,
                 });
@@ -20956,7 +21038,7 @@ fn handle_agent_event(
                     total_tokens,
                     was_goal_round: false,
                     was_loop_round: true,
-                    errored,
+                    stop_reason,
                     error_line_shown: state.turn_error_line_shown,
                     cached_pct,
                 });
@@ -20965,7 +21047,7 @@ fn handle_agent_event(
                 let dur = crate::render::fmt_dur(duration);
                 let label = turn_summary_label(
                     state,
-                    errored,
+                    stop_reason,
                     turn_count,
                     tool_call_count,
                     total_tokens,

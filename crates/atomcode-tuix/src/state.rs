@@ -1212,10 +1212,10 @@ pub struct PendingSeparator {
     /// Whether the turn ran inside an active `/loop` (decides `⚡ loop round N`
     /// vs the normal summary when flushed mid-loop).
     pub was_loop_round: bool,
-    /// Whether the turn ended abnormally (error, cancellation, or a safety
-    /// limit). Lets the deferred flush render the ✗ "stopped" summary instead
-    /// of a celebratory ✓ for an incomplete turn.
-    pub errored: bool,
+    /// Exact terminal projection retained across a deferred goal/loop separator.
+    /// In particular, policy denial must not collapse into the generic
+    /// "interrupted" label when the separator is flushed later.
+    pub stop_reason: crate::event_loop::ui_event::UiTurnStopReason,
     /// Snapshot of `UiState::turn_error_line_shown` at defer time. The deferred
     /// flush can land AFTER a later turn's `on_submit` has reset the live flag,
     /// so we capture it here to decide correctly whether the errored summary
