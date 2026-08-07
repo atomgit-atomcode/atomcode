@@ -106,6 +106,10 @@ export class DaemonClient {
   private port: number;
   /** Called when an idempotent GET fails with ECONNREFUSED; successful restart permits one GET retry. */
   public onConnectionLost?: () => Promise<boolean>;
+  /** Cached daemon token. `undefined` means "not read yet" — kept re-reading
+   * until the daemon has written its file — and is invalidated on a 401 so a
+   * restarted daemon's fresh token is picked up. Avoids a disk read per request. */
+  private cachedToken: string | undefined;
 
   constructor(port: number) {
     this.port = port;
@@ -113,10 +117,30 @@ export class DaemonClient {
     this.baseUrl = `http://${this.host}:${this.port}`;
   }
 
+  /** Daemon token, read from disk once and cached. Re-reads while absent. */
+  private token(): string | undefined {
+    if (this.cachedToken === undefined) {
+      this.cachedToken = readDaemonToken(this.port);
+    }
+    return this.cachedToken;
+  }
+
+  /** Drop the cached token so the next request re-reads it from disk. */
+  private invalidateToken(): void {
+    this.cachedToken = undefined;
+  }
+
   // ── REST helpers ──────────────────────────────────────────────
 
   private request<T>(method: string, path: string, body?: unknown): Promise<T> {
     return this.requestOnce<T>(method, path, body).catch(async (err) => {
+      // Stale token (daemon restarted → new token, or file not yet read): a 401
+      // is rejected by the auth middleware BEFORE the handler runs, so replaying
+      // is safe for any method. Invalidate the cache and retry once.
+      if (err instanceof DaemonHttpError && err.statusCode === 401) {
+        this.invalidateToken();
+        return this.requestOnce<T>(method, path, body);
+      }
       // Restart/retry only idempotent reads. Replaying POST/PATCH/DELETE after
       // process replacement can duplicate work or reuse daemon-owned stale IDs.
       if (method === 'GET'
@@ -135,7 +159,7 @@ export class DaemonClient {
   private requestOnce<T>(method: string, path: string, body?: unknown): Promise<T> {
     return new Promise((resolve, reject) => {
       const payload = body ? JSON.stringify(body) : undefined;
-      const token = readDaemonToken(this.port);
+      const token = this.token();
       const options: http.RequestOptions = {
         hostname: this.host,
         port: this.port,
