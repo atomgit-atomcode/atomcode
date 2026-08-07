@@ -5,7 +5,6 @@ async fn chat_requires_token_health_is_public() {
     let tmp = std::env::temp_dir().join(format!("atomcode_it_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     std::env::set_var("ATOMCODE_HOME", &tmp);
-    std::env::set_var("ATOMCODE_DAEMON_TOKEN", "it-token");
 
     let port = 18099u16;
     let tmp_for_spawn = tmp.clone();
@@ -59,7 +58,6 @@ async fn chat_requires_token_health_is_public() {
     assert!(tf.exists(), "daemon token file must exist");
 
     handle.abort();
-    std::env::remove_var("ATOMCODE_DAEMON_TOKEN");
     std::env::remove_var("ATOMCODE_HOME");
     let _ = std::fs::remove_dir_all(&tmp);
 }

@@ -18,12 +18,25 @@ pub fn write(port: u16, pid: u32, token: &str) -> std::io::Result<PathBuf> {
     }
     let body = format!("{{\"pid\":{pid},\"port\":{port},\"token\":{}}}",
         serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_string()));
-    std::fs::write(&path, body)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // Create with 0600 up front (no world-readable 0644 window between write
+        // and chmod). `mode` only applies on creation, so also fchmod the handle
+        // to correct a pre-existing (stale) file; truncation empties any old
+        // token before we set perms and write, so the token is never exposed.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(body.as_bytes())?;
     }
+    #[cfg(not(unix))]
+    std::fs::write(&path, body)?;
     Ok(path)
 }
 
