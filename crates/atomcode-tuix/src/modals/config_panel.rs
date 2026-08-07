@@ -1,0 +1,393 @@
+//! Searchable half-screen `/config` editor for non-provider settings.
+
+use anyhow::Result;
+use atomcode_config::settings::{ApplyPolicy, SettingKind, SettingSpec, SETTINGS};
+use crossterm::event::{KeyCode, KeyModifiers};
+
+use super::{Modal, ModalAction};
+use crate::event_loop::{
+    apply_config_panel_commit, build_status, Buffer, LoopCtx, PersistedConfigReload,
+};
+use crate::render::{MenuKind, MenuPayload, Renderer, UiLine};
+use crate::state::UiState;
+
+pub struct ConfigPanel {
+    query: String,
+    selected: usize,
+    editing: Option<&'static SettingSpec>,
+    edit_value: String,
+    replace_edit_value_on_input: bool,
+    pending_reset: Option<&'static str>,
+}
+
+impl ConfigPanel {
+    pub fn open() -> Self {
+        Self {
+            query: String::new(),
+            selected: 0,
+            editing: None,
+            edit_value: String::new(),
+            replace_edit_value_on_input: false,
+            pending_reset: None,
+        }
+    }
+
+    fn filtered(&self) -> Vec<&'static SettingSpec> {
+        SETTINGS
+            .iter()
+            .filter(|setting| setting.matches(&self.query))
+            .collect()
+    }
+
+    fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    fn move_down(&mut self) {
+        let len = self.filtered().len();
+        if self.selected + 1 < len {
+            self.selected += 1;
+        }
+    }
+
+    fn selected_setting(&self) -> Option<&'static SettingSpec> {
+        self.filtered().get(self.selected).copied()
+    }
+
+    fn save(
+        &mut self,
+        setting: &'static SettingSpec,
+        next: Option<&str>,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<()> {
+        let mut previous_document = None;
+        let commit = ctx.config_store.update_document(|document| {
+            previous_document = Some(document.to_string());
+            if let Some(next) = next {
+                setting.patch(document, next)
+            } else {
+                setting.reset(document);
+                Ok(())
+            }
+        })?;
+        let committed_value = setting.value(&commit.snapshot.config);
+        let success_message = format!("✓ {} = {}", setting.id, committed_value);
+        let outcome = apply_config_panel_commit(
+            ctx,
+            commit,
+            previous_document.unwrap_or_default(),
+            setting.apply == ApplyPolicy::AgentReassemble,
+            setting.apply == ApplyPolicy::CapabilityReprepare,
+            success_message.clone(),
+        )?;
+        if matches!(outcome, PersistedConfigReload::Applied { .. }) {
+            renderer.render(UiLine::Muted(success_message));
+        }
+        Ok(())
+    }
+
+    fn activate(&mut self, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> Result<()> {
+        let Some(setting) = self.selected_setting() else {
+            return Ok(());
+        };
+        let current = setting.value(&ctx.config);
+        match setting.kind {
+            SettingKind::Boolean => self.save(
+                setting,
+                Some(if current == "true" { "false" } else { "true" }),
+                ctx,
+                renderer,
+            ),
+            SettingKind::OptionalBoolean => {
+                let values = ["auto", "enabled", "disabled"];
+                let index = values
+                    .iter()
+                    .position(|value| *value == current)
+                    .unwrap_or(0);
+                self.save(
+                    setting,
+                    Some(values[(index + 1) % values.len()]),
+                    ctx,
+                    renderer,
+                )
+            }
+            SettingKind::Choice(values) => {
+                let index = values
+                    .iter()
+                    .position(|value| *value == current)
+                    .unwrap_or(0);
+                self.save(
+                    setting,
+                    Some(values[(index + 1) % values.len()]),
+                    ctx,
+                    renderer,
+                )
+            }
+            SettingKind::Integer { .. } => {
+                self.editing = Some(setting);
+                self.edit_value = current;
+                self.replace_edit_value_on_input = true;
+                Ok(())
+            }
+        }
+    }
+
+    fn draw_payload(&self, ctx: &LoopCtx) -> MenuPayload {
+        let filtered = self.filtered();
+        let zh = matches!(crate::i18n::current_locale(), crate::i18n::Locale::ZhCn);
+        let title = if zh {
+            format!("配置 ({} / {})", filtered.len(), SETTINGS.len())
+        } else {
+            format!("Config ({} / {})", filtered.len(), SETTINGS.len())
+        };
+        let search = if let Some(setting) = self.editing {
+            format!("{} = {}", setting.id, self.edit_value)
+        } else {
+            self.query.clone()
+        };
+        let hint = if let Some(id) = self.pending_reset {
+            if zh {
+                format!("再次按 Delete 恢复 {id} 的默认值")
+            } else {
+                format!("Press Delete again to reset {id}")
+            }
+        } else if zh {
+            "↑↓ 选择 · Enter 修改 · Delete 恢复默认 · Esc 返回".to_string()
+        } else {
+            "↑↓ select · Enter change · Delete reset · Esc close".to_string()
+        };
+        let mut items = vec![
+            (title, String::new()),
+            (String::new(), String::new()),
+            (search, String::new()),
+            (String::new(), String::new()),
+        ];
+        items.extend(filtered.iter().map(|setting| {
+            let label = if zh {
+                setting.label_zh
+            } else {
+                setting.label_en
+            };
+            let policy = match setting.apply {
+                ApplyPolicy::ImmediateUi => {
+                    if zh {
+                        "立即"
+                    } else {
+                        "now"
+                    }
+                }
+                ApplyPolicy::NextTurn => {
+                    if zh {
+                        "下一轮"
+                    } else {
+                        "next turn"
+                    }
+                }
+                ApplyPolicy::AgentReassemble => {
+                    if zh {
+                        "重新加载"
+                    } else {
+                        "reload"
+                    }
+                }
+                ApplyPolicy::CapabilityReprepare => {
+                    if zh {
+                        "重建能力"
+                    } else {
+                        "reprepare"
+                    }
+                }
+                ApplyPolicy::NextStartup => {
+                    if zh {
+                        "重启后"
+                    } else {
+                        "restart"
+                    }
+                }
+            };
+            (
+                label.to_string(),
+                format!("{} · {policy}", setting.value(&ctx.config)),
+            )
+        }));
+        items.push((format!("— {hint} —"), String::new()));
+        MenuPayload {
+            items,
+            selected: if filtered.is_empty() {
+                usize::MAX
+            } else {
+                4 + self.selected
+            },
+            kind: MenuKind::DirectoryList,
+        }
+    }
+}
+
+impl Modal for ConfigPanel {
+    fn handle_key(
+        &mut self,
+        code: KeyCode,
+        mods: KeyModifiers,
+        buf: &mut Buffer,
+        state: &mut UiState,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<ModalAction> {
+        if let Some(setting) = self.editing {
+            match code {
+                KeyCode::Enter => {
+                    let next = self.edit_value.clone();
+                    match self.save(setting, Some(&next), ctx, renderer) {
+                        Ok(()) => {
+                            self.editing = None;
+                            self.edit_value.clear();
+                            self.replace_edit_value_on_input = false;
+                        }
+                        Err(error) => renderer.render(UiLine::Error(error.to_string())),
+                    }
+                }
+                KeyCode::Esc => {
+                    self.editing = None;
+                    self.edit_value.clear();
+                    self.replace_edit_value_on_input = false;
+                }
+                KeyCode::Backspace => {
+                    if self.replace_edit_value_on_input {
+                        self.edit_value.clear();
+                        self.replace_edit_value_on_input = false;
+                    } else {
+                        self.edit_value.pop();
+                    }
+                }
+                KeyCode::Char(c) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                    if self.replace_edit_value_on_input {
+                        self.edit_value.clear();
+                        self.replace_edit_value_on_input = false;
+                    }
+                    self.edit_value.push(c)
+                }
+                _ => {}
+            }
+            self.draw(buf, state, ctx, renderer);
+            return Ok(ModalAction::Continue);
+        }
+
+        if !matches!(code, KeyCode::Delete) {
+            self.pending_reset = None;
+        }
+
+        match code {
+            KeyCode::Up => self.move_up(),
+            KeyCode::Down => self.move_down(),
+            KeyCode::Enter => {
+                if let Err(error) = self.activate(ctx, renderer) {
+                    renderer.render(UiLine::Error(error.to_string()));
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(setting) = self.selected_setting() {
+                    if self.pending_reset == Some(setting.id) {
+                        if let Err(error) = self.save(setting, None, ctx, renderer) {
+                            renderer.render(UiLine::Error(error.to_string()));
+                        }
+                        self.pending_reset = None;
+                    } else {
+                        self.pending_reset = Some(setting.id);
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                self.query.pop();
+                self.selected = 0;
+            }
+            KeyCode::Char(c) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                self.query.push(c);
+                self.selected = 0;
+            }
+            KeyCode::Esc => return Ok(ModalAction::Close),
+            _ => return Ok(ModalAction::Continue),
+        }
+        self.draw(buf, state, ctx, renderer);
+        Ok(ModalAction::Continue)
+    }
+
+    fn handle_paste(
+        &mut self,
+        text: &str,
+        buf: &mut Buffer,
+        state: &mut UiState,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<ModalAction> {
+        let target = if self.editing.is_some() {
+            &mut self.edit_value
+        } else {
+            &mut self.query
+        };
+        target.extend(text.chars().filter(|c| !c.is_control()));
+        self.selected = 0;
+        self.draw(buf, state, ctx, renderer);
+        Ok(ModalAction::Continue)
+    }
+
+    fn draw(&self, _buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+        renderer.render(UiLine::InputPrompt {
+            buf: if self.editing.is_some() {
+                self.edit_value.clone()
+            } else {
+                self.query.clone()
+            },
+            cursor_byte: if self.editing.is_some() {
+                self.edit_value.len()
+            } else {
+                self.query.len()
+            },
+            menu: Some(self.draw_payload(ctx)),
+            status: build_status(state, ctx),
+            attachments: Vec::new(),
+        });
+        renderer.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_filters_by_chinese_label_and_id() {
+        let mut panel = ConfigPanel::open();
+        panel.query = "Todo".into();
+        assert!(panel
+            .filtered()
+            .iter()
+            .all(|setting| setting.id.contains("todo")));
+        panel.query = "主题".into();
+        assert_eq!(panel.filtered()[0].id, "ui.theme");
+    }
+
+    #[test]
+    fn navigation_stays_inside_filtered_results() {
+        let mut panel = ConfigPanel::open();
+        panel.query = "ui.".into();
+        for _ in 0..100 {
+            panel.move_down();
+        }
+        assert_eq!(panel.selected + 1, panel.filtered().len());
+        for _ in 0..100 {
+            panel.move_up();
+        }
+        assert_eq!(panel.selected, 0);
+    }
+
+    #[test]
+    fn search_accepts_spaces_for_multi_word_aliases() {
+        let mut panel = ConfigPanel::open();
+        panel.query = "language server".into();
+        assert!(panel
+            .filtered()
+            .iter()
+            .all(|setting| setting.id.starts_with("lsp.")));
+    }
+}

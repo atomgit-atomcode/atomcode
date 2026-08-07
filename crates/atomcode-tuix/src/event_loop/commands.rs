@@ -30,7 +30,7 @@ use crate::custom_commands::ArgsRequirement;
 use crate::i18n::{t, Msg};
 use crate::modals::usage::{UsageData, UsageModal};
 use crate::modals::{
-    DiffViewer, DirPicker, FileViewer, LanguagePicker, Modal, ModelPicker, ProxyPicker,
+    ConfigPanel, DiffViewer, DirPicker, FileViewer, LanguagePicker, Modal, ModelPicker, ProxyPicker,
 };
 use crate::render::{Renderer, UiLine};
 use crate::session::{Session, SessionId};
@@ -1658,36 +1658,8 @@ fn execute_slash_command_impl(
             submit_agent_turn(ctx, state, review_prompt(arg));
         }
         "config" => {
-            // Head: current active provider + config path so users know
-            // which provider is talking and where to edit.
-            let config_path = ctx.config_store.path().display().to_string();
-            let mut txt = t(Msg::ConfigProviderLabel {
-                provider: &ctx.config.default_provider,
-                path: &config_path,
-            })
-            .into_owned();
-            // Body: one minimal runnable example + pointer to the full
-            // reference so users know where to get Claude / OpenAI /
-            // Ollama variants without flooding the terminal here.
-            txt.push_str(
-                "  Example:\n\
-                 \n\
-                 ```toml\n\
-                 default_provider = \"deepseek\"\n\
-                 \n\
-                 [providers.deepseek]\n\
-                 type           = \"openai\"\n\
-                 api_key        = \"sk-...\"\n\
-                 model          = \"deepseek-chat\"\n\
-                 base_url       = \"https://api.deepseek.com/v1\"\n\
-                 context_window = 64000\n\
-                 ```\n\
-                 \n\
-                 Full reference: docs/config.example.toml (every field, every provider flavour).\n\
-                 Edit the file, then run /reload — no restart needed.\n",
-            );
-            renderer.render(UiLine::CommandOutput(txt));
-            renderer.flush();
+            *active_modal = Some(Box::new(ConfigPanel::open()));
+            return Ok(());
         }
         "reload" => {
             match reload_persisted_config(ctx) {

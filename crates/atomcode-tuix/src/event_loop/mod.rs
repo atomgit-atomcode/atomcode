@@ -94,6 +94,27 @@ fn reload_runtime_provider_from(
     ctx: &LoopCtx,
     source: &Config,
 ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+    let agent_cfg = coding_agent_config_from(ctx, source);
+    ctx.runtime.reload_provider(
+        agent_cfg,
+        ctx.foreground_runtime_id,
+        ctx.runtime_event_tx.clone(),
+    )
+}
+
+fn reprepare_runtime_config_from(
+    ctx: &LoopCtx,
+    source: &Config,
+) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+    let agent_cfg = coding_agent_config_from(ctx, source);
+    ctx.runtime.reprepare_config(
+        agent_cfg,
+        ctx.foreground_runtime_id,
+        ctx.runtime_event_tx.clone(),
+    )
+}
+
+fn coding_agent_config_from(ctx: &LoopCtx, source: &Config) -> atomcode_coding::CodingAgentConfig {
     let mut config = atomcode_coding::CodingRuntimeConfig::from_config(
         source,
         &ctx.working_dir,
@@ -110,11 +131,7 @@ fn reload_runtime_provider_from(
     let mut agent_cfg = config.agent_config();
     agent_cfg.round_cap_checkpoint = true; // TUI implements the checkpoint panel (Task 3+)
     agent_cfg.next_prompt_suggestions = true;
-    ctx.runtime.reload_provider(
-        agent_cfg,
-        ctx.foreground_runtime_id,
-        ctx.runtime_event_tx.clone(),
-    )
+    agent_cfg
 }
 
 pub(crate) fn request_context_stats_render(
@@ -1735,6 +1752,19 @@ fn is_provider_reload_failure(event: &bg_runtime::RuntimeEventPayload) -> bool {
     }
 }
 
+fn is_provider_reload_terminal(event: &bg_runtime::RuntimeEventPayload) -> bool {
+    match event {
+        bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::ProviderReloadFinished(_)) => {
+            true
+        }
+        bg_runtime::RuntimeEventPayload::SequencedNative(envelope) => matches!(
+            &envelope.event,
+            CodingRuntimeEvent::ProviderReloadFinished(_)
+        ),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod submit_hold_tests {
     use super::*;
@@ -2329,6 +2359,11 @@ enum ReadyRuntimeRequest {
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     },
+    ReprepareConfig {
+        next: atomcode_coding::CodingAgentConfig,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
     DeactivateProvider {
         reason: atomcode_coding::ProviderUnavailableReason,
         runtime_id: bg_runtime::RuntimeId,
@@ -2384,6 +2419,7 @@ impl ReadyRuntimeControl {
         let phase = self.handle.status().phase;
         let allowed = match &request {
             ReadyRuntimeRequest::ReloadProvider { .. }
+            | ReadyRuntimeRequest::ReprepareConfig { .. }
             | ReadyRuntimeRequest::DeactivateProvider { .. } => matches!(
                 phase,
                 atomcode_coding::RuntimePhase::Ready
@@ -2593,6 +2629,22 @@ impl ReadyRuntimeControl {
                     event_tx,
                 } => {
                     let result = self.handle.reassemble_provider(next).await;
+                    RuntimeControl::send_native_result(
+                        &event_tx,
+                        runtime_id,
+                        CodingRuntimeEvent::ProviderReloadFinished(result),
+                    );
+                }
+                ReadyRuntimeRequest::ReprepareConfig {
+                    next,
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self
+                        .handle
+                        .reprepare_config(next)
+                        .await
+                        .map(|changed| changed.generation);
                     RuntimeControl::send_native_result(
                         &event_tx,
                         runtime_id,
@@ -3139,6 +3191,25 @@ impl RuntimeControl {
         }
     }
 
+    pub fn reprepare_config(
+        &self,
+        next: atomcode_coding::CodingAgentConfig,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::ReprepareConfig {
+                next,
+                runtime_id,
+                event_tx,
+            }),
+            Self::Deferred(deferred) if deferred.provider_operation_allowed() => {
+                deferred.send(atomcode_coding::DriverCommand::ReprepareConfig(next))
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
     pub fn deactivate_provider(
         &self,
         reason: atomcode_coding::ProviderUnavailableReason,
@@ -3540,6 +3611,7 @@ pub(crate) struct PendingProviderReload {
     desired_config: Config,
     persisted_revision: Option<ConfigRevision>,
     rollback_persisted_config: Option<Config>,
+    rollback_persisted_document: Option<String>,
     rollback_runtime_config: Option<Config>,
     previous_model_name: Option<String>,
     announce: Option<String>,
@@ -8593,6 +8665,8 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             maybe = ctx.runtime_event_rx.recv() => {
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let redraw_modal_after_terminal =
+                        is_provider_reload_terminal(&runtime_event.event);
                     let provider_reload_failed =
                         is_provider_reload_failure(&runtime_event.event);
                     let base_queue_action = type_ahead_queue_action(&runtime_event.event);
@@ -8683,6 +8757,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         } else {
                             crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
                             redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                        }
+                    }
+                    if redraw_modal_after_terminal {
+                        if let Some(modal) = app.active_modal.as_ref() {
+                            modal.draw(&app.buf, &app.state, &ctx, renderer);
                         }
                     }
                 } else {
@@ -8985,6 +9064,8 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             maybe = ctx.runtime_event_rx.recv() => {
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let redraw_modal_after_terminal =
+                        is_provider_reload_terminal(&runtime_event.event);
                     let provider_reload_failed =
                         is_provider_reload_failure(&runtime_event.event);
                     let base_queue_action = type_ahead_queue_action(&runtime_event.event);
@@ -9068,6 +9149,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         } else {
                             crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
                             redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                        }
+                    }
+                    if redraw_modal_after_terminal {
+                        if let Some(modal) = app.active_modal.as_ref() {
+                            modal.draw(&app.buf, &app.state, &ctx, renderer);
                         }
                     }
                 } else {
@@ -10396,6 +10482,7 @@ fn reconcile_persisted_config(
         desired_config: desired,
         persisted_revision: Some(snapshot.revision),
         rollback_persisted_config: None,
+        rollback_persisted_document: None,
         rollback_runtime_config: None,
         previous_model_name: None,
         announce: None,
@@ -10432,6 +10519,108 @@ pub(crate) fn reload_persisted_config(
         }
         ManualReloadDisposition::Start => reconcile_persisted_config(ctx, snapshot, true),
     }
+}
+
+/// Apply a document-level `/config` commit through the existing runtime owner.
+/// Runtime-affecting settings force the same generation-checked reprepare used
+/// by provider reloads; all other settings update the driver projection only.
+/// The exact pre-edit TOML is retained for CAS rollback until the authoritative
+/// reload terminal arrives.
+pub(crate) fn apply_config_panel_commit(
+    ctx: &mut LoopCtx,
+    commit: ConfigCommit,
+    previous_document: String,
+    force_agent_reassemble: bool,
+    force_capability_reprepare: bool,
+    success_message: String,
+) -> Result<PersistedConfigReload, anyhow::Error> {
+    if provider_transition_pending(ctx) {
+        let rollback = ctx.config_store.replace_document_if_revision(
+            &commit.snapshot.revision,
+            &previous_document,
+        )?;
+        if rollback.is_some() {
+            ctx.observed_config_revision = rollback.map(|commit| commit.snapshot.revision);
+        }
+        anyhow::bail!("a runtime configuration transition is already in progress");
+    }
+    let desired = desired_config_from_snapshot(ctx, commit.snapshot.config, false);
+    let auth_available = AuthObservation::read().is_available();
+    let wants_reload = force_agent_reassemble
+        || force_capability_reprepare
+        || should_reload_provider(
+            ctx.provider_selection_mode,
+            &ctx.config,
+            &desired,
+            ctx.runtime.ui_availability(),
+            auth_available,
+        )
+        || active_provider_config_changed(&ctx.config, &desired);
+
+    if !wants_reload {
+        let (provider, model) = resolved_provider_and_model(&desired);
+        if ctx.config.language != desired.language {
+            crate::i18n::set_locale(atomcode_config::i18n::resolve_initial_locale(
+                None,
+                desired.language,
+            ));
+        }
+        ctx.config = desired;
+        ctx.model_name = model.clone();
+        atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+        ctx.observed_config_revision = Some(commit.snapshot.revision);
+        ctx.observed_auth = None;
+        return Ok(PersistedConfigReload::Applied { provider, model });
+    }
+
+    let previous_runtime_config = ctx.config.clone();
+    let previous_model_name = ctx.model_name.clone();
+    let origin_generation = ctx.runtime.current_generation();
+    atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
+    let start = if force_capability_reprepare {
+        reprepare_runtime_config_from(ctx, &desired)
+    } else {
+        reload_runtime_provider_from(ctx, &desired)
+    };
+    if let Err(error) = start {
+        let rollback = rollback_pending_provider_reload(
+            ctx,
+            PendingProviderReload {
+                origin_generation,
+                desired_config: desired,
+                persisted_revision: Some(commit.snapshot.revision),
+                rollback_persisted_config: None,
+                rollback_persisted_document: Some(previous_document),
+                rollback_runtime_config: Some(previous_runtime_config),
+                previous_model_name: Some(previous_model_name),
+                announce: None,
+                language_change_notice: LanguageChangeNotice::None,
+                manual_reload_announce: false,
+                selection_mode_after_success: None,
+            },
+        );
+        let suffix = rollback
+            .error
+            .map(|rollback_error| format!("; config rollback failed: {rollback_error}"))
+            .unwrap_or_default();
+        anyhow::bail!("runtime reprepare could not be started: {error}{suffix}");
+    }
+
+    ctx.observed_config_revision = Some(commit.snapshot.revision.clone());
+    ctx.pending_provider_reload = Some(PendingProviderReload {
+        origin_generation,
+        desired_config: desired,
+        persisted_revision: Some(commit.snapshot.revision),
+        rollback_persisted_config: None,
+        rollback_persisted_document: Some(previous_document),
+        rollback_runtime_config: Some(previous_runtime_config),
+        previous_model_name: Some(previous_model_name),
+        announce: Some(success_message),
+        language_change_notice: LanguageChangeNotice::None,
+        manual_reload_announce: false,
+        selection_mode_after_success: None,
+    });
+    Ok(PersistedConfigReload::Queued)
 }
 
 /// Observe the shared config at an idle boundary. Normal interactive sessions
@@ -10512,6 +10701,7 @@ fn poll_external_auth(ctx: &mut LoopCtx) -> bool {
                     desired_config: ctx.config.clone(),
                     persisted_revision: None,
                     rollback_persisted_config: None,
+                    rollback_persisted_document: None,
                     rollback_runtime_config: None,
                     previous_model_name: None,
                     announce: None,
@@ -13374,12 +13564,30 @@ fn rollback_pending_provider_reload(
     let PendingProviderReload {
         persisted_revision,
         rollback_persisted_config,
+        rollback_persisted_document,
         rollback_runtime_config,
         previous_model_name,
         ..
     } = pending;
-    let (error, persisted_superseded) = match (persisted_revision, rollback_persisted_config) {
-        (Some(revision), Some(previous)) => {
+    let (error, persisted_superseded) = match (
+        persisted_revision,
+        rollback_persisted_document,
+        rollback_persisted_config,
+    ) {
+        (Some(revision), Some(previous), _) => {
+            match ctx
+                .config_store
+                .replace_document_if_revision(&revision, &previous)
+            {
+                Ok(Some(commit)) => {
+                    ctx.observed_config_revision = Some(commit.snapshot.revision);
+                    (None, false)
+                }
+                Ok(None) => (None, true),
+                Err(error) => (Some(error.to_string()), true),
+            }
+        }
+        (Some(revision), None, Some(previous)) => {
             match ctx.config_store.update_if_revision(&revision, |config| {
                 *config = previous;
                 Ok(())
@@ -13392,11 +13600,11 @@ fn rollback_pending_provider_reload(
                 Err(error) => (Some(error.to_string()), true),
             }
         }
-        (Some(revision), None) => match ctx.config_store.read() {
+        (Some(revision), None, None) => match ctx.config_store.read() {
             Ok(snapshot) => (None, snapshot.revision != revision),
             Err(error) => (Some(error.to_string()), true),
         },
-        (None, _) => (None, false),
+        (None, _, _) => (None, false),
     };
     if let Some(previous) = rollback_runtime_config {
         ctx.config = previous;
@@ -13573,6 +13781,7 @@ fn stage_committed_config_reload(
                 desired_config: desired,
                 persisted_revision: Some(commit.snapshot.revision),
                 rollback_persisted_config,
+                rollback_persisted_document: None,
                 rollback_runtime_config,
                 previous_model_name: Some(previous_model_name),
                 announce: None,
@@ -13597,6 +13806,7 @@ fn stage_committed_config_reload(
         desired_config: desired,
         persisted_revision: Some(commit.snapshot.revision),
         rollback_persisted_config,
+        rollback_persisted_document: None,
         rollback_runtime_config,
         previous_model_name: Some(previous_model_name),
         announce: Some(success_message),
@@ -13763,6 +13973,7 @@ pub(crate) fn select_provider_and_reload(
         desired_config: desired,
         persisted_revision: None,
         rollback_persisted_config: None,
+        rollback_persisted_document: None,
         rollback_runtime_config: None,
         previous_model_name: None,
         announce: Some(
@@ -13879,6 +14090,7 @@ pub(crate) fn set_default_provider_and_reload(
                 desired_config: desired,
                 persisted_revision: Some(commit.snapshot.revision),
                 rollback_persisted_config: previous_persisted,
+                rollback_persisted_document: None,
                 rollback_runtime_config: Some(ctx.config.clone()),
                 previous_model_name: Some(ctx.model_name.clone()),
                 announce: None,
@@ -13904,6 +14116,7 @@ pub(crate) fn set_default_provider_and_reload(
         desired_config: desired,
         persisted_revision: Some(commit.snapshot.revision),
         rollback_persisted_config: previous_persisted,
+        rollback_persisted_document: None,
         rollback_runtime_config: Some(ctx.config.clone()),
         previous_model_name: Some(ctx.model_name.clone()),
         announce: Some(

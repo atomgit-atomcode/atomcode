@@ -37,6 +37,9 @@ pub mod config;
 /// Transactional, cross-process-safe access to `config.toml`.
 pub mod store;
 
+/// Safe, UI-neutral catalog of editable non-provider settings.
+pub mod settings;
+
 /// Pure parsers for OS system-proxy descriptions: Windows ProxyServer/ProxyOverride
 /// and macOS `scutil --proxy` output → normalized HTTP(S)_PROXY / NO_PROXY values.
 pub mod system_proxy;

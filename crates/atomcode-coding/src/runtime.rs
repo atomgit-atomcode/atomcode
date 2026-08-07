@@ -418,6 +418,7 @@ pub enum DriverCommand {
     SetMode(RuntimeMode),
     QueueLocalContext(LocalContextInput),
     ReloadProvider(CodingAgentConfig),
+    ReprepareConfig(CodingAgentConfig),
     DeactivateProvider(ProviderUnavailableReason),
     UndoToPrompt(Option<usize>),
     Rewind {
@@ -1076,6 +1077,14 @@ impl CodingRuntimeHandle {
                     done,
                 }
             }
+            DriverCommand::ReprepareConfig(next) => {
+                let (done, _result) = oneshot::channel();
+                CodingRuntimeControl::Reprepare {
+                    generation,
+                    target: ReprepareTarget::ReloadConfig(next),
+                    done,
+                }
+            }
             DriverCommand::DeactivateProvider(reason) => {
                 let (done, _result) = oneshot::channel();
                 CodingRuntimeControl::DeactivateProvider {
@@ -1341,6 +1350,15 @@ impl CodingRuntimeHandle {
 
     pub async fn reload_capabilities(&self) -> Result<SessionChanged, RuntimeError> {
         self.reload_capabilities_with_plugin_skills(None).await
+    }
+
+    /// Rebuild every prepared capability with `next`, preserving the current
+    /// session and runtime continuity stores.
+    pub async fn reprepare_config(
+        &self,
+        next: CodingAgentConfig,
+    ) -> Result<SessionChanged, RuntimeError> {
+        self.reprepare_target(ReprepareTarget::ReloadConfig(next)).await
     }
 
     /// Reload the capability graph, optionally replacing the plugin skill
@@ -2112,6 +2130,7 @@ pub enum ReprepareTarget {
     Reload {
         plugin_skill_dirs: Option<Vec<(std::path::PathBuf, String)>>,
     },
+    ReloadConfig(CodingAgentConfig),
     Fresh,
     Resume(String),
     ResumeWithLease {
@@ -2229,6 +2248,7 @@ fn runtime_phase_accepts_command(phase: RuntimePhase, command: &DriverCommand) -
         RuntimePhase::AwaitingProvider | RuntimePhase::Failed => matches!(
             command,
             DriverCommand::ReloadProvider(_)
+                | DriverCommand::ReprepareConfig(_)
                 | DriverCommand::DeactivateProvider(_)
                 | DriverCommand::Shutdown
         ),
@@ -4240,7 +4260,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
-                        let withdraws_mcp = matches!(&target, ReprepareTarget::Reload { .. });
+                        let withdraws_mcp = matches!(
+                            &target,
+                            ReprepareTarget::Reload { .. } | ReprepareTarget::ReloadConfig(_)
+                        );
                         let resolved = match resolve_reprepare_input(&runtime, target) {
                             Ok(input) => input,
                             Err(error) => {
@@ -6141,6 +6164,21 @@ fn resolve_reprepare_input(
             Ok(Some((
                 ReprepareInput {
                     config: runtime.config.clone(),
+                    prepare,
+                    operation: ReconfigureKind::Reprepare,
+                },
+                None,
+            )))
+        }
+        ReprepareTarget::ReloadConfig(config) => {
+            let mut prepare = runtime.prepare.clone();
+            prepare.session = match runtime.parts.session.as_ref() {
+                Some(binding) => crate::SessionMode::Resume(binding.id.clone()),
+                None => crate::SessionMode::Disabled,
+            };
+            Ok(Some((
+                ReprepareInput {
+                    config,
                     prepare,
                     operation: ReconfigureKind::Reprepare,
                 },
@@ -11996,6 +12034,46 @@ mod tests {
 
         let second = CodingRuntime::start(start()).await.unwrap();
         second.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn config_reprepare_advances_generation_and_keeps_the_current_session() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let session_id = "config-reprepare-session";
+        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
+        persist_native_session(
+            &manager,
+            session_id,
+            project.path(),
+            &SessionSnapshot::new(vec![Message::user("persisted before reprepare")]),
+        );
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume(session_id.into());
+        let mut next_config = start.agent.clone();
+        next_config.todo.enabled = !next_config.todo.enabled;
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        let before = runtime.handle.status();
+
+        let changed = runtime
+            .handle
+            .reprepare_config(next_config)
+            .await
+            .unwrap();
+
+        assert!(changed.generation.0 > before.generation);
+        assert_eq!(changed.session_id.as_deref(), Some(session_id));
+        assert_eq!(changed.working_dir, project.path());
+        assert_eq!(runtime.handle.status().generation, changed.generation.0);
+        let snapshot = runtime.handle.snapshot().await.unwrap();
+        assert!(snapshot
+            .messages
+            .iter()
+            .any(|message| message.text == "persisted before reprepare"));
+        runtime.handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
