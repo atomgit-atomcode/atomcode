@@ -49,6 +49,11 @@ use atomcode_telemetry::{
 /// and on Windows can panic if the console handle isn't a real TTY.
 static HEADLESS_MODE: AtomicBool = AtomicBool::new(false);
 
+/// Set once the startup synchronous upgrade check has run this launch, so the
+/// post-parse detached stager can skip a redundant second `latest.json` fetch —
+/// the sync path already checked (and applied, if newer) on this same launch.
+static SYNC_UPGRADE_CHECKED: AtomicBool = AtomicBool::new(false);
+
 /// Restore terminal state if (and only if) we ever entered TUI mode.
 /// No-op in headless mode — see [`HEADLESS_MODE`].
 ///
@@ -344,6 +349,194 @@ async fn run_prepare_upgrade_worker() -> i32 {
     match atomcode_updater::prepare_deferred_upgrade(&current, tx).await {
         Ok(_) => 0,
         Err(_) => 1,
+    }
+}
+
+/// Whether the startup-time SYNCHRONOUS upgrade path should fire. Restored (with the
+/// detached stager kept alongside) after 31daa6ee removed it: the everyday startup cost
+/// this guards is only a small `latest.json` fetch — the heavy `models.dev` metadata
+/// refresh stays off the critical path — so a fresh release is applied on THIS launch
+/// instead of requiring two restarts. Returns false for `.bak`, dev, `ATOMCODE_PLAIN`,
+/// headless `-p`, subcommands, `auto_update = false`, or offline mode.
+fn should_try_sync_upgrade() -> bool {
+    if is_running_as_backup() {
+        return false;
+    }
+    if is_dev_mode() {
+        return false;
+    }
+    // Package-managed (distro-pm / HarmonyBrew) builds: upgrades belong to the package
+    // manager. Match the detached stager's gate so we don't spin up the check for a
+    // guaranteed no-op (`prepare_deferred_upgrade` early-returns on pm builds anyway).
+    if atomcode_updater::is_package_managed() {
+        return false;
+    }
+
+    // PlainRenderer 模式（ATOMCODE_PLAIN=1）：跳过同步自更新检查。
+    // 自更新用 eprintln! 直接写 stderr，和 PlainRenderer 的 stdout
+    // 流式输出交错，破坏启动体验。后台异步自更新不受影响，用户仍可
+    // 手动 /upgrade。
+    if std::env::var("ATOMCODE_PLAIN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_some()
+    {
+        return false;
+    }
+
+    let args: Vec<String> = std::env::args().collect();
+    let any = |needle: &[&str]| {
+        args.iter().skip(1).any(|a| {
+            needle
+                .iter()
+                .any(|n| a == n || a.starts_with(&format!("{}=", n)))
+        })
+    };
+
+    if any(&["-p", "--prompt", "--prompt-file"]) {
+        return false;
+    }
+    if args.iter().skip(1).any(|a| {
+        matches!(
+            a.as_str(),
+            "login"
+                | "logout"
+                | "status"
+                | "upgrade"
+                | "rollback"
+                | "uninstall"
+                | "mcp"
+                | "telemetry"
+                | "completion"
+                | "--version"
+                | "-V"
+                | "--help"
+                | "-h"
+        )
+    }) {
+        return false;
+    }
+
+    // Load config once to honor both `auto_update = false` and `offline_mode`.
+    // Runs pre-seed, so offline is resolved directly rather than via the process
+    // verdict. Env wins over config; only forced On skips. Failure to load = assume
+    // defaults (auto_update true, offline Off) — fresh installs benefit.
+    let path = atomcode_config::config::Config::default_path();
+    let offline_mode = if path.exists() {
+        if let Ok(cfg) = atomcode_config::config::Config::load(&path) {
+            if !cfg.auto_update {
+                return false;
+            }
+            cfg.offline_mode
+        } else {
+            atomcode_config::config::offline::OfflineMode::Off
+        }
+    } else {
+        atomcode_config::config::offline::OfflineMode::Off
+    };
+    // Offline (env wins over config; only forced On skips) disables binary self-update,
+    // same as auto_update=false. Works even with no config file (e.g. air-gapped container).
+    if atomcode_config::config::offline::offline_resolved(
+        offline_mode,
+        std::env::var(atomcode_config::config::offline::ATOMCODE_OFFLINE_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        return false;
+    }
+
+    true
+}
+
+/// Synchronous startup upgrade: fetch the manifest, and if a newer version is out,
+/// stage + apply it NOW and re-exec, so the user gets the new binary on THIS launch.
+/// Bounded by a 120s timeout; on timeout/error it just continues (the detached stager
+/// and `/upgrade` remain as fallbacks). Restored verbatim from the pre-31daa6ee path.
+async fn sync_stage_and_apply_if_newer() {
+    use atomcode_updater::{self as self_update, UpgradeEvent};
+
+    let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UpgradeEvent>();
+
+    // Progress consumer: renders ManifestFetched / Downloading / Verifying
+    // as a single-line updating status on stderr. Percent-debounced so a
+    // 15 MB download at 64 KiB chunks doesn't flood the terminal.
+    let progress = tokio::spawn(async move {
+        use std::io::Write;
+        let mut last_pct: i32 = -1;
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                UpgradeEvent::ManifestFetched { version } => {
+                    eprintln!("✨ New version available: {}", version);
+                }
+                UpgradeEvent::Downloading { bytes, total } => {
+                    let pct = if total == 0 {
+                        0
+                    } else {
+                        ((bytes * 100) / total) as i32
+                    };
+                    if pct != last_pct {
+                        eprint!(
+                            "\r   Downloading {}% ({:.1} / {:.1} MB)      ",
+                            pct,
+                            bytes as f64 / 1_048_576.0,
+                            total as f64 / 1_048_576.0
+                        );
+                        let _ = std::io::stderr().flush();
+                        last_pct = pct;
+                    }
+                }
+                UpgradeEvent::Verifying => {
+                    eprintln!("\n✓ Verifying sha256");
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        self_update::prepare_deferred_upgrade(&current, tx),
+    )
+    .await;
+
+    // Wait briefly for the progress consumer to drain — it closes when
+    // the sender drops at the end of prepare_deferred_upgrade.
+    let _ = progress.await;
+
+    match outcome {
+        Ok(Ok(Some(_staged))) => {
+            // Staged successfully. Apply right now so the user gets the new
+            // binary on this same invocation.
+            match self_update::apply_pending_upgrade() {
+                Ok(Some(applied)) => {
+                    eprintln!("✓ Upgrading to {}...", applied.version);
+                    // Save the CURRENT version (before upgrade) so TUI can show "Upgraded old → new"
+                    std::env::set_var(UPGRADED_FROM_ENV, &current);
+                    match self_update::re_exec_self(Some(&applied.exe)) {
+                        Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
+                        Err(e) => {
+                            eprintln!(
+                                "Upgrade applied but re-exec failed ({}). The new version will be used on the next launch.",
+                                e
+                            );
+                            std::env::remove_var(UPGRADED_FROM_ENV);
+                        }
+                    }
+                }
+                _ => {
+                    // Stage succeeded but apply didn't — weird, just continue.
+                }
+            }
+        }
+        Ok(Ok(None)) => {
+            // Already latest, no-op.
+        }
+        Ok(Err(_)) | Err(_) => {
+            // Network error or 120 s timeout. Don't spam the user —
+            // `/upgrade` will surface the real error if they ask.
+            eprintln!("Note: could not check for updates at startup (will retry in background).");
+        }
     }
 }
 
@@ -987,7 +1180,21 @@ async fn async_main() {
                     }
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                // Nothing was staged by a prior session. Do a fresh synchronous
+                // check → stage → apply so a newly-released version is picked up on
+                // THIS launch (restores the pre-31daa6ee "one restart upgrades you"
+                // behavior). The everyday no-update case is just a small latest.json
+                // fetch; should_try_sync_upgrade's gates + a 120s timeout keep
+                // headless / opted-out / offline runs fast, and the detached stager
+                // below stays as the survives-quick-exit fallback.
+                if should_try_sync_upgrade() {
+                    // Remember we checked, so the post-parse detached stager doesn't
+                    // re-fetch the manifest a second time this launch.
+                    SYNC_UPGRADE_CHECKED.store(true, Ordering::Relaxed);
+                    sync_stage_and_apply_if_newer().await;
+                }
+            }
             Err(e) => {
                 eprintln!("Note: pending upgrade could not be applied ({}). Continuing with current version.", e);
             }
@@ -1721,6 +1928,11 @@ async fn run() -> Result<i32> {
                 && !is_running_as_backup()
                 && !cli.dev
                 && !atomcode_updater::is_package_managed()
+                // Skip when the startup synchronous path already checked (and applied,
+                // if newer) this launch — otherwise both fetch `latest.json`. The
+                // detached stager stays as the fallback for launches where the sync
+                // path was skipped (e.g. ATOMCODE_PLAIN).
+                && !SYNC_UPGRADE_CHECKED.load(Ordering::Relaxed)
             {
                 spawn_detached_upgrade_prep();
             }
