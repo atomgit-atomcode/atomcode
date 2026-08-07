@@ -10,6 +10,7 @@
 
 use crate::highlight::theme;
 use crate::terminal::TerminalCaps;
+use std::borrow::Cow;
 
 /// Parser state maintained across lines of a streamed response.
 #[derive(Clone)]
@@ -1021,6 +1022,10 @@ fn render_flat_table(parsed: &[Vec<String>], caps: TerminalCaps) -> String {
 /// Walk the same parser `render_inline` uses, emit only the inner text,
 /// preserve unclosed markers verbatim (matching render's fallback).
 fn strip_md_for_width(s: &str) -> String {
+    // Keep width measurement in lockstep with `render_inline`: the display-only
+    // circled-list spacing is visible content and therefore must participate in
+    // table sizing and wrapping decisions as well.
+    let s = normalize_circled_list_spacing(s);
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1103,8 +1108,9 @@ pub fn render_inline_line(line: &str, caps: TerminalCaps) -> String {
 // ─── Helpers ───
 
 fn render_inline(line: &str, caps: TerminalCaps) -> String {
+    let line = normalize_circled_list_spacing(line);
     if !caps.colors {
-        return line.to_string();
+        return line.into_owned();
     }
     let mut out = String::with_capacity(line.len() + 16);
     let mut chars = line.chars().peekable();
@@ -1191,6 +1197,83 @@ fn render_inline(line: &str, caps: TerminalCaps) -> String {
         }
     }
     out
+}
+
+/// Add a visual separator after circled list numbers in ordinary prose.
+///
+/// Some Windows fonts let the right edge of `①`–`⑳` touch the following
+/// glyph when a model emits compact text such as `：①Rust` or ` ②前端`.
+/// Normalize only list-shaped boundaries and leave inline code and embedded
+/// identifiers (`第①章`) byte-for-byte unchanged. This runs on the ephemeral
+/// Markdown projection; conversation/session source text is never rewritten.
+fn normalize_circled_list_spacing(line: &str) -> Cow<'_, str> {
+    let mut chars = line.char_indices().peekable();
+    let mut previous = None;
+    let mut in_code = false;
+    let mut output: Option<String> = None;
+    let mut segment_start = 0;
+
+    while let Some((index, ch)) = chars.next() {
+        if ch == '`' {
+            in_code = !in_code;
+        } else if !in_code
+            && ('\u{2460}'..='\u{2473}').contains(&ch)
+            && previous.is_none_or(is_circled_list_boundary)
+            && chars
+                .peek()
+                .is_some_and(|(_, next)| is_list_label_char(*next))
+        {
+            let end = index + ch.len_utf8();
+            let output = output.get_or_insert_with(|| String::with_capacity(line.len() + 1));
+            output.push_str(&line[segment_start..end]);
+            output.push(' ');
+            segment_start = end;
+        }
+        previous = Some(ch);
+    }
+
+    match output {
+        Some(mut output) => {
+            output.push_str(&line[segment_start..]);
+            Cow::Owned(output)
+        }
+        None => Cow::Borrowed(line),
+    }
+}
+
+fn is_circled_list_boundary(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '：' | '，'
+                | '。'
+                | '；'
+                | '！'
+                | '？'
+                | '、'
+                | '（'
+                | '）'
+                | '【'
+                | '】'
+                | '《'
+                | '》'
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+        )
+}
+
+fn is_list_label_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric()
+        || matches!(
+            ch,
+            '\u{3400}'..='\u{4DBF}'
+                | '\u{4E00}'..='\u{9FFF}'
+                | '\u{F900}'..='\u{FAFF}'
+                | '\u{3040}'..='\u{30FF}'
+                | '\u{AC00}'..='\u{D7AF}'
+        )
 }
 
 /// Return the marker and marker width for a fenced-code opening line.
@@ -1655,6 +1738,97 @@ mod tests {
             !rendered.contains("\x1b[1;38;2;"),
             "inline code must NOT include truecolor RGB: {}",
             rendered
+        );
+    }
+
+    #[test]
+    fn circled_list_numbers_gain_visual_spacing_at_prose_boundaries() {
+        assert_eq!(
+            render_inline_line("现在批量落地：①Rust 修复 ②前端修复", plain_caps()),
+            "现在批量落地：① Rust 修复 ② 前端修复"
+        );
+        assert_eq!(render_inline_line("③Task", plain_caps()), "③ Task");
+        assert_eq!(render_inline_line("⑳版本", plain_caps()), "⑳ 版本");
+    }
+
+    #[test]
+    fn circled_list_spacing_preserves_code_existing_spaces_and_identifiers() {
+        assert_eq!(
+            render_inline_line("`①Rust` 和 `②前端`", plain_caps()),
+            "`①Rust` 和 `②前端`"
+        );
+        assert_eq!(
+            render_inline_line("① Rust、② 前端、第①章、build①Rust", plain_caps()),
+            "① Rust、② 前端、第①章、build①Rust"
+        );
+    }
+
+    #[test]
+    fn circled_list_spacing_keeps_inline_code_styled_content_unchanged() {
+        let rendered = render_inline_line("说明：①Rust，代码 `②前端`", caps());
+        assert!(rendered.contains("说明：① Rust，代码 "));
+        assert!(rendered.contains(&format!(
+            "{}②前端{}",
+            theme::md_inline_code_open(),
+            theme::MD_INLINE_CODE_CLOSE
+        )));
+    }
+
+    #[test]
+    fn circled_list_spacing_is_included_in_table_width_measurement() {
+        assert_eq!(
+            strip_md_for_width("说明：①Rust ②前端"),
+            "说明：① Rust ② 前端"
+        );
+        assert_eq!(strip_md_for_width("`①Rust` 第①章"), "①Rust 第①章");
+    }
+
+    #[test]
+    fn circled_list_spacing_keeps_table_borders_aligned() {
+        let rows = vec![
+            "| 项目 | 状态 |".to_string(),
+            "| --- | --- |".to_string(),
+            "| ①Rust | done |".to_string(),
+            "| ②前端 | pending |".to_string(),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
+        let widths: Vec<usize> = out
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(crate::width::display_width)
+            .collect();
+
+        assert!(
+            out.contains("① Rust"),
+            "first label was not normalized: {out}"
+        );
+        assert!(
+            out.contains("② 前端"),
+            "second label was not normalized: {out}"
+        );
+        assert!(
+            widths.windows(2).all(|pair| pair[0] == pair[1]),
+            "every table row must share one display width; got {widths:?} for\n{out}"
+        );
+    }
+
+    #[test]
+    fn circled_list_spacing_survives_narrow_table_fallback() {
+        let rows = vec![
+            "| 项目 | 很长的状态说明 |".to_string(),
+            "| --- | --- |".to_string(),
+            "| ①Rust | 正在执行一个很长的任务 |".to_string(),
+            "| ②前端 | 等待处理另一个很长的任务 |".to_string(),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 20);
+
+        assert!(
+            out.contains("① Rust"),
+            "first label was not normalized: {out}"
+        );
+        assert!(
+            out.contains("② 前端"),
+            "second label was not normalized: {out}"
         );
     }
 
