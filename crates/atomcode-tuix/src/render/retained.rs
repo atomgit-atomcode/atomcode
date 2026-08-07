@@ -498,8 +498,9 @@ fn todo_panel_rows(
     // Overflow: show a WINDOW of `body_budget` items that ALWAYS contains the current
     // frontier (in-progress / first pending / last). Prefer recent items (window bottom
     // at the list end); pull the window back if the tail would drop the frontier. Pending
-    // hidden BELOW the window get a `+N more` row; items hidden above need no indicator
-    // (the header already reports the done/open totals).
+    // hidden BELOW the window get a `+N more` row when at least one item row remains;
+    // with a single body slot the frontier wins and the header still reports the totals.
+    // Items hidden above need no indicator.
     let n = items.len();
     let anchor = items
         .iter()
@@ -511,7 +512,8 @@ fn todo_panel_rows(
         start = anchor;
     }
     let mut end = (start + body_budget).min(n);
-    if n - end > 0 {
+    let show_more = n - end > 0 && body_budget > 1;
+    if show_more {
         end -= 1; // reserve the last row for the `+N more` marker
     }
     let hidden = n - end;
@@ -522,10 +524,42 @@ fn todo_panel_rows(
             content: content.clone(),
         });
     }
-    if hidden > 0 {
+    if show_more {
         rows.push(TodoPanelRow::More { hidden });
     }
     rows
+}
+
+/// Wrap the current task into a small, width-safe preview. The sticky footer
+/// remains bounded, so an oversized task gets at most `max_lines`; the final
+/// visible line carries an ellipsis when more content exists.
+fn wrap_todo_content(
+    content: &str,
+    width: usize,
+    max_lines: usize,
+    ellipsis: &str,
+) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+    let safe = scrub_controls(content);
+    let mut lines = wrap_prompt_text(&safe, width.max(1));
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        if let Some(last) = lines.last_mut() {
+            let suffix_width = crate::width::display_width(ellipsis);
+            let content_width = width.saturating_sub(suffix_width);
+            *last = format!(
+                "{}{}",
+                crate::width::truncate_to_width(last, content_width),
+                crate::width::truncate_to_width(ellipsis, width)
+            );
+        }
+    }
+    lines
 }
 
 /// Format a token count using k/m units. `round_clean=true` drops the
@@ -2832,17 +2866,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         MAX_TODO_PANEL_ROWS.min(h.saturating_sub(4)).max(1)
     }
 
-    /// Number of rows the todo panel will occupy — mirrors `build_todo_rows`'
-    /// row count without building cells (used by the footer height math).
-    fn todo_panel_row_count(&self, todo: &crate::render::TodoProgress) -> usize {
-        todo_panel_rows(
-            &todo.items,
-            todo.completed,
-            todo.in_progress,
-            todo.total,
-            self.todo_panel_cap(),
-        )
-        .len()
+    /// Number of rows the todo panel will occupy. Use the width-aware builder
+    /// directly so wrapped current-task rows and footer height math cannot drift.
+    fn todo_panel_row_count(
+        &self,
+        todo: &crate::render::TodoProgress,
+        rule_width: usize,
+    ) -> usize {
+        self.build_todo_rows(todo, rule_width).len()
     }
 
     fn subtask_panel_cap(&self) -> usize {
@@ -3085,13 +3116,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
     ) -> Vec<Vec<Cell>> {
         use atomcode_capabilities::tools::todo::TodoStatus;
         let unicode = self.caps.unicode_symbols;
-        let rows = todo_panel_rows(
-            &todo.items,
-            todo.completed,
-            todo.in_progress,
-            todo.total,
-            self.todo_panel_cap(),
-        );
         // Checkbox glyphs (Tasks-panel style): ☐ open, ✔ done. Emit the ASCII form
         // directly on non-unicode terminals so the cell backstop never has to guess.
         let open_glyph = if unicode { "\u{2610}" } else { "[ ]" };
@@ -3103,6 +3127,47 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // presentation on many terminals (renders green + width-2, leaking a stray cell).
         let done_glyph = if unicode { "\u{2713}" } else { "[x]" };
         let ellipsis = if unicode { "\u{2026}" } else { "..." };
+
+        // The in-progress item owns the detailed preview. Before work starts,
+        // treat the first pending item as the frontier so a long first step is
+        // still readable. Closed lists retain the legacy single-line layout.
+        let frontier = todo
+            .items
+            .iter()
+            .position(|(status, _)| *status == TodoStatus::InProgress)
+            .or_else(|| {
+                todo.items
+                    .iter()
+                    .position(|(status, _)| *status == TodoStatus::Pending)
+            });
+        let panel_cap = self.todo_panel_cap();
+        let base_rows = if panel_cap >= 2 { 2 } else { 1 };
+        let body_rows = panel_cap.saturating_sub(base_rows);
+        let frontier_lines = frontier
+            .and_then(|index| todo.items.get(index).map(|(_, content)| (index, content)))
+            .map(|(index, content)| {
+                let status = todo.items[index].0;
+                let glyph = if status == TodoStatus::InProgress {
+                    filled_glyph
+                } else {
+                    open_glyph
+                };
+                let id = format!("#{}  ", index + 1);
+                let content_width = rule_width
+                    .saturating_sub(2 + crate::width::display_width(glyph) + 1)
+                    .saturating_sub(crate::width::display_width(&id));
+                wrap_todo_content(content, content_width, body_rows.min(3), ellipsis)
+            })
+            .unwrap_or_default();
+        let extra_frontier_rows = frontier_lines.len().saturating_sub(1);
+        let logical_cap = panel_cap.saturating_sub(extra_frontier_rows);
+        let rows = todo_panel_rows(
+            &todo.items,
+            todo.completed,
+            todo.in_progress,
+            todo.total,
+            logical_cap,
+        );
 
         // An indented item line: `  <glyph> <content>` (content width-fitted).
         let item_line = |glyph: &str,
@@ -3121,10 +3186,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             row
         };
 
-        rows.into_iter()
-            .map(|r| match r {
+        let mut rendered = Vec::new();
+        for logical in rows {
+            match logical {
                 // Blank spacer: empty cell list — paint_footer pads it to width.
-                TodoPanelRow::Spacer => Vec::new(),
+                TodoPanelRow::Spacer => rendered.push(Vec::new()),
                 TodoPanelRow::Header {
                     completed,
                     in_progress,
@@ -3150,7 +3216,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         &format!("({completed} done, {in_progress} in progress, {open} open)"),
                         &detail,
                     );
-                    row
+                    rendered.push(row);
                 }
                 TodoPanelRow::Item {
                     index,
@@ -3186,12 +3252,39 @@ impl<W: Write + Send> RetainedRenderer<W> {
                             (open_glyph, s.clone(), s)
                         }
                     };
-                    item_line(
-                        glyph,
-                        &format!("#{}  {}", index + 1, content),
-                        &glyph_style,
-                        &body_style,
-                    )
+                    if Some(index) == frontier && frontier_lines.len() > 1 {
+                        let id = format!("#{}  ", index + 1);
+                        for (line_index, line) in frontier_lines.iter().enumerate() {
+                            if line_index == 0 {
+                                rendered.push(item_line(
+                                    glyph,
+                                    &format!("{id}{line}"),
+                                    &glyph_style,
+                                    &body_style,
+                                ));
+                            } else {
+                                let mut row = Vec::new();
+                                let indent = 2
+                                    + crate::width::display_width(glyph)
+                                    + 1
+                                    + crate::width::display_width(&id);
+                                push_str_cells(
+                                    &mut row,
+                                    &" ".repeat(indent),
+                                    &CellStyle::default(),
+                                );
+                                push_str_cells(&mut row, line, &body_style);
+                                rendered.push(row);
+                            }
+                        }
+                    } else {
+                        rendered.push(item_line(
+                            glyph,
+                            &format!("#{}  {}", index + 1, content),
+                            &glyph_style,
+                            &body_style,
+                        ));
+                    }
                 }
                 TodoPanelRow::More { hidden } => {
                     // Fold indicator, not a task — no checkbox, just an indented muted+faint note.
@@ -3201,10 +3294,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     };
                     let mut row = Vec::new();
                     push_str_cells(&mut row, &format!("  +{hidden} more{ellipsis}"), &style);
-                    row
+                    rendered.push(row);
                 }
-            })
-            .collect()
+            }
+        }
+        for row in &mut rendered {
+            clamp_cell_row(row, rule_width);
+        }
+        rendered
     }
 
     /// Rows the approval panel occupies — one per option. The compact panel drops
@@ -4338,7 +4435,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.status
                 .todo
                 .as_ref()
-                .map(|t| self.todo_panel_row_count(t))
+                .map(|t| self.todo_panel_row_count(t, rule_width))
                 .unwrap_or(0)
         } else {
             0
@@ -5097,7 +5194,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // the same JediTerm last-column reserve so the wrapped ROW COUNT here
         // matches the actual render (else body_bottom is off by a row).
         let prefix_and_reserve = if self.caps.jediterm { 3 } else { 2 };
-        let text_budget = (self.screen.width() as usize).saturating_sub(prefix_and_reserve);
+        let screen_width = self.screen.width() as usize;
+        let text_budget = screen_width.saturating_sub(prefix_and_reserve);
+        let rule_width = screen_width.saturating_sub(PAD_COL * 2);
         let safe = if self.input_buf.is_empty() {
             self.status
                 .next_prompt_suggestion
@@ -5140,7 +5239,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.status
                 .todo
                 .as_ref()
-                .map(|t| self.todo_panel_row_count(t))
+                .map(|t| self.todo_panel_row_count(t, rule_width))
                 .unwrap_or(0)
         } else {
             0
@@ -5237,7 +5336,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.status
                 .todo
                 .as_ref()
-                .map(|todo| self.todo_panel_row_count(todo))
+                .map(|todo| self.todo_panel_row_count(todo, width))
                 .unwrap_or(0)
         } else {
             0
@@ -21962,6 +22061,30 @@ mod todo_panel_rows_tests {
     }
 
     #[test]
+    fn frontier_survives_tight_overflow_budget() {
+        // One body row cannot show both the frontier and a `More` marker. The
+        // active task is the useful state, so it must win that final slot.
+        let it = items(&[
+            (TodoStatus::InProgress, "active"),
+            (TodoStatus::Pending, "later one"),
+            (TodoStatus::Pending, "later two"),
+        ]);
+        let rows = todo_panel_rows(&it, 0, 1, 3, 3);
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(
+            &rows[2],
+            TodoPanelRow::Item {
+                index: 0,
+                status: TodoStatus::InProgress,
+                content,
+            } if content == "active"
+        ));
+        assert!(!rows
+            .iter()
+            .any(|row| matches!(row, TodoPanelRow::More { .. })));
+    }
+
+    #[test]
     fn never_exceeds_max_rows() {
         let mut it = items(&[(TodoStatus::InProgress, "ip"), (TodoStatus::Completed, "c")]);
         for i in 0..20 {
@@ -22074,6 +22197,103 @@ mod todo_panel_rows_tests {
             text(ip).contains('#'),
             "item must show a #N number, got: {:?}",
             text(ip)
+        );
+    }
+
+    #[test]
+    fn build_todo_rows_wraps_frontier_within_the_fixed_panel_budget() {
+        use crate::terminal::{EnvView, TerminalCaps};
+        use atomcode_capabilities::tools::todo::TodoStatus;
+
+        let caps = TerminalCaps::from_env(EnvView {
+            is_stdout_tty: true,
+            term: Some("xterm-256color".into()),
+            colorterm: Some("truecolor".into()),
+            lang: Some("en_US.UTF-8".into()),
+            ..Default::default()
+        });
+        let r = RetainedRenderer::with_writer(Vec::<u8>::new(), caps, 40, 24);
+        let todo = crate::render::TodoProgress {
+            current: None,
+            completed: 0,
+            in_progress: 0,
+            total: 6,
+            items: vec![
+                (
+                    TodoStatus::Pending,
+                    "frontier alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu"
+                        .into(),
+                ),
+                (TodoStatus::Pending, "second task".into()),
+                (TodoStatus::Pending, "third task".into()),
+                (TodoStatus::Pending, "fourth task".into()),
+                (TodoStatus::Pending, "fifth task".into()),
+                (TodoStatus::Pending, "sixth task".into()),
+            ],
+        };
+
+        let rows = r.build_todo_rows(&todo, 32);
+        let rendered = rows
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .collect::<Vec<_>>();
+        assert!(rows.len() <= MAX_TODO_PANEL_ROWS, "{rendered:#?}");
+        assert_eq!(
+            r.todo_panel_row_count(&todo, 32),
+            rows.len(),
+            "footer measurement must include wrapped continuation rows"
+        );
+        assert!(
+            rendered
+                .iter()
+                .filter(|line| line.contains("frontier") || line.contains("delta"))
+                .count()
+                >= 2,
+            "the pending frontier should wrap onto continuation rows: {rendered:#?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("more")),
+            "tasks displaced by wrapped rows must remain explicit: {rendered:#?}"
+        );
+    }
+
+    #[test]
+    fn wrapped_frontier_uses_ascii_ellipsis_without_unicode_support() {
+        use crate::terminal::{EnvView, TerminalCaps};
+        use atomcode_capabilities::tools::todo::TodoStatus;
+
+        let caps = TerminalCaps::from_env(EnvView {
+            is_stdout_tty: true,
+            term: Some("dumb".into()),
+            lang: Some("C".into()),
+            ..Default::default()
+        });
+        assert!(!caps.unicode_symbols);
+        let r = RetainedRenderer::with_writer(Vec::<u8>::new(), caps, 40, 24);
+        let todo = crate::render::TodoProgress {
+            current: Some("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda".into()),
+            completed: 0,
+            in_progress: 1,
+            total: 1,
+            items: vec![(
+                TodoStatus::InProgress,
+                "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda".into(),
+            )],
+        };
+
+        let rendered = r
+            .build_todo_rows(&todo, 24)
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("..."),
+            "expected ASCII ellipsis: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('…'),
+            "unexpected Unicode ellipsis: {rendered:?}"
         );
     }
 }
