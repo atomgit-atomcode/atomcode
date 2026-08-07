@@ -1421,8 +1421,12 @@ async fn run() -> Result<i32> {
                 eprintln!("Press Ctrl+C to stop.");
                 // Run the bundled server IN-PROCESS (same `run_server` the webui uses),
                 // instead of re-exec'ing into a separate `atomcode-daemon` binary that
-                // may not be installed. `webui_tokens: None` ⇒ enforce_token=false
-                // (headless), so loopback channel clients get interactive approval.
+                // may not be installed. This is an equivalent daemon entrypoint to the
+                // standalone `atomcode-daemon` binary, so it MUST enforce the local token
+                // identically (mirror of `atomcode-daemon/src/main.rs`): mint/resolve a
+                // token, enable enforcement, and write `~/.atomcode/daemon-<port>.json`.
+                // Otherwise `atomcode daemon` would be an unauthenticated bypass of the
+                // very surface the token guards.
                 let idle = idle_timeout
                     .or_else(|| {
                         std::env::var("ATOMCODE_DAEMON_IDLE_TIMEOUT")
@@ -1437,6 +1441,11 @@ async fn run() -> Result<i32> {
                     Some("atomcode-air") => atomcode_telemetry::SessionMode::AtomcodeAir,
                     _ => atomcode_telemetry::SessionMode::Ide,
                 };
+                let token_store = atomcode_daemon::auth_token::WebuiTokenStore::new();
+                let daemon_token = atomcode_daemon::resolve_daemon_token(
+                    std::env::var("ATOMCODE_DAEMON_TOKEN").ok(),
+                    &token_store,
+                );
                 let res = atomcode_daemon::run_server(atomcode_daemon::ServerOpts {
                     host: "127.0.0.1".to_string(),
                     port,
@@ -1445,11 +1454,12 @@ async fn run() -> Result<i32> {
                     },
                     idle_timeout_secs: idle,
                     startup_mode,
-                    webui_tokens: None,
+                    webui_tokens: Some(token_store),
                     quiet: false,
                     working_dir_override: None,
                     prebound_listener: None,
                     app_user_id: None,
+                    daemon_token_file: Some(daemon_token),
                 })
                 .await;
                 telemetry
