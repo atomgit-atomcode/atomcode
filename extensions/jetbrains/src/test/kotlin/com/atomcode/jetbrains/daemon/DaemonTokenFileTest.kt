@@ -2,10 +2,22 @@ package com.atomcode.jetbrains.daemon
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assumptions.assumeTrue
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import java.nio.file.Files
 
 class DaemonTokenFileTest {
+    @BeforeEach
+    fun guardAtomcodeHome() {
+        // ATOMCODE_HOME cannot be cleared from JVM at runtime; skip the test if a CI-exported
+        // value would shadow the user.home fallback that these tests rely on.
+        assumeTrue(
+            System.getenv("ATOMCODE_HOME").isNullOrEmpty(),
+            "ATOMCODE_HOME is set in the environment; skipping user.home-fallback tests to avoid shadowing.",
+        )
+    }
+
     @Test
     fun readsTokenFromFile() {
         val home = Files.createTempDirectory("ac-jb").toFile()

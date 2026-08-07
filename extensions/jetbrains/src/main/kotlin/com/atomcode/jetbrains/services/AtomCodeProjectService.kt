@@ -695,7 +695,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
     }
 
     private fun newClient(settings: AtomCodeSettings): AtomCodeDaemonClient =
-        AtomCodeDaemonClient(settings.host, settings.port, settings.requestTimeoutMs, auth)
+        AtomCodeDaemonClient(settings.host, settings.port, settings.requestTimeoutMs, DaemonAuth(DaemonTokenFile.read(settings.port)))
 
     private fun getOrCreateClient(): AtomCodeDaemonClient {
         val settings = settingsService.state.copy()
