@@ -3404,7 +3404,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         &self,
         panel: &crate::render::UserInputPanelView,
         rule_width: usize,
-        screen_width: usize,
+        _screen_width: usize,
     ) -> UserInputRows {
         use atomcode_capabilities::tools::request_user_input::UserInputMode;
         let unicode = self.caps.unicode_symbols;
@@ -3683,28 +3683,88 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 }
             }
             UserInputMode::Text => {
-                // Header CHIP + question + a `> {buffer}` input row.
+                // Header CHIP + question + a compact, theme-aware input box.
+                // Reverse video used to paint the whole terminal row white on
+                // light themes; a real border keeps the field legible without
+                // taking over the screen background.
                 push_line(&mut out, &panel.header, &self.style_bold(Role::Plan));
                 blank_row(&mut out);
                 push_line(&mut out, &panel.question, &self.style_bold(Role::Secondary));
                 blank_row(&mut out);
-                let style = CellStyle {
-                    reverse: true,
-                    ..CellStyle::default()
-                };
-                let mut row = Vec::new();
-                let budget = rule_width.saturating_sub(2);
-                let buf =
-                    crate::width::truncate_with_ellipsis(&scrub_controls(&panel.text), budget);
-                push_str_cells(&mut row, "> ", &style);
-                push_str_cells(&mut row, &buf, &style);
-                let current_width: usize = row.iter().map(|c| c.width as usize).sum();
-                let pad = screen_width.saturating_sub(current_width);
-                if pad > 0 {
-                    push_str_cells(&mut row, &" ".repeat(pad), &style);
+
+                let field_width = rule_width;
+                let placeholder = if unicode { "输入答案…" } else { "Enter answer..." };
+                let safe_text = scrub_controls(&panel.text);
+                if field_width < 5 {
+                    let mut row = Vec::new();
+                    if field_width > 0 {
+                        push_str_cells(&mut row, ">", &self.style_for(Role::Plan));
+                    }
+                    out.push(row);
+                    active = out.len().saturating_sub(1)..out.len();
+                } else {
+                    let inner_width = field_width.saturating_sub(2);
+                    let (top_left, horizontal, top_right, bottom_left, bottom_right, prompt, caret) =
+                        if unicode {
+                            ("╭", "─", "╮", "╰", "╯", "❯ ", "▏")
+                        } else {
+                            ("+", "-", "+", "+", "+", "> ", "|")
+                        };
+                    let border_style = self.style_for(Role::Plan);
+
+                    let mut top = Vec::new();
+                    push_str_cells(&mut top, top_left, &border_style);
+                    push_str_cells(
+                        &mut top,
+                        &horizontal.repeat(inner_width),
+                        &border_style,
+                    );
+                    push_str_cells(&mut top, top_right, &border_style);
+                    out.push(top);
+
+                    let mut row = Vec::new();
+                    push_str_cells(&mut row, if unicode { "│" } else { "|" }, &border_style);
+                    push_str_cells(&mut row, prompt, &self.style_bold(Role::Plan));
+                    let text_budget = inner_width
+                        .saturating_sub(crate::width::display_width(prompt))
+                        .saturating_sub(crate::width::display_width(caret));
+                    let buf = crate::width::truncate_with_ellipsis(&safe_text, text_budget);
+                    let visible_text = if buf.is_empty() {
+                        crate::width::truncate_with_ellipsis(placeholder, text_budget)
+                    } else {
+                        buf
+                    };
+                    let text_style = if panel.text.is_empty() {
+                        self.style_faint(Role::Muted)
+                    } else {
+                        self.style_for(Role::Secondary)
+                    };
+                    push_str_cells(&mut row, &visible_text, &text_style);
+                    push_str_cells(&mut row, caret, &border_style);
+                    let used = crate::width::display_width(prompt)
+                        + crate::width::display_width(&visible_text)
+                        + crate::width::display_width(caret);
+                    if inner_width > used {
+                        push_str_cells(
+                            &mut row,
+                            &" ".repeat(inner_width - used),
+                            &self.style_for(Role::Secondary),
+                        );
+                    }
+                    push_str_cells(&mut row, if unicode { "│" } else { "|" }, &border_style);
+                    out.push(row);
+                    active = out.len().saturating_sub(1)..out.len();
+
+                    let mut bottom = Vec::new();
+                    push_str_cells(&mut bottom, bottom_left, &border_style);
+                    push_str_cells(
+                        &mut bottom,
+                        &horizontal.repeat(inner_width),
+                        &border_style,
+                    );
+                    push_str_cells(&mut bottom, bottom_right, &border_style);
+                    out.push(bottom);
                 }
-                out.push(row);
-                active = out.len().saturating_sub(1)..out.len();
             }
         }
 
@@ -3774,6 +3834,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
             push_str_cells(&mut row, &body, style);
             out.push(row);
         };
+        let push_wrapped = |out: &mut Vec<Vec<Cell>>, text: &str, style: &CellStyle| {
+            let raw = crate::glyph::downgrade_glyphs(text, unicode);
+            let safe = scrub_controls(&raw);
+            for body in wrap_prompt_text(&safe, rule_width.saturating_sub(2).max(1)) {
+                let mut row = Vec::new();
+                push_str_cells(&mut row, "  ", style);
+                push_str_cells(&mut row, &body, style);
+                out.push(row);
+            }
+        };
         let hint_style = if crate::highlight::theme::is_light_for_render() {
             self.style_for(Role::Muted)
         } else {
@@ -3808,6 +3878,41 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
         if meta.on_submit {
             let answered = meta.answered.iter().filter(|a| **a).count();
+            push_line(
+                &mut out,
+                if unicode { "提交前确认" } else { "Review answers" },
+                &self.style_bold(Role::Plan),
+            );
+            out.push(Vec::new());
+            for (i, summary) in meta.summaries.iter().enumerate() {
+                push_wrapped(
+                    &mut out,
+                    &format!("{}. {}", i + 1, summary.header),
+                    &self.style_bold(Role::Secondary),
+                );
+                push_wrapped(
+                    &mut out,
+                    &summary.question,
+                    &self.style_faint(Role::Muted),
+                );
+                match summary.answer.as_deref() {
+                    Some(answer) => push_wrapped(
+                        &mut out,
+                        &if unicode {
+                            format!("回答：{answer}")
+                        } else {
+                            format!("Answer: {answer}")
+                        },
+                        &self.style_for(Role::Secondary),
+                    ),
+                    None => push_wrapped(
+                        &mut out,
+                        if unicode { "未回答" } else { "Unanswered" },
+                        &self.style_bold(Role::Warning),
+                    ),
+                }
+                out.push(Vec::new());
+            }
             let marker = if unicode {
                 "\u{276f} \u{2714} "
             } else {
@@ -3826,7 +3931,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             active = out.len().saturating_sub(1)..out.len();
             out.push(Vec::new()); // blank
                                   // Enter 提交 · Tab/Shift+Tab 切换问题 · Esc 放弃
-            let hint = "Enter \u{63d0}\u{4ea4} \u{00b7} Tab/Shift+Tab \u{5207}\u{6362}\u{95ee}\u{9898} \u{00b7} Esc \u{653e}\u{5f03}";
+            let hint = "Enter \u{63d0}\u{4ea4} \u{00b7} PgUp/PgDn \u{67e5}\u{770b} \u{00b7} Shift+Tab \u{8fd4}\u{56de} \u{00b7} Esc \u{653e}\u{5f03}";
             push_line(&mut out, hint, &hint_style);
         } else {
             // The current question's own rows. Drop its trailing hint row — the single
@@ -3844,11 +3949,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.fit_user_input_rows(
             UserInputRows { rows: out, active },
             screen_height,
-            if meta.on_submit {
-                0
-            } else {
-                view.scroll_offset
-            },
+            view.scroll_offset,
         )
     }
 
@@ -16475,8 +16576,38 @@ mod tests {
                 scroll_offset: 0,
                 batch: None,
             };
-            // header + blank + question + blank + input + hint = 6.
-            assert_eq!(r.build_user_input_rows(&view, 78, 80).len(), 6);
+            // header + blank + question + blank + 3-row input box + hint = 8.
+            let rows = r.build_user_input_rows(&view, 78, 80);
+            assert_eq!(rows.len(), 8);
+            assert!(
+                rows.rows
+                    .iter()
+                    .flatten()
+                    .all(|cell| !cell.style.reverse),
+                "text input must not use a full-width reverse-video strip"
+            );
+            for width in 0..5 {
+                let tiny = r.build_user_input_rows(&view, width, width);
+                let active = &tiny.rows[tiny.active.start];
+                let rendered_width: usize = active.iter().map(|cell| cell.width as usize).sum();
+                assert!(
+                    rendered_width <= width,
+                    "narrow text input exceeded its {width}-column budget: {rendered_width}"
+                );
+            }
+            let (mut ascii, _buf) = new_capturing(40, 24);
+            ascii.caps.unicode_symbols = false;
+            let mut empty = view.clone();
+            empty.text.clear();
+            let ascii_rows = ascii.build_user_input_rows(&empty, 38, 40);
+            let ascii_dump = ascii_rows
+                .rows
+                .iter()
+                .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(ascii_dump.contains("Enter answer"), "{ascii_dump}");
+            assert!(!ascii_dump.contains("输入答案"), "{ascii_dump}");
             status.user_input = Some(view);
             r.render(UiLine::InputPrompt {
                 buf: String::new(),
@@ -16493,7 +16624,8 @@ mod tests {
                 "question header\n{dump}"
             );
             assert!(
-                vterm.any_row(|r| r.contains("> atomcode")),
+                vterm
+                    .any_row(|r| r.contains("atomcode") && (r.contains("❯") || r.contains(">"))),
                 "text input row\n{dump}"
             );
         }
@@ -16657,6 +16789,7 @@ mod tests {
             total: 1,
             index: 1,
             answered: vec![false],
+            summaries: vec![],
             on_submit: false,
         }));
         assert_eq!(
@@ -16670,6 +16803,7 @@ mod tests {
             total: 2,
             index: 1,
             answered: vec![false, false],
+            summaries: vec![],
             on_submit: false,
         }));
         let q_rows = r.build_user_input_panel_view(&q, 78, 80, 24);
@@ -16681,11 +16815,23 @@ mod tests {
         // nav + blank + (single rows minus its own hint) + one batch hint = single + 2.
         assert_eq!(q_rows.len(), single_rows + 2);
 
-        // Submit stop: exactly 5 rows (nav + blank + submit + blank + hint).
+        // Submit stop: review every answer before the active confirmation row.
         let sub = base(Some(UserInputBatchMeta {
             total: 2,
             index: 2,
             answered: vec![true, false],
+            summaries: vec![
+                crate::render::UserInputAnswerSummary {
+                    header: "Auth".into(),
+                    question: "Which auth?".into(),
+                    answer: Some("OAuth".into()),
+                },
+                crate::render::UserInputAnswerSummary {
+                    header: "Region".into(),
+                    question: "Which region?".into(),
+                    answer: None,
+                },
+            ],
             on_submit: true,
         }));
         let sub_rows = r.build_user_input_panel_view(&sub, 78, 80, 24);
@@ -16694,7 +16840,34 @@ mod tests {
             r.user_input_panel_view_row_count(&sub),
             "row_count invariant (submit)"
         );
-        assert_eq!(sub_rows.len(), 5);
+        let sub_dump = sub_rows
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compact_sub_dump = sub_dump.replace(' ', "");
+        assert!(
+            compact_sub_dump.contains("提交前确认"),
+            "review title:\n{sub_dump}"
+        );
+        assert!(sub_dump.contains("Which auth?"), "question shown:\n{sub_dump}");
+        assert!(sub_dump.contains("OAuth"), "answer shown:\n{sub_dump}");
+        assert!(
+            compact_sub_dump.contains("未回答"),
+            "missing answer shown:\n{sub_dump}"
+        );
+        let (mut ascii, _buf) = new_capturing(80, 24);
+        ascii.caps.unicode_symbols = false;
+        let ascii_rows = ascii.build_user_input_panel_view(&sub, 78, 80, 24);
+        let ascii_dump = ascii_rows
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(ascii_dump.contains("Answer: OAuth"), "{ascii_dump}");
+        assert!(ascii_dump.contains("Unanswered"), "{ascii_dump}");
+        assert!(!ascii_dump.contains("回答："), "{ascii_dump}");
+        assert!(!ascii_dump.contains("未回答"), "{ascii_dump}");
         let tiny_submit = r.build_user_input_panel_view(&sub, 78, 80, 3);
         let tiny_dump = tiny_submit
             .iter()

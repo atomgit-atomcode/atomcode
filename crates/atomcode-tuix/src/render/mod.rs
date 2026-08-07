@@ -677,8 +677,8 @@ pub struct ApprovalPanelView {
 
 /// Renderer-facing snapshot of the `request_user_input` panel (mirrors
 /// `ApprovalPanelView`). Header + question + the mode-specific body: a
-/// reverse-highlight option list (single), `[x]`/`[ ]` checkboxes (multiple),
-/// or a `> {buffer}` input row (text).
+/// highlighted option list (single), `[x]`/`[ ]` checkboxes (multiple),
+/// or a bordered input field (text).
 #[derive(Debug, Clone)]
 pub struct UserInputPanelView {
     pub header: String,
@@ -721,8 +721,18 @@ pub struct UserInputBatchMeta {
     pub index: usize,
     /// Per-question answered flags (for the ✓/○ markers), length `total`.
     pub answered: Vec<bool>,
+    /// Full question/answer projection for the final review page.
+    pub summaries: Vec<UserInputAnswerSummary>,
     /// The cursor is on the Submit stop (render the submit screen, not a question).
     pub on_submit: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserInputAnswerSummary {
+    pub header: String,
+    pub question: String,
+    /// `None` is shown explicitly as unanswered and is serialized as declined.
+    pub answer: Option<String>,
 }
 
 /// Build a [`UserInputPanelView`] for the round-cap checkpoint panel (style B:

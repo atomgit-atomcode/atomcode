@@ -16267,11 +16267,30 @@ fn handle_user_input_batch_key(
 
     // On the Submit stop: Enter delivers all answers (untouched → declined).
     if batch.on_submit_stop() {
-        if code == KeyCode::Enter {
-            let resps = batch.build_batch_response();
-            app.state.on_user_input_resolved();
-            deliver_user_input_batch(ctx, id, resps);
-            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        match code {
+            KeyCode::Enter => {
+                let resps = batch.build_batch_response();
+                app.state.on_user_input_resolved();
+                deliver_user_input_batch(ctx, id, resps);
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            }
+            KeyCode::PageUp => {
+                app.state
+                    .user_input_batch
+                    .as_mut()
+                    .unwrap()
+                    .page_submit_up();
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            }
+            KeyCode::PageDown => {
+                app.state
+                    .user_input_batch
+                    .as_mut()
+                    .unwrap()
+                    .page_submit_down();
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            }
+            _ => {}
         }
         return Ok(()); // other keys are no-ops on the Submit stop
     }
@@ -22987,6 +23006,16 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         let idx = b.current.min(total.saturating_sub(1));
         let p = &b.questions[idx];
         let answered = (0..total).map(|i| b.is_answered(i)).collect();
+        let summaries = b
+            .questions
+            .iter()
+            .enumerate()
+            .map(|(i, question)| crate::render::UserInputAnswerSummary {
+                header: question.header.clone(),
+                question: question.question.clone(),
+                answer: b.answer_summary(i),
+            })
+            .collect();
         Some(crate::render::UserInputPanelView {
             header: p.header.clone(),
             question: p.question.clone(),
@@ -22997,7 +23026,11 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             text: p.text.clone(),
             custom_text: p.custom_text.clone(),
             custom: p.custom,
-            scroll_offset: p.scroll_offset,
+            scroll_offset: if b.on_submit_stop() {
+                b.submit_scroll_offset
+            } else {
+                p.scroll_offset
+            },
             batch: Some(crate::render::UserInputBatchMeta {
                 total,
                 // 1-based current question; clamped so the Submit stop (current==total)
@@ -23005,6 +23038,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
                 // contract honest).
                 index: (b.current + 1).min(total),
                 answered,
+                summaries,
                 on_submit: b.on_submit_stop(),
             }),
         })

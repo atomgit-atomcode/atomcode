@@ -391,6 +391,8 @@ pub struct UserInputBatch {
     pub request_id: u64,
     pub questions: Vec<UserInputPanel>,
     pub current: usize,
+    /// User-controlled displacement while reviewing the final answer summary.
+    pub submit_scroll_offset: isize,
 }
 
 impl UserInputBatch {
@@ -406,6 +408,7 @@ impl UserInputBatch {
             request_id,
             questions,
             current: 0,
+            submit_scroll_offset: 0,
         }
     }
 
@@ -439,6 +442,30 @@ impl UserInputBatch {
         } else {
             self.current - 1
         };
+    }
+
+    pub fn page_submit_up(&mut self) {
+        self.submit_scroll_offset = self.submit_scroll_offset.saturating_sub(5);
+    }
+
+    pub fn page_submit_down(&mut self) {
+        self.submit_scroll_offset = self.submit_scroll_offset.saturating_add(5);
+    }
+
+    /// Human-readable answer for the final review page. `None` deliberately
+    /// represents an unanswered question; wire serialization still maps that
+    /// state to a declined response for backward-compatible partial submit.
+    pub fn answer_summary(&self, i: usize) -> Option<String> {
+        let response = self.questions.get(i)?.build_response()?;
+        if !response.selected.is_empty() {
+            return Some(response.selected.join("、"));
+        }
+        response
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(ToOwned::to_owned)
     }
 
     /// Whether question `i` has real content (used for the ✓/○ navigator marker).
@@ -671,6 +698,29 @@ mod user_input_batch_tests {
         assert!(!b.is_answered(0), "empty text → not answered");
         b.questions[0].text.push_str("hi");
         assert!(b.is_answered(0));
+    }
+
+    #[test]
+    fn answer_summary_formats_selected_text_and_unanswered_questions() {
+        let mut b = UserInputBatch::new(
+            1,
+            &[single_q("choice"), text_q("text"), text_q("empty")],
+        );
+        b.questions[0].select_current_option();
+        b.questions[1].text.push_str("  atomcode  ");
+
+        assert_eq!(b.answer_summary(0).as_deref(), Some("x"));
+        assert_eq!(b.answer_summary(1).as_deref(), Some("atomcode"));
+        assert_eq!(b.answer_summary(2), None);
+    }
+
+    #[test]
+    fn submit_review_scroll_is_owned_by_the_batch() {
+        let mut b = UserInputBatch::new(1, &[text_q("a"), text_q("b")]);
+        b.page_submit_down();
+        assert_eq!(b.submit_scroll_offset, 5);
+        b.page_submit_up();
+        assert_eq!(b.submit_scroll_offset, 0);
     }
 
     #[test]
