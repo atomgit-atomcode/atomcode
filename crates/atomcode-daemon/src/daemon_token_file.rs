@@ -38,6 +38,12 @@ mod tests {
 
     #[test]
     fn write_creates_0600_json_and_remove_deletes() {
+        // Acquire the process-global lock to serialise ATOMCODE_HOME mutations
+        // across parallel tests, preventing concurrent set_var from other tests.
+        let _home_guard = crate::atomcode_home_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         // Redirect ~/.atomcode to a temp dir via ATOMCODE_HOME.
         let tmp = std::env::temp_dir().join(format!("atomcode_tokfile_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
