@@ -4969,6 +4969,8 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
             prebound_listener: Some(listener),
             // webui 模式不需要 app user_id 校验。
             app_user_id: None,
+            // 进程内 webui 不写 token 文件（token 通过 WebuiTokenStore 共享）。
+            daemon_token_file: None,
         };
         let task = tokio::spawn(async move {
             if let Err(e) = run_server(opts).await {
@@ -5126,6 +5128,8 @@ pub async fn ensure_app_server(
         working_dir_override: std::env::current_dir().ok(),
         prebound_listener: Some(listener),
         app_user_id: user_id,
+        // App 进程内启动器不写 token 文件（使用 require_app_user_id 校验）。
+        daemon_token_file: None,
     };
     let task = tokio::spawn(async move {
         if let Err(e) = run_server(opts).await {
@@ -5516,6 +5520,10 @@ pub struct ServerOpts {
     pub prebound_listener: Option<tokio::net::TcpListener>,
     /// App 远程访问模式期望的 user_id。非空时 daemon 启用 `X-Atom-User-Id` 请求头校验。
     pub app_user_id: Option<String>,
+    /// 独立/IDE daemon 模式：写入 `~/.atomcode/daemon-<port>.json` 的 token。
+    /// `Some(token)` 时 `run_server` bind 成功后写文件、退出时删除。
+    /// 进程内 webui / App 启动器传 None（不写文件）。
+    pub daemon_token_file: Option<String>,
 }
 
 /// Build and run the axum server until a shutdown signal is received.
@@ -5541,6 +5549,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         quiet,
         working_dir_override,
         prebound_listener,
+        daemon_token_file: token_file_token,
         ..
     } = opts;
 
@@ -5893,6 +5902,16 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         },
     };
 
+    // 独立/IDE daemon：把本地 token 落到 `~/.atomcode/daemon-<port>.json`（0600），
+    // 供 VSCode / JetBrains 读取并作为 Bearer 携带。进程内启动器传 None，不写。
+    let daemon_token_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+    if let Some(ref token) = token_file_token {
+        match daemon_token_file::write(daemon_token_port, std::process::id(), token) {
+            Ok(p) => tracing::info!("daemon token file written: {}", p.display()),
+            Err(e) => tracing::warn!("failed to write daemon token file: {e}"),
+        }
+    }
+
     // Steps 10-11: Enter CurrentContext scope and emit OpenAtomcode (R4.1, R4.2)
     CurrentContext::scope(
         CurrentContext {
@@ -5914,6 +5933,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal(shutdown_rx))
         .await
         .unwrap_or_else(|e| tracing::error!(?e, "axum::serve error"));
+
+    if token_file_token.is_some() {
+        daemon_token_file::remove(daemon_token_port);
+    }
 
     // Step 14: Final telemetry flush before process exit (R10.2-R10.5)
     telemetry.shutdown(Duration::from_millis(500)).await;

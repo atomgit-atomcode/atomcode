@@ -155,13 +155,19 @@ async fn main() {
 
     let (host, port, cli_override, idle_timeout_secs, startup_mode) = parse_daemon_args();
 
+    let token_store = atomcode_daemon::auth_token::WebuiTokenStore::new();
+    let daemon_token = atomcode_daemon::resolve_daemon_token(
+        std::env::var("ATOMCODE_DAEMON_TOKEN").ok(),
+        &token_store,
+    );
+
     if let Err(e) = run_server(ServerOpts {
         host,
         port,
         cli_override,
         idle_timeout_secs,
         startup_mode,
-        webui_tokens: None,
+        webui_tokens: Some(token_store),
         // 独立二进制：保留完整启动横幅。
         quiet: false,
         // 独立二进制 / VSCode：沿用 config 的 default_workdir，不覆盖。
@@ -170,6 +176,7 @@ async fn main() {
         prebound_listener: None,
         // 独立 daemon 模式不需要 app user_id 校验。
         app_user_id: None,
+        daemon_token_file: Some(daemon_token),
     })
     .await
     {

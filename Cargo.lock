@@ -543,6 +543,7 @@ dependencies = [
  "mime_guess",
  "qrcode",
  "regex",
+ "reqwest",
  "rust-embed",
  "serde",
  "serde_json",
