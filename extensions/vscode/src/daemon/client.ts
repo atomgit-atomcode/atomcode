@@ -1,4 +1,7 @@
+import * as fs from 'fs';
 import * as http from 'http';
+import * as os from 'os';
+import * as path from 'path';
 import {
   ChatRequest,
   ChatStreamCallbacks,
@@ -28,6 +31,27 @@ import {
   AppendSessionMessagesRequest,
   AppendSessionMessagesResponse,
 } from './types';
+
+/** `$ATOMCODE_HOME` or `~/.atomcode` — mirrors process.ts's `atomcodeHome()`. */
+function atomcodeHome(): string {
+  const env = process.env.ATOMCODE_HOME;
+  return env && env.length > 0 ? env : path.join(os.homedir(), '.atomcode');
+}
+
+/**
+ * Read the local daemon token from `<atomcodeHome()>/daemon-<port>.json`.
+ * Returns the token string if present, or `undefined` on any error (file
+ * absent, malformed JSON, empty/missing token field).
+ */
+export function readDaemonToken(port: number): string | undefined {
+  try {
+    const raw = fs.readFileSync(path.join(atomcodeHome(), `daemon-${port}.json`), 'utf-8');
+    const info = JSON.parse(raw) as { token?: string };
+    return info.token && info.token.length > 0 ? info.token : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 const REST_TIMEOUT = 30000;
 
@@ -111,6 +135,7 @@ export class DaemonClient {
   private requestOnce<T>(method: string, path: string, body?: unknown): Promise<T> {
     return new Promise((resolve, reject) => {
       const payload = body ? JSON.stringify(body) : undefined;
+      const token = readDaemonToken(this.port);
       const options: http.RequestOptions = {
         hostname: this.host,
         port: this.port,
@@ -119,6 +144,7 @@ export class DaemonClient {
         headers: {
           'Content-Type': 'application/json',
           'X-AtomCode-Client': 'vscode',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
           ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {}),
         },
         timeout: REST_TIMEOUT,
@@ -406,6 +432,7 @@ export class DaemonClient {
       },
     };
 
+    const token = readDaemonToken(this.port);
     const options: http.RequestOptions = {
       hostname: this.host,
       port: this.port,
@@ -415,6 +442,7 @@ export class DaemonClient {
         'Content-Type': 'application/json',
         'Accept': 'text/event-stream',
         'X-AtomCode-Client': 'vscode',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
         'Content-Length': Buffer.byteLength(payload),
       },
     };
