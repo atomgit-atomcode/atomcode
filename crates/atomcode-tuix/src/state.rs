@@ -1250,6 +1250,17 @@ pub struct UiState {
 #[derive(Debug, Clone)]
 pub struct ActiveToolBatch {
     pub call_ids: Vec<String>,
+    /// Completed edit-class results keyed by call id. Results may arrive out of
+    /// order, so `ToolBatchCompleted` walks `call_ids` and renders these in the
+    /// model's original order after the live group can no longer be updated.
+    pub edit_displays: std::collections::HashMap<String, BatchedEditDisplay>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchedEditDisplay {
+    pub summary: String,
+    pub diff_stats: (usize, usize),
+    pub entries: Vec<crate::render::DiffEntry>,
 }
 
 /// Stats captured at `TurnComplete` and held until the next event decides
@@ -2656,7 +2667,13 @@ mod tests {
         s.on_tool_batch_started();
         let anchor = s.phase_started_at.unwrap();
         s.active_tool_batches
-            .insert("b1".into(), ActiveToolBatch { call_ids: vec![] });
+            .insert(
+                "b1".into(),
+                ActiveToolBatch {
+                    call_ids: vec![],
+                    edit_displays: std::collections::HashMap::new(),
+                },
+            );
         std::thread::sleep(std::time::Duration::from_millis(15));
         s.on_tool_call_streaming("Bash(a)");
         assert_eq!(
@@ -2697,7 +2714,13 @@ mod tests {
         s.on_tool_batch_started();
         let anchor = s.phase_started_at.unwrap();
         s.active_tool_batches
-            .insert("b1".into(), ActiveToolBatch { call_ids: vec![] });
+            .insert(
+                "b1".into(),
+                ActiveToolBatch {
+                    call_ids: vec![],
+                    edit_displays: std::collections::HashMap::new(),
+                },
+            );
         std::thread::sleep(std::time::Duration::from_millis(15));
         s.on_thinking();
         assert_eq!(

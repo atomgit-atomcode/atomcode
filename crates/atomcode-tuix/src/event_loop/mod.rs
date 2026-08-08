@@ -7514,6 +7514,19 @@ mod tool_format_tests {
     }
 
     #[test]
+    fn batched_edit_display_preserves_diff_and_stats() {
+        let output = "Edited src/main.rs (1 replacement)\n@@ -1,2 +1,2 @@\n-old\n+new\n context";
+        let display = batched_edit_display("edit_file", output, true).expect("edit display");
+
+        assert_eq!(display.summary, "Edited src/main.rs");
+        assert_eq!(display.diff_stats, (1, 1));
+        assert_eq!(display.entries.len(), 3);
+        assert!(batched_edit_display("read_file", output, true).is_none());
+        assert!(batched_edit_display("edit_file", output, false).is_none());
+        assert!(batched_edit_display("edit_file", "Edited src/main.rs", true).is_none());
+    }
+
+    #[test]
     fn approval_denial_label_detects_denials() {
         // Policy denial → calm label (non-empty).
         let label = approval_denial_label(
@@ -20803,6 +20816,11 @@ fn handle_agent_event(
             // to in-place checkmarks on the existing child rows instead
             // of appending new lines.
             if let Some(batch_id) = state.call_id_to_batch.get(&call_id).cloned() {
+                if let Some(display) = batched_edit_display(&name, &output, success) {
+                    if let Some(batch) = state.active_tool_batches.get_mut(&batch_id) {
+                        batch.edit_displays.insert(call_id.clone(), display);
+                    }
+                }
                 // CC-style result-data update: `⎿ Read(mod.rs) → 200 lines`.
                 // The result snippet is generic line count of the
                 // output (works across read/grep/glob/bash without
@@ -21812,7 +21830,13 @@ fn handle_agent_event(
             }
             state
                 .active_tool_batches
-                .insert(batch_id.clone(), crate::state::ActiveToolBatch { call_ids });
+                .insert(
+                    batch_id.clone(),
+                    crate::state::ActiveToolBatch {
+                        call_ids,
+                        edit_displays: std::collections::HashMap::new(),
+                    },
+                );
             // Anchor the spinner clock to the batch start. The interleaved
             // per-tool events that follow won't reset it (they no-op the reset
             // while a batch is active), so the elapsed-ms ticks steadily instead
@@ -21985,10 +22009,26 @@ fn handle_agent_event(
             //
             // Just clear batch state so subsequent per-call events
             // fall back to the standard single-tool render path.
-            if let Some(b) = state.active_tool_batches.remove(&batch_id) {
-                for cid in b.call_ids {
-                    state.call_id_to_batch.remove(&cid);
+            if let Some(mut b) = state.active_tool_batches.remove(&batch_id) {
+                for cid in &b.call_ids {
+                    state.call_id_to_batch.remove(cid);
                 }
+                // Appending permanent diff rows while the group is live would
+                // freeze it and make later child updates disappear. Completion
+                // is the first safe point: every child is terminal, so render
+                // cached edit results now in the model's original call order.
+                for cid in b.call_ids {
+                    let Some(display) = b.edit_displays.remove(&cid) else {
+                        continue;
+                    };
+                    renderer.render(UiLine::ToolResult {
+                        success: true,
+                        summary: display.summary,
+                        diff_stats: Some(display.diff_stats),
+                    });
+                    renderer.render(UiLine::EditDiffBlock(display.entries));
+                }
+                renderer.flush();
             }
         }
         AgentEvent::SubAgentDispatchStart { tasks } => {
@@ -24081,7 +24121,11 @@ pub(crate) fn build_replay_tool_batch(
     calls: &[atomcode_kernel::tool::ToolCall],
     result_of: &std::collections::HashMap<String, (bool, String)>,
     todo_titles: &std::collections::HashMap<u64, String>,
-) -> (String, Vec<crate::render::ToolGroupChild>) {
+) -> (
+    String,
+    Vec<crate::render::ToolGroupChild>,
+    Vec<crate::state::BatchedEditDisplay>,
+) {
     let count = calls.len();
     let unique_names: std::collections::HashSet<&str> =
         calls.iter().map(|c| c.name.as_str()).collect();
@@ -24167,7 +24211,14 @@ pub(crate) fn build_replay_tool_batch(
             }
         })
         .collect();
-    (header, children)
+    let edit_displays = calls
+        .iter()
+        .filter_map(|call| {
+            let (success, output) = result_of.get(&call.id)?;
+            batched_edit_display(&call.name, output, *success)
+        })
+        .collect();
+    (header, children, edit_displays)
 }
 
 pub(crate) fn summarise(output: &str) -> String {
@@ -24470,6 +24521,44 @@ pub(crate) fn credential_policy_blocked(output: &str, success: bool) -> bool {
             == Some(
                 atomcode_capabilities::tools::credential_bash_gate::CREDENTIAL_BASH_DENIAL_REASON,
             )
+}
+
+pub(crate) fn batched_edit_display(
+    name: &str,
+    output: &str,
+    success: bool,
+) -> Option<crate::state::BatchedEditDisplay> {
+    if !success
+        || !matches!(
+            name,
+            "edit_file" | "write_file" | "create_file" | "search_replace"
+        )
+    {
+        return None;
+    }
+    let entries = crate::render::diff::parse_unified_diff(output, 120);
+    if entries.is_empty() {
+        return None;
+    }
+    let mut summary = summarise(output);
+    if name == "edit_file" {
+        if let Some((file, _)) = summary.split_once(" (") {
+            summary = file.to_string();
+        }
+    }
+    let added = entries
+        .iter()
+        .filter(|entry| entry.kind == crate::render::DiffKind::Add)
+        .count();
+    let removed = entries
+        .iter()
+        .filter(|entry| entry.kind == crate::render::DiffKind::Del)
+        .count();
+    Some(crate::state::BatchedEditDisplay {
+        summary,
+        diff_stats: (added, removed),
+        entries,
+    })
 }
 
 fn render_credential_policy_error(state: &mut UiState, renderer: &mut dyn Renderer) {
