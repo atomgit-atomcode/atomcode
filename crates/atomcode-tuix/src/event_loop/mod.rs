@@ -7496,6 +7496,24 @@ mod tool_format_tests {
     }
 
     #[test]
+    fn credential_policy_block_matches_only_the_stable_reason() {
+        let result = format!(
+            "blocked: {}",
+            atomcode_capabilities::tools::credential_bash_gate::CREDENTIAL_BASH_DENIAL_REASON
+        );
+        assert!(credential_policy_blocked(&result, false));
+        assert!(!credential_policy_blocked(
+            "blocked: plugin supplied arbitrary reason",
+            false
+        ));
+        assert!(!credential_policy_blocked(
+            "blocked: plan mode is active",
+            false
+        ));
+        assert!(!credential_policy_blocked(&result, true));
+    }
+
+    #[test]
     fn approval_denial_label_detects_denials() {
         // Policy denial → calm label (non-empty).
         let label = approval_denial_label(
@@ -16720,6 +16738,15 @@ fn turn_summary_label(
     dur: &str,
 ) -> String {
     if matches!(stop_reason, ui_event::UiTurnStopReason::PolicyDenied) {
+        // Always fold a sanitized policy reason into the terminal separator when
+        // available. A mid-stream red line can be overwritten by the retained
+        // Streaming→Idle redraw; the separator is the reliable final surface.
+        let reason = state
+            .last_policy_denial_reason
+            .take()
+            .map(|reason| summary_reason_headline(&reason));
+        // A policy terminal also closes the turn. Discard any unrelated provider
+        // error retained from an abnormal path, but never present it as policy context.
         state.last_turn_error = None;
         state.turn_error_line_shown = false;
         crate::i18n::t(crate::i18n::Msg::TurnSummaryPolicyDenied {
@@ -16727,9 +16754,11 @@ fn turn_summary_label(
             tool_call_count,
             duration: dur,
             total_tokens,
+            reason: reason.as_deref(),
         })
         .into_owned()
     } else if turn_is_incomplete(stop_reason) {
+        state.last_policy_denial_reason = None;
         // FOLD the captured failure cause into the separator itself
         // (`✗ 已中断：账户余额不足（HTTP 402） · …`) so the reason rides the
         // always-visible summary — the standalone mid-turn red line is emitted
@@ -16764,6 +16793,7 @@ fn turn_summary_label(
         // produced no summary (SnapshotUnavailable / RuntimeStopped), so it can
         // never fold into a LATER errored summary.
         state.last_turn_error = None;
+        state.last_policy_denial_reason = None;
         state.turn_error_line_shown = false;
         let done = state.next_done_label();
         crate::i18n::t(crate::i18n::Msg::TurnSummary {
@@ -16939,6 +16969,26 @@ mod background_notice_tests {
         ));
         assert!(state.deferred_background_notices.is_empty());
     }
+
+    #[test]
+    fn credential_policy_error_is_redacted_rendered_and_saved_for_terminal_fallback() {
+        let mut state = crate::state::UiState::new();
+        let mut renderer = CaptureRenderer::default();
+
+        render_credential_policy_error(&mut state, &mut renderer);
+
+        let saved = state
+            .last_policy_denial_reason
+            .as_deref()
+            .expect("saved reason");
+        assert!(saved.contains("安全策略") || saved.contains("security policy"));
+        assert!(!saved.contains("WECOM_WEBHOOK_URL"));
+        assert!(state.turn_error_line_shown);
+        assert!(matches!(
+            renderer.lines.as_slice(),
+            [UiLine::Error(message)] if message == saved
+        ));
+    }
 }
 
 /// Squeeze a captured failure reason into a SHORT headline that folds cleanly
@@ -17095,6 +17145,8 @@ mod turn_error_reason_tests {
     #[test]
     fn policy_denial_has_a_distinct_security_terminal_label() {
         let mut state = UiState::new();
+        state.last_policy_denial_reason = Some("sanitized credential policy reason".into());
+        state.turn_error_line_shown = true;
         let label = turn_summary_label(
             &mut state,
             ui_event::UiTurnStopReason::PolicyDenied,
@@ -17110,6 +17162,31 @@ mod turn_error_reason_tests {
             "{label}"
         );
         assert!(!label.contains("已中断"), "{label}");
+        assert!(
+            label.contains("sanitized credential policy reason"),
+            "{label}"
+        );
+        assert!(state.last_policy_denial_reason.is_none());
+        assert!(!state.turn_error_line_shown);
+    }
+
+    #[test]
+    fn policy_denial_never_folds_a_stale_provider_error() {
+        let mut state = UiState::new();
+        state.last_turn_error = Some("stale provider error".into());
+
+        let label = turn_summary_label(
+            &mut state,
+            ui_event::UiTurnStopReason::PolicyDenied,
+            1,
+            1,
+            0,
+            None,
+            "10ms",
+        );
+
+        assert!(!label.contains("stale provider error"), "{label}");
+        assert!(state.last_turn_error.is_none());
     }
 }
 
@@ -17124,6 +17201,7 @@ fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_
         .unwrap_or_default();
     let label = if matches!(ps.stop_reason, ui_event::UiTurnStopReason::PolicyDenied) {
         state.turn_error_line_shown = ps.error_line_shown;
+        state.last_policy_denial_reason = ps.policy_denial_reason;
         turn_summary_label(
             state,
             ps.stop_reason,
@@ -20690,6 +20768,7 @@ fn handle_agent_event(
             success,
             duration,
         } => {
+            let credential_policy_block = credential_policy_blocked(&output, success);
             // A result for this call arrived while an approval prompt is still up ⇒ the
             // approval was resolved WITHOUT the user answering (headless timeout fail-close,
             // a displaced second approval, or a cancel). Retract the orphaned "Waiting for
@@ -20781,6 +20860,12 @@ fn handle_agent_event(
                     call_id: call_id.clone(),
                     new_text: format!("  {} {}{}", child_glyph, prefix, suffix),
                 });
+                // Batch children normally collapse failures to a compact `✗`.
+                // A local security denial is different: hiding its reason leaves
+                // a blank-looking termination with no actionable explanation.
+                if credential_policy_block {
+                    render_credential_policy_error(state, renderer);
+                }
                 renderer.flush();
                 return;
             }
@@ -20841,6 +20926,7 @@ fn handle_agent_event(
             // already render it — otherwise we'd print it twice.
             if !call_rendered
                 && (!suppress_body_echo || (name == "task" && output.contains("<task ")))
+                && !(credential_policy_block && safe_name == "(invalid)")
             {
                 renderer.render(UiLine::ToolCall {
                     name: safe_name.clone(),
@@ -20848,10 +20934,12 @@ fn handle_agent_event(
                 });
             }
             if !suppress_body_echo {
+                if credential_policy_block {
+                    render_credential_policy_error(state, renderer);
                 // A plan-mode interception isn't a failure — render it as a calm `○`
                 // hint (with the gate's reason) instead of a ✗ error, so the user
                 // sees WHY the tool didn't run and that they should review the plan.
-                if is_incomplete_review_result(&name, &output, success) {
+                } else if is_incomplete_review_result(&name, &output, success) {
                     renderer.render(UiLine::Warning(summarise(&output)));
                 } else if let Some(reason) = plan_mode_block_reason(&output, success) {
                     renderer.render(UiLine::CommandOutput(format!("  ○ {reason}\n")));
@@ -21136,6 +21224,7 @@ fn handle_agent_event(
                     was_loop_round: false,
                     stop_reason,
                     error_line_shown: state.turn_error_line_shown,
+                    policy_denial_reason: state.last_policy_denial_reason.take(),
                     cached_pct,
                 });
             } else if state.loop_label.is_some() {
@@ -21152,6 +21241,7 @@ fn handle_agent_event(
                     was_loop_round: true,
                     stop_reason,
                     error_line_shown: state.turn_error_line_shown,
+                    policy_denial_reason: state.last_policy_denial_reason.take(),
                     cached_pct,
                 });
             } else {
@@ -24369,6 +24459,26 @@ pub(crate) fn plan_mode_block_reason(output: &str, success: bool) -> Option<&str
     }
     let reason = output.strip_prefix("blocked: ")?;
     reason.starts_with("plan mode").then_some(reason)
+}
+
+/// Match only the stable, policy-authored credential denial. Do not classify an
+/// arbitrary `blocked:` middleware reason as security-sensitive or reflect its
+/// model/plugin-controlled text into a privileged-looking red error.
+pub(crate) fn credential_policy_blocked(output: &str, success: bool) -> bool {
+    !success
+        && output.strip_prefix("blocked: ")
+            == Some(
+                atomcode_capabilities::tools::credential_bash_gate::CREDENTIAL_BASH_DENIAL_REASON,
+            )
+}
+
+fn render_credential_policy_error(state: &mut UiState, renderer: &mut dyn Renderer) {
+    let message = crate::i18n::t(crate::i18n::Msg::ToolBlockedBySecurityPolicy).into_owned();
+    // Keep the sanitized, driver-owned message for the PolicyDenied terminal
+    // separator. Never store the rejected command or raw middleware reason here.
+    state.last_policy_denial_reason = Some(message.clone());
+    state.turn_error_line_shown = true;
+    renderer.render(UiLine::Error(message));
 }
 
 /// A tool result that is an approval/user DENIAL → a calm compact label

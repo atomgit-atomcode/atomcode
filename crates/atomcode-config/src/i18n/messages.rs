@@ -454,6 +454,9 @@ pub enum Msg<'a> {
 
     // ── Tool result markers ──
     ToolDenied,
+    /// The credential-aware Bash policy rejected a tool call. Fixed text only:
+    /// never reflect the rejected command or model-controlled middleware output.
+    ToolBlockedBySecurityPolicy,
 
     // ── Execution mode ──
     CmdSwitchedAutoMode,
@@ -1436,6 +1439,8 @@ pub enum Msg<'a> {
         tool_call_count: usize,
         duration: &'a str,
         total_tokens: usize,
+        /// Optional driver-owned, sanitized reason folded into the terminal line.
+        reason: Option<&'a str>,
     },
 
     // ── OAuth login chrome (/login + /codingplan share these) ──

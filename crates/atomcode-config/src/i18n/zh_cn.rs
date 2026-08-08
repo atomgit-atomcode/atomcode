@@ -398,6 +398,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             }
         }
         Msg::ToolDenied => "已拒绝".into(),
+        Msg::ToolBlockedBySecurityPolicy =>
+            "安全策略已阻止工具调用：凭据不能通过通用 shell 参数、临时文件或环境变量传递".into(),
 
         Msg::CmdSwitchedAutoMode => "  已切换到自动模式(所有工具自动批准)。\n".into(),
         Msg::CmdSwitchedAcceptEditsMode => "  已切换到自动接受编辑模式(文件编辑免审批;bash 仍会询问)。\n".into(),
@@ -1097,8 +1099,10 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             let cause = reason.map(|r| format!("：{r}")).unwrap_or_default();
             format!("✗ 已中断{cause} · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into()
         }
-        Msg::TurnSummaryPolicyDenied { turn_count, tool_call_count, duration, total_tokens } =>
-            format!("✗ 安全策略已终止本回合 · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into(),
+        Msg::TurnSummaryPolicyDenied { turn_count, tool_call_count, duration, total_tokens, reason } => {
+            let cause = reason.map(|r| format!("：{r}")).unwrap_or_default();
+            format!("✗ 安全策略已终止本回合{cause} · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into()
+        }
         Msg::LoginQrHeader =>
             "  登录 AtomGit — 使用微信扫描下方二维码：\n\n".into(),
         Msg::LoginUrlAfterQr =>

@@ -1024,6 +1024,10 @@ pub struct UiState {
     /// to `None` when a CLEAN summary renders (`turn_summary_label`) so a reason
     /// from an error path that produced no summary can never fold into a later turn.
     pub last_turn_error: Option<String>,
+    /// Driver-owned, sanitized explanation for a credential policy denial.
+    /// Kept separate from `last_turn_error` so a provider/rate-limit failure can
+    /// never be presented as the cause of a later security-policy terminal.
+    pub last_policy_denial_reason: Option<String>,
     /// True once this turn already rendered a visible line carrying the failure
     /// cause (the red `UiLine::Error` line, or the muted rate-limit line). When
     /// set, `turn_summary_label` renders a bare `✗ 已中断 · …` and does NOT fold
@@ -1271,6 +1275,9 @@ pub struct PendingSeparator {
     /// so we capture it here to decide correctly whether the errored summary
     /// should fold the cause or render bare (the cause was already shown above).
     pub error_line_shown: bool,
+    /// Sanitized policy reason moved out of live state while a goal/loop
+    /// separator is deferred. This keeps it bound to the terminal that owns it.
+    pub policy_denial_reason: Option<String>,
     /// Cache-hit ratio over the turn's input, if the provider reported cached
     /// tokens. `None` ⇒ no annotation. Rendered as `· N% cached`.
     pub cached_pct: Option<u8>,
@@ -1345,6 +1352,7 @@ impl UiState {
             last_assistant_response: String::new(),
             response_finalized: false,
             last_turn_error: None,
+            last_policy_denial_reason: None,
             turn_error_line_shown: false,
             prior_phase: None,
             prior_spinner_label: None,

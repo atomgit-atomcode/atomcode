@@ -419,6 +419,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             }
         }
         Msg::ToolDenied => "denied".into(),
+        Msg::ToolBlockedBySecurityPolicy =>
+            "Tool call blocked by security policy: credentials cannot be passed through generic shell arguments, temporary files, or environment variables".into(),
 
         Msg::CmdSwitchedAutoMode => "  Switched to auto mode (all tools auto-approved).\n".into(),
         Msg::CmdSwitchedAcceptEditsMode => {
@@ -1123,8 +1125,10 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             let cause = reason.map(|r| format!(": {r}")).unwrap_or_default();
             format!("✗ Stopped{cause} · {turn_count} rounds · {tool_call_count} tools · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into()
         }
-        Msg::TurnSummaryPolicyDenied { turn_count, tool_call_count, duration, total_tokens } =>
-            format!("✗ Turn stopped by security policy · {turn_count} rounds · {tool_call_count} tools · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into(),
+        Msg::TurnSummaryPolicyDenied { turn_count, tool_call_count, duration, total_tokens, reason } => {
+            let cause = reason.map(|r| format!(": {r}")).unwrap_or_default();
+            format!("✗ Turn stopped by security policy{cause} · {turn_count} rounds · {tool_call_count} tools · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into()
+        }
         Msg::LoginQrHeader =>
             "  Sign in to AtomGit — scan the QR code with your WeChat:\n\n".into(),
         Msg::LoginUrlAfterQr =>
