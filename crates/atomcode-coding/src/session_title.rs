@@ -48,7 +48,11 @@ pub fn sanitize_generated_title(raw: &str) -> Option<String> {
 pub fn first_exchange_text(messages: &[Message]) -> Option<String> {
     let user = messages
         .iter()
-        .filter(|message| matches!(message.role, Role::User) && !message.synthetic)
+        .filter(|message| {
+            matches!(message.role, Role::User)
+                && !message.synthetic
+                && !atomcode_capabilities::reminder::is_system_reminder(&message.text)
+        })
         .map(|message| message.text.as_str())
         .next()
         .map(str::trim)
@@ -107,6 +111,21 @@ mod tests {
     fn first_exchange_skips_synthetic_context() {
         let messages = vec![
             Message::synthetic_user("[context compressed]"),
+            Message::user("修复登录错误"),
+            Message::assistant("已修复", vec![]),
+        ];
+        assert_eq!(
+            first_exchange_text(&messages).as_deref(),
+            Some("User: 修复登录错误\nAssistant: 已修复")
+        );
+    }
+
+    #[test]
+    fn first_exchange_skips_injected_system_reminder() {
+        let messages = vec![
+            Message::user(atomcode_capabilities::reminder::system_reminder(
+                "当前日期：2026-08-09",
+            )),
             Message::user("修复登录错误"),
             Message::assistant("已修复", vec![]),
         ];

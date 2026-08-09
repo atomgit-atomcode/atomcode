@@ -153,6 +153,7 @@ impl TuiSession {
                 // If origin matches but prefix does not, keep it as a real message.
                 !(m.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN)
                     && m.text.starts_with(LEGACY_COLD_SUMMARY_PREFIX))
+                    && !atomcode_capabilities::reminder::is_system_reminder(&m.text)
             })
             .cloned()
             .collect();
@@ -230,6 +231,7 @@ impl TuiSession {
                 // the text successfully strips the prefix.
                 !(m.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN)
                     && m.text.starts_with(LEGACY_COLD_SUMMARY_PREFIX))
+                    && !atomcode_capabilities::reminder::is_system_reminder(&m.text)
             })
             .collect();
     }
@@ -294,6 +296,29 @@ mod tests {
             format!("{LEGACY_COLD_SUMMARY_PREFIX}older context")
         );
         assert_eq!(out.messages[1].text, "recent");
+    }
+
+    #[test]
+    fn snapshot_ingest_skips_injected_system_reminders() {
+        let incoming = SessionSnapshot::new(vec![
+            Message::user("修复登录错误"),
+            Message::user(atomcode_capabilities::reminder::system_reminder(
+                "我就在任务1上！继续任务2！",
+            )),
+            Message::assistant("已修复", vec![]),
+        ]);
+
+        let mut session = Session::new(PathBuf::from("/tmp/project"));
+        session.update_from_conversation_snapshot(incoming);
+
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["修复登录错误", "已修复"]
+        );
     }
 
     #[test]
