@@ -686,7 +686,7 @@ daemon 聊天模式下可用的工具：
 | `web_search` | 网页搜索 |
 | `web_fetch` | 获取网页内容 |
 | `search_replace` | 搜索替换文件内容 |
-| `diagnostics` | LSP 诊断信息（需配置 LSP） |
+| `lsp` | LSP 定义、引用、悬浮信息和诊断（需配置 LSP） |
 | `use_skill` | 调用已注册的 Skill（需有可用 Skill） |
 
 ## 项目结构
