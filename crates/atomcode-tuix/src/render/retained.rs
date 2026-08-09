@@ -1214,24 +1214,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
-    /// Paired foreground/background style for the user-input block.
-    ///
-    /// Both channels are explicit because Windows cannot currently answer the
-    /// automatic background probe. If `Auto` falls back to the dark palette
-    /// while the terminal is actually light, inheriting its dark default
-    /// foreground would make the prompt unreadable on `PanelBg`.
-    /// Returns `bg: None` when colours are disabled — the caller treats that as
-    /// "no block, use the plain layout".
-    fn style_panel_bg(&self) -> CellStyle {
-        CellStyle {
-            fg: role(self.caps, Role::PanelFg),
-            bg: role(self.caps, Role::PanelBg),
-            bold: false,
-            reverse: false,
-            faint: false,
-        }
-    }
-
     /// Theme-aware muting via SGR 2 (faint). Renders the role's fg
     /// at ~50% intensity so secondary text reads as "subordinate"
     /// without picking a fixed gray that may collide with the user's
@@ -6539,37 +6521,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
-    /// Like `push_body_prefixed` but continuation rows carry `cont_prefix`
-    /// (e.g. a coloured `▎` left bar) instead of a blank pad, so a multi-line
-    /// block reads as one unit with a full-height left marker. `cont_prefix`
-    /// MUST be the same display width as `prefix` so the body stays aligned.
-    fn push_body_prefixed_cont(
-        &mut self,
-        prefix: &str,
-        prefix_style: &CellStyle,
-        cont_prefix: &str,
-        cont_style: &CellStyle,
-        body: &str,
-        body_style: &CellStyle,
-    ) {
-        let rows = self.build_prefixed_rows(
-            prefix,
-            prefix_style,
-            body,
-            body_style,
-            Some((cont_prefix, cont_style)),
-        );
-        for row in rows {
-            self.push_body_row(row);
-        }
-    }
-
     /// Symbol-anchored row builder. Wraps `body` to `screen_width − PAD_COL`,
     /// emits the leading row with `prefix`; continuation rows use `cont`'s
     /// `(prefix, style)` when given, else a blank pad of equal display width.
     /// Pure: no side effects on `body_lines` or terminal output. Used by
-    /// `push_body_prefixed` / `push_body_prefixed_cont` (which append each row
-    /// via push_body_row) and `render_inflight_tool` (which writes in-place
+    /// `push_body_prefixed` (which appends each row via `push_body_row`) and
+    /// `render_inflight_tool` (which writes in-place
     /// over previously-rendered inflight rows during spinner ticks — see that
     /// fn's doc comment for the scrollback-leak bug this split addresses).
     fn build_prefixed_rows(
@@ -7261,84 +7218,24 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.mark_message(crate::render::MarkKind::User);
         self.last_mark_was_assistant = false;
         let safe = scrub_controls(text);
-
-        let bg = self.style_panel_bg();
-
-        // No panel background (NO_COLOR / colours disabled): keep the original
-        // plain layout byte-for-byte so nothing regresses.
-        if bg.bg.is_none() {
-            let accent = self.style_bold(Role::Accent);
-            let text_style = CellStyle::default();
-            self.push_body_prefixed_cont(
-                self.caps.prompt_chevron(),
-                &accent,
-                self.caps.prompt_continuation_bar(),
-                &accent,
-                &safe,
-                &text_style,
-            );
-            let muted = self.style_for(Role::Muted);
-            for n in attachments {
-                self.push_body_text(&format!("└ [Image #{}]", n), &muted);
-            }
-            self.push_body_row(Vec::new());
-            self.md_state.reset();
-            return;
-        }
-
-        let w = (self.screen.width() as usize).saturating_sub(PAD_COL);
-
-        // Marker / text / attachment styles keep their fg but gain the panel
-        // bg so the colour sits behind the whole block.
-        let mut accent = self.style_bold(Role::Accent);
-        accent.bg = bg.bg;
-        let text_style = bg.clone();
-        let mut muted = self.style_for(Role::Muted);
-        muted.bg = bg.bg;
-
-        // Content rows: `❯ ` on the first row, then a plain bg-filled indent of
-        // equal width on continuation rows. The panel background now delineates
-        // the block, so the coloured `▎` continuation bar is redundant — drop it,
-        // keeping the indent so wrapped/multi-line text stays aligned and the
-        // background has no left-edge hole.
-        let chevron = self.caps.prompt_chevron();
-        let cont_indent = " ".repeat(crate::width::display_width(chevron));
-        let mut rows = self.build_prefixed_rows(
-            chevron,
+        // Keep the committed echo visually continuous with the composer: the
+        // accent chevron identifies the user turn, while text and continuation
+        // rows retain the terminal background. Paste placeholders are still
+        // expanded before this point; this is presentation-only and does not
+        // alter the payload or history model.
+        let accent = self.style_bold(Role::Accent);
+        let text_style = CellStyle::default();
+        self.push_body_prefixed(
+            self.caps.prompt_chevron(),
             &accent,
             &safe,
             &text_style,
-            Some((cont_indent.as_str(), &bg)),
         );
-        for row in &mut rows {
-            Self::pad_row_to_width(row, w, bg.clone());
-        }
-        for row in rows {
-            self.push_body_row(row);
-        }
 
-        // Attachment rows live inside the block. Reuse build_prefixed_rows with
-        // a PAD_COL-wide bg indent as the "prefix" so glyph downgrade + wrap
-        // (to width − 2·PAD_COL) match the plain `push_body_text` path.
+        let muted = self.style_for(Role::Muted);
         for n in attachments {
-            let indent = " ".repeat(PAD_COL);
-            let mut arows = self.build_prefixed_rows(
-                &indent,
-                &bg,
-                &format!("└ [Image #{}]", n),
-                &muted,
-                Some((&indent, &bg)),
-            );
-            for row in &mut arows {
-                Self::pad_row_to_width(row, w, bg.clone());
-            }
-            for row in arows {
-                self.push_body_row(row);
-            }
+            self.push_body_text(&format!("└ [Image #{}]", n), &muted);
         }
-
-        // Keep the usual paragraph gap after the user message, but let the
-        // panel background hug the actual content without top/bottom padding.
         self.push_body_row(Vec::new());
         self.md_state.reset();
     }
@@ -17415,49 +17312,36 @@ mod tests {
         }
     }
 
-    /// User-message text uses the foreground paired with its explicit panel
-    /// background. Inheriting the terminal default is unsafe on Windows where
-    /// `Auto` may fall back to a dark panel inside an actually-light terminal.
+    /// Committed user text keeps the terminal foreground/background used by
+    /// the composer; only the prompt marker carries the accent colour.
     #[test]
-    fn retained_user_message_text_uses_panel_foreground() {
-        let _theme = crate::highlight::theme::test_lock();
-        crate::highlight::theme::set_theme_mode(false);
-        let (mut r, _buf) = new_capturing(80, 24);
-        let expected_fg = crate::render::theme::role(r.caps, crate::render::theme::Role::PanelFg);
-        r.render(UiLine::User("hello".into()));
-
-        let mut found = false;
-        for row in &r.body_lines {
-            let text: String = row.iter().map(|c| c.ch).collect();
-            if !text.contains("hello") {
-                continue;
-            }
-            found = true;
-            // The text glyphs (the alphabetic cells; the chevron is a glyph/space)
-            // must carry the foreground selected for the panel background.
-            for cell in row {
-                if cell.ch.is_alphabetic() {
-                    assert_eq!(
-                        cell.style.fg, expected_fg,
-                        "user text cell '{}' must use panel fg {:?}, got {:?}",
-                        cell.ch, expected_fg, cell.style.fg,
-                    );
-                }
-            }
-            break;
-        }
-        assert!(found, "no row containing the user text 'hello' found");
-    }
-
-    /// A multi-line user message reads as one unit via the panel background,
-    /// not a coloured bar: the `❯` chevron sits on the first row, and every
-    /// continuation row starts with a plain bg-filled indent (no `▎` bar) so
-    /// the block is delineated by its background alone.
-    #[test]
-    fn retained_multiline_user_message_continuation_is_bg_no_bar() {
+    fn retained_user_message_keeps_composer_text_style() {
         let (mut r, _buf) = new_capturing(80, 24);
         r.caps.colors = true;
-        let expected_bg = crate::render::theme::role(r.caps, crate::render::theme::Role::PanelBg);
+        r.render(UiLine::User("hello".into()));
+
+        let row = r
+            .body_lines
+            .iter()
+            .find(|row| {
+                row.iter()
+                    .map(|c| c.ch)
+                    .collect::<String>()
+                    .contains("hello")
+            })
+            .expect("user text row present");
+        for cell in row.iter().filter(|cell| cell.ch.is_alphabetic()) {
+            assert_eq!(cell.style.fg, None, "user text must inherit terminal fg");
+            assert_eq!(cell.style.bg, None, "user text must inherit terminal bg");
+        }
+    }
+
+    /// A multi-line committed message uses the same layout as the composer:
+    /// `❯` on the first row and a plain equal-width indent on continuation rows.
+    #[test]
+    fn retained_multiline_user_message_matches_composer_indent() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = true;
         r.render(UiLine::User("first line\nsecond line".into()));
 
         let mut saw_chevron = false;
@@ -17478,16 +17362,12 @@ mod tests {
                 let head = row.first().expect("continuation row must not be empty");
                 assert_eq!(
                     head.ch, ' ',
-                    "continuation must start with a plain indent, not a ▎ bar, got {:?}",
+                    "continuation must start with the composer indent, got {:?}",
                     head.ch
                 );
                 assert_eq!(
-                    head.style.bg, expected_bg,
-                    "the continuation indent must carry the panel background"
-                );
-                assert!(
-                    row.iter().all(|c| c.ch != '\u{258e}'),
-                    "continuation row must not contain a ▎ bar"
+                    head.style.bg, None,
+                    "continuation indent must not paint a panel"
                 );
             }
         }
@@ -17498,14 +17378,9 @@ mod tests {
     }
 
     #[test]
-    fn retained_user_message_renders_panel_bg_block() {
+    fn retained_user_message_does_not_switch_to_panel_background() {
         let (mut r, _buf) = new_capturing(80, 24);
         r.caps.colors = true;
-        let expected_bg = crate::render::theme::role(r.caps, crate::render::theme::Role::PanelBg);
-        assert!(
-            expected_bg.is_some(),
-            "PanelBg must resolve to a colour when colours are on"
-        );
         r.render(UiLine::User("hello".into()));
 
         // Locate the content row (the one carrying the user's text).
@@ -17520,38 +17395,17 @@ mod tests {
             })
             .expect("user text row present");
 
-        // Every cell on the content row carries the panel background, including
-        // the ❯ marker cell and the trailing padding spaces.
         let content = &r.body_lines[idx];
         assert!(
-            content.iter().all(|c| c.style.bg == expected_bg),
-            "all content cells must carry PanelBg, got {:?}",
+            content.iter().all(|c| c.style.bg.is_none()),
+            "committed user rows must keep the composer background, got {:?}",
             content.iter().map(|c| c.style.bg).collect::<Vec<_>>()
         );
-        // Padded to screen width − PAD_COL (80 − 2 = 78) display columns.
-        let cols: usize = content.iter().map(|c| c.width as usize).sum();
-        assert_eq!(cols, 78, "content row padded to screen width − PAD_COL");
-
-        // The panel background hugs the content: no blank background padding
-        // row above or below. The normal paragraph spacer remains below.
-        assert_eq!(idx, 0, "no bg padding row may precede the content");
         let below = &r.body_lines[idx + 1];
         assert!(
             below.is_empty(),
             "the row below content must be the plain paragraph spacer"
         );
-    }
-
-    #[test]
-    fn retained_user_message_no_bg_when_colours_disabled() {
-        let (mut r, _buf) = new_capturing(80, 24);
-        r.caps.colors = false;
-        r.render(UiLine::User("hello".into()));
-        for row in &r.body_lines {
-            for c in row {
-                assert_eq!(c.style.bg, None, "no background when colours are disabled");
-            }
-        }
     }
 
     /// Submitting a recalled prompt clears the composer before its permanent
@@ -17606,31 +17460,29 @@ mod tests {
         assert!(visible.iter().any(|row| row.contains("second line")));
     }
 
-    /// No-colour terminals keep the `▎` continuation bar (there is no panel
-    /// background to delineate a multi-line block without it). On Windows /
-    /// no-unicode-font terminals that bar falls back to an ASCII `|` (2 display
-    /// cols, same as `❯`→`>`), so layout stays identical and no tofu appears.
+    /// Windows/no-unicode terminals use the ASCII prompt and the same plain
+    /// continuation indent, so submitted messages stay aligned without tofu.
     #[test]
-    fn retained_multiline_user_bar_ascii_fallback() {
+    fn retained_multiline_user_indent_ascii_fallback() {
         let (mut r, _buf) = new_capturing(80, 24);
-        r.caps.colors = false; // no panel background → bar is kept as the grouping cue
+        r.caps.colors = false;
         r.caps.unicode_symbols = false; // Windows legacy conhost / no-unicode font
         r.render(UiLine::User("first line\nsecond line".into()));
 
-        let mut saw_bar = false;
+        let mut saw_continuation = false;
         for row in &r.body_lines {
             let text: String = row.iter().map(|c| c.ch).collect();
             if text.contains("second line") {
-                saw_bar = true;
-                let bar = row.first().expect("continuation row must not be empty");
+                saw_continuation = true;
+                let indent = row.first().expect("continuation row must not be empty");
                 assert_eq!(
-                    bar.ch, '|',
-                    "ascii fallback bar must be '|', got {:?}",
-                    bar.ch
+                    indent.ch, ' ',
+                    "ascii continuation must use a plain indent, got {:?}",
+                    indent.ch
                 );
             }
         }
-        assert!(saw_bar, "expected a continuation row");
+        assert!(saw_continuation, "expected a continuation row");
     }
 
     /// Regression: when a long Bash command wraps to multiple terminal

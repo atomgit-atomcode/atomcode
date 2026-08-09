@@ -228,19 +228,6 @@ impl TerminalCaps {
         }
     }
 
-    /// Continuation-row left bar for a multi-line user message — a full-height
-    /// marker under the `❯` chevron so the block reads as one unit. `▎` (left
-    /// one-eighth block) when unicode is available, ASCII `|` otherwise (Windows
-    /// legacy conhost / no-unicode fonts — same `unicode_symbols` gate as the
-    /// chevron, so it never renders a tofu glyph). Both are exactly 2 display
-    /// columns, matching `prompt_chevron`, so wrapped-row alignment is identical.
-    pub fn prompt_continuation_bar(&self) -> &'static str {
-        if self.unicode_symbols {
-            "\u{258e} "
-        } else {
-            "| "
-        }
-    }
 }
 
 #[cfg(test)]

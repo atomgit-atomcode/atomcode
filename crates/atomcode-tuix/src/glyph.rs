@@ -4,7 +4,7 @@
 //! status marks baked into `atomcode-core`'s i18n strings, which live BELOW the terminal
 //! layer and so can't consult `TerminalCaps`. On a terminal flagged `!unicode_symbols`
 //! (legacy Windows conhost, no-unicode fonts) those glyphs render as `□` tofu — even
-//! though atomcode's *own* symbols (chevron, spinner, continuation bar) already fall back
+//! though atomcode's *own* symbols (such as the chevron and spinner) already fall back
 //! to ASCII via `TerminalCaps`.
 //!
 //! [`downgrade_glyphs`] closes that gap centrally: the renderer runs body/status text
