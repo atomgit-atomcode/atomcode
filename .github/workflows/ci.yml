@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 依赖解析/构建需要访问 atomgit.com 与 gitcode.com（与 build.yml 保持一致）
+      - name: Add hosts
+        run: |
+          echo "159.138.147.37 api.atomgit.com" | sudo tee -a /etc/hosts
+          echo "159.138.147.37 file.atomgit.com" | sudo tee -a /etc/hosts
+          echo "159.138.147.37 api.gitcode.com" | sudo tee -a /etc/hosts
+          echo "159.138.147.37 file.gitcode.com" | sudo tee -a /etc/hosts
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+  clippy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Add hosts
+        run: |
+          echo "159.138.147.37 api.atomgit.com" | sudo tee -a /etc/hosts
+          echo "159.138.147.37 file.atomgit.com" | sudo tee -a /etc/hosts
+          echo "159.138.147.37 api.gitcode.com" | sudo tee -a /etc/hosts
+          echo "159.138.147.37 file.gitcode.com" | sudo tee -a /etc/hosts
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # 当前仓库存在既有 clippy lint（如 doc_lazy_continuation、derivable_impls），
+      # 先作为检查项输出；待技术债清零后可加 -- -D warnings 收紧为门禁。
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets
