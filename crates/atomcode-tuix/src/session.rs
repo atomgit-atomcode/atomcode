@@ -159,6 +159,12 @@ impl TuiSession {
             .collect();
         let mut display_messages = Vec::with_capacity(view.presentation.entries.len());
         for entry in view.presentation.entries {
+            // UI-only replay entries are display data, not provider context; an
+            // injected `<system-reminder>` block must never surface as a user
+            // message in the terminal (see #1362 / #1349).
+            if atomcode_capabilities::reminder::is_system_reminder(&entry.text) {
+                continue;
+            }
             let after_message = match entry.anchor {
                 DisplayAnchor::AtStart => 0,
                 DisplayAnchor::AfterTurn { turn_id } => view
@@ -318,6 +324,50 @@ mod tests {
                 .map(|m| m.text.as_str())
                 .collect::<Vec<_>>(),
             vec!["修复登录错误", "已修复"]
+        );
+    }
+
+    #[test]
+    fn catalog_display_messages_skip_injected_system_reminders() {
+        use atomcode_capabilities::session::presentation::PRESENTATION_VERSION;
+        use atomcode_capabilities::session::{
+            DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole,
+        };
+        let view = atomcode_daemon::legacy_convert::CatalogSessionView {
+            snapshot: SessionSnapshot::new(vec![Message::user("修复登录错误")]),
+            meta: atomcode_capabilities::session::SessionMeta::new(
+                "reminder-session",
+                "/project",
+                1,
+            ),
+            presentation: PresentationFile {
+                v: PRESENTATION_VERSION,
+                entries: vec![
+                    PresentationEntry {
+                        anchor: DisplayAnchor::AtStart,
+                        role: PresentationRole::User,
+                        text: atomcode_capabilities::reminder::system_reminder(
+                            "我就在任务1上！继续任务2！",
+                        ),
+                    },
+                    PresentationEntry {
+                        anchor: DisplayAnchor::AtStart,
+                        role: PresentationRole::Assistant,
+                        text: "已修复".into(),
+                    },
+                ],
+            },
+        };
+
+        let session = Session::from_catalog_view(view).unwrap();
+
+        assert_eq!(
+            session
+                .display_messages
+                .iter()
+                .map(|d| d.message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["已修复"]
         );
     }
 

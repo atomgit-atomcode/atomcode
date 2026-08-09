@@ -2075,6 +2075,9 @@ fn merge_catalog_session_messages_for_display(
         Vec::with_capacity(runtime_messages.len() + session.presentation.entries.len());
     let mut append_presentation = |position: usize, messages: &mut Vec<MessageInfo>| {
         for entry in presentation.remove(&position).unwrap_or_default() {
+            if atomcode_capabilities::reminder::is_system_reminder(&entry.text) {
+                continue;
+            }
             messages.push(MessageInfo {
                 role: match entry.role {
                     PresentationRole::User => "user",
@@ -2101,6 +2104,9 @@ fn merge_catalog_session_messages_for_display(
     }
     for (_, entries) in presentation {
         for entry in entries {
+            if atomcode_capabilities::reminder::is_system_reminder(&entry.text) {
+                continue;
+            }
             messages.push(MessageInfo {
                 role: match entry.role {
                     PresentationRole::User => "user",
