@@ -369,6 +369,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelFieldBaseUrl => "Base URL".into(),
         Msg::ProviderPanelFieldApiKey => "API key".into(),
         Msg::ProviderPanelFieldModel => "Model".into(),
+        Msg::ProviderPanelFieldVision => "Image input".into(),
+        Msg::ProviderPanelVisionAuto => "Auto".into(),
+        Msg::ProviderPanelVisionEnabled => "Enabled".into(),
+        Msg::ProviderPanelVisionDisabled => "Disabled".into(),
         Msg::ProviderPanelFieldWindow => "Context window".into(),
         Msg::ProviderPanelFieldMakeDefault => "Set as default".into(),
         Msg::ProviderPanelSwitchHint => "←→ to switch".into(),
@@ -379,7 +383,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "Tab Next  ←→ Switch provider  Space Toggle  ↵ Save  Esc Back".into(),
         Msg::ProviderPanelAccountFormHint => "Tab Switch  ↵ Save  Esc Back".into(),
         Msg::ProviderPanelModelFormHint =>
-            "Tab Next  ←→ Switch account  Space Toggle  ↵ Save  Esc Back".into(),
+            "Tab Next  ←→ Switch option  Space Toggle  ↵ Save  Esc Back".into(),
         // ── Model picker ──
         Msg::ModelSwitched { provider, model } =>
             format!("  Switched to {provider} · {model} for this session\n").into(),

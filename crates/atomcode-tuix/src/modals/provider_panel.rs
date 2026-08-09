@@ -232,6 +232,7 @@ enum ModelField {
     Account,
     ApiKey,
     Model,
+    Vision,
     Window,
     MakeDefault,
 }
@@ -264,6 +265,8 @@ struct ModelForm {
     account_idx: usize,
     api_key: String,
     model: String,
+    /// `None` = Auto, `Some(true)` = Enabled, `Some(false)` = Disabled.
+    supports_vision: Option<bool>,
     window: String,
     make_default: bool,
     focus: ModelField,
@@ -292,6 +295,7 @@ impl ModelForm {
             account_idx,
             api_key: String::new(),
             model: String::new(),
+            supports_vision: None,
             window: String::new(),
             make_default: true,
             focus: ModelField::Account,
@@ -307,6 +311,7 @@ impl ModelForm {
             account_idx: 0,
             api_key: String::new(),
             model: m.model.clone(),
+            supports_vision: m.supports_vision,
             window: m.context_window.to_string(),
             make_default: config.effective_model_selection().as_deref() == Some(id),
             focus: ModelField::Model,
@@ -335,6 +340,7 @@ impl ModelForm {
             }
         }
         v.push(ModelField::Model);
+        v.push(ModelField::Vision);
         v.push(ModelField::Window);
         v.push(ModelField::MakeDefault);
         v
@@ -364,6 +370,27 @@ impl ModelForm {
         // The ApiKey field appears/disappears with the account.
         if !self.fields().contains(&self.focus) {
             self.focus = ModelField::Account;
+        }
+    }
+
+    fn cycle_vision(&mut self, forward: bool) {
+        self.supports_vision = match (self.supports_vision, forward) {
+            (None, true) => Some(true),
+            (Some(true), true) => Some(false),
+            (Some(false), true) => None,
+            (None, false) => Some(false),
+            (Some(false), false) => Some(true),
+            (Some(true), false) => None,
+        };
+    }
+
+    fn vision_label(&self) -> String {
+        match self.supports_vision {
+            None => crate::i18n::t(crate::i18n::Msg::ProviderPanelVisionAuto).into_owned(),
+            Some(true) => crate::i18n::t(crate::i18n::Msg::ProviderPanelVisionEnabled).into_owned(),
+            Some(false) => {
+                crate::i18n::t(crate::i18n::Msg::ProviderPanelVisionDisabled).into_owned()
+            }
         }
     }
 }
@@ -434,7 +461,7 @@ impl ProviderPanel {
                 ModelField::Window => form
                     .window
                     .extend(clean.chars().filter(char::is_ascii_digit)),
-                ModelField::Account | ModelField::MakeDefault => {}
+                ModelField::Account | ModelField::Vision | ModelField::MakeDefault => {}
             },
             Mode::List => {
                 self.query.push_str(clean);
@@ -862,6 +889,7 @@ impl ProviderPanel {
     fn save_model(&self, form: &ModelForm, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> bool {
         let account_id = form.account_id().to_string();
         let model_name = form.model.trim().to_string();
+        let supports_vision = form.supports_vision;
         if model_name.is_empty() {
             return false;
         }
@@ -926,9 +954,11 @@ impl ProviderPanel {
                 let selection_id = if let Some(id) = &edit_id {
                     if let Some(model) = persisted.models.get_mut(id) {
                         model.model = model_name.clone();
+                        model.supports_vision = supports_vision;
                         model.context_window = context_window;
                     } else if let Some(provider) = persisted.providers.get_mut(id) {
                         provider.model = model_name.clone();
+                        provider.supports_vision = supports_vision;
                         provider.context_window = context_window;
                     } else {
                         anyhow::bail!("model {id:?} changed; reopen /provider");
@@ -956,6 +986,7 @@ impl ProviderPanel {
                             model: model_name.clone(),
                             display_name: None,
                             system_prompt: None,
+                            supports_vision,
                             context_window,
                             max_tokens: None,
                             capable_model: None,
@@ -1150,6 +1181,11 @@ impl Modal for ProviderPanel {
                 KeyCode::BackTab | KeyCode::Up => form.advance_focus(false),
                 KeyCode::Left if form.focus == ModelField::Account => form.cycle_account(false),
                 KeyCode::Right if form.focus == ModelField::Account => form.cycle_account(true),
+                KeyCode::Left if form.focus == ModelField::Vision => form.cycle_vision(false),
+                KeyCode::Right if form.focus == ModelField::Vision => form.cycle_vision(true),
+                KeyCode::Char(' ') if form.focus == ModelField::Vision => {
+                    form.cycle_vision(true);
+                }
                 KeyCode::Char(' ') if form.focus == ModelField::MakeDefault => {
                     form.make_default = !form.make_default;
                 }
@@ -1577,6 +1613,11 @@ impl Modal for ProviderPanel {
                     form.model.clone(),
                     form.focus == ModelField::Model,
                 ));
+                items.push(field_row(
+                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldVision),
+                    format!("‹ {} ›", form.vision_label()),
+                    form.focus == ModelField::Vision,
+                ));
                 let win = if form.window.is_empty() {
                     format!(
                         "({})",
@@ -1835,6 +1876,37 @@ mod tests {
         assert_eq!(edit.model, "deepseek-chat");
         assert_eq!(edit.window, "131072");
         assert_eq!(edit.edit_id.as_deref(), Some("acc/m"));
+    }
+
+    #[test]
+    fn model_form_vision_cycles_auto_enabled_disabled_and_restores_edit_value() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "acc": { "provider": "openai-compatible" } },
+            "models": {
+                "acc/qwen": {
+                    "account": "acc",
+                    "model": "qwen3.8max",
+                    "supports_vision": true,
+                    "context_window": 131072
+                }
+            }
+        }))
+        .unwrap();
+
+        let mut add = ModelForm::new_add(&cfg, Some("acc")).unwrap();
+        assert_eq!(add.supports_vision, None);
+        add.cycle_vision(true);
+        assert_eq!(add.supports_vision, Some(true));
+        add.cycle_vision(true);
+        assert_eq!(add.supports_vision, Some(false));
+        add.cycle_vision(true);
+        assert_eq!(add.supports_vision, None);
+        add.cycle_vision(false);
+        assert_eq!(add.supports_vision, Some(false));
+
+        let edit = ModelForm::new_edit(&cfg, "acc/qwen").unwrap();
+        assert_eq!(edit.supports_vision, Some(true));
+        assert!(edit.fields().contains(&ModelField::Vision));
     }
 
     #[test]

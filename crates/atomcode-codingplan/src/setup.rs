@@ -1293,10 +1293,7 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
             .clone()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| PROVIDER_TYPE.to_string()),
-        api_key: entry
-            .api_key
-            .clone()
-            .filter(|key| !key.trim().is_empty()),
+        api_key: entry.api_key.clone().filter(|key| !key.trim().is_empty()),
         model: entry.display_model_name.clone(),
         base_url: Some(
             entry
@@ -1306,6 +1303,7 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
                 .unwrap_or_else(codingplan_llm_base_url),
         ),
         system_prompt: None,
+        supports_vision: None,
         user_agent: None,
         // `context_window: 0` from a misconfigured row would degrade
         // every request to a zero-token window; treat that as
@@ -2604,10 +2602,7 @@ mod tests {
         );
 
         let model_names = vec!["GLM-5.2".to_string(), "Qwen".to_string()];
-        let provider_names = vec![
-            "Longyuan-GLM-5.2".to_string(),
-            "Longyuan-Qwen".to_string(),
-        ];
+        let provider_names = vec!["Longyuan-GLM-5.2".to_string(), "Longyuan-Qwen".to_string()];
 
         let resolved = refreshed_default_provider(
             &config,
@@ -2638,9 +2633,10 @@ mod tests {
     #[test]
     fn a_custom_default_survives_the_refresh() {
         let mut config = blank_config();
-        config
-            .providers
-            .insert("my-ollama".into(), build_codingplan_provider(&entry("llama")));
+        config.providers.insert(
+            "my-ollama".into(),
+            build_codingplan_provider(&entry("llama")),
+        );
         let resolved = refreshed_default_provider(
             &config,
             "my-ollama",

@@ -40,11 +40,11 @@ impl ImagePreprocessor for VlImagePreprocessor {
         &self,
         text: String,
         images: Vec<ImageContent>,
-        active_model: String,
+        supports_vision: bool,
         session_id: Option<String>,
     ) -> (UserInput, Option<VisionNotice>) {
         // Short-circuit: no images, or the main model already accepts images.
-        if should_skip(&active_model, !images.is_empty()) {
+        if should_skip(supports_vision, !images.is_empty()) {
             return (UserInput { text, images }, None);
         }
         let config = match Config::load(&Config::default_path()) {

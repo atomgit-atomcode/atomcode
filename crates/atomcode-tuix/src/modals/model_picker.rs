@@ -352,6 +352,7 @@ mod tests {
                     model: model.to_string(),
                     base_url: None,
                     system_prompt: None,
+                    supports_vision: None,
                     user_agent: None,
                     context_window: 128000,
                     max_tokens: None,

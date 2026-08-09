@@ -46,6 +46,8 @@ pub struct AnthropicConfig {
     /// `/v1/messages`.
     pub base_url: String,
     pub model: String,
+    /// Whether user image blocks are emitted. Disabled profiles degrade to text.
+    pub supports_vision: bool,
     pub context_window: u32,
     /// REQUIRED output cap for the Messages API. Used when `ChatOptions::max_tokens` is
     /// `None` (Anthropic rejects a request with no `max_tokens`).
@@ -87,10 +89,12 @@ impl AnthropicConfig {
         base_url: impl Into<String>,
         model: impl Into<String>,
     ) -> Self {
+        let model = model.into();
         Self {
             api_key: api_key.into(),
             base_url: base_url.into(),
-            model: model.into(),
+            supports_vision: super::model_suggests_vision(&model),
+            model,
             context_window: 200_000,
             max_tokens: 4096,
             anthropic_version: "2023-06-01".to_string(),
@@ -409,7 +413,7 @@ fn build_request_body(
     );
     body.insert("stream".into(), json!(true));
 
-    let (system, msgs) = format_messages(messages, cfg.thinking);
+    let (system, msgs) = format_messages_with_vision(messages, cfg.thinking, cfg.supports_vision);
     if let Some(s) = system {
         body.insert("system".into(), json!(s));
     }
@@ -472,7 +476,16 @@ fn build_request_body(
 /// Split kernel messages into the Anthropic top-level `system` string (joined leading
 /// System messages) and the wire `messages[]` (User/Assistant/Tool mapped to content
 /// blocks; consecutive Tool results folded into one `user` message).
+#[cfg(test)]
 fn format_messages(messages: &[Message], echo_thinking: bool) -> (Option<String>, Vec<Value>) {
+    format_messages_with_vision(messages, echo_thinking, true)
+}
+
+fn format_messages_with_vision(
+    messages: &[Message],
+    echo_thinking: bool,
+    supports_vision: bool,
+) -> (Option<String>, Vec<Value>) {
     // Leading System messages lift to the top-level `system` (joined). Anthropic has no
     // system message ROLE on the wire.
     let system_text: String = messages
@@ -494,7 +507,7 @@ fn format_messages(messages: &[Message], echo_thinking: bool) -> (Option<String>
         match m.role {
             Role::System => {} // lifted above
             Role::User => {
-                out.push(format_user_message(m));
+                out.push(format_user_message(m, supports_vision));
                 i += 1;
                 continue;
             }
@@ -589,8 +602,8 @@ fn content_to_blocks(content: Value) -> Vec<Value> {
 
 /// A `user` message. Text-only → `content` is a STRING (prefix-cache parity with the
 /// no-block path); with images → an array of text + base64 `image` blocks.
-fn format_user_message(m: &Message) -> Value {
-    if m.images.is_empty() {
+fn format_user_message(m: &Message, supports_vision: bool) -> Value {
+    if !supports_vision || m.images.is_empty() {
         return json!({ "role": "user", "content": m.text });
     }
     let mut parts: Vec<Value> = Vec::with_capacity(m.images.len() + 1);
@@ -1298,6 +1311,19 @@ mod tests {
             c[1],
             json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}})
         );
+    }
+
+    #[test]
+    fn disabled_vision_degrades_user_images_to_text() {
+        let m = Message::user_with_images(
+            "look",
+            vec![ImageContent {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+            }],
+        );
+        let (_s, out) = format_messages_with_vision(&[m], false, false);
+        assert_eq!(out[0], json!({"role":"user","content":"look"}));
     }
 
     #[test]

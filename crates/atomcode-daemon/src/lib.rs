@@ -142,6 +142,10 @@ pub(crate) struct ProviderInfo {
     #[serde(rename = "type")]
     pub provider_type: String,
     pub model: String,
+    /// Effective capability after applying the Auto heuristic.
+    pub supports_vision: bool,
+    /// Persisted user override. `None` means Auto.
+    pub supports_vision_override: Option<bool>,
     pub base_url: Option<String>,
     pub has_api_key: bool,
     pub requires_login: bool,
@@ -4212,7 +4216,7 @@ async fn process_chat_request(
             .collect();
         let runtime_text = live_api::preprocess_image_caption(
             &config,
-            &provider_config.model,
+            provider_config.accepts_images(),
             &working_dir,
             telemetry.clone(),
             Some(&session_id),
@@ -6859,6 +6863,7 @@ mod tests {
             model: model.into(),
             base_url: Some(base_url),
             system_prompt: None,
+            supports_vision: None,
             user_agent: None,
             context_window: 128_000,
             max_tokens: Some(1024),

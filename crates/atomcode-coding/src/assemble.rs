@@ -4,11 +4,10 @@ use crate::config::CodingAgentConfig;
 use crate::discipline::VerifyCadenceHook;
 use crate::execution_policy::TurnExecutionPolicy;
 use crate::persona::coding_persona_with_language;
-use atomcode_capabilities::codeintel::{codeintel_tool_names, register_codeintel_tools};
-use atomcode_capabilities::codeintel::{register_lsp_tool, LspSettings};
-use atomcode_capabilities::provider::{
-    model_suggests_vision, OpenAiCompatConfig, OpenAiCompatProvider,
+use atomcode_capabilities::codeintel::{
+    codeintel_tool_names, register_codeintel_tools, register_lsp_tool, LspSettings,
 };
+use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider};
 use atomcode_capabilities::session::SessionContextHook;
 use atomcode_capabilities::tools::{
     coding_tool_names, register_coding_tools_with_vision, ApprovalMiddleware,
@@ -50,7 +49,7 @@ pub fn build_coding_agent(cfg: CodingAgentConfig) -> Result<Agent, String> {
     // Text-only models must NOT receive image content — a resumed conversation whose
     // history contains an image would otherwise 400 every turn. SAME canonical detector
     // as the tool-mount / read_file vision gate above.
-    provider_cfg.supports_vision = model_suggests_vision(&cfg.model);
+    provider_cfg.supports_vision = cfg.supports_vision;
     let provider = OpenAiCompatProvider::new(provider_cfg)
         .map_err(|e| format!("provider init failed: {}", e.message))?;
     try_build_coding_agent_with(&cfg, Arc::new(provider))
@@ -66,12 +65,12 @@ pub fn build_coding_agent(cfg: CodingAgentConfig) -> Result<Agent, String> {
 /// [`try_build_coding_agent_with`].
 pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmProvider>) -> Agent {
     let todo_enabled = crate::persona::todo_switch_enabled_for(cfg.todo.enabled);
-    match mount_coding_tools(model_suggests_vision(&cfg.model), todo_enabled, &cfg.lsp) {
+    match mount_coding_tools(cfg.supports_vision, todo_enabled, &cfg.lsp) {
         Ok(tools) => build_coding_agent_from_tools(cfg, provider, tools, None),
         Err(_error) => build_coding_agent_from_tools(
             cfg,
             provider,
-            mount_base_coding_tools(model_suggests_vision(&cfg.model), todo_enabled, &cfg.lsp),
+            mount_base_coding_tools(cfg.supports_vision, todo_enabled, &cfg.lsp),
             Some("AtomGit tools are unavailable because capability setup failed.".to_string()),
         ),
     }
@@ -84,7 +83,7 @@ pub fn try_build_coding_agent_with(
     provider: Arc<dyn LlmProvider>,
 ) -> Result<Agent, String> {
     let tools = mount_coding_tools(
-        model_suggests_vision(&cfg.model),
+        cfg.supports_vision,
         crate::persona::todo_switch_enabled_for(cfg.todo.enabled),
         &cfg.lsp,
     )?;

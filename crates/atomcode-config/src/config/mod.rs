@@ -481,7 +481,39 @@ impl Config {
     /// this form or they can accept images for a text-only model (or reject
     /// them for a vision model) based on stale configuration.
     pub fn image_attach_support_for_model(&self, active_model: &str) -> ImageAttachSupport {
-        if crate::util::model_name_suggests_vision(active_model) {
+        self.image_attach_support_for_selection(None, active_model)
+    }
+
+    /// Resolve image support for the exact active selection. Drivers should
+    /// prefer this over matching only the wire model name because two accounts
+    /// may expose the same model with different explicit capability overrides.
+    pub fn image_attach_support_for_selection(
+        &self,
+        active_selection: Option<&str>,
+        active_model: &str,
+    ) -> ImageAttachSupport {
+        // Prefer the active resolved selection so an explicit profile override
+        // reaches the TUI paste gate. Fall back to a unique matching wire model
+        // for runtime-local selections, then to the legacy name heuristic.
+        let selected = self
+            .resolve_model(active_selection)
+            .ok()
+            .filter(|resolved| resolved.model == active_model)
+            .map(|resolved| resolved.supports_vision);
+        let matching: Vec<_> = self
+            .logical_models()
+            .into_values()
+            .filter(|model| model.model == active_model)
+            .collect();
+        let unique = (matching.len() == 1).then(|| {
+            matching[0]
+                .supports_vision
+                .unwrap_or_else(|| crate::util::model_name_suggests_vision(active_model))
+        });
+        if selected
+            .or(unique)
+            .unwrap_or_else(|| crate::util::model_name_suggests_vision(active_model))
+        {
             return ImageAttachSupport::Supported;
         }
         match self.vision_preprocessor_provider.as_deref() {
@@ -759,6 +791,9 @@ impl Config {
             base_url,
             api_key,
             model: model.model.clone(),
+            supports_vision: model.supports_vision.unwrap_or_else(|| {
+                crate::util::model_name_suggests_vision(&model.model)
+            }),
             context_window: model.context_window,
             max_tokens: model.max_tokens,
             system_prompt: model.system_prompt.clone(),
@@ -799,6 +834,18 @@ impl Config {
         self.resolve_model(Some(selection_id))
             .ok()
             .map(|r| r.to_provider_config())
+    }
+
+    /// Raw image-capability override for a persisted selection. This preserves
+    /// the distinction between Auto (`None`) and an explicit true/false value;
+    /// callers needing the effective capability should use [`Self::resolve_model`].
+    pub fn model_vision_override(&self, selection_id: &str) -> Option<bool> {
+        if let Some(model) = self.models.get(selection_id) {
+            return model.supports_vision;
+        }
+        self.providers
+            .get(selection_id)
+            .and_then(|provider| provider.supports_vision)
     }
 
     /// Whether a selection id resolves to any provider/model (legacy or new
@@ -1073,6 +1120,7 @@ fn project_legacy_model(account_id: &str, p: &ProviderConfig) -> ModelProfileCon
         model: p.model.clone(),
         display_name: None,
         system_prompt: p.system_prompt.clone(),
+        supports_vision: p.supports_vision,
         context_window: p.context_window,
         max_tokens: p.max_tokens,
         capable_model: p.capable_model,
@@ -1150,7 +1198,7 @@ pub struct NetworkConfig {
 /// in their config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LspConfig {
-    /// Master switch for LSP diagnostics. Off by default — opt-in only.
+    /// Master switch for read-only LSP code intelligence. Off by default — opt-in only.
     #[serde(default)]
     pub enabled: bool,
     /// Automatically detect and start language servers from the built-in
@@ -2409,6 +2457,7 @@ model = "missing-type"
                 model: "m".to_string(),
                 base_url: None,
                 system_prompt: None,
+                supports_vision: None,
                 user_agent: None,
                 context_window: 16000,
                 max_tokens: None,
@@ -2625,6 +2674,7 @@ model = "missing-type"
                 model: "m".to_string(),
                 base_url: None,
                 system_prompt: None,
+                supports_vision: None,
                 user_agent: None,
                 context_window: 16000,
                 max_tokens: None,
@@ -2705,6 +2755,7 @@ model = "missing-type"
                 model: active_model.into(),
                 base_url: Some("http://127.0.0.1/".into()),
                 system_prompt: None,
+                supports_vision: None,
                 user_agent: None,
                 context_window: 8000,
                 max_tokens: None,
@@ -2732,6 +2783,50 @@ model = "missing-type"
         // Vision-capable main provider — preprocessor irrelevant.
         let cfg = cfg_with("claude-sonnet-4-5", None);
         assert!(cfg.can_handle_attached_images());
+    }
+
+    #[test]
+    fn explicit_vision_override_allows_unknown_custom_model() {
+        let mut cfg = cfg_with("qwen3.8max", None);
+        cfg.providers.get_mut("active").unwrap().supports_vision = Some(true);
+        assert!(cfg.can_handle_attached_images());
+        assert_eq!(
+            cfg.image_attach_support_for_model("qwen3.8max"),
+            ImageAttachSupport::Supported
+        );
+    }
+
+    #[test]
+    fn exact_selection_disambiguates_duplicate_wire_model_vision_overrides() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "account-a/qwen",
+            "provider_accounts": {
+                "account-a": { "provider": "openai", "api_key": "a" },
+                "account-b": { "provider": "openai", "api_key": "b" }
+            },
+            "models": {
+                "account-a/qwen": {
+                    "account": "account-a",
+                    "model": "qwen3.8max",
+                    "supports_vision": false
+                },
+                "account-b/qwen": {
+                    "account": "account-b",
+                    "model": "qwen3.8max",
+                    "supports_vision": true
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            cfg.image_attach_support_for_selection(Some("account-a/qwen"), "qwen3.8max"),
+            ImageAttachSupport::Unconfigured
+        );
+        assert_eq!(
+            cfg.image_attach_support_for_selection(Some("account-b/qwen"), "qwen3.8max"),
+            ImageAttachSupport::Supported
+        );
     }
 
     #[test]
@@ -2794,6 +2889,7 @@ model = "missing-type"
                 model: "Qwen/Qwen3-VL-32B-Instruct".into(),
                 base_url: Some("http://127.0.0.1/".into()),
                 system_prompt: None,
+                supports_vision: None,
                 user_agent: None,
                 context_window: 8000,
                 max_tokens: None,
@@ -3011,6 +3107,7 @@ capable_model = 5
                 model: "gpt-x".into(),
                 display_name: None,
                 system_prompt: None,
+                supports_vision: None,
                 context_window: 128_000,
                 max_tokens: None,
                 capable_model: None,
@@ -3059,6 +3156,7 @@ capable_model = 5
                 model: "".into(),                 // empty model → error
                 display_name: None,
                 system_prompt: None,
+                supports_vision: None,
                 context_window: 0, // zero window → error
                 max_tokens: None,
                 capable_model: None,

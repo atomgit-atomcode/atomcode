@@ -32,6 +32,11 @@ pub struct ProviderConfig {
     pub model: String,
     pub base_url: Option<String>,
     pub system_prompt: Option<String>,
+    /// Explicit image-input capability override. `None` keeps automatic model-name
+    /// detection; `Some(true/false)` is authoritative for custom model ids and
+    /// compatibility gateways whose wire name does not advertise its modalities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
     /// Override User-Agent for this provider (useful when the upstream blocks generic UAs).
     /// Defaults to `atomcode/<version>` if not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,6 +157,9 @@ pub struct ModelProfileConfig {
     /// design §14.5). Projected from a legacy provider's `system_prompt`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    /// Explicit image-input capability override. `None` means Auto.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
     #[serde(default = "default_context_window")]
     pub context_window: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -193,6 +201,8 @@ pub struct ResolvedModelConfig {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub model: String,
+    /// Final capability after applying the profile override and Auto fallback.
+    pub supports_vision: bool,
     pub context_window: usize,
     pub max_tokens: Option<usize>,
     pub system_prompt: Option<String>,
@@ -237,6 +247,7 @@ impl ResolvedModelConfig {
             model: self.model.clone(),
             base_url: self.base_url.clone(),
             system_prompt: self.system_prompt.clone(),
+            supports_vision: Some(self.supports_vision),
             user_agent: self.user_agent.clone(),
             context_window: self.context_window,
             max_tokens: self.max_tokens,
@@ -256,12 +267,11 @@ impl ResolvedModelConfig {
 
 impl ProviderConfig {
     /// True if this provider's active model can accept image inputs.
-    /// Driven entirely by the model-name heuristic in
-    /// `provider::model_name_suggests_vision` — if a future model isn't
-    /// recognised, extend the heuristic rather than threading a
-    /// per-provider config flag (no user-facing knob to discover).
+    /// An explicit config value wins; otherwise use the backwards-compatible
+    /// model-name heuristic.
     pub fn accepts_images(&self) -> bool {
-        crate::util::model_name_suggests_vision(&self.model)
+        self.supports_vision
+            .unwrap_or_else(|| crate::util::model_name_suggests_vision(&self.model))
     }
 
     /// Resolve the API key for this provider, taking environment variables into account.
@@ -465,6 +475,39 @@ output_per_million = 0
     }
 
     #[test]
+    fn explicit_vision_override_wins_over_auto_heuristic() {
+        let enabled: ProviderConfig = toml::from_str(
+            r#"
+                type = "openai"
+                model = "qwen3.8max"
+                supports_vision = true
+            "#,
+        )
+        .expect("parse enabled override");
+        assert!(enabled.accepts_images());
+
+        let disabled: ProviderConfig = toml::from_str(
+            r#"
+                type = "openai"
+                model = "gpt-4o"
+                supports_vision = false
+            "#,
+        )
+        .expect("parse disabled override");
+        assert!(!disabled.accepts_images());
+
+        let auto: ProviderConfig = toml::from_str(
+            r#"
+                type = "openai"
+                model = "gpt-4o"
+            "#,
+        )
+        .expect("parse auto");
+        assert_eq!(auto.supports_vision, None);
+        assert!(!toml::to_string(&auto).unwrap().contains("supports_vision"));
+    }
+
+    #[test]
     fn thinking_fields_default_to_none() {
         let toml_str = r#"
             type = "claude"
@@ -527,6 +570,7 @@ output_per_million = 0
             model: "gpt-4o".into(),
             base_url: None,
             system_prompt: None,
+            supports_vision: None,
             user_agent: None,
             context_window: 128000,
             max_tokens: None,
@@ -556,6 +600,7 @@ output_per_million = 0
             model: "gpt-4o".into(),
             base_url: Some("https://self-signed.example.com/v1".into()),
             system_prompt: None,
+            supports_vision: None,
             user_agent: None,
             context_window: 128000,
             max_tokens: None,
@@ -633,6 +678,7 @@ output_per_million = 0
             model: "gpt-4o".into(),
             base_url: None,
             system_prompt: None,
+            supports_vision: None,
             user_agent: None,
             context_window: 128000,
             max_tokens: None,
@@ -661,6 +707,7 @@ output_per_million = 0
             model: "gpt-4o".into(),
             base_url: None,
             system_prompt: None,
+            supports_vision: None,
             user_agent: None,
             context_window: 128000,
             max_tokens: None,
@@ -689,6 +736,7 @@ output_per_million = 0
             model: "gpt-4o".into(),
             base_url: None,
             system_prompt: None,
+            supports_vision: None,
             user_agent: None,
             context_window: 128000,
             max_tokens: None,

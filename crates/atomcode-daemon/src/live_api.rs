@@ -286,6 +286,7 @@ pub(crate) fn chat_runtime_config(
         api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
         model: p.map(|p| p.model.clone()).unwrap_or_default(),
+        supports_vision: p.is_some_and(|p| p.accepts_images()),
         preferred_language: Some(atomcode_config::i18n::resolve_initial_locale(
             None,
             config.language,
@@ -412,7 +413,12 @@ pub(crate) async fn run_chat_turn_v2(
     // model conversation below (`user_images = Vec::new()`), so a reloading client refills
     // the thumbnail from the sidecar. The /chat path previously skipped this, so the image
     // was lost after refresh for anyone loading the session fresh from disk. Mirrors /live.
-    stash_vl_display_images(&runtime_cfg.working_dir, &session_id, &user_text, &user_images);
+    stash_vl_display_images(
+        &runtime_cfg.working_dir,
+        &session_id,
+        &user_text,
+        &user_images,
+    );
     let naming_session_id = session_id.clone();
     let naming_project_bucket =
         atomcode_capabilities::session::SessionManager::project_hash(&runtime_cfg.working_dir);
@@ -1212,7 +1218,7 @@ pub(crate) struct LiveMessageReq {
 /// already contains either the VL description or an explicit failure marker.
 pub(crate) async fn preprocess_image_caption(
     config: &Config,
-    active_model: &str,
+    supports_vision: bool,
     working_dir: &std::path::Path,
     telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     session_id: Option<&str>,
@@ -1223,7 +1229,7 @@ pub(crate) async fn preprocess_image_caption(
         run_vl_caption, should_skip, vl_model_display, PreprocessOutcome,
     };
     // Short-circuit: no images, or the main model already accepts images.
-    if should_skip(active_model, !images.is_empty()) {
+    if should_skip(supports_vision, !images.is_empty()) {
         return message.to_string();
     }
     // Nothing configured (None or empty) ⇒ pass through unchanged (Skipped).
@@ -1329,8 +1335,8 @@ fn stash_vl_display_images(
 /// 对 live 输入做视觉预处理：主模型不支持视觉时，用 VL 模型把图片转文字拼进 caption
 /// （原图始终保留在 MultiPart 里用于缩略图渲染）。与 `/chat` 路径共享
 /// [`preprocess_image_caption`]；任何 config/provider 加载失败都降级为原文，不阻断发送。
-/// `provider_name` 为本轮已解析的主 provider，
-/// 仅用其模型名判定是否原生支持视觉。
+/// `provider_name` 为本轮已解析的 selection id；显式能力覆盖优先，Auto
+/// 才回退到模型名启发式判断。
 async fn preprocess_live_caption(
     message: &str,
     images: &[ImageContent],
@@ -1346,16 +1352,16 @@ async fn preprocess_live_caption(
         Ok(c) => c,
         Err(_) => return message.to_string(),
     };
-    // The main model name is what decides vision-capability (`should_skip`); the
+    // The resolved model capability decides whether preprocessing is needed; the
     // one-off VL request rides `session_id` onto the same upstream account.
     let name = resolve_provider_name(&config, provider_name);
-    let active_model = match config.provider_config_for_selection(&name) {
-        Some(pc) => pc.model.clone(),
+    let supports_vision = match config.provider_config_for_selection(&name) {
+        Some(pc) => pc.accepts_images(),
         None => return message.to_string(),
     };
     preprocess_image_caption(
         &config,
-        &active_model,
+        supports_vision,
         working_dir,
         telemetry,
         session_id,
@@ -1513,9 +1519,8 @@ pub(crate) async fn live_message(
 /// caption (the image description the text model needs) while the echo keeps the
 /// user's ORIGINAL words, so the machine caption never overwrites what the user typed.
 ///
-/// NOTE: relies on the active adapter degrading images for a non-vision model. That
-/// holds for the default openai_compat providers; a non-degrading adapter (ollama with
-/// a text-only model) would need its own `supports_vision` gate — tracked separately.
+/// Every shipped adapter receives the same resolved `supports_vision` capability and
+/// degrades images before constructing a text-only wire request.
 fn split_live_inputs(
     message: String,
     original_images: Vec<atomcode_kernel::message::ImageContent>,
@@ -2497,11 +2502,8 @@ mod tests {
     #[tokio::test]
     async fn chat_user_input_wait_degrades_to_null_at_driver_timeout() {
         let (_tx, rx) = tokio::sync::oneshot::channel();
-        let value = await_chat_user_input_response(
-            rx,
-            Some(std::time::Duration::from_millis(1)),
-        )
-        .await;
+        let value =
+            await_chat_user_input_response(rx, Some(std::time::Duration::from_millis(1))).await;
         assert!(value.is_null());
     }
 
@@ -2510,11 +2512,8 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         tx.send(serde_json::json!({ "selected": ["Blue"] }))
             .unwrap();
-        let value = await_chat_user_input_response(
-            rx,
-            Some(std::time::Duration::from_secs(1)),
-        )
-        .await;
+        let value =
+            await_chat_user_input_response(rx, Some(std::time::Duration::from_secs(1))).await;
         assert_eq!(value["selected"][0], "Blue");
     }
 

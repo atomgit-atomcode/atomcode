@@ -351,6 +351,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelFieldBaseUrl => "Base URL".into(),
         Msg::ProviderPanelFieldApiKey => "API 密钥".into(),
         Msg::ProviderPanelFieldModel => "模型".into(),
+        Msg::ProviderPanelFieldVision => "图片输入".into(),
+        Msg::ProviderPanelVisionAuto => "自动".into(),
+        Msg::ProviderPanelVisionEnabled => "启用".into(),
+        Msg::ProviderPanelVisionDisabled => "禁用".into(),
         Msg::ProviderPanelFieldWindow => "上下文窗口".into(),
         Msg::ProviderPanelFieldMakeDefault => "设为默认".into(),
         Msg::ProviderPanelSwitchHint => "←→ 切换".into(),
@@ -361,7 +365,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "Tab 下一项  ←→ 切厂商  空格 勾选  ↵ 保存  Esc 返回".into(),
         Msg::ProviderPanelAccountFormHint => "Tab 切换  ↵ 保存  Esc 返回".into(),
         Msg::ProviderPanelModelFormHint =>
-            "Tab 下一项  ←→ 切账号  空格 勾选  ↵ 保存  Esc 返回".into(),
+            "Tab 下一项  ←→ 切选项  空格切换  ↵ 保存  Esc 返回".into(),
         // ── Model 选择器 ──
         Msg::ModelSwitched { provider, model } =>
             format!("  当前会话已切换到 {provider} · {model}\n").into(),

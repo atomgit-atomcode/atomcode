@@ -296,6 +296,7 @@ pub fn panic_restore_terminal() {
 
 pub async fn run(
     config: Config,
+    provider_selection: String,
     model_name: String,
     provider_selection_mode: ProviderSelectionMode,
     config_store: atomcode_config::ConfigStore,
@@ -744,6 +745,7 @@ pub async fn run(
     let file_index_root = working_dir.clone();
     let ctx = LoopCtx {
         config,
+        provider_selection,
         model_name,
         provider_selection_mode,
         config_store,

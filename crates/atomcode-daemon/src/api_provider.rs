@@ -22,6 +22,7 @@ pub(crate) struct CreateProviderRequest {
     #[serde(rename = "type")]
     pub provider_type: String,
     pub model: String,
+    pub supports_vision: Option<bool>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub user_agent: Option<String>,
@@ -48,6 +49,9 @@ pub(crate) struct PatchProviderRequest {
     #[serde(rename = "type")]
     pub provider_type: Option<String>,
     pub model: Option<String>,
+    pub supports_vision: Option<bool>,
+    #[serde(default)]
+    pub clear_supports_vision: bool,
     pub api_key: Option<Option<String>>,
     #[serde(default)]
     pub clear_api_key: bool,
@@ -105,7 +109,14 @@ pub(crate) async fn get_providers() -> impl IntoResponse {
         .filter_map(|id| {
             config
                 .provider_config_for_selection(id)
-                .map(|p| provider_info(id, &p, &default_selection))
+                .map(|p| {
+                    provider_info(
+                        id,
+                        &p,
+                        config.model_vision_override(id),
+                        &default_selection,
+                    )
+                })
         })
         .collect();
     Json(serde_json::json!({
@@ -158,6 +169,7 @@ pub(crate) async fn create_provider(Json(req): Json<CreateProviderRequest>) -> i
         model: req.model,
         base_url: req.base_url,
         system_prompt: None,
+        supports_vision: req.supports_vision,
         user_agent: req.user_agent,
         context_window,
         max_tokens: req.max_tokens,
@@ -201,7 +213,12 @@ pub(crate) async fn create_provider(Json(req): Json<CreateProviderRequest>) -> i
     };
     (
         status,
-        Json(provider_info(&name, p, &config.default_provider)),
+        Json(provider_info(
+            &name,
+            p,
+            p.supports_vision,
+            &config.default_provider,
+        )),
     )
         .into_response()
 }
@@ -273,6 +290,11 @@ pub(crate) async fn patch_provider(
         }
         if let Some(value) = req.model {
             existing.model = value;
+        }
+        if req.clear_supports_vision {
+            existing.supports_vision = None;
+        } else if let Some(value) = req.supports_vision {
+            existing.supports_vision = Some(value);
         }
         if req.clear_api_key {
             existing.api_key = None;
@@ -352,7 +374,13 @@ pub(crate) async fn patch_provider(
 
     let default_provider = config.default_provider.clone();
     let p = config.providers.get(&final_name).unwrap();
-    Json(provider_info(&final_name, p, &default_provider)).into_response()
+    Json(provider_info(
+        &final_name,
+        p,
+        p.supports_vision,
+        &default_provider,
+    ))
+    .into_response()
 }
 
 /// DELETE /providers/:name - Delete a provider.
@@ -382,7 +410,7 @@ pub(crate) async fn delete_provider(Path(name): Path<String>) -> impl IntoRespon
     let providers: Vec<ProviderInfo> = config
         .providers
         .iter()
-        .map(|(n, p)| provider_info(n, p, &config.default_provider))
+        .map(|(n, p)| provider_info(n, p, p.supports_vision, &config.default_provider))
         .collect();
     Json(serde_json::json!({
         "default_provider": config.default_provider,
@@ -484,5 +512,29 @@ pub(crate) async fn patch_thinking(
         )
         .into_response();
     };
-    Json(provider_info(&name, &p, &default_selection)).into_response()
+    Json(provider_info(
+        &name,
+        &p,
+        config.model_vision_override(&name),
+        &default_selection,
+    ))
+    .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PatchProviderRequest;
+
+    #[test]
+    fn vision_patch_uses_explicit_clear_to_restore_auto() {
+        let enabled: PatchProviderRequest =
+            serde_json::from_value(serde_json::json!({ "supports_vision": true })).unwrap();
+        assert_eq!(enabled.supports_vision, Some(true));
+        assert!(!enabled.clear_supports_vision);
+
+        let auto: PatchProviderRequest =
+            serde_json::from_value(serde_json::json!({ "clear_supports_vision": true })).unwrap();
+        assert_eq!(auto.supports_vision, None);
+        assert!(auto.clear_supports_vision);
+    }
 }

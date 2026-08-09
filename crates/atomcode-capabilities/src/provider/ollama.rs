@@ -44,6 +44,8 @@ pub struct OllamaConfig {
     /// `/api/chat`.
     pub base_url: String,
     pub model: String,
+    /// Whether user image arrays are emitted. Disabled profiles degrade to text.
+    pub supports_vision: bool,
     pub context_window: u32,
     /// Output cap → `options.num_predict` when `ChatOptions::max_tokens` is `None`.
     /// `None` ⇒ let Ollama decide.
@@ -64,10 +66,12 @@ pub struct OllamaConfig {
 
 impl OllamaConfig {
     pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
+        let model = model.into();
         Self {
             api_key: String::new(),
             base_url: base_url.into(),
-            model: model.into(),
+            supports_vision: super::model_suggests_vision(&model),
+            model,
             context_window: 8_192,
             max_tokens: None,
             think: false,
@@ -336,7 +340,12 @@ async fn open_stream(
 
 /// Map kernel `Message`s onto Ollama `messages[]`. `system` is a ROLE here; tool results
 /// are `role:"tool"`; assistant `tool_calls[].function.arguments` is an OBJECT.
+#[cfg(test)]
 fn format_messages(messages: &[Message]) -> Vec<Value> {
+    format_messages_with_vision(messages, true)
+}
+
+fn format_messages_with_vision(messages: &[Message], supports_vision: bool) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
     for m in messages {
         match m.role {
@@ -348,12 +357,15 @@ fn format_messages(messages: &[Message]) -> Vec<Value> {
                 obj.insert("role".into(), json!("user"));
                 obj.insert("content".into(), json!(m.text));
                 // Ollama images are BARE base64 strings (no data: URL prefix).
-                let imgs: Vec<Value> = m
-                    .images
-                    .iter()
-                    .filter(|i| !i.data.is_empty())
-                    .map(|i| json!(i.data))
-                    .collect();
+                let imgs: Vec<Value> = if supports_vision {
+                    m.images
+                        .iter()
+                        .filter(|i| !i.data.is_empty())
+                        .map(|i| json!(i.data))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 if !imgs.is_empty() {
                     obj.insert("images".into(), json!(imgs));
                 }
@@ -399,7 +411,10 @@ fn build_request_body(
 ) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
-    body.insert("messages".into(), json!(format_messages(messages)));
+    body.insert(
+        "messages".into(),
+        json!(format_messages_with_vision(messages, cfg.supports_vision)),
+    );
     body.insert("stream".into(), json!(true));
 
     // `options` sub-object — only inserted if it has at least one knob.
@@ -680,6 +695,19 @@ mod tests {
             out[0],
             json!({"role":"user","content":"look","images":["QUJD"]})
         );
+    }
+
+    #[test]
+    fn disabled_vision_degrades_user_images_to_text() {
+        let m = Message::user_with_images(
+            "look",
+            vec![ImageContent {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+            }],
+        );
+        let out = format_messages_with_vision(&[m], false);
+        assert_eq!(out[0], json!({"role":"user","content":"look"}));
     }
 
     #[test]

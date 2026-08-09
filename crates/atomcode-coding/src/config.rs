@@ -77,6 +77,9 @@ pub struct CodingAgentConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    /// Final image-input capability resolved from the model profile override or
+    /// the backwards-compatible Auto heuristic.
+    pub supports_vision: bool,
     /// Preferred language for natural-language commit subjects and bodies.
     /// `None` means follow the current conversation language.
     pub preferred_language: Option<Locale>,
@@ -248,6 +251,7 @@ pub struct CodingRuntimeConfig {
     /// currently only the interactive TUI renders and accepts the result.
     pub next_prompt_suggestions: bool,
     pub pricing: Option<atomcode_capabilities::session::ModelPricing>,
+    pub supports_vision: bool,
     pub lsp: atomcode_capabilities::codeintel::LspSettings,
 }
 
@@ -308,6 +312,7 @@ impl CodingRuntimeConfig {
             api_key: r.and_then(|r| r.api_key.clone()).unwrap_or_default(),
             base_url: r.and_then(|r| r.base_url.clone()).unwrap_or_default(),
             model: r.map(|r| r.model.clone()).unwrap_or_default(),
+            supports_vision: r.map(|r| r.supports_vision).unwrap_or(false),
             preferred_language: Some(atomcode_config::i18n::resolve_initial_locale(
                 None,
                 config.language,
@@ -359,6 +364,7 @@ impl CodingRuntimeConfig {
             &self.working_dir,
         );
         config.context_window = self.context_window;
+        config.supports_vision = self.supports_vision;
         config.preferred_language = self.preferred_language;
         config.todo = self.todo.clone();
         config.provider_name = self.provider_name.clone();
@@ -396,6 +402,7 @@ pub fn apply_provider_config(
     provider: &atomcode_config::config::provider::ProviderConfig,
 ) {
     config.model = provider.model.clone();
+    config.supports_vision = provider.accepts_images();
     config.pricing = resolve_provider_pricing(&config.provider_name, provider);
     if let Some(base_url) = &provider.base_url {
         config.base_url = base_url.clone();
@@ -662,6 +669,7 @@ impl CodingAgentConfig {
             api_key: api_key.into(),
             base_url: base_url.into(),
             provider_name: model.clone(),
+            supports_vision: atomcode_capabilities::provider::model_suggests_vision(&model),
             model,
             preferred_language: None,
             todo: Default::default(),
@@ -930,6 +938,40 @@ mod tests {
         assert_eq!(rt2.model, "deepseek-chat");
         assert_eq!(rt2.api_key, "sk-acc");
         assert_eq!(rt2.base_url, "https://api.deepseek.com/v1");
+    }
+
+    #[test]
+    fn explicit_vision_override_reaches_runtime_agent_config() {
+        let source: atomcode_config::config::Config = serde_json::from_value(serde_json::json!({
+            "default_model": "custom/qwen",
+            "provider_accounts": {
+                "custom": {
+                    "provider": "openai",
+                    "api_key": "sk-custom",
+                    "base_url": "https://example.invalid/v1"
+                }
+            },
+            "models": {
+                "custom/qwen": {
+                    "account": "custom",
+                    "model": "qwen3.8max",
+                    "supports_vision": true
+                }
+            }
+        }))
+        .unwrap();
+
+        let runtime = CodingRuntimeConfig::from_config(
+            &source,
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            true,
+        );
+
+        assert!(runtime.supports_vision);
+        assert!(runtime.agent_config().supports_vision);
     }
 
     #[test]

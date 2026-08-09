@@ -1964,6 +1964,7 @@ async fn run() -> Result<i32> {
             let (runtime, coding_cfg) = native_tui_runtime
                 .take()
                 .expect("native TUI runtime built above");
+            let provider_selection = coding_cfg.provider_name.clone();
             let tui_runtime = into_tui_native_runtime(runtime, coding_cfg);
             // Same as the headless arm: don't `?` — a TUI run that ends in an
             // error must still reach the shutdown/flush below. Ok(()) → exit 0;
@@ -1980,6 +1981,7 @@ async fn run() -> Result<i32> {
             );
             match atomcode_tuix::run(
                 config,
+                provider_selection,
                 model_name,
                 provider_selection_mode,
                 atomcode_config::ConfigStore::new(config_path.clone()),

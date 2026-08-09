@@ -408,6 +408,8 @@ export interface ProviderInfo {
   name: string;
   type: string;
   model: string;
+  supports_vision: boolean;
+  supports_vision_override: boolean | null;
   base_url?: string;
   has_api_key: boolean;
   requires_login?: boolean;

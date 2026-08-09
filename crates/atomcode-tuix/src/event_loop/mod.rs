@@ -566,9 +566,9 @@ pub(crate) fn echo_text_with_image_markers(text: String, image_count: usize) -> 
 /// (`VisionPreprocessorUnresolvable`, which names the typo'd value) so the
 /// message stops telling users who DID configure a preprocessor that it is
 /// "未配置". Shared by every gate that surfaces the rejection to the user.
-fn image_attach_reject_line(config: &Config, model: &str) -> Option<String> {
+fn image_attach_reject_line(config: &Config, selection: &str, model: &str) -> Option<String> {
     use atomcode_config::config::ImageAttachSupport as S;
-    match config.image_attach_support_for_model(model) {
+    match config.image_attach_support_for_selection(Some(selection), model) {
         S::Supported => None,
         S::Unconfigured => {
             Some(crate::i18n::t(crate::i18n::Msg::ModelNoImageSupport { model }).into_owned())
@@ -3713,6 +3713,9 @@ impl AuthObservation {
 
 pub struct LoopCtx {
     pub config: Config,
+    /// Exact active model selection id. Unlike `model_name`, this remains
+    /// unambiguous when two accounts expose the same wire model.
+    pub provider_selection: String,
     pub model_name: String,
     pub(crate) provider_selection_mode: crate::ProviderSelectionMode,
     pub(crate) config_store: ConfigStore,
@@ -9595,6 +9598,7 @@ mod external_config_tests {
                 model: model.into(),
                 base_url: Some(base_url.into()),
                 system_prompt: None,
+                supports_vision: None,
                 user_agent: None,
                 context_window: 128_000,
                 max_tokens: None,
@@ -10550,6 +10554,7 @@ fn reconcile_persisted_config(
             ));
         }
         ctx.config = desired;
+        ctx.provider_selection = provider.clone();
         ctx.model_name = model.clone();
         atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
         ctx.observed_config_revision = Some(snapshot.revision);
@@ -10659,6 +10664,7 @@ pub(crate) fn apply_config_panel_commit(
             ));
         }
         ctx.config = desired;
+        ctx.provider_selection = provider.clone();
         ctx.model_name = model.clone();
         atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
         ctx.observed_config_revision = Some(commit.snapshot.revision);
@@ -10903,7 +10909,11 @@ fn attach_image_to_input(
     let Some((img, hash)) = img_hash else {
         return Ok(false);
     };
-    if let Some(reject) = image_attach_reject_line(&ctx.config, &ctx.model_name) {
+    if let Some(reject) = image_attach_reject_line(
+        &ctx.config,
+        &ctx.provider_selection,
+        &ctx.model_name,
+    ) {
         renderer.render(UiLine::Error(reject));
         renderer.flush();
         if matches!(app.state.phase, UiPhase::Idle) {
@@ -10963,7 +10973,7 @@ fn attach_typed_image_paths(
     images: &mut Vec<ImageContent>,
     kept_markers: &mut Vec<usize>,
 ) {
-    if image_attach_reject_line(&ctx.config, &ctx.model_name).is_some() {
+    if image_attach_reject_line(&ctx.config, &ctx.provider_selection, &ctx.model_name).is_some() {
         return;
     }
     // Snapshot tokens before mutating `text`. The `/` `\` / `@` pre-filter
@@ -12437,7 +12447,11 @@ fn handle_idle_key(
             // ModelArts.81001 "message[N].content[0] has invalid
             // field(s): text, type" for GLM-5.1). Helper in
             // `Config::can_handle_attached_images`.
-            if let Some(reject) = image_attach_reject_line(&ctx.config, &ctx.model_name) {
+            if let Some(reject) = image_attach_reject_line(
+                &ctx.config,
+                &ctx.provider_selection,
+                &ctx.model_name,
+            ) {
                 renderer.render(UiLine::Error(reject));
                 renderer.flush();
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
@@ -12609,7 +12623,11 @@ fn handle_idle_key(
             // Reject before clearing the editor when neither the live model nor
             // a configured VL preprocessor can consume it; otherwise the raw
             // path reaches the model and it falls back to a futile read_file.
-            if let Some(reject) = image_attach_reject_line(&ctx.config, &ctx.model_name) {
+            if let Some(reject) = image_attach_reject_line(
+                &ctx.config,
+                &ctx.provider_selection,
+                &ctx.model_name,
+            ) {
                 if contains_attachable_at_image(&line, &ctx.working_dir) {
                     renderer.render(UiLine::Error(reject));
                     renderer.flush();
@@ -13721,6 +13739,7 @@ fn rollback_pending_provider_reload(
     };
     if let Some(previous) = rollback_runtime_config {
         ctx.config = previous;
+        ctx.provider_selection = resolved_provider_and_model(&ctx.config).0;
     }
     if let Some(model) = previous_model_name {
         ctx.model_name = model;
@@ -18171,6 +18190,7 @@ fn apply_provider_projection(
     provider: String,
     model: String,
 ) {
+    ctx.provider_selection = provider.clone();
     ctx.model_name = model;
     atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
     state.on_model_window_changed(ctx.config.default_context_window());

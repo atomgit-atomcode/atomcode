@@ -600,9 +600,9 @@ impl RuntimeEventEmitter {
 /// compact) queue until it returns — matching the retired bridge's behavior.
 #[async_trait::async_trait]
 pub trait ImagePreprocessor: Send + Sync {
-    /// `active_model` is the runtime's resolved main-turn model name (honours
-    /// a `--provider` / `/model` selection), used to decide vision support —
-    /// authoritative, unlike re-reading a config default. `session_id` is the
+    /// `supports_vision` is the runtime's resolved main-turn capability (honours
+    /// a `--provider` / `/model` selection and explicit profile override).
+    /// `session_id` is the
     /// active conversation's id, forwarded onto any auxiliary (VL) call so a
     /// gateway pins it to the same upstream account.
     ///
@@ -614,7 +614,7 @@ pub trait ImagePreprocessor: Send + Sync {
         &self,
         text: String,
         images: Vec<ImageContent>,
-        active_model: String,
+        supports_vision: bool,
         session_id: Option<String>,
     ) -> (UserInput, Option<VisionNotice>);
 }
@@ -1358,7 +1358,8 @@ impl CodingRuntimeHandle {
         &self,
         next: CodingAgentConfig,
     ) -> Result<SessionChanged, RuntimeError> {
-        self.reprepare_target(ReprepareTarget::ReloadConfig(next)).await
+        self.reprepare_target(ReprepareTarget::ReloadConfig(next))
+            .await
     }
 
     /// Reload the capability graph, optionally replacing the plugin skill
@@ -3199,10 +3200,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                 // from the runtime's own resolved resources, not a
                                 // re-read config default (which would miss a
                                 // `--provider` override).
-                                let active_model = resources
+                                let supports_vision = resources
                                     .as_ref()
-                                    .map(|r| r.config.model.clone())
-                                    .unwrap_or_default();
+                                    .is_some_and(|r| r.config.supports_vision);
                                 let session_id = resources
                                     .as_ref()
                                     .and_then(|r| r.parts.session.as_ref())
@@ -3211,7 +3211,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     .preprocess(
                                         std::mem::take(&mut input.text),
                                         std::mem::take(&mut input.images),
-                                        active_model,
+                                        supports_vision,
                                         session_id,
                                     )
                                     .await;
@@ -7229,15 +7229,14 @@ async fn resolve_goal_round_cap(
         return config_default;
     }
     let call_limit = match rate_limit_source {
-        Some(source) => match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            source.fetch_windows(),
-        )
-        .await
-        {
-            Ok(Ok(windows)) => crate::rate_limit::binding_window_call_limit(&windows),
-            _ => None,
-        },
+        Some(source) => {
+            match tokio::time::timeout(std::time::Duration::from_secs(3), source.fetch_windows())
+                .await
+            {
+                Ok(Ok(windows)) => crate::rate_limit::binding_window_call_limit(&windows),
+                _ => None,
+            }
+        }
         None => None,
     };
     match call_limit {
@@ -7260,9 +7259,7 @@ mod tests {
         fn applies_to(&self, _base_url: &str) -> bool {
             true
         }
-        async fn fetch_windows(
-            &self,
-        ) -> Result<Vec<crate::rate_limit::RateLimitWindow>, String> {
+        async fn fetch_windows(&self) -> Result<Vec<crate::rate_limit::RateLimitWindow>, String> {
             self.result.clone()
         }
     }
@@ -7284,16 +7281,14 @@ mod tests {
     #[tokio::test]
     async fn goal_round_cap_derives_from_live_plan_quota() {
         // Pro window (call_limit 1000) → 30% = 300, overriding the passed default.
-        let pro: Arc<dyn crate::rate_limit::RateLimitWindowSource> =
-            Arc::new(FakeQuotaSource {
-                result: Ok(vec![quota_window(1000)]),
-            });
+        let pro: Arc<dyn crate::rate_limit::RateLimitWindowSource> = Arc::new(FakeQuotaSource {
+            result: Ok(vec![quota_window(1000)]),
+        });
         assert_eq!(resolve_goal_round_cap(Some(&pro), 777).await, 300);
         // Lite window (800) → 240.
-        let lite: Arc<dyn crate::rate_limit::RateLimitWindowSource> =
-            Arc::new(FakeQuotaSource {
-                result: Ok(vec![quota_window(800)]),
-            });
+        let lite: Arc<dyn crate::rate_limit::RateLimitWindowSource> = Arc::new(FakeQuotaSource {
+            result: Ok(vec![quota_window(800)]),
+        });
         assert_eq!(resolve_goal_round_cap(Some(&lite), 777).await, 240);
     }
 
@@ -7302,10 +7297,9 @@ mod tests {
         // No source, a fetch error, and empty windows all fall back to the config
         // default instead of blocking /goal or inventing a number.
         assert_eq!(resolve_goal_round_cap(None, 777).await, 777);
-        let err: Arc<dyn crate::rate_limit::RateLimitWindowSource> =
-            Arc::new(FakeQuotaSource {
-                result: Err("status_v2 unavailable".into()),
-            });
+        let err: Arc<dyn crate::rate_limit::RateLimitWindowSource> = Arc::new(FakeQuotaSource {
+            result: Err("status_v2 unavailable".into()),
+        });
         assert_eq!(resolve_goal_round_cap(Some(&err), 777).await, 777);
         let empty: Arc<dyn crate::rate_limit::RateLimitWindowSource> =
             Arc::new(FakeQuotaSource { result: Ok(vec![]) });
@@ -7812,6 +7806,7 @@ mod tests {
             model: model.into(),
             base_url: Some("https://example.test/v1".into()),
             system_prompt: None,
+            supports_vision: None,
             user_agent: None,
             context_window: 64_000,
             max_tokens: None,
@@ -8698,8 +8693,14 @@ mod tests {
         ));
 
         handle.pause_goal().await.unwrap();
-        assert!(matches!(kernel_commands.recv().await, Some(AgentCommand::Cancel)));
-        assert!(matches!(kernel_commands.recv().await, Some(AgentCommand::Snapshot)));
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Cancel)
+        ));
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
         assert!(matches!(
             runtime_events.recv().await,
             Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
@@ -10637,7 +10638,7 @@ mod tests {
             &self,
             text: String,
             _images: Vec<ImageContent>,
-            _active_model: String,
+            _supports_vision: bool,
             _session_id: Option<String>,
         ) -> (UserInput, Option<VisionNotice>) {
             (
@@ -10663,7 +10664,7 @@ mod tests {
             &self,
             text: String,
             _images: Vec<ImageContent>,
-            _active_model: String,
+            _supports_vision: bool,
             _session_id: Option<String>,
         ) -> (UserInput, Option<VisionNotice>) {
             self.called.store(true, Ordering::Release);
@@ -12058,11 +12059,7 @@ mod tests {
         let runtime = CodingRuntime::start(start).await.unwrap();
         let before = runtime.handle.status();
 
-        let changed = runtime
-            .handle
-            .reprepare_config(next_config)
-            .await
-            .unwrap();
+        let changed = runtime.handle.reprepare_config(next_config).await.unwrap();
 
         assert!(changed.generation.0 > before.generation);
         assert_eq!(changed.session_id.as_deref(), Some(session_id));
@@ -13504,12 +13501,9 @@ mod tests {
             if attempt == 0 {
                 // First round: evaluator says NotMet → continuation dispatched.
                 assert!(matches!(
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        kernel_commands.recv()
-                    )
-                    .await
-                    .expect("first goal continuation was not dispatched"),
+                    tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+                        .await
+                        .expect("first goal continuation was not dispatched"),
                     Some(AgentCommand::SendSyntheticMessage { .. })
                 ));
             }
@@ -13538,8 +13532,8 @@ mod tests {
             }
         ));
 
-        let progress = last_goal_progress
-            .expect("no GoalChanged event was emitted after round cap");
+        let progress =
+            last_goal_progress.expect("no GoalChanged event was emitted after round cap");
         assert_eq!(
             progress.phase,
             GoalPhase::PausedAtCap,
@@ -13604,12 +13598,9 @@ mod tests {
             if attempt == 0 {
                 // First round: evaluator says NotMet → continuation dispatched.
                 assert!(matches!(
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        kernel_commands.recv()
-                    )
-                    .await
-                    .expect("first goal continuation was not dispatched"),
+                    tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+                        .await
+                        .expect("first goal continuation was not dispatched"),
                     Some(AgentCommand::SendSyntheticMessage { .. })
                 ));
             }
@@ -13630,10 +13621,7 @@ mod tests {
 
         // --- Goal is now PausedAtCap; submit new message ---
         let submit_text = "please continue";
-        handle
-            .submit(UserInput::from(submit_text))
-            .await
-            .unwrap();
+        handle.submit(UserInput::from(submit_text)).await.unwrap();
 
         // Collect events until we see SendMessage or timeout.
         let mut saw_goal_changed_pursuing = false;
@@ -13741,10 +13729,7 @@ mod tests {
 
         // --- Goal is now Satisfied; submit new message ---
         let submit_text = "follow-up question";
-        handle
-            .submit(UserInput::from(submit_text))
-            .await
-            .unwrap();
+        handle.submit(UserInput::from(submit_text)).await.unwrap();
 
         // Collect until SendMessage; assert no GoalChanged(Pursuing) seen.
         let mut saw_goal_changed_pursuing = false;
@@ -13806,13 +13791,18 @@ mod tests {
         // --- Drive the goal to Satisfied ---
         handle.start_goal("tests pass").await.unwrap();
         let _ = runtime_events.recv().await; // GoalChanged(active=true)
-        handle.submit(UserInput::from("initial turn")).await.unwrap();
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
         ));
         kernel_events
-            .send(AgentEvent::TurnComplete { reason: StopReason::Stopped })
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            })
             .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
@@ -13889,13 +13879,18 @@ mod tests {
         // --- Drive the goal to Satisfied ---
         handle.start_goal("tests pass").await.unwrap();
         let _ = runtime_events.recv().await; // GoalChanged(active=true)
-        handle.submit(UserInput::from("initial turn")).await.unwrap();
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
         ));
         kernel_events
-            .send(AgentEvent::TurnComplete { reason: StopReason::Stopped })
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            })
             .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
@@ -13967,13 +13962,18 @@ mod tests {
         // --- Drive the goal to Satisfied ---
         handle.start_goal("tests pass").await.unwrap();
         let _ = runtime_events.recv().await; // GoalChanged(active=true)
-        handle.submit(UserInput::from("initial turn")).await.unwrap();
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
         ));
         kernel_events
-            .send(AgentEvent::TurnComplete { reason: StopReason::Stopped })
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            })
             .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
@@ -14026,7 +14026,10 @@ mod tests {
         .await
         .expect("empty submit did not deliver within timeout");
 
-        assert!(saw_send_message, "the (empty) message still runs as an ordinary turn");
+        assert!(
+            saw_send_message,
+            "the (empty) message still runs as an ordinary turn"
+        );
         assert!(
             !saw_goal_changed_pursuing,
             "empty input must NOT re-engage the goal (classifier skipped)"
