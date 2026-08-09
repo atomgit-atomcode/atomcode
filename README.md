@@ -42,7 +42,13 @@
 
 ---
 
+> **AtomCode —— 开源终端 AI 编码代理**（Open-source terminal AI coding agent）
+
+AtomCode 是一款运行在终端里的 AI 编码代理：你用自然语言描述任务，它就能自动阅读代码库、编辑文件、执行命令并验证结果，全程自主完成。
+
 AtomCode is an AI coding agent that lives in your terminal. Give it a task in natural language, and it will read your codebase, edit files, run commands, and verify its work — autonomously.
+
+你可以把它理解为 Claude Code / Cursor Agent 的开源替代品，完全运行在终端里，可接入任何兼容 OpenAI 接口的模型。
 
 Think of it as an open-source alternative to Claude Code / Cursor Agent, but running entirely in your terminal and connecting to any OpenAI-compatible API.
 

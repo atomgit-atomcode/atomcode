@@ -153,11 +153,18 @@ impl TuiSession {
                 // If origin matches but prefix does not, keep it as a real message.
                 !(m.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN)
                     && m.text.starts_with(LEGACY_COLD_SUMMARY_PREFIX))
+                    && !atomcode_capabilities::reminder::is_system_reminder(&m.text)
             })
             .cloned()
             .collect();
         let mut display_messages = Vec::with_capacity(view.presentation.entries.len());
         for entry in view.presentation.entries {
+            // UI-only replay entries are display data, not provider context; an
+            // injected `<system-reminder>` block must never surface as a user
+            // message in the terminal (see #1362 / #1349).
+            if atomcode_capabilities::reminder::is_system_reminder(&entry.text) {
+                continue;
+            }
             let after_message = match entry.anchor {
                 DisplayAnchor::AtStart => 0,
                 DisplayAnchor::AfterTurn { turn_id } => view
@@ -230,6 +237,7 @@ impl TuiSession {
                 // the text successfully strips the prefix.
                 !(m.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN)
                     && m.text.starts_with(LEGACY_COLD_SUMMARY_PREFIX))
+                    && !atomcode_capabilities::reminder::is_system_reminder(&m.text)
             })
             .collect();
     }
@@ -294,6 +302,73 @@ mod tests {
             format!("{LEGACY_COLD_SUMMARY_PREFIX}older context")
         );
         assert_eq!(out.messages[1].text, "recent");
+    }
+
+    #[test]
+    fn snapshot_ingest_skips_injected_system_reminders() {
+        let incoming = SessionSnapshot::new(vec![
+            Message::user("修复登录错误"),
+            Message::user(atomcode_capabilities::reminder::system_reminder(
+                "我就在任务1上！继续任务2！",
+            )),
+            Message::assistant("已修复", vec![]),
+        ]);
+
+        let mut session = Session::new(PathBuf::from("/tmp/project"));
+        session.update_from_conversation_snapshot(incoming);
+
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["修复登录错误", "已修复"]
+        );
+    }
+
+    #[test]
+    fn catalog_display_messages_skip_injected_system_reminders() {
+        use atomcode_capabilities::session::presentation::PRESENTATION_VERSION;
+        use atomcode_capabilities::session::{
+            DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole,
+        };
+        let view = atomcode_daemon::legacy_convert::CatalogSessionView {
+            snapshot: SessionSnapshot::new(vec![Message::user("修复登录错误")]),
+            meta: atomcode_capabilities::session::SessionMeta::new(
+                "reminder-session",
+                "/project",
+                1,
+            ),
+            presentation: PresentationFile {
+                v: PRESENTATION_VERSION,
+                entries: vec![
+                    PresentationEntry {
+                        anchor: DisplayAnchor::AtStart,
+                        role: PresentationRole::User,
+                        text: atomcode_capabilities::reminder::system_reminder(
+                            "我就在任务1上！继续任务2！",
+                        ),
+                    },
+                    PresentationEntry {
+                        anchor: DisplayAnchor::AtStart,
+                        role: PresentationRole::Assistant,
+                        text: "已修复".into(),
+                    },
+                ],
+            },
+        };
+
+        let session = Session::from_catalog_view(view).unwrap();
+
+        assert_eq!(
+            session
+                .display_messages
+                .iter()
+                .map(|d| d.message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["已修复"]
+        );
     }
 
     #[test]

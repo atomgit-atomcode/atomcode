@@ -493,7 +493,11 @@ impl SessionMeta {
         }
         let Some(text) = messages
             .iter()
-            .filter(|message| message.role == Role::User && !message.synthetic)
+            .filter(|message| {
+                message.role == Role::User
+                    && !message.synthetic
+                    && !crate::reminder::is_system_reminder(&message.text)
+            })
             .map(|message| strip_leading_image_markers(message.text.trim()))
             .find(|text| !text.is_empty())
         else {
@@ -4060,6 +4064,18 @@ mod tests {
         meta.auto_name_from_messages(&[Message::user("[Image #1]识别图片内容")]);
 
         assert_eq!(meta.name, "识别图片内容");
+    }
+
+    #[test]
+    fn fallback_name_skips_injected_system_reminder() {
+        let mut meta = SessionMeta::new("reminder-session", "/project", 1);
+
+        meta.auto_name_from_messages(&[
+            Message::user(crate::reminder::system_reminder("我就在任务1上！继续任务2！")),
+            Message::user("修复登录错误"),
+        ]);
+
+        assert_eq!(meta.name, "修复登录错误");
     }
 
     #[test]
