@@ -905,7 +905,14 @@ fn build_command(command: &str) -> Result<tokio::process::Command, String> {
 /// honor the console's OEM codepage (Windows), then use chardetng as a cross-platform
 /// fallback. The latter covers commands such as `curl` returning a legacy GB2312/GBK
 /// page on macOS/Linux without changing the command or its byte-level semantics.
-fn decode_output(bytes: &[u8]) -> String {
+pub(crate) fn decode_output(bytes: &[u8]) -> String {
+    // Windows-native programs may write UTF-16 directly to a redirected pipe.  In
+    // particular, wsl.exe's localized "install a distribution" diagnostic has
+    // appeared in hook stdout this way.  UTF-16LE ASCII is also valid UTF-8 (with
+    // embedded NULs), so this check MUST precede the UTF-8 fast path.
+    if let Some(decoded) = decode_utf16_output(bytes) {
+        return decoded;
+    }
     match std::str::from_utf8(bytes) {
         Ok(s) => return s.to_string(),
         // A truncated multibyte tail (no `error_len`) means the valid prefix IS real
@@ -915,6 +922,63 @@ fn decode_output(bytes: &[u8]) -> String {
         Err(_) => {}
     }
     decode_oem(bytes, console_codepage())
+}
+
+/// Recognize redirected UTF-16 output by BOM or by the byte-position NUL bias of
+/// console diagnostics.  The no-BOM heuristic also requires valid UTF-16 and a
+/// printable decoded result, so ordinary binary/legacy output is not reinterpreted.
+fn decode_utf16_output(bytes: &[u8]) -> Option<String> {
+    let (little_endian, body, bom) = if bytes.starts_with(&[0xFF, 0xFE]) {
+        (true, &bytes[2..], true)
+    } else if bytes.starts_with(&[0xFE, 0xFF]) {
+        (false, &bytes[2..], true)
+    } else {
+        if bytes.len() < 8 || bytes.len() % 2 != 0 {
+            return None;
+        }
+        let pairs = bytes.len() / 2;
+        let even_nuls = bytes.iter().step_by(2).filter(|&&byte| byte == 0).count();
+        let odd_nuls = bytes
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .filter(|&&byte| byte == 0)
+            .count();
+        // Localized diagnostics contain many non-ASCII UTF-16 code units (whose high
+        // byte is non-zero), so do not require every other byte to be NUL.  A 20%
+        // bias is enough when the decoded result also passes the strict text check
+        // below; this still rejects ordinary binary and legacy multibyte text.
+        if odd_nuls * 5 >= pairs && odd_nuls >= even_nuls.saturating_mul(3) {
+            (true, bytes, false)
+        } else if even_nuls * 5 >= pairs && even_nuls >= odd_nuls.saturating_mul(3) {
+            (false, bytes, false)
+        } else {
+            return None;
+        }
+    };
+    if body.len() % 2 != 0 {
+        return None;
+    }
+    let units = body.chunks_exact(2).map(|pair| {
+        if little_endian {
+            u16::from_le_bytes([pair[0], pair[1]])
+        } else {
+            u16::from_be_bytes([pair[0], pair[1]])
+        }
+    });
+    if bom {
+        return Some(
+            char::decode_utf16(units)
+                .map(|item| item.unwrap_or('\u{FFFD}'))
+                .collect(),
+        );
+    }
+    let decoded: String = char::decode_utf16(units).collect::<Result<_, _>>().ok()?;
+    let control_count = decoded
+        .chars()
+        .filter(|character| character.is_control() && !character.is_whitespace())
+        .count();
+    (control_count <= decoded.chars().count() / 20).then_some(decoded)
 }
 
 /// Decode `bytes` with a Windows OEM/ANSI codepage number. Pure and platform-independent
@@ -3589,6 +3653,27 @@ mod tests {
         assert!(!had_errors);
         assert_eq!(decode_detected(&gbk), source);
         assert_eq!(decode_oem(&gbk, 0), source);
+    }
+
+    #[test]
+    fn decode_output_recognizes_redirected_utf16_console_text() {
+        let source = "未安装 Linux 分发版。运行 wsl.exe --install <Distro>";
+        let mut little_endian = vec![0xFF, 0xFE];
+        little_endian.extend(source.encode_utf16().flat_map(u16::to_le_bytes));
+        assert_eq!(decode_output(&little_endian), source);
+
+        let ascii_without_bom: Vec<u8> = "Run wsl.exe --list --online"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(
+            decode_output(&ascii_without_bom),
+            "Run wsl.exe --list --online"
+        );
+
+        let localized_without_bom: Vec<u8> =
+            source.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(decode_output(&localized_without_bom), source);
     }
 
     #[test]

@@ -7390,6 +7390,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn live_user_text_shaped_like_a_reminder_is_still_echoed() {
+        let input = atomcode_coding::UserInput {
+            text: atomcode_capabilities::reminder::system_reminder(
+                "Explain why this appears.",
+            ),
+            images: Vec::new(),
+        };
+
+        assert!(matches!(
+            project_live_view_event(
+                atomcode_daemon::live_hub::LiveViewEvent::InputAccepted {
+                    input,
+                    client_input_id: Some("web-input".into()),
+                }
+            ),
+            Some(crate::event_loop::ui_event::UiEvent::UserEcho(text))
+                if text == atomcode_capabilities::reminder::system_reminder(
+                    "Explain why this appears."
+                )
+        ));
+    }
+
+    #[test]
+    fn live_user_text_that_only_mentions_reminder_tag_is_still_echoed() {
+        let input = atomcode_coding::UserInput {
+            text: "Why is <system-reminder> visible?".into(),
+            images: Vec::new(),
+        };
+
+        assert!(matches!(
+            project_live_view_event(
+                atomcode_daemon::live_hub::LiveViewEvent::InputAccepted {
+                    input,
+                    client_input_id: Some("web-input".into()),
+                }
+            ),
+            Some(crate::event_loop::ui_event::UiEvent::UserEcho(text))
+                if text == "Why is <system-reminder> visible?"
+        ));
+    }
+
+    #[test]
     fn live_request_resolution_projects_to_correlated_tui_event() {
         let event =
             project_live_view_event(atomcode_daemon::live_hub::LiveViewEvent::RequestResolved {

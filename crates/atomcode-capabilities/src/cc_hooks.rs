@@ -318,8 +318,8 @@ async fn run_command_hook(
         let out = child.wait_with_output().await.ok()?;
         Some((
             out.status.code(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
+            crate::tools::bash::decode_output(&out.stdout),
+            crate::tools::bash::decode_output(&out.stderr),
         ))
     };
 
@@ -563,7 +563,13 @@ impl LifecycleHooks for CCExternalHooks {
                 .and_then(|d| d.additional_context().map(str::to_owned))
                 .unwrap_or_else(|| stdout.trim().to_string());
             if !ctx.is_empty() {
-                convo.push(Message::user(crate::reminder::system_reminder(&ctx)));
+                // Hook stdout is runtime-owned ambient context, not text authored by the
+                // human.  Keep it as a user-role message for provider/cache compatibility,
+                // but preserve its provenance so presentation layers never replay it as a
+                // visible user bubble when a live snapshot is synchronized at turn end.
+                convo.push(Message::synthetic_user(crate::reminder::system_reminder(
+                    &ctx,
+                )));
             }
         }
     }
@@ -1090,6 +1096,34 @@ mod tests {
         assert!(cc.user_prompt_submit(&mut text).await.is_ok());
         assert!(text.contains("hi"), "original prompt preserved");
         assert!(text.contains("CTX"), "context appended: {text}");
+    }
+
+    #[tokio::test]
+    async fn session_start_context_is_synthetic_not_user_authored() {
+        let hook = HookConfig {
+            event: HookEvent::SessionStart,
+            matcher: None,
+            command: r#"echo '{"hookSpecificOutput":{"additionalContext":"WSL setup hint"}}'"#
+                .into(),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        let cc = CCExternalHooks::new(vec![hook], "/tmp");
+        let mut convo = Conversation::new();
+
+        cc.session_start(&mut convo, false).await;
+
+        let injected = convo
+            .messages
+            .last()
+            .expect("session hook should inject context");
+        assert_eq!(injected.role, atomcode_kernel::message::Role::User);
+        assert!(
+            injected.synthetic,
+            "hook context must not render as human input"
+        );
+        assert!(injected.text.contains("WSL setup hint"));
+        assert!(injected.text.starts_with("<system-reminder>"));
     }
 
     #[test]
