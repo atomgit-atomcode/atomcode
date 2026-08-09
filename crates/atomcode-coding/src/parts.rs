@@ -50,6 +50,7 @@ use atomcode_review::{ReviewTool, ReviewToolConfig, SharedReviewProvider};
 use crate::config::CodingAgentConfig;
 use crate::discipline::VerifyCadenceHook;
 use crate::execution_policy::TurnExecutionPolicy;
+use crate::mcp_instructions::McpInstructionsHook;
 #[cfg(test)]
 use crate::persona::coding_persona;
 use crate::persona::coding_persona_with_capabilities;
@@ -506,6 +507,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     } else {
         (None, None)
     };
+    let mcp_tool_names = Arc::new(std::sync::RwLock::new(Vec::new()));
 
     // Session binding: the id's single owner.
     let session = match &opts.session {
@@ -599,6 +601,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     //    prefix, so they compose (the insert position is computed live each time).
     // 2b. SkillCatalogHook — session_start: inject the AVAILABLE SKILLS catalog after
     //    memory (persona → context → memory → skills). Same header-prefix reconcile.
+    // 2c. McpInstructionsHook — pre_request append-only projection of live,
+    //     server-scoped instructions for currently mounted MCP tools. Ephemeral:
+    //     never persists external server guidance into the session snapshot.
     // 3. SnapshotHook  — turn_complete: persist .snapshot + .meta.
     // 4. TranscriptHook— turn_complete: append the .jsonl record. (No coupling with
     //    3 — the order is fixed purely for determinism.)
@@ -622,6 +627,12 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // (registered below) uses it to stay a no-op when there's nothing to trigger.
     let has_skills = skill_catalog.as_ref().is_some_and(|c| !c.trim().is_empty());
     hooks.push(Arc::new(SkillCatalogHook::new(skill_catalog)));
+    if let Some(registry) = &mcp_registry {
+        hooks.push(Arc::new(McpInstructionsHook::new(
+            Arc::clone(registry),
+            Arc::clone(&mcp_tool_names),
+        )));
+    }
     if let Some(b) = &session {
         let wd = cfg.working_dir.to_string_lossy().into_owned();
         let snapshot_hook = Arc::new(
@@ -740,7 +751,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         tool_names: names,
         todo_enabled,
         request_user_input_enabled,
-        mcp_tool_names: Arc::new(std::sync::RwLock::new(Vec::new())),
+        mcp_tool_names,
         mounted_tools: None,
         mounted_tools_publisher: None,
         mcp_connect_rx,

@@ -53,6 +53,7 @@ pub mod vision;
 mod assemble;
 mod execution_policy;
 mod init_prompt;
+mod mcp_instructions;
 mod next_prompt_suggestion;
 mod rate_limit;
 mod skill_first;

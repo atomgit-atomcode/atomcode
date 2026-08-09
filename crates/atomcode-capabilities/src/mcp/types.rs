@@ -67,6 +67,11 @@ pub struct InitializeResult {
     pub protocol_version: String,
     pub capabilities: ServerCapabilities,
     pub server_info: ServerInfo,
+    /// Optional server-scoped guidance describing how its features should be used.
+    /// The registry treats this as untrusted external input and projects it only
+    /// alongside tools mounted from the same server.
+    #[serde(default)]
+    pub instructions: Option<String>,
 }
 
 /// Server capabilities.
@@ -196,6 +201,29 @@ impl std::fmt::Display for ServerStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_optional_initialize_instructions() {
+        let result: InitializeResult = serde_json::from_value(serde_json::json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": { "tools": {} },
+            "serverInfo": { "name": "voice", "version": "1.0" },
+            "instructions": "Speak only the final answer."
+        }))
+        .unwrap();
+        assert_eq!(
+            result.instructions.as_deref(),
+            Some("Speak only the final answer.")
+        );
+
+        let without: InitializeResult = serde_json::from_value(serde_json::json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "serverInfo": { "name": "plain", "version": "1.0" }
+        }))
+        .unwrap();
+        assert!(without.instructions.is_none());
+    }
 
     #[test]
     fn parses_read_only_hint_annotation() {
