@@ -334,6 +334,7 @@ pub(crate) fn chat_runtime_config(
         pricing: p.and_then(|provider| {
             atomcode_coding::resolve_provider_pricing(provider_name, provider)
         }),
+        lsp: atomcode_coding::config::lsp_settings_from_config(&config.lsp),
     }
 }
 

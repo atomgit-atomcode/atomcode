@@ -165,8 +165,8 @@ codeintel = [
     # the cross-file graph layer (build_graph) walks the repo gitignore-aware
     "dep:ignore",
 ]
-# LSP diagnostics (spawns external language servers, JSON-RPC over stdio). Opt-in on top
-# of codeintel; needs the language servers installed (graceful "not available" if not).
+# Read-only LSP code intelligence (spawns local language servers, JSON-RPC over stdio).
+# Runtime exposure stays opt-in and missing binaries degrade gracefully.
 lsp = ["codeintel", "dep:which", "dep:url", "tokio/process", "tokio/io-util", "tokio/fs"]
 # Real-server LSP e2e (needs rust-analyzer etc. installed) — default-off, on demand.
 lsp-e2e = ["lsp"]

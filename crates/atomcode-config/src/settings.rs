@@ -187,8 +187,8 @@ pub static SETTINGS: &[SettingSpec] = &[
     bool_setting(
         "lsp.enabled",
         &["lsp", "enabled"],
-        "LSP diagnostics",
-        "LSP 诊断",
+        "LSP code intelligence",
+        "LSP 代码智能",
         &["language server"],
         ApplyPolicy::CapabilityReprepare,
     ),

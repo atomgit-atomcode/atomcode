@@ -308,6 +308,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             .iter()
             .map(|s| s.to_string()),
     );
+    if atomcode_capabilities::codeintel::register_lsp_tool(&mut registry, &cfg.lsp) {
+        names.push("lsp".into());
+    }
 
     #[cfg(feature = "atomgit")]
     crate::assemble::register_atomgit_capabilities(&mut registry, &mut names)

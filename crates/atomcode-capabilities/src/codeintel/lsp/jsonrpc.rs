@@ -3,6 +3,8 @@
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 
+const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Frame a JSON body with its `Content-Length` header.
 pub fn encode(body: &[u8]) -> Vec<u8> {
     let mut out = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
@@ -39,6 +41,12 @@ pub async fn read_message<R: AsyncRead + Unpin>(
             "LSP message: no Content-Length",
         )
     })?;
+    if len > MAX_MESSAGE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("LSP message exceeds {MAX_MESSAGE_BYTES} bytes"),
+        ));
+    }
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).await?;
     Ok(body)
@@ -70,5 +78,15 @@ mod tests {
     async fn eof_is_error() {
         let mut reader = BufReader::new(&b""[..]);
         assert!(read_message(&mut reader).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn oversized_message_is_rejected_before_allocation() {
+        let input = format!("Content-Length: {}\r\n\r\n", MAX_MESSAGE_BYTES + 1);
+        let mut reader = BufReader::new(input.as_bytes());
+        assert_eq!(
+            read_message(&mut reader).await.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 }
