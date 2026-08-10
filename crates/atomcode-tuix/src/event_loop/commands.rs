@@ -1126,8 +1126,17 @@ fn resolve_relay_client_bin() -> Option<String> {
     None
 }
 
+/// relay-client 的缓存目录：`$ATOMCODE_HOME/bin`。
+///
+/// 走 `Config::config_dir()` 而不是硬拼 `~/.atomcode`：设了 `$ATOMCODE_HOME`
+/// 时,下载的二进制本该和其它数据落在同一棵树里 —— 否则 `uninstall` 扫不到它,
+/// 而且提示语指的目录和实际写入的目录会对不上。
+fn relay_client_cache_dir() -> PathBuf {
+    atomcode_config::config::Config::config_dir().join("bin")
+}
+
 /// 确保 relay-client 二进制可用。
-/// 先尝试本地查找（环境变量 → 同目录 → 缓存），都不存在则自动下载到 ~/.atomcode/bin/。
+/// 先尝试本地查找（环境变量 → 同目录 → 缓存），都不存在则自动下载到缓存目录。
 fn ensure_relay_client_bin() -> Result<String, String> {
     // 先尝试环境变量和同目录
     if let Some(bin) = resolve_relay_client_bin() {
@@ -1140,9 +1149,7 @@ fn ensure_relay_client_bin() -> Result<String, String> {
         "atomcode-relay-client"
     };
 
-    let cache_dir = dirs::home_dir()
-        .map(|h| h.join(".atomcode").join("bin"))
-        .unwrap_or_else(|| PathBuf::from(".atomcode/bin"));
+    let cache_dir = relay_client_cache_dir();
     let cache_path = cache_dir.join(bare_name);
     let version_path = cache_dir.join(".version");
 
@@ -1153,18 +1160,21 @@ fn ensure_relay_client_bin() -> Result<String, String> {
 
     // 跳过下载标志
     if std::env::var("ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD").is_ok_and(|v| v == "1") {
-        return Err("自动下载已禁用（ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD=1），\
-                    请手动将 relay-client 放入 ~/.atomcode/bin/ 目录"
-            .to_string());
+        return Err(format!(
+            "自动下载已禁用（ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD=1），\
+             请手动将 relay-client 放入 {} 目录",
+            cache_dir.display()
+        ));
     }
 
     // 检测平台
     let target = relay_client_target();
     if target == "unknown" {
         return Err(format!(
-            "不支持的平台：{}/{}。请手动编译 relay-client 并放到 ~/.atomcode/bin/ 中",
+            "不支持的平台：{}/{}。请手动编译 relay-client 并放到 {} 中",
             std::env::consts::OS,
-            std::env::consts::ARCH
+            std::env::consts::ARCH,
+            cache_dir.display()
         ));
     }
 
@@ -1262,14 +1272,15 @@ fn ensure_relay_client_bin() -> Result<String, String> {
                  1. 打开浏览器访问\n\
                     https://gitcode.com/atomgit_atomcode/atomcode-relay-release/releases\n\
                  2. 下载对应平台的 binary\n\
-                 3. 保存到 ~/.atomcode/bin/atomcode-relay-client\n\
-                 4. chmod +x ~/.atomcode/bin/atomcode-relay-client\n\
+                 3. 保存到 {cache}/atomcode-relay-client\n\
+                 4. chmod +x {cache}/atomcode-relay-client\n\
                  5. /app 重试\n\
                  \n\
                  快速安装：\n\
                  curl -fsSL https://raw.gitcode.com/atomgit_atomcode/atomcode-relay-release/raw/main/scripts/install.sh | sh\n\
                  && /app 重试",
-                e
+                e,
+                cache = cache_dir.display()
             );
             Err(msg)
         }
@@ -2290,8 +2301,9 @@ fn execute_slash_command_impl(
                                         match cmd.spawn() {
                                             Err(e) => format!(
                                                 "启动 relay-client 失败（{e}）。已尝试路径 `{bin}`。\
-                                                 请确认 relay-client 在 ~/.atomcode/bin/ 目录下，\
-                                                 或删除该目录后重试 /app 自动下载。"
+                                                 请确认 relay-client 在 {cache} 目录下，\
+                                                 或删除该目录后重试 /app 自动下载。",
+                                                cache = relay_client_cache_dir().display()
                                             ),
                                             Ok(child) => {
                                                 if let Some(mut old) = ctx.app_relay_child.take() {
