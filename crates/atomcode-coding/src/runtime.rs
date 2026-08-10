@@ -5716,6 +5716,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                                     "stopped: too many failed rounds (context may be full) — run /compact, then send a message to continue",
                                                 );
                                                 keep_goal_registered = true;
+                                                held_turn = None;
                                                 completion_reason = StopReason::ProviderError;
                                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning("goal stopped: too many failed rounds — run /compact then continue".into()));
