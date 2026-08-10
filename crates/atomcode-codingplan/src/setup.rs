@@ -986,9 +986,9 @@ fn step_models_and_register(
     //   - None / AtomGit-* (i.e. previous /codingplan run): replace
     //     with first VL/OCR model's provider key from the new list,
     //     or clear to None when the new list has no VL candidate.
-    let vl_idx = names
+    let vl_idx = available
         .iter()
-        .position(|n| atomcode_config::util::model_name_suggests_vision(n));
+        .position(|model| model_entry_supports_vision(model));
     let new_vl_key = vl_idx.map(|i| provider_names[i].clone());
 
     let vision_preprocessor = {
@@ -1303,7 +1303,10 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
                 .unwrap_or_else(codingplan_llm_base_url),
         ),
         system_prompt: None,
-        supports_vision: None,
+        // Prefer the gateway's explicit per-model capability. `None` is kept
+        // for older models-v2 payloads so the existing model-name heuristic
+        // remains the backward-compatible fallback at provider resolution.
+        supports_vision: entry.supports_vision,
         user_agent: None,
         // `context_window: 0` from a misconfigured row would degrade
         // every request to a zero-token window; treat that as
@@ -1336,6 +1339,15 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
             cached_input_per_million: 0.0,
         }),
     }
+}
+
+/// Resolve the effective image-input capability advertised by models-v2.
+/// An explicit server value is authoritative; older payloads without the field
+/// retain the historical model-name heuristic.
+fn model_entry_supports_vision(entry: &ModelEntry) -> bool {
+    entry.supports_vision.unwrap_or_else(|| {
+        atomcode_config::util::model_name_suggests_vision(&entry.display_model_name)
+    })
 }
 
 #[cfg(test)]
@@ -1539,6 +1551,31 @@ mod tests {
     }
 
     #[test]
+    fn build_provider_preserves_explicit_vision_capability() {
+        let enabled = super::super::types::ModelEntry {
+            supports_vision: Some(true),
+            ..entry("plain-model-name")
+        };
+        assert_eq!(
+            build_codingplan_provider(&enabled).supports_vision,
+            Some(true)
+        );
+
+        // An explicit server opt-out is authoritative even when the model name
+        // would otherwise trigger the local vision-name heuristic.
+        let disabled = super::super::types::ModelEntry {
+            supports_vision: Some(false),
+            ..entry("Qwen3-VL-8B-Instruct")
+        };
+        assert_eq!(
+            build_codingplan_provider(&disabled).supports_vision,
+            Some(false)
+        );
+        let legacy = entry("Qwen3-VL-8B-Instruct");
+        assert_eq!(build_codingplan_provider(&legacy).supports_vision, None);
+    }
+
+    #[test]
     fn build_provider_uses_server_overrides_when_present() {
         // Per-model server fields take precedence over the
         // hard-coded fallbacks. Mirrors the new wire shape:
@@ -1551,6 +1588,7 @@ mod tests {
             base_url: Some("https://custom.example.com/v1".into()),
             provider_type: Some("claude".into()),
             context_window: Some(128_000),
+            supports_vision: Some(true),
             plan_available: true,
             capable_model: None,
             api_key: None,
@@ -1560,6 +1598,7 @@ mod tests {
         assert_eq!(p.provider_type, "claude");
         assert_eq!(p.base_url.as_deref(), Some("https://custom.example.com/v1"));
         assert_eq!(p.context_window, 128_000);
+        assert_eq!(p.supports_vision, Some(true));
     }
 
     #[test]
@@ -1598,6 +1637,7 @@ mod tests {
             "base_url": "https://api-ai.gitcode.com/v1",
             "type": "openai",
             "context_window": 64000,
+            "supports_vision": true,
             "plan_available": true
         }]"#;
         let list: Vec<super::super::types::ModelEntry> =
@@ -1611,6 +1651,7 @@ mod tests {
         assert_eq!(m.base_url.as_deref(), Some("https://api-ai.gitcode.com/v1"));
         assert_eq!(m.provider_type.as_deref(), Some("openai"));
         assert_eq!(m.context_window, Some(64_000));
+        assert_eq!(m.supports_vision, Some(true));
         assert!(m.plan_available);
     }
 
@@ -1632,6 +1673,7 @@ mod tests {
         assert!(m.base_url.is_none());
         assert!(m.provider_type.is_none());
         assert!(m.context_window.is_none());
+        assert!(m.supports_vision.is_none());
         assert_eq!(m.is_infinity, 0);
     }
 
@@ -2465,9 +2507,9 @@ mod tests {
         );
         config.default_provider = default_provider.clone();
 
-        let vl_idx = names
+        let vl_idx = models
             .iter()
-            .position(|n| atomcode_config::util::model_name_suggests_vision(n));
+            .position(|model| model_entry_supports_vision(model));
         let new_vl_key = vl_idx.map(|i| provider_names[i].clone());
         let vision_preprocessor = {
             let current = config.vision_preprocessor_provider.clone();
@@ -2806,6 +2848,39 @@ mod tests {
             VisionPreprocessorOutcome::AutoSet(expected.clone())
         );
         assert_eq!(config.vision_preprocessor_provider, Some(expected));
+    }
+
+    #[test]
+    fn vision_preprocessor_uses_explicit_server_capability() {
+        let mut config = blank_config();
+        let models = vec![super::super::types::ModelEntry {
+            supports_vision: Some(true),
+            ..vl_model_entry("model-without-vision-name")
+        }];
+        let info = run_register(&mut config, models);
+        assert_eq!(
+            info.vision_preprocessor,
+            VisionPreprocessorOutcome::AutoSet("AtomGit".into())
+        );
+        assert_eq!(
+            config.vision_preprocessor_provider.as_deref(),
+            Some("AtomGit")
+        );
+    }
+
+    #[test]
+    fn vision_preprocessor_respects_explicit_server_opt_out() {
+        let mut config = blank_config();
+        let models = vec![super::super::types::ModelEntry {
+            supports_vision: Some(false),
+            ..vl_model_entry("Qwen/Qwen3-VL-32B-Instruct")
+        }];
+        let info = run_register(&mut config, models);
+        assert_eq!(
+            info.vision_preprocessor,
+            VisionPreprocessorOutcome::UnchangedNone
+        );
+        assert_eq!(config.vision_preprocessor_provider, None);
     }
 
     #[test]
