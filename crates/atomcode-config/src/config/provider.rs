@@ -297,6 +297,7 @@ impl ProviderConfig {
             "openai" | "openai-compat" | "openai_compat" => "OPENAI_API_KEY",
             "claude" | "anthropic" => "ANTHROPIC_API_KEY",
             "ollama" => "OLLAMA_API_KEY",
+            "opencode" => "OPENCODE_API_KEY",
             _ => "",
         };
 

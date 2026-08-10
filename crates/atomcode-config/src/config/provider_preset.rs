@@ -190,6 +190,15 @@ pub const PRESETS: &[ProviderPreset] = &[
         model_source: ModelSource::DiscoveryApi,
     },
     ProviderPreset {
+        id: "opencode",
+        display_name: "OpenCode Zen",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some("https://opencode.ai/zen/v1"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: Some("OPENCODE_API_KEY"),
+        model_source: ModelSource::Manual,
+    },
+    ProviderPreset {
         id: "openai",
         display_name: "OpenAI",
         provider_type: ProviderType::OpenAi,
@@ -256,6 +265,7 @@ mod tests {
             "minimax",
             "siliconflow",
             "openrouter",
+            "opencode",
             "taotoken",
             "openai",
             "anthropic",
@@ -286,6 +296,20 @@ mod tests {
         );
         assert_eq!(taotoken.auth_kind, AuthKind::ApiKey);
         assert_eq!(taotoken.model_source, ModelSource::Manual);
+    }
+
+    #[test]
+    fn opencode_uses_its_openai_compatible_endpoint() {
+        let opencode = preset("opencode").expect("opencode preset");
+        assert_eq!(opencode.display_name, "OpenCode Zen");
+        assert_eq!(opencode.provider_type, ProviderType::OpenAi);
+        assert_eq!(
+            opencode.default_base_url,
+            Some("https://opencode.ai/zen/v1")
+        );
+        assert_eq!(opencode.auth_kind, AuthKind::ApiKey);
+        assert_eq!(opencode.api_key_env, Some("OPENCODE_API_KEY"));
+        assert_eq!(opencode.model_source, ModelSource::Manual);
     }
 
     #[test]
