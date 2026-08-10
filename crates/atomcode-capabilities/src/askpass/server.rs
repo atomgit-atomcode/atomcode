@@ -46,6 +46,13 @@ fn socket_path() -> io::Result<PathBuf> {
         return Ok(PathBuf::from(dir).join(filename));
     }
 
+    // Deliberately `$HOME`-anchored and NOT `$ATOMCODE_HOME`, unlike every other
+    // path this process writes: `bind()` caps a unix socket path at `SUN_LEN`
+    // (104 bytes on macOS, 108 on Linux) and `$ATOMCODE_HOME` is arbitrary-depth
+    // user input, so honouring it here would break askpass outright — every git
+    // /ssh credential prompt — on a deep config dir. There is nothing to fix:
+    // the filename is pid-namespaced, so parallel installs never collide, and
+    // `run/` is not in `uninstall_manifest()` under either spelling.
     let home = std::env::var("HOME")
         .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "HOME env var not set"))?;
     let dir = PathBuf::from(home).join(".atomcode").join("run");

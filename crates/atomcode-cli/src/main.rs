@@ -3603,7 +3603,7 @@ fn run_codingplan_core(
 static CRASH_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Synchronously append a panic's location + message + backtrace to
-/// `~/.atomcode/logs/panic.log`, then `flush` + `sync_all` so the bytes are
+/// `$ATOMCODE_HOME/logs/panic.log`, then `flush` + `sync_all` so the bytes are
 /// durable **before** the hook returns and the runtime calls `abort()`
 /// (`panic = "abort"` in the release profile).
 ///
@@ -3619,10 +3619,16 @@ fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) {
     if CRASH_LOGGED.swap(true, Ordering::SeqCst) {
         return;
     }
-    let Some(home) = atomcode_config::util::real_home_dir() else {
-        return;
-    };
-    let dir = home.join(".atomcode").join("logs");
+    // Same `logs/` dir as [`atomcode_log_path`], so it must resolve the same
+    // way: that one goes through `Config::config_dir()`, this one used to hard-
+    // code `~/.atomcode`, and with `$ATOMCODE_HOME` set the two split into
+    // different trees — `atomcode.log` where the user configured it, the crash
+    // report somewhere they never look.
+    //
+    // This also drops the old give-up-if-no-home arm: with nothing resolvable
+    // the report now lands in a cwd-relative dir, matching every other path the
+    // process writes, rather than being silently discarded.
+    let dir = atomcode_config::config::Config::config_dir().join("logs");
     let _ = std::fs::create_dir_all(&dir);
     let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
