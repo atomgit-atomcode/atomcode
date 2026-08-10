@@ -1200,10 +1200,17 @@ mod tests {
 
     #[test]
     fn binary_url_shape() {
+        // The shape is `<download base>/<version>/<asset>`; the base itself
+        // follows the deployment, so derive it rather than spelling a host.
         assert_eq!(
             binary_url("v4.19.0", "darwin-arm64"),
-            "https://atomgit.com/atomgit_atomcode/atomcode/releases/download/v4.19.0/atomcode-v4.19.0-darwin-arm64"
+            format!(
+                "{}/v4.19.0/{}",
+                download_base(),
+                binary_filename("v4.19.0", "darwin-arm64")
+            )
         );
+        assert!(binary_url("v4.19.0", "darwin-arm64").starts_with(download_base()));
     }
 
     #[test]

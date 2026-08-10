@@ -81,6 +81,8 @@ const HOSTED_MARKETPLACES: &[&str] = &[
 ];
 const HOSTED_AUTO_INSTALL: &[&str] = &["https://atomgit.com/atomgit_atomcode/atomcode-skills.git"];
 const HOSTED_TRUSTED_DOMAINS: &[&str] = &["atomgit.com", "gitcode.com"];
+/// Whether `/app` remote access is offered when nothing overrides it.
+const HOSTED_RELAY_ENABLED: bool = true;
 /// Prefix for CodingPlan provider keys. User-visible: it is the selection id in
 /// the model picker's left column and the account label in its right one, so a
 /// build serving its own gateway wants it to say something else.
@@ -204,7 +206,7 @@ pub fn relay_url() -> &'static str {
 /// host the operator does not run.
 pub fn relay_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| env_bool(ENABLE_RELAY_ENV).unwrap_or(true))
+    *ON.get_or_init(|| env_bool(ENABLE_RELAY_ENV).unwrap_or(HOSTED_RELAY_ENABLED))
 }
 
 /// Prefix that new CodingPlan entries are written with.
@@ -291,7 +293,7 @@ pub fn is_trusted_host(host: &str) -> bool {
 
 /// Hosts eligible for the automatic TLS-1.2 downgrade retry. Follows
 /// [`TRUSTED_HOSTS_ENV`] when set; otherwise the narrower hosted set.
-fn tls_fallback_domains() -> &'static [String] {
+pub fn tls_fallback_domains() -> &'static [String] {
     static DOMAINS: OnceLock<Vec<String>> = OnceLock::new();
     DOMAINS.get_or_init(|| normalized_list(TRUSTED_HOSTS_ENV, HOSTED_TLS_FALLBACK_DOMAINS))
 }
@@ -322,8 +324,15 @@ mod tests {
     // are covered through the pure helpers rather than by mutating a variable a
     // parallel test may already have observed.
 
+    /// Skipped when the process has an override set — the claim is about the
+    /// unconfigured default, and a harness that sets one is testing something
+    /// else. A build that replaces the `HOSTED_*` values still runs it, and
+    /// still passes: both sides of each assertion move together.
     #[test]
     fn nothing_configured_keeps_the_hosted_addresses() {
+        if std::env::var(PLATFORM_SERVER_ENV).is_ok() {
+            return;
+        }
         // The central promise of this module: it is additive. With no variable
         // set, every address is byte-identical to the const it replaced.
         assert_eq!(platform_server(), HOSTED_PLATFORM_SERVER);
@@ -339,7 +348,7 @@ mod tests {
             codingplan_provider_prefix(),
             HOSTED_CODINGPLAN_PROVIDER_PREFIX
         );
-        assert!(relay_enabled());
+        assert_eq!(relay_enabled(), HOSTED_RELAY_ENABLED);
     }
 
     #[test]
@@ -452,26 +461,48 @@ mod tests {
         ));
     }
 
+    // Host assertions derive from the configured sets rather than naming a
+    // vendor, so they hold in a build whose `HOSTED_*` values were replaced.
+
     #[test]
-    fn managed_url_requires_https_and_a_tls_fallback_host() {
-        assert!(is_managed_https_url("https://acs.atomgit.com/auth/login"));
-        assert!(is_managed_https_url("https://atomgit.com"));
-        assert!(is_managed_https_url("https://api.gitcode.com/api/v5"));
-        assert!(!is_managed_https_url("http://acs.atomgit.com"));
-        assert!(!is_managed_https_url("https://evilatomgit.com"));
+    fn a_host_outside_the_configured_sets_is_never_managed() {
+        // Holds for any configuration, including an empty one.
         assert!(!is_managed_https_url("https://api.openai.com/v1"));
         assert!(!is_managed_https_url("not a url"));
+        assert!(!is_trusted_host("api.openai.com"));
     }
 
     #[test]
-    fn tls_fallback_stays_narrower_than_token_trust() {
-        // Upstream scoped the TLS-1.2 retry to `api.gitcode.com`, never to
-        // gitcode.com at large. Token trust is the wider set. Sharing one list
-        // between them would have silently widened the retry to every
-        // gitcode.com host.
-        assert!(!is_managed_https_url("https://gitcode.com"));
-        assert!(!is_managed_https_url("https://raw.gitcode.com/x"));
-        assert!(is_trusted_host("gitcode.com"));
-        assert!(is_trusted_host("raw.gitcode.com"));
+    fn a_configured_fallback_host_is_managed_only_over_https() {
+        let Some(domain) = tls_fallback_domains().first() else {
+            return; // nothing configured — nothing to assert
+        };
+        assert!(is_managed_https_url(&format!("https://{domain}/some/path")));
+        // Plaintext never qualifies: these URLs carry a bearer token.
+        assert!(!is_managed_https_url(&format!("http://{domain}")));
+        // Lookalikes on either side of the host are rejected.
+        assert!(!is_managed_https_url(&format!("https://evil{domain}")));
+        assert!(!is_managed_https_url(&format!("https://{domain}.attacker.test")));
+    }
+
+    #[test]
+    fn every_configured_trusted_domain_is_trusted() {
+        for domain in trusted_domains() {
+            assert!(is_trusted_host(domain), "{domain}");
+            assert!(is_trusted_host(&format!("sub.{domain}")), "{domain}");
+            assert!(!is_trusted_host(&format!("evil{domain}")), "{domain}");
+        }
+    }
+
+    #[test]
+    fn tls_fallback_is_never_wider_than_token_trust() {
+        // The retry set is scoped more tightly than token trust on purpose;
+        // sharing one list between them would silently widen it.
+        for domain in tls_fallback_domains() {
+            assert!(
+                is_trusted_host(domain),
+                "{domain} takes the TLS retry but is not trusted"
+            );
+        }
     }
 }

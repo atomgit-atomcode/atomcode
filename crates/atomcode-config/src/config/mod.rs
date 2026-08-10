@@ -1063,9 +1063,24 @@ mod codingplan_prefix_tests {
 
     #[test]
     fn account_ids_group_by_wire_format() {
-        assert_eq!(codingplan_group_account_id("openai"), "AtomGit");
-        assert_eq!(codingplan_group_account_id("claude"), "AtomGit-anthropic");
-        assert_eq!(codingplan_group_account_id("ollama"), "AtomGit-ollama");
+        // The rule under test is the grouping — one account per wire format,
+        // all under the configured prefix — not what that prefix happens to
+        // say, which a distribution may replace.
+        let prefix = crate::endpoints::codingplan_provider_prefix();
+        assert_eq!(codingplan_group_account_id("openai"), prefix);
+        assert_eq!(
+            codingplan_group_account_id("claude"),
+            format!("{prefix}-anthropic")
+        );
+        assert_eq!(
+            codingplan_group_account_id("ollama"),
+            format!("{prefix}-ollama")
+        );
+        // Distinct wire formats must never collapse into one account.
+        assert_ne!(
+            codingplan_group_account_id("openai"),
+            codingplan_group_account_id("claude")
+        );
     }
 
     // `codingplan_prefixes` caches the configured prefix once per process, so
@@ -3450,11 +3465,18 @@ context_window = 131072
             }
         }))
         .unwrap();
+        // Keys stay written under the historical prefix on purpose: this also
+        // exercises the path a config predating a prefix change takes. The
+        // account ids they fold into follow the *configured* prefix, so derive
+        // them rather than spelling a vendor name.
+        let openai_account = codingplan_group_account_id("openai");
+        let claude_account = codingplan_group_account_id("claude");
+
         let accounts = cfg.logical_accounts();
         // Two openai CodingPlan models collapse into ONE account; claude gets its
         // own; the user's manual provider is untouched.
-        assert!(accounts.contains_key("AtomGit"));
-        assert!(accounts.contains_key("AtomGit-anthropic"));
+        assert!(accounts.contains_key(openai_account));
+        assert!(accounts.contains_key(claude_account));
         assert!(accounts.contains_key("my-openai"));
         assert!(!accounts.contains_key("AtomGit-GLM-5.2"), "folded away");
         assert!(!accounts.contains_key("AtomGit-Qwen"), "folded away");
@@ -3462,23 +3484,20 @@ context_window = 131072
         let models = cfg.logical_models();
         // Model ids stay = legacy provider keys (default_provider stays resolvable),
         // only the parent account folds.
-        assert_eq!(models["AtomGit-GLM-5.2"].account, "AtomGit");
-        assert_eq!(models["AtomGit-Qwen"].account, "AtomGit");
-        assert_eq!(
-            models["AtomGit-anthropic-claude"].account,
-            "AtomGit-anthropic"
-        );
+        assert_eq!(models["AtomGit-GLM-5.2"].account, openai_account);
+        assert_eq!(models["AtomGit-Qwen"].account, openai_account);
+        assert_eq!(models["AtomGit-anthropic-claude"].account, claude_account);
         assert_eq!(models["my-openai"].account, "my-openai");
 
         // Resolving by the stable legacy id still works and keeps the gateway
         // base_url (so the OAuth request signer still fires).
         let r = cfg.resolve_model(Some("AtomGit-GLM-5.2")).unwrap();
-        assert_eq!(r.account_id, "AtomGit");
+        assert_eq!(r.account_id, openai_account);
         assert_eq!(r.model, "GLM-5.2");
         assert_eq!(r.provider_type, "openai");
         assert!(r.base_url.as_deref().unwrap().contains("atomgit"));
         let c = cfg.resolve_model(Some("AtomGit-anthropic-claude")).unwrap();
-        assert_eq!(c.account_id, "AtomGit-anthropic");
+        assert_eq!(c.account_id, claude_account);
         assert_eq!(c.provider_type, "anthropic");
     }
 
