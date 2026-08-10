@@ -19749,6 +19749,7 @@ fn commit_native_session_changed(
     state.on_turn_complete();
     state.on_session_replaced();
     state.active_todos = None;
+    state.pending_todo_calls.clear();
     state.active_subtasks = None;
     sync_todo_titles(state);
     state.approval_panel = None;
@@ -20632,37 +20633,19 @@ fn handle_agent_event(
             // the incremental `{action}` shape; a resumed session may also carry legacy `todo`
             // calls. Distinguish by ARG SHAPE, not tool name.
             let is_todo_call = name == "todowrite" || name == "todo";
+            if is_todo_call {
+                state
+                    .pending_todo_calls
+                    .insert(id.clone(), arguments.clone());
+            }
             let todo_plan = if is_todo_call {
                 todo_progress_from_args(&arguments)
             } else {
                 None
             };
-            let is_todo_action = is_todo_call
-                && todo_plan.is_none()
-                && serde_json::from_str::<serde_json::Value>(&arguments)
-                    .ok()
-                    .is_some_and(|v| v.get("action").and_then(|a| a.as_str()).is_some());
-
-            // Incremental action (add / update id=N status): fold it into the live footer panel
-            // + title cache HERE — ABOVE the batch / approval early-returns below — so batched
-            // and approval-gated action calls update the panel too (they return before the
-            // generic tool path). Unlike a full-list plan we do NOT suppress the row; the compact
-            // `#N → status` line is a useful marker.
-            if is_todo_action {
-                patch_live_todos_from_action(state, &arguments);
-            }
-
-            // A full-list PLAN (`{todos:[…]}`) must populate the footer panel HERE —
-            // ABOVE the batch / approval early-returns below. When the model packs the
-            // todowrite into a BATCH (a group of calls submitted together — batch
-            // MEMBERSHIP, not parallel execution: the kernel may run them serially) or
-            // it's approval-gated, those paths early-return before the plan-assignment
-            // block, so setting `active_todos` only there left a batched plan's panel
-            // permanently empty. Mirrors the incremental-action patch above.
-            if let Some(progress) = todo_plan.as_ref() {
-                state.active_todos = Some(progress.clone());
-                sync_todo_titles(state); // titles follow the new plan (id = position)
-            }
+            // Todo state is staged above but committed only by a successful
+            // ToolCallResult. This keeps the live panel aligned with transcript
+            // replay when middleware, cancellation, or validation rejects a call.
 
             // Task fan-out owns a fixed footer panel while it runs. Seed the
             // stable child rows from the call arguments before any batch /
@@ -20707,10 +20690,10 @@ fn handle_agent_event(
                 return;
             }
 
-            // todowrite (non-batch, non-approval): the persistent footer PANEL is the
-            // sole view — `active_todos` was already set above; here we only SUPPRESS
-            // the tool CALL + RESULT rows. On a parse failure (`todo_plan` is None) fall
-            // through to the normal tool row so the error surfaces.
+            // todowrite (non-batch, non-approval): a valid plan will be committed
+            // to the persistent footer panel when its successful result arrives;
+            // suppress the tool rows meanwhile. On a parse failure (`todo_plan` is
+            // None), fall through so the eventual error remains visible.
             if todo_plan.is_some() {
                 // call_rendered=true ⇒ ToolCallResult suppresses the result row.
                 pending_tools.insert(id, (display.clone(), detail, true));
@@ -20801,6 +20784,7 @@ fn handle_agent_event(
             success,
             duration,
         } => {
+            commit_todo_call_result(state, &call_id, &name, success);
             let credential_policy_block = credential_policy_blocked(&output, success);
             // A result for this call arrived while an approval prompt is still up ⇒ the
             // approval was resolved WITHOUT the user answering (headless timeout fail-close,
@@ -21229,6 +21213,7 @@ fn handle_agent_event(
             }
             renderer.render(UiLine::AssistantLineBreak);
             pending_tools.clear();
+            state.pending_todo_calls.clear();
             // Footer token count: bill output + UNCACHED input (re-reading the
             // cached prefix each round is near-free). The event's `total_tokens`
             // is the v2 gross sum (prompt+completion per round) which overstates
@@ -24715,12 +24700,11 @@ pub(crate) fn sync_todo_titles(state: &mut crate::state::UiState) {
         .unwrap_or_default();
 }
 
-/// Fold ONE incremental `todo` action into the live footer panel + title cache, mirroring the
-/// canonical `reduce_todos`. Called for EVERY dispatch path so the panel never goes stale. A
-/// `todo update` while the panel is empty is a no-op (unknown id); a `todo add` from empty
-/// creates the panel.
+/// Fold ONE successfully completed incremental `todo` action into the live footer panel + title
+/// cache, mirroring the canonical transcript projection. A `todo update` while the panel is empty
+/// is a no-op (unknown id); a `todo add` from empty creates the panel.
 pub(crate) fn patch_live_todos_from_action(state: &mut crate::state::UiState, args: &str) {
-    use atomcode_capabilities::tools::todo::{apply_todo_action, TodoItem};
+    use atomcode_capabilities::tools::todo::{apply_new_todo_action, TodoItem};
     let mut items: Vec<TodoItem> = state
         .active_todos
         .as_ref()
@@ -24734,7 +24718,7 @@ pub(crate) fn patch_live_todos_from_action(state: &mut crate::state::UiState, ar
                 .collect()
         })
         .unwrap_or_default();
-    apply_todo_action(&mut items, args);
+    apply_new_todo_action(&mut items, args);
     state.active_todos = if items.is_empty() {
         None
     } else {
@@ -24743,8 +24727,28 @@ pub(crate) fn patch_live_todos_from_action(state: &mut crate::state::UiState, ar
     sync_todo_titles(state);
 }
 
+fn commit_todo_call_result(
+    state: &mut crate::state::UiState,
+    call_id: &str,
+    name: &str,
+    success: bool,
+) {
+    let Some(arguments) = state.pending_todo_calls.remove(call_id) else {
+        return;
+    };
+    if (name != "todowrite" && name != "todo") || !success {
+        return;
+    }
+    if let Some(progress) = todo_progress_from_args(&arguments) {
+        state.active_todos = (progress.total > 0).then_some(progress);
+        sync_todo_titles(state);
+    } else {
+        patch_live_todos_from_action(state, &arguments);
+    }
+}
+
 pub(crate) fn todo_progress_from_args(args: &str) -> Option<crate::render::TodoProgress> {
-    atomcode_capabilities::tools::todo::parse_todos(args)
+    atomcode_capabilities::tools::todo::validate_new_todo_plan(args)
         .ok()
         .map(|todos| todo_progress_from_items(&todos))
 }
@@ -24758,17 +24762,9 @@ pub(crate) fn todo_progress_from_args(args: &str) -> Option<crate::render::TodoP
 pub(crate) fn todo_progress_from_messages(
     messages: &[atomcode_kernel::message::Message],
 ) -> Option<crate::render::TodoProgress> {
-    // Fold `todowrite` (replace) + `todo` (add/update) in transcript order through the SAME
-    // reducer capabilities uses, so a resumed session's panel reflects incremental updates —
-    // not just the last full-list todowrite. Collect (name, args) in order first.
-    // kernel `Message.tool_calls` is a flat field (non-empty only on assistant
-    // messages that requested tools), so no content-variant match is needed.
-    let calls: Vec<(&str, &str)> = messages
-        .iter()
-        .flat_map(|m| m.tool_calls.iter())
-        .map(|c| (c.name.as_str(), c.arguments.as_str()))
-        .collect();
-    let todos = atomcode_capabilities::tools::todo::reduce_todos(calls);
+    // Use the canonical transcript projection so a resumed panel reflects incremental
+    // updates while excluding calls whose correlated tool result failed.
+    let todos = atomcode_capabilities::tools::todo::derive_current_todos(messages);
     if todos.is_empty() {
         return None; // no list, or the last valid todowrite cleared it → hide panel
     }
@@ -24778,6 +24774,49 @@ pub(crate) fn todo_progress_from_messages(
 #[cfg(test)]
 mod todo_block_tests {
     use super::*;
+
+    #[test]
+    fn failed_live_todo_result_discards_staged_mutation() {
+        let mut state = crate::state::UiState::new();
+        state.active_todos = todo_progress_from_args(
+            r#"{"todos":[{"content":"keep","status":"in_progress"}]}"#,
+        );
+        state.pending_todo_calls.insert(
+            "failed".into(),
+            r#"{"action":"add","content":"must not appear"}"#.into(),
+        );
+
+        commit_todo_call_result(&mut state, "failed", "todowrite", false);
+
+        let progress = state.active_todos.expect("prior list remains");
+        assert_eq!(progress.items.len(), 1);
+        assert_eq!(progress.items[0].1, "keep");
+        assert!(!state.pending_todo_calls.contains_key("failed"));
+    }
+
+    #[test]
+    fn successful_live_todo_result_commits_full_plan_and_action() {
+        let mut state = crate::state::UiState::new();
+        state.pending_todo_calls.insert(
+            "plan".into(),
+            r#"{"todos":[{"content":"first","status":"in_progress"}]}"#.into(),
+        );
+        commit_todo_call_result(&mut state, "plan", "todowrite", true);
+        assert_eq!(
+            state.active_todos.as_ref().unwrap().items[0].1,
+            "first"
+        );
+
+        state.pending_todo_calls.insert(
+            "add".into(),
+            r#"{"action":"add","content":"second"}"#.into(),
+        );
+        commit_todo_call_result(&mut state, "add", "todowrite", true);
+
+        let progress = state.active_todos.expect("successful action is committed");
+        assert_eq!(progress.items.len(), 2);
+        assert_eq!(progress.items[1].1, "second");
+    }
 
     #[test]
     fn todo_progress_from_args_carries_current_and_distinguishes_clear() {

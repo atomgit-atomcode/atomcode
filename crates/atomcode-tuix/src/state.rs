@@ -1204,12 +1204,16 @@ pub struct UiState {
     /// cleared: ids are monotonic within a session, so a stale title is
     /// harmless and a known title outlives the batch that revealed it.
     pub todo_titles: std::collections::HashMap<u64, String>,
-    /// Active todo list for the persistent footer todo PANEL. Written from the
-    /// turn's `todowrite` calls, seeded from the transcript on resume/switch
-    /// (`replay_session`), reset on `/clear`/`/new` (`reset_to_new_session`).
+    /// Active todo list for the persistent footer todo PANEL. Committed from the
+    /// turn's successful `todowrite` results, seeded from the transcript on
+    /// resume/switch (`replay_session`), reset on `/clear`/`/new`
+    /// (`reset_to_new_session`).
     /// Unlike the old live-only row, this PERSISTS across turn boundaries — the
     /// panel is a standing view, hidden only when the list is empty or all done.
     pub active_todos: Option<crate::render::TodoProgress>,
+    /// Todo mutations staged at ToolCallStarted and committed only after the
+    /// matching successful ToolCallResult. Keyed by the kernel-global call id.
+    pub pending_todo_calls: std::collections::HashMap<String, String>,
     /// Current reasoning_effort level for the active provider.
     pub reasoning_effort: Option<String>,
     /// Active goal condition string, if a `/goal` is running.
@@ -1398,6 +1402,7 @@ impl UiState {
             call_id_to_batch: std::collections::HashMap::new(),
             todo_titles: std::collections::HashMap::new(),
             active_todos: None,
+            pending_todo_calls: std::collections::HashMap::new(),
             reasoning_effort: None,
             goal_condition: None,
             goal_round: 0,

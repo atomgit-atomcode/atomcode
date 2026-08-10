@@ -54,6 +54,13 @@ impl SessionContextHook {
         }
     }
 
+    /// The exact instruction tiers this hook will inject. Exposed so other
+    /// prompt assembly (notably the budgeted skill catalog) can preserve skills
+    /// explicitly named by project rules without reimplementing precedence.
+    pub fn instruction_text(&self) -> String {
+        render_instructions(&self.home, &self.working_dir)
+    }
+
     /// Render the full context block. Always non-empty (the env sub-section is
     /// unconditional), so the session always carries a context message.
     fn render(&self) -> String {
@@ -70,7 +77,7 @@ impl SessionContextHook {
     /// base carries no `=== GIT STATUS` marker of its own.
     fn render_base(&self) -> String {
         let mut out = vec![CONTEXT_HEADER.to_string(), self.env_block()];
-        let instr = render_instructions(&self.home, &self.working_dir);
+        let instr = self.instruction_text();
         if !instr.is_empty() {
             out.push(instr);
         }

@@ -77,17 +77,31 @@ fn truncate_desc(desc: &str) -> String {
 /// no skills. The returned string has no surrounding blank lines — the caller
 /// wraps it with newlines to taste.
 pub fn render_skill_catalog(entries: &[CatalogEntry]) -> Option<String> {
+    render_skill_catalog_prioritizing(entries, &[])
+}
+
+/// Render while keeping installed skills explicitly named in project/user
+/// instructions ahead of source-rank ordering. This only recognizes exact skill
+/// names at token boundaries; it never guesses a skill from prose.
+pub fn render_skill_catalog_prioritizing(
+    entries: &[CatalogEntry],
+    priority_names: &[String],
+) -> Option<String> {
     if entries.is_empty() {
         return None;
     }
 
-    // Rank first (source tier), then name for determinism / prompt-cache
-    // stability within a tier.
+    // Explicit project references survive the budget first, then source tier and
+    // name preserve the existing deterministic/cache-stable order.
     let mut sorted: Vec<&CatalogEntry> = entries.iter().collect();
     sorted.sort_by(|a, b| {
-        a.source_rank
-            .cmp(&b.source_rank)
-            .then_with(|| a.name.cmp(&b.name))
+        let a_priority = priority_names.iter().any(|name| name == &a.name);
+        let b_priority = priority_names.iter().any(|name| name == &b.name);
+        b_priority.cmp(&a_priority).then_with(|| {
+            a.source_rank
+                .cmp(&b.source_rank)
+                .then_with(|| a.name.cmp(&b.name))
+        })
     });
 
     let mut lines: Vec<String> = Vec::new();
@@ -207,6 +221,24 @@ mod tests {
         let native = out.find("zzz-native").unwrap();
         let community = out.find("aaa-community").unwrap();
         assert!(native < community, "curated must precede community:\n{out}");
+    }
+
+    #[test]
+    fn explicit_instruction_reference_outranks_source_tier() {
+        let out = render_skill_catalog_prioritizing(
+            &[
+                entry("native-general", "d", 0),
+                entry("superpowers:writing-plans", "d", 3),
+            ],
+            &["superpowers:writing-plans".into()],
+        )
+        .unwrap();
+        let referenced = out.find("superpowers:writing-plans").unwrap();
+        let native = out.find("native-general").unwrap();
+        assert!(
+            referenced < native,
+            "explicit project reference must win:\n{out}"
+        );
     }
 
     #[test]

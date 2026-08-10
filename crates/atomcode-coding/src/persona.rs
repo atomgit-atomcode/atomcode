@@ -426,7 +426,10 @@ tools live under `Scripts\\` (not `bin/`).";
 const TODO_USAGE: &str = "\n\n## TASK TRACKING:\n\
 When a task has multiple requests, phases, files, dependencies, ambiguity, or requires \
 investigation followed by changes, call `todowrite` FIRST with the full list to \
-lay out the steps. Then keep it current by calling `todowrite` ONE item at a time — NOT by \
+lay out the steps. The initial list must cover the WHOLE request — investigation, architecture/module \
+design, implementation, and verification where relevant — not only the next immediate action. Each \
+item must name a concrete outcome that a later turn can execute without re-planning; never use placeholder \
+labels such as `task 1`, `step 2`, or `处理功能`. Then keep it current by calling `todowrite` ONE item at a time — NOT by \
 resending the whole list: `todowrite {\"action\":\"update\",\"id\":N,\"status\":\"in_progress\"}` \
 when you start item #N, and `status\":\"completed\"` the moment it is actually verified. Keep exactly one item \
 in_progress at a time (this is enforced for you) and \

@@ -85,9 +85,10 @@ struct Args {
     todos: Vec<RawItem>,
 }
 
-/// Parse + validate the full-list args. Enforces: valid status enum, non-empty
-/// content, at most one `in_progress`. Returns a human-readable reason on failure
-/// (fed back to the model so it can correct and resend).
+/// Parse the persisted/public full-list shape. This intentionally keeps the
+/// historical structural contract: older transcripts may contain vague labels
+/// such as `task 1`, and replay must not reinterpret those once-valid calls as
+/// missing state. New tool calls additionally pass [`validate_new_todo_plan`].
 pub fn parse_todos(args: &str) -> Result<Vec<TodoItem>, String> {
     let mut value: serde_json::Value = serde_json::from_str(args)
         .map_err(|e| format!("todowrite: invalid arguments: {e}. Expected {{\"todos\":[{{\"content\":\"…\",\"status\":\"pending|in_progress|completed\"}}]}}."))?;
@@ -109,7 +110,8 @@ pub fn parse_todos(args: &str) -> Result<Vec<TodoItem>, String> {
     let mut out = Vec::with_capacity(a.todos.len());
     let mut in_progress = 0usize;
     for item in a.todos {
-        if item.content.trim().is_empty() {
+        let content = item.content.trim();
+        if content.is_empty() {
             return Err("todowrite: every task needs non-empty `content`.".to_string());
         }
         let status = TodoStatus::parse(&item.status).ok_or_else(|| {
@@ -122,7 +124,7 @@ pub fn parse_todos(args: &str) -> Result<Vec<TodoItem>, String> {
             in_progress += 1;
         }
         out.push(TodoItem {
-            content: item.content,
+            content: content.to_string(),
             status,
         });
     }
@@ -130,6 +132,50 @@ pub fn parse_todos(args: &str) -> Result<Vec<TodoItem>, String> {
         return Err("todowrite: keep exactly ONE task `in_progress` at a time.".to_string());
     }
     Ok(out)
+}
+
+/// Strict quality gate for a newly executed full-list plan. Kept separate from
+/// [`parse_todos`] so persisted sessions retain their original interpretation.
+pub fn validate_new_todo_plan(args: &str) -> Result<Vec<TodoItem>, String> {
+    let todos = parse_todos(args)?;
+    for todo in &todos {
+        validate_new_todo_content(&todo.content)?;
+    }
+    Ok(todos)
+}
+
+fn validate_new_todo_content(content: &str) -> Result<(), String> {
+    if is_placeholder_task_label(content) {
+        return Err(format!(
+            "todowrite: `{content}` is a placeholder, not an executable task. Name a concrete outcome (for example `design session ownership boundaries` or `verify resume after provider failure`)."
+        ));
+    }
+    Ok(())
+}
+
+fn is_placeholder_task_label(content: &str) -> bool {
+    let normalized = content
+        .trim()
+        .trim_matches(|ch: char| ch.is_ascii_punctuation() || ch.is_whitespace())
+        .to_ascii_lowercase();
+    let compact = normalized
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && !matches!(ch, '-' | '_' | '#' | '.'))
+        .collect::<String>();
+    let suffix_is_number = |prefix: &str| {
+        compact
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.chars().all(|ch| ch.is_ascii_digit()))
+    };
+    [
+        "task", "step", "phase", "item", "任务", "步骤", "阶段", "事项",
+    ]
+    .iter()
+    .any(|prefix| suffix_is_number(prefix))
+        || matches!(
+            compact.as_str(),
+            "处理功能" | "实现功能" | "开发功能" | "编写代码" | "修改代码"
+        )
 }
 
 /// `(completed, in_progress, total)` for a todo list. The footer progress
@@ -156,6 +202,16 @@ pub fn todo_counts(todos: &[TodoItem]) -> (usize, usize, usize) {
 /// derived state must stay consistent). `update` to `in_progress` first clears any OTHER
 /// in_progress, so the "exactly one in_progress" invariant holds regardless of the model.
 pub fn apply_todo_action(list: &mut Vec<TodoItem>, args: &str) {
+    apply_todo_action_inner(list, args, false);
+}
+
+/// Apply a newly executed incremental action with the same quality gate used by
+/// new full plans. Historical replay continues to use [`apply_todo_action`].
+pub fn apply_new_todo_action(list: &mut Vec<TodoItem>, args: &str) {
+    apply_todo_action_inner(list, args, true);
+}
+
+fn apply_todo_action_inner(list: &mut Vec<TodoItem>, args: &str, strict: bool) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(args) else {
         return;
     };
@@ -163,7 +219,7 @@ pub fn apply_todo_action(list: &mut Vec<TodoItem>, args: &str) {
         Some("add") => {
             if let Some(content) = v.get("content").and_then(|c| c.as_str()) {
                 let content = content.trim();
-                if !content.is_empty() {
+                if !content.is_empty() && (!strict || validate_new_todo_content(content).is_ok()) {
                     list.push(TodoItem {
                         content: content.to_string(),
                         status: TodoStatus::Pending,
@@ -232,10 +288,16 @@ pub fn reduce_todos<'a>(calls: impl IntoIterator<Item = (&'a str, &'a str)>) -> 
 /// The current todo list, folded over the transcript (see [`reduce_todos`]). Returns `vec![]`
 /// if there is no valid `todowrite` and no `todo` events.
 pub fn derive_current_todos(messages: &[Message]) -> Vec<TodoItem> {
+    let failed_call_ids = messages
+        .iter()
+        .filter(|message| message.is_error)
+        .filter_map(|message| message.tool_call_id.as_deref())
+        .collect::<std::collections::HashSet<_>>();
     reduce_todos(
         messages
             .iter()
             .flat_map(|m| m.tool_calls.iter())
+            .filter(|call| !failed_call_ids.contains(call.id.as_str()))
             .map(|c| (c.name.as_str(), c.arguments.as_str())),
     )
 }
@@ -256,12 +318,13 @@ Call it in one of TWO ways:\n\
 • PLAN / RE-PLAN — send the FULL list: `{\"todos\":[{\"content\":\"…\",\"status\":\"pending|in_progress|completed\"}]}` \
 (REPLACES the previous list). Use when the work has multiple requests, phases, files, dependencies, ambiguity, or \
 requires investigation followed by changes. Also use it for a non-trivial refactor even when the exact steps emerge \
-during exploration. SKIP only for a genuinely simple single edit, an informational question, or a one-command ask.\n\
+during exploration. The initial list covers the complete work from investigation and architecture/module design \
+through implementation and verification where relevant — not only the next action. SKIP only for a genuinely simple single edit, an informational question, or a one-command ask.\n\
 • UPDATE ONE ITEM (preferred after the initial plan — do NOT resend the whole list): \
 `{\"action\":\"update\",\"id\":N,\"status\":\"in_progress|completed|pending\"}` changes ONE task (`id` is its number in \
 the list, e.g. `#3`); `{\"action\":\"add\",\"content\":\"…\"}` appends a new pending task. The MOMENT you START a task \
 set it `in_progress`; the MOMENT it is actually done (verified) set it `completed`.\n\
-Each task is ONE specific, verifiable action — write `add error handling to load_config`, not `handle errors`. Keep \
+Each task is ONE specific, verifiable action with a concrete outcome a later turn can execute without re-planning — write `add error handling to load_config`, not `handle errors`, `task 1`, or `处理功能`. Keep \
 EXACTLY ONE task `in_progress` at a time (enforced automatically). Mark a task `completed` ONLY after the work is \
 actually done, never on intent.";
 
@@ -312,7 +375,7 @@ impl Tool for TodoTool {
         // `<glyph> <id>. <content>` shape seeds the TUI title cache so later `action=update
         // id=N` rows show task names.
         if v.get("todos").is_some() {
-            return match parse_todos(args) {
+            return match validate_new_todo_plan(args) {
                 Ok(todos) => ok(render_todos_numbered(&todos, false)),
                 Err(e) => err(e),
             };
@@ -322,7 +385,10 @@ impl Tool for TodoTool {
         if let Some(action) = v.get("action").and_then(|a| a.as_str()) {
             return match action {
                 "add" => match v.get("content").and_then(|c| c.as_str()) {
-                    Some(c) if !c.trim().is_empty() => ok(format!("Added task: {}", c.trim())),
+                    Some(c) if !c.trim().is_empty() => match validate_new_todo_content(c.trim()) {
+                        Ok(()) => ok(format!("Added task: {}", c.trim())),
+                        Err(error) => err(error),
+                    },
                     _ => err("todowrite: `add` needs non-empty `content`.".to_string()),
                 },
                 "update" => {
@@ -400,6 +466,35 @@ mod tests {
     fn parse_rejects_empty_content() {
         let e = parse_todos(r#"{"todos":[{"content":"  ","status":"pending"}]}"#).unwrap_err();
         assert!(e.contains("content"), "{e}");
+    }
+
+    #[test]
+    fn new_plan_rejects_placeholder_task_labels() {
+        for content in ["task 1", "Step #2", "阶段3", "处理功能"] {
+            let args = serde_json::json!({
+                "todos": [{"content": content, "status": "pending"}]
+            })
+            .to_string();
+            let error = validate_new_todo_plan(&args).unwrap_err();
+            assert!(error.contains("placeholder"), "{content}: {error}");
+        }
+    }
+
+    #[test]
+    fn persisted_plan_keeps_legacy_placeholder_labels() {
+        let todos =
+            parse_todos(r#"{"todos":[{"content":"task 1","status":"in_progress"}]}"#).unwrap();
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].content, "task 1");
+    }
+
+    #[test]
+    fn parse_accepts_specific_numbered_tasks() {
+        let todos = parse_todos(
+            r#"{"todos":[{"content":"Step 1: map runtime owners","status":"in_progress"},{"content":"任务2：验证失败恢复","status":"pending"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(todos.len(), 2);
     }
 
     #[test]
@@ -566,6 +661,30 @@ mod tests {
     }
 
     #[test]
+    fn strict_incremental_add_rejects_placeholder_but_replay_keeps_legacy_call() {
+        let args = r#"{"action":"add","content":"task 4"}"#;
+        let mut live = Vec::new();
+        apply_new_todo_action(&mut live, args);
+        assert!(live.is_empty(), "new invalid add must not reach live state");
+
+        let mut replay = Vec::new();
+        apply_todo_action(&mut replay, args);
+        assert_eq!(replay.len(), 1, "persisted legacy add remains readable");
+    }
+
+    #[test]
+    fn failed_current_call_does_not_reappear_in_transcript_state() {
+        let messages = vec![
+            write_call("1", PLAN3),
+            todo_call("2", r#"{"action":"add","content":"task 4"}"#),
+            Message::tool_result("2", "placeholder task rejected", true),
+        ];
+        let todos = derive_current_todos(&messages);
+        assert_eq!(todos.len(), 3);
+        assert!(todos.iter().all(|todo| todo.content != "task 4"));
+    }
+
+    #[test]
     fn reduce_update_flips_only_that_id() {
         let msgs = vec![
             write_call("1", PLAN3),
@@ -673,24 +792,32 @@ mod tests {
         let t = TodoTool::new();
         let r = t
             .execute(
-                r#"{"todos":[{"content":"task","status":"pending"}]}"#,
+                r#"{"todos":[{"content":"verify scheduler registration","status":"pending"}]}"#,
                 &ctx(),
             )
             .await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("task"), "{}", r.content);
+        assert!(
+            r.content.contains("verify scheduler registration"),
+            "{}",
+            r.content
+        );
     }
 
     #[tokio::test]
     async fn execute_accepts_stringified_todos_from_provider() {
         let result = TodoTool::new()
             .execute(
-                r#"{"todos":"[{\"content\":\"task\",\"status\":\"pending\"}]"}"#,
+                r#"{"todos":"[{\"content\":\"verify scheduler registration\",\"status\":\"pending\"}]"}"#,
                 &ctx(),
             )
             .await;
         assert!(!result.is_error, "{}", result.content);
-        assert!(result.content.contains("task"), "{}", result.content);
+        assert!(
+            result.content.contains("verify scheduler registration"),
+            "{}",
+            result.content
+        );
     }
 
     #[tokio::test]
@@ -701,6 +828,15 @@ mod tests {
             .await;
         assert!(r.is_error);
         assert!(r.content.contains("pending"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_placeholder_incremental_add() {
+        let result = TodoTool::new()
+            .execute(r#"{"action":"add","content":"task 4"}"#, &ctx())
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("placeholder"), "{}", result.content);
     }
 
     #[test]

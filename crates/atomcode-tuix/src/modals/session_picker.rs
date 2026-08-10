@@ -1407,8 +1407,8 @@ mod tests {
             ),
             Message::tool_result("r1", "file contents", false),
             // A FAILED todowrite (is_error=true): its error result must NOT be
-            // suppressed (parity with live's `… && success` suppression). It IS
-            // the last valid call, so the panel is seeded from it (task C).
+            // suppressed (parity with live's `… && success` suppression), and
+            // its requested state must not replace the last successful panel.
             Message::assistant(
                 "",
                 vec![ToolCall {
@@ -1438,14 +1438,15 @@ mod tests {
                 .any(|s| s.contains("task A") || s.contains("task B") || s.contains("task C")),
             "todowrite no longer renders an inline block on replay: {cmd_out:?}"
         );
-        // Panel seeded from the transcript's LAST valid todowrite (task C, 1 pending).
+        // Panel stays on the last SUCCESSFUL todowrite (task A/B); the rejected
+        // task C call is not allowed to resurrect during transcript replay.
         let panel = state
             .active_todos
             .clone()
             .expect("panel seeded from transcript");
         assert_eq!(
-            panel.total, 1,
-            "last todowrite (task C) seeds the panel: {panel:?}"
+            panel.total, 2,
+            "failed task C call must preserve the prior task A/B panel: {panel:?}"
         );
 
         let tool_call_names: Vec<&str> = rec

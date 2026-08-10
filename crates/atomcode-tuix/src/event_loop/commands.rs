@@ -2566,6 +2566,7 @@ fn execute_slash_command_impl(
                     // this fresh foreground session has no todos, so drop the prior
                     // session's list (mirrors reset_to_new_session / native SessionChanged).
                     state.active_todos = None;
+                    state.pending_todo_calls.clear();
                     crate::event_loop::sync_todo_titles(state); // drop prior session's titles
                     state.approval_panel = None;
                     // One DECSET 2026 envelope around the wipe + welcome
@@ -6964,19 +6965,9 @@ pub(crate) fn format_todo_command(
     messages: &[atomcode_kernel::message::Message],
     unicode: bool,
 ) -> String {
-    // Fold the FULL transcript via the canonical `reduce_todos` (baseline = last full-list plan;
-    // then apply every `{action}` update after it), so `/todo` shows the CURRENT statuses — not
-    // just the initial plan. Shape-based, matching the merged `todowrite` tool + the live panel.
-    // kernel `Message.tool_calls` is a flat field, so no content-variant match.
-    let calls: Vec<(&str, &str)> = messages
-        .iter()
-        .flat_map(|m| {
-            m.tool_calls
-                .iter()
-                .map(|c| (c.name.as_str(), c.arguments.as_str()))
-        })
-        .collect();
-    let todos = atomcode_capabilities::tools::todo::reduce_todos(calls);
+    // Match the runtime hook, daemon command, and resume panel: failed calls do
+    // not become current state, while successful legacy calls remain readable.
+    let todos = atomcode_capabilities::tools::todo::derive_current_todos(messages);
     if todos.is_empty() {
         return t(Msg::TodoNoList).into_owned();
     }
@@ -8344,6 +8335,32 @@ mod todo_command_tests {
         assert!(
             !out.contains("[ ] do x"),
             "must reflect the completed update, not the pending plan: {out}"
+        );
+    }
+
+    #[test]
+    fn todo_command_ignores_failed_mutations() {
+        use atomcode_kernel::message::Message;
+
+        let mut msgs = vec![tool_call_msg(vec![ToolCall {
+            id: "ok".into(),
+            name: "todowrite".into(),
+            arguments:
+                r#"{"todos":[{"content":"keep","status":"in_progress"}]}"#.into(),
+        }])];
+        msgs.push(Message::tool_result("ok", "1 task", false));
+        msgs.push(tool_call_msg(vec![ToolCall {
+            id: "failed".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"action":"add","content":"must not appear"}"#.into(),
+        }]));
+        msgs.push(Message::tool_result("failed", "invalid todo", true));
+
+        let out = format_todo_command(&msgs, false);
+        assert!(out.contains("keep"), "successful state remains: {out}");
+        assert!(
+            !out.contains("must not appear"),
+            "failed mutation must not enter current state: {out}"
         );
     }
 

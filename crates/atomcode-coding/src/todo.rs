@@ -31,19 +31,21 @@ pub struct TodoHook;
 /// round one of a real user turn and only while no structured list exists.
 pub struct TodoEagerHook {
     eagerness: TodoEagerness,
+    /// `auto` keeps ordinary models judgment-based, but DeepSeek needs a hard
+    /// first-tool nudge for high-confidence feature/refactor requests.
+    force_complex_for_weak_model: bool,
 }
 
 impl TodoEagerHook {
     pub fn new(model: &str, provider_type: &str, configured: TodoEagerness) -> Self {
         let normalized = model.to_ascii_lowercase().replace(['_', ' '], "-");
+        let is_deepseek_v4_flash = normalized.contains("deepseek")
+            && normalized.contains("v4")
+            && normalized.contains("flash");
+        let mut force_complex_for_weak_model =
+            configured == TodoEagerness::Auto && is_deepseek_v4_flash;
         let mut eagerness = match configured {
-            TodoEagerness::Auto
-                if normalized.contains("deepseek")
-                    && normalized.contains("v4")
-                    && normalized.contains("flash") =>
-            {
-                TodoEagerness::Preferred
-            }
+            TodoEagerness::Auto if is_deepseek_v4_flash => TodoEagerness::Preferred,
             TodoEagerness::Auto => TodoEagerness::Auto,
             other => other,
         };
@@ -53,7 +55,15 @@ impl TodoEagerHook {
             );
             eagerness = TodoEagerness::Preferred;
         }
-        Self { eagerness }
+        // Ollama's adapter cannot express a forced tool choice. Keep the
+        // high-recency reminder, but never promise enforcement the provider drops.
+        if provider_type.eq_ignore_ascii_case("ollama") {
+            force_complex_for_weak_model = false;
+        }
+        Self {
+            eagerness,
+            force_complex_for_weak_model,
+        }
     }
 
     fn should_activate(&self, messages: &[Message], ctx: &TurnCtx) -> bool {
@@ -64,6 +74,95 @@ impl TodoEagerHook {
                 .iter()
                 .all(|todo| todo.status == TodoStatus::Completed)
     }
+
+    fn should_force(&self, messages: &[Message], ctx: &TurnCtx) -> bool {
+        self.should_activate(messages, ctx)
+            && (self.eagerness == TodoEagerness::Always
+                || (self.force_complex_for_weak_model
+                    && high_confidence_complex_engineering_request(messages)))
+    }
+}
+
+/// Deliberately narrow lexical gate for the DeepSeek `auto` policy. False
+/// negatives merely fall back to the preferred reminder; false positives force
+/// one harmless todo call, so keep only strong implementation/refactor signals.
+fn high_confidence_complex_engineering_request(messages: &[Message]) -> bool {
+    let Some(text) = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::User && !message.synthetic)
+        .map(|message| message.text.to_ascii_lowercase())
+    else {
+        return false;
+    };
+    let explicitly_read_only = [
+        "do not modify",
+        "don't modify",
+        "without changing",
+        "read-only",
+        "readonly",
+        "explain only",
+        "analysis only",
+        "不要修改",
+        "无需修改",
+        "禁止修改",
+        "只读",
+        "只分析",
+        "仅分析",
+        "只解释",
+        "仅解释",
+    ]
+    .iter()
+    .any(|signal| text.contains(signal));
+    let has_complex_signal = [
+        "architect",
+        "refactor",
+        "migration",
+        "migrate",
+        "redesign",
+        "implement feature",
+        "build feature",
+        "架构",
+        "重构",
+        "迁移",
+        "功能开发",
+        "新增功能",
+        "系统改造",
+    ]
+    .iter()
+    .any(|signal| text.contains(signal));
+    if !has_complex_signal {
+        return false;
+    }
+
+    // A read-only clause may be scoped to only part of a mixed request, for
+    // example "不要修改文档，但请重构代码并补充测试". Do not let that clause
+    // suppress an explicit implementation imperative elsewhere in the same
+    // prompt. Keep this override deliberately narrow so "不要修改代码" does
+    // not become a positive match merely because it contains 修改/代码.
+    let explicit_change_request = [
+        "please architect",
+        "please refactor",
+        "please migrate",
+        "please redesign",
+        "please implement",
+        "please build",
+        "but refactor",
+        "then refactor",
+        "请架构",
+        "请重构",
+        "请迁移",
+        "请实现",
+        "请新增",
+        "请改造",
+        "但请重构",
+        "同时重构",
+        "并重构",
+    ]
+    .iter()
+    .any(|signal| text.contains(signal));
+
+    !explicitly_read_only || explicit_change_request
 }
 
 #[async_trait]
@@ -72,10 +171,10 @@ impl LifecycleHooks for TodoEagerHook {
         if !self.should_activate(messages, ctx) {
             return;
         }
-        let lead = if self.eagerness == TodoEagerness::Always {
-            "You MUST call `todowrite` now, before any other tool or prose, to create the task list."
+        let lead = if self.should_force(messages, ctx) {
+            "You MUST call `todowrite` now, before any other tool or prose. Create the complete execution plan, not placeholder items: cover investigation, architecture/module design, implementation, and verification where relevant. Each item must name a concrete outcome that a later turn can execute without re-planning."
         } else {
-            "Before acting, decide whether this task benefits from a todo list. If it has multiple requests, phases, files, dependencies, ambiguity, or requires investigation plus changes, call `todowrite` now. Skip it only for a genuinely simple one-step or purely informational request."
+            "Before acting, decide whether this task benefits from a todo list. If it has multiple requests, phases, files, dependencies, ambiguity, or requires investigation plus changes, call `todowrite` now. A useful plan covers the complete request from investigation and architecture/module design through implementation and verification, with concrete outcomes a later turn can execute without re-planning. Skip it only for a genuinely simple one-step or purely informational request."
         };
         messages.push(synthetic_system_reminder(lead));
     }
@@ -86,7 +185,7 @@ impl LifecycleHooks for TodoEagerHook {
         options: &mut ChatOptions,
         ctx: &TurnCtx,
     ) {
-        if self.eagerness == TodoEagerness::Always && self.should_activate(messages, ctx) {
+        if self.should_force(messages, ctx) {
             options.tool_choice = ToolChoice::Specific("todowrite".to_string());
         }
     }
@@ -352,6 +451,68 @@ mod tests {
             .pre_request(&mut deepseek, &ctx)
             .await;
         assert_eq!(deepseek.len(), 2, "new DeepSeek generation gets the nudge");
+    }
+
+    #[tokio::test]
+    async fn deepseek_auto_forces_todo_for_high_confidence_complex_work() {
+        let hook = TodoEagerHook::new("deepseek-v4-flash", "openai", TodoEagerness::Auto);
+        let ctx = TurnCtx {
+            round: 1,
+            ..Default::default()
+        };
+        let messages = vec![Message::user("重构会话运行时并设计清晰的模块边界")];
+        let mut options = ChatOptions::default();
+        hook.pre_request_options(&messages, &mut options, &ctx)
+            .await;
+        assert_eq!(
+            options.tool_choice,
+            ToolChoice::Specific("todowrite".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_auto_keeps_simple_requests_judgment_based() {
+        let hook = TodoEagerHook::new("deepseek-v4-flash", "openai", TodoEagerness::Auto);
+        let ctx = TurnCtx {
+            round: 1,
+            ..Default::default()
+        };
+        let messages = vec![Message::user("解释这行代码")];
+        let mut options = ChatOptions::default();
+        hook.pre_request_options(&messages, &mut options, &ctx)
+            .await;
+        assert_eq!(options.tool_choice, ToolChoice::Auto);
+    }
+
+    #[tokio::test]
+    async fn deepseek_auto_respects_explicit_read_only_request() {
+        let hook = TodoEagerHook::new("deepseek-v4-flash", "openai", TodoEagerness::Auto);
+        let ctx = TurnCtx {
+            round: 1,
+            ..Default::default()
+        };
+        let messages = vec![Message::user("解释一下当前架构，不要修改代码")];
+        let mut options = ChatOptions::default();
+        hook.pre_request_options(&messages, &mut options, &ctx)
+            .await;
+        assert_eq!(options.tool_choice, ToolChoice::Auto);
+    }
+
+    #[tokio::test]
+    async fn deepseek_auto_forces_mixed_request_with_scoped_read_only_clause() {
+        let hook = TodoEagerHook::new("deepseek-v4-flash", "openai", TodoEagerness::Auto);
+        let ctx = TurnCtx {
+            round: 1,
+            ..Default::default()
+        };
+        let messages = vec![Message::user("不要修改文档，但请重构代码并补充测试")];
+        let mut options = ChatOptions::default();
+        hook.pre_request_options(&messages, &mut options, &ctx)
+            .await;
+        assert_eq!(
+            options.tool_choice,
+            ToolChoice::Specific("todowrite".into())
+        );
     }
 
     #[tokio::test]

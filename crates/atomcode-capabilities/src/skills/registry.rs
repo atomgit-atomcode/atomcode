@@ -179,6 +179,12 @@ impl SkillRegistry {
     /// source-ranked), or `None` when no skills are installed. See
     /// [`super::render`].
     pub fn render_catalog(&self) -> Option<String> {
+        self.render_catalog_prioritizing("")
+    }
+
+    /// Render the catalog while preserving installed skills whose exact names
+    /// appear in the effective project instruction text.
+    pub fn render_catalog_prioritizing(&self, instruction_text: &str) -> Option<String> {
         let entries: Vec<super::render::CatalogEntry> = self
             .skills
             .values()
@@ -189,8 +195,35 @@ impl SkillRegistry {
                 source_rank: super::render::source_rank(&s.source_path),
             })
             .collect();
-        super::render::render_skill_catalog(&entries)
+        let priority_names = self
+            .skills
+            .keys()
+            .filter(|name| text_mentions_exact_name(instruction_text, name))
+            .cloned()
+            .collect::<Vec<_>>();
+        super::render::render_skill_catalog_prioritizing(&entries, &priority_names)
     }
+}
+
+fn text_mentions_exact_name(text: &str, name: &str) -> bool {
+    if text.is_empty() || name.is_empty() {
+        return false;
+    }
+    let text = text.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    text.match_indices(&name).any(|(start, _)| {
+        let end = start + name.len();
+        let is_name_char = |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':');
+        let before_ok = text[..start]
+            .chars()
+            .next_back()
+            .map_or(true, |ch| !is_name_char(ch));
+        let after_ok = text[end..]
+            .chars()
+            .next()
+            .map_or(true, |ch| !is_name_char(ch));
+        before_ok && after_ok
+    })
 }
 
 impl Default for SkillRegistry {
@@ -514,5 +547,25 @@ mod tests {
             reg.get("resource").is_none(),
             "a skill's own resource .md is not a command"
         );
+    }
+
+    #[test]
+    fn instruction_skill_reference_requires_exact_token_boundaries() {
+        assert!(text_mentions_exact_name(
+            "Use `superpowers:writing-plans` before editing.",
+            "superpowers:writing-plans"
+        ));
+        assert!(text_mentions_exact_name(
+            "Use BRAINSTORMING first.",
+            "brainstorming"
+        ));
+        assert!(!text_mentions_exact_name(
+            "Use brainstorming-extra first.",
+            "brainstorming"
+        ));
+        assert!(!text_mentions_exact_name(
+            "Use mybrainstorming first.",
+            "brainstorming"
+        ));
     }
 }

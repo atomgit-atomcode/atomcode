@@ -466,6 +466,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             None
         };
 
+    // Build the context hook once so skill-catalog ranking and later context
+    // injection observe the exact same instruction-file precedence and bytes.
+    let session_context_hook = Arc::new(SessionContextHook::new(&cfg.working_dir));
+    let instruction_text = session_context_hook.instruction_text();
+
     // Skills: standard home+project precedence unless the caller supplied dirs.
     let skill_dirs = opts.skill_dirs.clone().unwrap_or_else(|| {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -483,7 +488,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // Render the catalog BEFORE the registry is moved into the tools; injected as a
     // leading system message by SkillCatalogHook below (without it the model never
     // learns which skills exist — only the use_skill/list_skills tools were mounted).
-    let skill_catalog = skills.render_catalog();
+    let skill_catalog = skills.render_catalog_prioritizing(&instruction_text);
     register_skill_tools(&mut registry, skills);
     names.extend(
         atomcode_capabilities::skills::skill_tool_names()
@@ -616,7 +621,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     let mut snapshot_hook_handle = None;
     let mut snapshot_persistence_status = None;
     // Env / project-instructions / git context — unconditional (v1 parity: always present).
-    hooks.push(Arc::new(SessionContextHook::new(&cfg.working_dir)));
+    hooks.push(session_context_hook);
     if opts.memory {
         hooks.push(Arc::new(MemoryHook::for_project(&cfg.working_dir)));
     }
