@@ -153,16 +153,18 @@ impl TuiSession {
                 // If origin matches but prefix does not, keep it as a real message.
                 !(m.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN)
                     && m.text.starts_with(LEGACY_COLD_SUMMARY_PREFIX))
-                    && !atomcode_capabilities::reminder::is_system_reminder(&m.text)
             })
             .cloned()
             .collect();
         let mut display_messages = Vec::with_capacity(view.presentation.entries.len());
         for entry in view.presentation.entries {
-            // UI-only replay entries are display data, not provider context; an
-            // injected `<system-reminder>` block must never surface as a user
-            // message in the terminal (see #1362 / #1349).
-            if atomcode_capabilities::reminder::is_system_reminder(&entry.text) {
+            // Presentation entries are display-only and do not participate in snapshot
+            // message indexing. Legacy builds could persist injected reminders here
+            // without provenance, so the reserved canonical wrapper remains a safe
+            // compatibility filter at this boundary.
+            if entry.role == PresentationRole::User
+                && atomcode_capabilities::reminder::is_system_reminder(&entry.text)
+            {
                 continue;
             }
             let after_message = match entry.anchor {
@@ -237,7 +239,6 @@ impl TuiSession {
                 // the text successfully strips the prefix.
                 !(m.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN)
                     && m.text.starts_with(LEGACY_COLD_SUMMARY_PREFIX))
-                    && !atomcode_capabilities::reminder::is_system_reminder(&m.text)
             })
             .collect();
     }
@@ -305,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_ingest_skips_injected_system_reminders() {
+    fn snapshot_ingest_preserves_reminders_for_runtime_roundtrip() {
         let incoming = SessionSnapshot::new(vec![
             Message::user("修复登录错误"),
             Message::user(atomcode_capabilities::reminder::system_reminder(
@@ -317,14 +318,12 @@ mod tests {
         let mut session = Session::new(PathBuf::from("/tmp/project"));
         session.update_from_conversation_snapshot(incoming);
 
-        assert_eq!(
-            session
-                .messages
-                .iter()
-                .map(|m| m.text.as_str())
-                .collect::<Vec<_>>(),
-            vec!["修复登录错误", "已修复"]
-        );
+        assert_eq!(session.messages.len(), 3);
+        assert!(atomcode_capabilities::reminder::is_system_reminder(
+            &session.messages[1].text
+        ));
+        let restored = session.to_conversation_snapshot();
+        assert_eq!(restored.messages, session.messages);
     }
 
     #[test]
@@ -355,6 +354,13 @@ mod tests {
                         role: PresentationRole::Assistant,
                         text: "已修复".into(),
                     },
+                    PresentationEntry {
+                        anchor: DisplayAnchor::AtStart,
+                        role: PresentationRole::Assistant,
+                        text: atomcode_capabilities::reminder::system_reminder(
+                            "这是 assistant 对标签的解释",
+                        ),
+                    },
                 ],
             },
         };
@@ -367,7 +373,10 @@ mod tests {
                 .iter()
                 .map(|d| d.message.text.as_str())
                 .collect::<Vec<_>>(),
-            vec!["已修复"]
+            vec![
+                "已修复",
+                "<system-reminder>\n这是 assistant 对标签的解释\n</system-reminder>"
+            ]
         );
     }
 

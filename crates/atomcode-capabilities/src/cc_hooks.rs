@@ -36,7 +36,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use atomcode_kernel::hook::LifecycleHooks;
-use atomcode_kernel::message::{Conversation, Message};
+use atomcode_kernel::message::Conversation;
 use atomcode_kernel::middleware::{AfterOutcome, BeforeOutcome, ToolMiddleware};
 use atomcode_kernel::request::RequestCtx;
 use atomcode_kernel::tool::{Tool, ToolCall, ToolResult};
@@ -567,9 +567,7 @@ impl LifecycleHooks for CCExternalHooks {
                 // human.  Keep it as a user-role message for provider/cache compatibility,
                 // but preserve its provenance so presentation layers never replay it as a
                 // visible user bubble when a live snapshot is synchronized at turn end.
-                convo.push(Message::synthetic_user(crate::reminder::system_reminder(
-                    &ctx,
-                )));
+                convo.push(crate::reminder::synthetic_system_reminder(&ctx));
             }
         }
     }

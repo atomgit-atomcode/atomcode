@@ -647,7 +647,10 @@ fn last_assistant_reply_markdown(messages: &[atomcode_kernel::message::Message])
 
 fn is_real_user_message(message: &atomcode_kernel::message::Message) -> bool {
     use atomcode_kernel::message::Role;
-    matches!(message.role, Role::User) && !message.synthetic
+    matches!(message.role, Role::User)
+        && !message.synthetic
+        // Compatibility only: old snapshots predate reliable synthetic provenance.
+        && !atomcode_capabilities::reminder::is_system_reminder(&message.text)
 }
 
 pub(crate) fn replay_session(

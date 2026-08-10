@@ -150,8 +150,8 @@ impl PlanModeReminderHook {
 impl LifecycleHooks for PlanModeReminderHook {
     async fn pre_request(&self, messages: &mut Vec<Message>, _ctx: &TurnCtx) {
         if self.active.load(Ordering::Relaxed) {
-            messages.push(Message::user(
-                atomcode_capabilities::reminder::system_reminder(PLAN_MODE_REMINDER_BODY),
+            messages.push(atomcode_capabilities::reminder::synthetic_system_reminder(
+                PLAN_MODE_REMINDER_BODY,
             ));
         }
     }
@@ -320,6 +320,7 @@ mod tests {
             before[..],
             "the cached prefix must be byte-identical"
         );
+        assert!(msgs[2].synthetic, "runtime reminders must carry provenance");
         assert!(
             msgs[2].text.contains("PLAN MODE"),
             "tail carries the plan reminder: {:?}",

@@ -4,7 +4,7 @@
 //! clone (never stored) — mirrors PlanModeGate / StatusReminderHook.
 
 use async_trait::async_trait;
-use atomcode_capabilities::reminder::system_reminder;
+use atomcode_capabilities::reminder::synthetic_system_reminder;
 use atomcode_capabilities::tools::todo::{
     derive_current_todos, render_todos_numbered, TodoItem, TodoStatus,
 };
@@ -77,7 +77,7 @@ impl LifecycleHooks for TodoEagerHook {
         } else {
             "Before acting, decide whether this task benefits from a todo list. If it has multiple requests, phases, files, dependencies, ambiguity, or requires investigation plus changes, call `todowrite` now. Skip it only for a genuinely simple one-step or purely informational request."
         };
-        messages.push(Message::user(system_reminder(lead)));
+        messages.push(synthetic_system_reminder(lead));
     }
 
     async fn pre_request_options(
@@ -185,7 +185,7 @@ impl LifecycleHooks for TodoHook {
 {}",
             render_todos_numbered(&todos, false)
         );
-        messages.push(Message::user(system_reminder(&body)));
+        messages.push(synthetic_system_reminder(&body));
     }
 
     /// The model wants to stop. If the task list still has OPEN items (pending or in_progress),
@@ -307,6 +307,7 @@ mod tests {
         assert_eq!(msgs.len(), before + 1, "one reminder appended");
         let last = &msgs[msgs.len() - 1];
         assert_eq!(last.role, Role::User);
+        assert!(last.synthetic, "runtime reminders must carry provenance");
         assert!(last.text.contains("system-reminder"), "{}", last.text);
         assert!(last.text.contains("step one"), "{}", last.text);
     }

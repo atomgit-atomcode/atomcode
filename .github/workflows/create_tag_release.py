@@ -6,14 +6,12 @@ import ssl
 import sys
 from urllib import error, parse, request
 
-REPO_OWNER = "atomgit_atomcode"
+REPO_OWNER = "bangxu"
 REPO_NAME = "atomcode"
 ACCESS_TOKEN = ""
 API_HOST = "https://api.gitcode.com"
 BODY_TEMPLATE = """
 Release  Note
-
-当前版本：{tag_name}
 
 使用于mac和linux的当前最新版本，安装命令如下
 
@@ -97,7 +95,7 @@ def send_request(url: str, method: str = "GET", payload: dict | None = None) -> 
 def create_tag_release(args: argparse.Namespace) -> dict:
     base_url = f"{API_HOST}/api/v5/repos/{args.owner}/{args.repo}/releases"
     url = f"{base_url}?access_token={parse.quote(args.access_token)}"
-    body = args.body or BODY_TEMPLATE.format(tag_name=args.tag_name)
+    body = args.body or BODY_TEMPLATE.replace("atomcode-v2.3.x", args.tag_name)
 
     payload = {
         "tag_name": args.tag_name,

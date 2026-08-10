@@ -24,15 +24,22 @@ pub fn system_reminder(body: &str) -> String {
     format!("<{SYSTEM_REMINDER_TAG}>\n{body}\n</{SYSTEM_REMINDER_TAG}>")
 }
 
-/// Whether `text` is a system-injected reminder block — i.e. begins with the
-/// canonical opening tag. Reminders are pushed as ordinary `Role::User`
-/// messages (see `cc_hooks.rs`, `plan_mode.rs`, …), so user-facing consumers
-/// that scan for "the first user message" (session auto-naming, AI title
-/// generation) must skip them or they would name the session after ambient
-/// runtime context instead of the user's own words.
+/// Build runtime-owned reminder context with explicit provenance. Providers still
+/// receive a `Role::User` message (preserving the established wire/cache shape), while
+/// session naming and presentation layers can distinguish it from human-authored input
+/// without inspecting its text.
+pub fn synthetic_system_reminder(body: &str) -> atomcode_kernel::message::Message {
+    atomcode_kernel::message::Message::synthetic_user(system_reminder(body))
+}
+
+/// Compatibility detector for reminders persisted before synthetic provenance was
+/// written consistently. New producers must use [`synthetic_system_reminder`]; this
+/// textual check is only a legacy fallback at naming/presentation boundaries.
 pub fn is_system_reminder(text: &str) -> bool {
+    let trimmed = text.trim();
     let opening = format!("<{SYSTEM_REMINDER_TAG}>");
-    text.trim_start().starts_with(&opening)
+    let closing = format!("</{SYSTEM_REMINDER_TAG}>");
+    trimmed.starts_with(&opening) && trimmed.ends_with(&closing)
 }
 
 #[cfg(test)]
@@ -53,9 +60,22 @@ mod tests {
     #[test]
     fn detects_wrapped_reminders_but_not_plain_user_text() {
         assert!(is_system_reminder(&system_reminder("日期：2026-08-09")));
-        assert!(is_system_reminder("  <system-reminder>\n注意\n</system-reminder>"));
+        assert!(is_system_reminder(
+            "  <system-reminder>\n注意\n</system-reminder>"
+        ));
         assert!(!is_system_reminder("我提到了 <system-reminder> 这个词"));
         assert!(!is_system_reminder("修复登录错误"));
         assert!(!is_system_reminder(""));
+        assert!(!is_system_reminder(
+            "<system-reminder> incomplete user text"
+        ));
+    }
+
+    #[test]
+    fn synthetic_constructor_preserves_user_role_and_marks_provenance() {
+        let message = synthetic_system_reminder("internal context");
+        assert_eq!(message.role, atomcode_kernel::message::Role::User);
+        assert!(message.synthetic);
+        assert!(is_system_reminder(&message.text));
     }
 }

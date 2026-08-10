@@ -2064,16 +2064,6 @@ fn merge_catalog_session_messages_for_display(
 ) -> anyhow::Result<Vec<MessageInfo>> {
     use atomcode_capabilities::session::{DisplayAnchor, PresentationRole};
 
-    let runtime_messages: Vec<_> = session
-        .snapshot
-        .messages
-        .iter()
-        .filter(|message| {
-            message.internal_origin.as_deref()
-                != Some(atomcode_kernel::message::LEGACY_COLD_SUMMARY_ORIGIN)
-                && !atomcode_capabilities::reminder::is_system_reminder(&message.text)
-        })
-        .collect();
     let mut presentation = std::collections::BTreeMap::<usize, Vec<_>>::new();
     for entry in &session.presentation.entries {
         let after_message = match entry.anchor {
@@ -2092,10 +2082,12 @@ fn merge_catalog_session_messages_for_display(
     }
     let timestamp = Some(u64::try_from(session.meta.updated_at.max(0)).unwrap_or(0));
     let mut messages =
-        Vec::with_capacity(runtime_messages.len() + session.presentation.entries.len());
+        Vec::with_capacity(session.snapshot.messages.len() + session.presentation.entries.len());
     let mut append_presentation = |position: usize, messages: &mut Vec<MessageInfo>| {
         for entry in presentation.remove(&position).unwrap_or_default() {
-            if atomcode_capabilities::reminder::is_system_reminder(&entry.text) {
+            if entry.role == PresentationRole::User
+                && atomcode_capabilities::reminder::is_system_reminder(&entry.text)
+            {
                 continue;
             }
             messages.push(MessageInfo {
@@ -2116,15 +2108,28 @@ fn merge_catalog_session_messages_for_display(
         }
     };
     append_presentation(0, &mut messages);
-    for (index, message) in runtime_messages.into_iter().enumerate() {
-        let mut info = MessageInfo::from_kernel(message);
-        info.created_at = timestamp;
-        messages.push(info);
+    for (index, message) in session.snapshot.messages.iter().enumerate() {
+        // Advance using the ORIGINAL snapshot position even for hidden entries: persisted
+        // PresentationFile anchors and turn_stats are expressed in that coordinate space.
+        // Compressing this iterator before applying `index + 1` moves presentation rows to
+        // the wrong turn.
+        let hidden_internal = message.internal_origin.as_deref()
+            == Some(atomcode_kernel::message::LEGACY_COLD_SUMMARY_ORIGIN)
+            || message.synthetic
+            || (message.role == atomcode_kernel::message::Role::User
+                && atomcode_capabilities::reminder::is_system_reminder(&message.text));
+        if !hidden_internal {
+            let mut info = MessageInfo::from_kernel(message);
+            info.created_at = timestamp;
+            messages.push(info);
+        }
         append_presentation(index + 1, &mut messages);
     }
     for (_, entries) in presentation {
         for entry in entries {
-            if atomcode_capabilities::reminder::is_system_reminder(&entry.text) {
+            if entry.role == PresentationRole::User
+                && atomcode_capabilities::reminder::is_system_reminder(&entry.text)
+            {
                 continue;
             }
             messages.push(MessageInfo {
@@ -5989,6 +5994,79 @@ mod fs_list_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_filter_preserves_snapshot_anchor_coordinates() {
+        use atomcode_capabilities::session::{
+            DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole, SessionMeta,
+            TurnStat,
+        };
+        use atomcode_kernel::message::{Message, SessionSnapshot};
+
+        let mut meta = SessionMeta::new("anchor-test", "/project", 1);
+        meta.turn_stats.push(TurnStat {
+            after_message: 2,
+            position_valid: true,
+            turn_id: 1,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 1,
+            errored: false,
+            used_tokens: 1,
+            ctx_window: 1_000,
+            model_usage: Vec::new(),
+        });
+        let session = crate::legacy_convert::CatalogSessionView {
+            snapshot: SessionSnapshot::new(vec![
+                atomcode_capabilities::reminder::synthetic_system_reminder("internal"),
+                Message::user("real user"),
+                Message::assistant("real assistant", vec![]),
+            ]),
+            meta,
+            presentation: PresentationFile {
+                v: atomcode_capabilities::session::presentation::PRESENTATION_VERSION,
+                entries: vec![PresentationEntry {
+                    anchor: DisplayAnchor::AfterTurn { turn_id: 1 },
+                    role: PresentationRole::Assistant,
+                    text: "anchored display".into(),
+                }],
+            },
+        };
+
+        let displayed = merge_catalog_session_messages_for_display(&session).unwrap();
+        let text = displayed
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(text, ["real user", "anchored display", "real assistant"]);
+    }
+
+    #[test]
+    fn display_filter_keeps_assistant_explanations_of_reminder_markup() {
+        use atomcode_capabilities::session::{
+            DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole, SessionMeta,
+        };
+        use atomcode_kernel::message::{Message, SessionSnapshot};
+
+        let wrapped = atomcode_capabilities::reminder::system_reminder("example");
+        let session = crate::legacy_convert::CatalogSessionView {
+            snapshot: SessionSnapshot::new(vec![Message::assistant(&wrapped, vec![])]),
+            meta: SessionMeta::new("assistant-wrapper", "/project", 1),
+            presentation: PresentationFile {
+                v: atomcode_capabilities::session::presentation::PRESENTATION_VERSION,
+                entries: vec![PresentationEntry {
+                    anchor: DisplayAnchor::AtStart,
+                    role: PresentationRole::Assistant,
+                    text: wrapped.clone(),
+                }],
+            },
+        };
+
+        let displayed = merge_catalog_session_messages_for_display(&session).unwrap();
+        assert_eq!(displayed.len(), 2);
+        assert!(displayed.iter().all(|message| message.content == wrapped));
+    }
 
     #[test]
     fn chat_resolves_new_schema_model_selection() {

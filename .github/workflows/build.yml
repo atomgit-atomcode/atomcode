@@ -74,8 +74,6 @@ jobs:
           TAG_NAME=${GITHUB_REF#refs/tags/}
 
           python3 .github/workflows/create_tag_release.py \
-            --owner=${{ github.repository_owner }} \
-            --repo=${{ github.event.repository.name }} \
             --tag-name=${TAG_NAME} \
             --file-name=atomcode-${TAG_NAME}-darwin-arm64 \
             --file-path=dist/atomcode-${TAG_NAME}-darwin-arm64 \
@@ -88,8 +86,6 @@ jobs:
           TAG_NAME=${GITHUB_REF#refs/tags/}
 
           python3 .github/workflows/create_tag_release.py \
-            --owner=${{ github.repository_owner }} \
-            --repo=${{ github.event.repository.name }} \
             --tag-name=${TAG_NAME} \
             --file-name=atomcode-${TAG_NAME}-darwin-x64 \
             --file-path=dist/atomcode-${TAG_NAME}-darwin-x64 \
@@ -173,8 +169,6 @@ jobs:
           TAG_NAME=${GITHUB_REF#refs/tags/}
 
           python3 .github/workflows/create_tag_release.py \
-            --owner=${{ github.repository_owner }} \
-            --repo=${{ github.event.repository.name }} \
             --tag-name=${TAG_NAME} \
             --file-name=atomcode-${TAG_NAME}-linux-x64 \
             --file-path=dist/atomcode-${TAG_NAME}-linux-x64 \
@@ -187,8 +181,6 @@ jobs:
           TAG_NAME=${GITHUB_REF#refs/tags/}
 
           python3 .github/workflows/create_tag_release.py \
-            --owner=${{ github.repository_owner }} \
-            --repo=${{ github.event.repository.name }} \
             --tag-name=${TAG_NAME} \
             --file-name=atomcode-${TAG_NAME}-linux-arm64 \
             --file-path=dist/atomcode-${TAG_NAME}-linux-arm64 \
@@ -254,8 +246,6 @@ jobs:
           TAG_NAME=${GITHUB_REF#refs/tags/}
 
           python3 .github/workflows/create_tag_release.py \
-            --owner=${{ github.repository_owner }} \
-            --repo=${{ github.event.repository.name }} \
             --tag-name=${TAG_NAME} \
             --file-name=atomcode-${TAG_NAME}-windows-arm64.exe \
             --file-path=dist/atomcode-${TAG_NAME}-windows-arm64.exe \
@@ -269,8 +259,6 @@ jobs:
           TAG_NAME=${GITHUB_REF#refs/tags/}
 
           python3 .github/workflows/create_tag_release.py \
-            --owner=${{ github.repository_owner }} \
-            --repo=${{ github.event.repository.name }} \
             --tag-name=${TAG_NAME} \
             --file-name=atomcode-${TAG_NAME}-windows-x64.exe \
             --file-path=dist/atomcode-${TAG_NAME}-windows-x64.exe \
