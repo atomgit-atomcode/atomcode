@@ -656,21 +656,33 @@ parallel workers NON-OVERLAPPING scopes."
     }
 }
 
-/// Parse the tool args, repairing unescaped control characters on failure (weak
-/// models / gateways sometimes emit a raw newline inside a JSON string value, which
-/// serde rejects). Repairs ONLY on failure, so valid JSON is never altered. This is
-/// the primary repair for a fresh dispatch — the model's tool-call args arrive
-/// verbatim (no upstream repair on the inbound path). It CANNOT recover a truncated
-/// payload (a large batch hitting the model's output limit) or an unescaped quote;
-/// the tool description advises smaller batches to avoid producing one. Shared by
+/// Parse the tool args, repairing malformed weak-model output on failure. Repairs
+/// ONLY on failure, so valid JSON is never altered.
+///
+/// Repair ladder: direct parse → `repair_json` (control chars / trailing commas)
+/// → `extract_task_args` (schema-aware salvage that rebuilds the tasks array from
+/// known keys, tolerating unescaped quotes in free-text prompts). The last step
+/// also runs in `RepairToolArgsMiddleware` on the inbound path; keeping it here
+/// makes the tool self-sufficient for any assembly that omits the middleware. It
+/// still CANNOT recover a genuinely truncated payload (a large batch hitting the
+/// model's output limit); the tool description advises smaller batches. Shared by
 /// `risk` and `execute` so both agree on whether a dispatch contains a `worker` — a
 /// mismatch would let a file-editing worker with control-char args skip the approval
 /// gate.
 fn parse_task_args(args: &str) -> Result<Args, serde_json::Error> {
-    match serde_json::from_str::<Args>(args) {
-        Ok(a) => Ok(a),
-        Err(_) => serde_json::from_str::<Args>(&super::repair::repair_json(args)),
+    if let Ok(a) = serde_json::from_str::<Args>(args) {
+        return Ok(a);
     }
+    if let Ok(a) = serde_json::from_str::<Args>(&super::repair::repair_json(args)) {
+        return Ok(a);
+    }
+    if let Some(v) = super::repair::extract_task_args(args) {
+        if let Ok(a) = serde_json::from_value::<Args>(v) {
+            return Ok(a);
+        }
+    }
+    // Reproduce the original parse error so the caller can surface it to the model.
+    serde_json::from_str::<Args>(args)
 }
 
 /// A one-line preview of what a child is about to do this round — the tool name plus a
