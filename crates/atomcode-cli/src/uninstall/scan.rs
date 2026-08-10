@@ -36,10 +36,14 @@ pub fn scan(binary_path: &Path, atomcode_dir: &Path) -> Result<Plan> {
             items.push(item(Group::Binary, p, "self-update backup")?);
         }
 
+        // Named by `atomcode-config::distribution`, the same source
+        // `atomcode-updater` creates them from — a rename there used to leave
+        // this sweep quietly matching nothing.
+        use atomcode_config::distribution as dist;
         for (name, note) in [
-            (".atomcode.rolling", "self-update rename slot"),
-            (".atomcode.download", "self-update partial download"),
-            (".atomcode.writable-probe", "self-update probe leftover"),
+            (dist::update_rolling_name(), "self-update rename slot"),
+            (dist::update_download_name(), "self-update partial download"),
+            (dist::update_probe_name(), "self-update probe leftover"),
         ] {
             let p = dir.join(name);
             if p.exists() {

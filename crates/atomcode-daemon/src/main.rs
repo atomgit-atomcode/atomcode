@@ -20,7 +20,9 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
 
 fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode) {
     const DEFAULT_HOST: &str = "127.0.0.1";
-    const DEFAULT_PORT: u16 = 13456;
+    // Shared with `atomcode daemon --port`'s clap default, which used to carry
+    // its own `13456` literal.
+    const DEFAULT_PORT: u16 = atomcode_config::distribution::DAEMON_PORT;
 
     let mut host: Option<String> = None;
     let mut port: Option<u16> = None;
@@ -126,6 +128,10 @@ fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode) {
 
 #[tokio::main]
 async fn main() {
+    // Before any config read. The daemon is launched by the VS Code extension
+    // rather than by the CLI, so it resolves the tree on its own.
+    atomcode_config::distribution::bootstrap_home();
+
     // On Windows, when built as a GUI-subsystem binary (windows_subsystem = "windows"),
     // there is no default console. If launched from a terminal (cmd.exe / PowerShell),
     // re-attach to the parent's console so eprintln!/tracing output is visible.

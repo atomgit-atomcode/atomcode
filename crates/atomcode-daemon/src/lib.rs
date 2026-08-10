@@ -4927,7 +4927,7 @@ fn primary_lan_ipv4() -> Option<String> {
 /// `/chat` 乃至 `/shutdown` 都会因缺 token 返回 401，扩展既用不了也停不掉它，表现为
 /// “daemon started but not responding”。让 webui 默认错开到 13457 即可彻底分离
 /// （webui 的访问 URL 是生成的，端口号对用户无感；被占时仍会向上扫描）。
-pub const WEBUI_DEFAULT_PORT: u16 = 13457;
+pub const WEBUI_DEFAULT_PORT: u16 = atomcode_config::distribution::WEBUI_PORT;
 
 /// 确保进程内 webui server 已起（已停止则重启），mint 一次性 token，开浏览器。
 ///
@@ -5087,7 +5087,7 @@ pub fn stop_server() -> String {
 
 /// `/app` 进程内 server 的默认端口。刻意错开 webui(13457)与独立守护(13456)，
 /// 三者各占一端口、互不踩；被占时由 [bind_scanning] 向上扫描。
-pub const APP_DEFAULT_PORT: u16 = 13458;
+pub const APP_DEFAULT_PORT: u16 = atomcode_config::distribution::APP_PORT;
 
 struct AppServerHandle {
     port: u16,

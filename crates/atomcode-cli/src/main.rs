@@ -599,8 +599,16 @@ const VERSION: &str = concat!(
     ")"
 );
 
+/// The name this binary is invoked as, taken from `[[bin]] name` rather than
+/// repeated as a literal. It reaches the user in three places that must agree:
+/// the `Usage:` line, the `--help` header, and the `complete -F` registration a
+/// generated completion script installs. Renaming the bin used to leave all
+/// three claiming the old name — and shell completion bound to a command that
+/// no longer exists.
+const BIN_NAME: &str = env!("CARGO_BIN_NAME");
+
 #[derive(Parser)]
-#[command(name = "atomcode", version = VERSION, about = "AI coding assistant in your terminal")]
+#[command(name = BIN_NAME, version = VERSION, about = "AI coding assistant in your terminal")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -712,8 +720,8 @@ enum Commands {
     Mcp(McpCli),
     /// Start the HTTP daemon for IDE integration (VS Code extension connects to this)
     Daemon {
-        /// Port to listen on (default: 13456)
-        #[arg(long, default_value = "13456")]
+        /// Port to listen on
+        #[arg(long, default_value_t = atomcode_config::distribution::DAEMON_PORT)]
         port: u16,
         /// Client identifier for telemetry (e.g. "vscode", "atomcode-air")
         #[arg(long)]
@@ -880,7 +888,7 @@ fn completion_command() -> clap::Command {
         .cloned()
         .collect::<Vec<_>>();
 
-    clap::Command::new("atomcode")
+    clap::Command::new(BIN_NAME)
         .version(VERSION)
         .about("AI coding assistant in your terminal")
         .args(source.get_arguments().cloned())
@@ -890,7 +898,7 @@ fn completion_command() -> clap::Command {
 
 fn print_shell_completion(shell: Shell, out: &mut dyn Write) {
     let mut command = completion_command();
-    clap_complete::generate(shell, &mut command, "atomcode", out);
+    clap_complete::generate(shell, &mut command, BIN_NAME, out);
 }
 
 /// Subcommands for hooks management
@@ -1049,6 +1057,12 @@ fn main() {
     if try_print_shell_completion() {
         return;
     }
+
+    // Settle where the config tree is before anything reads it, so all eight
+    // resolvers — and every child process that inherits our environment —
+    // agree by construction. Deliberately AFTER the completion fast path: that
+    // branch touches no config, and the comment above asks for it to stay bare.
+    atomcode_config::distribution::bootstrap_home();
 
     // Run the entire program on a thread with a large, explicit stack.
     // Rust gives the *main* OS thread the platform-default stack — on

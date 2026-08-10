@@ -1728,16 +1728,23 @@ impl Config {
 
     /// Resolve the atomcode config dir. Pure function for testability —
     /// `config_dir()` is a thin wrapper that injects real env + real home.
-    fn resolve_config_dir(env_atomcode_home: Option<String>, home: Option<PathBuf>) -> PathBuf {
+    ///
+    /// `pub(crate)` so [`crate::distribution`] can assert that what
+    /// `bootstrap_home` materialises is byte-identical to this fallback.
+    pub(crate) fn resolve_config_dir(
+        env_atomcode_home: Option<String>,
+        home: Option<PathBuf>,
+    ) -> PathBuf {
         if let Some(p) = env_atomcode_home {
             return PathBuf::from(p);
         }
-        home.unwrap_or_else(|| PathBuf::from(".")).join(".atomcode")
+        home.unwrap_or_else(|| PathBuf::from("."))
+            .join(crate::distribution::HOME_DIR_NAME)
     }
 
     pub fn config_dir() -> PathBuf {
         Self::resolve_config_dir(
-            std::env::var("ATOMCODE_HOME")
+            std::env::var(crate::distribution::HOME_ENV)
                 .ok()
                 .filter(|s| !s.is_empty()),
             crate::util::real_home_dir(),
