@@ -26,11 +26,7 @@ impl CommandRunner for RealCommandRunner {
 }
 
 /// Run a command and bail if it exits non-zero.
-fn run_checked(
-    runner: &dyn CommandRunner,
-    prog: &str,
-    args: &[String],
-) -> anyhow::Result<()> {
+fn run_checked(runner: &dyn CommandRunner, prog: &str, args: &[String]) -> anyhow::Result<()> {
     let out = runner.run(prog, args)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -78,16 +74,26 @@ impl Launchd {
         let exe = xml_escape(exe);
         let id_esc = xml_escape(id);
         let trigger_xml = match trigger {
-            LaunchdTrigger::Calendar { hour, minute, weekday } => {
+            LaunchdTrigger::Calendar {
+                hour,
+                minute,
+                weekday,
+            } => {
                 let mut dict = String::from("\t\t<dict>\n");
                 if let Some(h) = hour {
-                    dict.push_str(&format!("\t\t\t<key>Hour</key>\n\t\t\t<integer>{h}</integer>\n"));
+                    dict.push_str(&format!(
+                        "\t\t\t<key>Hour</key>\n\t\t\t<integer>{h}</integer>\n"
+                    ));
                 }
                 if let Some(m) = minute {
-                    dict.push_str(&format!("\t\t\t<key>Minute</key>\n\t\t\t<integer>{m}</integer>\n"));
+                    dict.push_str(&format!(
+                        "\t\t\t<key>Minute</key>\n\t\t\t<integer>{m}</integer>\n"
+                    ));
                 }
                 if let Some(wd) = weekday {
-                    dict.push_str(&format!("\t\t\t<key>Weekday</key>\n\t\t\t<integer>{wd}</integer>\n"));
+                    dict.push_str(&format!(
+                        "\t\t\t<key>Weekday</key>\n\t\t\t<integer>{wd}</integer>\n"
+                    ));
                 }
                 dict.push_str("\t\t</dict>");
                 format!("\t<key>StartCalendarInterval</key>\n{dict}")
@@ -159,10 +165,9 @@ impl OsScheduler for Launchd {
     fn uninstall(&self, id: &str) -> anyhow::Result<()> {
         let uid = get_uid();
         let domain_target = format!("gui/{uid}/{}", Self::label(id));
-        let _ = self.runner.run(
-            "launchctl",
-            &["bootout".to_string(), domain_target],
-        );
+        let _ = self
+            .runner
+            .run("launchctl", &["bootout".to_string(), domain_target]);
         let path = self.plist_path(id);
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -234,28 +239,42 @@ impl OsScheduler for SystemdTimer {
         let exe = std::env::current_exe()?;
         let exe_str = exe.to_string_lossy();
         std::fs::create_dir_all(&self.root)?;
-        std::fs::write(self.service_path(&task.id), Self::render_service(&task.id, &exe_str))?;
-        std::fs::write(self.timer_path(&task.id), Self::render_timer(&task.id, &cal))?;
-        run_checked(self.runner.as_ref(), "systemctl", &[
-            "--user".to_string(),
-            "daemon-reload".to_string(),
-        ])?;
-        run_checked(self.runner.as_ref(), "systemctl", &[
-            "--user".to_string(),
-            "enable".to_string(),
-            "--now".to_string(),
-            Self::timer_name(&task.id),
-        ])?;
+        std::fs::write(
+            self.service_path(&task.id),
+            Self::render_service(&task.id, &exe_str),
+        )?;
+        std::fs::write(
+            self.timer_path(&task.id),
+            Self::render_timer(&task.id, &cal),
+        )?;
+        run_checked(
+            self.runner.as_ref(),
+            "systemctl",
+            &["--user".to_string(), "daemon-reload".to_string()],
+        )?;
+        run_checked(
+            self.runner.as_ref(),
+            "systemctl",
+            &[
+                "--user".to_string(),
+                "enable".to_string(),
+                "--now".to_string(),
+                Self::timer_name(&task.id),
+            ],
+        )?;
         Ok(())
     }
 
     fn uninstall(&self, id: &str) -> anyhow::Result<()> {
-        let _ = self.runner.run("systemctl", &[
-            "--user".to_string(),
-            "disable".to_string(),
-            "--now".to_string(),
-            Self::timer_name(id),
-        ]);
+        let _ = self.runner.run(
+            "systemctl",
+            &[
+                "--user".to_string(),
+                "disable".to_string(),
+                "--now".to_string(),
+                Self::timer_name(id),
+            ],
+        );
         for path in [self.timer_path(id), self.service_path(id)] {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
@@ -263,10 +282,10 @@ impl OsScheduler for SystemdTimer {
                 Err(e) => return Err(e.into()),
             }
         }
-        let _ = self.runner.run("systemctl", &[
-            "--user".to_string(),
-            "daemon-reload".to_string(),
-        ]);
+        let _ = self.runner.run(
+            "systemctl",
+            &["--user".to_string(), "daemon-reload".to_string()],
+        );
         Ok(())
     }
 
@@ -316,12 +335,15 @@ impl OsScheduler for TaskSched {
 
     fn uninstall(&self, id: &str) -> anyhow::Result<()> {
         let tn = Self::task_name(id);
-        let _ = self.runner.run("schtasks", &[
-            "/Delete".to_string(),
-            "/F".to_string(),
-            "/TN".to_string(),
-            tn,
-        ]);
+        let _ = self.runner.run(
+            "schtasks",
+            &[
+                "/Delete".to_string(),
+                "/F".to_string(),
+                "/TN".to_string(),
+                tn,
+            ],
+        );
         Ok(())
     }
 
@@ -330,11 +352,9 @@ impl OsScheduler for TaskSched {
         // For a reliable cross-platform test path, we rely on the runner returning
         // success to indicate the task exists. In real usage, we'd parse output.
         let tn = Self::task_name(id);
-        let result = self.runner.run("schtasks", &[
-            "/Query".to_string(),
-            "/TN".to_string(),
-            tn,
-        ]);
+        let result = self
+            .runner
+            .run("schtasks", &["/Query".to_string(), "/TN".to_string(), tn]);
         match result {
             Ok(out) if out.status.success() => InstallState::Installed,
             _ => InstallState::Missing,
@@ -422,7 +442,9 @@ fn xml_escape(s: &str) -> String {
 }
 
 fn hhmm(s: &str) -> anyhow::Result<(u8, u8)> {
-    let (h, m) = s.split_once(':').ok_or_else(|| anyhow::anyhow!("bad time {s}"))?;
+    let (h, m) = s
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("bad time {s}"))?;
     Ok((h.parse()?, m.parse()?))
 }
 
@@ -482,7 +504,11 @@ pub fn launchd_calendar(s: &Schedule) -> anyhow::Result<LaunchdTrigger> {
     Ok(match s {
         Schedule::Daily { time } => {
             let (h, m) = hhmm(time)?;
-            LaunchdTrigger::Calendar { hour: Some(h), minute: Some(m), weekday: None }
+            LaunchdTrigger::Calendar {
+                hour: Some(h),
+                minute: Some(m),
+                weekday: None,
+            }
         }
         Schedule::Weekly { weekday, time } => {
             if *weekday == 0 || *weekday > 7 {
@@ -495,10 +521,18 @@ pub fn launchd_calendar(s: &Schedule) -> anyhow::Result<LaunchdTrigger> {
                 weekday: Some(*weekday % 7), // launchd Sunday=0; 7 % 7 == 0
             }
         }
-        Schedule::Hourly => LaunchdTrigger::Calendar { hour: None, minute: Some(0), weekday: None },
-        Schedule::Interval { every_minutes } => LaunchdTrigger::Interval(*every_minutes as u64 * 60),
+        Schedule::Hourly => LaunchdTrigger::Calendar {
+            hour: None,
+            minute: Some(0),
+            weekday: None,
+        },
+        Schedule::Interval { every_minutes } => {
+            LaunchdTrigger::Interval(*every_minutes as u64 * 60)
+        }
         Schedule::Cron { .. } => {
-            anyhow::bail!("cron schedules are not supported on macOS launchd; use a simple frequency")
+            anyhow::bail!(
+                "cron schedules are not supported on macOS launchd; use a simple frequency"
+            )
         }
     })
 }
@@ -520,7 +554,11 @@ pub fn schtasks_args(s: &Schedule) -> anyhow::Result<Vec<String>> {
             let (h, m) = hhmm(time)?;
             v(&["/SC", "WEEKLY", "/D"])
                 .into_iter()
-                .chain([schtasks_dow(*weekday)?.into(), "/ST".into(), format!("{h:02}:{m:02}")])
+                .chain([
+                    schtasks_dow(*weekday)?.into(),
+                    "/ST".into(),
+                    format!("{h:02}:{m:02}"),
+                ])
                 .collect()
         }
         Schedule::Hourly => v(&["/SC", "HOURLY"]),
@@ -554,7 +592,10 @@ mod tests {
     #[test]
     fn systemd_oncalendar_translation() {
         assert_eq!(
-            systemd_calendar(&Schedule::Daily { time: "09:30".into() }).unwrap(),
+            systemd_calendar(&Schedule::Daily {
+                time: "09:30".into()
+            })
+            .unwrap(),
             OnCalendar::Calendar("*-*-* 09:30:00".into())
         );
         assert_eq!(
@@ -566,7 +607,11 @@ mod tests {
             OnCalendar::Interval("30min".into())
         );
         assert_eq!(
-            systemd_calendar(&Schedule::Weekly { weekday: 1, time: "16:00".into() }).unwrap(),
+            systemd_calendar(&Schedule::Weekly {
+                weekday: 1,
+                time: "16:00".into()
+            })
+            .unwrap(),
             OnCalendar::Calendar("Mon *-*-* 16:00:00".into())
         );
     }
@@ -574,8 +619,18 @@ mod tests {
     #[test]
     fn launchd_calendar_translation() {
         // Daily 09:30 → {Hour:9, Minute:30}
-        let d = launchd_calendar(&Schedule::Daily { time: "09:30".into() }).unwrap();
-        assert_eq!(d, LaunchdTrigger::Calendar { hour: Some(9), minute: Some(30), weekday: None });
+        let d = launchd_calendar(&Schedule::Daily {
+            time: "09:30".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            d,
+            LaunchdTrigger::Calendar {
+                hour: Some(9),
+                minute: Some(30),
+                weekday: None
+            }
+        );
         // Interval 30min → StartInterval 1800
         assert_eq!(
             launchd_calendar(&Schedule::Interval { every_minutes: 30 }).unwrap(),
@@ -585,7 +640,10 @@ mod tests {
 
     #[test]
     fn schtasks_args_translation() {
-        let a = schtasks_args(&Schedule::Daily { time: "09:30".into() }).unwrap();
+        let a = schtasks_args(&Schedule::Daily {
+            time: "09:30".into(),
+        })
+        .unwrap();
         assert!(
             a.contains(&"/SC".to_string())
                 && a.contains(&"DAILY".to_string())
@@ -595,33 +653,58 @@ mod tests {
 
     #[test]
     fn cron_kind_rejected_on_launchd() {
-        assert!(launchd_calendar(&Schedule::Cron { expr: "0 9 * * *".into() }).is_err());
+        assert!(launchd_calendar(&Schedule::Cron {
+            expr: "0 9 * * *".into()
+        })
+        .is_err());
     }
 
     #[test]
     fn cron_kind_rejected_on_schtasks() {
-        assert!(schtasks_args(&Schedule::Cron { expr: "0 9 * * *".into() }).is_err());
+        assert!(schtasks_args(&Schedule::Cron {
+            expr: "0 9 * * *".into()
+        })
+        .is_err());
     }
 
     #[test]
     fn cron_kind_rejected_on_systemd() {
-        assert!(systemd_calendar(&Schedule::Cron { expr: "0 9 * * *".into() }).is_err());
+        assert!(systemd_calendar(&Schedule::Cron {
+            expr: "0 9 * * *".into()
+        })
+        .is_err());
     }
 
     #[test]
     fn launchd_weekly_sunday_conversion() {
         // weekday=7 (Sun in 1-7 convention) must map to launchd weekday=0 (Sun)
         assert_eq!(
-            launchd_calendar(&Schedule::Weekly { weekday: 7, time: "08:00".into() }).unwrap(),
-            LaunchdTrigger::Calendar { hour: Some(8), minute: Some(0), weekday: Some(0) }
+            launchd_calendar(&Schedule::Weekly {
+                weekday: 7,
+                time: "08:00".into()
+            })
+            .unwrap(),
+            LaunchdTrigger::Calendar {
+                hour: Some(8),
+                minute: Some(0),
+                weekday: Some(0)
+            }
         );
     }
 
     #[test]
     fn invalid_weekday_zero_rejected() {
         assert!(dow_abbr(0).is_err());
-        assert!(launchd_calendar(&Schedule::Weekly { weekday: 0, time: "08:00".into() }).is_err());
-        assert!(schtasks_args(&Schedule::Weekly { weekday: 0, time: "08:00".into() }).is_err());
+        assert!(launchd_calendar(&Schedule::Weekly {
+            weekday: 0,
+            time: "08:00".into()
+        })
+        .is_err());
+        assert!(schtasks_args(&Schedule::Weekly {
+            weekday: 0,
+            time: "08:00".into()
+        })
+        .is_err());
     }
 
     // ---- FakeRunner for OsScheduler end-to-end tests ----
@@ -635,7 +718,10 @@ mod tests {
 
     impl FakeRunner {
         fn new() -> Arc<Self> {
-            Arc::new(Self { calls: Default::default(), fail_if: None })
+            Arc::new(Self {
+                calls: Default::default(),
+                fail_if: None,
+            })
         }
 
         /// Return a FakeRunner that fails when program matches prog_substr AND
@@ -656,22 +742,28 @@ mod tests {
         fn run(&self, p: &str, a: &[String]) -> std::io::Result<std::process::Output> {
             self.calls.lock().unwrap().push((p.into(), a.to_vec()));
             if let Some((prog_sub, arg_sub)) = &self.fail_if {
-                if p.contains(prog_sub.as_str())
-                    && a.iter().any(|x| x.contains(arg_sub.as_str()))
-                {
+                if p.contains(prog_sub.as_str()) && a.iter().any(|x| x.contains(arg_sub.as_str())) {
                     return Ok(std::process::Output {
                         status: {
                             #[cfg(unix)]
-                            { std::os::unix::process::ExitStatusExt::from_raw(1) }
+                            {
+                                std::os::unix::process::ExitStatusExt::from_raw(1)
+                            }
                             #[cfg(not(unix))]
-                            { Default::default() }
+                            {
+                                Default::default()
+                            }
                         },
                         stdout: vec![],
                         stderr: b"simulated failure".to_vec(),
                     });
                 }
             }
-            Ok(std::process::Output { status: Default::default(), stdout: vec![], stderr: vec![] })
+            Ok(std::process::Output {
+                status: Default::default(),
+                stdout: vec![],
+                stderr: vec![],
+            })
         }
     }
 
@@ -681,7 +773,9 @@ mod tests {
             title: "Test task".into(),
             prompt: "do something".into(),
             cwd: "/tmp".into(),
-            schedule: Schedule::Daily { time: "09:30".into() },
+            schedule: Schedule::Daily {
+                time: "09:30".into(),
+            },
             permission_mode: "plan".into(),
             notify: "important".into(),
             enabled: true,
@@ -697,27 +791,39 @@ mod tests {
     fn systemd_install_writes_units_and_enables() {
         let tmp = tempfile::tempdir().unwrap();
         let runner = FakeRunner::new();
-        let sched = SystemdTimer { root: tmp.path().to_path_buf(), runner: runner.clone() };
+        let sched = SystemdTimer {
+            root: tmp.path().to_path_buf(),
+            runner: runner.clone(),
+        };
         let task = sample_task("t1");
 
         sched.install(&task).unwrap();
 
         // .service and .timer written
         assert!(tmp.path().join("atomcode-schedule-t1.service").exists());
-        let timer_content = std::fs::read_to_string(
-            tmp.path().join("atomcode-schedule-t1.timer")
-        ).unwrap();
-        assert!(timer_content.contains("OnCalendar=*-*-* 09:30:00"), "missing OnCalendar: {timer_content}");
-        assert!(timer_content.contains("Persistent=true"), "missing Persistent=true: {timer_content}");
+        let timer_content =
+            std::fs::read_to_string(tmp.path().join("atomcode-schedule-t1.timer")).unwrap();
+        assert!(
+            timer_content.contains("OnCalendar=*-*-* 09:30:00"),
+            "missing OnCalendar: {timer_content}"
+        );
+        assert!(
+            timer_content.contains("Persistent=true"),
+            "missing Persistent=true: {timer_content}"
+        );
 
         // runner called systemctl --user enable --now
         let calls = runner.calls();
         assert!(
-            calls.iter().any(|(p, a)| p == "systemctl" && a.iter().any(|x| x == "enable")),
+            calls
+                .iter()
+                .any(|(p, a)| p == "systemctl" && a.iter().any(|x| x == "enable")),
             "no systemctl enable call found: {calls:?}"
         );
         assert!(
-            calls.iter().any(|(p, a)| p == "systemctl" && a.iter().any(|x| x == "--now")),
+            calls
+                .iter()
+                .any(|(p, a)| p == "systemctl" && a.iter().any(|x| x == "--now")),
             "no --now flag in systemctl call: {calls:?}"
         );
 
@@ -738,15 +844,17 @@ mod tests {
     fn systemd_interval_uses_on_unit_active_sec() {
         let tmp = tempfile::tempdir().unwrap();
         let runner = FakeRunner::new();
-        let sched = SystemdTimer { root: tmp.path().to_path_buf(), runner: runner.clone() };
+        let sched = SystemdTimer {
+            root: tmp.path().to_path_buf(),
+            runner: runner.clone(),
+        };
         let mut task = sample_task("t2");
         task.schedule = Schedule::Interval { every_minutes: 15 };
 
         sched.install(&task).unwrap();
 
-        let timer_content = std::fs::read_to_string(
-            tmp.path().join("atomcode-schedule-t2.timer")
-        ).unwrap();
+        let timer_content =
+            std::fs::read_to_string(tmp.path().join("atomcode-schedule-t2.timer")).unwrap();
         assert!(
             timer_content.contains("OnUnitActiveSec=15min"),
             "expected OnUnitActiveSec=15min, got: {timer_content}"
@@ -758,18 +866,29 @@ mod tests {
     fn systemd_service_contains_quoted_exec_start() {
         let tmp = tempfile::tempdir().unwrap();
         let runner = FakeRunner::new();
-        let sched = SystemdTimer { root: tmp.path().to_path_buf(), runner: runner.clone() };
+        let sched = SystemdTimer {
+            root: tmp.path().to_path_buf(),
+            runner: runner.clone(),
+        };
         let task = sample_task("t3");
 
         sched.install(&task).unwrap();
 
-        let svc_content = std::fs::read_to_string(
-            tmp.path().join("atomcode-schedule-t3.service")
-        ).unwrap();
+        let svc_content =
+            std::fs::read_to_string(tmp.path().join("atomcode-schedule-t3.service")).unwrap();
         // ExecStart must quote the exe path
-        assert!(svc_content.contains("ExecStart=\""), "ExecStart must open with quote: {svc_content}");
-        assert!(svc_content.contains("schedule run t3"), "no 'schedule run t3' in service: {svc_content}");
-        assert!(svc_content.contains("Type=oneshot"), "no Type=oneshot in service: {svc_content}");
+        assert!(
+            svc_content.contains("ExecStart=\""),
+            "ExecStart must open with quote: {svc_content}"
+        );
+        assert!(
+            svc_content.contains("schedule run t3"),
+            "no 'schedule run t3' in service: {svc_content}"
+        );
+        assert!(
+            svc_content.contains("Type=oneshot"),
+            "no Type=oneshot in service: {svc_content}"
+        );
     }
 
     /// #3: install must propagate non-zero exit from systemctl enable as an error.
@@ -778,13 +897,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // Fail when systemctl is called with "enable" as an argument
         let runner = FakeRunner::failing("systemctl", "enable");
-        let sched = SystemdTimer { root: tmp.path().to_path_buf(), runner };
+        let sched = SystemdTimer {
+            root: tmp.path().to_path_buf(),
+            runner,
+        };
         let task = sample_task("t_fail");
 
         let result = sched.install(&task);
-        assert!(result.is_err(), "install should fail when systemctl enable returns non-zero");
+        assert!(
+            result.is_err(),
+            "install should fail when systemctl enable returns non-zero"
+        );
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("systemctl"), "error should mention systemctl: {msg}");
+        assert!(
+            msg.contains("systemctl"),
+            "error should mention systemctl: {msg}"
+        );
     }
 
     // ---- Launchd fake-runner tests ----
@@ -793,18 +921,34 @@ mod tests {
     fn launchd_install_writes_plist_and_bootstraps() {
         let tmp = tempfile::tempdir().unwrap();
         let runner = FakeRunner::new();
-        let sched = Launchd { root: tmp.path().to_path_buf(), runner: runner.clone() };
+        let sched = Launchd {
+            root: tmp.path().to_path_buf(),
+            runner: runner.clone(),
+        };
         let task = sample_task("lt1");
 
         sched.install(&task).unwrap();
 
         // plist file written with the right label
         let plist_path = tmp.path().join("com.atomcode.schedule.lt1.plist");
-        assert!(plist_path.exists(), "plist not written at {}", plist_path.display());
+        assert!(
+            plist_path.exists(),
+            "plist not written at {}",
+            plist_path.display()
+        );
         let plist_content = std::fs::read_to_string(&plist_path).unwrap();
-        assert!(plist_content.contains("com.atomcode.schedule.lt1"), "label missing");
-        assert!(plist_content.contains("schedule"), "ProgramArguments missing schedule");
-        assert!(plist_content.contains("StartCalendarInterval"), "trigger missing");
+        assert!(
+            plist_content.contains("com.atomcode.schedule.lt1"),
+            "label missing"
+        );
+        assert!(
+            plist_content.contains("schedule"),
+            "ProgramArguments missing schedule"
+        );
+        assert!(
+            plist_content.contains("StartCalendarInterval"),
+            "trigger missing"
+        );
         // #7: plist key/integer must be on separate lines
         assert!(
             !plist_content.contains("<key>Hour</key><integer>"),
@@ -813,10 +957,13 @@ mod tests {
 
         // launchctl bootstrap called with gui/<uid> domain (#4)
         let calls = runner.calls();
-        let bootstrap_call = calls.iter().find(|(p, a)| {
-            p == "launchctl" && a.iter().any(|x| x == "bootstrap")
-        });
-        assert!(bootstrap_call.is_some(), "no launchctl bootstrap call: {calls:?}");
+        let bootstrap_call = calls
+            .iter()
+            .find(|(p, a)| p == "launchctl" && a.iter().any(|x| x == "bootstrap"));
+        assert!(
+            bootstrap_call.is_some(),
+            "no launchctl bootstrap call: {calls:?}"
+        );
         let (_, boot_args) = bootstrap_call.unwrap();
         assert!(
             boot_args.iter().any(|x| x.starts_with("gui/")),
@@ -843,7 +990,10 @@ mod tests {
     fn launchd_install_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let runner = FakeRunner::new();
-        let sched = Launchd { root: tmp.path().to_path_buf(), runner: runner.clone() };
+        let sched = Launchd {
+            root: tmp.path().to_path_buf(),
+            runner: runner.clone(),
+        };
         let task = sample_task("lt_idem");
 
         // First install — must succeed.
@@ -853,10 +1003,14 @@ mod tests {
 
         // Both installs must have issued a bootout call (best-effort pre-cleanup).
         let calls = runner.calls();
-        let bootout_calls: Vec<_> = calls.iter()
+        let bootout_calls: Vec<_> = calls
+            .iter()
             .filter(|(p, a)| p == "launchctl" && a.iter().any(|x| x == "bootout"))
             .collect();
-        assert!(bootout_calls.len() >= 2, "expected ≥2 bootout calls (one per install): {calls:?}");
+        assert!(
+            bootout_calls.len() >= 2,
+            "expected ≥2 bootout calls (one per install): {calls:?}"
+        );
 
         // Status still shows installed after second install.
         assert_eq!(sched.status("lt_idem"), InstallState::Installed);
@@ -866,18 +1020,26 @@ mod tests {
     fn launchd_interval_uses_start_interval() {
         let tmp = tempfile::tempdir().unwrap();
         let runner = FakeRunner::new();
-        let sched = Launchd { root: tmp.path().to_path_buf(), runner: runner.clone() };
+        let sched = Launchd {
+            root: tmp.path().to_path_buf(),
+            runner: runner.clone(),
+        };
         let mut task = sample_task("lt2");
         task.schedule = Schedule::Interval { every_minutes: 10 };
 
         sched.install(&task).unwrap();
 
-        let plist_content = std::fs::read_to_string(
-            tmp.path().join("com.atomcode.schedule.lt2.plist")
-        ).unwrap();
+        let plist_content =
+            std::fs::read_to_string(tmp.path().join("com.atomcode.schedule.lt2.plist")).unwrap();
         // 10 minutes = 600 seconds
-        assert!(plist_content.contains("StartInterval"), "no StartInterval: {plist_content}");
-        assert!(plist_content.contains("600"), "wrong interval seconds: {plist_content}");
+        assert!(
+            plist_content.contains("StartInterval"),
+            "no StartInterval: {plist_content}"
+        );
+        assert!(
+            plist_content.contains("600"),
+            "wrong interval seconds: {plist_content}"
+        );
     }
 
     // ---- TaskSched fake-runner tests ----
@@ -885,33 +1047,43 @@ mod tests {
     #[test]
     fn tasksched_install_calls_schtasks_create() {
         let runner = FakeRunner::new();
-        let sched = TaskSched { runner: runner.clone() };
+        let sched = TaskSched {
+            runner: runner.clone(),
+        };
         let task = sample_task("ws1");
 
         sched.install(&task).unwrap();
 
         let calls = runner.calls();
-        let create_call = calls.iter().find(|(p, a)| {
-            p == "schtasks" && a.iter().any(|x| x == "/Create")
-        });
+        let create_call = calls
+            .iter()
+            .find(|(p, a)| p == "schtasks" && a.iter().any(|x| x == "/Create"));
         assert!(create_call.is_some(), "no schtasks /Create call: {calls:?}");
 
         let (_, args) = create_call.unwrap();
-        assert!(args.iter().any(|x| x.contains("ws1")), "task id missing: {args:?}");
-        assert!(args.iter().any(|x| x == "DAILY"), "DAILY flag missing: {args:?}");
+        assert!(
+            args.iter().any(|x| x.contains("ws1")),
+            "task id missing: {args:?}"
+        );
+        assert!(
+            args.iter().any(|x| x == "DAILY"),
+            "DAILY flag missing: {args:?}"
+        );
     }
 
     #[test]
     fn tasksched_uninstall_calls_delete_with_task_name() {
         let runner = FakeRunner::new();
-        let sched = TaskSched { runner: runner.clone() };
+        let sched = TaskSched {
+            runner: runner.clone(),
+        };
 
         sched.uninstall("ws1").unwrap();
 
         let calls = runner.calls();
-        let delete_call = calls.iter().find(|(p, a)| {
-            p == "schtasks" && a.iter().any(|x| x == "/Delete")
-        });
+        let delete_call = calls
+            .iter()
+            .find(|(p, a)| p == "schtasks" && a.iter().any(|x| x == "/Delete"));
         assert!(delete_call.is_some(), "no schtasks /Delete call: {calls:?}");
         let (_, del_args) = delete_call.unwrap();
         // #5: assert /TN is present and task name contains the id
@@ -934,9 +1106,15 @@ mod tests {
         let task = sample_task("ws_fail");
 
         let result = sched.install(&task);
-        assert!(result.is_err(), "install should fail when schtasks /Create returns non-zero");
+        assert!(
+            result.is_err(),
+            "install should fail when schtasks /Create returns non-zero"
+        );
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("schtasks"), "error should mention schtasks: {msg}");
+        assert!(
+            msg.contains("schtasks"),
+            "error should mention schtasks: {msg}"
+        );
     }
 
     // ---- D: xml_escape tests ----
@@ -944,7 +1122,10 @@ mod tests {
     #[test]
     fn xml_escape_ampersand_in_exe_produces_amp_entity() {
         let escaped = xml_escape("/usr/local/bin/foo&bar");
-        assert!(escaped.contains("&amp;"), "expected &amp; entity: {escaped}");
+        assert!(
+            escaped.contains("&amp;"),
+            "expected &amp; entity: {escaped}"
+        );
         assert!(!escaped.contains("&b"), "bare & must not appear: {escaped}");
     }
 
@@ -956,9 +1137,19 @@ mod tests {
 
     #[test]
     fn render_plist_escapes_special_chars_in_exe() {
-        let trigger = LaunchdTrigger::Calendar { hour: Some(9), minute: Some(0), weekday: None };
+        let trigger = LaunchdTrigger::Calendar {
+            hour: Some(9),
+            minute: Some(0),
+            weekday: None,
+        };
         let plist = Launchd::render_plist("my-task", "/path/to/foo&bar", &trigger);
-        assert!(plist.contains("&amp;"), "plist must contain &amp; entity: {plist}");
-        assert!(!plist.contains("&b"), "plist must not contain bare & followed by b: {plist}");
+        assert!(
+            plist.contains("&amp;"),
+            "plist must contain &amp; entity: {plist}"
+        );
+        assert!(
+            !plist.contains("&b"),
+            "plist must not contain bare & followed by b: {plist}"
+        );
     }
 }
