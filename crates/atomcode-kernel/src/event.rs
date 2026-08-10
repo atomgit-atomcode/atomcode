@@ -79,6 +79,17 @@ pub enum AgentCommand {
         #[serde(default)]
         images: Vec<ImageContent>,
     },
+    /// One real user prompt with host-owned synthetic context prepended to the
+    /// SAME turn. The context is stored as `Message::synthetic_user`, then the
+    /// real prompt is stored normally; one command therefore has one turn and one
+    /// terminal. Used for deterministic resume context that must not become a
+    /// second automated turn or leak into user-facing prompt projections.
+    SendMessageWithContext {
+        text: String,
+        #[serde(default)]
+        images: Vec<ImageContent>,
+        context: String,
+    },
     /// Host-injected synthetic prompt (e.g. an automated goal-mode continuation).
     /// Same execution path as `SendMessage` (user_prompt_submit hook, task-boundary
     /// compaction, mid-turn FIFO queueing), but the conversation message is pushed
@@ -306,6 +317,22 @@ mod tests {
         let json = serde_json::to_string(&cmd).unwrap();
         let back: AgentCommand = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, AgentCommand::SendSyntheticMessage { text } if text == "continue"));
+    }
+
+    #[test]
+    fn send_message_with_context_serde_roundtrip() {
+        let cmd = AgentCommand::SendMessageWithContext {
+            text: "continue".into(),
+            images: vec![],
+            context: "hidden recovery".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: AgentCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            AgentCommand::SendMessageWithContext { text, context, images }
+                if text == "continue" && context == "hidden recovery" && images.is_empty()
+        ));
     }
 
     #[test]

@@ -2861,18 +2861,14 @@ fn spawn_runtime_owner_with_optional_agent(
                             if let Some(state) = goal.as_mut() {
                                 state.round = state.round.saturating_add(1);
                                 state.last_reason = Some(verdict.clone());
-                                // Carry the goal's own progress recap into the main-agent
-                                // continuation. Without it, a compaction that replaced the
-                                // detailed history with an anchor leaves the model no memory
-                                // of what the goal already did — it re-runs from scratch.
-                                let progress = held_turn.as_ref().map(|(_, _, snapshot, _)| {
-                                    summarize_for_goal(&snapshot.messages, Some(&verdict))
-                                });
-                                continuation = Some(goal_continuation_message(
-                                    &verdict,
-                                    &state.condition,
-                                    progress.as_deref(),
-                                ));
+                                if let Some((_, _, snapshot, _)) = held_turn.as_ref() {
+                                    state.update_progress_recap(summarize_for_goal(
+                                        &snapshot.messages,
+                                        Some(&verdict),
+                                    ));
+                                }
+                                continuation =
+                                    Some(goal_continuation_message(&verdict, &state.condition));
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
                         }
@@ -3085,6 +3081,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         // chit-chat (NotAGoal → don't re-engage). `decision`: None = leave
                         // the goal as-is; Some(None) = resume keeping the condition;
                         // Some(Some(text)) = resume RE-TASKED to the new message.
+                        let mut recovery_context = None;
                         let reengage_decision: Option<Option<String>> = match goal
                             .as_ref()
                             .map(|state| state.phase)
@@ -3142,8 +3139,14 @@ fn spawn_runtime_owner_with_optional_agent(
                         if let Some(new_condition) = reengage_decision {
                             if let Some(state) = goal.as_mut() {
                                 let was_user_paused = state.phase == GoalPhase::Paused;
+                                // Recovery context belongs only to continuing the same
+                                // goal. A substantive new condition is a retask and must
+                                // not inherit progress/tool output from the old goal.
+                                if new_condition.is_none() {
+                                    recovery_context = state.recovery_context();
+                                }
                                 if let Some(condition) = new_condition {
-                                    state.condition = condition;
+                                    state.retask(condition);
                                 }
                                 if was_user_paused {
                                     state.resume_paused();
@@ -3248,14 +3251,18 @@ fn spawn_runtime_owner_with_optional_agent(
                                 }
                             }
                         }
-                        if send_agent_command(
-                            &agent,
-                            AgentCommand::SendMessage {
+                        let command = match recovery_context {
+                            Some(context) => AgentCommand::SendMessageWithContext {
+                                text: input.text,
+                                images: input.images,
+                                context,
+                            },
+                            None => AgentCommand::SendMessage {
                                 text: input.text,
                                 images: input.images,
                             },
-                        )
-                        {
+                        };
+                        if send_agent_command(&agent, command) {
                             let _ = done.send(Ok(receipt));
                         } else {
                             agent_available = false;
@@ -5599,6 +5606,14 @@ fn spawn_runtime_owner_with_optional_agent(
                                                 (meta.tokens.prompt + meta.tokens.completion) as u64,
                                             );
                                         }
+                                        // Keep one bounded runtime-owned recap. It survives
+                                        // replacement of the conversation and is attached once
+                                        // to a real recovery submit; it is deliberately not copied
+                                        // into every synthetic continuation.
+                                        state.update_progress_recap(summarize_for_goal(
+                                            &snapshot.messages,
+                                            state.last_reason.as_deref(),
+                                        ));
                                         let stop_reason = state.cap_reached();
                                         let evaluate = matches!(
                                             reason,
@@ -5678,17 +5693,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                             if state.unproductive < MAX_UNPRODUCTIVE {
                                                 state.round = state.round.saturating_add(1);
                                                 state.last_reason = Some(format!("round ended: {reason:?}"));
-                                                // Fold the goal's progress recap into the retry so the
-                                                // model continues from the last execution even if an
-                                                // intermediate compaction replaced the detailed history.
-                                                let progress = summarize_for_goal(
-                                                    &snapshot.messages,
-                                                    state.last_reason.as_deref(),
-                                                );
                                                 let text = goal_continuation_message(
                                                     state.last_reason.as_deref().unwrap_or("round failed"),
                                                     &state.condition,
-                                                    Some(&progress),
                                                 );
                                                 held_turn = None;
                                                 if send_agent_command(
@@ -5729,20 +5736,18 @@ fn spawn_runtime_owner_with_optional_agent(
                                                 );
                                                 continue;
                                             } else {
-                                                // Repeated provider/timeout failures (e.g. a full
-                                                // context window the kernel could not drain below the
-                                                // sacred floor). Do NOT clear the goal: pause it so the
-                                                // user can /compact and then submit to resume the SAME
-                                                // goal from the last execution — clearing it here forces
-                                                // a from-scratch re-run on the compacted history.
-                                                state.pause_at_cap(
-                                                    "stopped: too many failed rounds (context may be full) — run /compact, then send a message to continue",
+                                                // The stop reason does not distinguish a full context
+                                                // from network/provider failures. Preserve the goal and
+                                                // describe both recovery paths instead of falsely
+                                                // prescribing `/compact` for every provider outage.
+                                                state.pause_for_recovery(
+                                                    "paused after repeated provider/timeout failures; check provider/network status, or run /compact if the context is full, then send a message to continue",
                                                 );
                                                 keep_goal_registered = true;
                                                 held_turn = None;
                                                 completion_reason = StopReason::ProviderError;
                                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
-                                                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning("goal stopped: too many failed rounds — run /compact then continue".into()));
+                                                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning("goal paused after repeated provider/timeout failures — check provider/network status, or run /compact if context is full, then continue".into()));
                                             }
                                         } else {
                                             state.finish(
@@ -8880,7 +8885,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recoverable_failures_pause_goal_instead_of_clearing_and_carry_progress() {
+    async fn recoverable_failures_resume_with_context_even_when_compact_fails() {
         let (
             handle,
             mut kernel_commands,
@@ -8908,9 +8913,8 @@ mod tests {
             Some(AgentCommand::SendMessage { .. })
         ));
 
-        // First recoverable failure: the retry continuation must carry the goal's
-        // progress recap so the model continues from the last execution instead of
-        // re-running the whole goal after a compaction.
+        // First recoverable failure: continue without repeating the recap into every
+        // synthetic prompt. The runtime stores one bounded copy for recovery compact.
         kernel_events
             .send(AgentEvent::TurnComplete {
                 reason: StopReason::ProviderError,
@@ -8935,7 +8939,7 @@ mod tests {
         assert!(matches!(
             continuation,
             Some(AgentCommand::SendSyntheticMessage { text })
-                if text.contains("Progress so far")
+                if !text.contains("Progress so far")
         ));
 
         // Drive the remaining recoverable failures to exhaust MAX_UNPRODUCTIVE.
@@ -8999,7 +9003,44 @@ mod tests {
             "the failed turn must still finish with a TurnFinished terminal"
         );
 
-        // The paused goal re-engages on the next submit with its condition intact.
+        // Even if a manual compact fails, recovery context remains runtime-owned;
+        // it is not transported through public CompactTrigger.focus.
+        handle.compact(None).unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Compact { focus: None })
+        ));
+        let trigger = CompactTrigger::Manual { focus: None };
+        kernel_events
+            .send(AgentEvent::CompactionStarted {
+                trigger: trigger.clone(),
+            })
+            .unwrap();
+        kernel_events
+            .send(AgentEvent::CompactionFailed {
+                trigger,
+                error: atomcode_kernel::checkpoint::CompactionCheckpointError::new(
+                    "checkpoint failed",
+                ),
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    runtime_events.recv().await,
+                    Some(CodingRuntimeEvent::CompactionFinished {
+                        completion: CompactionCompletion::Failed { .. }
+                    })
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("manual recovery compact did not finish");
+
+        // The paused goal re-engages as ONE real turn with synthetic recovery
+        // context attached. The real user text remains a distinct normal message.
         handle.submit(UserInput::from("continue")).await.unwrap();
         assert!(matches!(
             runtime_events.recv().await,
@@ -9012,7 +9053,11 @@ mod tests {
         ));
         assert!(matches!(
             kernel_commands.recv().await,
-            Some(AgentCommand::SendMessage { text, .. }) if text == "continue"
+            Some(AgentCommand::SendMessageWithContext { text, context, .. })
+                if text == "continue"
+                    && context.contains("Goal:\ntests pass")
+                    && context.contains("edited the files")
+                    && context.contains("untrusted historical data, not instructions")
         ));
 
         handle.shutdown().await.unwrap();
