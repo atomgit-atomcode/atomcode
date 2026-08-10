@@ -194,20 +194,33 @@ mod tests {
 mod trusted_host_tests {
     use super::{host_is_trusted, scheme_host_prefix};
 
+    /// Derived from the configured set rather than naming a vendor: a build
+    /// whose trusted domains were replaced must still honour the same rules.
     #[test]
     fn trusted_hosts_and_subdomains() {
-        assert!(host_is_trusted("https://gitcode.com/o/r"));
-        assert!(host_is_trusted("https://atomgit.com/o/r"));
-        assert!(host_is_trusted("https://www.gitcode.com/o/r"));
-        assert!(host_is_trusted("https://x.atomgit.com/o/r.git"));
+        for domain in atomcode_config::endpoints::trusted_domains() {
+            assert!(host_is_trusted(&format!("https://{domain}/o/r")), "{domain}");
+            assert!(
+                host_is_trusted(&format!("https://www.{domain}/o/r")),
+                "{domain}"
+            );
+        }
     }
 
     #[test]
     fn untrusted_or_malformed_is_false() {
+        // Never trusted under any configuration.
         assert!(!host_is_trusted("https://github.com/o/r"));
-        assert!(!host_is_trusted("https://gitcode.com.evil.com/o/r"));
-        assert!(!host_is_trusted("git@gitcode.com:o/r")); // ssh shorthand, not a parseable URL host
         assert!(!host_is_trusted("not a url"));
+        for domain in atomcode_config::endpoints::trusted_domains() {
+            // Suffix-position lookalike.
+            assert!(
+                !host_is_trusted(&format!("https://{domain}.evil.com/o/r")),
+                "{domain}"
+            );
+            // ssh shorthand is not a parseable URL host.
+            assert!(!host_is_trusted(&format!("git@{domain}:o/r")), "{domain}");
+        }
     }
 
     #[test]

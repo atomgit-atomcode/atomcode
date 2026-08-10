@@ -110,25 +110,33 @@ mod tests {
 
     #[test]
     fn managed_hosts_are_matched_label_safely() {
-        assert!(is_managed_https_url("https://atomgit.com"));
-        assert!(is_managed_https_url("https://acs.atomgit.com/auth/login"));
-        assert!(is_managed_https_url("https://api.gitcode.com/api/v5"));
-        assert!(!is_managed_https_url("https://evilatomgit.com"));
-        assert!(!is_managed_https_url(
-            "https://acs.atomgit.com.evil.example"
-        ));
+        // Derived from the configured set rather than naming a vendor: a build
+        // whose `HOSTED_*` values were replaced must still hold this.
+        let Some(domain) = crate::endpoints::tls_fallback_domains().first() else {
+            return; // nothing configured — nothing to match
+        };
+        assert!(is_managed_https_url(&format!("https://{domain}")));
+        assert!(is_managed_https_url(&format!("https://sub.{domain}/some/path")));
+        assert!(!is_managed_https_url(&format!("https://evil{domain}")));
+        assert!(!is_managed_https_url(&format!("https://{domain}.evil.example")));
     }
 
     #[test]
     fn non_https_and_custom_hosts_are_not_managed() {
-        assert!(!is_managed_https_url("http://acs.atomgit.com"));
+        if let Some(domain) = crate::endpoints::tls_fallback_domains().first() {
+            assert!(!is_managed_https_url(&format!("http://{domain}")));
+        }
         assert!(!is_managed_https_url("https://api.openai.com/v1"));
         assert!(!is_managed_https_url("not a url"));
     }
 
     #[test]
     fn fallback_requires_managed_uncapped_connect_failure() {
-        let managed = "https://llm-api.atomgit.com/v1/chat/completions";
+        let Some(domain) = crate::endpoints::tls_fallback_domains().first() else {
+            return; // nothing configured — the gate can never open
+        };
+        let managed = format!("https://{domain}/v1/chat/completions");
+        let managed = managed.as_str();
         assert!(should_try_fallback(managed, false, true));
         assert!(!should_try_fallback(managed, true, true));
         assert!(!should_try_fallback(managed, false, false));
@@ -146,7 +154,11 @@ mod tests {
         // the class, this fn only gates on endpoint + cap. A corruption trigger
         // (warrants_fallback=true) on a managed uncapped endpoint qualifies with
         // NO is_connect involved.
-        let managed = "https://llm-api.atomgit.com/v1/chat/completions";
+        let Some(domain) = crate::endpoints::tls_fallback_domains().first() else {
+            return; // nothing configured — the gate can never open
+        };
+        let managed = format!("https://{domain}/v1/chat/completions");
+        let managed = managed.as_str();
         assert!(should_try_fallback(managed, false, true));
         // Already capped at 1.2 → nothing lower to escalate to.
         assert!(!should_try_fallback(managed, true, true));
