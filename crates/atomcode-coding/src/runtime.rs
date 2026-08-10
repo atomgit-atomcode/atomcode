@@ -2840,7 +2840,18 @@ fn spawn_runtime_owner_with_optional_agent(
                             if let Some(state) = goal.as_mut() {
                                 state.round = state.round.saturating_add(1);
                                 state.last_reason = Some(verdict.clone());
-                                continuation = Some(goal_continuation_message(&verdict, &state.condition));
+                                // Carry the goal's own progress recap into the main-agent
+                                // continuation. Without it, a compaction that replaced the
+                                // detailed history with an anchor leaves the model no memory
+                                // of what the goal already did — it re-runs from scratch.
+                                let progress = held_turn.as_ref().map(|(_, _, snapshot, _)| {
+                                    summarize_for_goal(&snapshot.messages, Some(&verdict))
+                                });
+                                continuation = Some(goal_continuation_message(
+                                    &verdict,
+                                    &state.condition,
+                                    progress.as_deref(),
+                                ));
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
                         }
@@ -5644,9 +5655,17 @@ fn spawn_runtime_owner_with_optional_agent(
                                             if state.unproductive < MAX_UNPRODUCTIVE {
                                                 state.round = state.round.saturating_add(1);
                                                 state.last_reason = Some(format!("round ended: {reason:?}"));
+                                                // Fold the goal's progress recap into the retry so the
+                                                // model continues from the last execution even if an
+                                                // intermediate compaction replaced the detailed history.
+                                                let progress = summarize_for_goal(
+                                                    &snapshot.messages,
+                                                    state.last_reason.as_deref(),
+                                                );
                                                 let text = goal_continuation_message(
                                                     state.last_reason.as_deref().unwrap_or("round failed"),
                                                     &state.condition,
+                                                    Some(&progress),
                                                 );
                                                 held_turn = None;
                                                 if send_agent_command(
@@ -5687,13 +5706,19 @@ fn spawn_runtime_owner_with_optional_agent(
                                                 );
                                                 continue;
                                             } else {
-                                                state.finish(
-                                                    GoalTerminal::Failed,
-                                                    "stopped: too many failed rounds",
+                                                // Repeated provider/timeout failures (e.g. a full
+                                                // context window the kernel could not drain below the
+                                                // sacred floor). Do NOT clear the goal: pause it so the
+                                                // user can /compact and then submit to resume the SAME
+                                                // goal from the last execution — clearing it here forces
+                                                // a from-scratch re-run on the compacted history.
+                                                state.pause_at_cap(
+                                                    "stopped: too many failed rounds (context may be full) — run /compact, then send a message to continue",
                                                 );
+                                                keep_goal_registered = true;
                                                 completion_reason = StopReason::ProviderError;
                                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
-                                                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning("goal stopped: too many failed rounds".into()));
+                                                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning("goal stopped: too many failed rounds — run /compact then continue".into()));
                                             }
                                         } else {
                                             state.finish(
@@ -8810,6 +8835,145 @@ mod tests {
                 .is_err(),
             "an evaluator failure must not dispatch a synthetic main-agent retry"
         );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recoverable_failures_pause_goal_instead_of_clearing_and_carry_progress() {
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+
+        handle.start_goal("tests pass").await.unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                active: true,
+                ..
+            }))
+        ));
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+
+        // First recoverable failure: the retry continuation must carry the goal's
+        // progress recap so the model continues from the last execution instead of
+        // re-running the whole goal after a compaction.
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::ProviderError,
+            })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![
+                    Message::user("initial turn"),
+                    Message::assistant("edited the files", vec![]),
+                ]),
+            })
+            .unwrap();
+        let continuation =
+            tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+                .await
+                .expect("recoverable failure did not dispatch a continuation");
+        assert!(matches!(
+            continuation,
+            Some(AgentCommand::SendSyntheticMessage { text })
+                if text.contains("Progress so far")
+        ));
+
+        // Drive the remaining recoverable failures to exhaust MAX_UNPRODUCTIVE.
+        for round in 2..=MAX_UNPRODUCTIVE {
+            kernel_events
+                .send(AgentEvent::TurnComplete {
+                    reason: StopReason::ProviderError,
+                })
+                .unwrap();
+            assert!(matches!(
+                kernel_commands.recv().await,
+                Some(AgentCommand::Snapshot)
+            ));
+            kernel_events
+                .send(AgentEvent::Snapshot {
+                    snapshot: SessionSnapshot::new(vec![
+                        Message::user("initial turn"),
+                        Message::assistant("edited the files", vec![]),
+                    ]),
+                })
+                .unwrap();
+            if round < MAX_UNPRODUCTIVE {
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+                        .await
+                        .expect("recoverable failure did not dispatch a continuation");
+            }
+        }
+
+        // The budget-exhausted terminal must PAUSE the goal (still registered,
+        // PausedAtCap) instead of clearing it — clearing would force a from-scratch
+        // re-run after the user compacts and continues.
+        let mut saw_paused_at_cap = false;
+        let mut saw_turn_finished = false;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                        active: false,
+                        phase: GoalPhase::PausedAtCap,
+                        terminal: Some(GoalTerminal::Stopped),
+                        ..
+                    })) => saw_paused_at_cap = true,
+                    Some(CodingRuntimeEvent::TurnFinished(_)) => {
+                        saw_turn_finished = true;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => panic!("runtime events closed before goal terminal"),
+                }
+            }
+        })
+        .await
+        .expect("recoverable exhaustion lost the goal terminal");
+        assert!(
+            saw_paused_at_cap,
+            "repeated recoverable failures must pause the goal at cap, not clear it"
+        );
+        assert!(
+            saw_turn_finished,
+            "the failed turn must still finish with a TurnFinished terminal"
+        );
+
+        // The paused goal re-engages on the next submit with its condition intact.
+        handle.submit(UserInput::from("continue")).await.unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                active: true,
+                phase: GoalPhase::Pursuing,
+                condition,
+                ..
+            })) if condition == "tests pass"
+        ));
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { text, .. }) if text == "continue"
+        ));
 
         handle.shutdown().await.unwrap();
     }

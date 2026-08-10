@@ -474,8 +474,25 @@ pub(crate) fn summarize_for_goal(messages: &[Message], previous: Option<&str>) -
     }
 }
 
-pub(crate) fn goal_continuation_message(verdict: &str, condition: &str) -> String {
-    format!("Goal not yet met: {verdict}\n\nKeep working toward this goal autonomously. Do NOT ask the user questions or wait for input — make reasonable assumptions and proceed; when genuinely blocked, pick the most sensible option and continue.\n\nGoal:\n```\n{condition}\n```")
+/// Continuation prompt injected into the MAIN agent when a goal round did not
+/// finish the goal. `progress` is the [`summarize_for_goal`] recap of what the
+/// goal has already done. It is folded into the message so the model keeps
+/// working from the last execution even after a compaction replaced the detailed
+/// history with an anchor summary — without it the model would re-run the whole
+/// goal from scratch, re-applying already-done work.
+pub(crate) fn goal_continuation_message(
+    verdict: &str,
+    condition: &str,
+    progress: Option<&str>,
+) -> String {
+    let mut text = format!(
+        "Goal not yet met: {verdict}\n\nKeep working toward this goal autonomously. Do NOT ask the user questions or wait for input — make reasonable assumptions and proceed; when genuinely blocked, pick the most sensible option and continue.\n\nGoal:\n```\n{condition}\n```"
+    );
+    if let Some(progress) = progress.filter(|progress| !progress.trim().is_empty()) {
+        text.push_str("\n\nProgress so far (continue from here, do NOT restart):\n");
+        text.push_str(progress);
+    }
+    text
 }
 
 fn sanitize_for_sentinel(value: &str) -> String {
@@ -977,5 +994,29 @@ mod tests {
             None,
             "time-uncapped goal must have no time-limit cap after resume"
         );
+    }
+
+    #[test]
+    fn goal_continuation_message_carries_progress_when_provided() {
+        let message = goal_continuation_message(
+            "still needs work",
+            "make tests pass",
+            Some("Files edited this goal: src/lib.rs\nRecent tool results: ok"),
+        );
+        assert!(message.contains("Goal not yet met: still needs work"));
+        assert!(message.contains("make tests pass"));
+        assert!(
+            message.contains("Progress so far (continue from here, do NOT restart)"),
+            "progress recap must be folded into the continuation prompt"
+        );
+        assert!(message.contains("Files edited this goal: src/lib.rs"));
+    }
+
+    #[test]
+    fn goal_continuation_message_omits_empty_progress() {
+        let message = goal_continuation_message("still needs work", "make tests pass", None);
+        assert!(!message.contains("Progress so far"));
+        let blank = goal_continuation_message("still needs work", "make tests pass", Some("   "));
+        assert!(!blank.contains("Progress so far"));
     }
 }
