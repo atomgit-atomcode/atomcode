@@ -4,6 +4,7 @@ pub mod roll;
 
 use crate::event::Record;
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -11,7 +12,13 @@ use uuid::Uuid;
 
 const READY_EXT: &str = "ndjson";
 const PARTIAL_EXT: &str = "partial";
+const INVALID_EXT: &str = "invalid";
 const SENDING_MARKER: &str = ".sending-";
+// Old AtomCode versions did not lock active partials. Requiring a full day
+// without a filesystem modification keeps cross-version recovery conservative.
+const PARTIAL_QUIET_AFTER: chrono::Duration = chrono::Duration::days(1);
+const RAW_RETENTION: chrono::Duration = chrono::Duration::days(90);
+const CLAIM_STALE_AFTER: chrono::Duration = chrono::Duration::minutes(1);
 
 pub struct Queue {
     dir: PathBuf,
@@ -23,6 +30,7 @@ pub struct Queue {
 pub struct Segment {
     pub path: PathBuf,
     ready_path: PathBuf,
+    marker_path: PathBuf,
     writer: BufWriter<File>,
     events: u32,
     bytes: u64,
@@ -30,14 +38,29 @@ pub struct Segment {
 
 impl Segment {
     fn new(path: PathBuf, ready_path: PathBuf) -> Result<Self> {
+        let marker_path = managed_marker_path(&path);
         let f = OpenOptions::new()
             .create_new(true)
+            .read(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("creating segment {}", path.display()))?;
+        f.lock_exclusive()
+            .with_context(|| format!("locking active segment {}", path.display()))?;
+        if let Err(error) = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&marker_path)
+        {
+            drop(f);
+            let _ = fs::remove_file(&path);
+            return Err(error)
+                .with_context(|| format!("creating segment marker {}", marker_path.display()));
+        }
         Ok(Self {
             path,
             ready_path,
+            marker_path,
             writer: BufWriter::new(f),
             events: 0,
             bytes: 0,
@@ -63,6 +86,7 @@ impl Segment {
         self.fsync()?;
         let partial_path = self.path.clone();
         let ready_path = self.ready_path.clone();
+        let marker_path = self.marker_path.clone();
         drop(self.writer);
         fs::rename(&partial_path, &ready_path).with_context(|| {
             format!(
@@ -71,6 +95,7 @@ impl Segment {
                 ready_path.display()
             )
         })?;
+        let _ = fs::remove_file(marker_path);
         Ok(ready_path)
     }
 }
@@ -83,9 +108,10 @@ impl Queue {
         //   1. .sending-* files are claimed segments whose HTTP POST never
         //      completed (process died mid-send).  Rename them back to
         //      .ndjson so the new process can retry.
-        //   2. Empty .partial files are segments created but never written
-        //      to before the process exited.  Safe to delete.
-        recover_stale_files(&dir)?;
+        //   2. Stale, valid .partial files are interrupted active segments.
+        //      Promote them to .ndjson without rewriting their original ts.
+        //   3. Empty .partial files are segments created but never written.
+        recover_stale_files_at(&dir, chrono::Utc::now(), false)?;
 
         Ok(Self {
             dir,
@@ -116,8 +142,10 @@ impl Queue {
             if seg.events == 0 {
                 // empty: drop the file
                 let path = seg.path.clone();
+                let marker_path = seg.marker_path.clone();
                 drop(seg.writer);
                 let _ = fs::remove_file(path);
+                let _ = fs::remove_file(marker_path);
                 return Ok(None);
             }
             let p = seg.finish()?;
@@ -149,7 +177,18 @@ impl Queue {
                 Uuid::new_v4()
             ));
             match fs::rename(&ready, &claimed) {
-                Ok(()) => return Ok(Some(claimed)),
+                Ok(()) => {
+                    if let Err(error) = filetime::set_file_mtime(
+                        &claimed,
+                        filetime::FileTime::from_system_time(std::time::SystemTime::now()),
+                    ) {
+                        let _ = fs::rename(&claimed, &ready);
+                        return Err(error).with_context(|| {
+                            format!("marking claimed segment {} active", claimed.display())
+                        });
+                    }
+                    return Ok(Some(claimed));
+                }
                 Err(e) if e.kind() == ErrorKind::NotFound => continue,
                 Err(e) => {
                     return Err(e).with_context(|| {
@@ -181,6 +220,78 @@ impl Queue {
         Ok(Some(ready))
     }
 
+    pub fn restore_claims_for_current_process(&self) -> Result<usize> {
+        let marker = format!("{}{}-", SENDING_MARKER, std::process::id());
+        let claims: Vec<PathBuf> = fs::read_dir(&self.dir)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(&marker))
+            })
+            .collect();
+        let mut restored = 0;
+        for claim in claims {
+            if self.restore_claim(&claim)?.is_some() {
+                restored += 1;
+            }
+        }
+        Ok(restored)
+    }
+
+    /// Remove every inactive local telemetry artifact. Active partials are
+    /// skipped when their advisory lock cannot be acquired.
+    pub fn clear_inactive(&self) -> Result<ClearStats> {
+        let mut stats = ClearStats::default();
+        for entry in fs::read_dir(&self.dir)? {
+            let path = entry?.path();
+            let extension = path.extension().and_then(|ext| ext.to_str());
+            match extension {
+                Some(READY_EXT) | Some(INVALID_EXT) => {
+                    fs::remove_file(&path)?;
+                    stats.removed += 1;
+                }
+                Some(PARTIAL_EXT) => {
+                    let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) else {
+                        stats.skipped += 1;
+                        continue;
+                    };
+                    if file.try_lock_exclusive().is_err() {
+                        stats.skipped += 1;
+                        continue;
+                    }
+                    drop(file);
+                    match fs::remove_file(&path) {
+                        Ok(()) => {
+                            let _ = fs::remove_file(managed_marker_path(&path));
+                            stats.removed += 1;
+                        }
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                _ => {
+                    if path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.contains(SENDING_MARKER))
+                    {
+                        stats.skipped += 1;
+                    }
+                }
+            }
+        }
+        Ok(stats)
+    }
+
+    /// Explicitly recover legacy partials created before lock markers existed.
+    /// Callers should ensure older AtomCode processes are stopped first.
+    pub fn recover_legacy_partials(&self) -> Result<usize> {
+        let before = self.ready_segments_sorted()?.len();
+        recover_stale_files_at(&self.dir, chrono::Utc::now(), true)?;
+        Ok(self.ready_segments_sorted()?.len().saturating_sub(before))
+    }
+
     fn segments_with_extension(&self, ext: &str) -> Result<Vec<PathBuf>> {
         let mut v: Vec<PathBuf> = fs::read_dir(&self.dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -197,6 +308,8 @@ impl Queue {
 
     pub fn stats(&self) -> Result<QueueStats> {
         let segs = self.segments_sorted()?;
+        let mut partials = self.segments_with_extension(PARTIAL_EXT)?;
+        partials.extend(self.segments_with_extension(INVALID_EXT)?);
         let mut total_bytes = 0u64;
         let mut total_events = 0u64;
         for p in &segs {
@@ -209,6 +322,11 @@ impl Queue {
             total_bytes,
             total_events,
             oldest: segs.first().cloned(),
+            stranded_partial_count: partials.len(),
+            stranded_partial_bytes: partials
+                .iter()
+                .filter_map(|p| fs::metadata(p).ok().map(|m| m.len()))
+                .sum(),
         })
     }
 
@@ -254,6 +372,14 @@ pub struct QueueStats {
     pub total_bytes: u64,
     pub total_events: u64,
     pub oldest: Option<PathBuf>,
+    pub stranded_partial_count: usize,
+    pub stranded_partial_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClearStats {
+    pub removed: usize,
+    pub skipped: usize,
 }
 
 fn ready_path_for_claim(path: &Path) -> Option<PathBuf> {
@@ -279,8 +405,13 @@ fn count_non_empty_lines(path: &Path) -> Result<u64> {
 /// that exited before completing its send or cleanup:
 ///
 /// - `.sending-*` files → rename back to `.ndjson` so they can be re-sent.
+/// - Stale, unlocked, valid `.partial` files within raw retention → `.ndjson`.
 /// - Empty `.partial` files → delete (they contain no events).
-fn recover_stale_files(dir: &Path) -> Result<()> {
+fn recover_stale_files_at(
+    dir: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+    recover_legacy: bool,
+) -> Result<()> {
     let entries: Vec<PathBuf> = fs::read_dir(dir)
         .with_context(|| format!("reading queue dir {}", dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -295,6 +426,9 @@ fn recover_stale_files(dir: &Path) -> Result<()> {
         // process died before the request completed or restore_claim ran.
         // Rename back to the original .ndjson so the sender retries them.
         if let Some(marker_start) = name.find(SENDING_MARKER) {
+            if !artifact_is_quiet(&path, now, CLAIM_STALE_AFTER) {
+                continue;
+            }
             let ready_name = &name[..marker_start];
             let ready_path = path.with_file_name(ready_name);
             match fs::rename(&path, &ready_path) {
@@ -315,29 +449,186 @@ fn recover_stale_files(dir: &Path) -> Result<()> {
             continue;
         }
 
-        // Clean up empty .partial files: these were created but never
-        // received any events before the process exited.
+        // Recover interrupted active segments conservatively. The age check
+        // protects partials written by pre-lock AtomCode versions; the lock
+        // protects active segments written by this and later versions.
         if name.ends_with(PARTIAL_EXT) {
-            if let Ok(meta) = fs::metadata(&path) {
-                if meta.len() == 0 {
-                    match fs::remove_file(&path) {
-                        Ok(()) => {
-                            tracing::info!("removed empty .partial segment {}", path.display());
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                ?e,
-                                "failed to remove empty .partial segment {}",
-                                path.display()
-                            );
-                        }
-                    }
-                }
+            let marker_path = managed_marker_path(&path);
+            let managed = marker_path.exists();
+            if !managed && !recover_legacy {
+                continue;
             }
+            if !managed && !partial_is_quiet(&path, now) {
+                continue;
+            }
+
+            let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) else {
+                continue;
+            };
+            if file.try_lock_exclusive().is_err() {
+                continue;
+            }
+            let empty = file.metadata().map(|m| m.len() == 0).unwrap_or(false);
+            let age = partial_filename_age(name, now);
+            if empty {
+                drop(file);
+                remove_recovered_artifact(&path, "empty telemetry .partial segment");
+                let _ = fs::remove_file(&marker_path);
+                continue;
+            }
+            if age.is_some_and(|age| age > RAW_RETENTION) {
+                drop(file);
+                remove_recovered_artifact(&path, "expired telemetry .partial segment");
+                let _ = fs::remove_file(&marker_path);
+                continue;
+            }
+            if !managed && !age.is_some_and(|age| age >= PARTIAL_QUIET_AFTER) {
+                continue;
+            }
+            let valid = partial_lines_are_valid(&file);
+            drop(file);
+            if !valid {
+                let invalid_path = path.with_extension(INVALID_EXT);
+                match fs::rename(&path, &invalid_path) {
+                    Ok(()) => tracing::warn!(
+                        "quarantined malformed telemetry segment as {}",
+                        invalid_path.display()
+                    ),
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    Err(e) => tracing::warn!(
+                        ?e,
+                        "failed to quarantine telemetry .partial segment {}",
+                        path.display()
+                    ),
+                }
+                let _ = fs::remove_file(&marker_path);
+                continue;
+            }
+
+            let ready_path = path.with_extension(READY_EXT);
+            match fs::rename(&path, &ready_path) {
+                Ok(()) => tracing::info!(
+                    "recovered stale telemetry .partial segment -> {}",
+                    ready_path.display()
+                ),
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(
+                    ?e,
+                    "failed to recover telemetry .partial segment {}",
+                    path.display()
+                ),
+            }
+            let _ = fs::remove_file(&marker_path);
         }
     }
 
+    cleanup_invalid_files(dir, now)?;
+
     Ok(())
+}
+
+fn managed_marker_path(partial: &Path) -> PathBuf {
+    let name = partial
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("segment.partial");
+    partial.with_file_name(format!("{name}.owner"))
+}
+
+fn cleanup_invalid_files(dir: &Path, now: chrono::DateTime<chrono::Utc>) -> Result<()> {
+    let mut invalid: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some(INVALID_EXT))
+        .collect();
+    invalid.sort();
+
+    for path in &invalid {
+        let expired = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| partial_filename_age(name, now))
+            .is_some_and(|age| age > RAW_RETENTION);
+        if expired {
+            remove_recovered_artifact(path, "expired invalid telemetry segment");
+        }
+    }
+
+    invalid.retain(|path| path.exists());
+    let mut total_bytes: u64 = invalid
+        .iter()
+        .filter_map(|path| fs::metadata(path).ok().map(|meta| meta.len()))
+        .sum();
+    while roll::over_cap(invalid.len(), total_bytes) {
+        let Some(oldest) = invalid.first().cloned() else {
+            break;
+        };
+        let bytes = fs::metadata(&oldest).map(|meta| meta.len()).unwrap_or(0);
+        remove_recovered_artifact(&oldest, "invalid telemetry segment over queue cap");
+        invalid.remove(0);
+        total_bytes = total_bytes.saturating_sub(bytes);
+    }
+    Ok(())
+}
+
+fn partial_filename_age(
+    name: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::Duration> {
+    let Some(stamp) = name.get(..15) else {
+        return None;
+    };
+    let Ok(naive) = chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%d-%H%M%S") else {
+        return None;
+    };
+    Some(now.signed_duration_since(naive.and_utc()))
+}
+
+fn partial_is_quiet(path: &Path, now: chrono::DateTime<chrono::Utc>) -> bool {
+    artifact_is_quiet(path, now, PARTIAL_QUIET_AFTER)
+}
+
+fn artifact_is_quiet(
+    path: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+    quiet_after: chrono::Duration,
+) -> bool {
+    let Ok(modified) = fs::metadata(path).and_then(|m| m.modified()) else {
+        return false;
+    };
+    now.signed_duration_since(chrono::DateTime::<chrono::Utc>::from(modified)) >= quiet_after
+}
+
+fn remove_recovered_artifact(path: &Path, label: &str) {
+    match fs::remove_file(path) {
+        Ok(()) => tracing::info!("removed {label} {}", path.display()),
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(?e, "failed to remove {label} {}", path.display()),
+    }
+}
+
+fn partial_lines_are_valid(file: &File) -> bool {
+    let Ok(cloned) = file.try_clone() else {
+        return false;
+    };
+    let mut saw_event = false;
+    for line in BufReader::new(cloned).lines() {
+        let Ok(line) = line else {
+            return false;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            return false;
+        };
+        if value.get("event_id").and_then(|v| v.as_str()).is_none()
+            || value.get("ts").and_then(|v| v.as_i64()).is_none()
+        {
+            return false;
+        }
+        saw_event = true;
+    }
+    saw_event
 }
 
 #[cfg(test)]
@@ -480,7 +771,12 @@ mod tests {
         // The .sending file should not appear in ready_segments.
         assert!(q.ready_segments_sorted().unwrap().is_empty());
 
-        // Re-open the queue — recover_stale_files should restore it.
+        recover_stale_files_at(
+            d.path(),
+            chrono::Utc::now() + CLAIM_STALE_AFTER + chrono::Duration::seconds(1),
+            false,
+        )
+        .unwrap();
         let q2 = Queue::open(d.path().to_path_buf()).unwrap();
         let ready = q2.ready_segments_sorted().unwrap();
         assert_eq!(
@@ -502,28 +798,208 @@ mod tests {
     }
 
     #[test]
-    fn open_removes_empty_partial_files() {
+    fn recovery_removes_empty_and_quarantines_malformed_partial_files() {
         let d = TempDir::new().unwrap();
+        let stamp = (chrono::Utc::now() - chrono::Duration::days(2)).format("%Y%m%d-%H%M%S");
 
         // Simulate stale empty .partial files left by a previous crash.
-        let empty_partial = d.path().join("20260512-000000-deadbeef.partial");
+        let empty_partial = d.path().join(format!("{stamp}-deadbeef.partial"));
         fs::File::create(&empty_partial).unwrap();
         assert_eq!(fs::metadata(&empty_partial).unwrap().len(), 0);
 
-        // Also create a non-empty .partial that should NOT be deleted.
-        let nonempty_partial = d.path().join("20260512-000001-alivecafe.partial");
+        let nonempty_partial = d.path().join(format!("{stamp}-alivecafe.partial"));
         fs::write(&nonempty_partial, b"some data\n").unwrap();
 
-        let _q = Queue::open(d.path().to_path_buf()).unwrap();
+        recover_stale_files_at(
+            d.path(),
+            chrono::Utc::now() + chrono::Duration::days(2),
+            true,
+        )
+        .unwrap();
 
         assert!(
             !empty_partial.exists(),
-            "empty .partial file should be removed on Queue::open"
+            "quiet empty .partial file should be removed"
         );
         assert!(
-            nonempty_partial.exists(),
-            "non-empty .partial file should be kept"
+            !nonempty_partial.exists(),
+            "malformed .partial file should be renamed"
         );
+        assert!(nonempty_partial.with_extension(INVALID_EXT).exists());
+    }
+
+    #[test]
+    fn open_recovers_stale_valid_partial_without_rewriting_event() {
+        let d = TempDir::new().unwrap();
+        let stamp = (chrono::Utc::now() - chrono::Duration::days(1)).format("%Y%m%d-%H%M%S");
+        let partial = d.path().join(format!("{stamp}-alivecafe.partial"));
+        let original = serde_json::to_string(&rec()).unwrap();
+        fs::write(&partial, format!("{original}\n")).unwrap();
+
+        recover_stale_files_at(
+            d.path(),
+            chrono::Utc::now() + chrono::Duration::days(2),
+            true,
+        )
+        .unwrap();
+        let q = Queue::open(d.path().to_path_buf()).unwrap();
+        let ready = q.ready_segments_sorted().unwrap();
+        assert_eq!(ready.len(), 1);
+        assert!(!partial.exists());
+        assert_eq!(
+            fs::read_to_string(&ready[0]).unwrap(),
+            format!("{original}\n")
+        );
+    }
+
+    #[test]
+    fn open_does_not_recover_recent_partial() {
+        let d = TempDir::new().unwrap();
+        let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        let partial = d.path().join(format!("{stamp}-alivecafe.partial"));
+        fs::write(
+            &partial,
+            format!("{}\n", serde_json::to_string(&rec()).unwrap()),
+        )
+        .unwrap();
+
+        let q = Queue::open(d.path().to_path_buf()).unwrap();
+        assert!(q.ready_segments_sorted().unwrap().is_empty());
+        assert!(partial.exists());
+        let stats = q.stats().unwrap();
+        assert_eq!(stats.stranded_partial_count, 1);
+        assert!(stats.stranded_partial_bytes > 0);
+    }
+
+    #[test]
+    fn open_does_not_automatically_recover_unmarked_legacy_partial() {
+        let d = TempDir::new().unwrap();
+        let stamp = (chrono::Utc::now() - chrono::Duration::days(2)).format("%Y%m%d-%H%M%S");
+        let partial = d.path().join(format!("{stamp}-legacy.partial"));
+        fs::write(
+            &partial,
+            format!("{}\n", serde_json::to_string(&rec()).unwrap()),
+        )
+        .unwrap();
+        filetime::set_file_mtime(
+            &partial,
+            filetime::FileTime::from_system_time(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86_400),
+            ),
+        )
+        .unwrap();
+
+        let q = Queue::open(d.path().to_path_buf()).unwrap();
+        assert!(q.ready_segments_sorted().unwrap().is_empty());
+        assert!(partial.exists());
+        assert_eq!(q.recover_legacy_partials().unwrap(), 1);
+        assert!(!partial.exists());
+    }
+
+    #[test]
+    fn open_automatically_recovers_managed_partial_after_crash() {
+        let d = TempDir::new().unwrap();
+        let partial = {
+            let mut q = Queue::open(d.path().to_path_buf()).unwrap();
+            q.append(&rec()).unwrap();
+            q.current.as_ref().unwrap().path.clone()
+        };
+        assert!(partial.exists());
+        assert!(managed_marker_path(&partial).exists());
+
+        let q = Queue::open(d.path().to_path_buf()).unwrap();
+        assert_eq!(q.ready_segments_sorted().unwrap().len(), 1);
+        assert!(!partial.exists());
+        assert!(!managed_marker_path(&partial).exists());
+    }
+
+    #[test]
+    fn clear_inactive_skips_locked_partial_and_removes_other_artifacts() {
+        let d = TempDir::new().unwrap();
+        let mut active = Queue::open(d.path().to_path_buf()).unwrap();
+        active.append(&rec()).unwrap();
+        let active_path = active.current.as_ref().unwrap().path.clone();
+        fs::write(d.path().join("old.ndjson"), b"event\n").unwrap();
+        fs::write(d.path().join("bad.invalid"), b"bad\n").unwrap();
+
+        let passive = Queue::open(d.path().to_path_buf()).unwrap();
+        let cleared = passive.clear_inactive().unwrap();
+        assert_eq!(cleared.removed, 2);
+        assert_eq!(cleared.skipped, 1);
+        assert!(active_path.exists());
+        assert!(active.force_roll().unwrap().unwrap().exists());
+    }
+
+    #[test]
+    fn recovery_removes_partial_outside_raw_retention() {
+        let d = TempDir::new().unwrap();
+        let stamp = (chrono::Utc::now() - RAW_RETENTION - chrono::Duration::days(1))
+            .format("%Y%m%d-%H%M%S");
+        let partial = d.path().join(format!("{stamp}-expired.partial"));
+        fs::write(
+            &partial,
+            format!("{}\n", serde_json::to_string(&rec()).unwrap()),
+        )
+        .unwrap();
+
+        recover_stale_files_at(
+            d.path(),
+            chrono::Utc::now() + chrono::Duration::days(2),
+            true,
+        )
+        .unwrap();
+        let q = Queue::open(d.path().to_path_buf()).unwrap();
+        assert!(q.ready_segments_sorted().unwrap().is_empty());
+        assert!(!partial.exists());
+    }
+
+    #[test]
+    fn open_does_not_recover_locked_stale_partial() {
+        let d = TempDir::new().unwrap();
+        let stamp = (chrono::Utc::now() - PARTIAL_QUIET_AFTER - chrono::Duration::minutes(1))
+            .format("%Y%m%d-%H%M%S");
+        let partial = d.path().join(format!("{stamp}-locked.partial"));
+        fs::write(
+            &partial,
+            format!("{}\n", serde_json::to_string(&rec()).unwrap()),
+        )
+        .unwrap();
+        let active = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&partial)
+            .unwrap();
+        active.lock_exclusive().unwrap();
+
+        recover_stale_files_at(
+            d.path(),
+            chrono::Utc::now() + chrono::Duration::days(2),
+            true,
+        )
+        .unwrap();
+        let q = Queue::open(d.path().to_path_buf()).unwrap();
+        assert!(q.ready_segments_sorted().unwrap().is_empty());
+        assert!(partial.exists());
+    }
+
+    #[test]
+    fn recovery_does_not_delete_active_zero_length_partial() {
+        let d = TempDir::new().unwrap();
+        let mut q = Queue::open(d.path().to_path_buf()).unwrap();
+        q.append(&rec()).unwrap();
+        let active_path = q.current.as_ref().unwrap().path.clone();
+        assert_eq!(fs::metadata(&active_path).unwrap().len(), 0);
+
+        recover_stale_files_at(
+            d.path(),
+            chrono::Utc::now() + chrono::Duration::days(2),
+            false,
+        )
+        .unwrap();
+
+        assert!(active_path.exists());
+        let ready = q.force_roll().unwrap().unwrap();
+        assert!(ready.exists());
     }
 
     #[test]

@@ -171,6 +171,102 @@ async fn track_writes_to_disk_queue() {
 }
 
 #[tokio::test]
+async fn shutdown_attempts_one_bounded_send_after_persisting() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/events"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let d = tempfile::TempDir::new().unwrap();
+    let cfg = ResolvedConfig {
+        state: TelemetryState::Enabled,
+        endpoint: format!("{}/v1/events", server.uri()),
+        atomcode_dir: d.path().to_path_buf(),
+    };
+    let tel = Telemetry::init(cfg, "test".into());
+    tel.track(Event::OpenAtomcode {
+        dangerously_skip_permissions: false,
+    });
+    tel.shutdown(std::time::Duration::from_secs(2)).await;
+
+    let q = Queue::open(d.path().join("telemetry/queue")).unwrap();
+    assert!(q.ready_segments_sorted().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn shutdown_drains_backlog_including_latest_event() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/events"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let d = tempfile::TempDir::new().unwrap();
+    let qdir = d.path().join("telemetry/queue");
+    let mut queue = Queue::open(qdir.clone()).unwrap();
+    for _ in 0..2 {
+        queue.append(&rec()).unwrap();
+        queue.force_roll().unwrap();
+    }
+    let cfg = ResolvedConfig {
+        state: TelemetryState::Enabled,
+        endpoint: format!("{}/v1/events", server.uri()),
+        atomcode_dir: d.path().to_path_buf(),
+    };
+    let tel = Telemetry::init(cfg, "test".into());
+    tel.track(Event::TelemetryDisabled);
+    tel.shutdown(std::time::Duration::from_secs(2)).await;
+
+    assert!(Queue::open(qdir)
+        .unwrap()
+        .ready_segments_sorted()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn shutdown_timeout_restores_cancelled_claim() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/events"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(2)))
+        .mount(&server)
+        .await;
+
+    let d = tempfile::TempDir::new().unwrap();
+    let cfg = ResolvedConfig {
+        state: TelemetryState::Enabled,
+        endpoint: format!("{}/v1/events", server.uri()),
+        atomcode_dir: d.path().to_path_buf(),
+    };
+    let tel = Telemetry::init(cfg, "test".into());
+    tel.track(Event::OpenAtomcode {
+        dangerously_skip_permissions: false,
+    });
+    tel.shutdown(std::time::Duration::from_millis(50)).await;
+
+    let qdir = d.path().join("telemetry/queue");
+    let names: Vec<String> = std::fs::read_dir(&qdir)
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .collect();
+    assert!(names.iter().all(|name| !name.contains(".sending-")));
+    assert_eq!(
+        Queue::open(qdir)
+            .unwrap()
+            .ready_segments_sorted()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn counters_increment_on_post() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

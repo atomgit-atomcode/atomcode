@@ -1024,6 +1024,8 @@ pub enum TelemetryAction {
     },
     /// Clear queued events (does not change enabled state)
     Clear,
+    /// Recover legacy .partial files after all older AtomCode processes stop
+    Recover,
 }
 
 /// Environment variable set by this process for its re-exec'd child, so
@@ -1498,6 +1500,7 @@ async fn run() -> Result<i32> {
                         telemetry_cmd::dump(&atomcode_dir, last, pretty)?
                     }
                     TelemetryAction::Clear => telemetry_cmd::clear(&atomcode_dir)?,
+                    TelemetryAction::Recover => telemetry_cmd::recover(&atomcode_dir)?,
                 }
                 // Flush telemetry before exiting.
                 telemetry
