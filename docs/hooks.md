@@ -244,15 +244,16 @@ Compatible with Claude Code plugin's `.hooks.json`. Load paths:
 }
 ```
 
-Supported `event` values: `pre_tool_use`, `post_tool_use`, `session_start`, `session_end`, `user_prompt_submit`.
+Supported `event` values: `pre_tool_use`, `post_tool_use`, `post_tool_use_failure`, `session_start`, `session_end`, `user_prompt_submit`.
 
-> **Case/style-insensitive:** the loader accepts both CC PascalCase (`PreToolUse`, `PostToolUse`, `SessionStart`, `UserPromptSubmit`) and snake_case (`pre_tool_use`, `session_start`, …) — the two spellings are equivalent.
+> **Case/style-insensitive:** the loader accepts both CC PascalCase (`PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `SessionStart`, `UserPromptSubmit`) and snake_case (`pre_tool_use`, `post_tool_use_failure`, `session_start`, …) — the two spellings are equivalent.
 
 Hooks receive context via environment variables (`ATOMCODE_HOOK_EVENT`, `ATOMCODE_HOOK_CONTEXT`, `ATOMCODE_TOOL_NAME`, etc.). The stdout protocol varies by event:
 
 - **`pre_tool_use`** — output `{"action":"allow"}` / `{"action":"block","reason":"..."}` / `{"action":"modify","args":{...}}` (`args` replaces the tool-call arguments)
 - **`user_prompt_submit`** — output `{"decision":"block","reason":"..."}` to block submission, or `{"hookSpecificOutput":{"additionalContext":"..."}}` to inject extra context; plain-text stdout is treated as an additionalContext injection
-- **`post_tool_use` / `session_start` / `session_end`** — fire-and-forget; stdout does not affect the flow
+- **`post_tool_use`** — fire-and-forget; stdout does not affect the flow
+- **`post_tool_use_failure`** — like `post_tool_use`, but fired only when the tool call FAILED (`tool_response` carries the error output), so a plugin can tell success from failure
 
 ---
 
