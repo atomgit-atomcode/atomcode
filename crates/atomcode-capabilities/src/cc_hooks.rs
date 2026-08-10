@@ -93,7 +93,7 @@ impl HookEvent {
 #[derive(Debug, Clone)]
 pub struct HookConfig {
     pub event: HookEvent,
-    /// Tool-name matcher (`PreToolUse`/`PostToolUse` only). `None`/`"*"` = all;
+    /// Tool-name matcher (`PreToolUse`/`PostToolUse`/`PostToolUseFailure`). `None`/`"*"` = all;
     /// `"foo_*"` = prefix; otherwise exact.
     pub matcher: Option<String>,
     pub command: String,
@@ -783,9 +783,10 @@ impl ToolMiddleware for CCExternalHooks {
         if matches!(gate, BeforeOutcome::Ask { .. }) {
             gate = self.resolve_ask(call, rt).await;
         }
-        // Remember this call's tool name for PostToolUse `after` (kernel hands it no tool
-        // name), but ONLY for a call that will actually run — a Deny here means the tool is
-        // blocked, so its PostToolUse must not fire. `after` removes the entry.
+        // Remember this call's tool name for PostToolUse / PostToolUseFailure `after`
+        // (kernel hands it no tool name), but ONLY for a call that will actually run — a
+        // Deny here means the tool is blocked, so its post-tool hook must not fire.
+        // `after` removes the entry.
         if self.has_post_tool_hooks && !gate.is_deny() {
             if let Ok(mut m) = self.call_tools.lock() {
                 m.insert(call.id.clone(), call.name.clone());
