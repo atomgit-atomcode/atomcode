@@ -13,6 +13,9 @@ use uuid::Uuid;
 const READY_EXT: &str = "ndjson";
 const PARTIAL_EXT: &str = "partial";
 const INVALID_EXT: &str = "invalid";
+// Suffix appended to an active `.partial` to mark it as written by a lock-aware
+// AtomCode version (`X.partial` -> `X.partial.owner`).
+const MARKER_SUFFIX: &str = ".owner";
 const SENDING_MARKER: &str = ".sending-";
 // Old AtomCode versions did not lock active partials. Requiring a full day
 // without a filesystem modification keeps cross-version recovery conservative.
@@ -523,6 +526,7 @@ fn recover_stale_files_at(
     }
 
     cleanup_invalid_files(dir, now)?;
+    cleanup_orphan_markers(dir)?;
 
     Ok(())
 }
@@ -532,7 +536,30 @@ fn managed_marker_path(partial: &Path) -> PathBuf {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("segment.partial");
-    partial.with_file_name(format!("{name}.owner"))
+    partial.with_file_name(format!("{name}{MARKER_SUFFIX}"))
+}
+
+/// Remove `.owner` markers whose `.partial` is gone — the segment was already
+/// promoted or removed and the marker was orphaned (e.g. a crash between
+/// `Segment::finish`'s rename and the marker cleanup). A marker whose `.partial`
+/// still exists (a live, locked segment held by another process) is left alone.
+fn cleanup_orphan_markers(dir: &Path) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let is_marker = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(MARKER_SUFFIX));
+        if !is_marker {
+            continue;
+        }
+        // The marker for `X.partial` is `X.partial.owner`; drop the suffix.
+        let partial = path.with_extension("");
+        if !partial.exists() {
+            remove_recovered_artifact(&path, "orphan telemetry segment marker");
+        }
+    }
+    Ok(())
 }
 
 fn cleanup_invalid_files(dir: &Path, now: chrono::DateTime<chrono::Utc>) -> Result<()> {
@@ -554,11 +581,16 @@ fn cleanup_invalid_files(dir: &Path, now: chrono::DateTime<chrono::Utc>) -> Resu
     }
 
     invalid.retain(|path| path.exists());
+    // Quarantined segments share the queue budget with ready data instead of
+    // opening a second one (which would let the on-disk footprint reach ~2× the
+    // cap). Evict the oldest invalid files first while the COMBINED ready+invalid
+    // footprint is over cap, so live telemetry keeps priority over quarantine.
+    let (ready_count, ready_bytes) = ready_footprint(dir);
     let mut total_bytes: u64 = invalid
         .iter()
         .filter_map(|path| fs::metadata(path).ok().map(|meta| meta.len()))
         .sum();
-    while roll::over_cap(invalid.len(), total_bytes) {
+    while roll::over_cap(ready_count + invalid.len(), ready_bytes + total_bytes) {
         let Some(oldest) = invalid.first().cloned() else {
             break;
         };
@@ -568,6 +600,21 @@ fn cleanup_invalid_files(dir: &Path, now: chrono::DateTime<chrono::Utc>) -> Resu
         total_bytes = total_bytes.saturating_sub(bytes);
     }
     Ok(())
+}
+
+/// Count and size the ready `.ndjson` segments currently on disk (best-effort).
+fn ready_footprint(dir: &Path) -> (usize, u64) {
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    if let Ok(entries) = fs::read_dir(dir) {
+        for path in entries.filter_map(|entry| entry.ok().map(|entry| entry.path())) {
+            if path.extension().and_then(|ext| ext.to_str()) == Some(READY_EXT) {
+                count += 1;
+                bytes += fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+            }
+        }
+    }
+    (count, bytes)
 }
 
 fn partial_filename_age(
@@ -1009,5 +1056,51 @@ mod tests {
         fs::write(&path, b"{\"a\":1}\n\n{\"b\":2}\n\n").unwrap();
 
         assert_eq!(count_non_empty_lines(&path).unwrap(), 2);
+    }
+
+    #[test]
+    fn invalid_files_share_the_queue_cap_with_ready_segments() {
+        let d = TempDir::new().unwrap();
+        // Fill ready segments up to the cap.
+        for i in 0..roll::MAX_SEGMENT_FILES {
+            fs::write(d.path().join(format!("20260101-000000-{i:08x}.ndjson")), b"{}\n").unwrap();
+        }
+        // Quarantined segments must not open a second, independent budget.
+        let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        for i in 0..10 {
+            fs::write(d.path().join(format!("{stamp}-{i:08x}.invalid")), b"x\n").unwrap();
+        }
+
+        recover_stale_files_at(d.path(), chrono::Utc::now(), false).unwrap();
+
+        let count = |ext: &str| {
+            fs::read_dir(d.path())
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some(ext))
+                .count()
+        };
+        let combined = count(READY_EXT) + count(INVALID_EXT);
+        assert!(
+            combined <= roll::MAX_SEGMENT_FILES,
+            "ready + invalid ({combined}) must stay within the shared cap {}",
+            roll::MAX_SEGMENT_FILES
+        );
+    }
+
+    #[test]
+    fn recovery_removes_orphan_owner_markers() {
+        let d = TempDir::new().unwrap();
+        // A marker left behind after its .partial was already promoted/removed
+        // (crash between finish()'s rename and the marker cleanup).
+        let orphan = d.path().join("20260101-000000-deadbeef.partial.owner");
+        fs::write(&orphan, b"").unwrap();
+
+        recover_stale_files_at(d.path(), chrono::Utc::now(), false).unwrap();
+
+        assert!(
+            !orphan.exists(),
+            "orphan .owner marker (no matching .partial) should be cleaned up"
+        );
     }
 }

@@ -634,7 +634,12 @@ async fn run_sender(
                         retry_attempt = 0;
                         Duration::from_secs(60)
                     }
-                    Err(crate::sender::http::SendError::BadRequest) => {
+                    // 400/413: flush_one already dropped the unsendable segment;
+                    // advance to the next one immediately.
+                    Err(
+                        crate::sender::http::SendError::BadRequest
+                        | crate::sender::http::SendError::PayloadTooLarge,
+                    ) => {
                         retry_attempt = 0;
                         Duration::ZERO
                     }

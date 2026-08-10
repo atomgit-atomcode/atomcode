@@ -306,3 +306,47 @@ async fn counters_increment_on_post() {
     );
     assert!(health_path.exists(), "health.json should be written");
 }
+
+#[tokio::test]
+async fn payload_too_large_drops_segment_instead_of_retrying_forever() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/events"))
+        .respond_with(ResponseTemplate::new(413))
+        .mount(&server)
+        .await;
+
+    let d = TempDir::new().unwrap();
+    let mut q = Queue::open(d.path().to_path_buf()).unwrap();
+    q.append(&rec()).unwrap();
+    q.force_roll().unwrap();
+
+    let q = Arc::new(Mutex::new(q));
+    let http = HttpSender::new(format!("{}/v1/events", server.uri()), "test".into());
+    let counters = Arc::new(atomcode_telemetry::Counters::default());
+    let rt = SenderRuntime::new(q.clone(), http, counters, d.path().join("health.json"));
+
+    // 413 is a permanent client error — retrying the identical oversized body will
+    // always fail. It must be dropped (like 400) so it never blocks the oldest-first
+    // queue, not restored to be re-claimed forever.
+    let result = rt.flush_one().await;
+    assert!(
+        matches!(
+            result,
+            Err(atomcode_telemetry::sender::http::SendError::PayloadTooLarge)
+        ),
+        "expected PayloadTooLarge, got {result:?}"
+    );
+    assert!(
+        q.lock().await.ready_segments_sorted().unwrap().is_empty(),
+        "oversized segment must not be restored to ready"
+    );
+    let names: Vec<String> = std::fs::read_dir(d.path())
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .collect();
+    assert!(
+        names.iter().all(|n| !n.contains(".sending-")),
+        "oversized segment's claim must be dropped, found {names:?}"
+    );
+}
