@@ -273,7 +273,7 @@ impl TeamRunManager {
                 TeamMemberRuntime {
                     id: member_id.clone(),
                     role: task.role.to_string(),
-                    model,
+                    model: model.clone(),
                     description: task.description.clone(),
                     status: TeamMemberStatus::Queued,
                     result: String::new(),
@@ -282,6 +282,17 @@ impl TeamRunManager {
                     abort: None,
                 },
             )?;
+            self.emit(
+                generation,
+                &run_id,
+                &seq,
+                TeamEventPayload::MemberQueued {
+                    member_id: member_id.clone(),
+                    role: task.role,
+                    model,
+                    description: task.description.clone(),
+                },
+            );
             let manager = self.clone();
             let run = run_id.clone();
             let member = member_id.clone();
@@ -1002,6 +1013,10 @@ mod tests {
         );
 
         let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            &event.event.payload,
+            TeamEventPayload::MemberQueued { model, .. } if model == "test-model"
+        )));
         assert!(events.iter().any(|event| matches!(
             &event.event.payload,
             TeamEventPayload::MemberStarted { model, .. } if model == "test-model"

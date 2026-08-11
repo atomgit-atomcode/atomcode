@@ -1456,7 +1456,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // the row in the ordinary ToolName/Secondary palette.
         let is_subagent_fanout = matches!(
             safe_name.to_ascii_lowercase().as_str(),
-            "task" | "codereview" | "code_review"
+            "task" | "team" | "codereview" | "code_review"
         );
         let prefix = format!("{} ", icon);
         let prefix_style = if is_subagent_fanout {
@@ -3087,8 +3087,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if needs_summary && rows.len() < cap {
             let mut parts = Vec::new();
             let hidden_running = running.len().saturating_sub(visible_running);
-            let expands_single_pending = !subtasks.call_id.starts_with("team:")
-                && pending.len() == 1
+            let expands_single_pending = pending.len() == 1
+                && pending_count == 1
                 && hidden_running == 0
                 && failed == 0;
             if hidden_running > 0 {
@@ -11264,34 +11264,36 @@ mod tests {
     #[test]
     fn retained_inflight_subagent_fanout_uses_brand_activity_style() {
         let (mut r, _buf) = new_capturing(100, 24);
-        r.render_inflight_tool(
-            "⠋",
-            "Task",
-            "3 subtasks",
-            " · thinking… (57s · ↑ 715 tokens)",
-        );
-
-        let row = r
-            .body_lines
-            .iter()
-            .find(|row| {
-                row.iter()
-                    .map(|cell| cell.ch)
-                    .collect::<String>()
-                    .contains("Task")
-            })
-            .expect("live Task row");
         let brand = r.style_for(Role::Brand).fg;
         assert!(
             brand.is_some(),
             "capturing terminal should enable brand color"
         );
-        assert!(
-            row.iter()
-                .filter(|cell| !cell.ch.is_whitespace())
-                .all(|cell| cell.style.fg == brand),
-            "live Task activity, including detail and spinner metadata, must use brand color"
-        );
+        for name in ["Task", "Team"] {
+            r.render_inflight_tool(
+                "⠋",
+                name,
+                "3 subtasks",
+                " · thinking… (57s · ↑ 715 tokens)",
+            );
+
+            let row = r
+                .body_lines
+                .iter()
+                .find(|row| {
+                    row.iter()
+                        .map(|cell| cell.ch)
+                        .collect::<String>()
+                        .contains(name)
+                })
+                .unwrap_or_else(|| panic!("live {name} row"));
+            assert!(
+                row.iter()
+                    .filter(|cell| !cell.ch.is_whitespace())
+                    .all(|cell| cell.style.fg == brand),
+                "live {name} activity, including detail and spinner metadata, must use brand color"
+            );
+        }
 
         r.render_inflight_tool("⠙", "Read", "src/lib.rs", " (2s)");
         let ordinary = r
@@ -16248,7 +16250,7 @@ mod tests {
     }
 
     #[test]
-    fn subtask_panel_expands_the_only_pending_task() {
+    fn subtask_and_team_panels_expand_the_only_pending_task() {
         use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
 
         let (r, _buf) = new_capturing(120, 24);
@@ -16261,28 +16263,30 @@ mod tests {
             output_tokens: 128,
             status: state,
         };
-        let progress = SubtaskProgress {
-            call_id: "call-task".into(),
-            completed: 0,
-            total: 4,
-            items: vec![
-                item("explore#1", SubtaskStatus::Running),
-                item("explore#2", SubtaskStatus::Running),
-                item("explore#3", SubtaskStatus::Running),
-                item("explore#4", SubtaskStatus::Pending),
-            ],
-        };
+        for call_id in ["call-task", "team:runtime"] {
+            let progress = SubtaskProgress {
+                call_id: call_id.into(),
+                completed: 0,
+                total: 4,
+                items: vec![
+                    item("explore#1", SubtaskStatus::Running),
+                    item("explore#2", SubtaskStatus::Running),
+                    item("explore#3", SubtaskStatus::Running),
+                    item("explore#4", SubtaskStatus::Pending),
+                ],
+            };
 
-        let text = r
-            .build_subtask_rows(&progress, 120)
-            .iter()
-            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
-            .collect::<Vec<_>>();
+            let text = r
+                .build_subtask_rows(&progress, 120)
+                .iter()
+                .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+                .collect::<Vec<_>>();
 
-        assert_eq!(text.len(), MAX_SUBTASK_PANEL_ROWS);
-        assert!(text[0].trim().is_empty());
-        assert!(text[5].contains("explore#4 · GLM-5.2 · inspect explore#4 · pending"));
-        assert!(!text[5].contains("1 pending"));
+            assert_eq!(text.len(), MAX_SUBTASK_PANEL_ROWS);
+            assert!(text[0].trim().is_empty());
+            assert!(text[5].contains("explore#4 · GLM-5.2 · inspect explore#4 · pending"));
+            assert!(!text[5].contains("1 pending"));
+        }
     }
 
     #[test]

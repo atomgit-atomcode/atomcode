@@ -150,6 +150,12 @@ pub enum TeamEventPayload {
     RunStarted {
         total: usize,
     },
+    MemberQueued {
+        member_id: TeamMemberId,
+        role: TeamRoleId,
+        model: String,
+        description: String,
+    },
     MemberStarted {
         member_id: TeamMemberId,
         role: TeamRoleId,

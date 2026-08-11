@@ -59,6 +59,21 @@ impl TeamProjection {
                 run.total = total;
                 self.visible = true;
             }
+            TeamEventPayload::MemberQueued {
+                member_id,
+                role,
+                model,
+                description,
+            } => {
+                let member = run.members.entry(member_id.to_string()).or_default();
+                member.label = role.to_string();
+                member.description = description;
+                member.model = model;
+                member.activity = "queued".into();
+                member.status = SubtaskStatus::Pending;
+                run.total = run.total.max(run.members.len());
+                self.visible = true;
+            }
             TeamEventPayload::MemberStarted {
                 member_id,
                 role,
@@ -291,6 +306,32 @@ mod tests {
         assert!(state.panel().is_some());
         state.clear();
         assert_eq!(state.summary(), "No Team runs.");
+    }
+
+    #[test]
+    fn reducer_projects_queued_member_metadata_as_pending() {
+        let mut state = TeamProjection::default();
+        state.apply(1, event("a", 1, TeamEventPayload::RunStarted { total: 1 }));
+        state.apply(
+            1,
+            event(
+                "a",
+                2,
+                TeamEventPayload::MemberQueued {
+                    member_id: TeamMemberId::new("performance#1"),
+                    role: TeamRoleId::Performance,
+                    model: "GLM-5.2".into(),
+                    description: "inspect render hot path".into(),
+                },
+            ),
+        );
+
+        let panel = state.panel().unwrap();
+        assert_eq!(panel.items.len(), 1);
+        assert_eq!(panel.items[0].label, "performance");
+        assert_eq!(panel.items[0].model, "GLM-5.2");
+        assert_eq!(panel.items[0].description, "inspect render hot path");
+        assert_eq!(panel.items[0].status, SubtaskStatus::Pending);
     }
 
     #[test]
