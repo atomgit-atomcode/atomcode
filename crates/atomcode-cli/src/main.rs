@@ -1488,6 +1488,13 @@ async fn run() -> Result<i32> {
             }
             Commands::Webui { port, host } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
+                // Fail before binding a port and opening a browser: without the
+                // assets every page would be a 404, and the cause is a build
+                // step, not anything the running server can recover from.
+                if !atomcode_daemon::webui::is_built() {
+                    eprint!("{}", atomcode_daemon::webui::NOT_BUILT_HELP);
+                    return Ok(1);
+                }
                 let msg = atomcode_daemon::ensure_server_and_open(&host, port, false).await;
                 eprintln!("{msg}");
                 // server 是后台 task；保持进程存活直到用户 Ctrl+C
