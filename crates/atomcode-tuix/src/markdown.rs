@@ -1207,11 +1207,26 @@ fn render_inline(line: &str, caps: TerminalCaps) -> String {
 /// identifiers (`第①章`) byte-for-byte unchanged. This is shared by ephemeral
 /// display projections; conversation/session source text is never rewritten.
 pub(crate) fn normalize_circled_list_spacing(line: &str) -> Cow<'_, str> {
+    normalize_circled_list_spacing_with_cursor(line, 0).0
+}
+
+/// Display-only circled-list spacing plus the corresponding cursor position.
+///
+/// The composer owns a byte cursor into the unmodified input buffer. Synthetic
+/// separator bytes inserted before (or exactly at) that cursor must therefore
+/// advance its display projection, while the source text and submitted payload
+/// remain byte-for-byte unchanged.
+pub(crate) fn normalize_circled_list_spacing_with_cursor(
+    line: &str,
+    cursor_byte: usize,
+) -> (Cow<'_, str>, usize) {
     let mut chars = line.char_indices().peekable();
     let mut previous = None;
     let mut in_code = false;
     let mut output: Option<String> = None;
     let mut segment_start = 0;
+    let source_cursor = cursor_byte.min(line.len());
+    let mut display_cursor = source_cursor;
 
     while let Some((index, ch)) = chars.next() {
         if ch == '`' {
@@ -1228,17 +1243,21 @@ pub(crate) fn normalize_circled_list_spacing(line: &str) -> Cow<'_, str> {
             output.push_str(&line[segment_start..end]);
             output.push(' ');
             segment_start = end;
+            if end <= source_cursor {
+                display_cursor += 1;
+            }
         }
         previous = Some(ch);
     }
 
-    match output {
+    let display = match output {
         Some(mut output) => {
             output.push_str(&line[segment_start..]);
             Cow::Owned(output)
         }
         None => Cow::Borrowed(line),
-    }
+    };
+    (display, display_cursor)
 }
 
 fn is_circled_list_boundary(ch: char) -> bool {
@@ -1761,6 +1780,30 @@ mod tests {
             render_inline_line("① Rust、② 前端、第①章、build①Rust", plain_caps()),
             "① Rust、② 前端、第①章、build①Rust"
         );
+    }
+
+    #[test]
+    fn circled_list_spacing_maps_composer_cursor_without_mutating_source() {
+        let source = "①Rust、②前端";
+
+        let (display, cursor_after_first_label) =
+            normalize_circled_list_spacing_with_cursor(source, '①'.len_utf8());
+        assert_eq!(display, "① Rust、② 前端");
+        assert_eq!(cursor_after_first_label, '①'.len_utf8() + 1);
+
+        let (display, cursor_at_end) =
+            normalize_circled_list_spacing_with_cursor(source, source.len());
+        assert_eq!(display, "① Rust、② 前端");
+        assert_eq!(cursor_at_end, source.len() + 2);
+        assert_eq!(source, "①Rust、②前端");
+    }
+
+    #[test]
+    fn circled_list_cursor_mapping_ignores_code_and_existing_spaces() {
+        let source = "`①Rust` ② 前端";
+        let (display, cursor) = normalize_circled_list_spacing_with_cursor(source, source.len());
+        assert_eq!(display, source);
+        assert_eq!(cursor, source.len());
     }
 
     #[test]

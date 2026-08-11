@@ -4156,10 +4156,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             scrub_controls(&self.input_buf)
         };
+        let (display, display_cursor_byte) =
+            crate::markdown::normalize_circled_list_spacing_with_cursor(
+                &safe,
+                self.input_cursor_byte,
+            );
         let (mut lines, cursor_row_in_middle, cursor_col_in_row) = if text_budget == 0 {
             (vec![String::new()], 0usize, 0usize)
         } else {
-            crate::width::wrap_with_cursor(&safe, text_budget, self.input_cursor_byte)
+            crate::width::wrap_with_cursor(&display, text_budget, display_cursor_byte)
         };
         if lines.is_empty() {
             lines.push(String::new());
@@ -5245,10 +5250,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             scrub_controls(&self.input_buf)
         };
+        let (display, display_cursor_byte) =
+            crate::markdown::normalize_circled_list_spacing_with_cursor(
+                &safe,
+                self.input_cursor_byte,
+            );
         let middle_rows = if text_budget == 0 {
             1
         } else {
-            crate::width::wrap_with_cursor(&safe, text_budget, self.input_cursor_byte)
+            crate::width::wrap_with_cursor(&display, text_budget, display_cursor_byte)
                 .0
                 .len()
                 .max(1)
@@ -17486,6 +17496,41 @@ mod tests {
         );
         assert!(!visible.contains("①Rust"));
         assert!(!visible.contains("②前端"));
+    }
+
+    /// History recall restores source text into the live composer rather than
+    /// emitting a committed `UiLine::User`. Its display projection must apply
+    /// the same circled-label spacing without changing the recalled buffer.
+    #[test]
+    fn retained_composer_spaces_recalled_circled_list_labels() {
+        let (mut r, buf) = new_capturing(120, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(120, 24);
+        let source = "如果是 ①Rust、②前端：属于模型没加空格，无需修 TUI。";
+        let mut status = status_basic();
+        status.history = Some(crate::render::HistoryPosition {
+            current: 119,
+            total: 119,
+        });
+
+        r.render(UiLine::InputPrompt {
+            buf: source.into(),
+            cursor_byte: source.len(),
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        assert!(
+            vterm.any_row(|row| row.contains("① Rust") && row.contains("② 前")),
+            "recalled composer should use spaced display projection:\n{}",
+            vterm.dump()
+        );
+        assert_eq!(
+            r.input_buf, source,
+            "recalled source text must stay unchanged"
+        );
     }
 
     /// A multi-line committed message uses the same layout as the composer:
