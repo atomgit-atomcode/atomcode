@@ -17,15 +17,17 @@ object DaemonTokenFile {
         else Path.of(System.getProperty("user.home"), ".atomcode")
     }
 
-    fun read(port: Int): String? = try {
-        val filePath = atomcodeHome().resolve("daemon-$port.json")
-        val raw = Files.readString(filePath)
-        val element = JsonParser.parseString(raw)
-        if (!element.isJsonObject) return null
-        val obj = element.asJsonObject
-        val token = obj.get("token")?.takeIf { !it.isJsonNull }?.asString
-        token?.takeIf { it.isNotEmpty() }
-    } catch (_: Exception) {
-        null
+    fun read(port: Int): String? {
+        return try {
+            val filePath = atomcodeHome().resolve("daemon-$port.json")
+            val raw = Files.readString(filePath)
+            val element = JsonParser.parseString(raw)
+            if (!element.isJsonObject) return null
+            val obj = element.asJsonObject
+            val token = obj.get("token")?.takeIf { !it.isJsonNull }?.asString
+            token?.takeIf { it.isNotEmpty() }
+        } catch (_: Exception) {
+            null
+        }
     }
 }

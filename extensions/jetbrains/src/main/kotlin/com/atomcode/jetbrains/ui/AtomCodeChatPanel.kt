@@ -201,6 +201,31 @@ class AtomCodeChatPanel(
     // ── UI components ──
     private val header = HeaderPanel()
     private val messageView = JBCefMessageView { action -> handleWelcomeAction(action) }
+    /** 持久化失败警告条文本标签，由 [persistenceWarningBar] CENTER 区持有；直接引用避免位置查找。 */
+    private val persistenceWarningText = JLabel().apply {
+        foreground = JBColor(0x6B5200, 0xF0D890)
+    }
+    /** 持久化失败警告条（时间线外展示，符合 daemon 契约）。默认隐藏。 */
+    private val persistenceWarningBar = JPanel(BorderLayout(8, 0)).apply {
+        isVisible = false
+        border = BorderFactory.createEmptyBorder(4, 8, 4, 8)
+        background = JBColor(0xFFF3E2, 0x5A4A1F)
+        add(
+            JLabel("⚠").apply { border = BorderFactory.createEmptyBorder(0, 0, 0, 4) },
+            BorderLayout.WEST,
+        )
+        add(persistenceWarningText, BorderLayout.CENTER)
+        add(
+            JButton("×").apply {
+                isOpaque = false
+                border = BorderFactory.createEmptyBorder(0, 4, 0, 0)
+                isContentAreaFilled = false
+                toolTipText = "Dismiss"
+                addActionListener { dismissPersistenceWarning() }
+            },
+            BorderLayout.EAST,
+        )
+    }
     private val inputPanel = InputPanel(
         onSend = { text -> handleSend(text) },
         onStop = { stopCurrentGeneration() },
@@ -262,8 +287,15 @@ class AtomCodeChatPanel(
         applyTheme()
 
         // ── Assemble 3-zone layout ──
+        // 消息区与持久化警告条包在 messageZone 中：警告条固定在滚动区外
+        // （消息时间线下方、输入框上方），符合 daemon 契约的时间线外展示。
+        val messageZone = JPanel(BorderLayout()).apply {
+            background = UIUtil.getPanelBackground()
+            add(messageView, BorderLayout.CENTER)
+            add(persistenceWarningBar, BorderLayout.SOUTH)
+        }
         add(header, BorderLayout.NORTH)
-        add(messageView, BorderLayout.CENTER)
+        add(messageZone, BorderLayout.CENTER)
         add(inputPanel, BorderLayout.SOUTH)
 
         // ── Action bindings ──
@@ -302,6 +334,19 @@ class AtomCodeChatPanel(
             1,
             UIManager.getColor("Component.borderColor") ?: JBColor.border(),
         )
+    }
+
+    /** 展示持久化失败警告（时间线外警告条，不进入消息流）。 */
+    private fun showPersistenceWarning(message: String) {
+        if (disposed) return
+        persistenceWarningText.text = message
+        persistenceWarningBar.isVisible = true
+    }
+
+    /** 隐藏持久化失败警告条（手动关闭 / 新回合 / 清空会话）。 */
+    private fun dismissPersistenceWarning() {
+        if (disposed) return
+        persistenceWarningBar.isVisible = false
     }
 
     override fun dispose() {
@@ -649,6 +694,7 @@ class AtomCodeChatPanel(
                 currentSession = session
                 persistRuntimeSession()
                 messageView.clear()
+                dismissPersistenceWarning()
                 addSystemMessage("Started new session ${session.name.ifBlank { session.id.take(8) }}.")
                 refreshSessionList()
                 inputPanel.focusInput()
@@ -882,6 +928,7 @@ class AtomCodeChatPanel(
 
     private fun renderSession(detail: SessionDetail) {
         messageView.clear()
+        dismissPersistenceWarning()
         var assistantGroupOpen = false
         detail.messages.forEach { message ->
             val role = message.role.lowercase()
@@ -1039,6 +1086,7 @@ class AtomCodeChatPanel(
         messageView.beginAssistantTurn()
         messageView.addThinkingIndicator()
         inputPanel.clearInput()
+        dismissPersistenceWarning()
         generating = true
         inputPanel.setGenerating(true)
         streamHandler.reset()
@@ -1111,6 +1159,7 @@ class AtomCodeChatPanel(
             }
             is ChatEvent.Tokens -> { /* no-op */ }
             is ChatEvent.Warning -> streamHandler.onWarning(event.message)
+            is ChatEvent.PersistenceWarning -> showPersistenceWarning(event.message)
             is ChatEvent.Done -> {
                 streamHandler.onDone(event.tokens, event.toolCalls)
                 refreshSessionList(updateCurrentTabTitle = true)
