@@ -5669,21 +5669,35 @@ mod buffer_tests {
     }
 
     #[test]
-    fn submit_strips_compact_prompt_char_without_space() {
-        // Prompt chars other than `$` have no competing syntax, so a compact
-        // PS1 with no trailing space (`❯git`) is still cleaned — unlike `$`,
-        // which is only stripped before a space so `$skill` survives.
-        match commit_of("❯git status") {
-            BufferResult::Commit(s) => assert_eq!(s, "git status"),
-            _ => panic!("expected Commit"),
+    fn submit_preserves_prompt_like_chars_without_space() {
+        for source in ["#8，。。。。", "#标题", ">quote", "%value", "λx", "❯git status"] {
+            match commit_of(source) {
+                BufferResult::Commit(s) => assert_eq!(s, source),
+                _ => panic!("expected Commit for {source:?}"),
+            }
         }
     }
 
     #[test]
-    fn submit_bare_dollar_is_empty() {
-        // `$` alone is not a skill invocation; it collapses to an empty line
-        // (Redraw), same as before this fix.
-        assert!(matches!(commit_of("$"), BufferResult::Redraw));
+    fn submit_preserves_bare_prompt_characters() {
+        for source in ["$", "#", ">", "%", "λ", "❯"] {
+            match commit_of(source) {
+                BufferResult::Commit(s) => assert_eq!(s, source),
+                _ => panic!("expected Commit for {source:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn submit_strips_prompt_characters_followed_by_whitespace() {
+        for source in ["# ls", "> status", "% pwd", "λ cargo test", "❯ git log"] {
+            let prefix_len = source.chars().next().unwrap().len_utf8();
+            let expected = source[prefix_len..].trim_start();
+            match commit_of(source) {
+                BufferResult::Commit(s) => assert_eq!(s, expected),
+                _ => panic!("expected Commit for {source:?}"),
+            }
+        }
     }
 }
 
@@ -11782,24 +11796,19 @@ fn parse_dollar_line(line: &str) -> Option<(String, String)> {
 /// terminal). Returns the `trim_start`ed remainder if a char was stripped,
 /// else `None`.
 ///
-/// The five unambiguous prompt chars (`❯ > # % λ`) are stripped whenever they
-/// lead, matching the long-standing cleanup. `$` is special: it is ALSO the
-/// `$skill` invocation prefix, so it is only treated as a pasted prompt when
-/// followed by a space (`$ ls`). A glued `$brainstorming` is intentional syntax
-/// and is kept verbatim — otherwise a `$skill` recalled from history (which
-/// bypasses the `$` menu) would lose its `$` and commit as plain text.
+/// A prompt char is stripped only when followed by whitespace (`# ls`,
+/// `❯ git status`). Glued text such as `#8`, `>quote`, or `$brainstorming` is
+/// intentional user input and must survive submission unchanged.
 fn strip_pasted_prompt_prefix(line: &str) -> Option<&str> {
     let mut chars = line.chars();
     let first = chars.next()?;
     let rest = chars.as_str();
-    match first {
-        '$' => match rest.strip_prefix(' ') {
-            Some(after) => Some(after.trim_start()), // `$ ls` → pasted prompt
-            None if rest.is_empty() => Some(rest),   // bare `$` → collapses to empty
-            None => None,                            // `$brainstorming` → keep verbatim
-        },
-        '❯' | '>' | '#' | '%' | 'λ' => Some(rest.trim_start()),
-        _ => None,
+    if matches!(first, '❯' | '>' | '#' | '%' | 'λ' | '$')
+        && rest.chars().next().is_some_and(char::is_whitespace)
+    {
+        Some(rest.trim_start())
+    } else {
+        None
     }
 }
 
