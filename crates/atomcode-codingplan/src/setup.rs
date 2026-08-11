@@ -1331,13 +1331,6 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
         // Server-driven capability rank for subagent strong/weak routing (None ⇒ not
         // participating). Threaded verbatim so re-ranking models needs no client release.
         capable_model: entry.capable_model,
-        // CodingPlan models are covered by the plan entitlement rather than
-        // locally metered API billing.
-        pricing: Some(atomcode_config::config::provider::ProviderPricing {
-            input_per_million: 0.0,
-            output_per_million: 0.0,
-            cached_input_per_million: 0.0,
-        }),
     }
 }
 

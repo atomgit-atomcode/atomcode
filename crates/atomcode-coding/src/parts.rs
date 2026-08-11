@@ -643,7 +643,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         let snapshot_hook = Arc::new(
             SnapshotHook::new(b.manager.clone(), &b.id, &wd)
                 .with_lease(b.lease.clone())
-                .with_model_attribution(&cfg.provider_name, &cfg.model, cfg.pricing),
+                .with_model_attribution(&cfg.provider_name, &cfg.model),
         );
         snapshot_persistence_status = Some(snapshot_hook.persistence_status());
         compaction_checkpoint = Some(snapshot_hook.clone());
@@ -1233,7 +1233,6 @@ pub fn assemble(
                 &session.id,
                 &cfg.provider_name,
                 &cfg.model,
-                cfg.pricing,
             );
             if let Some(status) = parts.snapshot_persistence_status() {
                 recorder = recorder.with_persistence_status(status);
@@ -1545,16 +1544,14 @@ pub fn assemble(
                 let install_recorder = |cell: &Arc<crate::config::TierProvider>, key: &str| {
                     // `key` is a model-selection id (design §14.2); resolve it the
                     // same way the tier provider was built so usage attribution
-                    // (model name + pricing) matches.
+                    // uses the same model identity.
                     if let Ok(resolved) = registry.resolve_model(Some(key)) {
-                        let pricing = crate::resolve_resolved_pricing(&resolved);
                         let mut recorder =
                             atomcode_capabilities::session::DetachedUsageRecorder::new(
                                 b.manager.clone(),
                                 &b.id,
                                 key,
                                 &resolved.model,
-                                pricing,
                             );
                         if let Some(status) = parts.snapshot_persistence_status() {
                             recorder = recorder.with_persistence_status(status);
@@ -1606,7 +1603,7 @@ pub fn assemble(
     // succeeded. ReassembleProvider stops the old agent before entering here,
     // so no accepted turn can observe a half-switched attribution.
     if let Some(snapshot_hook) = &parts.snapshot_hook {
-        snapshot_hook.set_model_attribution(&cfg.provider_name, &cfg.model, cfg.pricing);
+        snapshot_hook.set_model_attribution(&cfg.provider_name, &cfg.model);
     }
     Ok(agent)
 }

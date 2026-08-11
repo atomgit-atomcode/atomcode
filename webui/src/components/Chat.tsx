@@ -56,6 +56,7 @@ import {
 import { toolResultStatus, updateToolProgress, upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
 import { isInternalHistoryAssistantMessage, isInternalHistoryUserMessage } from '../lib/historyMessages';
 import {
+  activeTurnSubmissionDisposition,
   chatRecoveryPolicy,
   classifyChatDone,
   createLiveLifecycleState,
@@ -432,11 +433,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusyState] = useState(false);
   // Mirror of `busy` in a ref so pushCommandNotice can read it synchronously
   // without a stale closure (refs always reflect the latest render value).
   const busyRef = useRef(false);
   busyRef.current = busy;
+  function setBusy(next: boolean) {
+    // SSE callbacks and composer events can occur before Preact commits the
+    // next render. Keep the ref authoritative synchronously so an active
+    // `/chat` turn cannot be mistaken for an idle direct-send window.
+    busyRef.current = next;
+    setBusyState(next);
+  }
   const [chatRecovery, setChatRecovery] = useState<ChatRecoveryState>('ready');
   const chatRecoveryRef = useRef<ChatRecoveryState>('ready');
   chatRecoveryRef.current = chatRecovery;
@@ -822,7 +830,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // programmatic scroll lands immediately and the next scroll event reads "at bottom".
   useEffect(() => {
     if (atBottomRef.current) bottomRef.current?.scrollIntoView({ behavior: 'auto' });
-  }, [messages, tokens]);
+  }, [messages, tokens, queued.length]);
 
   // Abort the live (/live) stream + cancel any pending reconnect timer if the
   // component unmounts while sync is on.
@@ -2148,14 +2156,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setHistoryHint(null);
 
-    // Sync mode shares the native runtime, so an active-turn submit is an
-    // authoritative steer. The legacy /chat path has no steer transport and
-    // intentionally keeps its next-turn queue semantics.
-    if (busy) {
-      if (sync) {
-        void deliver(text, images);
-        return;
-      }
+    // Read the synchronous projection, not the render closure: an SSE state
+    // transition and a click/Enter can land before Preact commits a frame.
+    const disposition = activeTurnSubmissionDisposition(busyRef.current, syncRef.current);
+    if (disposition === 'queue') {
       setQueued((q) => [
         ...q,
         {
@@ -2168,6 +2172,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       return;
     }
 
+    // `deliver` itself distinguishes a live steer from a new live turn.
+    // For an idle turn this is an ordinary send; for active `/live` it is steer.
     void deliver(text, images);
   }
 
@@ -2969,7 +2975,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
         {/* 排队中的消息：执行中输入、待当前回合结束后自动发送，可点 × 撤回。 */}
         {queued.map((q) => (
-          <div key={`q-${q.id}`} class="user-message-wrapper queued">
+          <div
+            key={`q-${q.id}`}
+            class="user-message-wrapper queued"
+            role="status"
+            aria-label={t('chat.queued')}
+          >
             <div class="user-message-bubble">
               {q.images && q.images.length > 0 && (
                 <div class="msg-images">

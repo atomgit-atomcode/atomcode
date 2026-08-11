@@ -76,6 +76,9 @@ enum RenderCmd {
     /// `Flush`, exactly as `replay_session` issues them.
     BeginSync,
     EndSync,
+    BeginInitialHistoryReplay,
+    EndInitialHistoryReplay,
+    SetHistoryReplayMaxRows(Option<usize>),
     /// Suppress / restore automatic clipboard copy during history replay
     /// (issue #699 P1-1). Fire-and-forget.
     SetSuppressAutoCopy(bool),
@@ -193,6 +196,20 @@ impl Renderer for TaskRenderer {
 
     fn end_sync(&mut self) {
         let _ = self.cmd_tx.send(RenderCmd::EndSync);
+    }
+
+    fn begin_initial_history_replay(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::BeginInitialHistoryReplay);
+    }
+
+    fn end_initial_history_replay(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::EndInitialHistoryReplay);
+    }
+
+    fn set_history_replay_max_rows(&mut self, max_rows: Option<usize>) {
+        let _ = self
+            .cmd_tx
+            .send(RenderCmd::SetHistoryReplayMaxRows(max_rows));
     }
 
     fn set_suppress_auto_copy(&mut self, suppress: bool) {
@@ -383,6 +400,15 @@ fn run_worker(
             RenderCmd::EndSync => {
                 inner.end_sync();
             }
+            RenderCmd::BeginInitialHistoryReplay => {
+                inner.begin_initial_history_replay();
+            }
+            RenderCmd::EndInitialHistoryReplay => {
+                inner.end_initial_history_replay();
+            }
+            RenderCmd::SetHistoryReplayMaxRows(max_rows) => {
+                inner.set_history_replay_max_rows(max_rows);
+            }
             RenderCmd::SetSuppressAutoCopy(suppress) => {
                 inner.set_suppress_auto_copy(suppress);
             }
@@ -494,6 +520,7 @@ mod tests {
         deferred: usize,
         begin_syncs: usize,
         end_syncs: usize,
+        history_replay_caps: Vec<Option<usize>>,
         resizes: Vec<(u16, u16)>,
         calls: Vec<&'static str>,
     }
@@ -534,6 +561,13 @@ mod tests {
         }
         fn end_sync(&mut self) {
             self.counts.lock().unwrap().end_syncs += 1;
+        }
+        fn set_history_replay_max_rows(&mut self, max_rows: Option<usize>) {
+            self.counts
+                .lock()
+                .unwrap()
+                .history_replay_caps
+                .push(max_rows);
         }
         fn on_resize(&mut self, cols: u16, rows: u16) {
             let mut counts = self.counts.lock().unwrap();
@@ -582,6 +616,18 @@ mod tests {
         assert_eq!(c.begin_syncs, 1, "begin_sync must forward to inner");
         assert_eq!(c.end_syncs, 1, "end_sync must forward to inner");
         assert_eq!(c.renders, 1);
+    }
+
+    #[test]
+    fn history_replay_cap_updates_forward_to_inner() {
+        let (mut r, counts) = setup();
+        r.set_history_replay_max_rows(Some(1234));
+        r.set_history_replay_max_rows(None);
+        r.reset();
+        assert_eq!(
+            counts.lock().unwrap().history_replay_caps,
+            vec![Some(1234), None]
+        );
     }
 
     #[test]

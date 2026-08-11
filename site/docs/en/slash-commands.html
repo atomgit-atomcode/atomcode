@@ -107,7 +107,7 @@
           <tr><td><code>/diff</code></td><td>Show the git diff of uncommitted changes in the working directory (the file list shows up to 5 rows at a time with a "more files" scroll indicator)</td></tr>
           <tr><td><code>/review</code></td><td>Code review the current changes: <code>/review</code> reviews uncommitted changes, <code>/review staged</code> the staged diff, <code>/review &lt;base&gt;</code> against a base ref</td></tr>
           <tr><td><code>/paste</code></td><td>Attach an image from the clipboard (Windows fallback for when <code>Ctrl+V</code> is captured by the terminal)</td></tr>
-          <tr><td><code>/cost</code></td><td>Local token cost for the current session — works with any model (including self-integrated ones); APIs without usage reporting are estimated. Distinct from <code>/usage</code>, which queries the CodingPlan gateway for your plan quota</td></tr>
+          <tr><td><code>/cost</code></td><td>Prompt, completion, and cached tokens accumulated per model in the current session. Distinct from <code>/usage</code>, which queries the CodingPlan gateway for your plan quota</td></tr>
           <tr><td><code>/context</code></td><td>Show this turn's context budget breakdown: system prompt, tool defs, cold-zone compaction, total messages, and context-window usage</td></tr>
           <tr><td><code>/compact</code></td><td>Compact history: summarise earlier messages to free up context budget</td></tr>
           <tr><td><code>/rewind</code></td><td>Choose an earlier prompt and roll back the conversation, code, or both; see <a href="./sessions.html">Sessions &amp; Undo</a></td></tr>
@@ -254,14 +254,15 @@
   ✔ Default provider set to AtomGit-GLM
 &gt; hello</code></pre>
 
-      <h3>Check cost before wrapping up</h3>
+      <h3>Check token usage before wrapping up</h3>
       <pre><code>&gt; refactor src/db to use a connection pool
 ... (AI works)
 &gt; /cost
-Session token usage
-- Total output tokens: 8342
-- Current turn tokens: 2156
-- Context: 42K / 128K</code></pre>
+AtomGit · deepseek-v4-flash
+  Prompt tokens:     7210
+  Completion tokens: 1132
+  Cached tokens:     5080 (70% hit rate)
+  Total tokens:      8342</code></pre>
 
       <h3>Rewind and re-ask when the answer goes sideways</h3>
       <pre><code>&gt; add JSDoc to every function

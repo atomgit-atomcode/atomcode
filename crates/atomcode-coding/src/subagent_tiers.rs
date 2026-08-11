@@ -67,7 +67,6 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: capable,
-            pricing: None,
         }
     }
 

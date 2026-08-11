@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  activeTurnSubmissionDisposition,
   chatRecoveryPolicy,
   classifyChatDone,
   createLiveLifecycleState,
@@ -14,6 +15,13 @@ import {
   restoreLiveSnapshot,
   syncAttachDisposition,
 } from './chatTerminal.ts';
+
+test('active turn submissions steer live runtimes and queue legacy chat turns', () => {
+  assert.equal(activeTurnSubmissionDisposition(false, false), 'send');
+  assert.equal(activeTurnSubmissionDisposition(false, true), 'send');
+  assert.equal(activeTurnSubmissionDisposition(true, false), 'queue');
+  assert.equal(activeTurnSubmissionDisposition(true, true), 'steer');
+});
 
 test('legacy done and stopped are natural completions that preserve queued messages', () => {
   assert.deepEqual(classifyChatDone({}), {

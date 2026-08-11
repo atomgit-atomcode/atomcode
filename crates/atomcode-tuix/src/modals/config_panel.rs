@@ -82,6 +82,7 @@ impl ConfigPanel {
             success_message.clone(),
         )?;
         if matches!(outcome, PersistedConfigReload::Applied { .. }) {
+            crate::sync_history_replay_config(renderer, &ctx.config, &ctx.caps);
             renderer.render(UiLine::Muted(success_message));
         }
         Ok(())

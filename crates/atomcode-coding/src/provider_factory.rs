@@ -180,7 +180,6 @@ pub fn derive_tier_config(
     tier.model = provider.model.clone();
     tier.supports_vision = provider.accepts_images();
     tier.provider_name = provider_name.to_string();
-    tier.pricing = crate::resolve_provider_pricing(provider_name, provider);
     if let Some(base_url) = &provider.base_url {
         tier.base_url = base_url.clone();
     }
@@ -227,7 +226,6 @@ pub fn derive_tier_config_from_resolved(
     tier.model = resolved.model.clone();
     tier.supports_vision = resolved.supports_vision;
     tier.provider_name = resolved.selection_id.clone();
-    tier.pricing = crate::resolve_resolved_pricing(resolved);
     if let Some(base_url) = &resolved.base_url {
         tier.base_url = base_url.clone();
     }

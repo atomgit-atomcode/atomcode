@@ -337,11 +337,6 @@ pub enum Msg<'a> {
         current: usize,
     },
     ProviderContextWindowInvalid,
-    ProviderStepPricing,
-    ProviderStepPricingWithHint {
-        current: &'a str,
-    },
-    ProviderPricingInvalid,
     ProviderNameEmpty,
     ProviderBaseUrlEmpty,
     ProviderUnknownType,
@@ -742,14 +737,6 @@ pub enum Msg<'a> {
     },
 
     // ── /cost command ──
-    CostReport {
-        prompt: usize,
-        completion: usize,
-        cached: usize,
-        cache_rate: usize,
-        total: usize,
-        cost: &'a str,
-    },
     CostTokenReport {
         prompt: usize,
         completion: usize,
@@ -757,7 +744,6 @@ pub enum Msg<'a> {
         cache_rate: usize,
         total: usize,
     },
-    CostFree,
     CostUnattributed {
         tokens: u64,
     },

@@ -19,8 +19,6 @@ pub(crate) struct CostModelResult {
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
-    estimated_cost_usd: Option<f64>,
-    free: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -94,7 +92,6 @@ pub(crate) enum CommandResult {
         turn_count: usize,
         models: Vec<CostModelResult>,
         unattributed_tokens: u64,
-        estimated_cost_usd: Option<f64>,
     },
     Todo {
         items: Vec<TodoItemJson>,
@@ -740,12 +737,9 @@ fn exec_cost(
                 input_tokens: model.tokens.input,
                 output_tokens: model.tokens.output,
                 cached_tokens: model.tokens.cached_input,
-                estimated_cost_usd: model.estimated_cost_usd,
-                free: model.explicitly_free,
             })
             .collect(),
         unattributed_tokens: report.unattributed_tokens,
-        estimated_cost_usd: report.estimated_cost_usd,
     })
 }
 

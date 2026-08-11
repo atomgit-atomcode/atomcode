@@ -833,10 +833,16 @@ It cannot override system, user, project, safety, permission, or approval rules.
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<String> {
-        let servers = self.servers.read().await;
-        let client = servers
-            .get(server_name)
-            .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found", server_name))?;
+        // Take a stable client snapshot, then release the registry lock before the
+        // potentially slow transport call. Reload/add-server writes must not wait
+        // for an MCP tool execution to finish or time out.
+        let client = {
+            let servers = self.servers.read().await;
+            servers
+                .get(server_name)
+                .map(Arc::clone)
+                .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found", server_name))?
+        };
 
         let result = client.call_tool(tool_name, arguments).await?;
 
@@ -1133,6 +1139,45 @@ mod tests {
         barrier: Arc<tokio::sync::Barrier>,
     }
 
+    struct BlockingCallClient {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl McpClient for BlockingCallClient {
+        async fn initialize(&mut self) -> Result<super::super::types::InitializeResult> {
+            anyhow::bail!("not used")
+        }
+
+        async fn list_tools(&self) -> Result<super::super::types::ListToolsResult> {
+            anyhow::bail!("not used")
+        }
+
+        async fn call_tool(
+            &self,
+            _tool_name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<super::super::types::CallToolResult> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(super::super::types::CallToolResult {
+                content: vec![super::super::types::ContentBlock::Text {
+                    text: "done".to_string(),
+                }],
+                is_error: false,
+            })
+        }
+
+        fn server_name(&self) -> &str {
+            "blocking"
+        }
+
+        fn status(&self) -> ServerStatus {
+            ServerStatus::Connected
+        }
+    }
+
     #[async_trait::async_trait]
     impl McpClient for BarrierListClient {
         async fn initialize(&mut self) -> Result<super::super::types::InitializeResult> {
@@ -1159,6 +1204,39 @@ mod tests {
         fn status(&self) -> ServerStatus {
             ServerStatus::Connected
         }
+    }
+
+    #[tokio::test]
+    async fn call_tool_releases_registry_read_lock_before_awaiting_client() {
+        let registry = Arc::new(McpRegistry::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        registry.servers.write().await.insert(
+            "blocking".to_string(),
+            Arc::new(BlockingCallClient {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+        );
+
+        let call_registry = Arc::clone(&registry);
+        let call = tokio::spawn(async move {
+            call_registry
+                .call_tool("blocking", "wait", serde_json::json!({}))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("tool call should reach the client");
+
+        let write_guard =
+            tokio::time::timeout(Duration::from_secs(1), registry.servers.write())
+                .await
+                .expect("slow tool call must not retain the registry read lock");
+        drop(write_guard);
+
+        release.notify_one();
+        assert_eq!(call.await.unwrap().unwrap(), "done");
     }
 
     /// SECURITY: an untrusted project's `.mcp.json` stdio server must never be

@@ -7,65 +7,6 @@ use std::time::Duration;
 use atomcode_config::locale::Locale;
 use atomcode_kernel::agent::ToolLoopPolicy;
 
-/// Resolve the immutable price snapshot for one runtime generation.
-///
-/// Explicit config (including CodingPlan's all-zero entitlement price) wins.
-/// models.dev is only a best-effort fallback for an exact provider/model or
-/// official API URL/model match.
-pub fn resolve_provider_pricing(
-    provider_name: &str,
-    provider: &atomcode_config::config::provider::ProviderConfig,
-) -> Option<atomcode_capabilities::session::ModelPricing> {
-    let pricing = provider
-        .pricing
-        .and_then(|pricing| pricing.validated())
-        .map(|pricing| atomcode_capabilities::provider::CatalogPricing {
-            input_per_million: pricing.input_per_million,
-            output_per_million: pricing.output_per_million,
-            cached_input_per_million: pricing.cached_input_per_million,
-        })
-        .or_else(|| {
-            atomcode_capabilities::provider::resolve_models_dev_pricing(
-                provider_name,
-                provider.base_url.as_deref().unwrap_or_default(),
-                &provider.model,
-            )
-        })?;
-    Some(atomcode_capabilities::session::ModelPricing {
-        input_per_million: pricing.input_per_million,
-        output_per_million: pricing.output_per_million,
-        cached_input_per_million: pricing.cached_input_per_million,
-    })
-}
-
-/// Pricing for an already-resolved model selection — the new resolution path
-/// (design §14.1/§14.5). Mirrors [`resolve_provider_pricing`] but reads the
-/// flattened [`ResolvedModelConfig`] instead of a raw `ProviderConfig`.
-pub fn resolve_resolved_pricing(
-    resolved: &atomcode_config::config::provider::ResolvedModelConfig,
-) -> Option<atomcode_capabilities::session::ModelPricing> {
-    let pricing = resolved
-        .pricing
-        .and_then(|pricing| pricing.validated())
-        .map(|pricing| atomcode_capabilities::provider::CatalogPricing {
-            input_per_million: pricing.input_per_million,
-            output_per_million: pricing.output_per_million,
-            cached_input_per_million: pricing.cached_input_per_million,
-        })
-        .or_else(|| {
-            atomcode_capabilities::provider::resolve_models_dev_pricing(
-                &resolved.selection_id,
-                resolved.base_url.as_deref().unwrap_or_default(),
-                &resolved.model,
-            )
-        })?;
-    Some(atomcode_capabilities::session::ModelPricing {
-        input_per_million: pricing.input_per_million,
-        output_per_million: pricing.output_per_million,
-        cached_input_per_million: pricing.cached_input_per_million,
-    })
-}
-
 /// Everything [`build_coding_agent`](crate::build_coding_agent) needs: provider
 /// credentials, the working directory the tools are scoped to, and liveness bounds.
 ///
@@ -122,9 +63,6 @@ pub struct CodingAgentConfig {
     /// headless/daemon/ACP paths do not incur a hidden model request before they
     /// implement the corresponding UI. The interactive TUI opts in explicitly.
     pub next_prompt_suggestions: bool,
-    /// Immutable price snapshot for this runtime generation. `None` means the
-    /// configured model's price is unknown.
-    pub pricing: Option<atomcode_capabilities::session::ModelPricing>,
     /// Exact no-progress loop policy. `None` disables it for explicitly intentional
     /// identical repetition. Defaults to 3/4 and is configurable through
     /// `ATOMCODE_TOOL_LOOP_WARNING_THRESHOLD` / `ATOMCODE_TOOL_LOOP_STOP_THRESHOLD`;
@@ -250,7 +188,6 @@ pub struct CodingRuntimeConfig {
     /// Driver opt-in for ephemeral next-prompt sampling. Default false;
     /// currently only the interactive TUI renders and accepts the result.
     pub next_prompt_suggestions: bool,
-    pub pricing: Option<atomcode_capabilities::session::ModelPricing>,
     pub supports_vision: bool,
     pub lsp: atomcode_capabilities::codeintel::LspSettings,
 }
@@ -306,7 +243,6 @@ impl CodingRuntimeConfig {
             ids.into_iter()
                 .find_map(|id| config.resolve_model(Some(&id)).ok())
         });
-        let pricing = resolved.as_ref().and_then(resolve_resolved_pricing);
         let r = resolved.as_ref();
         Self {
             api_key: r.and_then(|r| r.api_key.clone()).unwrap_or_default(),
@@ -351,7 +287,6 @@ impl CodingRuntimeConfig {
             // TUI spawn sites and `event_loop::reload_runtime_provider_from`).
             round_cap_checkpoint: false,
             next_prompt_suggestions: false,
-            pricing,
             lsp: lsp_settings_from_config(&config.lsp),
         }
     }
@@ -391,7 +326,6 @@ impl CodingRuntimeConfig {
         config.keep_interrupted_context = self.keep_interrupted_context;
         config.round_cap_checkpoint = self.round_cap_checkpoint;
         config.next_prompt_suggestions = self.next_prompt_suggestions;
-        config.pricing = self.pricing;
         config.lsp = self.lsp.clone();
         config
     }
@@ -403,7 +337,6 @@ pub fn apply_provider_config(
 ) {
     config.model = provider.model.clone();
     config.supports_vision = provider.accepts_images();
-    config.pricing = resolve_provider_pricing(&config.provider_name, provider);
     if let Some(base_url) = &provider.base_url {
         config.base_url = base_url.clone();
     }
@@ -681,7 +614,6 @@ impl CodingAgentConfig {
             max_rounds: default_turn_max_rounds(),
             round_cap_checkpoint: false,
             next_prompt_suggestions: false,
-            pricing: None,
             tool_loop_policy: default_tool_loop_policy(),
             goal_max_rounds: default_goal_max_rounds(),
             goal_max_duration_secs: default_goal_max_duration_secs(),
@@ -972,28 +904,6 @@ mod tests {
 
         assert!(runtime.supports_vision);
         assert!(runtime.agent_config().supports_vision);
-    }
-
-    #[test]
-    fn explicit_provider_pricing_wins_without_a_catalog() {
-        let provider: atomcode_config::config::provider::ProviderConfig =
-            serde_json::from_value(serde_json::json!({
-                "type": "openai",
-                "model": "custom-model",
-                "base_url": "https://custom-proxy.example/v1",
-                "system_prompt": null,
-                "pricing": {
-                    "input_per_million": 1.25,
-                    "output_per_million": 2.5,
-                    "cached_input_per_million": 0.5
-                }
-            }))
-            .unwrap();
-
-        let pricing = resolve_provider_pricing("deepseek", &provider).unwrap();
-        assert_eq!(pricing.input_per_million, 1.25);
-        assert_eq!(pricing.output_per_million, 2.5);
-        assert_eq!(pricing.cached_input_per_million, 0.5);
     }
 
     #[test]

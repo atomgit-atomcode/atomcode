@@ -166,7 +166,7 @@
       <h2>异常退出后的恢复</h2>
       <p>回合进行中，AtomCode 会保存临时进度。终端异常退出或网络中断后，使用 <code>/resume</code> 会尽量恢复最后一条用户输入、已经生成的回复和工具调用进度，而不是只回到上一个完整回合。待确认的权限和问题不会被自动批准。</p>
 
-      <h2>查看和清理成本</h2>
+      <h2>查看和控制 Token 用量</h2>
       <pre><code>/cost</code></pre>
       <p>显示当前会话累计输入 / 输出 tokens。当数字逼近 provider 的 <code>context_window</code> 时:</p>
       <ul>

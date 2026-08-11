@@ -408,6 +408,12 @@ pub struct UiConfig {
     /// shows emoji as monochrome tofu boxes.
     #[serde(default = "default_terminal_status_glyph")]
     pub terminal_status_glyph: bool,
+    /// Maximum number of already-wrapped transcript rows written to the host
+    /// terminal when a session is resumed. `None` selects a terminal-aware
+    /// default; `Some(0)` disables the cap and restores the legacy full replay.
+    /// This only limits presentation: runtime restores the full native session.
+    #[serde(default)]
+    pub history_replay_max_rows: Option<usize>,
 }
 
 impl Default for UiConfig {
@@ -417,6 +423,7 @@ impl Default for UiConfig {
             auto_copy_code_blocks: default_auto_copy_code_blocks(),
             ai_session_naming: default_ai_session_naming(),
             terminal_status_glyph: default_terminal_status_glyph(),
+            history_replay_max_rows: None,
         }
     }
 }
@@ -796,7 +803,6 @@ impl Config {
             thinking_enabled: model.thinking_enabled,
             thinking_budget: model.thinking_budget,
             capable_model: model.capable_model,
-            pricing: model.pricing,
         })
     }
 
@@ -1139,7 +1145,6 @@ fn project_legacy_model(account_id: &str, p: &ProviderConfig) -> ModelProfileCon
         reasoning_effort: p.reasoning_effort.clone(),
         thinking_enabled: p.thinking_enabled,
         thinking_budget: p.thinking_budget,
-        pricing: p.pricing,
     }
 }
 
@@ -1594,6 +1599,9 @@ impl Config {
     /// for seeds and writes. Interactive startup uses the diagnostics so one
     /// malformed `[providers.<name>]` table cannot silently disappear.
     pub fn load_with_diagnostics(path: &Path) -> Result<(Self, Vec<String>)> {
+        // Pricing support was retired after v5.0.6. Clean only those known
+        // legacy tables; keep startup readable when the file is read-only.
+        let _ = crate::store::ConfigStore::new(path).remove_legacy_pricing();
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config: {}", path.display()))?;
         Self::parse_disk_content_tolerant(&content, path)
@@ -1985,6 +1993,43 @@ api_key = "keep-me-secret"
     }
 
     #[test]
+    fn legacy_pricing_fields_are_ignored_and_removed_on_save() {
+        let source = r#"
+default_provider = "legacy"
+
+[providers.legacy]
+type = "openai"
+model = "legacy-model"
+
+[providers.legacy.pricing]
+input_per_million = 1.0
+output_per_million = 2.0
+cached_input_per_million = 0.5
+
+[provider_accounts.account]
+provider = "openai"
+
+[models.profile]
+account = "account"
+model = "profile-model"
+
+[models.profile.pricing]
+input_per_million = 3.0
+output_per_million = 4.0
+cached_input_per_million = 1.0
+"#;
+
+        let config = Config::parse_disk_content(source, Path::new("legacy.toml")).unwrap();
+        assert_eq!(config.providers["legacy"].model, "legacy-model");
+        assert_eq!(config.models["profile"].model, "profile-model");
+
+        let rendered = config.serialize_for_disk(None).unwrap();
+        assert!(!rendered.contains("pricing"));
+        assert!(!rendered.contains("per_million"));
+        Config::parse_disk_content(&rendered, Path::new("saved.toml")).unwrap();
+    }
+
+    #[test]
     fn serialize_round_trip_survives_multiple_non_table_providers() {
         // Two providers written as inline scalars (`providers.Foo = "..."`) both
         // fail validation. Emitting them one-per-`to_string_pretty` call produced
@@ -2124,6 +2169,15 @@ model = "missing-type"
         assert!(UiConfig::default().terminal_status_glyph);
         let ui: UiConfig = toml::from_str("").unwrap();
         assert!(ui.terminal_status_glyph, "missing key → default on");
+    }
+
+    #[test]
+    fn history_replay_row_cap_is_optional_and_zero_is_preserved() {
+        assert_eq!(UiConfig::default().history_replay_max_rows, None);
+        let capped: UiConfig = toml::from_str("history_replay_max_rows = 1234").unwrap();
+        assert_eq!(capped.history_replay_max_rows, Some(1234));
+        let unlimited: UiConfig = toml::from_str("history_replay_max_rows = 0").unwrap();
+        assert_eq!(unlimited.history_replay_max_rows, Some(0));
     }
 
     #[test]
@@ -2486,7 +2540,6 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
-                pricing: None,
             },
         );
         cfg.save(&tmp).unwrap();
@@ -2703,7 +2756,6 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
-                pricing: None,
             },
         );
         cfg.save(tmp.path()).unwrap();
@@ -2784,7 +2836,6 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
-                pricing: None,
             },
         );
         Config {
@@ -2918,7 +2969,6 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
-                pricing: None,
             },
         );
         assert!(cfg.can_handle_attached_images());
@@ -3133,7 +3183,6 @@ capable_model = 5
                 reasoning_effort: None,
                 thinking_enabled: None,
                 thinking_budget: None,
-                pricing: None,
             },
         );
         let rendered = cfg.serialize_for_disk(None).unwrap();
@@ -3182,7 +3231,6 @@ capable_model = 5
                 reasoning_effort: None,
                 thinking_enabled: None,
                 thinking_budget: None,
-                pricing: None,
             },
         );
         cfg.default_model = Some("nope".into()); // unresolvable default → error

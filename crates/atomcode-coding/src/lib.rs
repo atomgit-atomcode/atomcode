@@ -65,8 +65,8 @@ pub use assemble::{build_coding_agent, build_coding_agent_with, try_build_coding
 /// so driver crates can implement the hook without naming `atomcode_kernel`.
 pub use atomcode_kernel::message::ImageContent;
 pub use config::{
-    apply_provider_config, resolve_loop_max_rounds, resolve_provider_pricing,
-    resolve_resolved_pricing, resolve_turn_max_rounds, CodingAgentConfig, CodingRuntimeConfig,
+    apply_provider_config, resolve_loop_max_rounds, resolve_turn_max_rounds, CodingAgentConfig,
+    CodingRuntimeConfig,
     SubagentProvider, TierProvider,
 };
 pub use controllers::{GoalPhase, GoalProgress, GoalTerminal, LoopProgress};
