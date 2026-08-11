@@ -1,7 +1,9 @@
 import React, { useMemo, useState, useEffect, useRef } from 'react';
 import { ChatMessage } from '../state/types';
+import { useChatContext } from '../state/ChatProvider';
 import { useT } from '../i18n';
 import { highlightPlainText } from '../utils/search';
+import { imageDataUrl } from '../utils/format';
 
 interface UserMessageProps {
   message: ChatMessage;
@@ -13,6 +15,7 @@ interface UserMessageProps {
 export function UserMessage({ message, className = '', searchQuery, isCurrentMatch }: UserMessageProps) {
   const [expanded, setExpanded] = useState(false);
   const t = useT();
+  const { dispatch } = useChatContext();
   const textRef = useRef<HTMLDivElement>(null);
   const shouldCollapse = useMemo(() => {
     const lineCount = message.text.split('\n').length;
@@ -82,8 +85,27 @@ export function UserMessage({ message, className = '', searchQuery, isCurrentMat
                 <img
                   key={`${img.media_type}-${index}`}
                   className="user-message-image"
-                  src={`data:${img.media_type};base64,${img.data}`}
+                  src={imageDataUrl(img)}
                   alt=""
+                  onClick={() => {
+                    // Only renderable images reach this branch, but the
+                    // lightbox navigates by index over the full array —
+                    // missing slots would otherwise abort the preview.
+                    // Filter to renderable images and recompute the index
+                    // so NEXT/PREV never land on a missing slot.
+                    const renderable = (message.images ?? []).filter(
+                      (i) => !i.missing && i.data,
+                    );
+                    const clicked = renderable.findIndex(
+                      (i) => i.media_type === img.media_type && i.data === img.data,
+                    );
+                    if (clicked < 0) return;
+                    dispatch({
+                      type: 'OPEN_IMAGE_PREVIEW',
+                      images: renderable,
+                      index: clicked,
+                    });
+                  }}
                 />
               )
             ))}

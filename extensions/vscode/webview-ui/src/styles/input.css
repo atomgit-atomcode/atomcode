@@ -373,11 +373,15 @@
   height: 18px;
   border: none;
   border-radius: 50%;
-  background: color-mix(in srgb, var(--app-primary-background) 82%, transparent);
-  color: var(--app-primary-foreground);
+  background: var(--app-primary-foreground);
+  color: var(--app-primary-background);
   cursor: pointer;
   line-height: 1;
   padding: 0;
+}
+
+.input-image-preview button:hover {
+  opacity: 0.8;
 }
 
 .footer-spacer { flex: 1; }

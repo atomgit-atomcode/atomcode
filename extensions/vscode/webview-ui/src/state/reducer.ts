@@ -462,6 +462,7 @@ export const initialState: ChatState = {
   searchQuery: '',
   searchOpen: false,
   search: EMPTY_SEARCH,
+  imagePreview: null,
   locale: document.body.dataset.locale,
   approvalMode: 'build',
   approvalModePending: false,
@@ -1007,6 +1008,35 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
 
     case 'TOGGLE_SETTINGS':
       return { ...state, settingsOpen: !state.settingsOpen };
+
+    case 'OPEN_IMAGE_PREVIEW':
+      return {
+        ...state,
+        imagePreview: { images: action.images, index: action.index },
+      };
+
+    case 'CLOSE_IMAGE_PREVIEW':
+      return { ...state, imagePreview: null };
+
+    case 'IMAGE_PREVIEW_NEXT':
+      if (!state.imagePreview || state.imagePreview.images.length <= 1) return state;
+      return {
+        ...state,
+        imagePreview: {
+          ...state.imagePreview,
+          index: (state.imagePreview.index + 1) % state.imagePreview.images.length,
+        },
+      };
+
+    case 'IMAGE_PREVIEW_PREV':
+      if (!state.imagePreview || state.imagePreview.images.length <= 1) return state;
+      return {
+        ...state,
+        imagePreview: {
+          ...state.imagePreview,
+          index: (state.imagePreview.index - 1 + state.imagePreview.images.length) % state.imagePreview.images.length,
+        },
+      };
 
     case 'LOAD_SESSION_MESSAGES': {
       // Convert daemon message format to our ChatMessage format

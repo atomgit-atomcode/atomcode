@@ -246,6 +246,13 @@
   border: 1px solid var(--app-input-border);
   border-radius: var(--corner-radius-small);
   background: var(--app-primary-background);
+  cursor: zoom-in;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.user-message-image:hover {
+  border-color: var(--app-accent-color);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--app-accent-color), transparent 60%);
 }
 
 .user-message-image-placeholder {
