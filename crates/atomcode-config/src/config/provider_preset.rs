@@ -130,9 +130,9 @@ pub const PRESETS: &[ProviderPreset] = &[
         id: "xiaomi-mimo",
         display_name: "Xiaomi MiMo",
         provider_type: ProviderType::OpenAi,
-        default_base_url: None,
+        default_base_url: Some("https://api.xiaomimimo.com/v1"),
         auth_kind: AuthKind::ApiKey,
-        api_key_env: None,
+        api_key_env: Some("MIMO_API_KEY"),
         model_source: ModelSource::Manual,
     },
     ProviderPreset {
@@ -322,11 +322,11 @@ mod tests {
                 p.id
             );
             // Concrete hosted vendors ship a default base_url. The generic
-            // `*-compatible` presets and open-weights models without a fixed
-            // public endpoint (Xiaomi MiMo) legitimately leave it unset.
+            // `*-compatible` presets legitimately leave it unset (the user
+            // fills in the endpoint on the custom row).
             let endpoint_optional = matches!(
                 p.id,
-                "openai-compatible" | "anthropic-compatible" | "xiaomi-mimo"
+                "openai-compatible" | "anthropic-compatible"
             );
             if !endpoint_optional {
                 assert!(
