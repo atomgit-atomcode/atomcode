@@ -60,7 +60,49 @@ impl ConfigStore {
 
     /// Read one internally-consistent config + revision snapshot.
     pub fn read(&self) -> Result<ConfigSnapshot> {
+        // Best-effort one-time schema cleanup. Failure to rewrite (for example a
+        // read-only config mounted into a container) must not turn a readable
+        // configuration into a startup failure.
+        let _ = self.remove_legacy_pricing();
         read_snapshot_tolerant(&self.path)
+    }
+
+    /// Remove the retired provider/model `pricing` tables without disturbing
+    /// comments, ordering, unknown keys, or quarantined provider text.
+    pub(crate) fn remove_legacy_pricing(&self) -> Result<bool> {
+        self.with_lock(false, |disk| {
+            let Some(_disk) = disk else {
+                return Ok(false);
+            };
+            let source = std::fs::read_to_string(&self.path).with_context(|| {
+                format!("Failed to read config document: {}", self.path.display())
+            })?;
+            if !source.contains("pricing") {
+                return Ok(false);
+            }
+            let mut document = source.parse::<DocumentMut>().with_context(|| {
+                format!("Failed to parse config document: {}", self.path.display())
+            })?;
+            let mut changed = false;
+            for section in ["providers", "models"] {
+                let Some(entries) = document
+                    .get_mut(section)
+                    .and_then(toml_edit::Item::as_table_like_mut)
+                else {
+                    continue;
+                };
+                for (_, entry) in entries.iter_mut() {
+                    let Some(table) = entry.as_table_like_mut() else {
+                        continue;
+                    };
+                    changed |= table.remove("pricing").is_some();
+                }
+            }
+            if changed {
+                self.persist_document_locked(&document.to_string())?;
+            }
+            Ok(changed)
+        })
     }
 
     /// Apply one delta to the latest disk snapshot while holding the process-shared lock.
@@ -326,6 +368,49 @@ fn is_not_found(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_removes_only_legacy_pricing_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let source = r#"# keep this heading
+default_provider = "custom"
+mystery_flag = "pricing stays in this value"
+
+[providers.custom]
+type = "openai"
+model = "demo"
+custom_provider_key = 42
+
+[providers.custom.pricing]
+input_per_million = 1.0
+output_per_million = 2.0
+
+[provider_accounts.account]
+provider = "openai"
+
+[models.profile]
+account = "account"
+model = "profile-model"
+
+[models.profile.pricing]
+input_per_million = 3.0
+output_per_million = 4.0
+"#;
+        std::fs::write(&path, source).unwrap();
+
+        let snapshot = ConfigStore::new(&path).read().unwrap();
+        assert_eq!(snapshot.config.providers["custom"].model, "demo");
+        assert_eq!(snapshot.config.models["profile"].model, "profile-model");
+
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(migrated.contains("# keep this heading"));
+        assert!(migrated.contains("custom_provider_key = 42"));
+        assert!(migrated.contains("mystery_flag = \"pricing stays in this value\""));
+        assert!(!migrated.contains("[providers.custom.pricing]"));
+        assert!(!migrated.contains("[models.profile.pricing]"));
+        assert!(!migrated.contains("per_million"));
+    }
 
     #[test]
     fn document_update_preserves_comments_unknown_keys_and_provider_text() {

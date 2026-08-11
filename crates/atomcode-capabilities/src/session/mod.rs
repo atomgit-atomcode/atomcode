@@ -37,7 +37,7 @@ pub use context::SessionContextHook;
 pub use manager::{
     aggregate_session_cost, CatalogDiagnostic, CatalogDiagnosticKind, CatalogEntry,
     CatalogLocation, CatalogPresence, CatalogScan, DetachedUsageRecorder, ForkInfo, ImportInfo,
-    ImportKind, LoadedSession, ModelCostSummary, ModelPricing, ModelUsageStat,
+    ImportKind, LoadedSession, ModelCostSummary, ModelUsageStat,
     NativeSessionRepairOutcome, SessionCostReport, SessionLease, SessionManager, SessionMeta,
     SessionResult, SessionStoreError, StorageOwner, TokenBreakdown, TurnStat,
 };

@@ -796,7 +796,6 @@ impl Config {
             thinking_enabled: model.thinking_enabled,
             thinking_budget: model.thinking_budget,
             capable_model: model.capable_model,
-            pricing: model.pricing,
         })
     }
 
@@ -1139,7 +1138,6 @@ fn project_legacy_model(account_id: &str, p: &ProviderConfig) -> ModelProfileCon
         reasoning_effort: p.reasoning_effort.clone(),
         thinking_enabled: p.thinking_enabled,
         thinking_budget: p.thinking_budget,
-        pricing: p.pricing,
     }
 }
 
@@ -1594,6 +1592,9 @@ impl Config {
     /// for seeds and writes. Interactive startup uses the diagnostics so one
     /// malformed `[providers.<name>]` table cannot silently disappear.
     pub fn load_with_diagnostics(path: &Path) -> Result<(Self, Vec<String>)> {
+        // Pricing support was retired after v5.0.6. Clean only those known
+        // legacy tables; keep startup readable when the file is read-only.
+        let _ = crate::store::ConfigStore::new(path).remove_legacy_pricing();
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config: {}", path.display()))?;
         Self::parse_disk_content_tolerant(&content, path)
@@ -1982,6 +1983,43 @@ api_key = "keep-me-secret"
         assert!(!reloaded.providers.contains_key("Broken"));
         assert!(reloaded.quarantined_providers.contains_key("Broken"));
         assert_eq!(rewarnings.len(), 1);
+    }
+
+    #[test]
+    fn legacy_pricing_fields_are_ignored_and_removed_on_save() {
+        let source = r#"
+default_provider = "legacy"
+
+[providers.legacy]
+type = "openai"
+model = "legacy-model"
+
+[providers.legacy.pricing]
+input_per_million = 1.0
+output_per_million = 2.0
+cached_input_per_million = 0.5
+
+[provider_accounts.account]
+provider = "openai"
+
+[models.profile]
+account = "account"
+model = "profile-model"
+
+[models.profile.pricing]
+input_per_million = 3.0
+output_per_million = 4.0
+cached_input_per_million = 1.0
+"#;
+
+        let config = Config::parse_disk_content(source, Path::new("legacy.toml")).unwrap();
+        assert_eq!(config.providers["legacy"].model, "legacy-model");
+        assert_eq!(config.models["profile"].model, "profile-model");
+
+        let rendered = config.serialize_for_disk(None).unwrap();
+        assert!(!rendered.contains("pricing"));
+        assert!(!rendered.contains("per_million"));
+        Config::parse_disk_content(&rendered, Path::new("saved.toml")).unwrap();
     }
 
     #[test]
@@ -2486,7 +2524,6 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
-                pricing: None,
             },
         );
         cfg.save(&tmp).unwrap();
@@ -2703,7 +2740,6 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
-                pricing: None,
             },
         );
         cfg.save(tmp.path()).unwrap();
@@ -2784,7 +2820,6 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
-                pricing: None,
             },
         );
         Config {
@@ -2918,7 +2953,6 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
-                pricing: None,
             },
         );
         assert!(cfg.can_handle_attached_images());
@@ -3133,7 +3167,6 @@ capable_model = 5
                 reasoning_effort: None,
                 thinking_enabled: None,
                 thinking_budget: None,
-                pricing: None,
             },
         );
         let rendered = cfg.serialize_for_disk(None).unwrap();
@@ -3182,7 +3215,6 @@ capable_model = 5
                 reasoning_effort: None,
                 thinking_enabled: None,
                 thinking_budget: None,
-                pricing: None,
             },
         );
         cfg.default_model = Some("nope".into()); // unresolvable default → error

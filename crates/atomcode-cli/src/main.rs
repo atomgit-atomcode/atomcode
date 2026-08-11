@@ -354,8 +354,7 @@ async fn run_prepare_upgrade_worker() -> i32 {
 
 /// Whether the startup-time SYNCHRONOUS upgrade path should fire. Restored (with the
 /// detached stager kept alongside) after 31daa6ee removed it: the everyday startup cost
-/// this guards is only a small `latest.json` fetch — the heavy `models.dev` metadata
-/// refresh stays off the critical path — so a fresh release is applied on THIS launch
+/// this guards is only a small `latest.json` fetch, so a fresh release is applied on THIS launch
 /// instead of requiring two restarts. Returns false for `.bak`, dev, `ATOMCODE_PLAIN`,
 /// headless `-p`, subcommands, `auto_update = false`, or offline mode.
 fn should_try_sync_upgrade() -> bool {
@@ -1547,9 +1546,6 @@ async fn run() -> Result<i32> {
                     cli.model.as_deref(),
                 );
                 let working_dir = resolve_working_dir(cli.dir.clone());
-                if !atomcode_config::config::offline::is_offline_active() {
-                    atomcode_capabilities::provider::spawn_models_dev_catalog_refresh();
-                }
                 let runtime_cfg = runtime_config_from(
                     &config,
                     &working_dir,
@@ -1731,17 +1727,6 @@ async fn run() -> Result<i32> {
     // config, so the `tool_registry`/`tool_context` assembled above are no longer
     // wired to an agent loop; they remain constructed (unchanged lifetime) pending
     // a follow-up cleanup.
-    let pricing_refresh_spawned = !atomcode_config::config::offline::is_offline_active();
-    if pricing_refresh_spawned {
-        atomcode_capabilities::provider::spawn_models_dev_catalog_refresh();
-    }
-    tracing::info!(
-        target: "atomcode::startup",
-        stage = "pricing_refresh_spawned",
-        spawned = pricing_refresh_spawned,
-        total_ms = run_start.elapsed().as_millis() as u64,
-        "optional metadata refresh detached from startup"
-    );
     let mut runtime_cfg = runtime_config_from(
         &config,
         &working_dir,

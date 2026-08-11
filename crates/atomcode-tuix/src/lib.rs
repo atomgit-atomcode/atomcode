@@ -22,7 +22,6 @@ pub mod input;
 pub mod markdown;
 pub mod modals;
 pub mod platform;
-pub mod pricing;
 pub mod render;
 pub mod sanitize;
 pub mod session;

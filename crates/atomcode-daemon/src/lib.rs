@@ -160,7 +160,6 @@ pub(crate) struct ProviderInfo {
     pub reasoning_effort: Option<String>,
     pub skip_tls_verify: bool,
     pub ephemeral: bool,
-    pub pricing: Option<atomcode_config::config::provider::ProviderPricing>,
 }
 
 /// Login attempts stay addressable while a blocking poll is in flight. Per-record
@@ -5692,12 +5691,6 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
 
     // Seed the offline verdict + note ONCE from config + env, before any tool/telemetry assembly.
     atomcode_config::config::offline::seed_offline_from_config(startup_config.as_ref());
-    if !atomcode_config::config::offline::is_offline_active() {
-        // Best-effort metadata; failure leaves `/cost` token-only and never
-        // prevents daemon/provider startup.
-        atomcode_capabilities::provider::spawn_models_dev_catalog_refresh();
-    }
-
     // Step 2: Resolve telemetry state (R1.2, R2.1-R2.3, R2.5)
     let resolved = resolve(
         &cfg_telemetry,
@@ -7067,7 +7060,6 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
-            pricing: None,
         }
     }
 

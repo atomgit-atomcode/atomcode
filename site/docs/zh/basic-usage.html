@@ -247,9 +247,9 @@ atomcode --dangerously-skip-permissions</code></pre>
       </ul>
       <p>详细行为见 <a href="./sessions.html">会话与撤销</a>。</p>
 
-      <h2>查看成本和 diff</h2>
+      <h2>查看 Token 用量和 diff</h2>
       <ul>
-        <li><code>/cost</code> —— 本次会话输出 token 数和上下文用量(不支持 usage 的 API 会自动估算)</li>
+        <li><code>/cost</code> —— 按模型显示本次会话累计的提示、补全和缓存 Token</li>
         <li><code>/diff</code> —— 当前工作目录未提交改动的 git diff</li>
         <li><code>/undo</code> —— 回滚上一轮的所有文件编辑</li>
       </ul>

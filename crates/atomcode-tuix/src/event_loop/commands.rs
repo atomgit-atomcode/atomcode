@@ -5064,15 +5064,13 @@ fn open_usage(renderer: &mut dyn Renderer, active_modal: &mut Option<Box<dyn Mod
     }
 }
 
-/// `/cost` 的用量报告文本：本会话累计 token × 模型价目表。与 `/usage`（只查
-/// CodingPlan 网关）不同，这是本地统计，任何模型（含自接入）都能出数。TUI arm
-/// 与手机远程执行共用。
+/// `/cost` 的本会话 Token 报告。与 `/usage`（只查 CodingPlan 网关）不同，
+/// 这是本地统计，任何模型（含自接入）都能出数。TUI 与手机远程执行共用。
 pub(crate) fn build_cost_report_text(
     mut report: atomcode_capabilities::session::SessionCostReport,
     config: &atomcode_config::config::Config,
     current_provider: &str,
     current_model: &str,
-    current_pricing: Option<atomcode_capabilities::session::ModelPricing>,
 ) -> String {
     if !report
         .models
@@ -5085,8 +5083,6 @@ pub(crate) fn build_cost_report_text(
                 provider_id: current_provider.to_string(),
                 model_id: current_model.to_string(),
                 tokens: Default::default(),
-                estimated_cost_usd: current_pricing.map(|_| 0.0),
-                explicitly_free: current_pricing.is_some_and(|pricing| pricing.is_free()),
             });
     }
 
@@ -5111,35 +5107,13 @@ pub(crate) fn build_cost_report_text(
             cached.saturating_mul(100) / prompt
         };
         let total = prompt.saturating_add(completion);
-        let body = if item.explicitly_free {
-            let cost = t(Msg::CostFree);
-            t(Msg::CostReport {
-                prompt,
-                completion,
-                cached,
-                cache_rate,
-                total,
-                cost: &cost,
-            })
-        } else if let Some(estimated) = item.estimated_cost_usd {
-            let cost = crate::pricing::format_cost(estimated);
-            t(Msg::CostReport {
-                prompt,
-                completion,
-                cached,
-                cache_rate,
-                total,
-                cost: &cost,
-            })
-        } else {
-            t(Msg::CostTokenReport {
-                prompt,
-                completion,
-                cached,
-                cache_rate,
-                total,
-            })
-        };
+        let body = t(Msg::CostTokenReport {
+            prompt,
+            completion,
+            cached,
+            cache_rate,
+            total,
+        });
         sections.push(format!(
             "{} · {}\n{}",
             account_of(&item.provider_id),
@@ -5164,10 +5138,6 @@ fn build_session_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
     // stale legacy `default_provider` — otherwise the row mislabels e.g.
     // "agnes-ai · GLM-5.2".
     let provider = ctx.config.effective_model_selection().unwrap_or_default();
-    let pricing = ctx
-        .config
-        .provider_config_for_selection(&provider)
-        .and_then(|config| atomcode_coding::resolve_provider_pricing(&provider, &config));
     let manager = session_manager_for_cost(
         ctx.current_session_project_bucket.as_deref(),
         &ctx.current_session.working_dir,
@@ -5187,7 +5157,6 @@ fn build_session_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
                 models: Vec::new(),
                 unattributed_tokens,
                 total_tokens: unattributed_tokens,
-                estimated_cost_usd: None,
             }
         }
     };
@@ -5210,11 +5179,6 @@ fn build_session_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
                 .tokens
                 .cached_input
                 .saturating_add(live_tokens.cached_input);
-            match (model.estimated_cost_usd.as_mut(), pricing) {
-                (Some(cost), Some(price)) => *cost += price.estimate(live_tokens),
-                _ => model.estimated_cost_usd = None,
-            }
-            model.explicitly_free &= pricing.is_some_and(|price| price.is_free());
         } else {
             report
                 .models
@@ -5222,14 +5186,11 @@ fn build_session_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
                     provider_id: provider.to_string(),
                     model_id: ctx.model_name.clone(),
                     tokens: live_tokens,
-                    estimated_cost_usd: pricing.map(|price| price.estimate(live_tokens)),
-                    explicitly_free: pricing.is_some_and(|price| price.is_free()),
                 });
         }
         report.total_tokens = report.total_tokens.saturating_add(live_tokens.total());
-        report.estimated_cost_usd = None;
     }
-    build_cost_report_text(report, &ctx.config, &provider, &ctx.model_name, pricing)
+    build_cost_report_text(report, &ctx.config, &provider, &ctx.model_name)
 }
 
 fn session_manager_for_cost(
@@ -8635,7 +8596,7 @@ mod todo_command_tests {
     }
 
     #[test]
-    fn cost_report_keeps_models_separate_and_hides_unknown_price() {
+    fn cost_report_keeps_models_separate_and_reports_tokens_only() {
         use crate::event_loop::commands::build_cost_report_text;
         use atomcode_capabilities::session::{ModelCostSummary, SessionCostReport, TokenBreakdown};
         let out = build_cost_report_text(
@@ -8648,17 +8609,13 @@ mod todo_command_tests {
                         output: 567,
                         cached_input: 89,
                     },
-                    estimated_cost_usd: None,
-                    explicitly_free: false,
                 }],
                 unattributed_tokens: 0,
                 total_tokens: 1890,
-                estimated_cost_usd: None,
             },
             &atomcode_config::config::Config::default(),
             "provider-b",
             "model-b",
-            None,
         );
         // Unknown ids (not in the catalog) fall back to the raw id; separator is `·`.
         assert!(out.contains("provider-a · model-a"));
@@ -8666,8 +8623,7 @@ mod todo_command_tests {
         assert!(out.contains("1323"));
         assert!(out.contains("567"));
         assert!(out.contains("89"));
-        assert!(!out.contains("Estimated cost"));
-        assert!(!out.contains("unknown"));
+        assert!(!out.contains('$'));
     }
 }
 

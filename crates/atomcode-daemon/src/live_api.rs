@@ -332,9 +332,6 @@ pub(crate) fn chat_runtime_config(
         // WebUI/daemon projection is intentionally deferred; avoid a hidden
         // auxiliary model request until that driver renders the suggestion.
         next_prompt_suggestions: false,
-        pricing: p.and_then(|provider| {
-            atomcode_coding::resolve_provider_pricing(provider_name, provider)
-        }),
         lsp: atomcode_coding::config::lsp_settings_from_config(&config.lsp),
     }
 }

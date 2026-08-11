@@ -996,7 +996,6 @@ impl ProviderPanel {
                             reasoning_effort: None,
                             thinking_enabled: None,
                             thinking_budget: None,
-                            pricing: None,
                         },
                     );
                     model_id

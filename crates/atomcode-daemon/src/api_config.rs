@@ -92,7 +92,6 @@ pub(crate) fn provider_info(
         reasoning_effort: p.reasoning_effort.clone(),
         skip_tls_verify: p.skip_tls_verify,
         ephemeral: p.ephemeral,
-        pricing: p.pricing,
     }
 }
 
@@ -181,7 +180,6 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
-            pricing: None,
         }
     }
 
@@ -236,19 +234,6 @@ mod tests {
             )
             .requires_login
         );
-    }
-
-    #[test]
-    fn provider_info_exposes_pricing_without_credentials() {
-        let mut configured = provider("https://example.test/v1");
-        configured.pricing = Some(atomcode_config::config::provider::ProviderPricing {
-            input_per_million: 1.0,
-            output_per_million: 2.0,
-            cached_input_per_million: 0.25,
-        });
-        let info = provider_info("custom", &configured, None, "custom");
-        assert_eq!(info.pricing, configured.pricing);
-        assert!(!info.has_api_key);
     }
 
     #[test]

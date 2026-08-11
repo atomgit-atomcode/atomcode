@@ -247,9 +247,9 @@ atomcode --dangerously-skip-permissions</code></pre>
       </ul>
       <p>Full behaviour at <a href="./sessions.html">Sessions &amp; Undo</a>.</p>
 
-      <h2>Inspecting cost and diff</h2>
+      <h2>Inspecting token usage and diff</h2>
       <ul>
-        <li><code>/cost</code> — token output for this session plus context usage (estimated when the API doesn't report usage)</li>
+        <li><code>/cost</code> — prompt, completion, and cached tokens accumulated per model in this session</li>
         <li><code>/diff</code> — git diff of uncommitted changes in the working directory</li>
         <li><code>/undo</code> — roll back every file edit from the last turn</li>
       </ul>
