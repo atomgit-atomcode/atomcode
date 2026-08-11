@@ -11,8 +11,12 @@ fn main() -> io::Result<()> {
     let stdout = io::stdout();
     let mut reader = BufReader::new(stdin.lock());
     let mut writer = stdout.lock();
+    let mut initialized = false;
 
     loop {
+        if initialized {
+            sleep_from_env("MCP_TEST_READ_DELAY_MS")?;
+        }
         let request = match read_frame(&mut reader) {
             Ok(value) => value,
             Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
@@ -68,6 +72,7 @@ fn main() -> io::Result<()> {
                 })
             }),
             "tools/call" => {
+                append_event_from_env("MCP_TEST_TOOL_CALL_COUNTER", "call")?;
                 if let Some(path) = std::env::var_os("MCP_TEST_EXIT_TOOL_CALLS_COUNTER") {
                     let path = std::path::PathBuf::from(path);
                     let remaining = std::fs::read_to_string(&path)?
@@ -95,6 +100,7 @@ fn main() -> io::Result<()> {
                     .and_then(|arguments| arguments.get("message"))
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
+                sleep_from_env("MCP_TEST_TOOL_RESPONSE_DELAY_MS")?;
                 id.map(|id| {
                     serde_json::json!({
                         "jsonrpc": "2.0",
@@ -111,6 +117,7 @@ fn main() -> io::Result<()> {
                 })
             }
             "notifications/initialized" => {
+                initialized = true;
                 if std::env::var_os("MCP_TEST_EXIT_AFTER_INITIALIZED").is_some() {
                     return Ok(());
                 }
@@ -136,6 +143,26 @@ fn main() -> io::Result<()> {
             write_frame(&mut writer, &response)?;
         }
     }
+}
+
+fn append_event_from_env(name: &str, event: &str) -> io::Result<()> {
+    let Some(path) = std::env::var_os(name) else {
+        return Ok(());
+    };
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{event}")
+}
+
+fn sleep_from_env(name: &str) -> io::Result<()> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(());
+    };
+    let milliseconds = value
+        .to_string_lossy()
+        .parse::<u64>()
+        .map_err(io::Error::other)?;
+    std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+    Ok(())
 }
 
 /// MCP stdio: newline-delimited JSON (NDJSON).
