@@ -3721,6 +3721,12 @@ pub struct LoopCtx {
     pub(crate) config_store: ConfigStore,
     pub(crate) observed_config_revision: Option<ConfigRevision>,
     pub(crate) pending_provider_reload: Option<PendingProviderReload>,
+    /// Last model candidate whose reload was initiated by F2/Shift+F2.
+    ///
+    /// This is navigation state only; `config` and the coding runtime remain the
+    /// authorities for the active model. It survives a failed reload so the next
+    /// shortcut can move past an unavailable candidate, and is cleared on success.
+    pub(crate) model_cycle_anchor: Option<String>,
     pub(crate) pending_provider_projection: Option<ProviderProjectionObservation>,
     pub(crate) observed_auth: Option<AuthObservation>,
     pub(crate) pending_provider_deactivation: bool,
@@ -12435,10 +12441,16 @@ fn handle_idle_key(
     // order. This idle-path handler runs after modal dispatch, so it cannot
     // mutate a running turn or steal F2 from an active picker.
     if let Some(direction) = crate::modals::model_picker::model_cycle_direction(code, modifiers) {
-        if let Some(provider) =
-            crate::modals::model_picker::adjacent_provider(&ctx.config, direction)
-        {
-            set_default_provider_and_reload(ctx, &provider, renderer);
+        if let Some(provider) = crate::modals::model_picker::adjacent_provider_from(
+            &ctx.config,
+            direction,
+            ctx.model_cycle_anchor.as_deref(),
+        ) {
+            if set_default_provider_and_reload(ctx, &provider, renderer) {
+                // Record only accepted reloads. Key-repeat events received while a
+                // transition is pending must not silently race through the catalog.
+                ctx.model_cycle_anchor = Some(provider);
+            }
         }
         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
         return Ok(());
@@ -19360,6 +19372,9 @@ fn handle_runtime_event(
                         );
                         return;
                     }
+                    // A successful runtime transition establishes a new authoritative
+                    // selection. Future F2 navigation starts from that selection.
+                    ctx.model_cycle_anchor = None;
                     let expected_persisted_revision = ctx
                         .pending_provider_reload
                         .as_ref()

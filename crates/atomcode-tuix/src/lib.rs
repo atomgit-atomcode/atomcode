@@ -789,6 +789,7 @@ pub async fn run(
         // earlier, so another process may have committed between those reads.
         observed_config_revision: None,
         pending_provider_reload: None,
+        model_cycle_anchor: None,
         pending_provider_projection: None,
         // Reconcile authentication against the runtime after startup. Keeping
         // this unobserved closes the race where auth.toml changes while the
