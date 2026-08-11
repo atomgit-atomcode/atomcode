@@ -55,6 +55,7 @@ import {
   splitAtToken,
 } from '../lib/atMention';
 import { toolResultStatus, updateToolProgress, upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
+import { commitTodoCall, todoToolDetail, type TodoTitles } from '../lib/todoToolDetail';
 import { isInternalHistoryAssistantMessage, isInternalHistoryUserMessage } from '../lib/historyMessages';
 import {
   activeTurnSubmissionDisposition,
@@ -312,7 +313,9 @@ function displayToolName(name: string): string {
 // JSON). `argsJson` is the stored arguments string; the full raw args stay
 // available by expanding the row. Returns '' when there's nothing useful to
 // show (the header then shows just the name, like the TUI).
-function formatToolDetail(name: string, argsJson: string): string {
+function formatToolDetail(name: string, argsJson: string, todoTitles: TodoTitles = new Map()): string {
+  const todoDetail = todoToolDetail(name, argsJson, todoTitles);
+  if (todoDetail !== null) return todoDetail;
   let v: Record<string, unknown>;
   try {
     const parsed = JSON.parse(argsJson);
@@ -381,19 +384,6 @@ function formatToolDetail(name: string, argsJson: string): string {
         })
         .filter((x): x is string => x !== null)
         .join(', ');
-    }
-    case 'todo': {
-      const action = getStr('action');
-      if (action === 'add') return getStr('content');
-      if (action === 'update') {
-        const id = typeof v.id === 'number' ? v.id : '';
-        const status = getStr('status');
-        if (id && status) return `#${id} → ${status}`;
-        if (id) return `#${id}`;
-        return status;
-      }
-      if (action === 'list') return 'list all';
-      return '';
     }
     case 'use_skill':
       return getStr('name');
@@ -631,6 +621,20 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // artifact_end can reconstruct the original markdown code block.
   const artifactLangRef = useRef('');
   const artifactBufRef = useRef('');
+  const todoTitlesRef = useRef<TodoTitles>(new Map());
+  const pendingTodoCallsRef = useRef<Map<string, { name: string; args: string }>>(new Map());
+
+  function restoreTodoTitles(messages: Message[]) {
+    todoTitlesRef.current.clear();
+    pendingTodoCallsRef.current.clear();
+    for (const message of messages) {
+      for (const part of message.parts) {
+        if (part.kind === 'tool' && part.tool.status === 'done') {
+          commitTodoCall(part.tool.name, part.tool.args, todoTitlesRef.current);
+        }
+      }
+    }
+  }
 
   // 切换/恢复会话时重置画布并加载历史。依赖 project_hash：刷新后 sessionId 先于
   // 元数据就绪，此时只显示提示；待 App 从会话列表回填 project_hash，本 effect 因
@@ -667,6 +671,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       }
 
       activeIdRef.current = sessionId;
+      todoTitlesRef.current.clear();
+      pendingTodoCallsRef.current.clear();
       providerPinnedRef.current = false;
       loadedForRef.current = null;
       optimisticFiredRef.current = false;
@@ -701,6 +707,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
       const cached = sessionId ? messageCacheRef.current.get(sessionId) : undefined;
       if (cached && cached.length > 0) {
+        restoreTodoTitles(cached);
         setMessages(cached);
       } else {
         setMessages([]);
@@ -1069,6 +1076,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // ── Shared history → display conversion (reused by session load AND live snapshot) ──
   function sessionMessagesToDisplay(msgs: SessionMessage[]): Message[] {
     const loaded: Message[] = [];
+    const todoTitles: TodoTitles = new Map();
+    const pendingTodoCalls = new Map<string, { name: string; args: string }>();
     for (const msg of msgs) {
       if (msg.role === 'user') {
         if (isInternalHistoryUserMessage(msg.content ?? '', msg.synthetic)) continue;
@@ -1085,15 +1094,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         const parts: MsgPart[] = [];
         if (msg.content) parts.push({ kind: 'text', text: msg.content });
         for (const tc of msg.tool_calls ?? []) {
+          const args = tc.arguments || tc.display || '';
           parts.push({
             kind: 'tool',
             tool: {
               id: tc.id,
               name: tc.name,
-              args: tc.arguments || tc.display || '',
+              args,
+              detail: formatToolDetail(tc.name, args, todoTitles),
               status: 'done',
             },
           });
+          pendingTodoCalls.set(tc.id, { name: tc.name, args });
         }
         loaded.push({ role: 'assistant', parts, ts: msg.created_at });
       } else if (msg.role === 'tool' && msg.tool_result) {
@@ -1105,6 +1117,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             if (p.kind === 'tool' && p.tool.id === result.call_id) {
               p.tool.output = result.summary;
               p.tool.status = toolResultStatus(result.success, result.summary);
+              const pending = pendingTodoCalls.get(result.call_id);
+              if (result.success && pending) {
+                commitTodoCall(pending.name, pending.args, todoTitles);
+              }
+              pendingTodoCalls.delete(result.call_id);
               break outer;
             }
           }
@@ -1112,6 +1129,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       }
       // system messages: skip
     }
+    todoTitlesRef.current = todoTitles;
+    pendingTodoCallsRef.current = pendingTodoCalls;
     return loaded;
   }
 
@@ -1239,6 +1258,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       if (!alreadyViewing) {
         sessionGenerationRef.current += 1;
         onSessionId(e.session_id);
+        todoTitlesRef.current.clear();
+        pendingTodoCallsRef.current.clear();
         setMessages([]);
         // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
         setSearch('');
@@ -1819,10 +1840,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
       case 'tool_start': {
         const argsStr = formatArgs(event.arguments);
+        pendingTodoCallsRef.current.set(event.id, { name: event.name, args: argsStr });
         addToolToLastAssistant({
           id: event.id,
           name: event.name,
           args: argsStr,
+          detail: formatToolDetail(event.name, argsStr, todoTitlesRef.current),
           status: 'pending',
         });
         break;
@@ -1845,6 +1868,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         break;
 
       case 'tool_result':
+        {
+          const pending = pendingTodoCallsRef.current.get(event.id);
+          if (event.success && pending) {
+            commitTodoCall(pending.name, pending.args, todoTitlesRef.current);
+          }
+          pendingTodoCallsRef.current.delete(event.id);
+        }
         updateToolInLastAssistant(event.id, {
           status: toolResultStatus(event.success, event.output),
           duration_ms: event.duration_ms,
@@ -3715,7 +3745,7 @@ function ToolRowView({ tool }: { tool: ToolRow }) {
       <div class="tool-header" onClick={() => setExpanded((e) => !e)}>
         <ToolTypeIcon name={tool.name} />
         <span class="tool-name">{displayToolName(tool.name)}</span>
-        <span class="tool-name-secondary">{abbreviateArgs(formatToolDetail(tool.name, tool.args))}</span>
+        <span class="tool-name-secondary">{abbreviateArgs(tool.detail ?? formatToolDetail(tool.name, tool.args))}</span>
         {annotation && (
           <span class={'tool-annotation ' + annotation.cls}>
             <ToolStatusIcon cls={annotation.cls} />

@@ -13,6 +13,8 @@ export interface ToolRow {
   id: string;
   name: string;
   args: string;
+  /** Pre-resolved compact label for stateful tools such as todowrite. */
+  detail?: string;
   status: 'pending' | 'done' | 'error' | 'incomplete' | 'waiting_approval';
   duration_ms?: number;
   output?: string;
