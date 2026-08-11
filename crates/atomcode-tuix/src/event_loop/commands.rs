@@ -3334,7 +3334,7 @@ fn execute_slash_command_impl(
                 .map(|(h, r)| (h, r.trim()))
                 .unwrap_or((trimmed, ""));
             match head {
-                "arm" => {
+                "__app_arm" => {
                     // Mobile App selected Goal mode but has not supplied the
                     // condition yet. The next idle TUI submit becomes the
                     // condition and is executed through this same command arm.

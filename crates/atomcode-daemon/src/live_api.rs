@@ -2088,7 +2088,7 @@ pub(crate) async fn live_goal_stop(State(_state): State<AppState>) -> impl IntoR
 /// with an attached TUI. No condition is known until either side submits text.
 pub(crate) async fn live_goal_arm(State(_state): State<AppState>) -> impl IntoResponse {
     if crate::native_live::embedded_binding().is_some() {
-        let accepted = crate::native_live::send_remote_command("/goal arm".into());
+        let accepted = crate::native_live::send_remote_command("/goal __app_arm".into());
         return Json(serde_json::json!({"accepted": accepted}));
     }
     Json(serde_json::json!({"accepted": true}))

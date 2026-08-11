@@ -19755,6 +19755,13 @@ fn commit_native_session_changed(
     state.loop_label = None;
     state.loop_round = 0;
     state.loop_started_at = None;
+    // Goal mode is session-scoped. Never carry a mobile pre-arm or a
+    // persistent goal into the replacement session.
+    state.goal_armed = false;
+    state.goal_condition = None;
+    state.goal_round = 0;
+    state.goal_started_at = None;
+    state.goal_phase = atomcode_coding::GoalPhase::Ended;
     state.total_tokens = 0;
     state.prompt_tokens = 0;
     state.completion_tokens = 0;
@@ -21990,6 +21997,7 @@ fn handle_agent_event(
                             }
                         }
                         state.goal_condition = None;
+                        state.goal_armed = false;
                         state.goal_round = 0;
                         state.goal_started_at = None;
                         // Reflect the true terminal state (not a lying "Pursuing").
