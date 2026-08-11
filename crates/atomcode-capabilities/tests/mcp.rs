@@ -27,6 +27,14 @@ fn test_server_config(name: &str) -> McpServerConfig {
 }
 
 fn test_server_config_with_env(name: &str, env: BTreeMap<String, String>) -> McpServerConfig {
+    test_server_config_with_env_and_timeout(name, env, 5_000)
+}
+
+fn test_server_config_with_env_and_timeout(
+    name: &str,
+    env: BTreeMap<String, String>,
+    timeout_ms: u64,
+) -> McpServerConfig {
     McpServerConfig {
         name: name.to_string(),
         source: McpConfigSource::Project,
@@ -35,7 +43,7 @@ fn test_server_config_with_env(name: &str, env: BTreeMap<String, String>) -> Mcp
             command: env!("CARGO_BIN_EXE_mcp-test-server").to_string(),
             args: vec![],
             env,
-            timeout_ms: Some(5_000),
+            timeout_ms: Some(timeout_ms),
         },
         trust: false,
         auto_approve: vec![],
@@ -141,6 +149,57 @@ async fn stdio_reconnects_once_after_server_exit_for_concurrent_calls() {
         registry.server_statuses().await,
         vec![("recover".to_string(), ServerStatus::Connected)]
     );
+}
+
+#[tokio::test]
+async fn stdio_timeout_uses_one_deadline_without_replaying_tool() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = temp.path().join("tool-call-count");
+    let spawns = temp.path().join("spawn-count");
+    let env = BTreeMap::from([
+        ("MCP_TEST_READ_DELAY_MS".to_string(), "350".to_string()),
+        (
+            "MCP_TEST_TOOL_RESPONSE_DELAY_MS".to_string(),
+            "350".to_string(),
+        ),
+        (
+            "MCP_TEST_TOOL_CALL_COUNTER".to_string(),
+            calls.display().to_string(),
+        ),
+        (
+            "MCP_TEST_SPAWN_COUNTER".to_string(),
+            spawns.display().to_string(),
+        ),
+    ]);
+    let registry = McpRegistry::new();
+    registry
+        .add_server(test_server_config_with_env_and_timeout(
+            "shared-deadline",
+            env,
+            500,
+        ))
+        .await
+        .expect("stdio MCP server should connect");
+
+    let message = "x".repeat(4 * 1024 * 1024);
+    let result = registry
+        .call_tool(
+            "shared-deadline",
+            "echo",
+            serde_json::json!({ "message": message }),
+        )
+        .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("write and response delays must share one deadline"),
+    };
+
+    assert!(
+        error.to_string().contains("result is unknown"),
+        "timed out tool result must stay unknown: {error:#}"
+    );
+    assert_eq!(spawn_count(&calls), 1, "the tool must run only once");
+    assert_eq!(spawn_count(&spawns), 2, "the client should only reconnect");
 }
 
 #[tokio::test]

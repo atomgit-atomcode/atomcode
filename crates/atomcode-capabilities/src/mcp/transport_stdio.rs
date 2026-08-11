@@ -191,7 +191,7 @@ impl StdioClient {
         }
         let request = serde_json::Value::Object(request);
 
-        let timeout = Duration::from_millis(self.timeout_ms);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(self.timeout_ms);
 
         // Write request (NDJSON).
         {
@@ -211,23 +211,46 @@ impl StdioClient {
             // Once write_all starts, a failure can still mean that a partial or
             // complete request reached the server. Treat the outcome as unknown
             // so side-effecting tools are never replayed automatically.
-            stdin
-                .write_all(&body)
+            tokio::time::timeout_at(deadline, stdin.write_all(&body))
                 .await
+                .with_context(|| {
+                    format!(
+                        "MCP request {method} timed out after {}ms while writing",
+                        self.timeout_ms
+                    )
+                })
+                .map_err(|error| RequestAttemptError {
+                    error,
+                    generation,
+                    request_may_have_been_sent: true,
+                })?
                 .map_err(|error| RequestAttemptError {
                     error: error.into(),
                     generation,
                     request_may_have_been_sent: true,
                 })?;
-            stdin.flush().await.map_err(|error| RequestAttemptError {
-                error: error.into(),
-                generation,
-                request_may_have_been_sent: true,
-            })?;
+            tokio::time::timeout_at(deadline, stdin.flush())
+                .await
+                .with_context(|| {
+                    format!(
+                        "MCP request {method} timed out after {}ms while flushing",
+                        self.timeout_ms
+                    )
+                })
+                .map_err(|error| RequestAttemptError {
+                    error,
+                    generation,
+                    request_may_have_been_sent: true,
+                })?
+                .map_err(|error| RequestAttemptError {
+                    error: error.into(),
+                    generation,
+                    request_may_have_been_sent: true,
+                })?;
         }
 
-        // Read response with timeout
-        let result = tokio::time::timeout(timeout, self.recv_jsonrpc_response())
+        // The write, flush, and read phases use one operation deadline.
+        let result = tokio::time::timeout_at(deadline, self.recv_jsonrpc_response())
             .await
             .with_context(|| {
                 format!(
