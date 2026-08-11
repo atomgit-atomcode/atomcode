@@ -16967,10 +16967,12 @@ fn turn_summary_label(
         state.last_turn_error = None;
         state.last_policy_denial_reason = None;
         state.turn_error_line_shown = false;
-        // A turn that merely DISPATCHED async team work isn't "done" — its members
-        // are still running in the background panel below. Don't burn a celebratory
-        // "Nailed it" rotation on it; show a neutral, accurate label instead.
-        let done = if state.team.has_active_runs() {
+        // A turn that DISPATCHED async team work isn't "done" — its members keep
+        // running in the background panel below. Show a neutral, accurate label
+        // instead of a celebratory rotation. Keyed on whether THIS turn dispatched
+        // (a RunStarted arrived), not on global active runs — so an unrelated turn
+        // isn't mislabeled while an old background team happens to still run.
+        let done = if state.team_dispatched_this_turn {
             "Dispatched"
         } else {
             state.next_done_label()
@@ -18727,6 +18729,14 @@ fn handle_runtime_event(
             }
             match event {
                 CodingRuntimeEvent::Team { generation, event } => {
+                    // A new run started THIS turn → the completion banner should say
+                    // "Dispatched" rather than a celebratory "done".
+                    if matches!(
+                        event.payload,
+                        atomcode_capabilities::team::TeamEventPayload::RunStarted { .. }
+                    ) {
+                        state.team_dispatched_this_turn = true;
+                    }
                     state.team.apply(generation.0, event);
                     return;
                 }

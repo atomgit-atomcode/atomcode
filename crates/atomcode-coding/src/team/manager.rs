@@ -49,6 +49,9 @@ pub struct TeamMemberOutcome {
     pub success: bool,
     pub stop: String,
     pub output: String,
+    /// Final accumulated output-token estimate for the member's whole run, so the
+    /// closing round (which surfaces no activity) is still reflected in the panel.
+    pub output_tokens: u64,
 }
 
 impl TeamMemberOutcome {
@@ -57,6 +60,7 @@ impl TeamMemberOutcome {
             success: true,
             stop: "completed".into(),
             output: output.into(),
+            output_tokens: 0,
         }
     }
 
@@ -65,6 +69,7 @@ impl TeamMemberOutcome {
             success: false,
             stop: "failed".into(),
             output: output.into(),
+            output_tokens: 0,
         }
     }
 
@@ -73,6 +78,7 @@ impl TeamMemberOutcome {
             success: false,
             stop: "stopped".into(),
             output: reason.into(),
+            output_tokens: 0,
         }
     }
 }
@@ -547,6 +553,9 @@ impl TeamRunManager {
             }
             member.status = completed_status;
             member.result = truncate_chars(&outcome.output, self.inner.config.max_result_chars);
+            // The outcome carries the run's final token total (incl. the closing
+            // round that emitted no activity); keep the larger of it and the live max.
+            member.output_tokens = member.output_tokens.max(outcome.output_tokens);
             let member_event = TeamEventPayload::MemberFinished {
                 member_id: member.id.clone(),
                 success: completed_status == TeamMemberStatus::Completed,

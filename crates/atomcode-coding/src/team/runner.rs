@@ -94,13 +94,14 @@ impl TeamRunnerFactory {
         };
         let provider = (self.providers)(task.difficulty);
         let tools = (self.tools)(task.permission);
+        let progress = Arc::new(TeamProgressHook::new(activity));
         let mut builder = Agent::builder()
             .provider(provider)
             .tools(tools)
             .persona(team_member_persona(profile, &task.scope))
             .working_dir(self.working_dir.clone())
             .cancel_token(cancel)
-            .hook(Arc::new(TeamProgressHook::new(activity)))
+            .hook(progress.clone())
             .middleware(Arc::new(DenyTeamBash));
         for middleware in team_child_middlewares(
             task.permission == TeamPermission::Worker,
@@ -138,18 +139,27 @@ impl TeamRunnerFactory {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        match outcome.stop {
+        // Carry the final accumulated token total out via the outcome: the closing
+        // round has no tool call, so on_model_response surfaced no activity for it.
+        let output_tokens = progress.total_tokens();
+        let member = match outcome.stop {
             StopReason::Stopped => TeamMemberOutcome::completed(output),
             StopReason::Cancelled => TeamMemberOutcome {
                 success: false,
                 stop: "stopped".into(),
                 output,
+                output_tokens: 0,
             },
             stop => TeamMemberOutcome {
                 success: false,
                 stop: format!("{stop:?}"),
                 output,
+                output_tokens: 0,
             },
+        };
+        TeamMemberOutcome {
+            output_tokens,
+            ..member
         }
     }
 }
@@ -212,12 +222,19 @@ impl LifecycleHooks for TeamProgressHook {
             .map(|meta| meta.tokens.completion as u64)
             .unwrap_or(0);
         self.total_tokens.fetch_add(reported.max(estimated), Relaxed);
-        let label = response
-            .tool_calls
-            .first()
-            .map(|call| format!("using {}", call.name))
-            .unwrap_or_else(|| "thinking".to_string());
-        (self.activity)(label, self.total_tokens.load(Relaxed));
+        // Only surface an activity when the model is about to use a tool. A
+        // response WITHOUT a tool call ends the turn — emitting "thinking" here
+        // would just overwrite the last real activity and double the event rate;
+        // the final token total is carried out via the member outcome instead.
+        if let Some(call) = response.tool_calls.first() {
+            (self.activity)(format!("using {}", call.name), self.total_tokens.load(Relaxed));
+        }
+    }
+}
+
+impl TeamProgressHook {
+    fn total_tokens(&self) -> u64 {
+        self.total_tokens.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

@@ -949,6 +949,11 @@ pub struct UiState {
     /// may outlive the foreground turn and are cleared on runtime generation or
     /// session replacement rather than ordinary turn completion.
     pub team: crate::team::TeamProjection,
+    /// Set when THIS turn dispatched an async team run (a `RunStarted` arrived),
+    /// cleared at each new submit. Used so the turn-completion banner says
+    /// "Dispatched" (not a celebratory "done") only for the turn that dispatched —
+    /// not for unrelated turns while an old background team happens to still run.
+    pub team_dispatched_this_turn: bool,
     /// Mirrors `TerminalCaps::unicode_symbols` — frozen at construction.
     /// When false, `tick_spinner` and the spinner-label ellipsis fall
     /// back to ASCII so terminals whose font lacks `◐` / `…` (notably
@@ -1359,6 +1364,7 @@ impl UiState {
             subagent_activity: None,
             active_subtasks: None,
             team: crate::team::TeamProjection::default(),
+            team_dispatched_this_turn: false,
             unicode_symbols,
             colors,
             total_tokens: 0,
@@ -1671,6 +1677,8 @@ impl UiState {
         self.spinner_label = self.current_thinking().to_string();
         self.spinner_frame = 0;
         self.thinking_idx = self.thinking_idx.wrapping_add(1);
+        // A fresh turn hasn't dispatched team work yet.
+        self.team_dispatched_this_turn = false;
         let now = std::time::Instant::now();
         self.turn_started_at = Some(now);
         self.phase_started_at = Some(now);
