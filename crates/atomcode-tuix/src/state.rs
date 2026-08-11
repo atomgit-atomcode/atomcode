@@ -1218,6 +1218,9 @@ pub struct UiState {
     pub reasoning_effort: Option<String>,
     /// Active goal condition string, if a `/goal` is running.
     pub goal_condition: Option<String>,
+    /// Mobile App armed Goal mode before the first condition/message is sent.
+    /// The next idle TUI submit consumes this flag as the Goal condition.
+    pub goal_armed: bool,
     /// Current round number of the running goal loop.
     pub goal_round: u32,
     /// When the goal was started, for elapsed-time display.
@@ -1405,6 +1408,7 @@ impl UiState {
             pending_todo_calls: std::collections::HashMap::new(),
             reasoning_effort: None,
             goal_condition: None,
+            goal_armed: false,
             goal_round: 0,
             goal_started_at: None,
             goal_phase: atomcode_coding::GoalPhase::Pursuing,

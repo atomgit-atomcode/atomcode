@@ -12939,6 +12939,22 @@ fn handle_idle_key(
                         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                         renderer.flush();
                     } else {
+                        if app.state.goal_armed {
+                            // A mobile client may arm Goal before either side
+                            // has entered the first condition. The first TUI
+                            // text submit is therefore the Goal condition.
+                            app.state.goal_armed = false;
+                            execute_slash_command(
+                                "goal",
+                                &expanded,
+                                &mut app.state,
+                                ctx,
+                                renderer,
+                                &mut app.active_modal,
+                                &mut app.setup_pending,
+                            )?;
+                            return Ok(());
+                        }
                         let submitted =
                             submit_foreground_runtime(ctx, runtime_user_input(expanded, images));
                         if submitted {
@@ -21591,6 +21607,32 @@ fn handle_agent_event(
             }
         }
         AgentEvent::RemoteSlashCommand(line) => {
+            // Goal is the one stateful command exposed to the mobile App. It
+            // must go through the normal TUI command handler so the TUI's
+            // local goal_condition/phase state and the shared CodingRuntime
+            // are updated together. Keep the other remote slash commands
+            // read-only below.
+            let remote = line.trim().trim_start_matches('/');
+            let (remote_name, remote_arg) = remote
+                .split_once(char::is_whitespace)
+                .map(|(name, arg)| (name, arg.trim()))
+                .unwrap_or((remote, ""));
+            if remote_name.eq_ignore_ascii_case("goal") {
+                let mut active_modal = None;
+                if let Err(error) = commands::execute_slash_command(
+                    "goal",
+                    remote_arg,
+                    state,
+                    ctx,
+                    renderer,
+                    &mut active_modal,
+                    setup_pending,
+                ) {
+                    renderer.render(UiLine::Error(format!("Goal 执行失败：{error}")));
+                    renderer.flush();
+                }
+                return;
+            }
             // 手机端发来的斜杠命令：只放行只读信息类白名单（status/cost/whoami/
             // diff），在桌面同样渲染一份（让桌面用户知道手机做了什么），输出经
             // CommandOutput 广播回手机。交互式/桌面专属命令礼貌拒绝。

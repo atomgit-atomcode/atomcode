@@ -648,6 +648,18 @@ pub(crate) enum LiveWireEvent {
     /// webui 各 tab 的「模式」pill 据此同步。
     #[serde(rename = "mode")]
     Mode { mode: String },
+    /// Goal controller progress. This is deliberately structured so mobile
+    /// clients can distinguish completion, failure and user cancellation.
+    #[serde(rename = "goal_changed")]
+    GoalChanged {
+        active: bool,
+        round: u32,
+        elapsed_secs: u64,
+        condition: String,
+        terminal: Option<String>,
+        phase: String,
+        last_reason: Option<String>,
+    },
     /// 斜杠命令的文本输出（如 /status 报告）。`text` 首行即 `/cmd` 标头，
     /// 前端整体显示为一条系统消息即可。
     #[serde(rename = "command_output")]
@@ -957,6 +969,29 @@ impl NativeLiveWireProjector {
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ModeChanged { mode }) => {
                 LiveWireEvent::Mode {
                     mode: mode.wire().into(),
+                }
+            }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::GoalChanged(progress)) => {
+                use atomcode_coding::{GoalPhase, GoalTerminal};
+                LiveWireEvent::GoalChanged {
+                    active: progress.active,
+                    round: progress.round,
+                    elapsed_secs: progress.elapsed_secs,
+                    condition: progress.condition,
+                    terminal: progress.terminal.map(|terminal| match terminal {
+                        GoalTerminal::Met => "met",
+                        GoalTerminal::Stopped => "stopped",
+                        GoalTerminal::Failed => "failed",
+                        GoalTerminal::Cancelled => "cancelled",
+                    }.into()),
+                    phase: match progress.phase {
+                        GoalPhase::Pursuing => "pursuing",
+                        GoalPhase::Paused => "paused",
+                        GoalPhase::PausedAtCap => "paused_at_cap",
+                        GoalPhase::Satisfied => "satisfied",
+                        GoalPhase::Ended => "ended",
+                    }.into(),
+                    last_reason: progress.last_reason,
                 }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ProviderChanged {
@@ -1997,6 +2032,66 @@ pub(crate) async fn live_command(
 pub(crate) async fn live_cancel(State(_state): State<AppState>) -> impl IntoResponse {
     let cancelled = crate::native_live::cancel_confirmed().await.is_ok();
     Json(serde_json::json!({ "cancelled": cancelled }))
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct LiveGoalReq {
+    pub condition: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// POST /live/goal/start —— start the native CodingRuntime goal controller.
+pub(crate) async fn live_goal_start(
+    State(state): State<AppState>,
+    Json(req): Json<LiveGoalReq>,
+) -> impl IntoResponse {
+    let condition = req.condition.unwrap_or_default().trim().to_string();
+    if condition.is_empty() {
+        return Json(serde_json::json!({"accepted": false, "error": "goal condition is empty"}));
+    }
+    // When the TUI owns the embedded runtime, route through its command
+    // boundary as well. The TUI keeps a presentation/input Goal state of its
+    // own; dispatching only a Runtime control would make App and TUI diverge
+    // (App enters Goal, but the next TUI submit is ordinary text).
+    if crate::native_live::embedded_binding().is_some() {
+        let command = format!("/goal {condition}");
+        let accepted = crate::native_live::send_remote_command(command);
+        return Json(serde_json::json!({"accepted": accepted, "delegated": accepted}));
+    }
+    let working_dir = { state.project.read().await.working_dir.clone() };
+    let sid = parse_session_id(req.session_id);
+    if let Err(error) = crate::native_live::ensure_headless_runtime(
+        live_current_working_dir(&working_dir),
+        state.telemetry.clone(),
+        live_current_provider(),
+        native_runtime_mode(live_current_approval_mode()),
+        sid,
+    ).await {
+        return Json(serde_json::json!({"accepted": false, "error": error}));
+    }
+    let accepted = crate::native_live::dispatch(atomcode_coding::DriverCommand::StartGoal(condition)).is_ok();
+    Json(serde_json::json!({"accepted": accepted}))
+}
+
+/// POST /live/goal/stop —— stop the native Goal controller (not just one turn).
+pub(crate) async fn live_goal_stop(State(_state): State<AppState>) -> impl IntoResponse {
+    if crate::native_live::embedded_binding().is_some() {
+        let accepted = crate::native_live::send_remote_command("/goal clear".into());
+        return Json(serde_json::json!({"accepted": accepted, "delegated": accepted}));
+    }
+    let accepted = crate::native_live::dispatch(atomcode_coding::DriverCommand::StopGoal).is_ok();
+    Json(serde_json::json!({"accepted": accepted}))
+}
+
+/// POST /live/goal/arm — synchronize the mobile composer's pre-send Goal mode
+/// with an attached TUI. No condition is known until either side submits text.
+pub(crate) async fn live_goal_arm(State(_state): State<AppState>) -> impl IntoResponse {
+    if crate::native_live::embedded_binding().is_some() {
+        let accepted = crate::native_live::send_remote_command("/goal arm".into());
+        return Json(serde_json::json!({"accepted": accepted}));
+    }
+    Json(serde_json::json!({"accepted": true}))
 }
 
 /// POST /live/compact —— webui/手机端在 sync 模式请求对共享实时运行时执行一次

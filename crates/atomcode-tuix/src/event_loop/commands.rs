@@ -3334,6 +3334,13 @@ fn execute_slash_command_impl(
                 .map(|(h, r)| (h, r.trim()))
                 .unwrap_or((trimmed, ""));
             match head {
+                "arm" => {
+                    // Mobile App selected Goal mode but has not supplied the
+                    // condition yet. The next idle TUI submit becomes the
+                    // condition and is executed through this same command arm.
+                    state.goal_armed = true;
+                    renderer.flush();
+                }
                 "" | "status" => {
                     if let Some(ref cond) = state.goal_condition {
                         // Display 1-based, consistent with the footer goal row.
@@ -3367,6 +3374,7 @@ fn execute_slash_command_impl(
                     state.goal_condition = None;
                     state.goal_round = 0;
                     state.goal_started_at = None;
+                    state.goal_armed = false;
                     renderer.render(UiLine::CommandOutput(
                         crate::i18n::t(crate::i18n::Msg::GoalCleared).into_owned(),
                     ));
@@ -3393,6 +3401,7 @@ fn execute_slash_command_impl(
                         return Ok(());
                     }
                     state.goal_condition = Some(condition.clone());
+                    state.goal_armed = false;
                     state.goal_round = 0;
                     state.goal_started_at = Some(std::time::Instant::now());
                     if submit_agent_text(ctx, condition) {
