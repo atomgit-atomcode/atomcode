@@ -23,6 +23,15 @@ use std::sync::{Arc, Mutex};
 const DEFAULT_MAX_CONCURRENT: usize = 3;
 static TASK_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+fn task_run_id(progress: &ProgressSink) -> crate::team::TeamRunId {
+    crate::team::TeamRunId::new(
+        progress
+            .source_id()
+            .map(|call_id| format!("task:{call_id}"))
+            .unwrap_or_else(|| format!("task-{}", TASK_RUN_COUNTER.fetch_add(1, Ordering::Relaxed))),
+    )
+}
+
 #[derive(Clone)]
 struct TaskEventEmitter {
     sink: Arc<dyn Fn(crate::team::TeamEvent) + Send + Sync>,
@@ -672,10 +681,12 @@ parallel workers NON-OVERLAPPING scopes."
         let mut set = tokio::task::JoinSet::new();
         let event_emitter = self.team_event_sink.as_ref().map(|sink| TaskEventEmitter {
             sink: Arc::clone(sink),
-            run_id: crate::team::TeamRunId::new(format!(
-                "task-{}",
-                TASK_RUN_COUNTER.fetch_add(1, Ordering::Relaxed)
-            )),
+            // A kernel-mounted tool receives its stable call id through the
+            // generic progress sink. Encode it into this synchronous Task run
+            // identity so drivers can join typed Team events back to the same
+            // tool projection even when the two event channels are interleaved.
+            // Direct/tool-test embeddings use the process-local fallback.
+            run_id: task_run_id(&ctx.progress),
             seq: Arc::new(AtomicU64::new(1)),
             emit_lock: Arc::new(Mutex::new(())),
         });
@@ -720,6 +731,14 @@ parallel workers NON-OVERLAPPING scopes."
             let progress = ctx.progress.clone();
             let inherited_worker_middlewares = inherited_worker_middlewares.clone();
             let member_events = event_emitter.clone();
+            if let Some(events) = &event_emitter {
+                events.emit(crate::team::TeamEventPayload::MemberQueued {
+                    member_id: member_id.clone(),
+                    role: t.role,
+                    model: model.clone(),
+                    description: desc.clone(),
+                });
+            }
             // Advertise the selected model while this child is still queued.
             // Marker-prefixed means retained UIs update the fixed panel without
             // committing an extra transcript row. The later ↻ event is the sole
@@ -1463,6 +1482,15 @@ mod tests {
     }
 
     #[test]
+    fn task_run_id_uses_the_parent_tool_call_identity_when_available() {
+        let sink = ProgressSink::with_source_id("call-42", Arc::new(|_| {}));
+        assert_eq!(task_run_id(&sink).as_str(), "task:call-42");
+        assert!(task_run_id(&ProgressSink::noop())
+            .as_str()
+            .starts_with("task-"));
+    }
+
+    #[test]
     fn child_round_limit_is_configurable_and_zero_means_unbounded() {
         assert_eq!(dummy().max_rounds, Some(200));
         assert_eq!(dummy().with_max_rounds(500).max_rounds, Some(500));
@@ -1764,6 +1792,8 @@ mod tests {
         let worker_registry = Arc::clone(&registry);
         let events = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&events);
+        let mut context = ctx();
+        context.progress = ProgressSink::with_source_id("parent-call", Arc::new(|_| {}));
         let result = TaskTool::new(
             || Arc::new(MockProvider { reply: Some("done".into()) }) as Arc<dyn LlmProvider>,
             || Arc::new(MockProvider { reply: Some("done".into()) }) as Arc<dyn LlmProvider>,
@@ -1775,7 +1805,7 @@ mod tests {
             }))
             .execute(
                 r#"{"tasks":[{"description":"inspect","prompt":"find it","subagent_type":"explore","role":"reviewer"}]}"#,
-                &ctx(),
+                &context,
             )
             .await;
         assert!(!result.is_error, "{}", result.content);
@@ -1784,6 +1814,17 @@ mod tests {
             events.first().map(|event| &event.payload),
             Some(crate::team::TeamEventPayload::RunStarted { total: 1 })
         ));
+        assert!(events
+            .iter()
+            .all(|event| event.run_id.as_str() == "task:parent-call"));
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            crate::team::TeamEventPayload::MemberQueued {
+                member_id,
+                role: crate::team::TeamRoleId::Reviewer,
+                ..
+            } if member_id.as_str() == "reviewer#1"
+        )));
         assert!(events.iter().any(|event| matches!(
             &event.payload,
             crate::team::TeamEventPayload::MemberStarted {

@@ -235,13 +235,12 @@ impl TeamProjection {
         let run = self.runs.get(run_id)?;
         let items = run
             .members
-            .values()
-            .map(|member| SubtaskItem {
-                label: if member.label.is_empty() {
-                    run_id.to_string()
-                } else {
-                    member.label.clone()
-                },
+            .iter()
+            .map(|(member_id, member)| SubtaskItem {
+                // The member id is the stable per-run identity (`reviewer#1`,
+                // `explorer#2`, …). A role label is not unique and BTreeMap
+                // iteration order is not the original Task argument order.
+                label: member_id.clone(),
                 description: member.description.clone(),
                 model: member.model.clone(),
                 activity: member.activity.clone(),
@@ -371,6 +370,8 @@ mod tests {
                 },
             ),
         );
+        let run = state.progress_for_run("a").unwrap();
+        assert_eq!(run.items[0].label, "performance#1");
 
         let panel = state.panel().unwrap();
         assert_eq!(panel.items.len(), 1);

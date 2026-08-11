@@ -3331,12 +3331,15 @@ impl RunningAgent {
                         progress: {
                             let events = events.clone();
                             let call_id = call.id.clone();
-                            ProgressSink::new(std::sync::Arc::new(move |message| {
-                                let _ = events.send(AgentEvent::ToolProgress {
-                                    call_id: call_id.clone(),
-                                    message,
-                                });
-                            }))
+                            ProgressSink::with_source_id(
+                                call_id.clone(),
+                                std::sync::Arc::new(move |message| {
+                                    let _ = events.send(AgentEvent::ToolProgress {
+                                        call_id: call_id.clone(),
+                                        message,
+                                    });
+                                }),
+                            )
                         },
                         requester: Some(self.rt.requester()),
                     };

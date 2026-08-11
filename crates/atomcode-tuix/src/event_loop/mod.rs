@@ -18102,6 +18102,23 @@ fn update_subtask_progress(
     terminal_line
 }
 
+fn task_call_id_from_team_run(run_id: &str) -> Option<&str> {
+    run_id.strip_prefix("task:").filter(|call_id| !call_id.is_empty())
+}
+
+fn correlate_task_team_progress(
+    state: &mut crate::state::UiState,
+    run_id: &str,
+    mut progress: crate::render::SubtaskProgress,
+    finished: bool,
+) -> crate::render::SubtaskProgress {
+    if let Some(call_id) = task_call_id_from_team_run(run_id) {
+        progress.call_id = call_id.to_string();
+        state.active_subtasks = (!finished).then(|| progress.clone());
+    }
+    progress
+}
+
 /// Inspect only generated top-level `<task ...>` headers. Child output is
 /// arbitrary text inside the block and must not be allowed to spoof the
 /// aggregate state by merely mentioning `state="error"`.
@@ -18147,8 +18164,8 @@ fn completed_task_detail(
 #[cfg(test)]
 mod subtask_progress_projection_tests {
     use super::{
-        completed_task_detail, should_defer_task_approval_row, subtask_progress_from_args,
-        update_subtask_progress,
+        completed_task_detail, correlate_task_team_progress, should_defer_task_approval_row,
+        subtask_progress_from_args, task_call_id_from_team_run, update_subtask_progress,
     };
     use crate::render::SubtaskStatus;
 
@@ -18286,6 +18303,65 @@ mod subtask_progress_projection_tests {
         assert_eq!(
             progress.completed, 1,
             "failed is finished but not completed"
+        );
+    }
+
+    #[test]
+    fn task_team_run_recovers_the_parent_tool_call_id() {
+        assert_eq!(
+            task_call_id_from_team_run("task:call-task-7"),
+            Some("call-task-7")
+        );
+        assert_eq!(task_call_id_from_team_run("task-legacy-7"), None);
+        assert_eq!(task_call_id_from_team_run("native-team-run"), None);
+    }
+
+    #[test]
+    fn task_team_terminal_keeps_parent_projection_after_tool_result_cleared_state() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let mut state = crate::state::UiState::new();
+        state.active_subtasks = None; // ToolResult won the cross-channel race.
+        let progress = correlate_task_team_progress(
+            &mut state,
+            "task:call-task-9",
+            SubtaskProgress {
+                call_id: "team:task:call-task-9".into(),
+                completed: 1,
+                total: 1,
+                items: vec![SubtaskItem {
+                    label: "reviewer#1".into(),
+                    description: "audit".into(),
+                    model: "model".into(),
+                    activity: "done".into(),
+                    started_at: None,
+                    output_tokens: 10,
+                    status: SubtaskStatus::Completed,
+                }],
+            },
+            true,
+        );
+
+        assert_eq!(progress.call_id, "call-task-9");
+        assert!(state.active_subtasks.is_none());
+    }
+
+    #[test]
+    fn task_team_progress_updates_state_even_without_a_todo_panel() {
+        let mut state = crate::state::UiState::new();
+        let progress = subtask_progress_from_args(
+            "team:task:call-task-10",
+            r#"{"tasks":[{"description":"audit","prompt":"a"}]}"#,
+        )
+        .unwrap();
+
+        let progress =
+            correlate_task_team_progress(&mut state, "task:call-task-10", progress, false);
+
+        assert_eq!(progress.call_id, "call-task-10");
+        assert_eq!(
+            state.active_subtasks.as_ref().map(|p| p.call_id.as_str()),
+            Some("call-task-10")
         );
     }
 
@@ -19024,13 +19100,19 @@ fn handle_runtime_event(
                         atomcode_capabilities::team::TeamEventPayload::RunFinished { .. }
                     );
                     state.team.apply(generation.0, event);
-                    if todo_panel_is_active(state) && !ctx.is_plain_renderer {
-                        if let Some(progress) = state.team.progress_for_run(&run_id) {
-                            let finished = run_finished;
-                            // RunStarted arrives before queued member metadata.
-                            // Wait for the complete stable row set so retained
-                            // updates never need to insert rows mid-block.
-                            if progress.items.len() == progress.total || finished {
+                    if let Some(mut progress) = state.team.progress_for_run(&run_id) {
+                        let finished = run_finished;
+                        // RunStarted arrives before queued member metadata. Wait
+                        // for the complete stable row set so retained updates
+                        // never need to insert rows mid-block.
+                        if progress.items.len() == progress.total || finished {
+                            // Structured Task Team events are the lifecycle
+                            // authority. Re-key them to the parent tool call
+                            // before presentation, independently of whether the
+                            // Todo panel currently owns the footer.
+                            progress =
+                                correlate_task_team_progress(state, &run_id, progress, finished);
+                            if todo_panel_is_active(state) && !ctx.is_plain_renderer {
                                 renderer.render(UiLine::AgentGroup { progress, finished });
                                 renderer.flush();
                             }
