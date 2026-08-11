@@ -2589,11 +2589,20 @@ fn spawn_runtime_owner_with_optional_agent(
             tokio::select! {
                 biased;
                 team_event = team_event_rx.recv() => {
+                    // Team runs persist across turns, so gate their events by the TEAM
+                    // manager's own generation (advanced only at `begin_generation` — an
+                    // agent rebuild/retask), NOT the per-turn runtime `generation`. A turn
+                    // bump that does not rebuild the agent (compaction suspend, stop) would
+                    // otherwise drop every subsequent team event and wipe the team panel.
+                    let team_generation = resources
+                        .as_ref()
+                        .map(|runtime| runtime.parts.team_manager.generation())
+                        .unwrap_or(generation);
                     if let Some(event) = team_event.and_then(|event| {
-                        project_team_event(generation, &mut team_sequences, event)
+                        project_team_event(team_generation, &mut team_sequences, event)
                     }) {
                         let _ = runtime_event_tx.send(CodingRuntimeEvent::Team {
-                            generation: RuntimeGeneration(generation),
+                            generation: RuntimeGeneration(team_generation),
                             event,
                         });
                     }

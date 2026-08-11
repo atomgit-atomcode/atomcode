@@ -85,6 +85,11 @@ struct Inner {
     generation: AtomicU64,
     generation_root: Mutex<CancellationToken>,
     event_tx: RwLock<Option<tokio::sync::mpsc::UnboundedSender<GenerationTeamEvent>>>,
+    /// Serializes seq assignment with the channel send so the receiver observes
+    /// events in seq order. Concurrent members share one per-run seq counter; if a
+    /// member reserved a lower seq (`fetch_add`) but lost the `send` race, the
+    /// consumer's monotonic filter (`seq <= previous`) would drop it forever.
+    emit_lock: Mutex<()>,
     /// Generation captured when a synchronous legacy `task` batch starts.
     /// Late events are ignored after `begin_generation` clears this map.
     external_runs: Mutex<BTreeMap<String, u64>>,
@@ -120,6 +125,7 @@ impl TeamRunManager {
                 generation: AtomicU64::new(0),
                 generation_root: Mutex::new(CancellationToken::new()),
                 event_tx: RwLock::new(None),
+                emit_lock: Mutex::new(()),
                 external_runs: Mutex::new(BTreeMap::new()),
                 config,
                 run_counter: AtomicU64::new(1),
@@ -576,10 +582,14 @@ impl TeamRunManager {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         if let Some(sender) = sender {
-            let _ = sender.send(GenerationTeamEvent {
-                generation,
-                event: TeamEvent::new(run_id.clone(), seq.fetch_add(1, Ordering::Relaxed), payload),
-            });
+            // Assign the seq and send it under one lock so the channel receives
+            // events in seq order; otherwise a lower-seq event that lost the send
+            // race is dropped by the consumer's monotonic filter. The send is
+            // non-blocking (unbounded), so the critical section stays short.
+            let _emit_guard = self.inner.emit_lock.lock().unwrap_or_else(|p| p.into_inner());
+            let event =
+                TeamEvent::new(run_id.clone(), seq.fetch_add(1, Ordering::Relaxed), payload);
+            let _ = sender.send(GenerationTeamEvent { generation, event });
         }
     }
 
@@ -1055,6 +1065,52 @@ mod tests {
             rx.try_recv().is_err(),
             "late external event must be dropped"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_member_events_arrive_in_strict_seq_order() {
+        // Regression guard for the emit reorder: many members share one per-run seq
+        // counter and emit concurrently. The receiver must observe events in seq
+        // order, or the consumer's `seq <= previous` filter drops the loser forever.
+        let manager = TeamRunManager::new(TeamRuntimeConfig {
+            max_concurrent: 16,
+            cancel_grace: Duration::from_millis(10),
+            ..TeamRuntimeConfig::default()
+        });
+        manager.begin_generation(7);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        manager.set_event_sender(tx);
+        let factory: TeamJobFactory = Arc::new(|_, _, activity| {
+            Box::pin(async move {
+                for i in 0..20 {
+                    activity(format!("step {i}"));
+                }
+                TeamMemberOutcome::completed("done")
+            })
+        });
+        let tasks = (0..12)
+            .map(|_| task(TeamRoleId::Explorer, TeamPermission::Explore, vec![]))
+            .collect::<Vec<_>>();
+        let run = manager.delegate(tasks, factory, models()).await.unwrap();
+        assert!(
+            manager
+                .wait(&run, Duration::from_secs(5))
+                .await
+                .unwrap()
+                .terminal
+        );
+
+        let mut last: BTreeMap<String, u64> = BTreeMap::new();
+        while let Ok(event) = rx.try_recv() {
+            let previous = last.entry(event.event.run_id.to_string()).or_insert(0);
+            assert!(
+                event.event.seq > *previous,
+                "out-of-order seq {} arrived after {}",
+                event.event.seq,
+                *previous
+            );
+            *previous = event.event.seq;
+        }
     }
 
     #[tokio::test]

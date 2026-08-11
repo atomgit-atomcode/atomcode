@@ -28,10 +28,15 @@ struct TaskEventEmitter {
     sink: Arc<dyn Fn(crate::team::TeamEvent) + Send + Sync>,
     run_id: crate::team::TeamRunId,
     seq: Arc<AtomicU64>,
+    /// Serializes seq assignment with the sink call so concurrent subtasks emit
+    /// their shared-counter events in seq order — otherwise a lower-seq event that
+    /// loses the send race is dropped by the consumer's monotonic filter.
+    emit_lock: Arc<Mutex<()>>,
 }
 
 impl TaskEventEmitter {
     fn emit(&self, payload: crate::team::TeamEventPayload) {
+        let _guard = self.emit_lock.lock().unwrap_or_else(|p| p.into_inner());
         (self.sink)(crate::team::TeamEvent::new(
             self.run_id.clone(),
             self.seq.fetch_add(1, Ordering::Relaxed),
@@ -132,6 +137,22 @@ fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
         cursor = parent;
     }
     path.to_path_buf()
+}
+
+/// True if a workspace-relative path (`/`-separated) points inside any `.git`
+/// directory — the repo's or a nested submodule's. Writing there (hooks, config)
+/// defers shell execution to the next git command, escaping the child's no-bash
+/// guarantee, so such writes are denied regardless of the declared scope.
+fn is_git_internal(rel: &str) -> bool {
+    rel.split('/').any(|component| component == ".git")
+}
+
+fn deny_git_internal(tool: &str, rel: &str) -> String {
+    format!(
+        "team {tool} denied: {rel} writes into a .git directory. Git internals \
+         (hooks, config) can run shell on the next git command and are never writable \
+         by a team child, whatever the scope."
+    )
 }
 
 /// 1-based indices of `worker` subtasks that declared no non-empty `scope`. A worker must
@@ -236,6 +257,9 @@ impl WorkerScopeGate {
                         None => Some(format!(
                             "worker edit out of scope: {dir} is outside the working directory."
                         )),
+                        Some(rel_dir) if is_git_internal(&rel_dir) => {
+                            Some(deny_git_internal(tool, &rel_dir))
+                        }
                         Some(rel_dir) if self.dir_in_scope(&rel_dir) => None,
                         Some(rel_dir) => Some(self.deny_out_of_scope(&rel_dir)),
                     },
@@ -263,6 +287,11 @@ impl WorkerScopeGate {
             None => Some(format!(
                 "team {tool} out of scope: {raw} is outside the working directory."
             )),
+            // A write into `.git/` is never in scope, whatever the declared globs say:
+            // a hook or config rewrite there runs shell on the next git command.
+            Some(rel) if tool != "read_file" && is_git_internal(&rel) => {
+                Some(deny_git_internal(tool, &rel))
+            }
             Some(rel) if self.globs.is_match(&rel) => None,
             Some(rel) if self.confine_reads && tool == "read_file" => {
                 Some(self.deny_read_out_of_scope(tool, &rel))
@@ -648,6 +677,7 @@ parallel workers NON-OVERLAPPING scopes."
                 TASK_RUN_COUNTER.fetch_add(1, Ordering::Relaxed)
             )),
             seq: Arc::new(AtomicU64::new(1)),
+            emit_lock: Arc::new(Mutex::new(())),
         });
         if let Some(events) = &event_emitter {
             events.emit(crate::team::TeamEventPayload::RunStarted { total: specs.len() });
@@ -902,10 +932,14 @@ fn validate_task_specs(args: &Args) -> Result<Vec<crate::team::TeamTaskSpec>, St
 }
 
 fn resolve_subtask_spec(t: &SubTask) -> Result<crate::team::TeamTaskSpec, String> {
+    // Only the exact `"worker"` opts into the write lane. Any other value — including
+    // the common `"explorer"` typo (which collides with a valid `role` name) — falls
+    // back to the read-only explore lane rather than rejecting the whole batch. This
+    // matches the pre-typed behavior (`is_worker = subagent_type == "worker"`) and
+    // fails closed on permission.
     let requested_permission = match t.subagent_type.as_str() {
-        "explore" => crate::team::TeamPermission::Explore,
         "worker" => crate::team::TeamPermission::Worker,
-        other => return Err(format!("unknown subagent_type: {other}")),
+        _ => crate::team::TeamPermission::Explore,
     };
     let default_role = match requested_permission {
         crate::team::TeamPermission::Explore => crate::team::TeamRoleId::Explorer,
@@ -928,10 +962,10 @@ fn resolve_subtask_spec(t: &SubTask) -> Result<crate::team::TeamTaskSpec, String
         ));
     }
     let difficulty = match t.difficulty.as_str() {
-        "" => profile.difficulty,
         "simple" => crate::team::TeamDifficulty::Simple,
         "hard" => crate::team::TeamDifficulty::Hard,
-        other => return Err(format!("unknown difficulty: {other}")),
+        // Empty or unrecognized → the role's default tier, not a hard error.
+        _ => profile.difficulty,
     };
     Ok(crate::team::TeamTaskSpec {
         description: t.description.clone(),
@@ -2037,6 +2071,33 @@ mod tests {
     }
 
     #[test]
+    fn worker_scope_gate_denies_git_internal_writes_regardless_of_scope() {
+        use super::WorkerScopeGate;
+        use std::path::Path;
+        // Even an all-encompassing scope must not let a worker write into `.git/`:
+        // a planted hook or rewritten config executes shell on the next git command,
+        // an escape around the team child's no-bash guarantee.
+        let g = WorkerScopeGate::new(&["**".into()], Path::new("/w"));
+        assert!(g
+            .violation("write_file", r#"{"file_path":".git/hooks/pre-commit"}"#)
+            .is_some());
+        assert!(g
+            .violation("edit_file", r#"{"file_path":".git/config"}"#)
+            .is_some());
+        // A nested/submodule `.git` is blocked too.
+        assert!(g
+            .violation("write_file", r#"{"file_path":"sub/.git/hooks/post-checkout"}"#)
+            .is_some());
+        assert!(g
+            .violation("search_replace", r#"{"path":".git"}"#)
+            .is_some());
+        // A normal file that merely contains "git" in its name is still allowed.
+        assert!(g
+            .violation("write_file", r#"{"file_path":"src/gitutil.rs"}"#)
+            .is_none());
+    }
+
+    #[test]
     fn team_scope_gate_confines_path_based_reads() {
         use super::WorkerScopeGate;
         use std::path::Path;
@@ -2177,6 +2238,35 @@ mod tests {
         ))
         .unwrap_err();
         assert!(mismatch.contains("requires worker"), "{mismatch}");
+    }
+
+    #[test]
+    fn unknown_subagent_type_or_difficulty_falls_back_instead_of_failing_the_batch() {
+        let parse = |input: &str| parse_task_args(input).unwrap();
+        // `"explorer"` (a common typo, and also a valid `role` value) must not reject
+        // the whole batch — it falls back to the read-only explore lane, matching the
+        // pre-typed behavior.
+        let specs = validate_task_specs(&parse(
+            r#"{"tasks":[{"description":"d","prompt":"p","subagent_type":"explorer"}]}"#,
+        ))
+        .expect("unknown subagent_type must fall back, not error");
+        assert_eq!(specs[0].permission, crate::team::TeamPermission::Explore);
+
+        // An unrecognized difficulty falls back to the role default rather than erroring.
+        let specs = validate_task_specs(&parse(
+            r#"{"tasks":[{"description":"d","prompt":"p","subagent_type":"explore","difficulty":"medium"}]}"#,
+        ))
+        .expect("unknown difficulty must fall back, not error");
+        assert_eq!(specs[0].difficulty, crate::team::TeamDifficulty::Simple);
+
+        // A mixed batch with one typo'd task still runs the valid tasks.
+        let specs = validate_task_specs(&parse(
+            r#"{"tasks":[{"description":"a","prompt":"p","subagent_type":"worker","role":"rust","scope":["src/**"]},{"description":"b","prompt":"q","subagent_type":"explorer"}]}"#,
+        ))
+        .expect("a single typo must not sink the whole batch");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].permission, crate::team::TeamPermission::Worker);
+        assert_eq!(specs[1].permission, crate::team::TeamPermission::Explore);
     }
 
     #[test]
