@@ -37,7 +37,7 @@ import {
   type SlashHandlers,
 } from '../lib/slashCommands';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
-import { beginModeSwitch, completeModeSwitch, failModeSwitch, initModeState } from '../lib/modeSwitch';
+import { beginModeSwitch, completeModeSwitch, failModeSwitch, initModeState, modeForQueuedPrompt } from '../lib/modeSwitch';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
 import { ModeSelector } from './ModeSelector';
@@ -97,7 +97,7 @@ interface QueuedMessage {
   id: number;
   text: string;
   images?: ImageData[];
-  approvalMode: ApprovalMode;
+  approvalMode?: ApprovalMode;
 }
 
 /** Concatenate all text segments (error-detection, skill-title, etc.). */
@@ -2140,14 +2140,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   function sendMessage() {
     const text = input.trim();
     const images = pendingImages;
-    if (modeState.pendingMode) return;
-    if (compactingRef.current) return;
     if (!text && images.length === 0) return;
 
     // 斜杠命令拦截：命中已知命令则执行且不作为聊天发送。带图时不拦截（命令不处理图片）。
     if (images.length === 0) {
       const parsed = parseSlashCommand(text);
       if (parsed && slashCommandMap.has(parsed.name)) {
+        // Preserve the existing command gate: this fix only makes ordinary
+        // prompts queueable while a turn is active.
+        if (modeState.pendingMode || compactingRef.current) return;
         setInput('');
         if (textareaRef.current) textareaRef.current.style.height = 'auto';
         setSlashOpen(false);
@@ -2157,6 +2158,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         return;
       }
     }
+
+    // Active turns accept ordinary input before transient mode/compaction
+    // gates: /chat queues it for the next turn and /live treats it as a steer.
+    // Those gates only prevent starting a new idle turn.
+    const disposition = activeTurnSubmissionDisposition(
+      busyRef.current,
+      syncRef.current,
+      Boolean(modeState.pendingMode),
+      compactingRef.current,
+    );
+    if (disposition === 'blocked') return;
 
     if (!chatRecoveryPolicy(chatRecoveryRef.current).allowSend) {
       pushCommandNotice(t('chat.recoveryBlocked'));
@@ -2172,7 +2184,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
     // Read the synchronous projection, not the render closure: an SSE state
     // transition and a click/Enter can land before Preact commits a frame.
-    const disposition = activeTurnSubmissionDisposition(busyRef.current, syncRef.current);
     if (disposition === 'queue') {
       setQueued((q) => [
         ...q,
@@ -2180,7 +2191,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           id: queueIdRef.current++,
           text,
           images: images.length ? images : undefined,
-          approvalMode: modeState.confirmedMode,
+          approvalMode: modeForQueuedPrompt(modeState),
         },
       ]);
       return;
@@ -2726,7 +2737,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
                   <button
                     class="btn-send"
                     onClick={sendMessage}
-                    disabled={Boolean(modeState.pendingMode)}
                     title={sync ? t('chat.steer') : t('chat.queue')}
                     aria-label={sync ? t('chat.steer') : t('chat.queue')}
                   >

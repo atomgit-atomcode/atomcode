@@ -23,6 +23,14 @@ test('active turn submissions steer live runtimes and queue legacy chat turns', 
   assert.equal(activeTurnSubmissionDisposition(true, true), 'steer');
 });
 
+test('active turns accept input before transient mode and compaction gates', () => {
+  assert.equal(activeTurnSubmissionDisposition(true, false, true, false), 'queue');
+  assert.equal(activeTurnSubmissionDisposition(true, false, false, true), 'queue');
+  assert.equal(activeTurnSubmissionDisposition(true, true, true, true), 'steer');
+  assert.equal(activeTurnSubmissionDisposition(false, false, true, false), 'blocked');
+  assert.equal(activeTurnSubmissionDisposition(false, false, false, true), 'blocked');
+});
+
 test('legacy done and stopped are natural completions that preserve queued messages', () => {
   assert.deepEqual(classifyChatDone({}), {
     kind: 'completed',
