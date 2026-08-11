@@ -191,7 +191,7 @@ pub const PRESETS: &[ProviderPreset] = &[
     },
     ProviderPreset {
         id: "opencode",
-        display_name: "OpenCode Zen",
+        display_name: "OpenCode Zen (OpenAI-compatible)",
         provider_type: ProviderType::OpenAi,
         default_base_url: Some("https://opencode.ai/zen/v1"),
         auth_kind: AuthKind::ApiKey,
@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn opencode_uses_its_openai_compatible_endpoint() {
         let opencode = preset("opencode").expect("opencode preset");
-        assert_eq!(opencode.display_name, "OpenCode Zen");
+        assert_eq!(opencode.display_name, "OpenCode Zen (OpenAI-compatible)");
         assert_eq!(opencode.provider_type, ProviderType::OpenAi);
         assert_eq!(
             opencode.default_base_url,

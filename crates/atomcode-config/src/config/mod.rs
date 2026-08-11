@@ -962,6 +962,10 @@ fn legacy_provider_to_preset_id(provider_type: &str) -> &'static str {
     match provider_type {
         "claude" | "anthropic" => "anthropic",
         "ollama" => "ollama",
+        // Preserve the vendor preset for legacy OpenCode Zen entries. Falling
+        // through to the generic OpenAI preset would resolve OPENAI_API_KEY
+        // instead of OPENCODE_API_KEY even though the wire protocol is the same.
+        "opencode" => "opencode",
         _ => "openai",
     }
 }
@@ -3231,6 +3235,29 @@ capable_model = 5
 mod legacy_projection_tests {
     use super::*;
 
+    struct EnvRestore {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
     const LEGACY: &str = r#"
 default_provider = "MyDeepSeek"
 
@@ -3524,6 +3551,49 @@ context_window = 131072
         assert_eq!(r.provider_type, "openai");
         // Falls back to the deepseek preset's default endpoint.
         assert_eq!(r.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
+    }
+
+    #[test]
+    fn opencode_resolves_vendor_preset_for_new_and_legacy_schema() {
+        let _env = EnvRestore::set("OPENCODE_API_KEY", "sk-opencode-test");
+        let new_schema = r#"
+default_model = "zen/model"
+
+[provider_accounts.zen]
+provider = "opencode"
+
+[models."zen/model"]
+account = "zen"
+model = "deepseek-v3.2"
+context_window = 131072
+"#;
+        let cfg: Config = toml::from_str(new_schema).unwrap();
+        let resolved = cfg.resolve_model(None).unwrap();
+        assert_eq!(resolved.provider_id, "opencode");
+        assert_eq!(resolved.provider_type, "openai");
+        assert_eq!(resolved.api_key.as_deref(), Some("sk-opencode-test"));
+        assert_eq!(
+            resolved.base_url.as_deref(),
+            Some("https://opencode.ai/zen/v1")
+        );
+
+        let legacy = r#"
+default_provider = "zen"
+
+[providers.zen]
+type = "opencode"
+model = "deepseek-v3.2"
+context_window = 131072
+"#;
+        let cfg: Config = toml::from_str(legacy).unwrap();
+        let resolved = cfg.resolve_model(None).unwrap();
+        assert_eq!(resolved.provider_id, "opencode");
+        assert_eq!(resolved.provider_type, "openai");
+        assert_eq!(resolved.api_key.as_deref(), Some("sk-opencode-test"));
+        assert_eq!(
+            resolved.base_url.as_deref(),
+            Some("https://opencode.ai/zen/v1")
+        );
     }
 
     #[test]
