@@ -9,6 +9,7 @@
 //! first-error-signature capture, telemetry, and the setsid/process-group reaping
 //! (the neutral version kills the direct child via `kill_on_drop`).
 
+use super::bash_workspace_gate::scan_redirect_writes;
 use super::{err, ok};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
@@ -1950,11 +1951,37 @@ pub fn check_destructive_command(command: &str) -> Option<String> {
     if cmd.contains(":(){") || cmd.contains(": (){") || cmd.contains("(){ :|:&") {
         return Some("fork bomb".to_string());
     }
-    // Critical system-file overwrite.
-    for f in ["/etc/passwd", "/etc/shadow", "/etc/hosts", "/etc/sudoers"] {
-        if cmd.contains(&format!("> {f}")) || cmd.contains(&format!(">> {f}")) {
+    // Critical system-file overwrite. Use the same quote/compound/fd-aware parser as the
+    // enforcing workspace gate: substring checks for `> /etc/passwd` miss the equally valid
+    // `>/etc/passwd`, `2>/etc/passwd`, and `>"/etc/passwd"` spellings.
+    let critical_files = ["/etc/passwd", "/etc/shadow", "/etc/hosts", "/etc/sudoers"];
+    let normalize_unix_absolute = |target: &str| {
+        if !target.starts_with('/') {
+            return None;
+        }
+        let mut parts: Vec<&str> = Vec::new();
+        for part in target.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                _ => parts.push(part),
+            }
+        }
+        Some(format!("/{}", parts.join("/")))
+    };
+    match scan_redirect_writes(command) {
+        Ok(targets)
+            if targets
+                .iter()
+                .filter_map(|target| normalize_unix_absolute(target))
+                .any(|target| critical_files.contains(&target.as_str())) =>
+        {
             return Some("critical system file overwrite".to_string());
         }
+        Err(()) => return Some("dynamic redirect target".to_string()),
+        _ => {}
     }
     // mkfifo / mknod.
     if cmd.contains("mkfifo ") || cmd.contains("mknod ") {
@@ -3639,6 +3666,19 @@ mod tests {
             "command dd if=backup.img of=/dev/sde",
             "builtin dd if=backup.img of=/dev/sdf",
             "echo ready && dd if=backup.img of=/dev/sdb",
+            "echo test >/etc/passwd",
+            "echo test >>/etc/shadow",
+            "echo test 1>/etc/hosts",
+            "echo test 2>/etc/sudoers",
+            "echo test >\"/etc/passwd\"",
+            "echo ready && printf test >/etc/shadow",
+            "echo test >$DYNAMIC_TARGET",
+            "test z >/etc/passwd",
+            "[ z ] >/etc/shadow",
+            "[[ z > a ]] >/etc/passwd",
+            "(( 2 > 1 )) >/etc/shadow",
+            "echo test >/etc/./hosts",
+            "echo test >//etc/sudoers",
             ":(){ :|:& };:",
             "git push --force origin main",
             "git reset --hard HEAD~3",
@@ -3679,6 +3719,9 @@ mod tests {
             "dd if=input.img of=/dev/stderr",
             "echo 'dd if=input.img of=/dev/sda'",
             "cd of=/dev/sda",
+            "echo '/etc/passwd'",
+            r"echo \>/etc/passwd",
+            "echo test >/etc/passwd.backup",
         ] {
             assert_eq!(
                 risk_of(c),

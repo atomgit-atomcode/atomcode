@@ -132,6 +132,15 @@ fn split_segments(cmd: &str) -> Vec<String> {
         let c = chars[i];
         if let Some(q) = quote {
             cur.push(c);
+            // A backslash can protect a double quote inside a double-quoted token. Preserve the
+            // pair verbatim, but do not let the escaped quote terminate quote mode and expose a
+            // following literal `>` as a redirect. Backslashes are literal inside single quotes.
+            if q == '"' && c == '\\' && i + 1 < chars.len() {
+                cur.push(chars[i + 1]);
+                prev_nonspace = Some(chars[i + 1]);
+                i += 2;
+                continue;
+            }
             if c == q {
                 quote = None;
             }
@@ -145,6 +154,14 @@ fn split_segments(cmd: &str) -> Vec<String> {
                 quote = Some(c);
                 prev_nonspace = Some(c);
                 i += 1;
+            }
+            '\\' if i + 1 < chars.len() => {
+                // Preserve the pair for `tokenize`, while ensuring an escaped `;`, `&`, or `|`
+                // remains ordinary word content rather than splitting the command.
+                cur.push(c);
+                cur.push(chars[i + 1]);
+                prev_nonspace = Some(chars[i + 1]);
+                i += 2;
             }
             ';' | '\n' => {
                 segs.push(std::mem::take(&mut cur));
@@ -199,6 +216,11 @@ fn tokenize(seg: &str) -> Vec<String> {
         let c = chars[i];
         if let Some(q) = quote {
             cur.push(c);
+            if q == '"' && c == '\\' && i + 1 < chars.len() {
+                cur.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
             if c == q {
                 quote = None;
             }
@@ -210,6 +232,13 @@ fn tokenize(seg: &str) -> Vec<String> {
                 cur.push(c);
                 quote = Some(c);
                 i += 1;
+            }
+            '\\' if i + 1 < chars.len() => {
+                // Outside quotes, bash uses `\` to make the next character literal. Append the
+                // escaped character to the current word so `\>` is not tokenized as a redirect;
+                // this also keeps escaped spaces within the same path token.
+                cur.push(chars[i + 1]);
+                i += 2;
             }
             c if c.is_whitespace() => {
                 if !cur.is_empty() {
@@ -261,7 +290,32 @@ fn tokenize(seg: &str) -> Vec<String> {
 /// Returns `Err(())` if a redirect target is an unexpanded `$var` (→ unresolvable).
 fn redirect_targets(toks: &[String]) -> Result<Vec<String>, ()> {
     let mut out = Vec::new();
-    let mut i = 0;
+    // `>` is an operator inside `[[ ... ]]` and `(( ... ))`, but a redirect after the closing
+    // token is ordinary shell syntax (`[[ ... ]] >/path`). Start scanning immediately after the
+    // expression rather than exempting the whole command segment.
+    let mut i = match effective_command_index(toks) {
+        Some(ci) => {
+            let closing = match command_word(&toks[ci]) {
+                "[[" => Some("]]"),
+                "((" => Some("))"),
+                _ => None,
+            };
+            match closing {
+                Some(closing) => {
+                    let Some(relative_end) = toks[ci + 1..]
+                        .iter()
+                        .position(|t| strip_quotes(t) == closing)
+                    else {
+                        // An unclosed expression is a shell syntax error and executes no write.
+                        return Ok(out);
+                    };
+                    ci + relative_end + 2
+                }
+                None => 0,
+            }
+        }
+        None => 0,
+    };
     while i < toks.len() {
         if toks[i] == ">" || toks[i] == ">>" {
             if let Some(raw) = toks.get(i + 1) {
@@ -279,6 +333,25 @@ fn redirect_targets(toks: &[String]) -> Result<Vec<String>, ()> {
         i += 1;
     }
     Ok(out)
+}
+
+/// Parse every file target written by shell redirection in `command`.
+///
+/// This is shared with `BashTool::risk()` so the advisory risk classifier and this enforcing
+/// workspace gate cannot disagree about whitespace-free redirects (`>/etc/passwd`), fd-prefixed
+/// redirects (`2>/etc/passwd`), quoted targets, or redirects embedded in compound commands.
+/// `Err(())` means a redirect target is dynamic and therefore cannot be classified statically.
+pub(crate) fn scan_redirect_writes(command: &str) -> Result<Vec<String>, ()> {
+    let joined = command.replace("\\\r\n", "").replace("\\\n", "");
+    let mut targets = Vec::new();
+    for seg in split_segments(joined.trim()) {
+        let toks = tokenize(seg.trim());
+        if toks.is_empty() {
+            continue;
+        }
+        targets.extend(redirect_targets(&toks)?);
+    }
+    Ok(targets)
 }
 
 /// The index of a segment's effective command token, skipping leading wrappers, flags, and
@@ -488,13 +561,6 @@ fn git_subcommand(args: &[String]) -> Option<&str> {
     None
 }
 
-/// Effective commands whose `>`/`<` are COMPARISON operators, not redirects (`[[ $a > $b ]]`,
-/// `(( a > b ))`, `test`). Redirect scanning is skipped for these so ordinary conditionals don't
-/// prompt.
-fn is_test_construct(effcmd: Option<&str>) -> bool {
-    matches!(effcmd, Some("[[") | Some("[") | Some("((") | Some("test"))
-}
-
 /// For each `mv` in the line, the `(source, dest)` pairs it performs — `mv A B C DEST`
 /// (or `mv -t DEST A B C`) → `[(A,DEST), (B,DEST), (C,DEST)]`.
 ///
@@ -544,9 +610,13 @@ pub(crate) fn scan_destructive_bash(command: &str) -> BashScan {
         return BashScan::NotDestructive;
     }
 
-    let mut targets: Vec<String> = Vec::new();
-    let mut any_destructive = false;
-    let mut unresolvable = false;
+    let (mut targets, mut any_destructive, mut unresolvable) = match scan_redirect_writes(cmd) {
+        Ok(targets) => {
+            let any = !targets.is_empty();
+            (targets, any, false)
+        }
+        Err(()) => (Vec::new(), true, true),
+    };
     let mut saw_cd = false;
 
     for seg in split_segments(cmd) {
@@ -556,23 +626,6 @@ pub(crate) fn scan_destructive_bash(command: &str) -> BashScan {
         }
         let ci = effective_command_index(&toks);
         let effcmd: Option<&str> = ci.map(|i| command_word(&toks[i]));
-
-        // Redirect writes (any command in this segment) — except inside a test/arithmetic
-        // construct, where `>` is a comparison operator.
-        if !is_test_construct(effcmd) {
-            match redirect_targets(&toks) {
-                Ok(mut r) => {
-                    if !r.is_empty() {
-                        any_destructive = true;
-                        targets.append(&mut r);
-                    }
-                }
-                Err(()) => {
-                    any_destructive = true;
-                    unresolvable = true;
-                }
-            }
-        }
 
         if let Some(ci) = ci {
             let effcmd = effcmd.unwrap();
@@ -989,6 +1042,48 @@ mod tests {
             scan("run 2> /outside/err.log"),
             BashScan::Targets(vec!["/outside/err.log".into()])
         );
+    }
+
+    #[test]
+    fn redirect_scanner_handles_spacing_fds_quotes_and_compounds() {
+        assert_eq!(
+            scan_redirect_writes("echo x >/etc/passwd").unwrap(),
+            vec!["/etc/passwd"]
+        );
+        assert_eq!(
+            scan_redirect_writes("echo x >>/etc/shadow").unwrap(),
+            vec!["/etc/shadow"]
+        );
+        assert_eq!(
+            scan_redirect_writes("echo x 2>\"/etc/hosts\"").unwrap(),
+            vec!["/etc/hosts"]
+        );
+        assert_eq!(
+            scan_redirect_writes("echo ok && echo x >/etc/sudoers").unwrap(),
+            vec!["/etc/sudoers"]
+        );
+        assert!(scan_redirect_writes("echo x >$TARGET").is_err());
+        assert_eq!(scan_redirect_writes("test z > a").unwrap(), vec!["a"]);
+        assert_eq!(scan_redirect_writes("[ z ] > b").unwrap(), vec!["b"]);
+        assert!(scan_redirect_writes("[[ z > a ]]").unwrap().is_empty());
+        assert!(scan_redirect_writes("(( 2 > 1 ))").unwrap().is_empty());
+        assert_eq!(
+            scan_redirect_writes("[[ z > a ]] >/etc/passwd").unwrap(),
+            vec!["/etc/passwd"]
+        );
+        assert_eq!(
+            scan_redirect_writes("(( 2 > 1 )) >/etc/shadow").unwrap(),
+            vec!["/etc/shadow"]
+        );
+        assert!(scan_redirect_writes(r"echo \>/etc/passwd")
+            .unwrap()
+            .is_empty());
+        assert!(scan_redirect_writes(r#"echo "literal \" | >/etc/passwd""#)
+            .unwrap()
+            .is_empty());
+        assert!(scan_redirect_writes("echo '>/etc/passwd'")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
