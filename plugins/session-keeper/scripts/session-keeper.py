@@ -488,7 +488,7 @@ def cmd_backup(quiet=False):
             checksums[rel] = md5.hexdigest()
 
     checksum_path = os.path.join(backup_dir, "BACKUP_CHECKSUM.md5")
-    with open(checksum_path, "w") as f:
+    with open(checksum_path, "w", encoding="utf-8") as f:
         for rel, md5 in sorted(checksums.items()):
             f.write(f"{md5}  {rel}\n")
 
@@ -572,7 +572,7 @@ def cmd_restore(backup_name=None):
     if os.path.isfile(checksum_path):
         print(f"Verifying backup integrity...")
         try:
-            with open(checksum_path, "r") as f:
+            with open(checksum_path, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
