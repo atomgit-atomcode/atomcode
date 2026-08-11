@@ -1544,21 +1544,30 @@ pub(crate) async fn live_message(
                 state.telemetry.clone(),
             );
             let next = crate::kernel_runtime::coding_config_from_runtime(&runtime_config);
-            if let Err(error) =
-                crate::native_live::reload_provider(&join.binding, next, requested_fingerprint)
-                    .await
+            match crate::native_live::reload_provider(&join.binding, next, requested_fingerprint)
+                .await
             {
-                // Same active-turn flag as /live/provider so the client can tell the
-                // user to stop the turn rather than showing a raw error.
-                let active_turn = matches!(error, crate::live_hub::HubError::ActiveTurn);
-                return Json(serde_json::json!({
-                    "accepted": false,
-                    "active_turn": active_turn,
-                    "error": format!("provider reload rejected: {error:?}"),
-                }));
+                Ok(_) => {
+                    provider_name = requested_provider;
+                }
+                // A turn is active, so this /live/message is a STEER that folds into
+                // the current turn — which cannot switch providers. Do NOT reject it:
+                // keep the active provider and submit the steer, matching the TUI
+                // (where mid-turn input never reloads the provider). Any requested
+                // provider change takes effect on the next idle turn. `reload_provider`
+                // checks `turn_in_progress()` before mutating, so nothing was applied.
+                Err(crate::live_hub::HubError::ActiveTurn) => {}
+                Err(error) => {
+                    return Json(serde_json::json!({
+                        "accepted": false,
+                        "active_turn": false,
+                        "error": format!("provider reload rejected: {error:?}"),
+                    }));
+                }
             }
+        } else {
+            provider_name = requested_provider;
         }
-        provider_name = requested_provider;
     }
     let original_images: Vec<ImageContent> = req
         .images
