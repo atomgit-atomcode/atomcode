@@ -75,6 +75,7 @@ import {
 } from '../lib/chatTerminal';
 import {
   acknowledgeLiveSteers,
+  isSteerPending,
   pendingSteersToDraft,
   reconcileSteerReceipt,
   shouldApplySteerProviderFallback,
@@ -3047,6 +3048,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
                   timeFull={timeFull}
                   search={search}
                   isActiveSearchMatch={isActiveSearchMatch}
+                  steerPending={isSteerPending(msg.pendingSteerId, pendingSteers)}
                 />
               );
             }
@@ -3442,6 +3444,7 @@ function UserMessageView({
   timeFull,
   search,
   isActiveSearchMatch,
+  steerPending,
 }: {
   msg: Message;
   searchRef?: (el: HTMLElement | null) => void;
@@ -3449,6 +3452,7 @@ function UserMessageView({
   timeFull?: string;
   search: string;
   isActiveSearchMatch: boolean;
+  steerPending?: boolean;
 }) {
   const t = useT();
   // 技能/文档型消息默认折叠为一行徽章，点击展开查看原文。
@@ -3492,7 +3496,15 @@ function UserMessageView({
     </button>
   );
 
-  const wrapperClass = 'user-message-wrapper' + (isActiveSearchMatch ? ' is-active-search-match' : '');
+  const wrapperClass = 'user-message-wrapper'
+    + (isActiveSearchMatch ? ' is-active-search-match' : '')
+    + (steerPending ? ' steer-pending' : '');
+  // A steer accepted mid-turn stays badged until the runtime folds it into the
+  // turn (the fold ack drops it from pendingSteers) — so the user can see, on
+  // their own message, exactly when it goes from "queued" to applied.
+  const steerBadge = steerPending && (
+    <div class="steer-pending-badge" role="status">{t('chat.steerBadge')}</div>
+  );
 
   if (skillTitle && !expanded) {
     return (
@@ -3507,6 +3519,7 @@ function UserMessageView({
           <span class="skill-badge-label">{skillTitle}</span>
           <span class="skill-badge-hint">{t('chat.skillExpand')}</span>
         </button>
+        {steerBadge}
         {timeLabel && <div class="msg-time msg-time-user" title={timeFull}>{timeLabel}</div>}
       </div>
     );
@@ -3528,6 +3541,7 @@ function UserMessageView({
       <div class="msg-actions">
         {copyBtn}
       </div>
+      {steerBadge}
       {/* PR #562 send-time label — below the bubble, right-aligned to match
           the user side; full timestamp on hover. */}
       {timeLabel && <div class="msg-time msg-time-user" title={timeFull}>{timeLabel}</div>}

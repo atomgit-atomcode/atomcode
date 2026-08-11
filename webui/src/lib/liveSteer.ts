@@ -92,6 +92,26 @@ export function reconcileSteerReceipt(
   return lifecycle.terminalConsumed ? 'release' : 'confirm';
 }
 
+/**
+ * Whether a message that was optimistically appended for a steer is still
+ * waiting to fold into the current turn — i.e. its steer was accepted
+ * (`confirmed`) but the runtime has not yet drained it at a tool boundary.
+ *
+ * The fold ack (`acknowledgeLiveSteers`) removes the entry from `pendingSteers`
+ * at the exact moment the steer enters the turn, so the badge this drives stays
+ * on the bubble until the steer truly applies. Unconfirmed submits (a new idle
+ * turn resolves to `started` and is dropped) are not badged.
+ */
+export function isSteerPending(
+  pendingSteerId: string | undefined,
+  pendingSteers: PendingLiveSteer[],
+): boolean {
+  return (
+    pendingSteerId !== undefined &&
+    pendingSteers.some((steer) => steer.id === pendingSteerId && steer.confirmed)
+  );
+}
+
 /** Restore unacknowledged steers to an editable draft without losing order. */
 export function pendingSteersToDraft(pending: PendingLiveSteer[]): {
   text: string;

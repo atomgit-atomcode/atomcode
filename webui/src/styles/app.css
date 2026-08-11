@@ -539,6 +539,31 @@ body {
   color: var(--app-secondary-foreground);
   font-size: 11px;
 }
+/* A steer message stays visibly "pending" on its own bubble until the runtime
+   folds it into the turn (the fold ack unmounts the badge) — a gentle pulse
+   makes the queued→applied transition easy to catch. */
+.user-message-wrapper.steer-pending .user-message-bubble {
+  border: 1px dashed color-mix(in srgb, var(--app-brand), transparent 55%);
+}
+.steer-pending-badge {
+  align-self: flex-end;
+  margin: 3px 4px 6px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  background: color-mix(in srgb, var(--app-brand), transparent 82%);
+  color: var(--app-brand);
+  animation: steer-pending-pulse 1.4s ease-in-out infinite;
+}
+@keyframes steer-pending-pulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .steer-pending-badge { animation: none; opacity: 0.9; }
+}
 .queued-remove:hover { color: var(--app-primary-foreground); }
 
 /* 技能/文档型用户消息折叠徽章：把 TUI 注入的整段 SKILL.md 收起为一行 */

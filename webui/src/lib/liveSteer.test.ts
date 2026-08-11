@@ -2,10 +2,33 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   acknowledgeLiveSteers,
+  isSteerPending,
   pendingSteersToDraft,
   reconcileSteerReceipt,
   shouldApplySteerProviderFallback,
 } from './liveSteer.ts';
+
+test('isSteerPending badges a message whose confirmed steer has not folded yet', () => {
+  // The steer was accepted (`confirmed`) and is still buffered on the runtime,
+  // waiting to fold at the next tool boundary → the bubble shows the pending
+  // badge until the fold ack removes it from pendingSteers.
+  const pending = [{ id: 'steer-1', text: 'add Shenzhen', confirmed: true }];
+  assert.equal(isSteerPending('steer-1', pending), true);
+});
+
+test('isSteerPending clears once the steer folded (no longer in pendingSteers)', () => {
+  // acknowledgeLiveSteers removes the steer at the fold boundary, so the badge
+  // disappears exactly when the steer truly enters the turn.
+  assert.equal(isSteerPending('steer-1', []), false);
+});
+
+test('isSteerPending does not badge an unconfirmed submit or a bubble without a steer id', () => {
+  // A submit not yet confirmed as a steer (a new turn resolves to `started` and
+  // is dropped) must not flash a badge; a plain message has no steer id.
+  const pending = [{ id: 'steer-1', text: 'hi', confirmed: false }];
+  assert.equal(isSteerPending('steer-1', pending), false);
+  assert.equal(isSteerPending(undefined, pending), false);
+});
 
 test('provider fallback applies only to the selection submitted with the steer', () => {
   assert.equal(
