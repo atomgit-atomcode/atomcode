@@ -2818,9 +2818,6 @@ body {
   /* Leave room at the header's left edge for the floating menu button. */
   .session-header { padding: 10px 12px 10px 54px; }
 
-  /* Keyboard hint is desktop-only affordance; drop it to save room. */
-  .input-hint { display: none; }
-
   /* Sidebar becomes off-canvas drawer */
   .session-list {
     position: fixed;

@@ -80,6 +80,7 @@ import {
   shouldApplySteerProviderFallback,
   type PendingLiveSteer,
 } from '../lib/liveSteer';
+import { hasCoarsePointer, shouldSendComposerOnEnter } from '../lib/composerKeyboard';
 
 interface Message {
   role: 'user' | 'assistant' | 'system';
@@ -572,6 +573,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const atBottomRef = useRef(true);
   const [showJumpBtn, setShowJumpBtn] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [coarsePointer, setCoarsePointer] = useState(hasCoarsePointer);
   const slashRef = useRef<HTMLDivElement>(null);
   const atRef = useRef<HTMLDivElement>(null);
   // 当前 Chat 正在显示的会话 id。用于区分「外部切换会话(需重置+加载历史)」
@@ -599,6 +601,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return;
+    const media = window.matchMedia('(pointer: coarse)');
+    const update = () => setCoarsePointer(media.matches);
+    update();
+    media.addEventListener?.('change', update);
+    return () => media.removeEventListener?.('change', update);
+  }, []);
   // 实时（/live）总线对应的会话 id（来自 snapshot）。用于门控实时事件：仅当用户当前
   // 查看的就是这个实时会话时才把输出渲染进画布——否则用户从侧栏打开了别的历史会话，
   // 实时输出会串进错误页面、且刷新即消失（刷新会按真实会话重载）。
@@ -2323,7 +2333,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       }
     }
 
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (shouldSendComposerOnEnter(e, coarsePointer)) {
       e.preventDefault();
       sendMessage();
     }
@@ -2730,6 +2740,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         rows={2}
         placeholder={t('chat.inputPlaceholder')}
         value={input}
+        enterkeyhint={coarsePointer ? 'enter' : 'send'}
         onInput={handleInput}
         onKeyDown={handleKeyDown}
         onPaste={handlePaste}
@@ -2838,7 +2849,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         )}
         <span class="input-cwd-chevron">▾</span>
       </button>
-      <span class="input-hint">{t('chat.kbdHint')}</span>
+      <span class="input-hint">
+        {t(coarsePointer ? 'chat.kbdHintMobile' : 'chat.kbdHint')}
+      </span>
     </div>
   );
 
