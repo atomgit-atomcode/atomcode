@@ -39,6 +39,17 @@ pub(crate) fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecisi
 /// Web/TUI 共同显示并下发给 Coding Runtime 的审批模式。
 static LIVE_APPROVAL_MODE: StdMutex<ApprovalMode> = StdMutex::new(ApprovalMode::Build);
 
+#[derive(Serialize)]
+pub(crate) struct LiveGoalSnapshot {
+    active: bool,
+    round: u32,
+    elapsed_secs: u64,
+    condition: String,
+    terminal: Option<String>,
+    phase: String,
+    last_reason: Option<String>,
+}
+
 /// 读取当前生效的审批模式。`pub(crate)` 以便 `/chat` 路径（非 sync webui）也据此
 /// 选择 PermissionDecider——否则模式 pill 只在 sync 模式生效。
 pub(crate) fn live_current_approval_mode() -> ApprovalMode {
@@ -641,6 +652,9 @@ pub(crate) enum LiveWireEvent {
         /// 当前工作目录，让 App 端能展示项目名。
         #[serde(rename = "working_dir")]
         working_dir: String,
+        /// Goal controller state is not persisted in SessionSnapshot, so the
+        /// initial wire snapshot carries it explicitly for late subscribers.
+        goal: Option<LiveGoalSnapshot>,
     },
     #[serde(rename = "provider")]
     Provider { provider: String },
@@ -1077,6 +1091,30 @@ impl NativeLiveWireProjector {
     }
 }
 
+fn goal_snapshot(progress: &atomcode_coding::GoalProgress) -> LiveGoalSnapshot {
+    use atomcode_coding::{GoalPhase, GoalTerminal};
+    LiveGoalSnapshot {
+        active: progress.active,
+        round: progress.round,
+        elapsed_secs: progress.elapsed_secs,
+        condition: progress.condition.clone(),
+        terminal: progress.terminal.map(|terminal| match terminal {
+            GoalTerminal::Met => "met",
+            GoalTerminal::Stopped => "stopped",
+            GoalTerminal::Failed => "failed",
+            GoalTerminal::Cancelled => "cancelled",
+        }.into()),
+        phase: match progress.phase {
+            GoalPhase::Pursuing => "pursuing",
+            GoalPhase::Paused => "paused",
+            GoalPhase::PausedAtCap => "paused_at_cap",
+            GoalPhase::Satisfied => "satisfied",
+            GoalPhase::Ended => "ended",
+        }.into(),
+        last_reason: progress.last_reason.clone(),
+    }
+}
+
 // ============================================================================
 // Handlers: GET /live (SSE) + POST /live/message
 // ============================================================================
@@ -1149,6 +1187,7 @@ pub(crate) async fn live_stream(
         }
     };
     let project_hash = crate::hash_path(&snapshot_wd);
+    let initial_goal = join.goal_progress.clone();
     let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
     let mut snapshot_messages: Vec<crate::MessageInfo> = join
         .snapshot
@@ -1172,11 +1211,22 @@ pub(crate) async fn live_stream(
         provider: join.binding.provider.clone(),
         mode: live_current_mode_wire(),
         working_dir: snapshot_wd.to_string_lossy().to_string(),
+        goal: initial_goal.as_ref().map(goal_snapshot),
     });
     let mut projector = NativeLiveWireProjector {
         session_id: join.binding.session_id.clone(),
         ..Default::default()
     };
+    // Goal is controller state rather than persisted conversation history. It
+    // is therefore restored separately from the message snapshot so an App
+    // connecting after the TUI turn has finished still sees the Goal badge.
+    if let Some(goal) = join.goal_progress {
+        if let Some(w) = projector.project(crate::live_hub::LiveViewEvent::Runtime(
+            atomcode_coding::CodingRuntimeEvent::GoalChanged(goal),
+        )) {
+            let _ = tx.send(w);
+        }
+    }
     for observation in join.replay {
         if let Some(w) = projector.project(observation.event) {
             let _ = tx.send(w);

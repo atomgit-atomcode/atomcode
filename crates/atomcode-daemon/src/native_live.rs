@@ -117,6 +117,13 @@ pub fn publish_unsequenced(
     hub().publish_unsequenced(binding, event)
 }
 
+pub fn seed_goal_progress(
+    binding: &LiveBinding,
+    progress: atomcode_coding::GoalProgress,
+) -> Result<(), HubError> {
+    hub().seed_goal_progress(binding, progress)
+}
+
 pub fn join() -> Result<LiveJoin, HubError> {
     hub().join()
 }

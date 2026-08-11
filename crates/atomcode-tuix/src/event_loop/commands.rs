@@ -563,9 +563,35 @@ fn live_provider_selection(config: &Config) -> Result<String, String> {
     }
 }
 
+fn current_live_goal(state: &UiState) -> Option<atomcode_coding::GoalProgress> {
+    let condition = state.goal_condition.as_ref()?.clone();
+    let phase = state.goal_phase;
+    let terminal = match phase {
+        atomcode_coding::GoalPhase::Satisfied => Some(atomcode_coding::GoalTerminal::Met),
+        atomcode_coding::GoalPhase::PausedAtCap => {
+            Some(atomcode_coding::GoalTerminal::Stopped)
+        }
+        _ => None,
+    };
+    Some(atomcode_coding::GoalProgress {
+        active: phase == atomcode_coding::GoalPhase::Pursuing,
+        terminal,
+        phase,
+        round: state.goal_round,
+        max_rounds: None,
+        elapsed_secs: state
+            .goal_started_at
+            .map(|started| started.elapsed().as_secs())
+            .unwrap_or(0),
+        condition,
+        last_reason: None,
+    })
+}
+
 pub(crate) fn attach_live_runtime(
     ctx: &mut LoopCtx,
     mode: AgentMode,
+    state: &UiState,
     renderer: &mut dyn Renderer,
 ) -> Result<(), String> {
     let snapshot = ctx.current_session.to_conversation_snapshot();
@@ -586,6 +612,13 @@ pub(crate) fn attach_live_runtime(
         std::sync::Arc::new(ctx.runtime.clone()),
     )
     .map_err(|error| format!("共享当前 runtime 失败：{error:?}"))?;
+    // Binding the already-running TUI runtime starts a fresh live hub. Seed
+    // its initial Goal state from the TUI presentation so `/app` can include
+    // it in the first snapshot even when no GoalChanged event is replayable.
+    if let Some(goal) = current_live_goal(state) {
+        atomcode_daemon::native_live::seed_goal_progress(&binding, goal)
+        .map_err(|error| format!("同步当前 Goal 状态失败：{error:?}"))?;
+    }
     // The runtime binding owns execution; the process-level mode seeds the first
     // live snapshot before any ModeChanged event exists.
     atomcode_daemon::live_set_mode(mode);
@@ -2066,7 +2099,7 @@ fn execute_slash_command_impl(
                     "127.0.0.1".to_string()
                 }
                 let host = parse_host(a);
-                if let Err(error) = attach_live_runtime(ctx, state.agent_mode, renderer) {
+                if let Err(error) = attach_live_runtime(ctx, state.agent_mode, state, renderer) {
                     renderer.render(UiLine::Error(error));
                     renderer.flush();
                     return Ok(());
@@ -2095,7 +2128,7 @@ fn execute_slash_command_impl(
                     Err(error) => renderer.render(UiLine::Error(error)),
                 }
             } else {
-                if let Err(error) = attach_live_runtime(ctx, state.agent_mode, renderer) {
+                if let Err(error) = attach_live_runtime(ctx, state.agent_mode, state, renderer) {
                     renderer.render(UiLine::Error(error));
                 }
             }
@@ -2322,7 +2355,7 @@ fn execute_slash_command_impl(
                                                     m_param
                                                 );
                                                 // 6) 手机视图复用 TUI 当前 CodingRuntime。
-                                                if let Err(error) = attach_live_runtime(ctx, state.agent_mode, renderer) {
+                                                if let Err(error) = attach_live_runtime(ctx, state.agent_mode, state, renderer) {
                                                     if let Some(mut child) = ctx.app_relay_child.take() {
                                                         let _ = child.start_kill();
                                                     }
