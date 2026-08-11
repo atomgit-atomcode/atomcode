@@ -815,6 +815,21 @@ impl LiveViewHub {
         let mut replay = state.turn_active;
         match &event {
             CodingRuntimeEvent::Agent(AgentEvent::TurnStarted) => {
+                // A new turn closes the prior driver-owned recovery window. A turn
+                // started outside `submit`/`submit_confirmed` (embedded TUI / sync
+                // mode drives the runtime handle directly, so those replay-clearing
+                // paths never run) would otherwise carry a lingering policy
+                // intervention into this turn's replay — a reconnecting client would
+                // then see a stale credential-recovery contract. Drop only that
+                // structured observation; ordinary replay is already empty here.
+                state.replay.retain(|observation| {
+                    !matches!(
+                        &observation.event,
+                        LiveViewEvent::Runtime(CodingRuntimeEvent::Agent(
+                            AgentEvent::PolicyIntervention { .. }
+                        ))
+                    )
+                });
                 state.turn_active = true;
                 replay = true;
             }
@@ -1588,6 +1603,72 @@ mod tests {
             images: Vec::new(),
         })
         .unwrap();
+        assert!(hub
+            .join()
+            .unwrap()
+            .replay
+            .iter()
+            .all(|observation| !matches!(
+                &observation.event,
+                LiveViewEvent::Runtime(CodingRuntimeEvent::Agent(
+                    AgentEvent::PolicyIntervention { .. }
+                ))
+            )));
+    }
+
+    #[test]
+    fn a_new_turn_start_clears_a_lingering_policy_intervention() {
+        // A turn started outside `submit` (embedded TUI / sync mode drives the
+        // runtime handle directly) must not carry the prior turn's recovery
+        // contract into this turn's replay — a reconnecting client would else
+        // render a stale credential-recovery card for an unrelated turn.
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind("session-1", PathBuf::from("/one"), snapshot("old"), control)
+            .unwrap();
+        for (sequence, event) in [
+            (1, CodingRuntimeEvent::Agent(AgentEvent::TurnStarted)),
+            (
+                2,
+                CodingRuntimeEvent::Agent(AgentEvent::PolicyIntervention {
+                    intervention:
+                        atomcode_kernel::event::PolicyIntervention::credential_shell_blocked(),
+                }),
+            ),
+            (
+                3,
+                CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                    turn_id: 1,
+                    reason: atomcode_kernel::event::StopReason::PolicyDenied,
+                    snapshot: Arc::new(snapshot("committed")),
+                    stats: Default::default(),
+                }),
+            ),
+        ] {
+            hub.publish(
+                &binding,
+                SequencedRuntimeEvent {
+                    generation: 1,
+                    sequence,
+                    event,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(hub.join().unwrap().replay.len(), 1);
+
+        // The next turn begins straight from the runtime (no `submit`).
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 4,
+                event: CodingRuntimeEvent::Agent(AgentEvent::TurnStarted),
+            },
+        )
+        .unwrap();
+
         assert!(hub
             .join()
             .unwrap()

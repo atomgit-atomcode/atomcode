@@ -16133,7 +16133,7 @@ fn handle_user_input_key(
 ) -> Result<()> {
     use atomcode_capabilities::tools::request_user_input::UserInputMode;
     if app.state.pending_policy_intervention.is_some() {
-        return handle_policy_intervention_key(app, ctx, renderer, code);
+        return handle_policy_intervention_key(app, ctx, renderer, code, modifiers);
     }
     // A multi-question batch is handled by its own self-contained handler (keeps the
     // single-question path below untouched → N==1 behavior is literally unchanged).
@@ -16297,8 +16297,23 @@ fn handle_policy_intervention_key(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
     use atomcode_kernel::event::PolicyRecoveryAction;
+
+    // Ctrl+C dismisses the driver-owned recovery panel (the turn already ended,
+    // so there is nothing to cancel) — mirror the request_user_input handler's
+    // Ctrl+C contract instead of leaving the app's universal escape hatch inert.
+    // Checked before the Char arm so it never falls through to the digit branch.
+    if code == KeyCode::Char('c')
+        && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+    {
+        app.state.pending_policy_intervention = None;
+        app.state.user_input_panel = None;
+        app.state.phase = UiPhase::Idle;
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
 
     match code {
         KeyCode::Up | KeyCode::Char('k') => {

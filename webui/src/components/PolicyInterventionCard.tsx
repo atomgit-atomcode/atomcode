@@ -12,6 +12,11 @@ interface PolicyInterventionCardProps {
   intervention: PolicyInterventionEvent;
   onSubmit: (message: string) => Promise<boolean> | boolean;
   onClose: () => void;
+  // The recovery event precedes the authoritative terminal by design. While the
+  // runtime is still busy the actions are disabled (no submit before idle), but
+  // the card stays mounted so its own loading/error state can render during and
+  // after a recovery submit.
+  busy?: boolean;
 }
 
 interface ActionCopy {
@@ -49,18 +54,20 @@ export function PolicyInterventionCard({
   intervention,
   onSubmit,
   onClose,
+  busy = false,
 }: PolicyInterventionCardProps) {
   const t = useT();
   const [loading, setLoading] = useState(false);
   const [showInstructions, setShowInstructions] = useState(false);
   const [error, setError] = useState(false);
+  const disabled = loading || busy;
   const actions = intervention.code === 'credential_shell_blocked'
     ? intervention.actions.filter(isPolicyRecoveryAction)
     : [];
   if (!actions.includes('end_task')) actions.push('end_task');
 
   async function choose(action: PolicyRecoveryAction) {
-    if (loading) return;
+    if (disabled) return;
     if (action === 'view_safe_instructions') {
       setShowInstructions(true);
       return;
@@ -101,7 +108,7 @@ export function PolicyInterventionCard({
                   key={action}
                   type="button"
                   class="user-input-option policy-recovery-action"
-                  disabled={loading}
+                  disabled={disabled}
                   onClick={() => void choose(action)}
                 >
                   <span class="user-input-option-body">

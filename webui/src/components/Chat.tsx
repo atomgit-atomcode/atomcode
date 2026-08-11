@@ -2807,11 +2807,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     />
   );
 
-  // The kernel event precedes the authoritative terminal by design. Do not
-  // allow a recovery submit until the runtime has actually returned to idle.
-  const policyInterventionCard = policyIntervention && !busy && (
+  // The kernel event precedes the authoritative terminal by design. Keep the
+  // card mounted through its own recovery submit (so its loading/error state can
+  // render) and gate SUBMIT — not mounting — on idle by forwarding `busy`: while
+  // the runtime is still busy the actions are disabled, so no recovery turn can
+  // start before the runtime has actually returned to idle.
+  const policyInterventionCard = policyIntervention && (
     <PolicyInterventionCard
       intervention={policyIntervention}
+      busy={busy}
       onClose={() => setPolicyIntervention(null)}
       onSubmit={(message) => deliver(message, [])}
     />

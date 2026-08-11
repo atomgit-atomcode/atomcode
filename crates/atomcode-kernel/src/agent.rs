@@ -3518,6 +3518,13 @@ impl RunningAgent {
             // cancel-skipped Execute slots applied nothing (dangling tool_calls now
             // rolled back / backfilled by finish_cancelled). Close any batch and
             // finish the cancelled turn — exactly the old loop's checkpoint path.
+            //
+            // A concurrent cancel deliberately SUPERSEDES a policy denial reached
+            // in this same batch: any pending `policy_intervention` is dropped WITH
+            // its PolicyDenied terminal (this returns before the `policy_denied`
+            // block below), so a driver never sees a recovery contract without the
+            // matching terminal. The hard block still stands — its paired blocked
+            // ToolResult was already persisted above. See `PolicyIntervention`.
             if cancelled_during_batch || cancel.is_cancelled() {
                 if let Some((batch_id, started_at)) = &batch_start {
                     self.rt.emit(AgentEvent::ToolBatchCompleted {

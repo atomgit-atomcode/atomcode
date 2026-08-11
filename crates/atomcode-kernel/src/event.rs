@@ -222,7 +222,11 @@ pub enum AgentEvent {
     },
     /// A hard policy boundary stopped the turn, with a driver-safe recovery
     /// contract. Emitted only after every tool call in the batch has a paired
-    /// result and immediately before the authoritative PolicyDenied terminal.
+    /// result and immediately before the authoritative PolicyDenied terminal —
+    /// UNLESS the turn is concurrently cancelled, in which case the cancel
+    /// supersedes: this event and the PolicyDenied terminal are both dropped
+    /// together (the turn ends Cancelled) and drivers surface nothing. The hard
+    /// block itself still stands — its paired blocked ToolResult is persisted.
     PolicyIntervention {
         intervention: PolicyIntervention,
     },
