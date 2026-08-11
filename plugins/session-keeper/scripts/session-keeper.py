@@ -605,8 +605,25 @@ def cmd_restore(backup_name=None):
             files_in_dir = len([f for f in os.listdir(src) if os.path.isfile(os.path.join(src, f))])
             sessions_count += files_in_dir
 
+    # Restore config.toml and memory.md — these are part of the backup
+    # (see cmd_backup) so a full restore must bring them back too, otherwise
+    # the restore silently loses the user's configuration and long-term memory.
+    restored_aux = 0
+    for aux in ("config.toml", "memory.md"):
+        src = os.path.join(backup_path, aux)
+        if os.path.isfile(src):
+            dst = os.path.join(ATOMCODE_HOME, aux)
+            if os.path.isfile(dst):
+                # Keep a safety copy of the current file before overwriting.
+                shutil.copy2(dst, f"{dst}.pre-restore")
+            shutil.copy2(src, dst)
+            restored_aux += 1
+            print(f"  ✅  Restored {aux}")
+
     print(f"  ✅  Restored from: {chosen}")
     print(f"  📂  Sessions files: {sessions_count}")
+    if restored_aux:
+        print(f"  📄  Config/memory files: {restored_aux} (previous copies kept as *.pre-restore)")
     print(f"  🔄  Restart AtomCode to see restored sessions")
     return True
 
