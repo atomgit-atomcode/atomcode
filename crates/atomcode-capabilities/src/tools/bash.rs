@@ -1668,6 +1668,7 @@ pub fn check_destructive_command(command: &str) -> Option<String> {
         const WRAPPERS: &[&str] = &[
             "env", "nice", "nohup", "timeout", "strace", "ionice", "taskset", "setsid", "screen",
             "tmux", "script", "unshare", "nsenter", "chroot", "setarch", "linux32", "linux64",
+            "command", "builtin",
         ];
         const KNOWN: &[&str] = &[
             "rm", "dd", "chmod", "chown", "chgrp", "mkfs", "format", "drop", "python", "perl",
@@ -1676,11 +1677,37 @@ pub fn check_destructive_command(command: &str) -> Option<String> {
         fn b(t: &str) -> &str {
             t.rsplit('/').next().unwrap_or(t)
         }
+        fn is_env_assignment(t: &str) -> bool {
+            let Some((name, _value)) = t.split_once('=') else {
+                return false;
+            };
+            !name.is_empty()
+                && name.chars().enumerate().all(|(i, c)| {
+                    c == '_' || c.is_ascii_alphanumeric() && (i > 0 || !c.is_ascii_digit())
+                })
+        }
         let toks: Vec<&str> = cmd.split_whitespace().collect();
-        if toks.is_empty() || !WRAPPERS.contains(&b(toks[0])) {
+        if toks.is_empty() {
             return cmd.to_string();
         }
-        let mut skip = 1;
+        // Shell assignment prefixes (`LC_ALL=C dd …`) are not the effective command. Strip only
+        // syntactically-valid variable assignments so an arbitrary argument containing `=` does
+        // not move the command boundary.
+        let mut skip = 0;
+        while skip < toks.len() && is_env_assignment(toks[skip]) {
+            skip += 1;
+        }
+        if skip == toks.len() {
+            return cmd.to_string();
+        }
+        if !WRAPPERS.contains(&b(toks[skip])) {
+            return if skip == 0 {
+                cmd.to_string()
+            } else {
+                toks[skip..].join(" ")
+            };
+        }
+        skip += 1;
         while skip < toks.len() {
             let t = toks[skip];
             // Skip the wrapper's flags / values / env-assignments; stop at a real command
@@ -1900,10 +1927,23 @@ pub fn check_destructive_command(command: &str) -> Option<String> {
             ));
         }
     }
-    // dd raw disk write. Gate the `if=/dev/` substring on dd actually being the command
-    // so `cd if=/dev/foo` (normalizes to `cdif=/dev/foo`) is not a false positive.
-    let dd_norm: String = cmd.split_whitespace().collect();
-    if dd_norm.starts_with("ddif=") || (first_base == "dd" && dd_norm.contains("if=/dev/")) {
+    // dd raw-device access. Gate device operands on `dd` actually being the command so a
+    // harmless mention such as `cd if=/dev/foo` cannot false-positive. In particular, the
+    // OUTPUT operand is the destructive side: `dd if=image.raw of=/dev/sda` can overwrite an
+    // entire disk even though its input is an ordinary file. Keep the historical `if=/dev/`
+    // classification as well; removing it would silently weaken the established approval policy.
+    let dd_device_operand = |name: &str| {
+        first_base == "dd"
+            && cmd.split_whitespace().skip(1).any(|arg| {
+                let arg = normalize(arg);
+                let Some(device) = arg.strip_prefix(name) else {
+                    return false;
+                };
+                device.starts_with("/dev/")
+                    && !matches!(device, "/dev/null" | "/dev/stdout" | "/dev/stderr")
+            })
+    };
+    if dd_device_operand("if=") || dd_device_operand("of=") {
         return Some("raw disk write (dd)".to_string());
     }
     // Fork bomb.
@@ -3590,6 +3630,15 @@ mod tests {
             "rm -rf ~/important",
             "sudo rm foo",
             "dd if=/dev/zero of=/dev/sda",
+            "dd if=backup.img of=/dev/sda",
+            "dd if=backup.img of=\"/dev/nvme0n1\" bs=4M",
+            "/usr/bin/dd of=/dev/disk2 if=backup.img",
+            "timeout 10 dd if=backup.img of=/dev/mapper/data",
+            "LC_ALL=C dd if=backup.img of=/dev/sdc",
+            "FOO=1 BAR=two /usr/bin/dd if=backup.img of=/dev/sdd",
+            "command dd if=backup.img of=/dev/sde",
+            "builtin dd if=backup.img of=/dev/sdf",
+            "echo ready && dd if=backup.img of=/dev/sdb",
             ":(){ :|:& };:",
             "git push --force origin main",
             "git reset --hard HEAD~3",
@@ -3618,6 +3667,24 @@ mod tests {
             "socat tcp-listen:4444 exec:/bin/sh",
         ] {
             assert_eq!(risk_of(c), RiskLevel::Risky, "{c} should be Risky");
+        }
+    }
+
+    #[test]
+    fn dd_non_device_outputs_are_not_flagged_as_raw_disk_writes() {
+        for c in [
+            "dd if=input.img of=output.img",
+            "dd if=input.img of=/dev/null",
+            "dd if=input.img of=/dev/stdout",
+            "dd if=input.img of=/dev/stderr",
+            "echo 'dd if=input.img of=/dev/sda'",
+            "cd of=/dev/sda",
+        ] {
+            assert_eq!(
+                risk_of(c),
+                RiskLevel::Safe,
+                "{c} must not be classified as a raw-device write"
+            );
         }
     }
 
