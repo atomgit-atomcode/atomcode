@@ -55,6 +55,7 @@ fn grouped_selection_ids(config: &Config) -> Vec<String> {
     ids
 }
 
+#[cfg(test)]
 pub(crate) fn adjacent_provider(config: &Config, direction: ModelCycleDirection) -> Option<String> {
     adjacent_provider_from(config, direction, None)
 }
