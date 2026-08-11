@@ -145,6 +145,14 @@ pub static SETTINGS: &[SettingSpec] = &[
         ApplyPolicy::ImmediateUi,
     ),
     bool_setting(
+        "ui.truncate_resumed_history",
+        &["ui", "truncate_resumed_history"],
+        "Truncate resumed history",
+        "恢复历史截断",
+        &["resume", "history", "replay", "完整展示"],
+        ApplyPolicy::ImmediateUi,
+    ),
+    bool_setting(
         "notifications.enabled",
         &["notifications", "enabled"],
         "Notifications",
@@ -257,6 +265,9 @@ impl SettingSpec {
             "ui.auto_copy_code_blocks" => config.ui.auto_copy_code_blocks.to_string(),
             "ui.ai_session_naming" => config.ui.ai_session_naming.to_string(),
             "ui.terminal_status_glyph" => config.ui.terminal_status_glyph.to_string(),
+            "ui.truncate_resumed_history" => (config.ui.truncate_resumed_history
+                && config.ui.history_replay_max_rows != Some(0))
+            .to_string(),
             "notifications.enabled" => config.notifications.enabled.to_string(),
             "notifications.bell" => config.notifications.bell.to_string(),
             "datalog.enabled" => config.datalog.enabled.to_string(),
@@ -277,6 +288,19 @@ impl SettingSpec {
     }
 
     pub fn patch(&self, document: &mut DocumentMut, input: &str) -> Result<()> {
+        // `history_replay_max_rows = 0` was the legacy way to disable the cap.
+        // When the user explicitly enables the new switch, remove only that
+        // legacy sentinel; positive custom caps remain untouched.
+        if self.id == "ui.truncate_resumed_history" {
+            let enabled = input
+                .parse::<bool>()
+                .map_err(|_| anyhow::anyhow!("expected true or false"))?;
+            set_path(document, self.path, value(enabled));
+            if enabled && integer_at_path(document, &["ui", "history_replay_max_rows"]) == Some(0) {
+                remove_path(document, &["ui", "history_replay_max_rows"]);
+            }
+            return Ok(());
+        }
         let item = match self.kind {
             SettingKind::Boolean => value(
                 input
@@ -318,6 +342,11 @@ impl SettingSpec {
 
     pub fn reset(&self, document: &mut DocumentMut) {
         remove_path(document, self.path);
+        if self.id == "ui.truncate_resumed_history"
+            && integer_at_path(document, &["ui", "history_replay_max_rows"]) == Some(0)
+        {
+            remove_path(document, &["ui", "history_replay_max_rows"]);
+        }
     }
 }
 
@@ -362,6 +391,15 @@ fn remove_path(document: &mut DocumentMut, path: &[&str]) {
         table = next;
     }
     table.remove(leaf);
+}
+
+fn integer_at_path(document: &DocumentMut, path: &[&str]) -> Option<i64> {
+    let (leaf, parents) = path.split_last()?;
+    let mut table = document.as_table();
+    for key in parents {
+        table = table.get(key)?.as_table()?;
+    }
+    table.get(leaf)?.as_integer()
 }
 
 #[cfg(test)]
@@ -451,6 +489,61 @@ mod tests {
         assert!(document.to_string().contains("enabled = false"));
         setting.patch(&mut document, "auto").unwrap();
         assert!(!document.to_string().contains("enabled"));
+    }
+
+    #[test]
+    fn resumed_history_toggle_preserves_custom_row_cap() {
+        let setting = SETTINGS
+            .iter()
+            .find(|setting| setting.id == "ui.truncate_resumed_history")
+            .unwrap();
+
+        let mut document = "[ui]\nhistory_replay_max_rows = 777\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        let configured: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(setting.value(&configured), "true");
+
+        setting.patch(&mut document, "false").unwrap();
+        assert!(document
+            .to_string()
+            .contains("history_replay_max_rows = 777"));
+        assert!(document
+            .to_string()
+            .contains("truncate_resumed_history = false"));
+        let unlimited: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(setting.value(&unlimited), "false");
+
+        setting.patch(&mut document, "true").unwrap();
+        assert!(document
+            .to_string()
+            .contains("history_replay_max_rows = 777"));
+        let restored: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(setting.value(&restored), "true");
+    }
+
+    #[test]
+    fn enabling_resumed_history_truncation_migrates_legacy_zero_cap() {
+        let setting = SETTINGS
+            .iter()
+            .find(|setting| setting.id == "ui.truncate_resumed_history")
+            .unwrap();
+        let mut document = "[ui]\nhistory_replay_max_rows = 0\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        let legacy: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(setting.value(&legacy), "false");
+
+        setting.patch(&mut document, "true").unwrap();
+        assert!(!document.to_string().contains("history_replay_max_rows"));
+        assert!(document
+            .to_string()
+            .contains("truncate_resumed_history = true"));
+
+        setting.reset(&mut document);
+        assert!(!document.to_string().contains("truncate_resumed_history"));
+        let reset: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(setting.value(&reset), "true");
     }
 
     #[test]

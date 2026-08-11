@@ -414,6 +414,10 @@ pub struct UiConfig {
     /// This only limits presentation: runtime restores the full native session.
     #[serde(default)]
     pub history_replay_max_rows: Option<usize>,
+    /// Whether resumed history replay is bounded. Disabling this keeps the
+    /// configured row cap intact so re-enabling restores the previous limit.
+    #[serde(default = "default_true")]
+    pub truncate_resumed_history: bool,
 }
 
 impl Default for UiConfig {
@@ -424,6 +428,7 @@ impl Default for UiConfig {
             ai_session_naming: default_ai_session_naming(),
             terminal_status_glyph: default_terminal_status_glyph(),
             history_replay_max_rows: None,
+            truncate_resumed_history: true,
         }
     }
 }
@@ -2174,10 +2179,13 @@ model = "missing-type"
     #[test]
     fn history_replay_row_cap_is_optional_and_zero_is_preserved() {
         assert_eq!(UiConfig::default().history_replay_max_rows, None);
+        assert!(UiConfig::default().truncate_resumed_history);
         let capped: UiConfig = toml::from_str("history_replay_max_rows = 1234").unwrap();
         assert_eq!(capped.history_replay_max_rows, Some(1234));
+        assert!(capped.truncate_resumed_history);
         let unlimited: UiConfig = toml::from_str("history_replay_max_rows = 0").unwrap();
         assert_eq!(unlimited.history_replay_max_rows, Some(0));
+        assert!(unlimited.truncate_resumed_history);
     }
 
     #[test]

@@ -298,6 +298,9 @@ pub(crate) fn resolve_history_replay_max_rows(
     config: &atomcode_config::Config,
     caps: &terminal::TerminalCaps,
 ) -> Option<usize> {
+    if !config.ui.truncate_resumed_history {
+        return None;
+    }
     match config.ui.history_replay_max_rows {
         Some(0) => None,
         Some(rows) => Some(rows),
@@ -974,6 +977,10 @@ mod panic_restore_tests {
             resolve_history_replay_max_rows(&config, &test_caps()),
             Some(777)
         );
+
+        config.ui.truncate_resumed_history = false;
+        assert_eq!(resolve_history_replay_max_rows(&config, &test_caps()), None);
+        assert_eq!(config.ui.history_replay_max_rows, Some(777));
     }
 
     #[test]
