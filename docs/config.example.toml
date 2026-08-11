@@ -294,3 +294,6 @@ auto_update_marketplaces = true
 # =============================================================================
 [ui]
 theme = "auto"
+# /resume 初次回放到终端原生 scrollback 的视觉行上限。
+# 省略时按终端自动选择；0 表示完整回放（长会话恢复会更慢）。
+# history_replay_max_rows = 5000

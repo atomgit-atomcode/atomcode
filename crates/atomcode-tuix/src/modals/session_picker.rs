@@ -668,6 +668,7 @@ pub(crate) fn replay_session(
     // final frame inside the envelope and closes it. No-op on renderers
     // without synchronized output (plain/pipe mode).
     renderer.begin_sync();
+    renderer.begin_initial_history_replay();
     // Suppress auto-copy during replay so we don't overwrite the user's
     // clipboard or inject stale "Copied" hints (issue #699 P1).
     renderer.set_suppress_auto_copy(true);
@@ -839,6 +840,7 @@ pub(crate) fn replay_session(
     }
     renderer.render(UiLine::TurnComplete);
     renderer.render(UiLine::TurnSeparator { label: resumed });
+    renderer.end_initial_history_replay();
     renderer.flush();
     renderer.set_suppress_auto_copy(false);
     renderer.end_sync();

@@ -293,6 +293,39 @@ pub fn panic_restore_terminal() {
     let _ = out.flush();
 }
 
+pub(crate) fn resolve_history_replay_max_rows(
+    config: &atomcode_config::Config,
+    caps: &terminal::TerminalCaps,
+) -> Option<usize> {
+    match config.ui.history_replay_max_rows {
+        Some(0) => None,
+        Some(rows) => Some(rows),
+        None => {
+            let term_program = std::env::var("TERM_PROGRAM")
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if term_program.contains("vscode") || caps.legacy_conhost || caps.jediterm {
+                Some(1_000)
+            } else if term_program.contains("wezterm") {
+                Some(3_000)
+            } else {
+                // Keep every automatic cap below RetainedRenderer's 5,000-row
+                // memory ceiling; otherwise the "bounded" replay is identical
+                // to the legacy full replay and provides no latency benefit.
+                Some(2_500)
+            }
+        }
+    }
+}
+
+pub(crate) fn sync_history_replay_config(
+    renderer: &mut dyn Renderer,
+    config: &atomcode_config::Config,
+    caps: &terminal::TerminalCaps,
+) {
+    renderer.set_history_replay_max_rows(resolve_history_replay_max_rows(config, caps));
+}
+
 pub async fn run(
     config: Config,
     provider_selection: String,
@@ -482,6 +515,8 @@ pub async fn run(
         Err(_) => config.ui.auto_copy_code_blocks,
     };
     inner.set_auto_copy_enabled(auto_copy);
+    let history_replay_max_rows = resolve_history_replay_max_rows(&config, &caps);
+    inner.set_history_replay_max_rows(history_replay_max_rows);
     let mut renderer: Box<dyn Renderer> = Box::new(TaskRenderer::new(inner));
 
     // Input thread (only spawn when raw-mode/TTY available; pipe mode
@@ -899,8 +934,44 @@ pub async fn run(
 
 #[cfg(test)]
 mod panic_restore_tests {
-    use super::{kitty_keyboard_flags, panic_restore_sequence};
+    use super::{
+        kitty_keyboard_flags, panic_restore_sequence, resolve_history_replay_max_rows,
+    };
     use crossterm::event::KeyboardEnhancementFlags;
+
+    fn test_caps() -> crate::terminal::TerminalCaps {
+        crate::terminal::TerminalCaps {
+            tty: true,
+            colors: true,
+            spinner: true,
+            bracketed_paste: true,
+            raw_mode: true,
+            scroll_region: true,
+            unicode_symbols: true,
+            legacy_conhost: false,
+            jediterm: false,
+            modern_emulator: true,
+        }
+    }
+
+    #[test]
+    fn automatic_history_replay_cap_is_below_retained_memory_limit() {
+        let cap = resolve_history_replay_max_rows(&atomcode_config::Config::default(), &test_caps())
+            .expect("automatic replay must stay bounded");
+        assert!(cap < crate::render::retained::MAX_SCROLLBACK_ROWS);
+    }
+
+    #[test]
+    fn configured_history_replay_cap_preserves_zero_and_custom_values() {
+        let mut config = atomcode_config::Config::default();
+        config.ui.history_replay_max_rows = Some(0);
+        assert_eq!(resolve_history_replay_max_rows(&config, &test_caps()), None);
+        config.ui.history_replay_max_rows = Some(777);
+        assert_eq!(
+            resolve_history_replay_max_rows(&config, &test_caps()),
+            Some(777)
+        );
+    }
 
     #[test]
     fn kitty_keyboard_flags_do_not_request_release_events() {

@@ -720,6 +720,24 @@ impl Renderer for CaptureRenderer<'_> {
     fn on_resize(&mut self, cols: u16, rows: u16) {
         self.inner.on_resize(cols, rows);
     }
+    fn begin_sync(&mut self) {
+        self.inner.begin_sync();
+    }
+    fn end_sync(&mut self) {
+        self.inner.end_sync();
+    }
+    fn begin_initial_history_replay(&mut self) {
+        self.inner.begin_initial_history_replay();
+    }
+    fn end_initial_history_replay(&mut self) {
+        self.inner.end_initial_history_replay();
+    }
+    fn set_history_replay_max_rows(&mut self, max_rows: Option<usize>) {
+        self.inner.set_history_replay_max_rows(max_rows);
+    }
+    fn set_suppress_auto_copy(&mut self, suppress: bool) {
+        self.inner.set_suppress_auto_copy(suppress);
+    }
 }
 
 /// 同步模式下输出**不**镜像到手机的命令：它们的输出是桌面侧的接入引导
@@ -1675,6 +1693,7 @@ fn execute_slash_command_impl(
         "reload" => {
             match reload_persisted_config(ctx) {
                 Ok(PersistedConfigReload::Applied { provider, model }) => {
+                    crate::sync_history_replay_config(renderer, &ctx.config, &ctx.caps);
                     state.on_model_window_changed(ctx.config.default_context_window());
                     renderer.render(UiLine::CommandOutput(
                         t(Msg::CmdReloadDone {
@@ -7352,6 +7371,69 @@ mod expand_cd_target_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct ReplayLifecycleProbe {
+        begin_sync: usize,
+        end_sync: usize,
+        begin_replay: usize,
+        end_replay: usize,
+        caps: Vec<Option<usize>>,
+        suppress: Vec<bool>,
+    }
+
+    impl Renderer for ReplayLifecycleProbe {
+        fn render(&mut self, _line: UiLine) {}
+        fn flush(&mut self) {}
+        fn shutdown(&mut self) {}
+        fn reset(&mut self) {}
+        fn clear_screen(&mut self) {}
+        fn suspend_for_external(&mut self) {}
+        fn resume_from_external(&mut self) {}
+        fn flush_deferred(&mut self) {}
+        fn begin_sync(&mut self) {
+            self.begin_sync += 1;
+        }
+        fn end_sync(&mut self) {
+            self.end_sync += 1;
+        }
+        fn begin_initial_history_replay(&mut self) {
+            self.begin_replay += 1;
+        }
+        fn end_initial_history_replay(&mut self) {
+            self.end_replay += 1;
+        }
+        fn set_history_replay_max_rows(&mut self, max_rows: Option<usize>) {
+            self.caps.push(max_rows);
+        }
+        fn set_suppress_auto_copy(&mut self, suppress: bool) {
+            self.suppress.push(suppress);
+        }
+    }
+
+    #[test]
+    fn capture_renderer_forwards_resume_lifecycle() {
+        let mut inner = ReplayLifecycleProbe::default();
+        let mut captured = CaptureRenderer {
+            inner: &mut inner,
+            captured: String::new(),
+        };
+        captured.begin_sync();
+        captured.begin_initial_history_replay();
+        captured.set_history_replay_max_rows(Some(321));
+        captured.set_suppress_auto_copy(true);
+        captured.set_suppress_auto_copy(false);
+        captured.end_initial_history_replay();
+        captured.end_sync();
+        drop(captured);
+
+        assert_eq!(inner.begin_sync, 1);
+        assert_eq!(inner.end_sync, 1);
+        assert_eq!(inner.begin_replay, 1);
+        assert_eq!(inner.end_replay, 1);
+        assert_eq!(inner.caps, vec![Some(321)]);
+        assert_eq!(inner.suppress, vec![true, false]);
+    }
 
     #[test]
     fn live_user_text_shaped_like_a_reminder_is_still_echoed() {

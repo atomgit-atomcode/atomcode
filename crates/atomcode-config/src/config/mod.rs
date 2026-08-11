@@ -408,6 +408,12 @@ pub struct UiConfig {
     /// shows emoji as monochrome tofu boxes.
     #[serde(default = "default_terminal_status_glyph")]
     pub terminal_status_glyph: bool,
+    /// Maximum number of already-wrapped transcript rows written to the host
+    /// terminal when a session is resumed. `None` selects a terminal-aware
+    /// default; `Some(0)` disables the cap and restores the legacy full replay.
+    /// This only limits presentation: runtime restores the full native session.
+    #[serde(default)]
+    pub history_replay_max_rows: Option<usize>,
 }
 
 impl Default for UiConfig {
@@ -417,6 +423,7 @@ impl Default for UiConfig {
             auto_copy_code_blocks: default_auto_copy_code_blocks(),
             ai_session_naming: default_ai_session_naming(),
             terminal_status_glyph: default_terminal_status_glyph(),
+            history_replay_max_rows: None,
         }
     }
 }
@@ -2162,6 +2169,15 @@ model = "missing-type"
         assert!(UiConfig::default().terminal_status_glyph);
         let ui: UiConfig = toml::from_str("").unwrap();
         assert!(ui.terminal_status_glyph, "missing key → default on");
+    }
+
+    #[test]
+    fn history_replay_row_cap_is_optional_and_zero_is_preserved() {
+        assert_eq!(UiConfig::default().history_replay_max_rows, None);
+        let capped: UiConfig = toml::from_str("history_replay_max_rows = 1234").unwrap();
+        assert_eq!(capped.history_replay_max_rows, Some(1234));
+        let unlimited: UiConfig = toml::from_str("history_replay_max_rows = 0").unwrap();
+        assert_eq!(unlimited.history_replay_max_rows, Some(0));
     }
 
     #[test]

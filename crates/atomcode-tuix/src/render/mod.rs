@@ -330,6 +330,16 @@ pub trait Renderer: Send {
     /// frame inside it). Default no-op. Must be paired with `begin_sync()`.
     fn end_sync(&mut self) {}
 
+    /// Rebuild an initial `/resume` replay in memory instead of eagerly
+    /// scrolling every historical row through the host terminal.
+    fn begin_initial_history_replay(&mut self) {}
+
+    /// Emit the bounded suffix retained by `begin_initial_history_replay`.
+    fn end_initial_history_replay(&mut self) {}
+
+    /// Configure the terminal projection cap. `None` preserves full replay.
+    fn set_history_replay_max_rows(&mut self, _max_rows: Option<usize>) {}
+
     /// Suppress automatic clipboard copy during history replay so that
     /// `/resume`, `/undo` and `atomcode -c` don't overwrite the user's
     /// clipboard or inject stale "Copied" hints into the replay output

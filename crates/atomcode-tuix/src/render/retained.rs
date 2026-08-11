@@ -970,6 +970,10 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// level (not only on `screen`) because `reset()` rebuilds `screen` —
     /// the flag is re-applied to the fresh `screen` so suppression survives.
     in_sync_batch: bool,
+    /// `/resume` rebuilds the complete retained model while suppressing eager
+    /// terminal writes, then emits one bounded suffix at replay completion.
+    history_replay_max_rows: Option<usize>,
+    initial_history_replay_active: bool,
     /// When `Some`, the live row at body_bottom is the animated
     /// in-flight tool-call line (`<frame> Bash(cmd)`), not the generic
     /// spinner. The Spinner / StreamingBox tick handlers consult this:
@@ -1171,6 +1175,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             force_continuous_body_projection: false,
             pending_scroll_flush: false,
             in_sync_batch: false,
+            history_replay_max_rows: None,
+            initial_history_replay_active: false,
             inflight_tool: None,
             inflight_tool_rows: 0,
             inflight_hint: None,
@@ -5835,7 +5841,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // A legacy-conhost resize first rebuilds the retained model without
         // terminal I/O. A bounded physical-row suffix is emitted once after
         // the semantic replay completes.
-        if self.replaying && self.caps.legacy_conhost {
+        if (self.replaying
+            && (self.caps.legacy_conhost || self.history_replay_max_rows.is_some()))
+            || self.initial_history_replay_active
+        {
             return;
         }
         let h = self.screen.height() as usize;
@@ -7170,11 +7179,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
     /// Rebuild a bounded suffix of the retained body into native scrollback.
     /// The complete model remains available for marks and later rendering.
-    fn replay_legacy_conhost_scrollback(&mut self) {
+    fn replay_bounded_scrollback(&mut self, max_rows: usize) {
         let full_body = std::mem::take(&mut self.body_lines);
-        let suffix_start = full_body
-            .len()
-            .saturating_sub(LEGACY_CONHOST_REFLOW_MAX_ROWS);
+        let suffix_start = full_body.len().saturating_sub(max_rows);
         let retained_rows: Vec<Vec<Cell>> = full_body[suffix_start..].to_vec();
 
         self.scrolled_off = 0;
@@ -7188,6 +7195,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let visible_rows = self.body_lines.len().saturating_sub(self.scrolled_off);
         self.body_lines = full_body;
         self.scrolled_off = self.body_lines.len().saturating_sub(visible_rows);
+    }
+
+    fn replay_legacy_conhost_scrollback(&mut self) {
+        self.replay_bounded_scrollback(LEGACY_CONHOST_REFLOW_MAX_ROWS);
     }
 
     fn reflow_welcome_prefix(&mut self) {
@@ -8469,6 +8480,24 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let _ = self.out.flush();
     }
 
+    fn begin_initial_history_replay(&mut self) {
+        self.initial_history_replay_active = self.history_replay_max_rows.is_some();
+    }
+
+    fn end_initial_history_replay(&mut self) {
+        if !std::mem::take(&mut self.initial_history_replay_active) {
+            return;
+        }
+        let Some(max_rows) = self.history_replay_max_rows else {
+            return;
+        };
+        self.replay_bounded_scrollback(max_rows);
+    }
+
+    fn set_history_replay_max_rows(&mut self, max_rows: Option<usize>) {
+        self.history_replay_max_rows = max_rows.filter(|rows| *rows > 0);
+    }
+
     fn set_suppress_auto_copy(&mut self, suppress: bool) {
         self.suppress_auto_copy = suppress;
     }
@@ -8940,7 +8969,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // overflow into scrollback at the new width via its append-only
         // LFs, completing the `\x1b[3J` rebuild above.
         self.reflow_body_to_current_width();
-        if self.caps.legacy_conhost {
+        if let Some(max_rows) = self.history_replay_max_rows {
+            self.replay_bounded_scrollback(max_rows);
+        } else if self.caps.legacy_conhost {
             self.replay_legacy_conhost_scrollback();
         }
 
@@ -20242,6 +20273,50 @@ mod tests {
             "stream must close with ESU after the final paint: {:?}",
             out
         );
+    }
+
+    #[test]
+    fn initial_history_replay_emits_only_bounded_tail_but_keeps_full_model() {
+        let (mut r, buf) = new_capturing(40, 12);
+        buf.lock().unwrap().clear();
+        r.set_history_replay_max_rows(Some(3));
+
+        r.begin_initial_history_replay();
+        for i in 0..10 {
+            r.render(UiLine::CommandOutput(format!("history-row-{i}")));
+        }
+        assert!(buf.lock().unwrap().is_empty());
+        r.end_initial_history_replay();
+
+        let out = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        assert!(!out.contains("history-row-0"), "old prefix leaked: {out:?}");
+        assert!(out.contains("history-row-9"), "newest row missing: {out:?}");
+        assert!(r.body_lines.len() > 3, "retained model must stay complete");
+        let semantic_text = r.body_log.iter().filter_map(|line| match line {
+            UiLine::CommandOutput(text) => Some(text.as_str()),
+            _ => None,
+        }).collect::<String>();
+        assert!(semantic_text.contains("history-row-0"));
+        assert!(semantic_text.contains("history-row-9"));
+        assert_eq!(r.body_lines.len().saturating_sub(r.scrolled_off), 3);
+    }
+
+    #[test]
+    fn resize_reuses_history_replay_cap_instead_of_replaying_full_prefix() {
+        let (mut r, buf) = new_capturing(40, 12);
+        r.set_history_replay_max_rows(Some(3));
+        for i in 0..10 {
+            r.render(UiLine::User(format!("resize-history-{i}")));
+        }
+        r.flush_deferred();
+        buf.lock().unwrap().clear();
+
+        r.on_resize(41, 12);
+
+        let out = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        assert!(!out.contains("resize-history-0"), "old prefix leaked: {out:?}");
+        assert!(out.contains("resize-history-9"), "newest row missing: {out:?}");
+        assert_eq!(r.body_lines.len().saturating_sub(r.scrolled_off), 3);
     }
 
     /// Windows resize footer-duplication regression: `on_resize` must call
