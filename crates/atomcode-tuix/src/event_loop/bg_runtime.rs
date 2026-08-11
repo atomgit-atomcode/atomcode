@@ -50,6 +50,11 @@ pub enum DriverEvent {
     CapabilitiesReloadFinished {
         result: Result<atomcode_coding::SessionChanged, atomcode_coding::RuntimeError>,
     },
+    PolicyInterventionResolutionFinished {
+        intervention_id: u64,
+        action: atomcode_kernel::event::PolicyRecoveryAction,
+        result: Result<(), atomcode_coding::RuntimeError>,
+    },
     /// The `/resume` session catalog finished loading off the UI thread (the scan
     /// reads/parses every session file, which froze the event loop when done
     /// inline). Carries the current-project session list ready to install into the

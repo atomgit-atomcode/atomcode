@@ -6,7 +6,7 @@ use atomcode_coding::{
     CodingRuntimeEvent, CodingRuntimeHandle, DriverCommand, RuntimePhase, RuntimeStatus,
     RuntimeUnavailable, SequencedRuntimeEvent, SubmitReceipt, TurnCompletion, UserInput,
 };
-use atomcode_kernel::event::{AgentEvent, RequestId};
+use atomcode_kernel::event::{AgentEvent, PolicyRecoveryAction, RequestId};
 use atomcode_kernel::message::SessionSnapshot;
 use tokio::sync::broadcast;
 
@@ -540,6 +540,18 @@ impl LiveViewHub {
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))
     }
 
+    pub async fn resolve_policy_intervention(
+        &self,
+        intervention_id: u64,
+        action: PolicyRecoveryAction,
+    ) -> Result<(), HubError> {
+        self.bound_handle()?
+            .1
+            .resolve_policy_intervention(intervention_id, action)
+            .await
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))
+    }
+
     /// Whether the bound runtime is mid-turn, parked awaiting approval, or already
     /// reconfiguring. A provider reload in any of these states hard-kills the
     /// in-flight turn (via `AgentCommand::Shutdown`) and drops its context — the
@@ -889,6 +901,21 @@ impl LiveViewHub {
                 state.turn_active = false;
                 replay = false;
             }
+            CodingRuntimeEvent::PolicyInterventionResolved {
+                intervention_id, ..
+            }
+            | CodingRuntimeEvent::PolicyInterventionCleared { intervention_id } => {
+                state.replay.retain(|observation| {
+                    !matches!(
+                        &observation.event,
+                        LiveViewEvent::Runtime(CodingRuntimeEvent::Agent(
+                            AgentEvent::PolicyIntervention { intervention }
+                        ))
+                        if intervention.id == *intervention_id
+                    )
+                });
+                replay = false;
+            }
             CodingRuntimeEvent::SessionChanged(changed) => {
                 let current = state.binding.as_mut().expect("binding checked above");
                 let identity_changed = changed
@@ -1175,7 +1202,7 @@ mod tests {
         CodingRuntimeEvent, DriverCommand, GoalPhase, GoalProgress, RuntimePhase, RuntimeStatus,
         RuntimeUnavailable, SequencedRuntimeEvent, TurnCompletion, UserInput,
     };
-    use atomcode_kernel::event::AgentEvent;
+    use atomcode_kernel::event::{AgentEvent, PolicyRecoveryAction};
     use atomcode_kernel::message::{Message, SessionSnapshot};
 
     use super::{
@@ -1554,13 +1581,15 @@ mod tests {
         let binding = hub
             .bind("session-1", PathBuf::from("/one"), snapshot("old"), control)
             .unwrap();
+        let mut intervention =
+            atomcode_kernel::event::PolicyIntervention::credential_shell_blocked();
+        intervention.id = 42;
         for (sequence, event) in [
             (1, CodingRuntimeEvent::Agent(AgentEvent::TurnStarted)),
             (
                 2,
                 CodingRuntimeEvent::Agent(AgentEvent::PolicyIntervention {
-                    intervention:
-                        atomcode_kernel::event::PolicyIntervention::credential_shell_blocked(),
+                    intervention,
                 }),
             ),
         ] {
@@ -1614,6 +1643,86 @@ mod tests {
                     AgentEvent::PolicyIntervention { .. }
                 ))
             )));
+    }
+
+    #[test]
+    fn policy_resolution_clears_replay_and_is_broadcast_without_being_replayed() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind("session-1", PathBuf::from("/one"), snapshot("old"), control)
+            .unwrap();
+        let mut intervention =
+            atomcode_kernel::event::PolicyIntervention::credential_shell_blocked();
+        intervention.id = 42;
+        for (sequence, event) in [
+            (1, CodingRuntimeEvent::Agent(AgentEvent::TurnStarted)),
+            (
+                2,
+                CodingRuntimeEvent::Agent(AgentEvent::PolicyIntervention {
+                    intervention,
+                }),
+            ),
+            (
+                3,
+                CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                    turn_id: 1,
+                    reason: atomcode_kernel::event::StopReason::PolicyDenied,
+                    snapshot: Arc::new(snapshot("committed")),
+                    stats: Default::default(),
+                }),
+            ),
+        ] {
+            hub.publish(
+                &binding,
+                SequencedRuntimeEvent {
+                    generation: 1,
+                    sequence,
+                    event,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(hub.join().unwrap().replay.len(), 1);
+        let mut listener = hub.join().unwrap().receiver;
+
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 4,
+                event: CodingRuntimeEvent::PolicyInterventionResolved {
+                    intervention_id: 41,
+                    action: PolicyRecoveryAction::SkipStep,
+                },
+            },
+        )
+        .unwrap();
+        let _ = listener.try_recv().unwrap();
+        assert_eq!(hub.join().unwrap().replay.len(), 1);
+
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 5,
+                event: CodingRuntimeEvent::PolicyInterventionResolved {
+                    intervention_id: 42,
+                    action: PolicyRecoveryAction::SkipStep,
+                },
+            },
+        )
+        .unwrap();
+
+        let broadcast = listener.try_recv().unwrap();
+        assert!(matches!(
+            broadcast.event,
+            LiveViewEvent::Runtime(CodingRuntimeEvent::PolicyInterventionResolved {
+                intervention_id: 42,
+                action: PolicyRecoveryAction::SkipStep,
+            })
+        ));
+        assert!(hub.join().unwrap().replay.is_empty());
     }
 
     #[test]

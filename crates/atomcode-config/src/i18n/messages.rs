@@ -467,6 +467,9 @@ pub enum Msg<'a> {
     PolicyRecoveryEnd,
     PolicyRecoveryEndDesc,
     PolicyRecoverySafeInstructions,
+    PolicyRecoveryCompletedLocally,
+    PolicyRecoverySkippedLocally,
+    PolicyRecoverySubmitError,
 
     // ── Execution mode ──
     CmdSwitchedAutoMode,

@@ -20,7 +20,9 @@ use atomcode_capabilities::session::{PresentationFile, SessionMeta, StorageOwner
 use atomcode_capabilities::tools::{ApprovalResponse, APPROVAL_KIND};
 use atomcode_kernel::agent::AgentHandle;
 use atomcode_kernel::checkpoint::CompactionCheckpointError;
-use atomcode_kernel::event::{AgentCommand, AgentEvent, RequestId, StopReason};
+use atomcode_kernel::event::{
+    AgentCommand, AgentEvent, PolicyIntervention, PolicyRecoveryAction, RequestId, StopReason,
+};
 pub use atomcode_kernel::message::CompactTrigger;
 use atomcode_kernel::message::{
     CompactionStrategy, CompactionView, Conversation, ImageContent, Message, MessageMeta,
@@ -78,6 +80,17 @@ pub enum CodingRuntimeEvent {
     Request(RuntimeRequest),
     /// Exactly one terminal for an accepted foreground turn.
     TurnFinished(TurnCompletion),
+    /// A driver acknowledged the runtime's pending security intervention.
+    /// This is control-plane state only and is never appended to conversation input.
+    PolicyInterventionResolved {
+        intervention_id: u64,
+        action: PolicyRecoveryAction,
+    },
+    /// The runtime invalidated a pending intervention because its owning
+    /// conversation was replaced. Drivers must remove only the matching UI.
+    PolicyInterventionCleared {
+        intervention_id: u64,
+    },
     ModeChanged {
         mode: RuntimeMode,
     },
@@ -418,6 +431,10 @@ pub enum DriverCommand {
         id: RequestId,
         value: serde_json::Value,
     },
+    ResolvePolicyIntervention {
+        intervention_id: u64,
+        action: PolicyRecoveryAction,
+    },
     Cancel,
     PauseGoal,
     Compact(Option<String>),
@@ -470,6 +487,8 @@ pub enum RuntimeError {
     Busy,
     SessionInUse { id: String },
     StaleRequest { id: RequestId },
+    NoPendingPolicyIntervention,
+    InvalidPolicyRecoveryAction,
     DeliveryFailed,
     Unavailable,
     ProviderUnavailable(ProviderUnavailableReason),
@@ -489,6 +508,12 @@ impl fmt::Display for RuntimeError {
                 write!(f, "session {id:?} is already in use by another runtime")
             }
             Self::StaleRequest { id } => write!(f, "runtime request {id} is stale"),
+            Self::NoPendingPolicyIntervention => {
+                f.write_str("no security policy intervention is pending")
+            }
+            Self::InvalidPolicyRecoveryAction => {
+                f.write_str("security policy recovery action is not available")
+            }
             Self::DeliveryFailed => f.write_str("kernel command delivery failed"),
             Self::Unavailable => f.write_str("coding runtime is unavailable"),
             Self::ProviderUnavailable(reason) => write!(f, "provider unavailable: {reason}"),
@@ -1067,6 +1092,18 @@ impl CodingRuntimeHandle {
                     done,
                 }
             }
+            DriverCommand::ResolvePolicyIntervention {
+                intervention_id,
+                action,
+            } => {
+                let (done, _result) = oneshot::channel();
+                CodingRuntimeControl::ResolvePolicyIntervention {
+                    generation,
+                    intervention_id,
+                    action,
+                    done,
+                }
+            }
             DriverCommand::Cancel => {
                 let (done, _result) = oneshot::channel();
                 CodingRuntimeControl::Cancel { generation, done }
@@ -1192,6 +1229,24 @@ impl CodingRuntimeHandle {
                 generation: runtime_state_generation(state),
                 id,
                 value,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    pub async fn resolve_policy_intervention(
+        &self,
+        intervention_id: u64,
+        action: PolicyRecoveryAction,
+    ) -> Result<(), RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::ResolvePolicyIntervention {
+                generation: runtime_state_generation(state),
+                intervention_id,
+                action,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -2014,6 +2069,12 @@ pub enum CodingRuntimeControl {
         value: serde_json::Value,
         done: oneshot::Sender<Result<(), RuntimeError>>,
     },
+    ResolvePolicyIntervention {
+        generation: u64,
+        intervention_id: u64,
+        action: PolicyRecoveryAction,
+        done: oneshot::Sender<Result<(), RuntimeError>>,
+    },
     Snapshot {
         generation: u64,
         done: oneshot::Sender<Result<RuntimeSnapshotReceipt, RuntimeError>>,
@@ -2267,6 +2328,9 @@ fn runtime_state_available(state: u64) -> bool {
 }
 
 fn runtime_phase_accepts_command(phase: RuntimePhase, command: &DriverCommand) -> bool {
+    if matches!(command, DriverCommand::ResolvePolicyIntervention { .. }) {
+        return phase == RuntimePhase::Ready;
+    }
     match phase {
         RuntimePhase::Ready | RuntimePhase::InTurn | RuntimePhase::WaitingApproval => true,
         RuntimePhase::AwaitingProvider | RuntimePhase::Failed => matches!(
@@ -2548,6 +2612,7 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut conversation_revision = 0u64;
         let mut active_turn = None;
         let mut pending_requests = BTreeSet::new();
+        let mut pending_policy_intervention: Option<PolicyIntervention> = None;
         let mut snapshot_waiters: Vec<RuntimeSnapshotWaiter> = Vec::new();
         let mut snapshot_in_flight = false;
         let mut terminal_reason = None;
@@ -3122,6 +3187,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
+                        if pending_policy_intervention.is_some() {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
                         // A persistent goal (paused at its round cap, OR already
                         // satisfied) re-engages on the next user message: resume it
                         // into Pursuing so the follow-up advances the goal and the
@@ -3357,6 +3426,41 @@ fn spawn_runtime_owner_with_optional_agent(
                                     Ordering::Release,
                                 );
                             }
+                            let _ = done.send(Ok(()));
+                        }
+                    }
+                    Some(CodingRuntimeControl::ResolvePolicyIntervention {
+                        generation: request_generation,
+                        intervention_id,
+                        action,
+                        done,
+                    }) => {
+                        if request_generation != generation
+                            || controls.state.load(Ordering::Acquire)
+                                != runtime_phase_state(generation, RuntimePhase::Ready)
+                        {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                        } else if pending_policy_intervention.as_ref().is_none() {
+                            let _ = done.send(Err(RuntimeError::NoPendingPolicyIntervention));
+                        } else if pending_policy_intervention
+                            .as_ref()
+                            .is_some_and(|intervention| intervention.id != intervention_id)
+                        {
+                            let _ = done.send(Err(RuntimeError::NoPendingPolicyIntervention));
+                        } else if !pending_policy_intervention
+                            .as_ref()
+                            .is_some_and(|intervention| intervention.actions.contains(&action))
+                            || matches!(action, PolicyRecoveryAction::ViewSafeInstructions)
+                        {
+                            let _ = done.send(Err(RuntimeError::InvalidPolicyRecoveryAction));
+                        } else {
+                            pending_policy_intervention = None;
+                            let _ = runtime_event_tx.send(
+                                CodingRuntimeEvent::PolicyInterventionResolved {
+                                    intervention_id,
+                                    action,
+                                },
+                            );
                             let _ = done.send(Ok(()));
                         }
                     }
@@ -4229,6 +4333,13 @@ fn spawn_runtime_owner_with_optional_agent(
                             continue;
                         }
                         if !agent_available && provider_unavailable_reason == Some(reason) {
+                            if let Some(intervention) = pending_policy_intervention.take() {
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::PolicyInterventionCleared {
+                                        intervention_id: intervention.id,
+                                    },
+                                );
+                            }
                             let _ = done.send(Ok(RuntimeGeneration(generation)));
                             continue;
                         }
@@ -4333,6 +4444,13 @@ fn spawn_runtime_owner_with_optional_agent(
                             runtime_phase_state(generation, RuntimePhase::AwaitingProvider),
                             Ordering::Release,
                         );
+                        if let Some(intervention) = pending_policy_intervention.take() {
+                            let _ = runtime_event_tx.send(
+                                CodingRuntimeEvent::PolicyInterventionCleared {
+                                    intervention_id: intervention.id,
+                                },
+                            );
+                        }
                         let _ = runtime_event_tx.send(CodingRuntimeEvent::ProviderUnavailable {
                             reason,
                             forced: stop_report.forced,
@@ -4626,6 +4744,15 @@ fn spawn_runtime_owner_with_optional_agent(
                         );
                         let _ = runtime_event_tx
                             .send(CodingRuntimeEvent::SessionChanged(changed.clone()));
+                        if changes_session {
+                            if let Some(intervention) = pending_policy_intervention.take() {
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::PolicyInterventionCleared {
+                                        intervention_id: intervention.id,
+                                    },
+                                );
+                            }
+                        }
                         if operation == ReconfigureKind::ChangeDirectory {
                             let _ = runtime_event_tx
                                 .send(CodingRuntimeEvent::WorkingDirectoryChanged(cwd));
@@ -4948,6 +5075,13 @@ fn spawn_runtime_owner_with_optional_agent(
                                 let _ = runtime_event_tx.send(
                                     CodingRuntimeEvent::SessionChanged(changed.clone()),
                                 );
+                                if let Some(intervention) = pending_policy_intervention.take() {
+                                    let _ = runtime_event_tx.send(
+                                        CodingRuntimeEvent::PolicyInterventionCleared {
+                                            intervention_id: intervention.id,
+                                        },
+                                    );
+                                }
                                 let _ = runtime_event_tx.send(
                                     CodingRuntimeEvent::Reconfigured {
                                         operation: ReconfigureKind::RestoreSession,
@@ -5410,6 +5544,12 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         match event {
                         Some(event) if native_protocol => match event {
+                            AgentEvent::PolicyIntervention { intervention } => {
+                                pending_policy_intervention = Some(intervention.clone());
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(
+                                    AgentEvent::PolicyIntervention { intervention },
+                                ));
+                            }
                             AgentEvent::Usage(meta) => {
                                 observed_tokens = Some(meta.used_tokens as usize);
                                 turn_stats.turn_count = turn_stats.turn_count.saturating_add(1);
@@ -5939,6 +6079,13 @@ fn spawn_runtime_owner_with_optional_agent(
                                 }
                             }
                             AgentEvent::TurnStarted => {
+                                if let Some(intervention) = pending_policy_intervention.take() {
+                                    let _ = runtime_event_tx.send(
+                                        CodingRuntimeEvent::PolicyInterventionCleared {
+                                            intervention_id: intervention.id,
+                                        },
+                                    );
+                                }
                                 turn_started_at = Some(std::time::Instant::now());
                                 controls.state.store(
                                     runtime_phase_state(generation, RuntimePhase::InTurn),
@@ -6133,6 +6280,7 @@ fn reject_runtime_control(
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::Respond { done, .. }
+        | CodingRuntimeControl::ResolvePolicyIntervention { done, .. }
         | CodingRuntimeControl::Cancel { done, .. }
         | CodingRuntimeControl::PauseGoal { done, .. }
         | CodingRuntimeControl::SetMode { done, .. }
@@ -10081,6 +10229,96 @@ mod tests {
             Some(CodingRuntimeControl::Compact { focus: Some(focus), .. })
                 if focus == "recent tool output"
         ));
+    }
+
+    #[tokio::test]
+    async fn policy_resolution_is_runtime_owned_and_never_becomes_agent_input() {
+        let (agent, mut kernel_commands, kernel_events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (runtime_tx, mut runtime_rx) = mpsc::unbounded_channel();
+        let adapter = spawn_runtime_owner_with_protocol(
+            agent, controls, runtime_tx, true, true, None, None, None,
+        );
+
+        let intervention = PolicyIntervention::credential_shell_blocked();
+        let intervention_id = intervention.id;
+        kernel_events
+            .send(AgentEvent::PolicyIntervention { intervention })
+            .unwrap();
+        assert!(matches!(
+            runtime_rx.recv().await,
+            Some(CodingRuntimeEvent::Agent(
+                AgentEvent::PolicyIntervention { .. }
+            ))
+        ));
+
+        assert_eq!(
+            handle
+                .submit(UserInput::from("must not start a new turn"))
+                .await,
+            Err(RuntimeError::Busy),
+        );
+        let unavailable_config = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "replacement",
+            std::env::current_dir().unwrap(),
+        );
+        assert_eq!(
+            handle.reassemble_provider(unavailable_config).await,
+            Err(RuntimeError::Unavailable),
+        );
+
+        assert_eq!(
+            handle
+                .resolve_policy_intervention(
+                    intervention_id,
+                    PolicyRecoveryAction::ViewSafeInstructions,
+                )
+                .await,
+            Err(RuntimeError::InvalidPolicyRecoveryAction)
+        );
+        assert!(runtime_rx.try_recv().is_err());
+
+        handle
+            .resolve_policy_intervention(intervention_id, PolicyRecoveryAction::SkipStep)
+            .await
+            .unwrap();
+        assert!(matches!(
+            runtime_rx.recv().await,
+            Some(CodingRuntimeEvent::PolicyInterventionResolved {
+                intervention_id: resolved_id,
+                action: PolicyRecoveryAction::SkipStep
+            }) if resolved_id == intervention_id
+        ));
+        assert!(kernel_commands.try_recv().is_err());
+
+        let next_intervention = PolicyIntervention::credential_shell_blocked();
+        let next_intervention_id = next_intervention.id;
+        kernel_events
+            .send(AgentEvent::PolicyIntervention {
+                intervention: next_intervention,
+            })
+            .unwrap();
+        assert!(matches!(
+            runtime_rx.recv().await,
+            Some(CodingRuntimeEvent::Agent(
+                AgentEvent::PolicyIntervention { .. }
+            ))
+        ));
+        assert_eq!(
+            handle
+                .resolve_policy_intervention(intervention_id, PolicyRecoveryAction::SkipStep)
+                .await,
+            Err(RuntimeError::NoPendingPolicyIntervention)
+        );
+        handle
+            .resolve_policy_intervention(next_intervention_id, PolicyRecoveryAction::EndTask)
+            .await
+            .unwrap();
+
+        handle.dispatch(DriverCommand::Shutdown).unwrap();
+        let _ = adapter.owner_task.await;
     }
 
     #[test]

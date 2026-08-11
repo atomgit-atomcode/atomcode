@@ -705,6 +705,7 @@ export type PolicyRecoveryAction =
 
 export interface PolicyInterventionEvent {
   type: 'policy_intervention';
+  intervention_id: number;
   code: string;
   actions: PolicyRecoveryAction[];
 }
@@ -730,6 +731,8 @@ export type LiveWireEvent =
   | { type: 'user_input_request'; request_id: number; header: string; question: string; mode: 'single' | 'multiple' | 'text'; options: { label: string; description?: string }[] }
   | { type: 'user_input_resolved'; request_id: number }
   | PolicyInterventionEvent
+  | { type: 'policy_intervention_resolved'; intervention_id: number; action: PolicyRecoveryAction }
+  | { type: 'policy_intervention_cleared'; intervention_id: number }
   | { type: 'steered'; count: number; inputs: { text: string; images: ImageData[] }[]; client_input_ids: Array<string | null> }
   | { type: 'session_switched'; session_id: string }
   | { type: 'session_renamed'; session_id: string; name: string }
@@ -1012,6 +1015,23 @@ export async function postLiveUserInput(
   const result = await resp.json() as { accepted: boolean; error?: string };
   if (!result.accepted) {
     throw new Error(result.error ?? 'live runtime did not accept the user input answer');
+  }
+  return result;
+}
+
+export async function postLivePolicyInterventionResolution(
+  interventionId: number,
+  action: Exclude<PolicyRecoveryAction, 'view_safe_instructions'>,
+): Promise<{ accepted: boolean }> {
+  const resp = await fetch('/live/policy-intervention', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ intervention_id: interventionId, action }),
+  });
+  if (!resp.ok) throw new Error(`resolve live policy intervention failed: ${resp.status}`);
+  const result = await resp.json() as { accepted: boolean; error?: string };
+  if (!result.accepted) {
+    throw new Error(result.error ?? 'live runtime did not accept the policy intervention resolution');
   }
   return result;
 }

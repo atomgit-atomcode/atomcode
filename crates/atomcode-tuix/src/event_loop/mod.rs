@@ -2389,6 +2389,12 @@ enum ReadyRuntimeRequest {
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     },
+    ResolvePolicyIntervention {
+        intervention_id: u64,
+        action: atomcode_kernel::event::PolicyRecoveryAction,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
     RestoreSnapshot {
         snapshot: atomcode_kernel::message::SessionSnapshot,
         correlation_id: u64,
@@ -2491,6 +2497,9 @@ impl ReadyRuntimeControl {
                     | atomcode_coding::RuntimePhase::Failed
             ),
             ReadyRuntimeRequest::Dispatch(command) => self.handle.accepts(command),
+            ReadyRuntimeRequest::ResolvePolicyIntervention { .. } => {
+                phase == atomcode_coding::RuntimePhase::Ready
+            }
             ReadyRuntimeRequest::Compact(_)
             | ReadyRuntimeRequest::Undo { .. }
             | ReadyRuntimeRequest::RewindCatalog { .. }
@@ -2600,6 +2609,27 @@ impl ReadyRuntimeControl {
                         runtime_id,
                         CodingRuntimeEvent::ContextStatsRefreshed(result),
                     );
+                }
+                ReadyRuntimeRequest::ResolvePolicyIntervention {
+                    intervention_id,
+                    action,
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self
+                        .handle
+                        .resolve_policy_intervention(intervention_id, action)
+                        .await;
+                    let _ = event_tx.send(bg_runtime::RuntimeEvent {
+                        runtime_id,
+                        event: bg_runtime::RuntimeEventPayload::Driver(
+                            bg_runtime::DriverEvent::PolicyInterventionResolutionFinished {
+                                intervention_id,
+                                action,
+                                result,
+                            },
+                        ),
+                    });
                 }
                 ReadyRuntimeRequest::RestoreSnapshot {
                     snapshot,
@@ -2948,6 +2978,50 @@ impl RuntimeControl {
                 deferred.send(atomcode_coding::DriverCommand::Compact(focus))
             }
             Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    pub fn resolve_policy_intervention(
+        &self,
+        intervention_id: u64,
+        action: atomcode_kernel::event::PolicyRecoveryAction,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::ResolvePolicyIntervention {
+                intervention_id,
+                action,
+                runtime_id,
+                event_tx,
+            }),
+            Self::Deferred(_) => {
+                let handle = self
+                    .active_handle()
+                    .ok_or(atomcode_coding::RuntimeUnavailable)?;
+                if !handle.accepts(&atomcode_coding::DriverCommand::ResolvePolicyIntervention {
+                    intervention_id,
+                    action,
+                }) {
+                    return Err(atomcode_coding::RuntimeUnavailable);
+                }
+                tokio::spawn(async move {
+                    let result = handle
+                        .resolve_policy_intervention(intervention_id, action)
+                        .await;
+                    let _ = event_tx.send(bg_runtime::RuntimeEvent {
+                        runtime_id,
+                        event: bg_runtime::RuntimeEventPayload::Driver(
+                            bg_runtime::DriverEvent::PolicyInterventionResolutionFinished {
+                                intervention_id,
+                                action,
+                                result,
+                            },
+                        ),
+                    });
+                });
+                Ok(())
+            }
         }
     }
 
@@ -16317,13 +16391,21 @@ fn handle_policy_intervention_key(
     // so there is nothing to cancel) — mirror the request_user_input handler's
     // Ctrl+C contract instead of leaving the app's universal escape hatch inert.
     // Checked before the Char arm so it never falls through to the digit branch.
-    if code == KeyCode::Char('c')
-        && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-    {
-        app.state.pending_policy_intervention = None;
-        app.state.user_input_panel = None;
-        app.state.phase = UiPhase::Idle;
+    if code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        request_policy_intervention_resolution(
+            &mut app.state,
+            ctx,
+            renderer,
+            PolicyRecoveryAction::EndTask,
+        );
         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
+    // The runtime owner has not acknowledged the previous choice yet. Preserve
+    // the panel and ignore repeats so a fast double key press cannot race two
+    // decisions against the same intervention.
+    if app.state.pending_policy_resolution.is_some() {
         return Ok(());
     }
 
@@ -16347,9 +16429,12 @@ fn handle_policy_intervention_key(
             }
         }
         KeyCode::Esc => {
-            app.state.pending_policy_intervention = None;
-            app.state.user_input_panel = None;
-            app.state.phase = UiPhase::Idle;
+            request_policy_intervention_resolution(
+                &mut app.state,
+                ctx,
+                renderer,
+                PolicyRecoveryAction::EndTask,
+            );
         }
         KeyCode::Enter => {
             let index = app
@@ -16374,27 +16459,24 @@ fn handle_policy_intervention_key(
                 }
                 Some(PolicyRecoveryAction::CompleteExternally)
                 | Some(PolicyRecoveryAction::SkipStep) => {
-                    let text = if matches!(action, Some(PolicyRecoveryAction::CompleteExternally)) {
-                        POLICY_RECOVERY_COMPLETE_EXTERNALLY_MESSAGE
-                    } else {
-                        POLICY_RECOVERY_SKIP_STEP_MESSAGE
-                    };
-                    if submit_foreground_runtime(ctx, runtime_user_input(text.to_string(), vec![]))
-                    {
-                        app.state.pending_policy_intervention = None;
-                        app.state.user_input_panel = None;
-                        app.state.on_submit();
-                    } else {
-                        renderer.render(UiLine::Error(
-                            "policy recovery could not start a new turn".into(),
-                        ));
-                        renderer.flush();
-                    }
+                    let action = action.expect("matched action");
+                    // Recovery acknowledgement is driver-owned. Never turn it into
+                    // model input: the prior transcript may contain credential-like
+                    // material that a fresh model turn could reconstruct or repeat.
+                    request_policy_intervention_resolution(
+                        &mut app.state,
+                        ctx,
+                        renderer,
+                        action,
+                    );
                 }
                 Some(PolicyRecoveryAction::EndTask) | None => {
-                    app.state.pending_policy_intervention = None;
-                    app.state.user_input_panel = None;
-                    app.state.phase = UiPhase::Idle;
+                    request_policy_intervention_resolution(
+                        &mut app.state,
+                        ctx,
+                        renderer,
+                        PolicyRecoveryAction::EndTask,
+                    );
                 }
                 Some(_) => {}
             }
@@ -16403,6 +16485,101 @@ fn handle_policy_intervention_key(
     }
     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
     Ok(())
+}
+
+fn request_policy_intervention_resolution(
+    state: &mut UiState,
+    ctx: &LoopCtx,
+    renderer: &mut dyn Renderer,
+    action: atomcode_kernel::event::PolicyRecoveryAction,
+) -> bool {
+    if state.pending_policy_resolution.is_some() {
+        return false;
+    }
+    let Some(intervention_id) = state
+        .pending_policy_intervention
+        .as_ref()
+        .map(|intervention| intervention.id)
+    else {
+        return false;
+    };
+    let queued = ctx
+        .runtime
+        .resolve_policy_intervention(
+            intervention_id,
+            action,
+            ctx.foreground_runtime_id,
+            ctx.runtime_event_tx.clone(),
+        )
+        .is_ok();
+    if queued {
+        state.pending_policy_resolution = Some((intervention_id, action));
+    } else {
+        renderer.render(UiLine::Error(
+            crate::i18n::t(crate::i18n::Msg::PolicyRecoverySubmitError).into_owned(),
+        ));
+        renderer.flush();
+    }
+    queued
+}
+
+fn complete_policy_intervention_resolution(
+    state: &mut UiState,
+    intervention_id: u64,
+    action: atomcode_kernel::event::PolicyRecoveryAction,
+    renderer: &mut dyn Renderer,
+) -> bool {
+    let correlated = state.pending_policy_resolution == Some((intervention_id, action))
+        || state
+            .pending_policy_intervention
+            .as_ref()
+            .is_some_and(|intervention| {
+                intervention.id == intervention_id && intervention.actions.contains(&action)
+            });
+    if !correlated {
+        return false;
+    }
+
+    state.pending_policy_resolution = None;
+    state.pending_policy_intervention = None;
+    state.user_input_panel = None;
+    state.phase = UiPhase::Idle;
+    if let Some(message) = policy_recovery_local_message(action) {
+        renderer.render(UiLine::CommandOutput(crate::i18n::t(message).into_owned()));
+        renderer.flush();
+    }
+    true
+}
+
+fn reject_policy_intervention_resolution(
+    state: &mut UiState,
+    intervention_id: u64,
+    action: atomcode_kernel::event::PolicyRecoveryAction,
+    renderer: &mut dyn Renderer,
+) -> bool {
+    if state.pending_policy_resolution != Some((intervention_id, action)) {
+        return false;
+    }
+    state.pending_policy_resolution = None;
+    renderer.render(UiLine::Error(
+        crate::i18n::t(crate::i18n::Msg::PolicyRecoverySubmitError).into_owned(),
+    ));
+    renderer.flush();
+    true
+}
+
+fn policy_recovery_local_message(
+    action: atomcode_kernel::event::PolicyRecoveryAction,
+) -> Option<crate::i18n::Msg<'static>> {
+    use atomcode_kernel::event::PolicyRecoveryAction;
+
+    match action {
+        PolicyRecoveryAction::CompleteExternally => {
+            Some(crate::i18n::Msg::PolicyRecoveryCompletedLocally)
+        }
+        PolicyRecoveryAction::SkipStep => Some(crate::i18n::Msg::PolicyRecoverySkippedLocally),
+        _ => None,
+    }
 }
 
 /// Key handling for a multi-question `request_user_input` batch. Tab/Shift+Tab move
@@ -17195,6 +17372,87 @@ mod background_notice_tests {
         assert!(!rendered.contains(
             atomcode_capabilities::tools::credential_bash_gate::CREDENTIAL_BASH_DENIAL_REASON
         ));
+    }
+
+    #[test]
+    fn policy_recovery_acknowledgements_are_driver_local() {
+        use atomcode_kernel::event::PolicyRecoveryAction;
+
+        assert_eq!(
+            policy_recovery_local_message(PolicyRecoveryAction::CompleteExternally),
+            Some(crate::i18n::Msg::PolicyRecoveryCompletedLocally)
+        );
+        assert_eq!(
+            policy_recovery_local_message(PolicyRecoveryAction::SkipStep),
+            Some(crate::i18n::Msg::PolicyRecoverySkippedLocally)
+        );
+        assert_eq!(
+            policy_recovery_local_message(PolicyRecoveryAction::ViewSafeInstructions),
+            None
+        );
+    }
+
+    #[test]
+    fn policy_recovery_closes_only_after_authoritative_success() {
+        use atomcode_kernel::event::{PolicyIntervention, PolicyRecoveryAction};
+
+        let mut state = crate::state::UiState::new();
+        let intervention = PolicyIntervention::credential_shell_blocked();
+        let intervention_id = intervention.id;
+        state.pending_policy_intervention = Some(intervention);
+        state.pending_policy_resolution = Some((intervention_id, PolicyRecoveryAction::SkipStep));
+        let mut renderer = CaptureRenderer::default();
+
+        assert!(!complete_policy_intervention_resolution(
+            &mut state,
+            intervention_id + 1,
+            PolicyRecoveryAction::SkipStep,
+            &mut renderer,
+        ));
+        assert!(state.pending_policy_intervention.is_some());
+
+        assert!(complete_policy_intervention_resolution(
+            &mut state,
+            intervention_id,
+            PolicyRecoveryAction::SkipStep,
+            &mut renderer,
+        ));
+        assert!(state.pending_policy_intervention.is_none());
+        assert!(state.pending_policy_resolution.is_none());
+        assert!(matches!(
+            renderer.lines.as_slice(),
+            [UiLine::CommandOutput(_)]
+        ));
+
+        assert!(!complete_policy_intervention_resolution(
+            &mut state,
+            intervention_id,
+            PolicyRecoveryAction::SkipStep,
+            &mut renderer,
+        ));
+        assert_eq!(renderer.lines.len(), 1, "late duplicate must be ignored");
+    }
+
+    #[test]
+    fn rejected_policy_recovery_keeps_the_intervention_retryable() {
+        use atomcode_kernel::event::{PolicyIntervention, PolicyRecoveryAction};
+
+        let mut state = crate::state::UiState::new();
+        let intervention = PolicyIntervention::credential_shell_blocked();
+        let intervention_id = intervention.id;
+        state.pending_policy_intervention = Some(intervention);
+        state.pending_policy_resolution = Some((intervention_id, PolicyRecoveryAction::SkipStep));
+        let mut renderer = CaptureRenderer::default();
+
+        assert!(reject_policy_intervention_resolution(
+            &mut state,
+            intervention_id,
+            PolicyRecoveryAction::SkipStep,
+            &mut renderer,
+        ));
+        assert!(state.pending_policy_intervention.is_some());
+        assert!(state.pending_policy_resolution.is_none());
+        assert!(matches!(renderer.lines.as_slice(), [UiLine::Error(_)]));
     }
 }
 
@@ -18756,6 +19014,34 @@ fn handle_runtime_event(
                     }
                     return;
                 }
+                CodingRuntimeEvent::PolicyInterventionResolved {
+                    intervention_id,
+                    action,
+                } => {
+                    if complete_policy_intervention_resolution(
+                        state,
+                        intervention_id,
+                        action,
+                        renderer,
+                    ) {
+                        redraw_idle_plain(buf, state, ctx, renderer);
+                    }
+                    return;
+                }
+                CodingRuntimeEvent::PolicyInterventionCleared { intervention_id } => {
+                    if state
+                        .pending_policy_intervention
+                        .as_ref()
+                        .is_some_and(|intervention| intervention.id == intervention_id)
+                    {
+                        state.pending_policy_resolution = None;
+                        state.pending_policy_intervention = None;
+                        state.user_input_panel = None;
+                        state.phase = UiPhase::Idle;
+                        redraw_idle_plain(buf, state, ctx, renderer);
+                    }
+                    return;
+                }
                 CodingRuntimeEvent::Request(request) => {
                     use atomcode_capabilities::tools::{
                         request_user_input::{UserInputResponse, REQUEST_USER_INPUT_KIND},
@@ -19549,6 +19835,19 @@ fn handle_runtime_event(
                 renderer.render(UiLine::CommandOutput(output));
             }
             renderer.flush();
+        }
+        bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::PolicyInterventionResolutionFinished {
+                intervention_id,
+                action,
+                result,
+            },
+        ) => {
+            if result.is_err()
+                && reject_policy_intervention_resolution(state, intervention_id, action, renderer)
+            {
+                redraw_idle_plain(buf, state, ctx, renderer);
+            }
         }
         bg_runtime::RuntimeEventPayload::Driver(
             bg_runtime::DriverEvent::SessionResumePrepared {
@@ -21380,6 +21679,7 @@ fn handle_agent_event(
         AgentEvent::PhaseChange(_) => {}
         AgentEvent::PolicyIntervention(intervention) => {
             state.pending_policy_intervention = Some(intervention);
+            state.pending_policy_resolution = None;
         }
         AgentEvent::TurnComplete {
             duration,
@@ -21507,6 +21807,7 @@ fn handle_agent_event(
                 // terminal after the intervention event was forwarded. Never
                 // carry that recovery contract into an unrelated later turn.
                 state.pending_policy_intervention = None;
+                state.pending_policy_resolution = None;
             }
 
             // Reset the think stripper between turns. If the previous turn
@@ -24826,11 +25127,6 @@ fn render_credential_policy_error(state: &mut UiState, renderer: &mut dyn Render
     state.turn_error_line_shown = true;
     renderer.render(UiLine::Error(message));
 }
-
-const POLICY_RECOVERY_COMPLETE_EXTERNALLY_MESSAGE: &str =
-    "The blocked authenticated step was completed externally. Continue from the next step. Do not request, read, or expose credentials.";
-const POLICY_RECOVERY_SKIP_STEP_MESSAGE: &str =
-    "Skip the blocked authenticated step and continue with the remaining task. Do not retry credential extraction or generic-shell secret handling.";
 
 fn activate_policy_intervention(state: &mut UiState) {
     use atomcode_capabilities::tools::request_user_input::{

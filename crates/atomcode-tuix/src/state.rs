@@ -1040,6 +1040,10 @@ pub struct UiState {
     /// Driver-safe recovery contract received from the kernel. It survives the
     /// PolicyDenied terminal long enough for the TUI to open a local choice panel.
     pub pending_policy_intervention: Option<atomcode_kernel::event::PolicyIntervention>,
+    /// Recovery action awaiting the runtime owner's authoritative response.
+    /// Keeping this separate from the intervention prevents repeated key presses
+    /// while preserving the panel when the runtime rejects a stale decision.
+    pub pending_policy_resolution: Option<(u64, atomcode_kernel::event::PolicyRecoveryAction)>,
     /// True once this turn already rendered a visible line carrying the failure
     /// cause (the red `UiLine::Error` line, or the muted rate-limit line). When
     /// set, `turn_summary_label` renders a bare `✗ 已中断 · …` and does NOT fold
@@ -1386,6 +1390,7 @@ impl UiState {
             last_turn_error: None,
             last_policy_denial_reason: None,
             pending_policy_intervention: None,
+            pending_policy_resolution: None,
             turn_error_line_shown: false,
             prior_phase: None,
             prior_spinner_label: None,
@@ -1778,6 +1783,7 @@ impl UiState {
         self.user_input_panel = None;
         self.user_input_batch = None;
         self.pending_policy_intervention = None;
+        self.pending_policy_resolution = None;
         self.pending_steers.clear();
         self.round_cap_panel = None;
         // Streaming-only `/usage` tab panel — drop it on cancel too (mirrors
@@ -1804,6 +1810,7 @@ impl UiState {
         self.active_subtasks = None;
         self.team.clear();
         self.pending_policy_intervention = None;
+        self.pending_policy_resolution = None;
         self.user_input_panel = None;
     }
 
@@ -2379,13 +2386,23 @@ mod tests {
         let intervention = atomcode_kernel::event::PolicyIntervention::credential_shell_blocked();
         let mut cancelled = UiState::new();
         cancelled.pending_policy_intervention = Some(intervention.clone());
+        cancelled.pending_policy_resolution = Some((
+            intervention.id,
+            atomcode_kernel::event::PolicyRecoveryAction::SkipStep,
+        ));
         cancelled.on_turn_cancelled();
         assert!(cancelled.pending_policy_intervention.is_none());
+        assert!(cancelled.pending_policy_resolution.is_none());
 
         let mut replaced = UiState::new();
+        replaced.pending_policy_resolution = Some((
+            intervention.id,
+            atomcode_kernel::event::PolicyRecoveryAction::EndTask,
+        ));
         replaced.pending_policy_intervention = Some(intervention);
         replaced.on_session_replaced();
         assert!(replaced.pending_policy_intervention.is_none());
+        assert!(replaced.pending_policy_resolution.is_none());
     }
 
     #[test]

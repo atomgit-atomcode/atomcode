@@ -3,19 +3,16 @@ import type { PolicyInterventionEvent, PolicyRecoveryAction } from '../api';
 import type { MsgKey } from '../i18n';
 import { useT } from '../settings';
 
-export const COMPLETE_EXTERNALLY_MESSAGE =
-  'I completed the blocked authenticated step outside AtomCode. Continue from the next safe step without requesting or handling the credential.';
-export const SKIP_STEP_MESSAGE =
-  'Skip the blocked authenticated step and continue with the remaining safe work. Do not request, read, or handle the credential.';
-
 interface PolicyInterventionCardProps {
   intervention: PolicyInterventionEvent;
-  onSubmit: (message: string) => Promise<boolean> | boolean;
+  onResolve: (
+    action: Exclude<PolicyRecoveryAction, 'view_safe_instructions'>,
+  ) => Promise<boolean> | boolean;
   onClose: () => void;
   // The recovery event precedes the authoritative terminal by design. While the
   // runtime is still busy the actions are disabled (no submit before idle), but
   // the card stays mounted so its own loading/error state can render during and
-  // after a recovery submit.
+  // after a recovery decision.
   busy?: boolean;
 }
 
@@ -52,7 +49,7 @@ function isPolicyRecoveryAction(action: string): action is PolicyRecoveryAction 
 
 export function PolicyInterventionCard({
   intervention,
-  onSubmit,
+  onResolve,
   onClose,
   busy = false,
 }: PolicyInterventionCardProps) {
@@ -72,20 +69,13 @@ export function PolicyInterventionCard({
       setShowInstructions(true);
       return;
     }
-    if (action === 'end_task') {
-      onClose();
-      return;
-    }
-
+    // This is a structured control-plane acknowledgement, never a model prompt.
+    // A new model turn could reconstruct credential material from prior context.
     setLoading(true);
     setError(false);
     try {
-      const accepted = await onSubmit(
-        action === 'complete_externally'
-          ? COMPLETE_EXTERNALLY_MESSAGE
-          : SKIP_STEP_MESSAGE,
-      );
-      if (!accepted) throw new Error('recovery submit was not accepted');
+      const accepted = await onResolve(action);
+      if (!accepted) throw new Error('policy intervention resolution was not accepted');
       onClose();
     } catch {
       setLoading(false);

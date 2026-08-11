@@ -135,6 +135,27 @@ test('postLiveUserInput rejects an answer the runtime did not accept', async () 
   }
 });
 
+test('postLivePolicyInterventionResolution correlates the typed recovery action', async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({ url: String(url), init });
+    return new Response('{"accepted":true}', { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const { postLivePolicyInterventionResolution } = await import('./api.ts');
+    await postLivePolicyInterventionResolution(42, 'skip_step');
+    assert.equal(calls[0].url, '/live/policy-intervention');
+    assert.deepEqual(JSON.parse(String(calls[0].init?.body)), {
+      intervention_id: 42,
+      action: 'skip_step',
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('postChatUserInput correlates the answer by session and native request id', async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   const originalFetch = globalThis.fetch;

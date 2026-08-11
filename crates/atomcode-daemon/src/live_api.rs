@@ -751,9 +751,17 @@ pub(crate) enum LiveWireEvent {
     UserInputResolved { request_id: u64 },
     #[serde(rename = "policy_intervention")]
     PolicyIntervention {
+        intervention_id: u64,
         code: atomcode_kernel::event::PolicyInterventionCode,
         actions: Vec<atomcode_kernel::event::PolicyRecoveryAction>,
     },
+    #[serde(rename = "policy_intervention_resolved")]
+    PolicyInterventionResolved {
+        intervention_id: u64,
+        action: atomcode_kernel::event::PolicyRecoveryAction,
+    },
+    #[serde(rename = "policy_intervention_cleared")]
+    PolicyInterventionCleared { intervention_id: u64 },
     /// One or more live inputs were folded into the active turn. The exact
     /// payload lets browser clients acknowledge their FIFO pending-steer UI
     /// without guessing from text deltas or turn terminals.
@@ -880,6 +888,7 @@ impl NativeLiveWireProjector {
                     }
                 }
                 Kernel::PolicyIntervention { intervention } => LiveWireEvent::PolicyIntervention {
+                    intervention_id: intervention.id,
                     code: intervention.code,
                     actions: intervention.actions,
                 },
@@ -1023,6 +1032,16 @@ impl NativeLiveWireProjector {
                     name,
                 }
             }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::PolicyInterventionResolved {
+                intervention_id,
+                action,
+            }) => LiveWireEvent::PolicyInterventionResolved {
+                intervention_id,
+                action,
+            },
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::PolicyInterventionCleared {
+                intervention_id,
+            }) => LiveWireEvent::PolicyInterventionCleared { intervention_id },
             crate::live_hub::LiveViewEvent::Runtime(Runtime::SessionChanged(changed)) => {
                 let session_id = changed.session_id?;
                 self.session_id = session_id.clone();
@@ -2064,6 +2083,26 @@ pub(crate) async fn live_user_input(
 }
 
 #[derive(serde::Deserialize)]
+pub(crate) struct PolicyInterventionResolutionReq {
+    pub intervention_id: u64,
+    pub action: atomcode_kernel::event::PolicyRecoveryAction,
+}
+
+/// Resolve a pending security intervention without creating model input.
+pub(crate) async fn live_policy_intervention_resolution(
+    State(_state): State<AppState>,
+    Json(req): Json<PolicyInterventionResolutionReq>,
+) -> impl IntoResponse {
+    match crate::native_live::resolve_policy_intervention(req.intervention_id, req.action).await {
+        Ok(()) => axum::Json(serde_json::json!({ "accepted": true })),
+        Err(error) => axum::Json(serde_json::json!({
+            "accepted": false,
+            "error": format!("policy intervention resolution was not accepted: {error:?}"),
+        })),
+    }
+}
+
+#[derive(serde::Deserialize)]
 pub(crate) struct LiveCommandReq {
     /// 形如 `/status` 的斜杠命令行（带不带前导 `/` 都接受）。
     pub command: String,
@@ -2785,6 +2824,23 @@ mod tests {
         assert_eq!(json["code"], "credential_shell_blocked");
         assert_eq!(json["actions"].as_array().map(Vec::len), Some(4));
         assert!(!json.to_string().contains("WECOM_WEBHOOK_URL"));
+    }
+
+    #[test]
+    fn native_live_projector_exposes_policy_resolution() {
+        let mut projector = NativeLiveWireProjector::default();
+        let wire = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::PolicyInterventionResolved {
+                    intervention_id: 42,
+                    action: atomcode_kernel::event::PolicyRecoveryAction::SkipStep,
+                },
+            ))
+            .expect("policy resolution must reach every live client");
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "policy_intervention_resolved");
+        assert_eq!(json["intervention_id"], 42);
+        assert_eq!(json["action"], "skip_step");
     }
 
     #[test]

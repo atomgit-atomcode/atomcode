@@ -1,6 +1,7 @@
 use crate::message::{ImageContent, MessageMeta, SessionSnapshot};
 use crate::tool::{ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Driver round-trip `kind` for the round-cap checkpoint (kernel-initiated:
 /// the fuse pauses the turn and asks the driver "continue past the cap?").
@@ -35,13 +36,18 @@ pub enum PolicyRecoveryAction {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyIntervention {
+    /// Process-unique correlation id. Drivers must echo this id when resolving
+    /// the intervention so a delayed response cannot acknowledge a newer one.
+    pub id: u64,
     pub code: PolicyInterventionCode,
     pub actions: Vec<PolicyRecoveryAction>,
 }
 
 impl PolicyIntervention {
     pub fn credential_shell_blocked() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             code: PolicyInterventionCode::CredentialShellBlocked,
             actions: vec![
                 PolicyRecoveryAction::CompleteExternally,

@@ -182,6 +182,15 @@ pub async fn respond_confirmed(
     hub().respond_confirmed(id, value).await
 }
 
+pub async fn resolve_policy_intervention(
+    intervention_id: u64,
+    action: atomcode_kernel::event::PolicyRecoveryAction,
+) -> Result<(), HubError> {
+    hub()
+        .resolve_policy_intervention(intervention_id, action)
+        .await
+}
+
 pub async fn respond_pending_kind_confirmed(
     kind: &str,
     value: serde_json::Value,

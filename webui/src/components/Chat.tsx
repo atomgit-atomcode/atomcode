@@ -27,7 +27,7 @@
 
 import { VNode } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, postLiveCompact, postLiveUserInput, postChatUserInput, type CommandResult, UserInputRequestEvent, type PolicyInterventionEvent } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, postLiveCompact, postLiveUserInput, postChatUserInput, postLivePolicyInterventionResolution, type CommandResult, UserInputRequestEvent, type PolicyInterventionEvent } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -1335,6 +1335,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       }
       case 'policy_intervention': {
         setPolicyIntervention(e);
+        break;
+      }
+      case 'policy_intervention_resolved': {
+        setPolicyIntervention((current) => current?.intervention_id === e.intervention_id ? null : current);
+        break;
+      }
+      case 'policy_intervention_cleared': {
+        setPolicyIntervention((current) => current?.intervention_id === e.intervention_id ? null : current);
         break;
       }
       default: {
@@ -2818,16 +2826,27 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   );
 
   // The kernel event precedes the authoritative terminal by design. Keep the
-  // card mounted through its own recovery submit (so its loading/error state can
-  // render) and gate SUBMIT — not mounting — on idle by forwarding `busy`: while
-  // the runtime is still busy the actions are disabled, so no recovery turn can
-  // start before the runtime has actually returned to idle.
+  // Keep the card mounted while its control-plane acknowledgement is pending so
+  // loading/error state can render. Gate the action — not mounting — on `busy`:
+  // the runtime accepts a resolution only after the interrupted turn is idle.
   const policyInterventionCard = policyIntervention && (
     <PolicyInterventionCard
       intervention={policyIntervention}
       busy={busy}
       onClose={() => setPolicyIntervention(null)}
-      onSubmit={(message) => deliver(message, [])}
+      onResolve={async (action) => {
+        if (sync) {
+          await postLivePolicyInterventionResolution(policyIntervention.intervention_id, action);
+        }
+        pushCommandNotice(t(
+          action === 'complete_externally'
+            ? 'policyRecovery.completedLocally'
+            : action === 'skip_step'
+              ? 'policyRecovery.skippedLocally'
+              : 'policyRecovery.endedLocally',
+        ));
+        return true;
+      }}
     />
   );
 

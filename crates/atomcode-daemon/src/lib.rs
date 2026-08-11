@@ -3090,6 +3090,7 @@ pub enum ChatEvent {
     /// recovery actions. Rejected commands and credentials are never included.
     #[serde(rename = "policy_intervention")]
     PolicyIntervention {
+        intervention_id: u64,
         code: atomcode_kernel::event::PolicyInterventionCode,
         actions: Vec<atomcode_kernel::event::PolicyRecoveryAction>,
     },
@@ -3915,6 +3916,7 @@ impl ChatRuntimeProjector {
             Agent::Warning(message) => vec![ChatEvent::Warning { message }],
             Agent::PolicyIntervention { intervention } => {
                 vec![ChatEvent::PolicyIntervention {
+                    intervention_id: intervention.id,
                     code: intervention.code,
                     actions: intervention.actions,
                 }]
@@ -5864,6 +5866,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/stop", post(live_api::live_stop))
         .route("/live/permission", post(live_api::live_permission))
         .route("/live/user-input", post(live_api::live_user_input))
+        .route(
+            "/live/policy-intervention",
+            post(live_api::live_policy_intervention_resolution),
+        )
         .route("/live/provider", post(live_api::live_provider))
         .route("/live/mode", post(live_api::live_mode))
         .route("/live/cancel", post(live_api::live_cancel))
