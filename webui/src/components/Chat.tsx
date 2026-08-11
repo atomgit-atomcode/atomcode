@@ -76,6 +76,7 @@ import {
 import {
   acknowledgeLiveSteers,
   pendingSteersToDraft,
+  reconcileSteerReceipt,
   type PendingLiveSteer,
 } from '../lib/liveSteer';
 
@@ -1282,13 +1283,24 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         });
         liveLifecycleRef.current = lifecycle.state;
         setBusy(lifecycle.state.running);
-        if (lifecycle.terminal) {
-          // A submit whose HTTP receipt is still in flight may belong to the
-          // next turn; only confirmed steers are recoverable at this terminal.
-          restorePendingSteers(false);
-          if (lifecycle.terminal.discardQueued) {
+        const terminal = lifecycle.terminal;
+        if (terminal) {
+          if (terminal.discardQueued) {
+            // Abnormal terminal (cancel / error): the kernel CLEARS its steer
+            // buffer (agent.rs Cancel/Shutdown), so a leftover steer is NOT
+            // re-run. Recover its text to the composer instead of stranding the
+            // optimistic bubble with no re-run to fill it.
+            restorePendingSteers(false);
             setQueued([]);
-            pushNoticeToLastAssistant(t('chat.incomplete', { msg: lifecycle.terminal.detail }));
+            pushNoticeToLastAssistant(t('chat.incomplete', { msg: terminal.detail }));
+          } else {
+            // Normal completion: the kernel re-runs any steer that did not fold
+            // as the next turn (agent.rs leftover-steer drain), so drop the
+            // pending markers and let that authoritative re-run reconcile the
+            // optimistic echo — matching the TUI, which never returns the text to
+            // the input. Unconfirmed steers keep their marker; their in-flight
+            // receipt lands as `release` (terminal now consumed) and drops it.
+            setPendingSteers((pending) => pending.filter((item) => !item.confirmed));
           }
           // 回合结束（idle）时不可能再有待批准项：清掉因对端(TUI)批准或回合收尾而
           // 残留的审批卡片，否则 webui 会一直挂着一张「等待批准…」的卡片直到刷新。
@@ -2026,15 +2038,21 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           activeIdRef.current,
           pendingSteer.id,
         );
-        // The receipt is authoritative. The browser's busy flag can race a
-        // terminal event, so reconcile pending ownership in either direction.
-        if (receipt.disposition === 'started') {
-          setPendingSteers((pending) => pending.filter((item) => item.id !== pendingSteer.id));
-        } else {
+        // The receipt is authoritative. Reconcile from the lifecycle's observed
+        // terminal — NOT the transient `running` flag, which is false for a tab
+        // that attached mid-turn. A `steered` submit is never bounced back to the
+        // composer: the runtime folds it, or (if the turn already ended) re-runs
+        // it as the next turn, matching the TUI.
+        const outcome = reconcileSteerReceipt(receipt.disposition, liveLifecycleRef.current);
+        if (outcome === 'confirm') {
           setPendingSteers((pending) => pending.map((item) => (
             item.id === pendingSteer.id ? { ...item, confirmed: true } : item
           )));
-          if (!liveLifecycleRef.current.running) restorePendingSteers(false);
+        } else {
+          // 'clear': a new turn began; the submit IS that turn's input.
+          // 'release': the steer raced the turn terminal; the runtime re-runs it
+          //   as the next turn, so drop the marker and defer to that re-run.
+          setPendingSteers((pending) => pending.filter((item) => item.id !== pendingSteer.id));
         }
       } catch (error) {
         // Roll back the optimistic append — the send never reached the server.

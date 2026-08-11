@@ -47,6 +47,35 @@ export function acknowledgeLiveSteers(
   return remaining;
 }
 
+export type SteerReceiptDisposition = 'started' | 'steered';
+export type SteerReceiptOutcome = 'clear' | 'confirm' | 'release';
+
+/**
+ * Reconcile a locally-submitted steer against its `/live/message` receipt.
+ *
+ * A `steered` receipt is authoritative: the runtime accepted the input into the
+ * active turn. It must NEVER be rolled back into the composer — that both breaks
+ * parity with the TUI (which folds the input or, if the turn ends first, re-runs
+ * it as the next turn — but never bounces it back) and would duplicate the
+ * prompt, because the kernel already re-runs any steer that arrived too late to
+ * fold as the next turn (see `agent.rs` leftover-steer drain).
+ *
+ * - `started`  → `clear`: a new turn began; the submit IS that turn's input.
+ * - `steered` while the client has not yet consumed the turn terminal → `confirm`:
+ *   keep it pending; the `steered` ack removes it when the fold lands, or the
+ *   turn terminal releases it if the turn ends first.
+ * - `steered` after the terminal was consumed → `release`: the fold can no longer
+ *   land, so drop the pending marker and defer to the runtime's re-run of the
+ *   leftover steer. Do NOT restore to the composer.
+ */
+export function reconcileSteerReceipt(
+  disposition: SteerReceiptDisposition,
+  lifecycle: { running: boolean; terminalConsumed: boolean },
+): SteerReceiptOutcome {
+  if (disposition === 'started') return 'clear';
+  return lifecycle.terminalConsumed ? 'release' : 'confirm';
+}
+
 /** Restore unacknowledged steers to an editable draft without losing order. */
 export function pendingSteersToDraft(pending: PendingLiveSteer[]): {
   text: string;
