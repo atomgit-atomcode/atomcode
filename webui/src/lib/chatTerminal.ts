@@ -3,6 +3,21 @@ export interface ChatDoneTerminal {
   message?: string;
 }
 
+export type ActiveTurnSubmissionDisposition = 'send' | 'queue' | 'steer';
+
+/**
+ * Decide composer behavior from the synchronous runtime projection.
+ * `/chat` cannot steer an active turn, so it owns a next-turn queue; `/live`
+ * submits into the shared runtime as an in-turn steer.
+ */
+export function activeTurnSubmissionDisposition(
+  running: boolean,
+  sync: boolean,
+): ActiveTurnSubmissionDisposition {
+  if (!running) return 'send';
+  return sync ? 'steer' : 'queue';
+}
+
 export type ChatDoneDisposition =
   | { kind: 'completed'; discardQueued: false }
   | { kind: 'incomplete'; discardQueued: true; detail: string };
