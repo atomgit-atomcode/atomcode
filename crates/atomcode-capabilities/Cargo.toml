@@ -246,7 +246,7 @@ windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Foundatio
 reqwest = { version = "0.12", features = ["native-tls"], default-features = false, optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util", "test-util"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util", "net", "test-util"] }
 # Local mock HTTP server for deterministic provider tests (retry / multi-round).
 wiremock = "0.6"
 # Temp dirs for the tool tests; cancellation token construction in tests.

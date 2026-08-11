@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use futures::StreamExt;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
@@ -19,6 +20,13 @@ use super::types::{
 
 /// Default timeout for HTTP operations (30 seconds).
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
+/// Maximum response body accepted from an HTTP MCP server.
+///
+/// This is enforced while streaming the body, rather than after `bytes()` or `text()`
+/// has already buffered it, so an absent or dishonest `Content-Length` cannot cause an
+/// unbounded allocation.
+const MAX_MCP_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Streamable HTTP / SSE-style MCP endpoints (e.g. Playwright) reject requests unless
 /// `Accept` advertises both JSON and event-stream; see MCP HTTP transport guidance.
@@ -193,7 +201,6 @@ impl HttpClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
             if (status == reqwest::StatusCode::UNAUTHORIZED
                 || status == reqwest::StatusCode::FORBIDDEN)
                 && self.auth.is_some()
@@ -205,6 +212,7 @@ impl HttpClient {
                     self.server_name
                 );
             }
+            let body = read_limited_response_text(response, &self.server_name).await?;
             bail!(
                 "MCP server {} returned HTTP {}: {}",
                 self.server_name,
@@ -225,10 +233,7 @@ impl HttpClient {
             .map(|s| s.to_ascii_lowercase())
             .unwrap_or_default();
 
-        let body = response
-            .text()
-            .await
-            .with_context(|| format!("Failed to read MCP HTTP body from {}", self.server_name))?;
+        let body = read_limited_response_text(response, &self.server_name).await?;
 
         let result: super::types::JsonRpcResponse = if content_type.contains("text/event-stream") {
             parse_sse_jsonrpc(&body, id).with_context(|| {
@@ -328,6 +333,60 @@ impl HttpClient {
         // Fire and forget — ignore response
         let _ = req.send().await;
         Ok(())
+    }
+}
+
+async fn read_limited_response_text(
+    response: reqwest::Response,
+    server_name: &str,
+) -> Result<String> {
+    read_limited_response_text_with_limit(response, server_name, MAX_MCP_RESPONSE_BYTES).await
+}
+
+async fn read_limited_response_text_with_limit(
+    response: reqwest::Response,
+    server_name: &str,
+    limit: usize,
+) -> Result<String> {
+    if let Some(declared) = response.content_length() {
+        if declared > limit as u64 {
+            bail!(
+                "MCP server {} response body exceeds limit: declared {} bytes (max {} bytes)",
+                server_name,
+                declared,
+                limit
+            );
+        }
+    }
+
+    let capacity = response
+        .content_length()
+        .unwrap_or_default()
+        .min(limit as u64) as usize;
+    let mut body = Vec::with_capacity(capacity);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.with_context(|| format!("Failed to read MCP HTTP body from {}", server_name))?;
+        let observed = body.len().checked_add(chunk.len()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "MCP server {} response body size overflowed while reading",
+                server_name
+            )
+        })?;
+        if observed > limit {
+            bail!(
+                "MCP server {} response body exceeds limit: received more than {} bytes",
+                server_name,
+                limit
+            );
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    match String::from_utf8(body) {
+        Ok(body) => Ok(body),
+        Err(error) => Ok(String::from_utf8_lossy(error.as_bytes()).into_owned()),
     }
 }
 
@@ -616,6 +675,80 @@ mod sse_tests {
                     data: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}\n\n";
         let resp = parse_sse_jsonrpc(body, 5).expect("parse");
         assert_eq!(resp.id, 5);
+    }
+}
+
+#[cfg(test)]
+mod response_limit_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn response_from_raw(raw_response: &'static [u8]) -> reqwest::Response {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(raw_response)
+                .await
+                .expect("write response");
+        });
+
+        reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .expect("request")
+    }
+
+    #[tokio::test]
+    async fn rejects_declared_content_length_before_reading_body() {
+        let response = response_from_raw(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 33\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+
+        let error = read_limited_response_text_with_limit(response, "oversized", 32)
+            .await
+            .expect_err("declared oversized response must fail");
+        let message = error.to_string();
+        assert!(message.contains("declared 33 bytes"), "{message}");
+        assert!(message.contains("max 32 bytes"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn rejects_chunked_body_when_observed_size_exceeds_limit() {
+        let response = response_from_raw(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+              20\r\n01234567890123456789012345678901\r\n\
+              1\r\nx\r\n0\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response.content_length(), None);
+
+        let error = read_limited_response_text_with_limit(response, "chunked", 32)
+            .await
+            .expect_err("observed oversized response must fail");
+        assert!(
+            error.to_string().contains("received more than 32 bytes"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_body_at_exact_limit() {
+        let response = response_from_raw(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        )
+        .await;
+
+        let body = read_limited_response_text_with_limit(response, "exact", 5)
+            .await
+            .expect("body at the limit is valid");
+        assert_eq!(body, "hello");
     }
 }
 
