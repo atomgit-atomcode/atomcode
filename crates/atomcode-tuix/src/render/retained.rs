@@ -1010,6 +1010,15 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// no-op since the group rows are no longer at the bottom and may
     /// have scrolled out of the visible body strip).
     live_group: Option<LiveGroup>,
+    /// Agent progress block rendered in the conversation body while Todo owns
+    /// the footer. Unlike a tool batch it may remain live while ordinary body
+    /// text is appended; absolute indices stay valid until the rows enter host
+    /// scrollback, at which point updates safely stop.
+    live_agent_groups: std::collections::HashMap<String, LiveAgentGroup>,
+    /// Projection ids whose rows have entered native scrollback. Ignore their
+    /// remaining activity events until terminal so a long run cannot append
+    /// repeated snapshots every time the old block leaves the viewport.
+    frozen_agent_groups: std::collections::HashSet<String>,
     /// Modal overlay state: a floating window drawn on top of body+footer.
     /// When Some, `paint_frame` paints the overlay cells after the normal
     /// body+footer, so the diff sees the combined frame.
@@ -1070,6 +1079,12 @@ struct LiveGroup {
     /// are absolute; they remain valid as long as no rows are drained
     /// from the front of `body_lines` while the group is live.
     child_indices: std::collections::HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveAgentGroup {
+    header_idx: usize,
+    child_indices: Vec<usize>,
 }
 
 /// Wraps the real stdout writer with an optional mirror file. When
@@ -1181,6 +1196,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             inflight_tool_rows: 0,
             inflight_hint: None,
             live_group: None,
+            live_agent_groups: std::collections::HashMap::new(),
+            frozen_agent_groups: std::collections::HashSet::new(),
             modal_overlay: None,
             diff_overlay_active: false,
             body_log: Vec::new(),
@@ -4462,9 +4479,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             0
         };
-        // Modal input always wins the scarce interactive footer area. While a
-        // Task fan-out is active it owns the expanded top-panel slot and the
-        // standing TodoWrite panel collapses completely until Task finishes.
+        // Modal input always wins the scarce interactive footer area. The event
+        // loop routes Task/Team progress out of `status.subtasks` while Todo owns
+        // this slot, so only one expanded footer panel reaches the renderer.
         let approval_rows = self.modal_panel_rows();
         let subtask_rows = if approval_rows == 0 {
             self.status
@@ -7153,6 +7170,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if self.replaying {
             return;
         }
+        if let UiLine::AgentGroup { progress, .. } = line {
+            if let Some(existing) = self.body_log.iter_mut().rev().find(|existing| {
+                matches!(
+                    existing,
+                    UiLine::AgentGroup { progress: prior, finished: false }
+                        if prior.call_id == progress.call_id
+                )
+            }) {
+                *existing = line.clone();
+                return;
+            }
+        }
         match line {
             // Transient / footer / modal: never part of the permanent
             // transcript, so re-derived from live state on every frame.
@@ -7161,6 +7190,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             | UiLine::Spinner { .. }
             | UiLine::ClearTransient
             | UiLine::InputCommit
+            | UiLine::AgentGroupsFreeze
             | UiLine::DiffPanel { .. }
             | UiLine::ModalOverlayClear => return,
             _ => {}
@@ -7217,6 +7247,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.reasoning_line_buf.clear();
         self.md_state.reset();
         self.live_group = None;
+        self.live_agent_groups.clear();
+        self.frozen_agent_groups.clear();
         self.inflight_tool = None;
         self.inflight_tool_rows = 0;
         self.inflight_hint = None;
@@ -7326,6 +7358,207 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let downgr = crate::glyph::downgrade_glyphs(text, unicode);
         let safe = scrub_controls(&downgr);
         build_one_row(&safe, muted, screen_w, unicode)
+    }
+
+    fn agent_group_rows(
+        &self,
+        progress: &crate::render::SubtaskProgress,
+        finished: bool,
+    ) -> (Vec<Cell>, Vec<Vec<Cell>>) {
+        use crate::render::SubtaskStatus;
+
+        let failed = progress
+            .items
+            .iter()
+            .filter(|item| item.status == SubtaskStatus::Failed)
+            .count();
+        let stopped = progress
+            .items
+            .iter()
+            .filter(|item| item.status == SubtaskStatus::Stopped)
+            .count();
+        let terminal = progress.completed + failed + stopped;
+        let running = progress
+            .items
+            .iter()
+            .filter(|item| item.status == SubtaskStatus::Running)
+            .count();
+        let kind = if progress.call_id.starts_with("team:") {
+            "Team agents"
+        } else {
+            "Subagents"
+        };
+        let marker = if self.caps.unicode_symbols { "●" } else { "*" };
+        let header = if finished && terminal >= progress.total {
+            format!(
+                "{marker} {kind} · {terminal}/{} finished · {failed} failed",
+                progress.total
+            )
+        } else {
+            format!("{marker} Running {running}/{} {kind}…", progress.total)
+        };
+        let header_style = self.style_bold(Role::Secondary);
+        let header_row = build_one_row(
+            &header,
+            &header_style,
+            self.screen.width(),
+            self.caps.unicode_symbols,
+        );
+        let child_style = if crate::highlight::theme::is_light_for_render() {
+            self.style_for(Role::Muted)
+        } else {
+            self.style_faint(Role::Muted)
+        };
+        let child_rows = progress
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let branch = if index + 1 == progress.items.len() {
+                    "└"
+                } else {
+                    "├"
+                };
+                let state = match item.status {
+                    SubtaskStatus::Pending => "pending",
+                    SubtaskStatus::Running => {
+                        if item.activity.is_empty() {
+                            "running"
+                        } else {
+                            item.activity.as_str()
+                        }
+                    }
+                    SubtaskStatus::Completed => "done",
+                    SubtaskStatus::Stopped => "stopped",
+                    SubtaskStatus::Failed => "failed",
+                };
+                let mut text = format!("  {branch} {}", item.label);
+                if !item.description.is_empty() {
+                    text.push_str(&format!(": {}", item.description));
+                }
+                if !item.model.is_empty() {
+                    text.push_str(&format!(" · {}", item.model));
+                }
+                text.push_str(&format!(" · {state}"));
+                if item.output_tokens > 0 {
+                    text.push_str(&format!(" · ↑ {} tokens", item.output_tokens));
+                }
+                build_one_row(
+                    &text,
+                    &child_style,
+                    self.screen.width(),
+                    self.caps.unicode_symbols,
+                )
+            })
+            .collect();
+        (header_row, child_rows)
+    }
+
+    fn render_agent_group(
+        &mut self,
+        progress: crate::render::SubtaskProgress,
+        finished: bool,
+    ) {
+        let projection_id = progress.call_id.clone();
+        let (header, children) = self.agent_group_rows(&progress, finished);
+        if self.frozen_agent_groups.contains(&projection_id) {
+            if finished {
+                self.frozen_agent_groups.remove(&projection_id);
+            }
+            return;
+        }
+        if let Some(group) = self.live_agent_groups.get(&projection_id).cloned() {
+            let still_rewritable = group.header_idx >= self.scrolled_off
+                && group.child_indices.len() == children.len()
+                && group
+                    .child_indices
+                    .iter()
+                    .all(|index| *index >= self.scrolled_off && *index < self.body_lines.len());
+            if still_rewritable {
+                if let Some(row) = self.body_lines.get_mut(group.header_idx) {
+                    *row = header;
+                }
+                for (index, child) in group.child_indices.iter().zip(children) {
+                    self.body_lines[*index] = child;
+                }
+                // Body rows are emitted eagerly and are not repainted by the
+                // footer diff. Rewrite every still-visible Agent row at its
+                // absolute terminal position, matching ToolGroupChildUpdate.
+                let bottom = self.body_bottom_row();
+                let body_len = self.body_lines.len();
+                if bottom > 0 {
+                    let mut indices = Vec::with_capacity(group.child_indices.len() + 1);
+                    indices.push(group.header_idx);
+                    indices.extend(group.child_indices.iter().copied());
+                    for index in indices {
+                        let offset_from_bottom = (body_len - 1).saturating_sub(index);
+                        if (bottom as usize) <= offset_from_bottom {
+                            continue;
+                        }
+                        let target_row = (bottom as usize) - offset_from_bottom;
+                        let _ = write!(self.out, "\x1b[{target_row};1H\x1b[K");
+                        if let Some(row) = self.body_lines.get(index) {
+                            let _ = self.out.write_all(&serialize_row(row));
+                        }
+                    }
+                }
+                if finished {
+                    self.live_agent_groups.remove(&projection_id);
+                }
+                self.dirty = true;
+                return;
+            }
+            self.live_agent_groups.remove(&projection_id);
+            if !finished {
+                self.frozen_agent_groups.insert(projection_id);
+            }
+            return;
+        }
+        self.clear_live_spinner_before_permanent_body();
+        self.flush_assistant_remainder();
+        self.mark_message(crate::render::MarkKind::ToolCall);
+        self.last_mark_was_assistant = false;
+        self.push_body_row(Vec::new());
+        self.push_body_row(header);
+        let header_idx = self.body_lines.len() - 1;
+        let mut child_indices = Vec::with_capacity(children.len());
+        for child in children {
+            self.push_body_row(child);
+            child_indices.push(self.body_lines.len() - 1);
+        }
+        if !finished {
+            self.live_agent_groups.insert(
+                projection_id,
+                LiveAgentGroup {
+                    header_idx,
+                    child_indices,
+                },
+            );
+        }
+    }
+
+    fn freeze_agent_groups(&mut self) {
+        let projection_ids = self
+            .live_agent_groups
+            .keys()
+            .chain(self.frozen_agent_groups.iter())
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        for projection_id in &projection_ids {
+            if let Some(UiLine::AgentGroup { finished, .. }) =
+                self.body_log.iter_mut().rev().find(|event| {
+                    matches!(
+                        event,
+                        UiLine::AgentGroup { progress, finished: false }
+                            if progress.call_id == projection_id.as_str()
+                    )
+                })
+            {
+                *finished = true;
+            }
+        }
+        self.live_agent_groups.clear();
+        self.frozen_agent_groups.clear();
     }
 }
 
@@ -7801,6 +8034,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 );
                 self.push_body_row(row);
             }
+            UiLine::AgentGroup { progress, finished } => {
+                self.render_agent_group(progress, finished);
+            }
+            UiLine::AgentGroupsFreeze => self.freeze_agent_groups(),
             UiLine::ToolCall { name, detail } => {
                 // Capture BEFORE the arm mutates `last_mark_was_assistant`.
                 // We need the entry-time value to decide whether to insert a
@@ -16287,6 +16524,282 @@ mod tests {
             assert!(text[5].contains("explore#4 · GLM-5.2 · inspect explore#4 · pending"));
             assert!(!text[5].contains("1 pending"));
         }
+    }
+
+    #[test]
+    fn agent_group_updates_in_body_across_foreign_output_and_freezes_final_state() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut r, buf) = new_capturing(120, 24);
+        let mut progress = SubtaskProgress {
+            call_id: "team:runtime".into(),
+            completed: 0,
+            total: 2,
+            items: vec![
+                SubtaskItem {
+                    label: "explorer".into(),
+                    description: "scan kernel".into(),
+                    model: "GLM-5.2".into(),
+                    activity: "thinking".into(),
+                    started_at: Some(std::time::Instant::now()),
+                    output_tokens: 128,
+                    status: SubtaskStatus::Running,
+                },
+                SubtaskItem {
+                    label: "reviewer".into(),
+                    description: "review findings".into(),
+                    model: "GLM-5.2".into(),
+                    activity: "queued".into(),
+                    started_at: None,
+                    output_tokens: 0,
+                    status: SubtaskStatus::Pending,
+                },
+            ],
+        };
+        r.render(UiLine::AgentGroup {
+            progress: progress.clone(),
+            finished: false,
+        });
+        let group = r
+            .live_agent_groups
+            .get("team:runtime")
+            .cloned()
+            .expect("live agent block");
+
+        r.render(UiLine::CommandOutput("parent task remains visible\n".into()));
+        assert!(
+            r.live_agent_groups.contains_key("team:runtime"),
+            "foreign output must not freeze Agent block"
+        );
+
+        progress.items[1].status = SubtaskStatus::Running;
+        progress.items[1].activity = "reading files".into();
+        progress.items[1].output_tokens = 256;
+        buf.lock().unwrap().clear();
+        r.render(UiLine::AgentGroup {
+            progress: progress.clone(),
+            finished: false,
+        });
+        assert!(
+            String::from_utf8_lossy(&buf.lock().unwrap()).contains("\x1b["),
+            "Agent update must immediately rewrite visible terminal rows"
+        );
+        let child = r.body_lines[group.child_indices[1]]
+            .iter()
+            .map(|cell| cell.ch)
+            .collect::<String>();
+        assert!(child.contains("reading files"));
+        assert!(child.contains("256 tokens"));
+
+        for item in &mut progress.items {
+            item.status = SubtaskStatus::Completed;
+            item.activity = "done".into();
+        }
+        progress.completed = 2;
+        r.render(UiLine::AgentGroup {
+            progress,
+            finished: true,
+        });
+        assert!(!r.live_agent_groups.contains_key("team:runtime"));
+        let header = r.body_lines[group.header_idx]
+            .iter()
+            .map(|cell| cell.ch)
+            .collect::<String>();
+        assert!(header.contains("2/2 finished"));
+
+        r.reflow_body_to_current_width();
+        let body = r
+            .body_lines
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("2/2 finished"), "resize replay keeps frozen Agent block");
+    }
+
+    #[test]
+    fn concurrent_task_and_team_agent_groups_update_independently() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut r, _buf) = new_capturing(120, 30);
+        let progress = |call_id: &str, label: &str| SubtaskProgress {
+            call_id: call_id.into(),
+            completed: 0,
+            total: 1,
+            items: vec![SubtaskItem {
+                label: label.into(),
+                description: format!("inspect {label}"),
+                model: "GLM-5.2".into(),
+                activity: "thinking".into(),
+                started_at: Some(std::time::Instant::now()),
+                output_tokens: 0,
+                status: SubtaskStatus::Running,
+            }],
+        };
+        let mut task = progress("call-task-1", "task-agent");
+        let mut team = progress("team:run-1", "team-agent");
+        r.render(UiLine::AgentGroup {
+            progress: task.clone(),
+            finished: false,
+        });
+        r.render(UiLine::AgentGroup {
+            progress: team.clone(),
+            finished: false,
+        });
+        assert_eq!(r.live_agent_groups.len(), 2);
+
+        task.items[0].output_tokens = 128;
+        r.render(UiLine::AgentGroup {
+            progress: task,
+            finished: false,
+        });
+        team.items[0].output_tokens = 256;
+        r.render(UiLine::AgentGroup {
+            progress: team.clone(),
+            finished: false,
+        });
+        assert!(r.live_agent_groups.contains_key("call-task-1"));
+        assert!(r.live_agent_groups.contains_key("team:run-1"));
+
+        team.items[0].status = SubtaskStatus::Completed;
+        team.completed = 1;
+        r.render(UiLine::AgentGroup {
+            progress: team,
+            finished: true,
+        });
+        assert!(r.live_agent_groups.contains_key("call-task-1"));
+        assert!(!r.live_agent_groups.contains_key("team:run-1"));
+    }
+
+    #[test]
+    fn freeze_event_seals_every_live_agent_group_for_resize_replay() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut r, _buf) = new_capturing(120, 30);
+        for (call_id, label) in [("call-task-1", "task-agent"), ("team:run-1", "team-agent")]
+        {
+            r.render(UiLine::AgentGroup {
+                progress: SubtaskProgress {
+                    call_id: call_id.into(),
+                    completed: 0,
+                    total: 1,
+                    items: vec![SubtaskItem {
+                        label: label.into(),
+                        description: String::new(),
+                        model: String::new(),
+                        activity: "thinking".into(),
+                        started_at: None,
+                        output_tokens: 0,
+                        status: SubtaskStatus::Running,
+                    }],
+                },
+                finished: false,
+            });
+        }
+        assert_eq!(r.live_agent_groups.len(), 2);
+
+        r.render(UiLine::AgentGroupsFreeze);
+
+        assert!(r.live_agent_groups.is_empty());
+        assert!(r.frozen_agent_groups.is_empty());
+        let sealed = r
+            .body_log
+            .iter()
+            .filter(|event| matches!(event, UiLine::AgentGroup { finished: true, .. }))
+            .count();
+        assert_eq!(sealed, 2);
+
+        r.reflow_body_to_current_width();
+        assert!(r.live_agent_groups.is_empty(), "sealed history must not become live again");
+    }
+
+    #[test]
+    fn repeated_agent_group_id_starts_new_history_lifecycle_after_terminal() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut r, _buf) = new_capturing(100, 24);
+        let progress = SubtaskProgress {
+            call_id: "team:run-1".into(),
+            completed: 0,
+            total: 1,
+            items: vec![SubtaskItem {
+                label: "explorer".into(),
+                description: String::new(),
+                model: String::new(),
+                activity: "thinking".into(),
+                started_at: None,
+                output_tokens: 0,
+                status: SubtaskStatus::Running,
+            }],
+        };
+        r.render(UiLine::AgentGroup {
+            progress: progress.clone(),
+            finished: false,
+        });
+        r.render(UiLine::AgentGroup {
+            progress: progress.clone(),
+            finished: true,
+        });
+        r.render(UiLine::AgentGroup {
+            progress,
+            finished: false,
+        });
+
+        let lifecycle_count = r
+            .body_log
+            .iter()
+            .filter(|event| matches!(event, UiLine::AgentGroup { .. }))
+            .count();
+        assert_eq!(lifecycle_count, 2);
+    }
+
+    #[test]
+    fn scrolled_agent_group_freezes_without_appending_repeated_snapshots() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut r, _buf) = new_capturing(100, 12);
+        let mut progress = SubtaskProgress {
+            call_id: "team:run-long".into(),
+            completed: 0,
+            total: 1,
+            items: vec![SubtaskItem {
+                label: "explorer".into(),
+                description: "long audit".into(),
+                model: String::new(),
+                activity: "thinking".into(),
+                started_at: None,
+                output_tokens: 0,
+                status: SubtaskStatus::Running,
+            }],
+        };
+        r.render(UiLine::AgentGroup {
+            progress: progress.clone(),
+            finished: false,
+        });
+        let group = r.live_agent_groups["team:run-long"].clone();
+        r.scrolled_off = group.header_idx + 1;
+        progress.items[0].output_tokens = 100;
+        r.render(UiLine::AgentGroup {
+            progress: progress.clone(),
+            finished: false,
+        });
+        assert!(r.frozen_agent_groups.contains("team:run-long"));
+        let body_len = r.body_lines.len();
+
+        progress.items[0].output_tokens = 200;
+        r.render(UiLine::AgentGroup {
+            progress: progress.clone(),
+            finished: false,
+        });
+        assert_eq!(r.body_lines.len(), body_len, "frozen updates must not append");
+
+        progress.items[0].status = SubtaskStatus::Completed;
+        progress.completed = 1;
+        r.render(UiLine::AgentGroup {
+            progress,
+            finished: true,
+        });
+        assert!(!r.frozen_agent_groups.contains("team:run-long"));
     }
 
     #[test]

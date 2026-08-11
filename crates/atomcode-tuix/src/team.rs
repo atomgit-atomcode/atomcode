@@ -15,6 +15,7 @@ pub struct TeamProjection {
 struct RunProjection {
     last_seq: u64,
     total: usize,
+    finished: bool,
     members: BTreeMap<String, MemberProjection>,
 }
 
@@ -54,9 +55,11 @@ impl TeamProjection {
             return;
         }
         run.last_seq = event.seq;
+        let mut run_finished = false;
         match event.payload {
             TeamEventPayload::RunStarted { total } => {
                 run.total = total;
+                run.finished = false;
                 self.visible = true;
             }
             TeamEventPayload::MemberQueued {
@@ -135,7 +138,12 @@ impl TeamProjection {
             }
             TeamEventPayload::RunFinished { total, .. } => {
                 run.total = total.max(run.members.len());
+                run.finished = true;
+                run_finished = true;
             }
+        }
+        if run_finished && self.runs.values().all(|run| run.finished) {
+            self.visible = false;
         }
     }
 
@@ -184,6 +192,13 @@ impl TeamProjection {
         if !self.visible || self.runs.is_empty() {
             return None;
         }
+        self.progress()
+    }
+
+    pub fn progress(&self) -> Option<SubtaskProgress> {
+        if self.runs.is_empty() {
+            return None;
+        }
         let mut items = Vec::new();
         let mut total = 0;
         for (run_id, run) in &self.runs {
@@ -212,6 +227,37 @@ impl TeamProjection {
             call_id: "team:runtime".into(),
             completed,
             total: total.max(items.len()),
+            items,
+        })
+    }
+
+    pub fn progress_for_run(&self, run_id: &str) -> Option<SubtaskProgress> {
+        let run = self.runs.get(run_id)?;
+        let items = run
+            .members
+            .values()
+            .map(|member| SubtaskItem {
+                label: if member.label.is_empty() {
+                    run_id.to_string()
+                } else {
+                    member.label.clone()
+                },
+                description: member.description.clone(),
+                model: member.model.clone(),
+                activity: member.activity.clone(),
+                started_at: member.started_at,
+                output_tokens: member.output_tokens,
+                status: member.status,
+            })
+            .collect::<Vec<_>>();
+        let completed = items
+            .iter()
+            .filter(|item| item.status == SubtaskStatus::Completed)
+            .count();
+        Some(SubtaskProgress {
+            call_id: format!("team:{run_id}"),
+            completed,
+            total: run.total.max(items.len()),
             items,
         })
     }
@@ -332,6 +378,74 @@ mod tests {
         assert_eq!(panel.items[0].model, "GLM-5.2");
         assert_eq!(panel.items[0].description, "inspect render hot path");
         assert_eq!(panel.items[0].status, SubtaskStatus::Pending);
+    }
+
+    #[test]
+    fn panel_hides_only_after_all_runs_finish_and_can_be_shown_again() {
+        let mut state = TeamProjection::default();
+        state.apply(1, event("a", 1, TeamEventPayload::RunStarted { total: 1 }));
+        state.apply(1, event("b", 1, TeamEventPayload::RunStarted { total: 1 }));
+
+        state.apply(
+            1,
+            event(
+                "a",
+                2,
+                TeamEventPayload::RunFinished {
+                    total: 1,
+                    completed: 1,
+                    failed: 0,
+                },
+            ),
+        );
+        assert!(state.panel().is_some(), "run b is still active");
+
+        state.apply(
+            1,
+            event(
+                "b",
+                2,
+                TeamEventPayload::RunFinished {
+                    total: 1,
+                    completed: 0,
+                    failed: 1,
+                },
+            ),
+        );
+        assert!(state.panel().is_none(), "all Team runs are terminal");
+
+        state.show();
+        assert!(state.panel().is_some(), "history remains available via /team show");
+    }
+
+    #[test]
+    fn per_run_progress_has_unique_projection_id_and_excludes_other_runs() {
+        let mut state = TeamProjection::default();
+        for (run_id, role) in [("a", TeamRoleId::Explorer), ("b", TeamRoleId::Reviewer)] {
+            state.apply(1, event(run_id, 1, TeamEventPayload::RunStarted { total: 1 }));
+            state.apply(
+                1,
+                event(
+                    run_id,
+                    2,
+                    TeamEventPayload::MemberQueued {
+                        member_id: TeamMemberId::new(format!("{run_id}#1")),
+                        role,
+                        model: "GLM-5.2".into(),
+                        description: format!("inspect {run_id}"),
+                    },
+                ),
+            );
+        }
+
+        let a = state.progress_for_run("a").unwrap();
+        let b = state.progress_for_run("b").unwrap();
+        assert_eq!(a.call_id, "team:a");
+        assert_eq!(b.call_id, "team:b");
+        assert_eq!(a.items.len(), 1);
+        assert_eq!(b.items.len(), 1);
+        assert_eq!(a.items[0].description, "inspect a");
+        assert_eq!(b.items[0].description, "inspect b");
     }
 
     #[test]

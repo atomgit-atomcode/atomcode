@@ -1,7 +1,7 @@
 // crates/atomcode-tuix/src/render/plain.rs
 use std::io::{BufWriter, Stdout, Write};
 
-use super::{Renderer, UiLine};
+use super::{Renderer, SubtaskStatus, UiLine};
 use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
 
@@ -284,6 +284,27 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                     );
                 }
             }
+            UiLine::AgentGroup { progress, finished } => {
+                // Plain terminals cannot rewrite body rows. Avoid streaming a
+                // full snapshot per activity event; print only the frozen final
+                // summary if this variant is ever routed to plain mode.
+                if finished {
+                    self.drop_transient();
+                    let failed = progress
+                        .items
+                        .iter()
+                        .filter(|item| item.status == SubtaskStatus::Failed)
+                        .count();
+                    let _ = writeln!(
+                        self.out,
+                        "Agents: {}/{} finished · {} failed",
+                        progress.items.len(),
+                        progress.total,
+                        failed
+                    );
+                }
+            }
+            UiLine::AgentGroupsFreeze => {}
             UiLine::ToolCallCommit { call_id: _ } => {
                 // Plain mode never animated the row, so there is
                 // nothing to freeze. Skip silently.

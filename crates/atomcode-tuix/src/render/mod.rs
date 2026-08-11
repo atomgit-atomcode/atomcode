@@ -112,6 +112,18 @@ pub enum UiLine {
     ToolGroupSummary {
         text: String,
     },
+    /// Live Task/Team agent projection rendered in the conversation body when
+    /// the persistent Todo/Tasks panel already owns the footer. Repeated events
+    /// with the same `call_id` replace the existing rows in place; `finished`
+    /// freezes the final snapshot into conversation history.
+    AgentGroup {
+        progress: SubtaskProgress,
+        finished: bool,
+    },
+    /// Freeze every live conversation-body Agent block at its current
+    /// snapshot, used when Todo stops owning the footer and Task/Team progress
+    /// returns to the fixed panel.
+    AgentGroupsFreeze,
     ToolResult {
         success: bool,
         summary: String,
@@ -624,8 +636,9 @@ pub struct StatusLine {
     /// conversations that never used todowrite). Carries raw fields; the
     /// renderer owns glyph/width/terminal-safety (mirrors GoalStatus).
     pub todo: Option<TodoProgress>,
-    /// Active `task` fan-out, rendered as a fixed panel above the input. While
-    /// present it takes the expanded top-panel slot and TodoWrite collapses.
+    /// Active `task`/Team fan-out rendered as a fixed panel above the input when
+    /// no Todo/Tasks plan already owns that slot. With an active Todo plan the
+    /// same projection is routed to a live conversation-body Agent block.
     pub subtasks: Option<SubtaskProgress>,
     /// When the approval panel is active (user must confirm/deny a tool call),
     /// this carries its current state for the dedicated footer approval panel

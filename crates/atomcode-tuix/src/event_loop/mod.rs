@@ -17915,6 +17915,13 @@ fn ephemeral_tool_activity<'a>(tool_display: Option<&str>, chunk: &'a str) -> Op
     supported.then_some(activity)
 }
 
+fn todo_panel_is_active(state: &crate::state::UiState) -> bool {
+    state
+        .active_todos
+        .as_ref()
+        .is_some_and(|todo| todo.total > 0 && todo.completed < todo.total)
+}
+
 fn subtask_progress_from_args(
     call_id: &str,
     arguments: &str,
@@ -18987,6 +18994,7 @@ fn handle_runtime_event(
             }
             match event {
                 CodingRuntimeEvent::Team { generation, event } => {
+                    let run_id = event.run_id.to_string();
                     // A new run started THIS turn → the completion banner should say
                     // "Dispatched" rather than a celebratory "done".
                     if matches!(
@@ -18995,7 +19003,23 @@ fn handle_runtime_event(
                     ) {
                         state.team_dispatched_this_turn = true;
                     }
+                    let run_finished = matches!(
+                        &event.payload,
+                        atomcode_capabilities::team::TeamEventPayload::RunFinished { .. }
+                    );
                     state.team.apply(generation.0, event);
+                    if todo_panel_is_active(state) && !ctx.is_plain_renderer {
+                        if let Some(progress) = state.team.progress_for_run(&run_id) {
+                            let finished = run_finished;
+                            // RunStarted arrives before queued member metadata.
+                            // Wait for the complete stable row set so retained
+                            // updates never need to insert rows mid-block.
+                            if progress.items.len() == progress.total || finished {
+                                renderer.render(UiLine::AgentGroup { progress, finished });
+                                renderer.flush();
+                            }
+                        }
+                    }
                     return;
                 }
                 CodingRuntimeEvent::Agent(event) => {
@@ -21162,6 +21186,13 @@ fn handle_agent_event(
             if let Some(progress) = task_panel.as_ref() {
                 state.active_subtasks = Some(progress.clone());
                 state.subagent_activity = None;
+                if todo_panel_is_active(state) && !ctx.is_plain_renderer {
+                    renderer.render(UiLine::AgentGroup {
+                        progress: progress.clone(),
+                        finished: false,
+                    });
+                    renderer.flush();
+                }
             }
 
             // If this call is part of an active batch, the
@@ -21248,15 +21279,22 @@ fn handle_agent_event(
                 .as_ref()
                 .is_some_and(|progress| progress.call_id == call_id)
             {
-                let terminal_line = state
-                    .active_subtasks
-                    .as_mut()
-                    .and_then(|progress| update_subtask_progress(progress, &chunk));
+                let (terminal_line, agent_progress) = {
+                    let progress = state.active_subtasks.as_mut().expect("checked above");
+                    let terminal_line = update_subtask_progress(progress, &chunk);
+                    (terminal_line, progress.clone())
+                };
                 if let Some(terminal_line) = terminal_line {
                     // Running activity belongs to the fixed panel, but a terminal
                     // child is historical information. Commit it once so completed
                     // and failed children remain visible above the live panel.
                     renderer.render(UiLine::CommandOutput(terminal_line));
+                }
+                if todo_panel_is_active(state) && !ctx.is_plain_renderer {
+                    renderer.render(UiLine::AgentGroup {
+                        progress: agent_progress,
+                        finished: false,
+                    });
                 }
                 state.subagent_activity = None;
                 renderer.flush();
@@ -21287,7 +21325,17 @@ fn handle_agent_event(
             success,
             duration,
         } => {
+            let todo_owned_footer_before_result = todo_panel_is_active(state);
             commit_todo_call_result(state, &call_id, &name, success);
+            if todo_owned_footer_before_result
+                && !todo_panel_is_active(state)
+                && !ctx.is_plain_renderer
+            {
+                // Todo no longer owns the footer. Freeze every conversation
+                // Agent block at its latest snapshot; normal Task/Team footer
+                // projection resumes on the next frame.
+                renderer.render(UiLine::AgentGroupsFreeze);
+            }
             let credential_policy_block = credential_policy_blocked(&output, success);
             // A result for this call arrived while an approval prompt is still up ⇒ the
             // approval was resolved WITHOUT the user answering (headless timeout fail-close,
@@ -21304,6 +21352,34 @@ fn handle_agent_event(
                     .as_ref()
                     .is_some_and(|progress| progress.call_id == call_id)
                 {
+                    if todo_panel_is_active(state) && !ctx.is_plain_renderer {
+                        let mut progress = state.active_subtasks.clone().expect("checked above");
+                        for item in &mut progress.items {
+                            if matches!(
+                                item.status,
+                                crate::render::SubtaskStatus::Pending
+                                    | crate::render::SubtaskStatus::Running
+                            ) {
+                                item.status = if success {
+                                    crate::render::SubtaskStatus::Completed
+                                } else {
+                                    crate::render::SubtaskStatus::Failed
+                                };
+                                item.activity = if success { "done" } else { "failed" }.into();
+                            }
+                        }
+                        progress.completed = progress
+                            .items
+                            .iter()
+                            .filter(|item| {
+                                item.status == crate::render::SubtaskStatus::Completed
+                            })
+                            .count();
+                        renderer.render(UiLine::AgentGroup {
+                            progress,
+                            finished: true,
+                        });
+                    }
                     state.active_subtasks = None;
                 }
             }
@@ -21892,6 +21968,24 @@ fn handle_agent_event(
         AgentEvent::TurnCancelled { snapshot } => {
             // Seal the reply buffer (partial reply still copyable via `/copy`).
             state.response_finalized = true;
+            if todo_panel_is_active(state) && !ctx.is_plain_renderer {
+                if let Some(mut progress) = state.active_subtasks.clone() {
+                    for item in &mut progress.items {
+                        if matches!(
+                            item.status,
+                            crate::render::SubtaskStatus::Pending
+                                | crate::render::SubtaskStatus::Running
+                        ) {
+                            item.status = crate::render::SubtaskStatus::Stopped;
+                            item.activity = "cancelled".into();
+                        }
+                    }
+                    renderer.render(UiLine::AgentGroup {
+                        progress,
+                        finished: true,
+                    });
+                }
+            }
             atomcode_capabilities::notify::notify(
                 &ctx.config.notifications,
                 atomcode_capabilities::notify::NotificationEvent::TurnFinished(
@@ -23676,6 +23770,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         .active_todos
         .clone()
         .filter(|p| p.total > 0 && p.completed < p.total);
+    let todo_owns_footer = todo.is_some();
     let approval = state
         .approval_panel
         .as_ref()
@@ -23774,7 +23869,11 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         goal,
         loop_status,
         todo,
-        subtasks: state.active_subtasks.clone().or_else(|| state.team.panel()),
+        subtasks: if todo_owns_footer {
+            None
+        } else {
+            state.active_subtasks.clone().or_else(|| state.team.panel())
+        },
         approval,
         user_input,
         round_cap_panel: state.round_cap_panel.as_ref().map(|p| {

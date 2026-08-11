@@ -476,6 +476,8 @@ fn ui_line_tag(l: &UiLine) -> &'static str {
         UiLine::ToolGroupRender { .. } => "ToolGroupRender",
         UiLine::ToolGroupChildUpdate { .. } => "ToolGroupChildUpdate",
         UiLine::ToolGroupSummary { .. } => "ToolGroupSummary",
+        UiLine::AgentGroup { .. } => "AgentGroup",
+        UiLine::AgentGroupsFreeze => "AgentGroupsFreeze",
         UiLine::ToolResult { .. } => "ToolResult",
         UiLine::DiffLine { .. } => "DiffLine",
         UiLine::DiffBlock(_) => "DiffBlock",
