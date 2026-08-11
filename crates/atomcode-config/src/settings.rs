@@ -121,14 +121,6 @@ pub static SETTINGS: &[SettingSpec] = &[
         apply: ApplyPolicy::NextStartup,
     },
     bool_setting(
-        "ui.auto_copy_on_select",
-        &["ui", "auto_copy_on_select"],
-        "Copy on select",
-        "选中时复制",
-        &["clipboard"],
-        ApplyPolicy::ImmediateUi,
-    ),
-    bool_setting(
         "ui.auto_copy_code_blocks",
         &["ui", "auto_copy_code_blocks"],
         "Copy code blocks",
@@ -262,7 +254,6 @@ impl SettingSpec {
             "subagent.max_concurrent" => config.subagent.max_concurrent.to_string(),
             "subagent.max_rounds" => config.subagent.max_rounds.to_string(),
             "ui.theme" => format!("{:?}", config.ui.theme).to_lowercase(),
-            "ui.auto_copy_on_select" => config.ui.auto_copy_on_select.to_string(),
             "ui.auto_copy_code_blocks" => config.ui.auto_copy_code_blocks.to_string(),
             "ui.ai_session_naming" => config.ui.ai_session_naming.to_string(),
             "ui.terminal_status_glyph" => config.ui.terminal_status_glyph.to_string(),

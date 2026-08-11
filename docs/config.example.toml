@@ -285,4 +285,3 @@ auto_update_marketplaces = true
 # =============================================================================
 [ui]
 theme = "auto"
-auto_copy_on_select = true

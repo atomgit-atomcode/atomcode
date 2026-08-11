@@ -360,10 +360,6 @@ impl Default for PluginConfig {
     }
 }
 
-fn default_auto_copy_on_select() -> bool {
-    !cfg!(windows)
-}
-
 fn default_auto_copy_code_blocks() -> bool {
     // OFF by default. Auto-copying every rendered code block silently overwrote
     // the user's clipboard on each reply (issue #699 feedback), so it is opt-in.
@@ -395,11 +391,6 @@ pub struct UiConfig {
     /// configs see no behaviour change.
     #[serde(default)]
     pub theme: UiTheme,
-    /// Drag-select in the conversation auto-copies to the clipboard and
-    /// shows a notice. Opt-out via `/config`. Default off on Windows
-    /// (conhost QuickEdit conflict).
-    #[serde(default = "default_auto_copy_on_select")]
-    pub auto_copy_on_select: bool,
     /// Auto-copy a rendered code block's raw source to the clipboard when the
     /// AI finishes emitting it. OFF by default — it silently overwrote the
     /// user's clipboard on every code-block reply (issue #699 feedback). Env
@@ -423,7 +414,6 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             theme: UiTheme::default(),
-            auto_copy_on_select: default_auto_copy_on_select(),
             auto_copy_code_blocks: default_auto_copy_code_blocks(),
             ai_session_naming: default_ai_session_naming(),
             terminal_status_glyph: default_terminal_status_glyph(),
@@ -2113,9 +2103,9 @@ model = "missing-type"
     }
 
     #[test]
-    fn auto_copy_on_select_defaults_per_platform() {
-        let ui = UiConfig::default();
-        assert_eq!(ui.auto_copy_on_select, !cfg!(windows));
+    fn legacy_auto_copy_on_select_is_ignored() {
+        let ui: UiConfig = toml::from_str("auto_copy_on_select = true").unwrap();
+        assert!(!ui.auto_copy_code_blocks);
     }
 
     #[test]
