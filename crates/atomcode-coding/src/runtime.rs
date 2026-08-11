@@ -4038,7 +4038,9 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
-                            Some(&runtime.parts.team_manager),
+                            // Preserve detached Team runs across a `/model` reassemble:
+                            // the session continues, so background team work must not die.
+                            None,
                             runtime.parts.snapshot_persistence_status(),
                         )
                         .await;
@@ -4116,7 +4118,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                 agent = Some(candidate.spawn());
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
-                                runtime.parts.team_manager.begin_generation(generation);
+                                // Do NOT begin a new team generation here: a `/model`
+                                // reassemble keeps the session, so in-flight team runs
+                                // (and their events) must survive rather than be cancelled.
                                 agent_available = true;
                                 provider_unavailable_reason = None;
                                 controls.provider_unavailable_reason.store(0, Ordering::Release);
@@ -4542,6 +4546,9 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            // Reprepare REBUILDS the runtime (`runtime = candidate` below), so
+                            // the team_manager itself is replaced; terminate its in-flight runs
+                            // cleanly here before the old manager is dropped.
                             Some(&runtime.parts.team_manager),
                             runtime.parts.snapshot_persistence_status(),
                         )
@@ -6931,9 +6938,12 @@ async fn stop_current_agent(
     team_manager: Option<&crate::team::TeamRunManager>,
     persistence_status: Option<SnapshotPersistenceStatus>,
 ) -> StopReport {
-    // Detached Team members are part of this runtime generation even though
-    // their tool call has already returned. Terminate them before the owning
-    // kernel agent so replacement/shutdown cannot leave background editors.
+    // Detached Team members outlive the tool call that spawned them. On a genuine
+    // teardown (shutdown, provider deactivate, undo/restore) callers pass the
+    // manager so we terminate them and no background editor is orphaned. A mere
+    // provider RECONFIGURE that KEEPS the session (`/model`, `/config` reload)
+    // passes `None`: that async work is independent of which provider the main
+    // agent uses and must survive the reconfigure.
     if let Some(manager) = team_manager {
         manager.stop_all().await;
     }
@@ -10384,6 +10394,70 @@ mod tests {
                 .terminal
         );
         assert_eq!(manager.snapshot(Some(&run)).unwrap().runs[0].stopped, 1);
+    }
+
+    #[tokio::test]
+    async fn reassembling_provider_preserves_detached_team_members() {
+        use atomcode_capabilities::team::{
+            TeamDifficulty, TeamPermission, TeamRoleId, TeamTaskSpec,
+        };
+
+        let manager = crate::team::TeamRunManager::new(crate::team::TeamRuntimeConfig {
+            cancel_grace: std::time::Duration::from_millis(1),
+            ..Default::default()
+        });
+        manager.begin_generation(4);
+        let factory: crate::team::TeamJobFactory =
+            Arc::new(|_, _, _| Box::pin(std::future::pending::<crate::team::TeamMemberOutcome>()));
+        let run = manager
+            .delegate(
+                vec![TeamTaskSpec {
+                    description: "inspect".into(),
+                    prompt: "inspect".into(),
+                    role: TeamRoleId::Explorer,
+                    permission: TeamPermission::Explore,
+                    difficulty: TeamDifficulty::Simple,
+                    scope: Vec::new(),
+                }],
+                factory,
+                Arc::new(|_| "test-model".to_string()),
+            )
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        let mut agent = None;
+        let mut compactions = CompactionTracker::default();
+        let mut observed_tokens = None;
+        let (raw, _events) = mpsc::unbounded_channel();
+        let emitter = RuntimeEventEmitter {
+            raw,
+            tagged: None,
+            generation: Arc::new(AtomicU64::new(4)),
+        };
+        // A `/model` reassemble passes `None` for the manager: the session
+        // continues, so the detached member must NOT be terminated.
+        stop_current_agent(
+            &mut agent,
+            &mut compactions,
+            &mut observed_tokens,
+            &emitter,
+            CompactionInterruption::RuntimeReconfigured,
+            None,
+            None,
+        )
+        .await;
+
+        // The member is still pending (std::future::pending), so the run is NOT terminal.
+        assert!(
+            !manager
+                .wait(&run, std::time::Duration::from_millis(20))
+                .await
+                .unwrap()
+                .terminal,
+            "reassemble must preserve in-flight team members"
+        );
+        assert_eq!(manager.snapshot(Some(&run)).unwrap().runs[0].stopped, 0);
     }
 
     #[tokio::test]

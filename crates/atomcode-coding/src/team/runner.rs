@@ -156,41 +156,68 @@ impl TeamRunnerFactory {
 
 struct TeamProgressHook {
     activity: TeamActivitySink,
-    /// Streamed output chars so far; tokens are estimated as chars/4 to match the
-    /// legacy `task` subagent panel (which has no exact provider usage either).
-    output_chars: std::sync::atomic::AtomicU64,
+    /// Output+reasoning tokens finalized from completed rounds — the provider's
+    /// reported `completion` count when available, else a chars/4 estimate. Mirrors
+    /// the legacy `task` subagent panel so both show a real live token count.
+    total_tokens: std::sync::atomic::AtomicU64,
+    /// Chars streamed in the CURRENT (unfinished) round, reset at each round end.
+    round_chars: std::sync::atomic::AtomicU64,
 }
 
 impl TeamProgressHook {
     fn new(activity: TeamActivitySink) -> Self {
         Self {
             activity,
-            output_chars: std::sync::atomic::AtomicU64::new(0),
+            total_tokens: std::sync::atomic::AtomicU64::new(0),
+            round_chars: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    fn estimated_tokens(&self) -> u64 {
-        self.output_chars.load(std::sync::atomic::Ordering::Relaxed) / 4
+    /// Finalized tokens plus a running estimate for the in-progress round.
+    fn live_tokens(&self) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.total_tokens.load(Relaxed) + self.round_chars.load(Relaxed) / 4
+    }
+
+    fn add_chars(&self, delta: &str) {
+        self.round_chars.fetch_add(
+            delta.chars().count() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 
 #[async_trait]
 impl LifecycleHooks for TeamProgressHook {
     async fn pre_request(&self, _messages: &mut Vec<Message>, _ctx: &TurnCtx) {
-        (self.activity)("thinking".to_string(), self.estimated_tokens());
+        (self.activity)("thinking".to_string(), self.live_tokens());
     }
 
     async fn on_text_delta(&self, delta: &mut String) {
-        self.output_chars.fetch_add(
-            delta.chars().count() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        self.add_chars(delta);
+    }
+
+    async fn on_reasoning_delta(&self, delta: &mut String) {
+        self.add_chars(delta);
     }
 
     async fn on_model_response(&self, response: &mut Message) {
-        if let Some(call) = response.tool_calls.first() {
-            (self.activity)(format!("using {}", call.name), self.estimated_tokens());
-        }
+        use std::sync::atomic::Ordering::Relaxed;
+        // Finalize this round: prefer the provider's reported completion count,
+        // falling back to the chars/4 estimate when usage is unavailable.
+        let estimated = self.round_chars.swap(0, Relaxed) / 4;
+        let reported = response
+            .meta
+            .as_ref()
+            .map(|meta| meta.tokens.completion as u64)
+            .unwrap_or(0);
+        self.total_tokens.fetch_add(reported.max(estimated), Relaxed);
+        let label = response
+            .tool_calls
+            .first()
+            .map(|call| format!("using {}", call.name))
+            .unwrap_or_else(|| "thinking".to_string());
+        (self.activity)(label, self.total_tokens.load(Relaxed));
     }
 }
 

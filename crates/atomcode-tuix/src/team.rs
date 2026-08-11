@@ -124,6 +124,20 @@ impl TeamProjection {
         }
     }
 
+    /// True while any member is still running or queued — i.e. a background team
+    /// run is in flight. Used so a turn that merely DISPATCHED async team work
+    /// doesn't get a celebratory "done" banner while the work is unfinished.
+    pub fn has_active_runs(&self) -> bool {
+        self.runs.values().any(|run| {
+            run.members.values().any(|member| {
+                matches!(
+                    member.status,
+                    SubtaskStatus::Running | SubtaskStatus::Pending
+                )
+            })
+        })
+    }
+
     pub fn show(&mut self) {
         self.visible = true;
     }
@@ -291,5 +305,44 @@ mod tests {
         assert!(state.panel().is_some());
         state.clear();
         assert_eq!(state.summary(), "No Team runs.");
+    }
+
+    #[test]
+    fn has_active_runs_reflects_in_flight_members() {
+        let mut state = TeamProjection::default();
+        assert!(!state.has_active_runs());
+        state.apply(1, event("a", 1, TeamEventPayload::RunStarted { total: 1 }));
+        state.apply(
+            1,
+            event(
+                "a",
+                2,
+                TeamEventPayload::MemberStarted {
+                    member_id: TeamMemberId::new("a#1"),
+                    role: TeamRoleId::Explorer,
+                    model: "fast".into(),
+                    description: "x".into(),
+                },
+            ),
+        );
+        assert!(state.has_active_runs(), "a running member is active");
+        state.apply(
+            1,
+            event(
+                "a",
+                3,
+                TeamEventPayload::MemberFinished {
+                    member_id: TeamMemberId::new("a#1"),
+                    success: true,
+                    stop: "completed".into(),
+                    summary: "done".into(),
+                    output_tokens: 10,
+                },
+            ),
+        );
+        assert!(
+            !state.has_active_runs(),
+            "all members terminal -> not active"
+        );
     }
 }

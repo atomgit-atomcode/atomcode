@@ -16967,7 +16967,14 @@ fn turn_summary_label(
         state.last_turn_error = None;
         state.last_policy_denial_reason = None;
         state.turn_error_line_shown = false;
-        let done = state.next_done_label();
+        // A turn that merely DISPATCHED async team work isn't "done" — its members
+        // are still running in the background panel below. Don't burn a celebratory
+        // "Nailed it" rotation on it; show a neutral, accurate label instead.
+        let done = if state.team.has_active_runs() {
+            "Dispatched"
+        } else {
+            state.next_done_label()
+        };
         crate::i18n::t(crate::i18n::Msg::TurnSummary {
             done,
             turn_count,
