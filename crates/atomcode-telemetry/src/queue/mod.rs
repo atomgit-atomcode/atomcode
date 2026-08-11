@@ -1103,4 +1103,85 @@ mod tests {
             "orphan .owner marker (no matching .partial) should be cleaned up"
         );
     }
+
+    #[test]
+    fn recovery_keeps_owner_marker_for_live_locked_partial() {
+        let d = TempDir::new().unwrap();
+        let stamp = (chrono::Utc::now() - PARTIAL_QUIET_AFTER - chrono::Duration::minutes(1))
+            .format("%Y%m%d-%H%M%S");
+        let partial = d.path().join(format!("{stamp}-locked.partial"));
+        fs::write(
+            &partial,
+            format!("{}\n", serde_json::to_string(&rec()).unwrap()),
+        )
+        .unwrap();
+        // A managed partial carries its .owner marker (crash-recovery contract).
+        let marker = managed_marker_path(&partial);
+        fs::write(&marker, b"").unwrap();
+        let active = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&partial)
+            .unwrap();
+        active.lock_exclusive().unwrap();
+
+        recover_stale_files_at(
+            d.path(),
+            chrono::Utc::now() + chrono::Duration::days(2),
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            partial.exists(),
+            "live locked partial must survive recovery untouched"
+        );
+        assert!(
+            marker.exists(),
+            "owner marker for a live locked partial must be left alone"
+        );
+    }
+
+    #[test]
+    fn invalid_eviction_keeps_ready_and_drops_oldest_invalid_first() {
+        let d = TempDir::new().unwrap();
+        // Ready segments just under the cap: live telemetry keeps priority.
+        for i in 0..(roll::MAX_SEGMENT_FILES - 5) {
+            fs::write(
+                d.path().join(format!("20260101-000000-{i:08x}.ndjson")),
+                b"{}\n",
+            )
+            .unwrap();
+        }
+        // Quarantined files pushing the COMBINED footprint over the shared cap.
+        let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        for i in 0..10 {
+            fs::write(d.path().join(format!("{stamp}-{i:08x}.invalid")), b"x\n").unwrap();
+        }
+
+        recover_stale_files_at(d.path(), chrono::Utc::now(), false).unwrap();
+
+        let count = |ext: &str| {
+            fs::read_dir(d.path())
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some(ext))
+                .count()
+        };
+        let ready = count(READY_EXT);
+        let invalid = count(INVALID_EXT);
+        assert_eq!(
+            ready,
+            roll::MAX_SEGMENT_FILES - 5,
+            "ready segments must be preserved (live telemetry wins over quarantine)"
+        );
+        assert!(
+            ready + invalid <= roll::MAX_SEGMENT_FILES,
+            "combined ({ready}+{invalid}) must stay within the shared cap"
+        );
+        assert!(
+            !d.path().join(format!("{stamp}-00000000.invalid")).exists(),
+            "oldest invalid file must be evicted first"
+        );
+    }
 }

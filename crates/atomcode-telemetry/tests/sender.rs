@@ -308,6 +308,65 @@ async fn counters_increment_on_post() {
 }
 
 #[tokio::test]
+async fn transient_server_error_restores_segment_then_retry_succeeds() {
+    let server = MockServer::start().await;
+    // First POST returns a transient 5xx; the retry succeeds.
+    Mock::given(method("POST"))
+        .and(path("/v1/events"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/events"))
+        .respond_with(ResponseTemplate::new(200))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    let d = TempDir::new().unwrap();
+    let mut q = Queue::open(d.path().to_path_buf()).unwrap();
+    q.append(&rec()).unwrap();
+    q.force_roll().unwrap();
+
+    let q = Arc::new(Mutex::new(q));
+    let http = HttpSender::new(format!("{}/v1/events", server.uri()), "test".into());
+    let counters = Arc::new(atomcode_telemetry::Counters::default());
+    let health_path = d.path().join("health.json");
+    let rt = SenderRuntime::new(q.clone(), http, counters, health_path);
+
+    // 5xx is a transient error: the claimed segment must be restored to ready.
+    let first = rt.flush_one().await;
+    assert!(
+        matches!(
+            first,
+            Err(atomcode_telemetry::sender::http::SendError::Server(_))
+        ),
+        "expected transient server error, got {first:?}"
+    );
+    assert_eq!(
+        q.lock()
+            .await
+            .ready_segments_sorted()
+            .unwrap()
+            .len(),
+        1,
+        "segment must be restored to ready after a transient error"
+    );
+
+    // The next flush retries and succeeds; the segment is deleted.
+    let second = rt.flush_one().await;
+    assert!(
+        second.is_ok(),
+        "retry after transient error should succeed, got {second:?}"
+    );
+    assert!(
+        q.lock().await.ready_segments_sorted().unwrap().is_empty(),
+        "segment must be deleted after the successful retry"
+    );
+}
+
+#[tokio::test]
 async fn payload_too_large_drops_segment_instead_of_retrying_forever() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
