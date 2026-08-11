@@ -1549,17 +1549,23 @@ fn list_all_sessions_in_root(
 fn resolve_session_in_root(
     sessions_root: &std::path::Path,
     id_prefix: &str,
-) -> std::io::Result<Option<SessionMetaWithProject>> {
+) -> atomcode_capabilities::session::SessionResult<Option<SessionMetaWithProject>> {
     if id_prefix.is_empty() {
         return Ok(None);
     }
-    catalog_scan_in_root(sessions_root)?
-        .find(id_prefix)
+    let scan = catalog_scan_in_root(sessions_root).map_err(|source| {
+        atomcode_capabilities::session::SessionStoreError::Io {
+            path: sessions_root.to_path_buf(),
+            source,
+        }
+    })?;
+    scan.find(id_prefix)
         .map(|entry| entry.as_ref().map(catalog_entry_with_project))
-        .map_err(std::io::Error::from)
 }
 
-fn resolve_session_by_id(id_prefix: &str) -> std::io::Result<Option<SessionMetaWithProject>> {
+fn resolve_session_by_id(
+    id_prefix: &str,
+) -> atomcode_capabilities::session::SessionResult<Option<SessionMetaWithProject>> {
     resolve_session_in_root(&NativeSessionManager::sessions_root(), id_prefix)
 }
 
@@ -1915,6 +1921,21 @@ async fn resolve_session(Path(id): Path<String>) -> impl IntoResponse {
     match resolve_session_by_id(&id) {
         Ok(Some(s)) => Json(s).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, Json("Session not found")).into_response(),
+        Err(atomcode_capabilities::session::SessionStoreError::AmbiguousId { query, matches }) => {
+            let locations: Vec<String> = matches
+                .iter()
+                .map(|m| format!("{} (bucket {})", m.id, m.project_bucket))
+                .collect();
+            (
+                StatusCode::CONFLICT,
+                Json(format!(
+                    "session query {query:?} is ambiguous across {} locations: {}",
+                    locations.len(),
+                    locations.join(", ")
+                )),
+            )
+                .into_response()
+        }
         Err(e) => {
             let msg = format!("Failed to resolve session: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response()
@@ -4140,6 +4161,83 @@ async fn finalize_chat_task(
     cleanup_chats.complete(cleanup_operation_id).await;
 }
 
+/// Outcome of resolving which session a `/chat` request continues.
+#[derive(Debug)]
+struct ChatSessionResolution {
+    /// Canonical session id (newly allocated for a fresh chat).
+    session_id: String,
+    /// Initial messages loaded from the session (empty for a fresh chat).
+    initial_messages: Vec<atomcode_kernel::message::Message>,
+    /// Whether this is a brand-new session (no persisted aggregate).
+    is_new_session: bool,
+    /// Effective working dir the turn runs in: the session's own home when the
+    /// session was continued from another workspace bucket, otherwise the
+    /// request's working dir.
+    effective_working_dir: std::path::PathBuf,
+}
+
+/// Resolve the session a `/chat` request continues. Bucket-scoped lookup is
+/// tried first (the common same-workspace case); on a miss the global resolver
+/// locates the session's real bucket so a session created under a different
+/// workspace folder (different bucket) can still be continued instead of
+/// failing with "not found in project bucket". When the session lives in
+/// another bucket, the effective working dir is redirected to the session's own
+/// home so the runtime keeps persisting the session in its original bucket
+/// rather than the currently open workspace's bucket.
+fn resolve_chat_session(
+    working_dir: &std::path::Path,
+    session_id: Option<&str>,
+) -> anyhow::Result<ChatSessionResolution> {
+    let Some(session_id_str) = session_id else {
+        return Ok(ChatSessionResolution {
+            session_id: uuid::Uuid::new_v4().to_string(),
+            initial_messages: Vec::new(),
+            is_new_session: true,
+            effective_working_dir: working_dir.to_path_buf(),
+        });
+    };
+    let project_bucket = NativeSessionManager::project_hash(working_dir);
+    let session = match crate::legacy_convert::load_catalog_session_view_in_project(
+        &project_bucket,
+        session_id_str,
+    )? {
+        Some(session) => session,
+        None => {
+            let resolved = resolve_session_by_id(session_id_str).map_err(|error| {
+                anyhow::anyhow!("session {session_id_str:?} could not be resolved: {error}")
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "session {session_id_str:?} not found in project bucket {project_bucket}"
+                )
+            })?;
+            let session = crate::legacy_convert::load_catalog_session_view_in_project(
+                &resolved.project_hash,
+                &resolved.meta.id,
+            )?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "session {:?} resolved to bucket {} but could not be loaded",
+                    resolved.meta.id,
+                    resolved.project_hash
+                )
+            })?;
+            return Ok(ChatSessionResolution {
+                session_id: session.meta.id,
+                initial_messages: session.snapshot.messages,
+                is_new_session: false,
+                effective_working_dir: resolved.meta.working_dir.clone(),
+            });
+        }
+    };
+    Ok(ChatSessionResolution {
+        session_id: session.meta.id,
+        initial_messages: session.snapshot.messages,
+        is_new_session: false,
+        effective_working_dir: working_dir.to_path_buf(),
+    })
+}
+
 /// Process a chat request and stream events
 async fn process_chat_request(
     req: ChatRequest,
@@ -4176,26 +4274,27 @@ async fn process_chat_request(
     });
 
     // Get working directory
-    let working_dir = req
+    let mut working_dir = req
         .working_dir
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    // Remember the request's working dir so the cross-bucket redirect below can
+    // be detected when refreshing the telemetry repo_origin.
+    let requested_working_dir = working_dir.clone();
 
-    let (session_id, initial_messages, is_new_session) =
-        if let Some(ref session_id_str) = req.session_id {
-            let project_bucket = NativeSessionManager::project_hash(&working_dir);
-            let session = crate::legacy_convert::load_catalog_session_view_in_project(
-                &project_bucket,
-                session_id_str,
-            )?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "session {session_id_str:?} not found in project bucket {project_bucket}"
-                )
-            })?;
-            (session.meta.id, session.snapshot.messages, false)
-        } else {
-            (uuid::Uuid::new_v4().to_string(), Vec::new(), true)
-        };
+    // Resolve which session this turn continues. Bucket-scoped lookup first (the
+    // common same-workspace case); on a miss, fall back to the global resolver
+    // so a session created under a different workspace folder (different bucket)
+    // can still be continued from here instead of failing with "not found in
+    // project bucket". A cross-bucket hit redirects the turn's working dir to
+    // the session's own home so the runtime keeps persisting the session in its
+    // original bucket.
+    let ChatSessionResolution {
+        session_id,
+        initial_messages,
+        is_new_session,
+        effective_working_dir,
+    } = resolve_chat_session(&requested_working_dir, req.session_id.as_deref())?;
+    working_dir = effective_working_dir;
     active_chats
         .bind_session(&operation_id, &session_id)
         .await?;
@@ -4283,8 +4382,15 @@ async fn process_chat_request(
         return Ok(());
     }
 
-    // Capture CurrentContext so the inner spawn inherits mode/repo_origin/session_id
-    let tel_ctx = CurrentContext::current();
+    // Capture CurrentContext so the inner spawn inherits mode/repo_origin/session_id.
+    // The cross-bucket continuation redirect above moves the turn to the
+    // session's own home directory; refresh repo_origin so telemetry for the
+    // turn reflects the repo the runtime actually executes in, not the request's
+    // workspace.
+    let mut tel_ctx = CurrentContext::current();
+    if working_dir != requested_working_dir {
+        tel_ctx.repo_origin = Some(detect_repo_origin(&working_dir));
+    }
 
     // Run turn(s) in a background task on the native kernel stack; the
     // downstream native-event → ChatEvent projector shapes the HTTP stream.
@@ -7448,6 +7554,119 @@ mod tests {
 
         // Unknown id → None.
         assert!(resolve_session_in_root(root, "zzzzzzzz").unwrap().is_none());
+    }
+
+    // 回归：同一会话 id 出现在多个桶时,全局解析必须返回结构化 AmbiguousId
+    // 错误(而不是被压平成 io::Error 后由 handler 报 500),由 /sessions/resolve
+    // 映射为 409 并列出冲突位置。
+    #[test]
+    fn resolve_session_ambiguous_id_reports_all_locations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mk = |bucket: &str, wd: &str, id: &str| {
+            use atomcode_capabilities::session::{
+                PresentationFile, SessionManager, SessionMeta, StorageOwner,
+            };
+            let manager = SessionManager::with_root(root.join(bucket));
+            let lease = manager.acquire_lease(id).unwrap();
+            let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+                atomcode_kernel::message::Message::user("fixture"),
+            ]);
+            let mut meta = SessionMeta::new(id, wd, 1);
+            meta.owner = StorageOwner::Native;
+            meta.message_count = 1;
+            manager
+                .commit_native_import(
+                    &lease,
+                    Some(&snapshot),
+                    Some(&PresentationFile::default()),
+                    &meta,
+                )
+                .unwrap();
+        };
+        let dup = "99999999-9999-4999-8999-999999999999";
+        mk("1111111111111111", "/proj/one", dup);
+        mk("2222222222222222", "/proj/two", dup);
+
+        match resolve_session_in_root(root, dup) {
+            Err(atomcode_capabilities::session::SessionStoreError::AmbiguousId {
+                query,
+                matches,
+            }) => {
+                assert_eq!(query, dup);
+                assert_eq!(matches.len(), 2);
+                let mut buckets: Vec<_> = matches
+                    .iter()
+                    .map(|location| location.project_bucket.as_str())
+                    .collect();
+                buckets.sort_unstable();
+                assert_eq!(buckets, vec!["1111111111111111", "2222222222222222"]);
+            }
+            other => panic!("expected AmbiguousId, got {other:?}"),
+        }
+    }
+
+    // 回归：/chat 跨工作区续聊。会话创建于工作区 B（桶 B），用户在工作区 A
+    // 打开该会话并发送消息时，process_chat_request 必须先全局解析真实桶，
+    // 加载 B 的历史，并把 turn 的 working_dir 重定向到 B，避免把新消息写进
+    // 当前工作区 A 的桶造成同 ID 双份。
+    #[test]
+    fn chat_continuation_loads_session_from_other_bucket_and_redirects_working_dir() {
+        let home = ScopedChatHome::new();
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+        // Seed a native session in bucket B.
+        {
+            use atomcode_capabilities::session::{
+                PresentationFile, SessionManager, SessionMeta, StorageOwner,
+            };
+            let manager = SessionManager::for_project(dir_b.path());
+            let lease = manager.acquire_lease(id).unwrap();
+            let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+                atomcode_kernel::message::Message::user("history from B"),
+            ]);
+            let mut meta = SessionMeta::new(id, dir_b.path().to_string_lossy(), 1);
+            meta.owner = StorageOwner::Native;
+            meta.message_count = 1;
+            manager
+                .commit_native_import(
+                    &lease,
+                    Some(&snapshot),
+                    Some(&PresentationFile::default()),
+                    &meta,
+                )
+                .unwrap();
+        }
+
+        // Continue from workspace A: bucket-scoped lookup misses, global resolve
+        // finds the session in bucket B and redirects working dir to B's home.
+        let ChatSessionResolution {
+            session_id,
+            initial_messages,
+            is_new_session,
+            effective_working_dir,
+        } = resolve_chat_session(dir_a.path(), Some(id)).unwrap();
+        assert_eq!(session_id, id);
+        assert!(!is_new_session);
+        assert_eq!(initial_messages.len(), 1);
+        assert_eq!(effective_working_dir, dir_b.path());
+
+        // Same-workspace continuation keeps the request working dir.
+        let same = resolve_chat_session(dir_b.path(), Some(id)).unwrap();
+        assert_eq!(same.session_id, id);
+        assert_eq!(same.effective_working_dir, dir_b.path());
+
+        // Fresh chat allocates a new session under the request working dir.
+        let fresh = resolve_chat_session(dir_a.path(), None).unwrap();
+        assert!(fresh.is_new_session);
+        assert!(fresh.initial_messages.is_empty());
+        assert_eq!(fresh.effective_working_dir, dir_a.path());
+
+        // Unknown id → explicit error, not a silent fallback.
+        let err = resolve_chat_session(dir_a.path(), Some("zzzzzzzz")).unwrap_err();
+        assert!(err.to_string().contains("not found in project bucket"));
     }
 
     // 回归：/chat (HTTP) 路径上非致命提示作为独立的 `warning` 事件下发,而不是 error。
