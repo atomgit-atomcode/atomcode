@@ -125,8 +125,15 @@ def cmd_diagnose():
             # orphan snapshot (has .snapshot but no .meta)
             if has_snap and not has_meta:
                 d = os.path.join(_sessions_root(), proj)
-                sz = os.path.getsize(os.path.join(d, f"{sid}.snapshot"))
-                orphans.append((proj, sid, sz))
+                snap_path = os.path.join(d, f"{sid}.snapshot")
+                try:
+                    sz = os.path.getsize(snap_path)
+                    orphans.append((proj, sid, sz))
+                except OSError:
+                    # Snapshot vanished between the directory scan and here
+                    # (e.g. another process cleaned it up); don't crash the
+                    # whole health check over a race.
+                    continue
 
             # missing .ui.json (has .meta but no .ui.json)
             if has_meta and not has_ui:
