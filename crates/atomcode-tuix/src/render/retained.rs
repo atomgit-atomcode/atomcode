@@ -7280,17 +7280,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.mark_message(crate::render::MarkKind::User);
         self.last_mark_was_assistant = false;
         let safe = scrub_controls(text);
+        let display = crate::markdown::normalize_circled_list_spacing(&safe);
         // Keep the committed echo visually continuous with the composer: the
         // accent chevron identifies the user turn, while text and continuation
         // rows retain the terminal background. Paste placeholders are still
-        // expanded before this point; this is presentation-only and does not
-        // alter the payload or history model.
+        // expanded before this point. Circled list labels receive the same
+        // display-only spacing as Markdown; neither transform alters the
+        // payload or history model.
         let accent = self.style_bold(Role::Accent);
         let text_style = CellStyle::default();
         self.push_body_prefixed(
             self.caps.prompt_chevron(),
             &accent,
-            &safe,
+            display.as_ref(),
             &text_style,
         );
 
@@ -17457,6 +17459,33 @@ mod tests {
             assert_eq!(cell.style.fg, None, "user text must inherit terminal fg");
             assert_eq!(cell.style.bg, None, "user text must inherit terminal bg");
         }
+    }
+
+    /// Directly pasted circled list labels receive a display-only separator
+    /// after commit, avoiding glyph overlap in Windows Terminal fonts.
+    #[test]
+    fn retained_user_message_spaces_compact_circled_list_labels() {
+        let (mut r, _buf) = new_capturing(120, 24);
+        let source = "如果是 ①Rust、②前端：属于模型没加空格，无需修 TUI。";
+        r.render(UiLine::User(source.into()));
+
+        let visible = r
+            .body_lines
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .filter(|cell| cell.width != 0)
+                    .map(|cell| cell.ch)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            visible.contains("如果是 ① Rust、② 前端：属于模型没加空格，无需修 TUI。"),
+            "committed user echo should space compact circled labels: {visible:?}"
+        );
+        assert!(!visible.contains("①Rust"));
+        assert!(!visible.contains("②前端"));
     }
 
     /// A multi-line committed message uses the same layout as the composer:

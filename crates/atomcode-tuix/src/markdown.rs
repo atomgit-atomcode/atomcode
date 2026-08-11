@@ -1204,9 +1204,9 @@ fn render_inline(line: &str, caps: TerminalCaps) -> String {
 /// Some Windows fonts let the right edge of `①`–`⑳` touch the following
 /// glyph when a model emits compact text such as `：①Rust` or ` ②前端`.
 /// Normalize only list-shaped boundaries and leave inline code and embedded
-/// identifiers (`第①章`) byte-for-byte unchanged. This runs on the ephemeral
-/// Markdown projection; conversation/session source text is never rewritten.
-fn normalize_circled_list_spacing(line: &str) -> Cow<'_, str> {
+/// identifiers (`第①章`) byte-for-byte unchanged. This is shared by ephemeral
+/// display projections; conversation/session source text is never rewritten.
+pub(crate) fn normalize_circled_list_spacing(line: &str) -> Cow<'_, str> {
     let mut chars = line.char_indices().peekable();
     let mut previous = None;
     let mut in_code = false;
