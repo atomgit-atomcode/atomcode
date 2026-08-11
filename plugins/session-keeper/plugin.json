@@ -1,6 +1,6 @@
 {
   "name": "session-keeper",
   "version": "1.0.0",
-  "description": "AtomCode 会话健康守护 — 自动诊断、修复、备份，防止会话数据丢失。集成 daemon 格式容错层（PR #810）之外的防御体系。",
+  "description": "AtomCode 会话健康守护 — 自动诊断、修复、备份，防止会话数据丢失。集成 daemon 格式容错层（PR #15）之外的防御体系。",
   "skills": "./skills"
 }
