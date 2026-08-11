@@ -3,7 +3,7 @@
 //! The runtime owns the replaceable kernel [`AgentHandle`] so native controls and
 //! events never need to traverse a legacy driver adapter.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -46,6 +46,12 @@ use crate::{assemble, CodingAgentConfig, CodingProviderFactory, PluginHookSource
 pub enum CodingRuntimeEvent {
     /// A kernel observation that is not owned as a runtime terminal/request.
     Agent(AgentEvent),
+    /// Structured Team Agent lifecycle projection. Drivers consume this typed
+    /// event instead of parsing tool output or progress strings.
+    Team {
+        generation: RuntimeGeneration,
+        event: atomcode_capabilities::team::TeamEvent,
+    },
     /// Vision (VL) preprocessing recognised the turn's image(s) — the driver
     /// renders a "✓ VL recognised image, returned N chars" status line.
     VisionPreprocessSuccess {
@@ -557,6 +563,23 @@ struct RuntimeEventEmitter {
     raw: mpsc::UnboundedSender<CodingRuntimeEvent>,
     tagged: Option<mpsc::UnboundedSender<GenerationTaggedRuntimeEvent>>,
     generation: Arc<AtomicU64>,
+}
+
+fn project_team_event(
+    current_generation: u64,
+    sequences: &mut BTreeMap<(u64, String), u64>,
+    tagged: crate::team::GenerationTeamEvent,
+) -> Option<atomcode_capabilities::team::TeamEvent> {
+    if tagged.generation != current_generation {
+        return None;
+    }
+    let key = (tagged.generation, tagged.event.run_id.to_string());
+    let previous = sequences.entry(key).or_insert(0);
+    if tagged.event.seq <= *previous {
+        return None;
+    }
+    *previous = tagged.event.seq;
+    Some(tagged.event)
 }
 
 impl RuntimeEventEmitter {
@@ -2480,6 +2503,13 @@ fn spawn_runtime_owner_with_optional_agent(
     let (session_name_tx, mut session_name_rx) = mpsc::unbounded_channel::<(u64, String)>();
     let (next_prompt_tx, mut next_prompt_rx) =
         mpsc::unbounded_channel::<NextPromptSuggestionOutcome>();
+    let (team_event_tx, mut team_event_rx) = mpsc::unbounded_channel();
+    if let Some(runtime) = resources.as_ref() {
+        runtime
+            .parts
+            .team_manager
+            .set_event_sender(team_event_tx.clone());
+    }
     let mut generation = 0;
     let event_generation = Arc::new(AtomicU64::new(generation));
     let runtime_event_tx = RuntimeEventEmitter {
@@ -2497,6 +2527,10 @@ fn spawn_runtime_owner_with_optional_agent(
     );
 
     let owner_task = tokio::spawn(async move {
+        // Keep the event bus alive while the runtime can install a replacement
+        // TeamRunManager during reprepare.
+        let _team_event_guard = team_event_tx.clone();
+        let mut team_sequences = BTreeMap::new();
         // Keep the fallback receiver pending for transitional owner tests/adapters
         // that do not mount the runtime-owned schedule_wakeup tool.
         let _wakeup_guard = _closed_wakeup_tx;
@@ -2554,6 +2588,16 @@ fn spawn_runtime_owner_with_optional_agent(
         loop {
             tokio::select! {
                 biased;
+                team_event = team_event_rx.recv() => {
+                    if let Some(event) = team_event.and_then(|event| {
+                        project_team_event(generation, &mut team_sequences, event)
+                    }) {
+                        let _ = runtime_event_tx.send(CodingRuntimeEvent::Team {
+                            generation: RuntimeGeneration(generation),
+                            event,
+                        });
+                    }
+                }
                 management = owner_rx.recv() => match management {
                     Some(OwnerControl::SuspendCompaction { done }) => {
                         if !compaction_suspended {
@@ -2609,6 +2653,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            resources.as_ref().map(|runtime| &runtime.parts.team_manager),
                             resources
                                 .as_ref()
                                 .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
@@ -2679,6 +2724,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            resources.as_ref().map(|runtime| &runtime.parts.team_manager),
                             resources
                                 .as_ref()
                                 .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
@@ -2713,6 +2759,9 @@ fn spawn_runtime_owner_with_optional_agent(
                         agent = Some(replacement);
                         agent_available = true;
                         observed_tokens = None;
+                        if let Some(runtime) = resources.as_ref() {
+                            runtime.parts.team_manager.begin_generation(generation);
+                        }
                         if resume_after_replace {
                             compaction_suspended = false;
                             controls
@@ -2748,6 +2797,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeShutdown,
+                            resources.as_ref().map(|runtime| &runtime.parts.team_manager),
                             resources
                                 .as_ref()
                                 .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
@@ -3555,6 +3605,14 @@ fn spawn_runtime_owner_with_optional_agent(
                         generation: request_generation,
                         done,
                     }) => {
+                        if native_protocol
+                            && request_generation == generation
+                            && agent_available
+                        {
+                            if let Some(runtime) = resources.as_ref() {
+                                runtime.parts.team_manager.stop_all().await;
+                            }
+                        }
                         if !native_protocol || request_generation != generation || !agent_available {
                             let _ = done.send(Err(RuntimeError::Unavailable));
                         } else if let Some((turn_id, _, snapshot, stats)) = held_turn.take() {
@@ -3971,6 +4029,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            Some(&runtime.parts.team_manager),
                             runtime.parts.snapshot_persistence_status(),
                         )
                         .await;
@@ -4048,6 +4107,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 agent = Some(candidate.spawn());
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
+                                runtime.parts.team_manager.begin_generation(generation);
                                 agent_available = true;
                                 provider_unavailable_reason = None;
                                 controls.provider_unavailable_reason.store(0, Ordering::Release);
@@ -4198,6 +4258,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            resources.as_ref().map(|runtime| &runtime.parts.team_manager),
                             resources
                                 .as_ref()
                                 .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
@@ -4472,6 +4533,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            Some(&runtime.parts.team_manager),
                             runtime.parts.snapshot_persistence_status(),
                         )
                         .await;
@@ -4524,6 +4586,11 @@ fn spawn_runtime_owner_with_optional_agent(
                         agent = Some(replacement);
                         generation = generation.wrapping_add(1);
                         event_generation.store(generation, Ordering::Release);
+                        runtime
+                            .parts
+                            .team_manager
+                            .set_event_sender(team_event_tx.clone());
+                        runtime.parts.team_manager.begin_generation(generation);
                         agent_available = true;
                         observed_tokens = None;
                         snapshot_in_flight = false;
@@ -4637,6 +4704,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            Some(&runtime.parts.team_manager),
                             runtime.parts.snapshot_persistence_status(),
                         )
                         .await;
@@ -4667,6 +4735,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 agent = Some(replacement);
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
+                                runtime.parts.team_manager.begin_generation(generation);
                                 agent_available = true;
                                 observed_tokens = None;
                                 snapshot_in_flight = false;
@@ -4795,6 +4864,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            Some(&runtime.parts.team_manager),
                             runtime.parts.snapshot_persistence_status(),
                         )
                         .await;
@@ -4849,6 +4919,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 agent = Some(replacement);
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
+                                runtime.parts.team_manager.begin_generation(generation);
                                 agent_available = true;
                                 observed_tokens = None;
                                 snapshot_in_flight = false;
@@ -5152,6 +5223,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeShutdown,
+                            resources.as_ref().map(|runtime| &runtime.parts.team_manager),
                             resources
                                 .as_ref()
                                 .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
@@ -5957,6 +6029,9 @@ fn spawn_runtime_owner_with_optional_agent(
                 &mut observed_tokens,
                 &runtime_event_tx,
                 CompactionInterruption::RuntimeShutdown,
+                resources
+                    .as_ref()
+                    .map(|runtime| &runtime.parts.team_manager),
                 resources
                     .as_ref()
                     .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
@@ -6844,8 +6919,15 @@ async fn stop_current_agent(
     observed_tokens: &mut Option<usize>,
     runtime_event_tx: &RuntimeEventEmitter,
     reason: CompactionInterruption,
+    team_manager: Option<&crate::team::TeamRunManager>,
     persistence_status: Option<SnapshotPersistenceStatus>,
 ) -> StopReport {
+    // Detached Team members are part of this runtime generation even though
+    // their tool call has already returned. Terminate them before the owning
+    // kernel agent so replacement/shutdown cannot leave background editors.
+    if let Some(manager) = team_manager {
+        manager.stop_all().await;
+    }
     let Some(mut agent) = agent.take() else {
         compactions.interrupt_all(reason, runtime_event_tx);
         emit_terminal_persistence_warnings(persistence_status.as_ref(), runtime_event_tx);
@@ -7279,6 +7361,60 @@ async fn resolve_goal_round_cap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn team_event(
+        generation: u64,
+        run: &str,
+        seq: u64,
+        payload: atomcode_capabilities::team::TeamEventPayload,
+    ) -> crate::team::GenerationTeamEvent {
+        crate::team::GenerationTeamEvent {
+            generation,
+            event: atomcode_capabilities::team::TeamEvent::new(
+                atomcode_capabilities::team::TeamRunId::new(run),
+                seq,
+                payload,
+            ),
+        }
+    }
+
+    #[test]
+    fn team_event_projection_filters_generation_and_deduplicates_sequences() {
+        use atomcode_capabilities::team::TeamEventPayload;
+
+        let mut sequences = BTreeMap::new();
+        let first = team_event(3, "run-a", 1, TeamEventPayload::RunStarted { total: 2 });
+        assert!(project_team_event(3, &mut sequences, first.clone()).is_some());
+        assert!(project_team_event(3, &mut sequences, first).is_none());
+        assert!(project_team_event(
+            3,
+            &mut sequences,
+            team_event(3, "run-a", 0, TeamEventPayload::RunStarted { total: 2 })
+        )
+        .is_none());
+        assert!(project_team_event(
+            3,
+            &mut sequences,
+            team_event(2, "old", 99, TeamEventPayload::RunStarted { total: 1 })
+        )
+        .is_none());
+        let terminal = project_team_event(
+            3,
+            &mut sequences,
+            team_event(
+                3,
+                "run-a",
+                2,
+                TeamEventPayload::RunFinished {
+                    total: 2,
+                    completed: 2,
+                    failed: 0,
+                },
+            ),
+        )
+        .expect("ordered terminal must be delivered");
+        assert!(matches!(terminal.payload, TeamEventPayload::RunFinished { .. }));
+    }
 
     #[derive(Debug)]
     struct FakeQuotaSource {
@@ -8014,6 +8150,7 @@ mod tests {
                 memory: false,
                 web: false,
                 review: false,
+                subagents: crate::SubagentPolicy::Disabled,
                 rate_limit_source: None,
             },
             provider_factory: Arc::new(TestProviderFactory {
@@ -10156,6 +10293,7 @@ mod tests {
             &emitter,
             CompactionInterruption::RuntimeReconfigured,
             None,
+            None,
         )
         .await;
 
@@ -10177,6 +10315,66 @@ mod tests {
             &emitter,
         );
         assert_eq!(conversation_revision, 8);
+    }
+
+    #[tokio::test]
+    async fn stopping_runtime_agent_terminates_detached_team_members() {
+        use atomcode_capabilities::team::{
+            TeamDifficulty, TeamPermission, TeamRoleId, TeamTaskSpec,
+        };
+
+        let manager = crate::team::TeamRunManager::new(crate::team::TeamRuntimeConfig {
+            cancel_grace: std::time::Duration::from_millis(1),
+            ..Default::default()
+        });
+        manager.begin_generation(4);
+        let factory: crate::team::TeamJobFactory =
+            Arc::new(|_, _, _| Box::pin(std::future::pending::<crate::team::TeamMemberOutcome>()));
+        let run = manager
+            .delegate(
+                vec![TeamTaskSpec {
+                    description: "inspect".into(),
+                    prompt: "inspect".into(),
+                    role: TeamRoleId::Explorer,
+                    permission: TeamPermission::Explore,
+                    difficulty: TeamDifficulty::Simple,
+                    scope: Vec::new(),
+                }],
+                factory,
+                Arc::new(|_| "test-model".to_string()),
+            )
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        let mut agent = None;
+        let mut compactions = CompactionTracker::default();
+        let mut observed_tokens = None;
+        let (raw, _events) = mpsc::unbounded_channel();
+        let emitter = RuntimeEventEmitter {
+            raw,
+            tagged: None,
+            generation: Arc::new(AtomicU64::new(4)),
+        };
+        stop_current_agent(
+            &mut agent,
+            &mut compactions,
+            &mut observed_tokens,
+            &emitter,
+            CompactionInterruption::RuntimeShutdown,
+            Some(&manager),
+            None,
+        )
+        .await;
+
+        assert!(
+            manager
+                .wait(&run, std::time::Duration::from_millis(20))
+                .await
+                .unwrap()
+                .terminal
+        );
+        assert_eq!(manager.snapshot(Some(&run)).unwrap().runs[0].stopped, 1);
     }
 
     #[tokio::test]

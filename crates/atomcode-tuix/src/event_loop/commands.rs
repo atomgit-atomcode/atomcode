@@ -3369,6 +3369,31 @@ fn execute_slash_command_impl(
                 }
             }
         }
+        "team" => {
+            match arg.trim() {
+                "" | "status" => {
+                    renderer.render(UiLine::CommandOutput(state.team.summary()));
+                }
+                "show" => {
+                    state.team.show();
+                    renderer.render(UiLine::CommandOutput("Team panel shown.".into()));
+                }
+                "hide" => {
+                    state.team.hide();
+                    renderer.render(UiLine::CommandOutput("Team panel hidden.".into()));
+                }
+                "clear" => {
+                    state.team.clear();
+                    renderer.render(UiLine::CommandOutput("Team panel cleared.".into()));
+                }
+                _ => {
+                    renderer.render(UiLine::CommandOutput(
+                        "Usage: /team [show|hide|status|clear]".into(),
+                    ));
+                }
+            }
+            renderer.flush();
+        }
         "goal" => {
             // Sub-commands aligned with Claude Code's /goal (v2.1.139+):
             //   /goal <condition>             → set a new goal

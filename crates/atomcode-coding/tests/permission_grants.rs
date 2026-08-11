@@ -35,6 +35,7 @@ async fn always_allow_grants_survive_reassembly() {
         memory: false,
         web: false,
         review: false,
+        subagents: atomcode_coding::SubagentPolicy::Disabled,
         request_user_input: true,
         rate_limit_source: None,
     };

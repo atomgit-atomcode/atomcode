@@ -78,6 +78,29 @@ pub enum SessionMode {
     Disabled,
 }
 
+/// Driver-owned policy for mounting child-agent capabilities. The library default
+/// is fail-closed; interactive drivers must opt in explicitly.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SubagentPolicy {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+impl SubagentPolicy {
+    fn resolve(self, env: Option<&str>) -> bool {
+        if self == Self::Disabled {
+            return false;
+        }
+        env.is_none_or(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off" | "no"
+            )
+        })
+    }
+}
+
 /// Capability inputs for [`prepare`] — what to wire beyond the always-on core
 /// (fs/bash tools + codeintel). Defaults = the full production-parity agent.
 #[derive(Clone, Debug)]
@@ -107,6 +130,9 @@ pub struct PrepareOptions {
     /// in-session via the review specialization). Reuses the host provider (set at
     /// assemble), so it works on a signing gateway. `false` ⇒ not mounted.
     pub review: bool,
+    /// Mount `task` and `team`. Drivers must opt in explicitly; the environment
+    /// may still disable an enabled driver with `ATOMCODE_SUBAGENT=0`.
+    pub subagents: SubagentPolicy,
     /// Mount the structured `request_user_input` tool. Drivers without a typed
     /// request/response protocol must set this false instead of advertising a tool
     /// they can only fail with `Null`.
@@ -125,6 +151,7 @@ impl Default for PrepareOptions {
             memory: true,
             web: true,
             review: true,
+            subagents: SubagentPolicy::Disabled,
             request_user_input: true,
             rate_limit_source: None,
         }
@@ -237,8 +264,14 @@ pub struct CodingParts {
     /// Host-provider fallback slot for the `task` subagent tool, filled by [`assemble`].
     /// Configured fast/capable tiers are resolved through the runtime-owned cells on
     /// [`CodingAgentConfig`].
-    /// `None` when the `ATOMCODE_SUBAGENT` env gate is off.
+    /// `None` when the driver policy or `ATOMCODE_SUBAGENT` override disables it.
     pub subagent_provider: Option<SharedReviewProvider>,
+    /// Child-agent assembly prepared from the same live tier-provider cells and
+    /// execution policy as `task`. The `team` tool is mounted in the next phase.
+    pub team_runner: Option<crate::team::TeamRunnerFactory>,
+    /// Runtime-owned Team Agent orchestration. The manager is shared with the
+    /// mounted tool, while lifecycle termination is driven only by CodingRuntime.
+    pub team_manager: crate::team::TeamRunManager,
     /// User/project CC external hooks (`$ATOMCODE_HOME/hooks.json` + `<root>/.hooks.json`).
     /// ONE instance is registered as BOTH a [`LifecycleHooks`] (already pushed into `hooks`)
     /// and a [`ToolMiddleware`](atomcode_kernel::middleware::ToolMiddleware) (registered by
@@ -296,6 +329,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     let request_user_input_enabled =
         opts.request_user_input && crate::persona::request_user_input_switch_enabled();
     let todo_enabled = crate::persona::todo_switch_enabled_for(cfg.todo.enabled);
+    let subagents_enabled = opts.subagents.resolve(
+        std::env::var("ATOMCODE_SUBAGENT").ok().as_deref(),
+    );
     if !todo_enabled {
         names.retain(|name| name != "todowrite");
     }
@@ -364,11 +400,30 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         None
     };
 
-    // `task` subagent tool (env-gated, default ON; opt out with ATOMCODE_SUBAGENT=0). Configured fast/capable tiers use
+    // `task`/`team` are mounted only when the driver policy resolves enabled. An
+    // explicit ATOMCODE_SUBAGENT value overrides that policy for compatibility.
+    // Configured fast/capable tiers use
     // runtime-owned provider cells; missing/same-as-host tiers reuse the host slot.
     // Child tools: read-only `explore` vs edit-capable `worker`.
+    // One runtime-owned manager projects both persistent `team` runs and
+    // synchronous legacy `task` batches into the same typed event stream.
+    let subagent_cfg = cfg
+        .subagent_config
+        .as_ref()
+        .map(|config| config.subagent.clone())
+        .unwrap_or_default();
+    let (subagent_max_concurrent, subagent_max_rounds) = subagent_runtime_knobs(
+        &subagent_cfg,
+        std::env::var("ATOMCODE_SUBAGENT_MAX_ROUNDS")
+            .ok()
+            .as_deref(),
+    );
+    let team_manager = crate::team::TeamRunManager::new(crate::team::TeamRuntimeConfig {
+        max_concurrent: subagent_max_concurrent,
+        ..Default::default()
+    });
     let subagent_provider: Option<SharedReviewProvider> =
-        if subagent_enabled_from_env(std::env::var("ATOMCODE_SUBAGENT").ok().as_deref()) {
+        if subagents_enabled {
             use atomcode_capabilities::tools::TaskTool;
 
             let slot: SharedReviewProvider = Arc::new(std::sync::RwLock::new(None));
@@ -437,17 +492,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
 
             // `[subagent]` live knobs. `timeout_secs` remains parse-only compatibility:
             // a productive child is never cancelled for total wall-clock age.
-            let subagent_cfg = cfg
-                .subagent_config
-                .as_ref()
-                .map(|c| c.subagent.clone())
-                .unwrap_or_default();
-            let (max_concurrent, max_rounds) = subagent_runtime_knobs(
-                &subagent_cfg,
-                std::env::var("ATOMCODE_SUBAGENT_MAX_ROUNDS")
-                    .ok()
-                    .as_deref(),
-            );
+            let task_team_manager = team_manager.clone();
             registry.register(Arc::new(
                 TaskTool::new(
                     make_fast,
@@ -455,16 +500,76 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                     make_explore_tools,
                     make_worker_tools,
                 )
-                .with_max_concurrent(max_concurrent)
-                .with_max_rounds(max_rounds)
+                .with_max_concurrent(subagent_max_concurrent)
+                .with_max_rounds(subagent_max_rounds)
                 .with_tool_loop_policy(cfg.tool_loop_policy)
-                .with_worker_middleware(turn_execution_policy.clone()),
+                .with_worker_middleware(turn_execution_policy.clone())
+                .with_team_event_sink(Arc::new(move |event| {
+                    task_team_manager.publish_external(event);
+                })),
             ));
             names.push("task".to_string());
             Some(slot)
         } else {
             None
         };
+
+    let team_runner = subagent_provider.as_ref().map(|slot| {
+        use atomcode_capabilities::team::{TeamDifficulty, TeamPermission};
+
+        let mut child_registry = atomcode_kernel::tool::ToolRegistry::new();
+        atomcode_capabilities::tools::register_coding_tools_with_vision(&mut child_registry, false);
+        let child_registry = Arc::new(child_registry);
+        let provider_slot = slot.clone();
+        let fast_cell = cfg.subagent_fast_provider.clone();
+        let capable_cell = cfg.subagent_capable_provider.clone();
+        let providers = Arc::new(move |difficulty| {
+            let tier = match difficulty {
+                TeamDifficulty::Simple => fast_cell.as_ref(),
+                TeamDifficulty::Hard => capable_cell.as_ref(),
+            };
+            tier.and_then(|cell| cell.get()).unwrap_or_else(|| {
+                provider_slot
+                    .read()
+                    .ok()
+                    .and_then(|provider| provider.clone())
+                    .expect("team provider slot filled at assemble before any turn")
+            })
+        });
+        let tools_registry = Arc::clone(&child_registry);
+        let tools = Arc::new(move |permission| {
+            let names: &[&str] = match permission {
+                TeamPermission::Explore => &["read_file", "grep", "glob", "list_directory"],
+                // Bash is intentionally absent. DenyTeamBash remains a second
+                // fail-closed gate if this registry is broadened later.
+                TeamPermission::Worker => &[
+                    "read_file",
+                    "edit_file",
+                    "write_file",
+                    "grep",
+                    "glob",
+                    "search_replace",
+                    "list_directory",
+                ],
+            };
+            tools_registry.mount(names)
+        });
+        let runner = crate::team::TeamRunnerFactory::new(providers, tools, cfg.working_dir.clone())
+            .with_runtime_policy(
+                (subagent_max_rounds > 0).then_some(subagent_max_rounds),
+                cfg.tool_loop_policy,
+                Some(cfg.stream_timeout),
+                cfg.request_timeout,
+            )
+            .with_worker_middleware(turn_execution_policy.clone());
+        registry.register(Arc::new(crate::team::TeamTool::new(
+            team_manager.clone(),
+            runner.job_factory(),
+            runner.model_factory(),
+        )));
+        names.push("team".to_string());
+        runner
+    });
 
     // Build the context hook once so skill-catalog ranking and later context
     // injection observe the exact same instruction-file precedence and bytes.
@@ -774,6 +879,8 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         mcp_registry,
         review_provider,
         subagent_provider,
+        team_runner,
+        team_manager,
         cc_external_hooks: cc_external,
         rate_limit_source: opts.rate_limit_source,
     })
@@ -1212,6 +1319,7 @@ pub fn assemble(
                     parts.todo_enabled,
                     parts.request_user_input_enabled,
                     parts.review_provider.is_some(),
+                    parts.subagent_provider.is_some(),
                 );
                 b.resume = Some(snap);
             }
@@ -1332,6 +1440,7 @@ pub fn assemble(
             parts.todo_enabled,
             parts.request_user_input_enabled,
             parts.review_provider.is_some(),
+            parts.subagent_provider.is_some(),
         ))
         // Repair model-produced arguments before any observer or policy gate reads them.
         // Approval must inspect the same bytes that the tool executes.
@@ -1577,6 +1686,7 @@ pub fn assemble(
             parts.todo_enabled,
             parts.request_user_input_enabled,
             parts.review_provider.is_some(),
+            parts.subagent_provider.is_some(),
         );
         builder = builder.resume(snapshot);
     }
@@ -1626,6 +1736,7 @@ fn reconcile_coding_persona(
     todo_enabled: bool,
     request_user_input_enabled: bool,
     review_enabled: bool,
+    subagents_enabled: bool,
 ) {
     let persona = coding_persona_with_capabilities(
         &cfg.model,
@@ -1633,6 +1744,7 @@ fn reconcile_coding_persona(
         todo_enabled,
         request_user_input_enabled,
         review_enabled,
+        subagents_enabled,
     );
     let is_persona = |message: &Message| {
         message.role == Role::System && message.text.starts_with(ATOMCODE_PERSONA_PREFIX)
@@ -1709,9 +1821,8 @@ fn check_snapshot_version(snap: &SessionSnapshot) -> io::Result<()> {
     Ok(())
 }
 
-/// env `ATOMCODE_SUBAGENT` gate: default ON; only `0`/`false`/`off` (case-insensitive)
-/// disables — unset or any other value = on. (Now matches `ATOMCODE_TODO` /
-/// `ATOMCODE_MEMORY_TOOL`; opt out with `ATOMCODE_SUBAGENT=0`.)
+/// Legacy environment-only resolver retained for callers that have not yet adopted
+/// [`SubagentPolicy`]. New runtime assembly resolves the explicit driver policy first.
 pub fn subagent_enabled_from_env(var: Option<&str>) -> bool {
     match var {
         None => true,
@@ -1789,6 +1900,15 @@ mod tests {
     }
 
     #[test]
+    fn subagent_policy_is_driver_explicit_and_env_can_disable() {
+        assert!(!SubagentPolicy::Disabled.resolve(None));
+        assert!(SubagentPolicy::Enabled.resolve(None));
+        assert!(!SubagentPolicy::Enabled.resolve(Some("0")));
+        assert!(!SubagentPolicy::Disabled.resolve(Some("1")));
+        assert!(SubagentPolicy::Enabled.resolve(Some("1")));
+    }
+
+    #[test]
     fn subagent_runtime_knobs_ignore_legacy_timeout_and_floor_concurrency() {
         use super::subagent_runtime_knobs;
         use atomcode_config::config::SubAgentConfig;
@@ -1839,6 +1959,7 @@ mod tests {
             true,
             true,
             true,
+            true,
         );
 
         assert!(snapshot.messages[0]
@@ -1853,7 +1974,7 @@ mod tests {
         let mut snapshot = SessionSnapshot::new(vec![Message::system("SESSION CONTEXT")]);
         let cfg = agent_config("deepseek-v4-flash");
 
-        reconcile_coding_persona(&mut snapshot, &cfg, false, true, true);
+        reconcile_coding_persona(&mut snapshot, &cfg, false, true, true, true);
 
         assert!(!snapshot.messages[0].text.contains("## TASK TRACKING"));
         assert!(snapshot.messages[0]
@@ -1881,6 +2002,7 @@ mod tests {
         reconcile_coding_persona(
             &mut snapshot,
             &agent_config("deepseek-v4-flash"),
+            true,
             true,
             true,
             true,
@@ -1927,8 +2049,8 @@ mod tests {
             Message::assistant("I am model-a", vec![]),
         ]);
 
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true);
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-c"), true, true, true);
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true, true);
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-c"), true, true, true, true);
 
         let transitions: Vec<_> = snapshot
             .messages
@@ -1966,6 +2088,7 @@ mod tests {
             true,
             true,
             true,
+            true,
         );
 
         assert_eq!(snapshot.messages[0].text, persona);
@@ -1990,7 +2113,7 @@ mod tests {
         let mut cfg = agent_config("model-a");
         cfg.preferred_language = Some(Locale::ZhCn);
 
-        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, true);
 
         assert!(snapshot.messages[0]
             .text
@@ -2017,12 +2140,12 @@ mod tests {
             )),
             Message::assistant("I am model-a", vec![]),
         ]);
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true);
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true, true);
         let transition = snapshot.messages.last().cloned().unwrap();
         let mut cfg = agent_config("model-b");
         cfg.preferred_language = Some(Locale::ZhCn);
 
-        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, true);
 
         assert_eq!(snapshot.messages.last(), Some(&transition));
         assert_eq!(
@@ -2068,6 +2191,7 @@ mod tests {
             memory: false,
             web: false,
             review: false,
+            subagents: SubagentPolicy::Disabled,
             request_user_input: true,
             rate_limit_source: None,
         };
@@ -2136,6 +2260,7 @@ mod tests {
             memory: false,
             web: false,
             review: false,
+            subagents: SubagentPolicy::Disabled,
             request_user_input: true,
             rate_limit_source: None,
         }

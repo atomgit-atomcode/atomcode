@@ -106,6 +106,7 @@ async fn start_native_runtime_with_session_bootstrap(
         other => (other, None),
     };
     let prepare = PrepareOptions {
+        subagents: atomcode_coding::SubagentPolicy::Enabled,
         request_user_input: true,
         session,
         skill_dirs: None,

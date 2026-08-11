@@ -919,7 +919,14 @@ fn unescape_field_value_end(raw: &str) -> String {
 /// Known `task` subtask fields, in schema-declared order. `description` and
 /// `prompt` are required (no serde default); the rest carry defaults.
 const TASK_SUBTASK_KEYS: &[&str] =
-    &["description", "prompt", "subagent_type", "difficulty", "scope"];
+    &[
+        "description",
+        "prompt",
+        "subagent_type",
+        "difficulty",
+        "role",
+        "scope",
+    ];
 
 /// Specialized salvage for `task` arguments when JSON parsing fails.
 ///
@@ -1358,6 +1365,13 @@ mod tests {
         let input = r#"{"tasks":[{"description":"a","prompt":"say \"hi\"","subagent_type":"explore"}]}"#;
         let v = extract_task_args(input).expect("should salvage");
         assert_eq!(v["tasks"][0]["prompt"], "say \"hi\"");
+    }
+
+    #[test]
+    fn extract_task_args_preserves_role() {
+        let input = r#"{"tasks":[{"description":"a","prompt":"say "hi"","subagent_type":"explore","role":"reviewer"}]}"#;
+        let value = extract_task_args(input).expect("should salvage task role");
+        assert_eq!(value["tasks"][0]["role"], "reviewer");
     }
 
     #[test]

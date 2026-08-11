@@ -17624,7 +17624,7 @@ fn update_subtask_progress(
     };
     let was_terminal = matches!(
         item.status,
-        SubtaskStatus::Completed | SubtaskStatus::Failed
+        SubtaskStatus::Completed | SubtaskStatus::Stopped | SubtaskStatus::Failed
     );
     if was_terminal {
         return None;
@@ -17646,7 +17646,10 @@ fn update_subtask_progress(
     {
         item.output_tokens = item.output_tokens.max(tokens);
     }
-    let terminal_line = if matches!(status, SubtaskStatus::Completed | SubtaskStatus::Failed) {
+    let terminal_line = if matches!(
+        status,
+        SubtaskStatus::Completed | SubtaskStatus::Stopped | SubtaskStatus::Failed
+    ) {
         let elapsed = item
             .started_at
             .map(|started_at| started_at.elapsed())
@@ -18571,6 +18574,10 @@ fn handle_runtime_event(
                 ctx.pending_runtime_request_id = Some(request.id);
             }
             match event {
+                CodingRuntimeEvent::Team { generation, event } => {
+                    state.team.apply(generation.0, event);
+                    return;
+                }
                 CodingRuntimeEvent::Agent(event) => {
                     if let Some(event) = project_kernel_event(event, ctx) {
                         handle_agent_event(
@@ -23280,7 +23287,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         goal,
         loop_status,
         todo,
-        subtasks: state.active_subtasks.clone(),
+        subtasks: state.active_subtasks.clone().or_else(|| state.team.panel()),
         approval,
         user_input,
         round_cap_panel: state.round_cap_panel.as_ref().map(|p| {

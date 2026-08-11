@@ -836,6 +836,7 @@ pub enum SubtaskStatus {
     Pending,
     Running,
     Completed,
+    Stopped,
     Failed,
 }
 

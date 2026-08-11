@@ -2378,6 +2378,7 @@ pub(crate) async fn spawn_native_cli_runtime(
         None => (atomcode_coding::SessionMode::Fresh, None, None),
     };
     let prepare = atomcode_coding::PrepareOptions {
+        subagents: atomcode_coding::SubagentPolicy::Enabled,
         session,
         plugin_skill_dirs: atomcode_daemon::gather_plugin_skill_dirs_for(&cfg.working_dir),
         mcp: cfg.mcp,

@@ -28,6 +28,7 @@ pub mod session;
 #[cfg(unix)]
 mod signal_restore;
 pub mod state;
+pub mod team;
 pub mod terminal;
 pub mod terminal_bg;
 #[cfg(test)]

@@ -17,9 +17,28 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const DEFAULT_MAX_CONCURRENT: usize = 3;
+static TASK_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+struct TaskEventEmitter {
+    sink: Arc<dyn Fn(crate::team::TeamEvent) + Send + Sync>,
+    run_id: crate::team::TeamRunId,
+    seq: Arc<AtomicU64>,
+}
+
+impl TaskEventEmitter {
+    fn emit(&self, payload: crate::team::TeamEventPayload) {
+        (self.sink)(crate::team::TeamEvent::new(
+            self.run_id.clone(),
+            self.seq.fetch_add(1, Ordering::Relaxed),
+            payload,
+        ));
+    }
+}
 /// Sentinel prefix on a `ctx.progress` line that marks it as EPHEMERAL live activity
 /// (current action of a running subtask) rather than a committed ↻/✓/✗ scrollback line.
 /// The TUI routes marker-prefixed chunks to the in-place spinner instead of scrollback.
@@ -91,13 +110,40 @@ fn lexical_normalize(p: &Path) -> PathBuf {
     out
 }
 
+/// Canonicalize the deepest existing prefix, then append any not-yet-created
+/// suffix. This closes symlink escapes without requiring a write target to
+/// already exist.
+fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    while let Some(parent) = cursor.parent() {
+        if let Some(name) = cursor.file_name() {
+            missing.push(name.to_os_string());
+        }
+        if let Ok(mut canonical) = std::fs::canonicalize(parent) {
+            for part in missing.iter().rev() {
+                canonical.push(part);
+            }
+            return canonical;
+        }
+        cursor = parent;
+    }
+    path.to_path_buf()
+}
+
 /// 1-based indices of `worker` subtasks that declared no non-empty `scope`. A worker must
 /// declare its writable lane so the dispatch approval shows it and the gate can enforce it.
-fn workers_missing_scope(tasks: &[SubTask]) -> Vec<usize> {
+fn workers_missing_scope(tasks: &[crate::team::TeamTaskSpec]) -> Vec<usize> {
     tasks
         .iter()
         .enumerate()
-        .filter(|(_, t)| t.subagent_type == "worker" && t.scope.iter().all(|s| s.trim().is_empty()))
+        .filter(|(_, t)| {
+            t.permission == crate::team::TeamPermission::Worker
+                && t.scope.iter().all(|s| s.trim().is_empty())
+        })
         .map(|(i, _)| i + 1)
         .collect()
 }
@@ -114,10 +160,17 @@ struct WorkerScopeGate {
     dir_prefixes: Vec<PathBuf>,
     /// Human-readable scope list for deny messages.
     display: String,
+    /// Team children use a stricter lane: their path-based read tools are scoped too.
+    /// Legacy `task` workers keep cross-scope reads for compatibility.
+    confine_reads: bool,
 }
 
 impl WorkerScopeGate {
     fn new(scopes: &[String], working_dir: &Path) -> Self {
+        Self::new_with_read_policy(scopes, working_dir, false)
+    }
+
+    fn new_with_read_policy(scopes: &[String], working_dir: &Path, confine_reads: bool) -> Self {
         let mut builder = globset::GlobSetBuilder::new();
         let mut dir_prefixes = Vec::new();
         for s in scopes {
@@ -139,6 +192,7 @@ impl WorkerScopeGate {
             globs,
             dir_prefixes,
             display: scopes.join(", "),
+            confine_reads,
         }
     }
 
@@ -146,29 +200,28 @@ impl WorkerScopeGate {
     /// always return `None`.
     fn violation(&self, tool: &str, args_json: &str) -> Option<String> {
         match tool {
-            "edit_file" | "write_file" => {
-                let raw = match serde_json::from_str::<serde_json::Value>(args_json)
-                    .ok()
-                    .as_ref()
-                    .and_then(|v| v.get("file_path"))
-                    .and_then(|x| x.as_str())
-                {
-                    Some(p) => p.to_string(),
-                    // Fail closed: a write tool with no usable `file_path` must not slip past
-                    // the gate (defense-in-depth; the tool itself also rejects it).
-                    None => {
-                        return Some(format!(
-                            "worker {tool} call has no usable `file_path`; cannot verify it is within scope."
-                        ))
-                    }
-                };
-                match self.workspace_relative(&raw) {
+            "read_file" if self.confine_reads => {
+                self.file_path_violation(tool, args_json, "file_path")
+            }
+            "list_directory" | "grep" | "glob" if self.confine_reads => {
+                let value = serde_json::from_str::<serde_json::Value>(args_json)
+                    .unwrap_or(serde_json::Value::Null);
+                let raw = value.get("path").and_then(|x| x.as_str()).unwrap_or(".");
+                match self.workspace_relative(raw) {
                     None => Some(format!(
-                        "worker edit out of scope: {raw} is outside the working directory."
+                        "team {tool} out of scope: {raw} is outside the working directory."
                     )),
-                    Some(rel) if self.globs.is_match(&rel) => None,
-                    Some(rel) => Some(self.deny_out_of_scope(&rel)),
+                    Some(rel_dir)
+                        if self.dir_in_scope(&rel_dir)
+                            || (tool == "grep" && self.globs.is_match(&rel_dir)) =>
+                    {
+                        None
+                    }
+                    Some(rel_dir) => Some(self.deny_read_out_of_scope(tool, &rel_dir)),
                 }
+            }
+            "edit_file" | "write_file" => {
+                self.file_path_violation(tool, args_json, "file_path")
             }
             "search_replace" => {
                 let value = serde_json::from_str::<serde_json::Value>(args_json)
@@ -192,10 +245,44 @@ impl WorkerScopeGate {
         }
     }
 
+    fn file_path_violation(&self, tool: &str, args_json: &str, field: &str) -> Option<String> {
+        let raw = match serde_json::from_str::<serde_json::Value>(args_json)
+            .ok()
+            .as_ref()
+            .and_then(|v| v.get(field))
+            .and_then(|x| x.as_str())
+        {
+            Some(path) => path.to_string(),
+            None => {
+                return Some(format!(
+                    "team {tool} call has no usable `{field}`; cannot verify it is within scope."
+                ))
+            }
+        };
+        match self.workspace_relative(&raw) {
+            None => Some(format!(
+                "team {tool} out of scope: {raw} is outside the working directory."
+            )),
+            Some(rel) if self.globs.is_match(&rel) => None,
+            Some(rel) if self.confine_reads && tool == "read_file" => {
+                Some(self.deny_read_out_of_scope(tool, &rel))
+            }
+            Some(rel) => Some(self.deny_out_of_scope(&rel)),
+        }
+    }
+
     fn deny_out_of_scope(&self, rel: &str) -> String {
         format!(
             "worker edit out of scope: {rel} is not within the declared scope [{}]. To change \
              it, re-dispatch this worker with a wider scope that includes it.",
+            self.display
+        )
+    }
+
+    fn deny_read_out_of_scope(&self, tool: &str, rel: &str) -> String {
+        format!(
+            "team {tool} out of scope: {rel} is not within the declared scope [{}]. Re-dispatch \
+             this member with a wider scope if it needs that path.",
             self.display
         )
     }
@@ -209,9 +296,17 @@ impl WorkerScopeGate {
         } else {
             self.working_dir.join(raw)
         };
-        let base = lexical_normalize(&self.working_dir);
-        let full = lexical_normalize(&joined);
-        full.strip_prefix(&base)
+        let lexical_base = lexical_normalize(&self.working_dir);
+        let lexical_full = lexical_normalize(&joined);
+        // Reject an explicit `..`/absolute escape before filesystem resolution;
+        // canonicalization must not accidentally turn a lexical escape into a
+        // path that appears relative to a different existing ancestor.
+        lexical_full.strip_prefix(&lexical_base).ok()?;
+
+        let canonical_base = lexical_normalize(&canonicalize_existing_prefix(&lexical_base));
+        let canonical_full = lexical_normalize(&canonicalize_existing_prefix(&lexical_full));
+        canonical_full
+            .strip_prefix(&canonical_base)
             .ok()
             .map(|p| p.to_string_lossy().replace('\\', "/"))
     }
@@ -250,11 +345,27 @@ impl ToolMiddleware for WorkerScopeGate {
 /// everyone, the feature-enabled AtomGit bash guard, plus a `WorkerScopeGate` confining a
 /// `worker`'s writes to its `scope`. `explore` children mount only read tools, so the latter
 /// gate is unnecessary.
-fn child_middlewares(
+pub fn subagent_child_middlewares(
     is_worker: bool,
     scope: &[String],
     working_dir: &Path,
     inherited_worker_middlewares: &[Arc<dyn ToolMiddleware>],
+) -> Vec<Arc<dyn ToolMiddleware>> {
+    subagent_child_middlewares_with_policy(
+        is_worker,
+        scope,
+        working_dir,
+        inherited_worker_middlewares,
+        false,
+    )
+}
+
+fn subagent_child_middlewares_with_policy(
+    is_worker: bool,
+    scope: &[String],
+    working_dir: &Path,
+    inherited_worker_middlewares: &[Arc<dyn ToolMiddleware>],
+    confine_reads: bool,
 ) -> Vec<Arc<dyn ToolMiddleware>> {
     let mut mw: Vec<Arc<dyn ToolMiddleware>> = vec![
         Arc::new(super::CredentialBashGate::new()),
@@ -265,10 +376,33 @@ fn child_middlewares(
     }
     #[cfg(feature = "atomgit")]
     mw.push(Arc::new(super::AtomgitBashGate::new()));
-    if is_worker {
-        mw.push(Arc::new(WorkerScopeGate::new(scope, working_dir)));
+    if is_worker || (confine_reads && !scope.is_empty()) {
+        let gate = if confine_reads {
+            WorkerScopeGate::new_with_read_policy(scope, working_dir, true)
+        } else {
+            WorkerScopeGate::new(scope, working_dir)
+        };
+        mw.push(Arc::new(gate));
     }
     mw
+}
+
+/// Middleware stack for asynchronous Team members. Unlike legacy `task`, a non-empty Team
+/// scope confines every path-based tool, including reads. An unscoped Explore member remains
+/// whole-workspace read-only; Worker members are validated to always carry a scope.
+pub fn team_child_middlewares(
+    is_worker: bool,
+    scope: &[String],
+    working_dir: &Path,
+    inherited_worker_middlewares: &[Arc<dyn ToolMiddleware>],
+) -> Vec<Arc<dyn ToolMiddleware>> {
+    subagent_child_middlewares_with_policy(
+        is_worker,
+        scope,
+        working_dir,
+        inherited_worker_middlewares,
+        true,
+    )
 }
 
 const EXPLORE_PERSONA: &str = "You are a READ-ONLY investigation subagent. Use read/search \
@@ -292,6 +426,10 @@ struct SubTask {
     subagent_type: String,
     #[serde(default)]
     difficulty: String,
+    /// Optional specialized profile. Defaults to explorer/implementer according
+    /// to `subagent_type`; the profile's permission must match that type.
+    #[serde(default)]
+    role: Option<String>,
     /// Worker-only: working-dir-relative globs the worker may WRITE within. Required for
     /// `worker`; ignored for `explore` (read-only). Enforced by `WorkerScopeGate`.
     #[serde(default)]
@@ -312,6 +450,7 @@ pub struct TaskTool {
     max_rounds: Option<u32>,
     tool_loop_policy: Option<ToolLoopPolicy>,
     inherited_worker_middlewares: Vec<Arc<dyn ToolMiddleware>>,
+    team_event_sink: Option<Arc<dyn Fn(crate::team::TeamEvent) + Send + Sync>>,
 }
 
 impl TaskTool {
@@ -330,6 +469,7 @@ impl TaskTool {
             max_rounds: Some(super::DEFAULT_CHILD_MAX_ROUNDS),
             tool_loop_policy: Some(ToolLoopPolicy::default()),
             inherited_worker_middlewares: Vec::new(),
+            team_event_sink: None,
         }
     }
 
@@ -358,6 +498,16 @@ impl TaskTool {
         self.inherited_worker_middlewares.push(middleware);
         self
     }
+
+    /// Project this synchronous task batch into the runtime's typed Team event
+    /// stream. Ordinary progress remains available for non-runtime embeddings.
+    pub fn with_team_event_sink(
+        mut self,
+        sink: Arc<dyn Fn(crate::team::TeamEvent) + Send + Sync>,
+    ) -> Self {
+        self.team_event_sink = Some(sink);
+        self
+    }
 }
 
 #[async_trait]
@@ -368,9 +518,10 @@ impl Tool for TaskTool {
 
     fn description(&self) -> &str {
         "Dispatch one or more subtasks to isolated subagents. Each task: {description, \
-prompt, subagent_type: 'explore'|'worker', difficulty: 'simple'|'hard'}. 'explore' = \
+prompt, subagent_type: 'explore'|'worker', difficulty: 'simple'|'hard', role?: profile}. 'explore' = \
 read-only investigation returning findings; 'worker' = edits files then stops (you review \
-the diff afterward). 'simple' runs on the fast model, 'hard' on the capable model. Give \
+the diff afterward). Optional roles include architect, reviewer, tester, rust, and tui_ux; \
+the role permission must match subagent_type. 'simple' runs on the fast model, 'hard' on the capable model. Give \
 each worker a TIGHTLY-specified task and non-overlapping file scopes when dispatching \
 several. Subagents run in parallel and cannot themselves dispatch. The WHOLE batch is \
 emitted as ONE JSON payload, so keep each `prompt` concise and dispatch in small batches \
@@ -393,6 +544,10 @@ parallel workers NON-OVERLAPPING scopes."
                             "prompt": {"type": "string", "description": "The full subtask for the subagent"},
                             "subagent_type": {"type": "string", "enum": ["explore", "worker"]},
                             "difficulty": {"type": "string", "enum": ["simple", "hard"]},
+                            "role": {
+                                "type": "string",
+                                "enum": ["planner", "architect", "explorer", "implementer", "rust", "tui_ux", "reviewer", "tester", "debugger", "security", "performance", "docs_writer", "release_manager", "migration_compat"]
+                            },
                             "scope": {
                                 "type": "array",
                                 "items": { "type": "string" },
@@ -412,7 +567,15 @@ parallel workers NON-OVERLAPPING scopes."
         // control-char args is still detected as Risky (not silently downgraded to
         // Safe, which would let a file-editing worker skip the approval gate).
         match parse_task_args(args) {
-            Ok(a) if a.tasks.iter().any(|t| t.subagent_type == "worker") => RiskLevel::Risky,
+            Ok(parsed)
+                if validate_task_specs(&parsed).is_ok_and(|specs| {
+                    specs
+                        .iter()
+                        .any(|t| t.permission == crate::team::TeamPermission::Worker)
+                }) =>
+            {
+                RiskLevel::Risky
+            }
             _ => RiskLevel::Safe,
         }
     }
@@ -443,7 +606,18 @@ parallel workers NON-OVERLAPPING scopes."
             };
         }
 
-        let missing = workers_missing_scope(&parsed.tasks);
+        let specs = match validate_task_specs(&parsed) {
+            Ok(specs) => specs,
+            Err(error) => {
+                return ToolResult {
+                    call_id: String::new(),
+                    content: format!("invalid task args: {error}"),
+                    is_error: true,
+                    images: vec![],
+                }
+            }
+        };
+        let missing = workers_missing_scope(&specs);
         if !missing.is_empty() {
             let idxs = missing
                 .iter()
@@ -467,15 +641,26 @@ parallel workers NON-OVERLAPPING scopes."
         let tool_loop_policy = self.tool_loop_policy;
         let inherited_worker_middlewares = self.inherited_worker_middlewares.clone();
         let mut set = tokio::task::JoinSet::new();
+        let event_emitter = self.team_event_sink.as_ref().map(|sink| TaskEventEmitter {
+            sink: Arc::clone(sink),
+            run_id: crate::team::TeamRunId::new(format!(
+                "task-{}",
+                TASK_RUN_COUNTER.fetch_add(1, Ordering::Relaxed)
+            )),
+            seq: Arc::new(AtomicU64::new(1)),
+        });
+        if let Some(events) = &event_emitter {
+            events.emit(crate::team::TeamEventPayload::RunStarted { total: specs.len() });
+        }
         // Live progress: the whole batch would otherwise be a black box until every subtask
         // finishes. Emit a header + per-subtask start/done so the driver renders them live.
         ctx.progress
-            .emit(format!("dispatching {} subtask(s)…", parsed.tasks.len()));
+            .emit(format!("dispatching {} subtask(s)…", specs.len()));
 
-        for (idx, t) in parsed.tasks.into_iter().enumerate() {
-            let is_worker = t.subagent_type == "worker";
+        for (idx, t) in specs.into_iter().enumerate() {
+            let is_worker = t.permission == crate::team::TeamPermission::Worker;
             let scope = t.scope.clone();
-            let is_hard = t.difficulty == "hard";
+            let is_hard = t.difficulty == crate::team::TeamDifficulty::Hard;
             // Fresh provider + fresh tools per child (a session consumes its provider).
             let provider = if is_hard {
                 (self.make_capable_provider)()
@@ -490,26 +675,21 @@ parallel workers NON-OVERLAPPING scopes."
             } else {
                 (self.make_explore_tools)()
             };
-            let persona = if is_worker {
-                WORKER_PERSONA
-            } else {
-                EXPLORE_PERSONA
-            }
-            .to_string();
+            let profile = crate::team::role_by_id(t.role.as_str())
+                .expect("validated task role must resolve");
+            let persona = subtask_persona(profile);
             let child_cancel = ctx.cancel.child_token();
             // A second handle for the progress hook to short-circuit emits once cancelled.
             let hook_cancel = child_cancel.clone();
             let wd = ctx.working_dir.clone();
-            let label = format!(
-                "{}#{}",
-                if is_worker { "worker" } else { "explore" },
-                idx + 1
-            );
+            let label = format!("{}#{}", t.role, idx + 1);
+            let member_id = crate::team::TeamMemberId::new(label.clone());
             let prompt = t.prompt;
             let desc = t.description;
             let sem = sem.clone();
             let progress = ctx.progress.clone();
             let inherited_worker_middlewares = inherited_worker_middlewares.clone();
+            let member_events = event_emitter.clone();
             // Advertise the selected model while this child is still queued.
             // Marker-prefixed means retained UIs update the fixed panel without
             // committing an extra transcript row. The later ↻ event is the sole
@@ -521,6 +701,14 @@ parallel workers NON-OVERLAPPING scopes."
 
             set.spawn(async move {
                 let _permit = sem.acquire_owned().await.expect("semaphore not closed");
+                if let Some(events) = &member_events {
+                    events.emit(crate::team::TeamEventPayload::MemberStarted {
+                        member_id: member_id.clone(),
+                        role: t.role,
+                        model: model.clone(),
+                        description: desc.clone(),
+                    });
+                }
                 // ↻ started — include a compact preview of WHAT this subtask is, so a live
                 // fan-out shows each child's job, not just its number.
                 progress.emit(subtask_progress_line(
@@ -533,6 +721,8 @@ parallel workers NON-OVERLAPPING scopes."
                     label.clone(),
                     desc.contains(|ch: char| ('\u{4e00}'..='\u{9fff}').contains(&ch)),
                     hook_cancel,
+                    member_events.clone(),
+                    member_id.clone(),
                 ));
                 let mut builder = Agent::builder()
                     .provider(provider)
@@ -550,7 +740,7 @@ parallel workers NON-OVERLAPPING scopes."
                 // The child runs AutoRespond::AllowAll (no human in its loop), so the parent's
                 // prompting gates wouldn't protect it. Hard-deny sensitive-path ops for every
                 // child (#1); additionally confine a `worker`'s WRITES to its declared scope.
-                for mw in child_middlewares(
+                for mw in subagent_child_middlewares(
                     is_worker,
                     &scope,
                     &wd,
@@ -591,6 +781,17 @@ parallel workers NON-OVERLAPPING scopes."
                     format!("\u{2717} failed ({:?}) \u{b7} {label}", outcome.stop)
                 };
                 progress.emit(subtask_progress_line(&head, &model, &desc));
+                if let Some(events) = &member_events {
+                    events.emit(crate::team::TeamEventPayload::MemberFinished {
+                        member_id,
+                        success: outcome.stop == StopReason::Stopped,
+                        stop: format!("{:?}", outcome.stop),
+                        summary: first_line_capped(
+                            outcome.error.as_deref().unwrap_or(&outcome.text),
+                            120,
+                        ),
+                    });
+                }
                 (label, desc, model, outcome)
             });
         }
@@ -603,6 +804,17 @@ parallel workers NON-OVERLAPPING scopes."
             if let Ok(tuple) = res {
                 collected.push(tuple);
             }
+        }
+        if let Some(events) = &event_emitter {
+            let failed = collected
+                .iter()
+                .filter(|(_, _, _, outcome)| outcome.stop != StopReason::Stopped)
+                .count();
+            events.emit(crate::team::TeamEventPayload::RunFinished {
+                total: collected.len(),
+                completed: collected.len().saturating_sub(failed),
+                failed,
+            });
         }
         // Sort by label for deterministic output regardless of scheduling order.
         collected.sort_by(|a, b| a.0.cmp(&b.0));
@@ -685,6 +897,63 @@ fn parse_task_args(args: &str) -> Result<Args, serde_json::Error> {
     serde_json::from_str::<Args>(args)
 }
 
+fn validate_task_specs(args: &Args) -> Result<Vec<crate::team::TeamTaskSpec>, String> {
+    args.tasks.iter().map(resolve_subtask_spec).collect()
+}
+
+fn resolve_subtask_spec(t: &SubTask) -> Result<crate::team::TeamTaskSpec, String> {
+    let requested_permission = match t.subagent_type.as_str() {
+        "explore" => crate::team::TeamPermission::Explore,
+        "worker" => crate::team::TeamPermission::Worker,
+        other => return Err(format!("unknown subagent_type: {other}")),
+    };
+    let default_role = match requested_permission {
+        crate::team::TeamPermission::Explore => crate::team::TeamRoleId::Explorer,
+        crate::team::TeamPermission::Worker => crate::team::TeamRoleId::Implementer,
+    };
+    let profile = match t.role.as_deref() {
+        Some(role) => crate::team::role_by_id(role)
+            .ok_or_else(|| format!("unknown team role: {role}"))?,
+        None => crate::team::role_by_id(default_role.as_str())
+            .expect("built-in default team role must exist"),
+    };
+    if profile.permission != requested_permission {
+        return Err(format!(
+            "role {} requires {} subagent_type",
+            profile.id,
+            match profile.permission {
+                crate::team::TeamPermission::Explore => "explore",
+                crate::team::TeamPermission::Worker => "worker",
+            }
+        ));
+    }
+    let difficulty = match t.difficulty.as_str() {
+        "" => profile.difficulty,
+        "simple" => crate::team::TeamDifficulty::Simple,
+        "hard" => crate::team::TeamDifficulty::Hard,
+        other => return Err(format!("unknown difficulty: {other}")),
+    };
+    Ok(crate::team::TeamTaskSpec {
+        description: t.description.clone(),
+        prompt: t.prompt.clone(),
+        role: profile.id,
+        permission: profile.permission,
+        difficulty,
+        scope: t.scope.clone(),
+    })
+}
+
+fn subtask_persona(profile: &crate::team::TeamRoleProfile) -> String {
+    let base = match profile.permission {
+        crate::team::TeamPermission::Explore => EXPLORE_PERSONA,
+        crate::team::TeamPermission::Worker => WORKER_PERSONA,
+    };
+    format!(
+        "{base}\n\n## TEAM ROLE\nYou are the {} role.\n{}\n{}",
+        profile.display_name, profile.persona, profile.when_to_use
+    )
+}
+
 /// A one-line preview of what a child is about to do this round — the tool name plus a
 /// concise argument (path / pattern / command / …) when one is present. Best-effort: if the
 /// args aren't parseable JSON or carry no recognisable key, just the tool name.
@@ -744,6 +1013,8 @@ struct SubtaskProgressHook {
     /// so cancellation propagates through this token; gate emits on it so a
     /// non-cooperative child cannot resurrect stale activity after the parent moved on.
     cancel: tokio_util::sync::CancellationToken,
+    team_events: Option<TaskEventEmitter>,
+    member_id: crate::team::TeamMemberId,
     live: Mutex<SubtaskLiveState>,
 }
 
@@ -763,12 +1034,16 @@ impl SubtaskProgressHook {
         label: String,
         localized_zh: bool,
         cancel: tokio_util::sync::CancellationToken,
+        team_events: Option<TaskEventEmitter>,
+        member_id: crate::team::TeamMemberId,
     ) -> Self {
         Self {
             progress,
             label,
             localized_zh,
             cancel,
+            team_events,
+            member_id,
             live: Mutex::new(SubtaskLiveState::default()),
         }
     }
@@ -856,7 +1131,7 @@ impl SubtaskProgressHook {
             return;
         }
         let now = std::time::Instant::now();
-        let message = {
+        let (message, event_activity) = {
             let Ok(mut live) = self.live.lock() else {
                 return;
             };
@@ -875,14 +1150,23 @@ impl SubtaskProgressHook {
             }
             live.last_emit = Some(now);
             let estimated = (live.round_chars / 4) as u64;
-            format!(
-                "{SUBAGENT_ACTIVITY_MARKER}{} \u{b7} {} \u{b7} tokens={}",
-                self.label,
-                live.activity,
-                live.total_tokens.saturating_add(estimated)
+            (
+                format!(
+                    "{SUBAGENT_ACTIVITY_MARKER}{} \u{b7} {} \u{b7} tokens={}",
+                    self.label,
+                    live.activity,
+                    live.total_tokens.saturating_add(estimated)
+                ),
+                live.activity.clone(),
             )
         };
         self.progress.emit(message);
+        if let Some(events) = &self.team_events {
+            events.emit(crate::team::TeamEventPayload::MemberActivity {
+                member_id: self.member_id.clone(),
+                activity: event_activity,
+            });
+        }
     }
 
     fn observe_delta(&self, delta: &str, semantic: bool) {
@@ -1198,7 +1482,14 @@ mod tests {
             ProgressSink::new(Arc::new(move |m: String| c.lock().unwrap().push(m)))
         };
         let cancel = CancellationToken::new();
-        let hook = SubtaskProgressHook::new(sink, "explore#1".into(), false, cancel.clone());
+        let hook = SubtaskProgressHook::new(
+            sink,
+            "explore#1".into(),
+            false,
+            cancel.clone(),
+            None,
+            crate::team::TeamMemberId::new("explore#1"),
+        );
         let ctx = TurnCtx {
             session_id: None,
             turn_id: 1,
@@ -1261,8 +1552,14 @@ mod tests {
                 captured.lock().unwrap().push(message)
             }))
         };
-        let hook =
-            SubtaskProgressHook::new(sink, "explore#1".into(), true, CancellationToken::new());
+        let hook = SubtaskProgressHook::new(
+            sink,
+            "explore#1".into(),
+            true,
+            CancellationToken::new(),
+            None,
+            crate::team::TeamMemberId::new("explore#1"),
+        );
         let mut response =
             Message::assistant("已定位命令注册入口，正在核对补全与权限机制", Vec::new());
         response.meta = Some(MessageMeta {
@@ -1307,8 +1604,14 @@ mod tests {
                 captured.lock().unwrap().push(message)
             }))
         };
-        let hook =
-            SubtaskProgressHook::new(sink, "explore#1".into(), true, CancellationToken::new());
+        let hook = SubtaskProgressHook::new(
+            sink,
+            "explore#1".into(),
+            true,
+            CancellationToken::new(),
+            None,
+            crate::team::TeamMemberId::new("explore#1"),
+        );
         let read = ToolCall {
             id: "read-1".into(),
             name: "read_file".into(),
@@ -1414,6 +1717,55 @@ mod tests {
             "missing state: {}",
             out.content
         );
+    }
+
+    #[tokio::test]
+    async fn task_projects_typed_team_lifecycle_events() {
+        let registry = Arc::new(ToolRegistry::new());
+        let explore_registry = Arc::clone(&registry);
+        let worker_registry = Arc::clone(&registry);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let result = TaskTool::new(
+            || Arc::new(MockProvider { reply: Some("done".into()) }) as Arc<dyn LlmProvider>,
+            || Arc::new(MockProvider { reply: Some("done".into()) }) as Arc<dyn LlmProvider>,
+            move || explore_registry.mount(&[]),
+            move || worker_registry.mount(&[]),
+        )
+            .with_team_event_sink(Arc::new(move |event| {
+                captured.lock().unwrap().push(event);
+            }))
+            .execute(
+                r#"{"tasks":[{"description":"inspect","prompt":"find it","subagent_type":"explore","role":"reviewer"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        let events = events.lock().unwrap();
+        assert!(matches!(
+            events.first().map(|event| &event.payload),
+            Some(crate::team::TeamEventPayload::RunStarted { total: 1 })
+        ));
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            crate::team::TeamEventPayload::MemberStarted {
+                role: crate::team::TeamRoleId::Reviewer,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            crate::team::TeamEventPayload::MemberFinished { success: true, .. }
+        )));
+        assert!(matches!(
+            events.last().map(|event| &event.payload),
+            Some(crate::team::TeamEventPayload::RunFinished {
+                total: 1,
+                completed: 1,
+                failed: 0,
+            })
+        ));
+        assert!(events.windows(2).all(|pair| pair[0].seq < pair[1].seq));
     }
 
     #[tokio::test]
@@ -1685,6 +2037,23 @@ mod tests {
     }
 
     #[test]
+    fn team_scope_gate_confines_path_based_reads() {
+        use super::WorkerScopeGate;
+        use std::path::Path;
+        let g = WorkerScopeGate::new_with_read_policy(
+            &["src/auth/**".into(), "Cargo.toml".into()], Path::new("/w"), true,
+        );
+        assert!(g.violation("read_file", r#"{"file_path":"src/auth/login.rs"}"#).is_none());
+        assert!(g.violation("read_file", r#"{"file_path":"src/db/schema.rs"}"#).is_some());
+        assert!(g.violation("grep", r#"{"pattern":"x","path":"Cargo.toml"}"#).is_none());
+        assert!(g.violation("grep", r#"{"pattern":"x","path":"src/db"}"#).is_some());
+        assert!(g.violation("list_directory", r#"{"path":"src/auth"}"#).is_none());
+        assert!(g.violation("list_directory", r#"{"path":"src"}"#).is_some());
+        assert!(g.violation("glob", r#"{"pattern":"**/*.rs","path":"src/auth"}"#).is_none());
+        assert!(g.violation("glob", r#"{"pattern":"**/*.rs"}"#).is_some());
+    }
+
+    #[test]
     fn worker_scope_gate_denies_workspace_escape_and_absolute_outside() {
         use super::WorkerScopeGate;
         use std::path::Path;
@@ -1773,49 +2142,85 @@ mod tests {
             prompt: "p".into(),
             subagent_type: ty.into(),
             difficulty: String::new(),
+            role: None,
             scope: scope.into_iter().map(String::from).collect(),
         };
-        let tasks = vec![
+        let args = Args { tasks: vec![
             mk("worker", vec!["src/a/**"]), // #1 ok
             mk("explore", vec![]),          // #2 explore — ignored even with no scope
             mk("worker", vec![]),           // #3 missing → flagged
             mk("worker", vec!["   "]),      // #4 whitespace-only → flagged
-        ];
-        assert_eq!(workers_missing_scope(&tasks), vec![3, 4]);
+        ]};
+        let specs = validate_task_specs(&args).unwrap();
+        assert_eq!(workers_missing_scope(&specs), vec![3, 4]);
+    }
+
+    #[test]
+    fn task_role_defaults_and_permission_are_validated() {
+        let parse = |input: &str| parse_task_args(input).unwrap();
+        let explore = validate_task_specs(&parse(
+            r#"{"tasks":[{"description":"d","prompt":"p","subagent_type":"explore"}]}"#,
+        ))
+        .unwrap();
+        assert_eq!(explore[0].role, crate::team::TeamRoleId::Explorer);
+        assert_eq!(explore[0].difficulty, crate::team::TeamDifficulty::Simple);
+
+        let reviewer = validate_task_specs(&parse(
+            r#"{"tasks":[{"description":"d","prompt":"p","subagent_type":"explore","role":"reviewer"}]}"#,
+        ))
+        .unwrap();
+        assert_eq!(reviewer[0].role, crate::team::TeamRoleId::Reviewer);
+        assert_eq!(reviewer[0].difficulty, crate::team::TeamDifficulty::Hard);
+
+        let mismatch = validate_task_specs(&parse(
+            r#"{"tasks":[{"description":"d","prompt":"p","subagent_type":"explore","role":"rust"}]}"#,
+        ))
+        .unwrap_err();
+        assert!(mismatch.contains("requires worker"), "{mismatch}");
     }
 
     #[test]
     fn child_middlewares_add_the_scope_gate_only_for_workers() {
-        use super::{child_middlewares, DenySensitivePaths};
+        use super::{subagent_child_middlewares, DenySensitivePaths};
         use std::path::Path;
         #[cfg(feature = "atomgit")]
         let base = 3; // DenySensitivePaths + CredentialBashGate + AtomgitBashGate.
         #[cfg(not(feature = "atomgit"))]
         let base = 2; // DenySensitivePaths + CredentialBashGate.
         assert_eq!(
-            child_middlewares(false, &[], Path::new("/w"), &[]).len(),
+            subagent_child_middlewares(false, &[], Path::new("/w"), &[]).len(),
             base
         );
         assert_eq!(
-            child_middlewares(true, &["src/**".into()], Path::new("/w"), &[]).len(),
+            subagent_child_middlewares(true, &["src/**".into()], Path::new("/w"), &[]).len(),
             base + 1
         );
         let inherited: Vec<Arc<dyn ToolMiddleware>> = vec![Arc::new(DenySensitivePaths)];
         assert_eq!(
-            child_middlewares(false, &[], Path::new("/w"), &inherited).len(),
+            subagent_child_middlewares(false, &[], Path::new("/w"), &inherited).len(),
             base,
             "read-only explore children do not need worker execution policy"
         );
         assert_eq!(
-            child_middlewares(
-                true,
-                &["src/**".into()],
-                Path::new("/w"),
-                &inherited,
-            )
-            .len(),
+            subagent_child_middlewares(true, &["src/**".into()], Path::new("/w"), &inherited,)
+                .len(),
             base + 2,
             "worker receives inherited policy plus its scope gate"
+        );
+    }
+
+    #[test]
+    fn team_middlewares_scope_explore_only_when_scope_is_declared() {
+        use super::team_child_middlewares;
+        use std::path::Path;
+        #[cfg(feature = "atomgit")]
+        let base = 3;
+        #[cfg(not(feature = "atomgit"))]
+        let base = 2;
+        assert_eq!(team_child_middlewares(false, &[], Path::new("/w"), &[]).len(), base);
+        assert_eq!(
+            team_child_middlewares(false, &["src/**".into()], Path::new("/w"), &[]).len(),
+            base + 1
         );
     }
 

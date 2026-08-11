@@ -945,6 +945,10 @@ pub struct UiState {
     /// Structured, fixed-footer projection of the currently-running Task
     /// fan-out. Owned by the TUI driver and keyed by the parent tool call id.
     pub active_subtasks: Option<crate::render::SubtaskProgress>,
+    /// Process-local Team Agent projection. Unlike `active_subtasks`, Team runs
+    /// may outlive the foreground turn and are cleared on runtime generation or
+    /// session replacement rather than ordinary turn completion.
+    pub team: crate::team::TeamProjection,
     /// Mirrors `TerminalCaps::unicode_symbols` — frozen at construction.
     /// When false, `tick_spinner` and the spinner-label ellipsis fall
     /// back to ASCII so terminals whose font lacks `◐` / `…` (notably
@@ -1351,6 +1355,7 @@ impl UiState {
             compaction_forced_streaming: false,
             subagent_activity: None,
             active_subtasks: None,
+            team: crate::team::TeamProjection::default(),
             unicode_symbols,
             colors,
             total_tokens: 0,
@@ -1784,6 +1789,7 @@ impl UiState {
         self.footer_usage = None;
         self.subagent_activity = None;
         self.active_subtasks = None;
+        self.team.clear();
     }
 
     /// The TUI dispatched a mid-turn steer to the kernel — one prompt now waiting

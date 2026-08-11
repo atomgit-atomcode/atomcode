@@ -1259,6 +1259,7 @@ pub enum Msg<'a> {
     CmdDescProxy,
     /// Description for the `/todo` slash command — reprint the current task list.
     CmdDescTodo,
+    CmdDescTeam,
     /// Description for the `/schedule` slash command — list local scheduled tasks.
     CmdDescSchedule,
     /// Description for the `/desktop` slash command.

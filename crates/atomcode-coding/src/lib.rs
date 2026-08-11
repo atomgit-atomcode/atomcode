@@ -47,6 +47,7 @@ pub mod plugin_hooks;
 pub mod provider_factory;
 pub mod runtime;
 pub mod session_title;
+pub mod team;
 pub mod telemetry;
 pub mod vision;
 
@@ -75,6 +76,7 @@ pub use init_prompt::INIT_PROMPT;
 pub use parts::{
     assemble, prepare, prepare_with_plugin_hook_source, prepare_with_plugin_hooks,
     subagent_enabled_from_env, CodingParts, PrepareOptions, SessionBinding, SessionMode,
+    SubagentPolicy,
 };
 pub use persona::{coding_persona, coding_persona_with_language, commit_language_guidance};
 pub use plan_mode::PlanModeGate;

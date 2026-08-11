@@ -2912,12 +2912,35 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .iter()
             .filter(|item| item.status == crate::render::SubtaskStatus::Failed)
             .count();
-        let pending = subtasks
+        let stopped = subtasks
+            .items
+            .iter()
+            .filter(|item| item.status == crate::render::SubtaskStatus::Stopped)
+            .count();
+        let pending_items = subtasks
             .items
             .iter()
             .filter(|item| item.status == crate::render::SubtaskStatus::Pending)
             .count();
-        let needs_summary = failed > 0 || pending > 0 || running > MAX_VISIBLE_RUNNING_SUBTASKS;
+        let terminal = subtasks
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.status,
+                    crate::render::SubtaskStatus::Completed
+                        | crate::render::SubtaskStatus::Stopped
+                        | crate::render::SubtaskStatus::Failed
+                )
+            })
+            .count();
+        let pending = if subtasks.call_id.starts_with("team:") {
+            subtasks.total.saturating_sub(terminal + running)
+        } else {
+            pending_items
+        };
+        let needs_summary =
+            failed > 0 || stopped > 0 || pending > 0 || running > MAX_VISIBLE_RUNNING_SUBTASKS;
         let spacer_rows = usize::from(cap >= 2);
         let summary_rows = usize::from(needs_summary && cap >= spacer_rows + 2);
         let visible_running = running
@@ -2960,11 +2983,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
             "*"
         };
         push_str_cells(&mut header, marker, &self.style_for(Role::Brand));
-        push_str_cells(&mut header, " Subtasks", &bold);
+        let panel_title = if subtasks.call_id.starts_with("team:") {
+            " Team"
+        } else {
+            " Subtasks"
+        };
+        push_str_cells(&mut header, panel_title, &bold);
         let failed = subtasks
             .items
             .iter()
             .filter(|item| item.status == SubtaskStatus::Failed)
+            .count();
+        let stopped = subtasks
+            .items
+            .iter()
+            .filter(|item| item.status == SubtaskStatus::Stopped)
             .count();
         let running = subtasks
             .items
@@ -2976,21 +3009,33 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .iter()
             .filter(|item| item.status == SubtaskStatus::Pending)
             .collect::<Vec<_>>();
-        let finished = subtasks.completed.saturating_add(failed);
+        let finished = subtasks
+            .completed
+            .saturating_add(failed)
+            .saturating_add(stopped);
+        let pending_count = if subtasks.call_id.starts_with("team:") {
+            subtasks
+                .total
+                .saturating_sub(finished + running.len())
+        } else {
+            pending.len()
+        };
         push_str_cells(
             &mut header,
             &format!(
                 " \u{b7} {finished}/{} finished \u{b7} {} running \u{b7} {pending} pending",
                 subtasks.total,
                 running.len(),
-                pending = pending.len()
+                pending = pending_count
             ),
             &detail,
         );
         rows.push(header);
 
-        let needs_summary =
-            failed > 0 || !pending.is_empty() || running.len() > MAX_VISIBLE_RUNNING_SUBTASKS;
+        let needs_summary = failed > 0
+            || stopped > 0
+            || pending_count > 0
+            || running.len() > MAX_VISIBLE_RUNNING_SUBTASKS;
         let summary_rows = usize::from(needs_summary && cap >= rows.len() + 1);
         let visible_running = running
             .len()
@@ -3042,7 +3087,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if needs_summary && rows.len() < cap {
             let mut parts = Vec::new();
             let hidden_running = running.len().saturating_sub(visible_running);
-            let expands_single_pending = pending.len() == 1 && hidden_running == 0 && failed == 0;
+            let expands_single_pending = !subtasks.call_id.starts_with("team:")
+                && pending.len() == 1
+                && hidden_running == 0
+                && failed == 0;
             if hidden_running > 0 {
                 parts.push(format!("{hidden_running} running"));
             }
@@ -3059,11 +3107,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     identity.push_str(&format!(" \u{b7} {}{}", item.model, remainder));
                 }
                 parts.push(format!("{} \u{b7} pending", scrub_controls(&identity)));
-            } else if !pending.is_empty() {
-                parts.push(format!("{} pending", pending.len()));
+            } else if pending_count > 0 {
+                parts.push(format!("{pending_count} pending"));
             }
             if failed > 0 {
                 parts.push(format!("{failed} failed"));
+            }
+            if stopped > 0 {
+                parts.push(format!("{stopped} stopped"));
             }
             let mut row = Vec::new();
             push_str_cells(&mut row, "  ", &CellStyle::default());
@@ -16095,6 +16146,47 @@ mod tests {
         assert!(!grid.contains("failed#1"));
         assert!(grid.contains("5/8 finished · 1 running · 2 pending"));
         assert!(grid.contains("2 pending · 1 failed"));
+    }
+
+    #[test]
+    fn team_panel_reports_stopped_separately_from_failed() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut r, buf) = new_capturing(100, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(100, 24);
+        let mut status = status_basic();
+        let item = |label: &str, state| SubtaskItem {
+            label: label.into(),
+            description: String::new(),
+            model: String::new(),
+            activity: String::new(),
+            started_at: None,
+            output_tokens: 0,
+            status: state,
+        };
+        status.subtasks = Some(SubtaskProgress {
+            call_id: "team:runtime".into(),
+            completed: 1,
+            total: 3,
+            items: vec![
+                item("done", SubtaskStatus::Completed),
+                item("stopped", SubtaskStatus::Stopped),
+                item("failed", SubtaskStatus::Failed),
+            ],
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: vec![],
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let grid = vterm.dump();
+        assert!(grid.contains("3/3 finished · 0 running · 0 pending"));
+        assert!(grid.contains("1 failed · 1 stopped"));
     }
 
     #[test]
