@@ -347,7 +347,6 @@
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>
             <span data-i18n="panel.login.title">登录后领取专属邀请链接</span>
           </div>
-          <div class="panel-meta"><span data-i18n="panel.meta.prefix">数据更新时间：</span><span class="js-updated-at">--</span></div>
         </div>
         <div class="login-card">
           <p data-i18n="login.desc">使用 AtomGit 账号登录后即可生成邀请码，并查看本周邀请、活跃和预计结算金额。</p>
@@ -364,7 +363,6 @@
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>
             <span data-i18n="panel.mine">我的专属邀请面板</span>
           </div>
-          <div class="panel-meta"><span data-i18n="panel.meta.prefix">数据更新时间：</span><span class="js-updated-at">--</span></div>
         </div>
         <div class="panel-body">
           <div class="user-strip">
@@ -390,7 +388,6 @@
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>
             <span data-i18n="panel.mine">我的专属邀请面板</span>
           </div>
-          <div class="panel-meta"><span data-i18n="panel.meta.prefix">数据更新时间：</span><span class="js-updated-at">--</span></div>
           <div class="period" id="summary-period">
             <button class="period-arrow" id="summary-prev" title="上一周" aria-label="上一周" onclick="changeSummaryWeek(-1)">◂</button>
             <b id="summary-week-label" aria-live="polite" aria-atomic="true">--</b>
@@ -698,7 +695,6 @@ function resetSummaryState() {
   if (periodEl) periodEl.dataset.weekStart = '';
   const labelEl = document.getElementById('summary-week-label');
   if (labelEl) labelEl.textContent = '--';
-  document.querySelectorAll('.js-updated-at').forEach(function(el) { el.textContent = '--'; });
   renderSummary(currentSummary);
 }
 function logout() { clearSid(); currentCode = null; currentUser = null; resetSummaryState(); showState('unauth'); renderAnnouncement('public-announcement'); }
@@ -844,10 +840,6 @@ async function loadSummary(weekStart) {
         lastDisplayedWeek = '';
       }
     }
-    var timeText = data.refreshed_at ? timeAgo(data.refreshed_at) : '--';
-    document.querySelectorAll('.js-updated-at').forEach(function(el) {
-      el.textContent = timeText;
-    });
   } catch (e) {
     if (reqId !== summaryReqSeq) return; // 过期失败，忽略
     console.error('Failed to load summary', e);
@@ -875,22 +867,6 @@ function formatLocalDate(date) {
   return date.getFullYear() + '-' +
     String(date.getMonth() + 1).padStart(2, '0') + '-' +
     String(date.getDate()).padStart(2, '0');
-}
-function timeAgo(isoStr) {
-  if (!isoStr) return t('time.now');
-  var then = new Date(isoStr);
-  if (isNaN(then.getTime())) return '--';
-  var diff = Date.now() - then.getTime();
-  var seconds = Math.floor(diff / 1000);
-  if (seconds < 10) return t('time.now');
-  var minutes = Math.floor(seconds / 60);
-  if (minutes < 1) return t('time.now');
-  if (minutes < 60) return minutes + (LANG === 'en' ? ' min ago' : '分钟前');
-  var hours = Math.floor(minutes / 60);
-  if (hours < 24) return hours + (LANG === 'en' ? ' h ago' : '小时前');
-  var days = Math.floor(hours / 24);
-  if (days < 30) return days + (LANG === 'en' ? ' d ago' : '天前');
-  return formatLocalDate(then);
 }
 function normalizeSummary(data) {
   const devices = parseNumber(data.devices ?? data.installs ?? data.install_count ?? data.device_count);
@@ -1058,10 +1034,6 @@ function normalizeRate(value, devices, active) {
     var nextBtn = document.getElementById('summary-next');
     if (prevBtn) { prevBtn.title = t('board.prev'); prevBtn.setAttribute('aria-label', t('board.prev')); }
     if (nextBtn) { nextBtn.title = t('board.next'); nextBtn.setAttribute('aria-label', t('board.next')); }
-    var timeText = currentSummary.refreshedAt ? timeAgo(currentSummary.refreshedAt) : '--';
-    document.querySelectorAll('.js-updated-at').forEach(function(el) {
-      el.textContent = timeText;
-    });
   }
   applyAll();
   btn.addEventListener('click',()=>{
