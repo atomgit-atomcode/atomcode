@@ -510,7 +510,7 @@ impl ProviderPanel {
         // the trailing custom row; the AtomGit gateway (id "atomgit", matched
         // case-insensitively vs the CodingPlan "AtomGit" fold) must go through
         // the OAuth signer via /login; and presets without a default base_url
-        // (e.g. xiaomi-mimo) have nothing to dispatch against.
+        // (the `*-compatible` presets) have nothing to dispatch against.
         for p in provider_preset::PRESETS {
             let has_dispatchable_endpoint = p
                 .default_base_url
@@ -2043,9 +2043,8 @@ mod tests {
         // The lowercase "atomgit" gateway preset must NOT be quick-addable as a
         // raw-key account — it has to go through the CodingPlan OAuth signer.
         assert!(!ids.contains(&"atomgit".to_string()));
-        // A preset without a default endpoint (nothing to dispatch against) is
-        // not listed either.
-        assert!(!ids.contains(&"xiaomi-mimo".to_string()));
+        // A preset with a concrete default endpoint is quick-addable.
+        assert!(ids.contains(&"xiaomi-mimo".to_string()));
         // A keyed preset vendor prompts for a key when you add its first model.
         assert!(account_needs_key(&cfg, "deepseek"));
         assert!(!account_needs_key(&cfg, "AtomGit"));
