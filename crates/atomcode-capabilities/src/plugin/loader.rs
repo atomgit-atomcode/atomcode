@@ -386,6 +386,24 @@ mod tests {
     }
 
     #[test]
+    fn file_cc_hooks_parses_wrapped_settings_format() {
+        // Claude Code settings.json / superpowers style: outer `{ "hooks": { … } }`.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("hooks")).unwrap();
+        std::fs::write(
+            dir.join("hooks/hooks.json"),
+            r#"{"hooks":{"SessionStart":[{"matcher":"startup|clear|compact","hooks":[{"type":"command","command":"echo wrapped","shell":"bash","async":false}]}]}}"#,
+        )
+        .unwrap();
+        let hooks = plugin_file_cc_hooks(dir);
+        assert_eq!(hooks.len(), 1, "wrapped hooks must be parsed");
+        assert_eq!(hooks[0].event, "SessionStart");
+        assert_eq!(hooks[0].command, "echo wrapped");
+        assert_eq!(hooks[0].matcher.as_deref(), Some("startup|clear|compact"));
+    }
+
+    #[test]
     fn file_cc_hooks_none_when_absent_or_malformed() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(plugin_file_cc_hooks(tmp.path()).is_empty());
