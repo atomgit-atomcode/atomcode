@@ -820,6 +820,9 @@ parallel workers NON-OVERLAPPING scopes."
                             outcome.error.as_deref().unwrap_or(&outcome.text),
                             120,
                         ),
+                        // Rough final estimate; the projection keeps the max of this
+                        // and the live per-round estimates already emitted.
+                        output_tokens: (outcome.text.chars().count() / 4) as u64,
                     });
                 }
                 (label, desc, model, outcome)
@@ -1165,7 +1168,7 @@ impl SubtaskProgressHook {
             return;
         }
         let now = std::time::Instant::now();
-        let (message, event_activity) = {
+        let (message, event_activity, event_tokens) = {
             let Ok(mut live) = self.live.lock() else {
                 return;
             };
@@ -1184,14 +1187,14 @@ impl SubtaskProgressHook {
             }
             live.last_emit = Some(now);
             let estimated = (live.round_chars / 4) as u64;
+            let tokens = live.total_tokens.saturating_add(estimated);
             (
                 format!(
                     "{SUBAGENT_ACTIVITY_MARKER}{} \u{b7} {} \u{b7} tokens={}",
-                    self.label,
-                    live.activity,
-                    live.total_tokens.saturating_add(estimated)
+                    self.label, live.activity, tokens
                 ),
                 live.activity.clone(),
+                tokens,
             )
         };
         self.progress.emit(message);
@@ -1199,6 +1202,7 @@ impl SubtaskProgressHook {
             events.emit(crate::team::TeamEventPayload::MemberActivity {
                 member_id: self.member_id.clone(),
                 activity: event_activity,
+                output_tokens: event_tokens,
             });
         }
     }

@@ -26,6 +26,7 @@ struct MemberProjection {
     activity: String,
     status: SubtaskStatus,
     started_at: Option<std::time::Instant>,
+    output_tokens: u64,
 }
 
 impl Default for MemberProjection {
@@ -37,6 +38,7 @@ impl Default for MemberProjection {
             activity: String::new(),
             status: SubtaskStatus::Pending,
             started_at: None,
+            output_tokens: 0,
         }
     }
 }
@@ -78,12 +80,15 @@ impl TeamProjection {
             TeamEventPayload::MemberActivity {
                 member_id,
                 activity,
+                output_tokens,
             } => {
                 let member = run.members.entry(member_id.to_string()).or_default();
                 if member.label.is_empty() {
                     member.label = member_id.to_string();
                 }
                 member.activity = activity;
+                // Estimates are monotonic; a reordered/late event can't lower the count.
+                member.output_tokens = member.output_tokens.max(output_tokens);
                 if member.status == SubtaskStatus::Pending {
                     member.status = SubtaskStatus::Running;
                     member.started_at = Some(std::time::Instant::now());
@@ -95,11 +100,13 @@ impl TeamProjection {
                 success,
                 stop,
                 summary,
+                output_tokens,
             } => {
                 let member = run.members.entry(member_id.to_string()).or_default();
                 if member.label.is_empty() {
                     member.label = member_id.to_string();
                 }
+                member.output_tokens = member.output_tokens.max(output_tokens);
                 let was_stopped = stop == "stopped";
                 member.activity = if summary.is_empty() { stop } else { summary };
                 member.status = if success {
@@ -177,7 +184,7 @@ impl TeamProjection {
                     model: member.model.clone(),
                     activity: member.activity.clone(),
                     started_at: member.started_at,
-                    output_tokens: 0,
+                    output_tokens: member.output_tokens,
                     status: member.status,
                 });
             }
@@ -246,6 +253,7 @@ mod tests {
                     success: false,
                     stop: "failed".into(),
                     summary: "boom".into(),
+                    output_tokens: 900,
                 },
             ),
         );
@@ -261,6 +269,7 @@ mod tests {
                     success: false,
                     stop: "stopped".into(),
                     summary: "cancelled".into(),
+                    output_tokens: 0,
                 },
             ),
         );
@@ -269,6 +278,12 @@ mod tests {
             state.panel().unwrap().items.iter()
                 .find(|item| item.label == "b#1").unwrap().status,
             SubtaskStatus::Stopped
+        );
+        // Real per-member token estimate flows through to the panel (was hardcoded 0).
+        assert_eq!(
+            state.panel().unwrap().items.iter()
+                .find(|item| item.label == "a#1").unwrap().output_tokens,
+            900
         );
         state.hide();
         assert!(state.panel().is_none());

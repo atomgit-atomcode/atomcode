@@ -100,7 +100,7 @@ impl TeamRunnerFactory {
             .persona(team_member_persona(profile, &task.scope))
             .working_dir(self.working_dir.clone())
             .cancel_token(cancel)
-            .hook(Arc::new(TeamProgressHook { activity }))
+            .hook(Arc::new(TeamProgressHook::new(activity)))
             .middleware(Arc::new(DenyTeamBash));
         for middleware in team_child_middlewares(
             task.permission == TeamPermission::Worker,
@@ -156,17 +156,40 @@ impl TeamRunnerFactory {
 
 struct TeamProgressHook {
     activity: TeamActivitySink,
+    /// Streamed output chars so far; tokens are estimated as chars/4 to match the
+    /// legacy `task` subagent panel (which has no exact provider usage either).
+    output_chars: std::sync::atomic::AtomicU64,
+}
+
+impl TeamProgressHook {
+    fn new(activity: TeamActivitySink) -> Self {
+        Self {
+            activity,
+            output_chars: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn estimated_tokens(&self) -> u64 {
+        self.output_chars.load(std::sync::atomic::Ordering::Relaxed) / 4
+    }
 }
 
 #[async_trait]
 impl LifecycleHooks for TeamProgressHook {
     async fn pre_request(&self, _messages: &mut Vec<Message>, _ctx: &TurnCtx) {
-        (self.activity)("thinking".to_string());
+        (self.activity)("thinking".to_string(), self.estimated_tokens());
+    }
+
+    async fn on_text_delta(&self, delta: &mut String) {
+        self.output_chars.fetch_add(
+            delta.chars().count() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     async fn on_model_response(&self, response: &mut Message) {
         if let Some(call) = response.tool_calls.first() {
-            (self.activity)(format!("using {}", call.name));
+            (self.activity)(format!("using {}", call.name), self.estimated_tokens());
         }
     }
 }

@@ -159,12 +159,18 @@ pub enum TeamEventPayload {
     MemberActivity {
         member_id: TeamMemberId,
         activity: String,
+        /// Estimated output tokens so far (chars/4), matching the legacy `task`
+        /// subagent panel so both render a live token count consistently.
+        #[serde(default)]
+        output_tokens: u64,
     },
     MemberFinished {
         member_id: TeamMemberId,
         success: bool,
         stop: String,
         summary: String,
+        #[serde(default)]
+        output_tokens: u64,
     },
     RunFinished {
         total: usize,
@@ -380,6 +386,7 @@ mod tests {
             TeamEventPayload::MemberActivity {
                 member_id: TeamMemberId::new("architect#1"),
                 activity: "inspect runtime ownership".into(),
+                output_tokens: 128,
             },
         );
         let encoded = encode_team_event(&event).unwrap();

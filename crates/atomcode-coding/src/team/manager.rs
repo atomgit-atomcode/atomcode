@@ -12,7 +12,9 @@ use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 
 pub type TeamJob = Pin<Box<dyn Future<Output = TeamMemberOutcome> + Send + 'static>>;
-pub type TeamActivitySink = Arc<dyn Fn(String) + Send + Sync>;
+/// `(activity_text, estimated_output_tokens)` — the runner reports a live token
+/// estimate alongside each activity so the panel matches the `task` subagent.
+pub type TeamActivitySink = Arc<dyn Fn(String, u64) + Send + Sync>;
 pub type TeamJobFactory =
     Arc<dyn Fn(TeamTaskSpec, CancellationToken, TeamActivitySink) -> TeamJob + Send + Sync>;
 pub type TeamModelFactory = Arc<dyn Fn(&TeamTaskSpec) -> String + Send + Sync>;
@@ -269,6 +271,7 @@ impl TeamRunManager {
                     description: task.description.clone(),
                     status: TeamMemberStatus::Queued,
                     result: String::new(),
+                    output_tokens: 0,
                     cancel: child_cancel.clone(),
                     abort: None,
                 },
@@ -297,8 +300,13 @@ impl TeamRunManager {
                 let activity_manager = manager.clone();
                 let activity_run = run.clone();
                 let activity_member = member.clone();
-                let activity: TeamActivitySink = Arc::new(move |activity| {
-                    activity_manager.member_activity(&activity_run, &activity_member, activity);
+                let activity: TeamActivitySink = Arc::new(move |activity, tokens| {
+                    activity_manager.member_activity(
+                        &activity_run,
+                        &activity_member,
+                        activity,
+                        tokens,
+                    );
                 });
                 let outcome = tokio::select! {
                     outcome = factory(task, child_cancel.clone(), activity) => outcome,
@@ -475,21 +483,30 @@ impl TeamRunManager {
         true
     }
 
-    fn member_activity(&self, run_id: &TeamRunId, member_id: &TeamMemberId, activity: String) {
+    fn member_activity(
+        &self,
+        run_id: &TeamRunId,
+        member_id: &TeamMemberId,
+        activity: String,
+        output_tokens: u64,
+    ) {
         if activity.trim().is_empty() {
             return;
         }
         let (generation, seq) = {
-            let store = self.lock_store();
-            let Some(run) = store.runs.get(run_id.as_str()) else {
+            let mut store = self.lock_store();
+            let Some(run) = store.runs.get_mut(run_id.as_str()) else {
                 return;
             };
-            let Some(member) = run.members.get(member_id.as_str()) else {
+            let Some(member) = run.members.get_mut(member_id.as_str()) else {
                 return;
             };
             if member.status != TeamMemberStatus::Running {
                 return;
             }
+            // Estimates are monotonic within a run; keep the max so a late,
+            // reordered activity can't roll the displayed count backward.
+            member.output_tokens = member.output_tokens.max(output_tokens);
             (run.generation, Arc::clone(&run.seq))
         };
         self.emit(
@@ -499,6 +516,7 @@ impl TeamRunManager {
             TeamEventPayload::MemberActivity {
                 member_id: member_id.clone(),
                 activity,
+                output_tokens,
             },
         );
     }
@@ -541,6 +559,7 @@ impl TeamRunManager {
                     .chars()
                     .take(160)
                     .collect(),
+                output_tokens: member.output_tokens,
             };
             run.recount();
             let run_event = run.is_terminal().then_some(TeamEventPayload::RunFinished {
@@ -684,6 +703,7 @@ struct TeamMemberRuntime {
     description: String,
     status: TeamMemberStatus,
     result: String,
+    output_tokens: u64,
     cancel: CancellationToken,
     abort: Option<AbortHandle>,
 }
@@ -794,6 +814,7 @@ pub struct TeamMemberSnapshot {
     pub role: String,
     pub status: TeamMemberStatus,
     pub result: String,
+    pub output_tokens: u64,
 }
 
 impl From<&TeamRunState> for TeamRunSnapshot {
@@ -813,6 +834,7 @@ impl From<&TeamRunState> for TeamRunSnapshot {
                     role: member.role.clone(),
                     status: member.status,
                     result: member.result.clone(),
+                    output_tokens: member.output_tokens,
                 })
                 .collect(),
         }
@@ -950,7 +972,7 @@ mod tests {
         manager.set_event_sender(tx);
         let factory: TeamJobFactory = Arc::new(|_, _, activity| {
             Box::pin(async move {
-                activity("using read_file".to_string());
+                activity("using read_file".to_string(), 512);
                 TeamMemberOutcome::completed("done")
             })
         });
@@ -977,7 +999,13 @@ mod tests {
         )));
         assert!(events.iter().any(|event| matches!(
             &event.event.payload,
-            TeamEventPayload::MemberActivity { activity, .. } if activity == "using read_file"
+            TeamEventPayload::MemberActivity { activity, output_tokens, .. }
+                if activity == "using read_file" && *output_tokens == 512
+        )));
+        // The final event carries the accumulated token estimate.
+        assert!(events.iter().any(|event| matches!(
+            &event.event.payload,
+            TeamEventPayload::MemberFinished { output_tokens, .. } if *output_tokens == 512
         )));
     }
 
@@ -1083,7 +1111,7 @@ mod tests {
         let factory: TeamJobFactory = Arc::new(|_, _, activity| {
             Box::pin(async move {
                 for i in 0..20 {
-                    activity(format!("step {i}"));
+                    activity(format!("step {i}"), (i as u64 + 1) * 4);
                 }
                 TeamMemberOutcome::completed("done")
             })
