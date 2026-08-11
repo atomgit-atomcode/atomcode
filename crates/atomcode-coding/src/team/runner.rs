@@ -275,7 +275,13 @@ fn team_member_persona(profile: &TeamRoleProfile, scope: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomcode_kernel::tool::{ToolContext, ToolResult};
+    use atomcode_capabilities::team::TeamRoleId;
+    use atomcode_kernel::hook::TurnCtx;
+    use atomcode_kernel::message::Message;
+    use atomcode_kernel::provider::ChatOptions;
+    use atomcode_kernel::stream::{ProviderError, StreamEvent};
+    use atomcode_kernel::tool::{ToolCall, ToolContext, ToolDef, ToolRegistry, ToolResult};
+    use futures::stream::BoxStream;
 
     struct DummyTool;
     #[async_trait]
@@ -380,5 +386,94 @@ mod tests {
         )
         .await
         .is_deny());
+    }
+
+    #[tokio::test]
+    async fn progress_hook_estimates_tokens_chars_over_four() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let activity: TeamActivitySink = Arc::new(move |text, tokens| {
+            let _ = tx.send((text, tokens));
+        });
+        let hook = TeamProgressHook::new(activity);
+        // 8 chars → 2 tokens（chars/4 估算）。
+        let mut delta = "abcdefgh".to_string();
+        hook.on_text_delta(&mut delta).await;
+        assert_eq!(hook.live_tokens(), 2);
+        // pre_request 发布 "thinking" 并携带当前 token 估算。
+        hook.pre_request(&mut vec![], &TurnCtx::default()).await;
+        let (text, tokens) = rx.try_recv().unwrap();
+        assert_eq!(text, "thinking");
+        assert_eq!(tokens, 2);
+        // on_model_response 发布 "using <tool>"。
+        let mut response = Message::assistant(
+            "",
+            vec![ToolCall {
+                id: "1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        hook.on_model_response(&mut response).await;
+        let (text, _) = rx.try_recv().unwrap();
+        assert_eq!(text, "using read_file");
+    }
+
+    struct NamedProvider(&'static str);
+    #[async_trait]
+    impl LlmProvider for NamedProvider {
+        fn model_name(&self) -> &str {
+            self.0
+        }
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDef],
+            _options: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    #[test]
+    fn model_factory_maps_difficulty() {
+        let providers: TeamProviderFactory = Arc::new(|difficulty| {
+            let name = match difficulty {
+                TeamDifficulty::Simple => "fast-model",
+                TeamDifficulty::Hard => "capable-model",
+            };
+            Arc::new(NamedProvider(name)) as Arc<dyn LlmProvider>
+        });
+        let runner = TeamRunnerFactory::new(
+            providers,
+            Arc::new(|_| ToolRegistry::new().mount(&[])),
+            std::env::temp_dir(),
+        );
+        let models = runner.model_factory();
+        let simple = TeamTaskSpec {
+            description: "d".into(),
+            prompt: "p".into(),
+            role: TeamRoleId::Explorer,
+            permission: TeamPermission::Explore,
+            difficulty: TeamDifficulty::Simple,
+            scope: vec![],
+        };
+        let hard = TeamTaskSpec {
+            difficulty: TeamDifficulty::Hard,
+            ..simple.clone()
+        };
+        assert_eq!(models(&simple), "fast-model");
+        assert_eq!(models(&hard), "capable-model");
+    }
+
+    #[test]
+    fn persona_embeds_scope_and_authority() {
+        let worker = role_by_id("implementer").unwrap();
+        let persona = team_member_persona(worker, &["src/**".into()]);
+        assert!(persona.contains("src/**"), "{persona}");
+        assert!(persona.contains("Do not run shell commands"), "{persona}");
+        let explorer = role_by_id("explorer").unwrap();
+        let persona = team_member_persona(explorer, &[]);
+        assert!(persona.contains("read-only"), "{persona}");
+        assert!(!persona.contains("Do not run shell commands"), "{persona}");
     }
 }

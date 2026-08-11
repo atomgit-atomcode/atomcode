@@ -293,4 +293,131 @@ mod tests {
         assert_eq!(state.summary(), "No Team runs.");
     }
 
+    #[test]
+    fn activity_promotes_pending_to_running_and_tracks_tokens() {
+        let mut state = TeamProjection::default();
+        // RunStarted 使面板可见；之后只有 MemberActivity、没有 MemberStarted：
+        // Pending 应提升为 Running，token 估计应单调取 max（乱序/迟到事件不能把计数拉低）。
+        state.apply(1, event("a", 1, TeamEventPayload::RunStarted { total: 1 }));
+        state.apply(
+            1,
+            event(
+                "a",
+                2,
+                TeamEventPayload::MemberActivity {
+                    member_id: TeamMemberId::new("a#1"),
+                    activity: "using read_file".into(),
+                    output_tokens: 300,
+                },
+            ),
+        );
+        state.apply(
+            1,
+            event(
+                "a",
+                3,
+                TeamEventPayload::MemberActivity {
+                    member_id: TeamMemberId::new("a#1"),
+                    activity: "using grep".into(),
+                    output_tokens: 500,
+                },
+            ),
+        );
+        // 迟到的低 token 事件（seq 更大但 token 更小）不能拉低显示计数。
+        state.apply(
+            1,
+            event(
+                "a",
+                4,
+                TeamEventPayload::MemberActivity {
+                    member_id: TeamMemberId::new("a#1"),
+                    activity: "done".into(),
+                    output_tokens: 100,
+                },
+            ),
+        );
+        let panel = state.panel().unwrap();
+        let item = panel
+            .items
+            .iter()
+            .find(|item| item.label == "a#1")
+            .unwrap();
+        assert_eq!(item.status, SubtaskStatus::Running);
+        assert_eq!(item.activity, "done");
+        assert_eq!(item.output_tokens, 500, "token 计数必须单调取 max");
+        assert!(state.summary().contains("1 running"));
+    }
+
+    #[test]
+    fn out_of_order_seq_events_are_dropped() {
+        let mut state = TeamProjection::default();
+        // RunStarted 使面板可见并建立 seq=1 基线。
+        state.apply(1, event("a", 1, TeamEventPayload::RunStarted { total: 1 }));
+        // 先到达高 seq 事件。
+        state.apply(
+            1,
+            event(
+                "a",
+                5,
+                TeamEventPayload::MemberFinished {
+                    member_id: TeamMemberId::new("a#1"),
+                    success: true,
+                    stop: "completed".into(),
+                    summary: "ok".into(),
+                    output_tokens: 100,
+                },
+            ),
+        );
+        // 迟到的低 seq 事件（seq <= last_seq）必须被丢弃，不得覆盖终态。
+        state.apply(
+            1,
+            event(
+                "a",
+                4,
+                TeamEventPayload::MemberActivity {
+                    member_id: TeamMemberId::new("a#1"),
+                    activity: "late".into(),
+                    output_tokens: 999,
+                },
+            ),
+        );
+        let panel = state.panel().unwrap();
+        let item = panel
+            .items
+            .iter()
+            .find(|item| item.label == "a#1")
+            .unwrap();
+        assert_eq!(item.status, SubtaskStatus::Completed);
+        assert_eq!(item.activity, "ok");
+        assert_eq!(item.output_tokens, 100);
+        assert!(state.summary().contains("1 completed"));
+    }
+
+    #[test]
+    fn reset_generation_clears_previous_runs() {
+        let mut state = TeamProjection::default();
+        state.apply(1, event("a", 1, TeamEventPayload::RunStarted { total: 1 }));
+        state.apply(
+            1,
+            event(
+                "a",
+                2,
+                TeamEventPayload::MemberFinished {
+                    member_id: TeamMemberId::new("a#1"),
+                    success: false,
+                    stop: "failed".into(),
+                    summary: "boom".into(),
+                    output_tokens: 0,
+                },
+            ),
+        );
+        assert!(state.summary().contains("1 failed"));
+        // 显式 reset 到新 generation：旧 run 应被清空。
+        state.reset_generation(2);
+        assert_eq!(state.summary(), "No Team runs.");
+        // 新 generation 的 RunStarted 生效，旧 run 的失败计数不得残留。
+        state.apply(2, event("b", 1, TeamEventPayload::RunStarted { total: 2 }));
+        assert_eq!(state.panel().unwrap().total, 2);
+        assert!(!state.summary().contains("1 failed"));
+    }
 }

@@ -1169,4 +1169,198 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("non-empty scope"));
     }
+
+    #[tokio::test]
+    async fn delegate_rejects_empty_tasks() {
+        let manager = manager();
+        let factory: TeamJobFactory =
+            Arc::new(|_, _, _| Box::pin(async { TeamMemberOutcome::completed("unused") }));
+        let error = manager
+            .delegate(vec![], factory, models())
+            .await
+            .unwrap_err();
+        assert!(error.contains("at least one task"));
+    }
+
+    #[tokio::test]
+    async fn delegate_rejects_permission_mismatch() {
+        let manager = manager();
+        let factory: TeamJobFactory =
+            Arc::new(|_, _, _| Box::pin(async { TeamMemberOutcome::completed("unused") }));
+        // Explorer 角色必须用 Explore 权限；错配 Worker 权限应被拒绝。
+        let mut spec = task(TeamRoleId::Explorer, TeamPermission::Explore, vec![]);
+        spec.permission = TeamPermission::Worker;
+        let error = manager
+            .delegate(vec![spec], factory, models())
+            .await
+            .unwrap_err();
+        assert!(error.contains("requires"));
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_only_the_target_run() {
+        let manager = manager();
+        let factory: TeamJobFactory = Arc::new(|_, _, _| Box::pin(std::future::pending()));
+        let run_a = manager
+            .delegate(
+                vec![task(TeamRoleId::Explorer, TeamPermission::Explore, vec![])],
+                Arc::clone(&factory),
+                models(),
+            )
+            .await
+            .unwrap();
+        let run_b = manager
+            .delegate(
+                vec![task(TeamRoleId::Explorer, TeamPermission::Explore, vec![])],
+                Arc::clone(&factory),
+                models(),
+            )
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        manager.stop(&run_a).await.unwrap();
+        assert!(
+            manager
+                .wait(&run_a, Duration::from_secs(1))
+                .await
+                .unwrap()
+                .terminal
+        );
+        // run_b 不受影响，仍在运行（非终态）。
+        let snap_b = manager.snapshot(Some(&run_b)).unwrap();
+        assert!(
+            snap_b.runs[0].completed + snap_b.runs[0].failed + snap_b.runs[0].stopped
+                < snap_b.runs[0].total
+        );
+        manager.stop_all().await; // 清理
+    }
+
+    #[tokio::test]
+    async fn wait_times_out_without_terminal() {
+        let manager = manager();
+        let factory: TeamJobFactory = Arc::new(|_, _, _| Box::pin(std::future::pending()));
+        let run = manager
+            .delegate(
+                vec![task(TeamRoleId::Explorer, TeamPermission::Explore, vec![])],
+                factory,
+                models(),
+            )
+            .await
+            .unwrap();
+        let outcome = manager
+            .wait(&run, Duration::from_millis(20))
+            .await
+            .unwrap();
+        assert!(!outcome.terminal);
+        manager.stop_all().await; // 清理
+    }
+
+    #[tokio::test]
+    async fn wait_unknown_run_errors() {
+        let manager = manager();
+        let error = manager
+            .wait(&TeamRunId::new("missing"), Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(error.contains("unknown team run"));
+    }
+
+    #[tokio::test]
+    async fn finish_member_is_idempotent() {
+        let manager = manager();
+        let factory: TeamJobFactory =
+            Arc::new(|_, _, _| Box::pin(async { TeamMemberOutcome::completed("done") }));
+        let run = manager
+            .delegate(
+                vec![task(TeamRoleId::Explorer, TeamPermission::Explore, vec![])],
+                factory,
+                models(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .wait(&run, Duration::from_secs(1))
+                .await
+                .unwrap()
+                .terminal
+        );
+        // 已终态成员再次 finish：不得改变计数或状态。
+        let member = manager.snapshot(Some(&run)).unwrap().runs[0].members[0].clone();
+        manager.finish_member(&run, &member.id, TeamMemberOutcome::failed("dup"));
+        let snap = manager.snapshot(Some(&run)).unwrap();
+        assert_eq!(snap.runs[0].completed, 1);
+        assert_eq!(snap.runs[0].failed, 0);
+    }
+
+    #[tokio::test]
+    async fn activity_ignored_outside_running() {
+        let manager = manager();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        manager.set_event_sender(tx);
+        let factory: TeamJobFactory =
+            Arc::new(|_, _, _| Box::pin(async { TeamMemberOutcome::completed("done") }));
+        let run = manager
+            .delegate(
+                vec![task(TeamRoleId::Explorer, TeamPermission::Explore, vec![])],
+                factory,
+                models(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .wait(&run, Duration::from_secs(1))
+                .await
+                .unwrap()
+                .terminal
+        );
+        while rx.try_recv().is_ok() {} // 排空
+        // 成员已终态（Completed），activity 必须被忽略：不发布事件、不更新 token。
+        let member = manager.snapshot(Some(&run)).unwrap().runs[0].members[0].clone();
+        manager.member_activity(&run, &member.id, "late".into(), 999);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn truncate_chars_honors_max_result_chars() {
+        assert_eq!(truncate_chars("abc", 5), "abc");
+        assert_eq!(truncate_chars("abcdef", 5), "abcde…");
+        assert_eq!(truncate_chars("你好世界", 3), "你好世…");
+    }
+
+    #[test]
+    fn publish_external_runfinished_cleans_map() {
+        let manager = manager();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        manager.set_event_sender(tx);
+        let run = TeamRunId::new("task-1");
+        manager.publish_external(TeamEvent::new(
+            run.clone(),
+            1,
+            TeamEventPayload::RunStarted { total: 1 },
+        ));
+        assert!(rx.try_recv().is_ok());
+        manager.publish_external(TeamEvent::new(
+            run.clone(),
+            2,
+            TeamEventPayload::RunFinished {
+                total: 1,
+                completed: 1,
+                failed: 0,
+            },
+        ));
+        assert!(rx.try_recv().is_ok());
+        // RunFinished 已清理 external_runs 映射：后续非 RunStarted 事件应被丢弃。
+        manager.publish_external(TeamEvent::new(
+            run,
+            3,
+            TeamEventPayload::RunFinished {
+                total: 1,
+                completed: 1,
+                failed: 0,
+            },
+        ));
+        assert!(rx.try_recv().is_err());
+    }
 }

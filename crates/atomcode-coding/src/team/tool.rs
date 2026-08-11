@@ -343,4 +343,74 @@ mod tests {
             TeamPermission::Worker
         );
     }
+
+    #[test]
+    fn risk_is_safe_for_read_only_roles_and_risky_for_workers() {
+        let tool = tool(100);
+        // 只读角色（explorer）delegate → Safe。
+        assert_eq!(
+            tool.risk(r#"{"action":"delegate","tasks":[{"description":"read","prompt":"inspect","role":"explorer"}]}"#),
+            RiskLevel::Safe
+        );
+        // worker 角色（rust，带 scope）delegate → Risky。
+        assert_eq!(
+            tool.risk(r#"{"action":"delegate","tasks":[{"description":"edit","prompt":"change","role":"rust","scope":["src/**"]}]}"#),
+            RiskLevel::Risky
+        );
+        // 非 delegate 动作（status/wait）→ Safe。
+        assert_eq!(tool.risk(r#"{"action":"status"}"#), RiskLevel::Safe);
+        assert_eq!(
+            tool.risk(r#"{"action":"wait","run_id":"team-1-1","timeout_secs":1}"#),
+            RiskLevel::Safe
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_timeout_is_capped_and_unknown_run_fails_closed() {
+        let tool = tool(100);
+        // 未知 run：wait/result/stop 都应报错。
+        let waited = tool
+            .execute(r#"{"action":"wait","run_id":"missing","timeout_secs":1}"#, &ctx())
+            .await;
+        assert!(waited.is_error);
+        assert!(waited.content.contains("unknown team run"));
+        let resulted = tool
+            .execute(r#"{"action":"result","run_id":"missing"}"#, &ctx())
+            .await;
+        assert!(resulted.is_error);
+        assert!(resulted.content.contains("unknown team run"));
+        let stopped = tool
+            .execute(r#"{"action":"stop","run_id":"missing"}"#, &ctx())
+            .await;
+        assert!(stopped.is_error);
+        assert!(stopped.content.contains("unknown team run"));
+    }
+
+    #[tokio::test]
+    async fn delegate_rejects_empty_description_or_prompt() {
+        let tool = tool(100);
+        // description/prompt 为空 → task_spec 拒绝。
+        let empty = tool
+            .execute(
+                r#"{"action":"delegate","tasks":[{"description":"","prompt":"","role":"explorer"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(empty.is_error);
+        assert!(empty.content.contains("must not be empty"));
+        // 只缺 prompt → 同样拒绝。
+        let no_prompt = tool
+            .execute(
+                r#"{"action":"delegate","tasks":[{"description":"read","prompt":"","role":"explorer"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(no_prompt.is_error);
+        assert!(no_prompt.content.contains("must not be empty"));
+        // 空任务数组 → delegate 拒绝。
+        let no_tasks = tool
+            .execute(r#"{"action":"delegate","tasks":[]}"#, &ctx())
+            .await;
+        assert!(no_tasks.is_error);
+    }
 }
