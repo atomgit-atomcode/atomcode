@@ -115,6 +115,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 ac.context_window = cfg.context_window;
                 ac.idle_timeout = cfg.stream_timeout;
                 ac.max_tokens = default_max_tokens(cfg.context_window);
+                ac.supports_vision = cfg.supports_vision;
                 ac.thinking = cfg.thinking_enabled.unwrap_or(false);
                 ac.user_agent = Some(ua.clone());
                 ac.skip_tls_verify = cfg.skip_tls_verify;
@@ -129,6 +130,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 oc.context_window = cfg.context_window;
                 oc.idle_timeout = cfg.stream_timeout;
                 oc.max_tokens = Some(default_max_tokens(cfg.context_window));
+                oc.supports_vision = cfg.supports_vision;
                 oc.think = cfg.thinking_enabled.unwrap_or(false);
                 oc.user_agent = Some(ua.clone());
                 oc.skip_tls_verify = cfg.skip_tls_verify;
@@ -140,8 +142,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
                 pc.context_window = cfg.context_window;
                 pc.idle_timeout = cfg.stream_timeout;
-                pc.supports_vision =
-                    atomcode_capabilities::provider::model_suggests_vision(&cfg.model);
+                pc.supports_vision = cfg.supports_vision;
                 pc.max_tokens = Some(default_max_tokens(cfg.context_window));
                 pc.reasoning_policy =
                     ReasoningPolicy::from_config(cfg.reasoning_history.as_deref())
@@ -177,8 +178,8 @@ pub fn derive_tier_config(
 ) -> CodingAgentConfig {
     let mut tier = base.clone();
     tier.model = provider.model.clone();
+    tier.supports_vision = provider.accepts_images();
     tier.provider_name = provider_name.to_string();
-    tier.pricing = crate::resolve_provider_pricing(provider_name, provider);
     if let Some(base_url) = &provider.base_url {
         tier.base_url = base_url.clone();
     }
@@ -223,8 +224,8 @@ pub fn derive_tier_config_from_resolved(
 ) -> CodingAgentConfig {
     let mut tier = base.clone();
     tier.model = resolved.model.clone();
+    tier.supports_vision = resolved.supports_vision;
     tier.provider_name = resolved.selection_id.clone();
-    tier.pricing = crate::resolve_resolved_pricing(resolved);
     if let Some(base_url) = &resolved.base_url {
         tier.base_url = base_url.clone();
     }

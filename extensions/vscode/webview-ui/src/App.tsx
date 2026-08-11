@@ -5,6 +5,7 @@ import { WelcomeScreen } from './components/WelcomeScreen';
 import { MessageList } from './components/MessageList';
 import { InputArea } from './components/InputArea';
 import { SessionList } from './components/SessionList';
+import { ImageLightbox } from './components/ImageLightbox';
 import { I18nProvider } from './i18n';
 
 function ChatApp() {
@@ -40,6 +41,7 @@ function ChatApp() {
         )}
         <InputArea />
       </div>
+      <ImageLightbox />
     </div>
   );
 }

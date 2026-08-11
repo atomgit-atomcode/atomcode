@@ -171,6 +171,10 @@ struct ReviewArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `atomcodex` shares the config tree with `atomcode` but is often invoked
+    // directly, so it cannot rely on inheriting the variable from a parent.
+    atomcode_config::distribution::bootstrap_home();
+
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Code(args) => code::code(args).await,

@@ -96,9 +96,15 @@ pub struct ProcessInfo {
     pub name: String,
 }
 
+/// Whether a running process is one of THIS distribution's own.
+///
+/// The list comes from `distribution::PROCESS_NAMES` rather than being spelled
+/// out here, so it cannot drift from the `[[bin]] name`s actually shipped. It
+/// also bounds the blast radius: a build installed alongside another one must
+/// not offer to kill the other's processes on uninstall.
 pub fn matches_atomcode_name(name: &str) -> bool {
     let stripped = name.strip_suffix(".exe").unwrap_or(name);
-    matches!(stripped, "atomcode" | "atomcode-daemon")
+    atomcode_config::distribution::PROCESS_NAMES.contains(&stripped)
 }
 
 /// List all atomcode-family processes excluding the calling process.

@@ -44,7 +44,14 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
         .filter_map(|id| {
             config
                 .provider_config_for_selection(id)
-                .map(|p| provider_info(id, &p, &default_selection))
+                .map(|p| {
+                    provider_info(
+                        id,
+                        &p,
+                        config.model_vision_override(id),
+                        &default_selection,
+                    )
+                })
         })
         .collect();
     ConfigResponse {
@@ -59,12 +66,15 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
 pub(crate) fn provider_info(
     name: &str,
     p: &ProviderConfig,
+    supports_vision_override: Option<bool>,
     default_provider: &str,
 ) -> ProviderInfo {
     ProviderInfo {
         name: name.to_string(),
         provider_type: p.provider_type.clone(),
         model: p.model.clone(),
+        supports_vision: p.accepts_images(),
+        supports_vision_override,
         base_url: p.base_url.clone(),
         has_api_key: p.resolved_api_key().is_some(),
         requires_login: p
@@ -82,7 +92,6 @@ pub(crate) fn provider_info(
         reasoning_effort: p.reasoning_effort.clone(),
         skip_tls_verify: p.skip_tls_verify,
         ephemeral: p.ephemeral,
-        pricing: p.pricing,
     }
 }
 
@@ -158,6 +167,7 @@ mod tests {
             model: "model".into(),
             base_url: Some(base_url.into()),
             system_prompt: None,
+            supports_vision: None,
             user_agent: None,
             context_window: 128_000,
             max_tokens: None,
@@ -170,7 +180,6 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
-            pricing: None,
         }
     }
 
@@ -211,6 +220,7 @@ mod tests {
             provider_info(
                 "renamed",
                 &provider("https://llm-api.atomgit.com/v1"),
+                None,
                 "renamed"
             )
             .requires_login
@@ -219,6 +229,7 @@ mod tests {
             !provider_info(
                 "AtomGit-looking-custom",
                 &provider("https://example.test/v1"),
+                None,
                 "AtomGit-looking-custom"
             )
             .requires_login
@@ -226,15 +237,20 @@ mod tests {
     }
 
     #[test]
-    fn provider_info_exposes_pricing_without_credentials() {
-        let mut configured = provider("https://example.test/v1");
-        configured.pricing = Some(atomcode_config::config::provider::ProviderPricing {
-            input_per_million: 1.0,
-            output_per_million: 2.0,
-            cached_input_per_million: 0.25,
-        });
-        let info = provider_info("custom", &configured, "custom");
-        assert_eq!(info.pricing, configured.pricing);
-        assert!(!info.has_api_key);
+    fn config_response_preserves_auto_override_separately_from_effective_capability() {
+        let mut config = Config::with_default_provider("custom");
+        let mut auto = provider("https://example.test/v1");
+        auto.model = "qwen3-vl-plus".into();
+        auto.supports_vision = None;
+        config.providers.insert("custom".into(), auto);
+
+        let response = config_response(&config);
+        let info = response
+            .providers
+            .iter()
+            .find(|provider| provider.name == "custom")
+            .unwrap();
+        assert!(info.supports_vision, "Auto resolves to the model heuristic");
+        assert_eq!(info.supports_vision_override, None, "Auto remains visible");
     }
 }

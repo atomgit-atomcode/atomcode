@@ -55,13 +55,30 @@ fn grouped_selection_ids(config: &Config) -> Vec<String> {
     ids
 }
 
+#[cfg(test)]
 pub(crate) fn adjacent_provider(config: &Config, direction: ModelCycleDirection) -> Option<String> {
+    adjacent_provider_from(config, direction, None)
+}
+
+/// Pick the adjacent model using an optional UI-local cycle anchor.
+///
+/// The runtime remains authoritative for the active model. The anchor only remembers a
+/// candidate that F2 already submitted but whose reload later failed, allowing the next
+/// keypress to advance instead of selecting the same unavailable candidate forever.
+pub(crate) fn adjacent_provider_from(
+    config: &Config,
+    direction: ModelCycleDirection,
+    anchor: Option<&str>,
+) -> Option<String> {
     let ids = grouped_selection_ids(config);
     if ids.len() < 2 {
         return None;
     }
 
-    let current = config.effective_model_selection().unwrap_or_default();
+    let current = anchor
+        .filter(|candidate| ids.iter().any(|id| id == *candidate))
+        .map(str::to_owned)
+        .unwrap_or_else(|| config.effective_model_selection().unwrap_or_default());
     let pos = ids
         .iter()
         .position(|id| *id == current)
@@ -352,6 +369,7 @@ mod tests {
                     model: model.to_string(),
                     base_url: None,
                     system_prompt: None,
+                    supports_vision: None,
                     user_agent: None,
                     context_window: 128000,
                     max_tokens: None,
@@ -364,7 +382,6 @@ mod tests {
                     skip_tls_verify: false,
                     ephemeral: false,
                     capable_model: None,
-                    pricing: None,
                 },
             );
         }
@@ -650,6 +667,26 @@ mod tests {
 
         let only = make_config(vec![("alpha", "openai", "gpt-4")], "alpha");
         assert_eq!(adjacent_provider(&only, ModelCycleDirection::Next), None);
+    }
+
+    #[test]
+    fn cycle_anchor_advances_past_a_failed_candidate() {
+        let config = make_config(
+            vec![
+                ("alpha", "openai", "model-a"),
+                ("bravo", "openai", "model-b"),
+                ("charlie", "openai", "model-c"),
+            ],
+            "alpha",
+        );
+
+        let failed = adjacent_provider(&config, ModelCycleDirection::Next).unwrap();
+        assert_eq!(failed, "bravo");
+        assert_eq!(
+            adjacent_provider_from(&config, ModelCycleDirection::Next, Some(&failed)).as_deref(),
+            Some("charlie"),
+            "the runtime may still be on alpha after rollback, but F2 must advance"
+        );
     }
 
     #[test]

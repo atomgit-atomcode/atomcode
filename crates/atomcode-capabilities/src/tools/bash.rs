@@ -9,6 +9,7 @@
 //! first-error-signature capture, telemetry, and the setsid/process-group reaping
 //! (the neutral version kills the direct child via `kill_on_drop`).
 
+use super::bash_workspace_gate::scan_redirect_writes;
 use super::{err, ok};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
@@ -905,7 +906,14 @@ fn build_command(command: &str) -> Result<tokio::process::Command, String> {
 /// honor the console's OEM codepage (Windows), then use chardetng as a cross-platform
 /// fallback. The latter covers commands such as `curl` returning a legacy GB2312/GBK
 /// page on macOS/Linux without changing the command or its byte-level semantics.
-fn decode_output(bytes: &[u8]) -> String {
+pub(crate) fn decode_output(bytes: &[u8]) -> String {
+    // Windows-native programs may write UTF-16 directly to a redirected pipe.  In
+    // particular, wsl.exe's localized "install a distribution" diagnostic has
+    // appeared in hook stdout this way.  UTF-16LE ASCII is also valid UTF-8 (with
+    // embedded NULs), so this check MUST precede the UTF-8 fast path.
+    if let Some(decoded) = decode_utf16_output(bytes) {
+        return decoded;
+    }
     match std::str::from_utf8(bytes) {
         Ok(s) => return s.to_string(),
         // A truncated multibyte tail (no `error_len`) means the valid prefix IS real
@@ -915,6 +923,63 @@ fn decode_output(bytes: &[u8]) -> String {
         Err(_) => {}
     }
     decode_oem(bytes, console_codepage())
+}
+
+/// Recognize redirected UTF-16 output by BOM or by the byte-position NUL bias of
+/// console diagnostics.  The no-BOM heuristic also requires valid UTF-16 and a
+/// printable decoded result, so ordinary binary/legacy output is not reinterpreted.
+fn decode_utf16_output(bytes: &[u8]) -> Option<String> {
+    let (little_endian, body, bom) = if bytes.starts_with(&[0xFF, 0xFE]) {
+        (true, &bytes[2..], true)
+    } else if bytes.starts_with(&[0xFE, 0xFF]) {
+        (false, &bytes[2..], true)
+    } else {
+        if bytes.len() < 8 || bytes.len() % 2 != 0 {
+            return None;
+        }
+        let pairs = bytes.len() / 2;
+        let even_nuls = bytes.iter().step_by(2).filter(|&&byte| byte == 0).count();
+        let odd_nuls = bytes
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .filter(|&&byte| byte == 0)
+            .count();
+        // Localized diagnostics contain many non-ASCII UTF-16 code units (whose high
+        // byte is non-zero), so do not require every other byte to be NUL.  A 20%
+        // bias is enough when the decoded result also passes the strict text check
+        // below; this still rejects ordinary binary and legacy multibyte text.
+        if odd_nuls * 5 >= pairs && odd_nuls >= even_nuls.saturating_mul(3) {
+            (true, bytes, false)
+        } else if even_nuls * 5 >= pairs && even_nuls >= odd_nuls.saturating_mul(3) {
+            (false, bytes, false)
+        } else {
+            return None;
+        }
+    };
+    if body.len() % 2 != 0 {
+        return None;
+    }
+    let units = body.chunks_exact(2).map(|pair| {
+        if little_endian {
+            u16::from_le_bytes([pair[0], pair[1]])
+        } else {
+            u16::from_be_bytes([pair[0], pair[1]])
+        }
+    });
+    if bom {
+        return Some(
+            char::decode_utf16(units)
+                .map(|item| item.unwrap_or('\u{FFFD}'))
+                .collect(),
+        );
+    }
+    let decoded: String = char::decode_utf16(units).collect::<Result<_, _>>().ok()?;
+    let control_count = decoded
+        .chars()
+        .filter(|character| character.is_control() && !character.is_whitespace())
+        .count();
+    (control_count <= decoded.chars().count() / 20).then_some(decoded)
 }
 
 /// Decode `bytes` with a Windows OEM/ANSI codepage number. Pure and platform-independent
@@ -1604,6 +1669,7 @@ pub fn check_destructive_command(command: &str) -> Option<String> {
         const WRAPPERS: &[&str] = &[
             "env", "nice", "nohup", "timeout", "strace", "ionice", "taskset", "setsid", "screen",
             "tmux", "script", "unshare", "nsenter", "chroot", "setarch", "linux32", "linux64",
+            "command", "builtin",
         ];
         const KNOWN: &[&str] = &[
             "rm", "dd", "chmod", "chown", "chgrp", "mkfs", "format", "drop", "python", "perl",
@@ -1612,11 +1678,37 @@ pub fn check_destructive_command(command: &str) -> Option<String> {
         fn b(t: &str) -> &str {
             t.rsplit('/').next().unwrap_or(t)
         }
+        fn is_env_assignment(t: &str) -> bool {
+            let Some((name, _value)) = t.split_once('=') else {
+                return false;
+            };
+            !name.is_empty()
+                && name.chars().enumerate().all(|(i, c)| {
+                    c == '_' || c.is_ascii_alphanumeric() && (i > 0 || !c.is_ascii_digit())
+                })
+        }
         let toks: Vec<&str> = cmd.split_whitespace().collect();
-        if toks.is_empty() || !WRAPPERS.contains(&b(toks[0])) {
+        if toks.is_empty() {
             return cmd.to_string();
         }
-        let mut skip = 1;
+        // Shell assignment prefixes (`LC_ALL=C dd …`) are not the effective command. Strip only
+        // syntactically-valid variable assignments so an arbitrary argument containing `=` does
+        // not move the command boundary.
+        let mut skip = 0;
+        while skip < toks.len() && is_env_assignment(toks[skip]) {
+            skip += 1;
+        }
+        if skip == toks.len() {
+            return cmd.to_string();
+        }
+        if !WRAPPERS.contains(&b(toks[skip])) {
+            return if skip == 0 {
+                cmd.to_string()
+            } else {
+                toks[skip..].join(" ")
+            };
+        }
+        skip += 1;
         while skip < toks.len() {
             let t = toks[skip];
             // Skip the wrapper's flags / values / env-assignments; stop at a real command
@@ -1836,21 +1928,60 @@ pub fn check_destructive_command(command: &str) -> Option<String> {
             ));
         }
     }
-    // dd raw disk write. Gate the `if=/dev/` substring on dd actually being the command
-    // so `cd if=/dev/foo` (normalizes to `cdif=/dev/foo`) is not a false positive.
-    let dd_norm: String = cmd.split_whitespace().collect();
-    if dd_norm.starts_with("ddif=") || (first_base == "dd" && dd_norm.contains("if=/dev/")) {
+    // dd raw-device access. Gate device operands on `dd` actually being the command so a
+    // harmless mention such as `cd if=/dev/foo` cannot false-positive. In particular, the
+    // OUTPUT operand is the destructive side: `dd if=image.raw of=/dev/sda` can overwrite an
+    // entire disk even though its input is an ordinary file. Keep the historical `if=/dev/`
+    // classification as well; removing it would silently weaken the established approval policy.
+    let dd_device_operand = |name: &str| {
+        first_base == "dd"
+            && cmd.split_whitespace().skip(1).any(|arg| {
+                let arg = normalize(arg);
+                let Some(device) = arg.strip_prefix(name) else {
+                    return false;
+                };
+                device.starts_with("/dev/")
+                    && !matches!(device, "/dev/null" | "/dev/stdout" | "/dev/stderr")
+            })
+    };
+    if dd_device_operand("if=") || dd_device_operand("of=") {
         return Some("raw disk write (dd)".to_string());
     }
     // Fork bomb.
     if cmd.contains(":(){") || cmd.contains(": (){") || cmd.contains("(){ :|:&") {
         return Some("fork bomb".to_string());
     }
-    // Critical system-file overwrite.
-    for f in ["/etc/passwd", "/etc/shadow", "/etc/hosts", "/etc/sudoers"] {
-        if cmd.contains(&format!("> {f}")) || cmd.contains(&format!(">> {f}")) {
+    // Critical system-file overwrite. Use the same quote/compound/fd-aware parser as the
+    // enforcing workspace gate: substring checks for `> /etc/passwd` miss the equally valid
+    // `>/etc/passwd`, `2>/etc/passwd`, and `>"/etc/passwd"` spellings.
+    let critical_files = ["/etc/passwd", "/etc/shadow", "/etc/hosts", "/etc/sudoers"];
+    let normalize_unix_absolute = |target: &str| {
+        if !target.starts_with('/') {
+            return None;
+        }
+        let mut parts: Vec<&str> = Vec::new();
+        for part in target.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                _ => parts.push(part),
+            }
+        }
+        Some(format!("/{}", parts.join("/")))
+    };
+    match scan_redirect_writes(command) {
+        Ok(targets)
+            if targets
+                .iter()
+                .filter_map(|target| normalize_unix_absolute(target))
+                .any(|target| critical_files.contains(&target.as_str())) =>
+        {
             return Some("critical system file overwrite".to_string());
         }
+        Err(()) => return Some("dynamic redirect target".to_string()),
+        _ => {}
     }
     // mkfifo / mknod.
     if cmd.contains("mkfifo ") || cmd.contains("mknod ") {
@@ -3526,6 +3657,28 @@ mod tests {
             "rm -rf ~/important",
             "sudo rm foo",
             "dd if=/dev/zero of=/dev/sda",
+            "dd if=backup.img of=/dev/sda",
+            "dd if=backup.img of=\"/dev/nvme0n1\" bs=4M",
+            "/usr/bin/dd of=/dev/disk2 if=backup.img",
+            "timeout 10 dd if=backup.img of=/dev/mapper/data",
+            "LC_ALL=C dd if=backup.img of=/dev/sdc",
+            "FOO=1 BAR=two /usr/bin/dd if=backup.img of=/dev/sdd",
+            "command dd if=backup.img of=/dev/sde",
+            "builtin dd if=backup.img of=/dev/sdf",
+            "echo ready && dd if=backup.img of=/dev/sdb",
+            "echo test >/etc/passwd",
+            "echo test >>/etc/shadow",
+            "echo test 1>/etc/hosts",
+            "echo test 2>/etc/sudoers",
+            "echo test >\"/etc/passwd\"",
+            "echo ready && printf test >/etc/shadow",
+            "echo test >$DYNAMIC_TARGET",
+            "test z >/etc/passwd",
+            "[ z ] >/etc/shadow",
+            "[[ z > a ]] >/etc/passwd",
+            "(( 2 > 1 )) >/etc/shadow",
+            "echo test >/etc/./hosts",
+            "echo test >//etc/sudoers",
             ":(){ :|:& };:",
             "git push --force origin main",
             "git reset --hard HEAD~3",
@@ -3554,6 +3707,27 @@ mod tests {
             "socat tcp-listen:4444 exec:/bin/sh",
         ] {
             assert_eq!(risk_of(c), RiskLevel::Risky, "{c} should be Risky");
+        }
+    }
+
+    #[test]
+    fn dd_non_device_outputs_are_not_flagged_as_raw_disk_writes() {
+        for c in [
+            "dd if=input.img of=output.img",
+            "dd if=input.img of=/dev/null",
+            "dd if=input.img of=/dev/stdout",
+            "dd if=input.img of=/dev/stderr",
+            "echo 'dd if=input.img of=/dev/sda'",
+            "cd of=/dev/sda",
+            "echo '/etc/passwd'",
+            r"echo \>/etc/passwd",
+            "echo test >/etc/passwd.backup",
+        ] {
+            assert_eq!(
+                risk_of(c),
+                RiskLevel::Safe,
+                "{c} must not be classified as a raw-device write"
+            );
         }
     }
 
@@ -3589,6 +3763,27 @@ mod tests {
         assert!(!had_errors);
         assert_eq!(decode_detected(&gbk), source);
         assert_eq!(decode_oem(&gbk, 0), source);
+    }
+
+    #[test]
+    fn decode_output_recognizes_redirected_utf16_console_text() {
+        let source = "未安装 Linux 分发版。运行 wsl.exe --install <Distro>";
+        let mut little_endian = vec![0xFF, 0xFE];
+        little_endian.extend(source.encode_utf16().flat_map(u16::to_le_bytes));
+        assert_eq!(decode_output(&little_endian), source);
+
+        let ascii_without_bom: Vec<u8> = "Run wsl.exe --list --online"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(
+            decode_output(&ascii_without_bom),
+            "Run wsl.exe --list --online"
+        );
+
+        let localized_without_bom: Vec<u8> =
+            source.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(decode_output(&localized_without_bom), source);
     }
 
     #[test]

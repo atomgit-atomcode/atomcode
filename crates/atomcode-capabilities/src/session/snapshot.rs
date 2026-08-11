@@ -22,7 +22,7 @@ use super::rewind::{
     TRANSACTION_VERSION,
 };
 use super::{
-    now_ms, ModelPricing, ModelUsageStat, PresentationFile, SessionLease, SessionManager,
+    now_ms, ModelUsageStat, PresentationFile, SessionLease, SessionManager,
     SessionMeta, SessionStoreError, TokenBreakdown, TurnStat, WorkspaceCheckpoint,
     WorkspaceCheckpointError, WorkspaceRestoreReceipt,
 };
@@ -151,7 +151,6 @@ impl RewindTransactionReceipt {
 struct ModelAttribution {
     provider_id: String,
     model_id: String,
-    pricing: Option<ModelPricing>,
 }
 
 impl SnapshotHook {
@@ -199,12 +198,10 @@ impl SnapshotHook {
         mut self,
         provider_id: impl Into<String>,
         model_id: impl Into<String>,
-        pricing: Option<ModelPricing>,
     ) -> Self {
         self.attribution = Mutex::new(Some(ModelAttribution {
             provider_id: provider_id.into(),
             model_id: model_id.into(),
-            pricing,
         }));
         self
     }
@@ -216,7 +213,6 @@ impl SnapshotHook {
         &self,
         provider_id: impl Into<String>,
         model_id: impl Into<String>,
-        pricing: Option<ModelPricing>,
     ) {
         *self
             .attribution
@@ -224,7 +220,6 @@ impl SnapshotHook {
             .unwrap_or_else(|error| error.into_inner()) = Some(ModelAttribution {
             provider_id: provider_id.into(),
             model_id: model_id.into(),
-            pricing,
         });
     }
 
@@ -797,8 +792,8 @@ impl LifecycleHooks for SnapshotHook {
             a.used_tokens = meta.used_tokens;
             a.ctx_window = meta.ctx_window;
             // Provider prompt usage includes cached input for the adapters we
-            // support. Store mutually-exclusive buckets so aggregation and
-            // pricing never charge cached tokens twice.
+            // support. Store mutually-exclusive buckets so token aggregation
+            // never counts cached input twice.
             a.tokens.input = a.tokens.input.saturating_add(u64::from(
                 meta.tokens.prompt.saturating_sub(meta.tokens.cached),
             ));
@@ -899,7 +894,6 @@ impl LifecycleHooks for SnapshotHook {
                     provider_id: attribution.provider_id.clone(),
                     model_id: attribution.model_id.clone(),
                     tokens,
-                    pricing: attribution.pricing,
                 }]
             })
             .unwrap_or_default();
@@ -1482,15 +1476,7 @@ mod tests {
     #[tokio::test]
     async fn records_round_count_and_distinct_token_semantics() {
         let (base, mgr, _d) = hook("s1a-stats");
-        let h = base.with_model_attribution(
-            "provider-a",
-            "model-a",
-            Some(ModelPricing {
-                input_per_million: 1.0,
-                output_per_million: 2.0,
-                cached_input_per_million: 0.1,
-            }),
-        );
+        let h = base.with_model_attribution("provider-a", "model-a");
         h.user_prompt_submit(&mut "go".to_string()).await.unwrap();
         h.on_model_response(&mut resp_with_usage(1, 100, 10, 800, 1_000))
             .await;
@@ -1517,7 +1503,7 @@ mod tests {
     #[tokio::test]
     async fn model_attribution_can_switch_between_completed_turns() {
         let (base, mgr, _d) = hook("s1a-model-switch");
-        let h = base.with_model_attribution("provider-a", "model-a", None);
+        let h = base.with_model_attribution("provider-a", "model-a");
 
         h.user_prompt_submit(&mut "first".to_string())
             .await
@@ -1533,7 +1519,7 @@ mod tests {
         )
         .await;
 
-        h.set_model_attribution("provider-b", "model-b", None);
+        h.set_model_attribution("provider-b", "model-b");
         h.user_prompt_submit(&mut "second".to_string())
             .await
             .unwrap();

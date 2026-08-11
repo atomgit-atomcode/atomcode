@@ -20,7 +20,9 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
 
 fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode) {
     const DEFAULT_HOST: &str = "127.0.0.1";
-    const DEFAULT_PORT: u16 = 13456;
+    // Shared with `atomcode daemon --port`'s clap default, which used to carry
+    // its own `13456` literal.
+    const DEFAULT_PORT: u16 = atomcode_config::distribution::DAEMON_PORT;
 
     let mut host: Option<String> = None;
     let mut port: Option<u16> = None;
@@ -126,6 +128,10 @@ fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode) {
 
 #[tokio::main]
 async fn main() {
+    // Before any config read. The daemon is launched by the VS Code extension
+    // rather than by the CLI, so it resolves the tree on its own.
+    atomcode_config::distribution::bootstrap_home();
+
     // On Windows, when built as a GUI-subsystem binary (windows_subsystem = "windows"),
     // there is no default console. If launched from a terminal (cmd.exe / PowerShell),
     // re-attach to the parent's console so eprintln!/tracing output is visible.
@@ -155,13 +161,19 @@ async fn main() {
 
     let (host, port, cli_override, idle_timeout_secs, startup_mode) = parse_daemon_args();
 
+    let token_store = atomcode_daemon::auth_token::WebuiTokenStore::new();
+    let daemon_token = atomcode_daemon::resolve_daemon_token(
+        std::env::var("ATOMCODE_DAEMON_TOKEN").ok(),
+        &token_store,
+    );
+
     if let Err(e) = run_server(ServerOpts {
         host,
         port,
         cli_override,
         idle_timeout_secs,
         startup_mode,
-        webui_tokens: None,
+        webui_tokens: Some(token_store),
         // 独立二进制：保留完整启动横幅。
         quiet: false,
         // 独立二进制 / VSCode：沿用 config 的 default_workdir，不覆盖。
@@ -170,6 +182,7 @@ async fn main() {
         prebound_listener: None,
         // 独立 daemon 模式不需要 app user_id 校验。
         app_user_id: None,
+        daemon_token_file: Some(daemon_token),
     })
     .await
     {

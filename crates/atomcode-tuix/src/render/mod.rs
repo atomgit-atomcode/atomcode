@@ -112,6 +112,18 @@ pub enum UiLine {
     ToolGroupSummary {
         text: String,
     },
+    /// Live Task/Team agent projection rendered in the conversation body when
+    /// the persistent Todo/Tasks panel already owns the footer. Repeated events
+    /// with the same `call_id` replace the existing rows in place; `finished`
+    /// freezes the final snapshot into conversation history.
+    AgentGroup {
+        progress: SubtaskProgress,
+        finished: bool,
+    },
+    /// Freeze every live conversation-body Agent block at its current
+    /// snapshot, used when Todo stops owning the footer and Task/Team progress
+    /// returns to the fixed panel.
+    AgentGroupsFreeze,
     ToolResult {
         success: bool,
         summary: String,
@@ -329,6 +341,16 @@ pub trait Renderer: Send {
     /// Close the envelope opened by `begin_sync()` (after landing the final
     /// frame inside it). Default no-op. Must be paired with `begin_sync()`.
     fn end_sync(&mut self) {}
+
+    /// Rebuild an initial `/resume` replay in memory instead of eagerly
+    /// scrolling every historical row through the host terminal.
+    fn begin_initial_history_replay(&mut self) {}
+
+    /// Emit the bounded suffix retained by `begin_initial_history_replay`.
+    fn end_initial_history_replay(&mut self) {}
+
+    /// Configure the terminal projection cap. `None` preserves full replay.
+    fn set_history_replay_max_rows(&mut self, _max_rows: Option<usize>) {}
 
     /// Suppress automatic clipboard copy during history replay so that
     /// `/resume`, `/undo` and `atomcode -c` don't overwrite the user's
@@ -614,8 +636,9 @@ pub struct StatusLine {
     /// conversations that never used todowrite). Carries raw fields; the
     /// renderer owns glyph/width/terminal-safety (mirrors GoalStatus).
     pub todo: Option<TodoProgress>,
-    /// Active `task` fan-out, rendered as a fixed panel above the input. While
-    /// present it takes the expanded top-panel slot and TodoWrite collapses.
+    /// Active `task`/Team fan-out rendered as a fixed panel above the input when
+    /// no Todo/Tasks plan already owns that slot. With an active Todo plan the
+    /// same projection is routed to a live conversation-body Agent block.
     pub subtasks: Option<SubtaskProgress>,
     /// When the approval panel is active (user must confirm/deny a tool call),
     /// this carries its current state for the dedicated footer approval panel
@@ -677,8 +700,8 @@ pub struct ApprovalPanelView {
 
 /// Renderer-facing snapshot of the `request_user_input` panel (mirrors
 /// `ApprovalPanelView`). Header + question + the mode-specific body: a
-/// reverse-highlight option list (single), `[x]`/`[ ]` checkboxes (multiple),
-/// or a `> {buffer}` input row (text).
+/// highlighted option list (single), `[x]`/`[ ]` checkboxes (multiple),
+/// or a bordered input field (text).
 #[derive(Debug, Clone)]
 pub struct UserInputPanelView {
     pub header: String,
@@ -721,8 +744,18 @@ pub struct UserInputBatchMeta {
     pub index: usize,
     /// Per-question answered flags (for the ✓/○ markers), length `total`.
     pub answered: Vec<bool>,
+    /// Full question/answer projection for the final review page.
+    pub summaries: Vec<UserInputAnswerSummary>,
     /// The cursor is on the Submit stop (render the submit screen, not a question).
     pub on_submit: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserInputAnswerSummary {
+    pub header: String,
+    pub question: String,
+    /// `None` is shown explicitly as unanswered and is serialized as declined.
+    pub answer: Option<String>,
 }
 
 /// Build a [`UserInputPanelView`] for the round-cap checkpoint panel (style B:
@@ -816,6 +849,7 @@ pub enum SubtaskStatus {
     Pending,
     Running,
     Completed,
+    Stopped,
     Failed,
 }
 

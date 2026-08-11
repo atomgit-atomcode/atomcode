@@ -2,6 +2,21 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A source location normalized for model-facing output. Lines and columns are
+/// one-based even though LSP uses zero-based positions on the wire.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Location {
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+impl Location {
+    pub fn display_line(&self) -> String {
+        format!("{}:{}:{}", self.file, self.line, self.column)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DiagnosticSeverity {
     Error = 1,

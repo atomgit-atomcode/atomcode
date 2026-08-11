@@ -106,17 +106,40 @@ pub struct ToolDef {
 #[derive(Clone)]
 pub struct ProgressSink {
     inner: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    source_id: Option<Arc<str>>,
 }
 
 impl ProgressSink {
     /// A sink that discards (no driver listening). The default.
     pub fn noop() -> Self {
-        Self { inner: None }
+        Self {
+            inner: None,
+            source_id: None,
+        }
     }
     /// A sink backed by `f`. The kernel installs one that forwards to the driver event
     /// stream, tagging each message with the executing call's id.
     pub fn new(f: Arc<dyn Fn(String) + Send + Sync>) -> Self {
-        Self { inner: Some(f) }
+        Self {
+            inner: Some(f),
+            source_id: None,
+        }
+    }
+    /// Build a sink whose generic progress stream is correlated to a stable
+    /// source id. The kernel uses the tool call id; composed tools may reuse it
+    /// to correlate richer side-channel projections without depending on event
+    /// arrival order.
+    pub fn with_source_id(
+        source_id: impl Into<Arc<str>>,
+        f: Arc<dyn Fn(String) + Send + Sync>,
+    ) -> Self {
+        Self {
+            inner: Some(f),
+            source_id: Some(source_id.into()),
+        }
+    }
+    pub fn source_id(&self) -> Option<&str> {
+        self.source_id.as_deref()
     }
     /// Report incremental progress to the driver. No-op if no driver is listening.
     pub fn emit(&self, message: impl Into<String>) {
@@ -136,6 +159,7 @@ impl std::fmt::Debug for ProgressSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProgressSink")
             .field("active", &self.inner.is_some())
+            .field("source_id", &self.source_id)
             .finish()
     }
 }
@@ -463,6 +487,14 @@ mod tests {
     fn progress_noop_sink_is_silent() {
         ProgressSink::noop().emit("ignored"); // no listener → must not panic
         ProgressSink::default().emit("also ignored");
+    }
+
+    #[test]
+    fn progress_sink_exposes_optional_source_identity() {
+        let sink = ProgressSink::with_source_id("call-7", Arc::new(|_| {}));
+        assert_eq!(sink.source_id(), Some("call-7"));
+        assert_eq!(ProgressSink::new(Arc::new(|_| {})).source_id(), None);
+        assert_eq!(ProgressSink::noop().source_id(), None);
     }
 
     #[test]

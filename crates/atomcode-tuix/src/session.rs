@@ -158,6 +158,15 @@ impl TuiSession {
             .collect();
         let mut display_messages = Vec::with_capacity(view.presentation.entries.len());
         for entry in view.presentation.entries {
+            // Presentation entries are display-only and do not participate in snapshot
+            // message indexing. Legacy builds could persist injected reminders here
+            // without provenance, so the reserved canonical wrapper remains a safe
+            // compatibility filter at this boundary.
+            if entry.role == PresentationRole::User
+                && atomcode_capabilities::reminder::is_system_reminder(&entry.text)
+            {
+                continue;
+            }
             let after_message = match entry.anchor {
                 DisplayAnchor::AtStart => 0,
                 DisplayAnchor::AfterTurn { turn_id } => view
@@ -294,6 +303,81 @@ mod tests {
             format!("{LEGACY_COLD_SUMMARY_PREFIX}older context")
         );
         assert_eq!(out.messages[1].text, "recent");
+    }
+
+    #[test]
+    fn snapshot_ingest_preserves_reminders_for_runtime_roundtrip() {
+        let incoming = SessionSnapshot::new(vec![
+            Message::user("修复登录错误"),
+            Message::user(atomcode_capabilities::reminder::system_reminder(
+                "我就在任务1上！继续任务2！",
+            )),
+            Message::assistant("已修复", vec![]),
+        ]);
+
+        let mut session = Session::new(PathBuf::from("/tmp/project"));
+        session.update_from_conversation_snapshot(incoming);
+
+        assert_eq!(session.messages.len(), 3);
+        assert!(atomcode_capabilities::reminder::is_system_reminder(
+            &session.messages[1].text
+        ));
+        let restored = session.to_conversation_snapshot();
+        assert_eq!(restored.messages, session.messages);
+    }
+
+    #[test]
+    fn catalog_display_messages_skip_injected_system_reminders() {
+        use atomcode_capabilities::session::presentation::PRESENTATION_VERSION;
+        use atomcode_capabilities::session::{
+            DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole,
+        };
+        let view = atomcode_daemon::legacy_convert::CatalogSessionView {
+            snapshot: SessionSnapshot::new(vec![Message::user("修复登录错误")]),
+            meta: atomcode_capabilities::session::SessionMeta::new(
+                "reminder-session",
+                "/project",
+                1,
+            ),
+            presentation: PresentationFile {
+                v: PRESENTATION_VERSION,
+                entries: vec![
+                    PresentationEntry {
+                        anchor: DisplayAnchor::AtStart,
+                        role: PresentationRole::User,
+                        text: atomcode_capabilities::reminder::system_reminder(
+                            "我就在任务1上！继续任务2！",
+                        ),
+                    },
+                    PresentationEntry {
+                        anchor: DisplayAnchor::AtStart,
+                        role: PresentationRole::Assistant,
+                        text: "已修复".into(),
+                    },
+                    PresentationEntry {
+                        anchor: DisplayAnchor::AtStart,
+                        role: PresentationRole::Assistant,
+                        text: atomcode_capabilities::reminder::system_reminder(
+                            "这是 assistant 对标签的解释",
+                        ),
+                    },
+                ],
+            },
+        };
+
+        let session = Session::from_catalog_view(view).unwrap();
+
+        assert_eq!(
+            session
+                .display_messages
+                .iter()
+                .map(|d| d.message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "已修复",
+                "<system-reminder>\n这是 assistant 对标签的解释\n</system-reminder>"
+            ]
+        );
     }
 
     #[test]

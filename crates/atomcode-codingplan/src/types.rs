@@ -99,6 +99,7 @@ pub struct ClaimResponse {
 ///   "base_url": "https://api-ai.gitcode.com/v1",
 ///   "type": "openai",
 ///   "context_window": 64000,
+///   "supports_vision": true,
 ///   "plan_available": true
 /// }
 /// ```
@@ -145,6 +146,12 @@ pub struct ModelEntry {
     /// silently truncated.
     #[serde(default)]
     pub context_window: Option<usize>,
+    /// Explicit vision capability advertised by `models-v2`. `None` keeps
+    /// compatibility with older servers and lets `ProviderConfig` fall back
+    /// to its existing model-name heuristic; `Some(false)` must remain an
+    /// authoritative opt-out even when the model name looks vision-capable.
+    #[serde(default)]
+    pub supports_vision: Option<bool>,
     /// `true` iff the user's current plan tier (the one their `claim-v2`
     /// succeeded on) covers this model. `false` means it's a higher-tier
     /// model — show with strikethrough but DON'T register as a provider

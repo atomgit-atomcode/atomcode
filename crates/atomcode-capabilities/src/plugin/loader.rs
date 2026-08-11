@@ -87,9 +87,31 @@ fn expand_cc_hooks(cc_map: &CCHooksMap, plugin_root: &Path) -> Vec<PluginCcHook>
 }
 
 /// Parse a CC-format hooks file. `None` on missing/malformed (skip, never wedge).
+///
+/// Accepts two equivalent shapes — the bare event map and the settings-style
+/// `{ "hooks": { … } }` wrapper used by `~/.claude/settings.json` and several
+/// third-party plugins (e.g. superpowers' `hooks/hooks.json`):
+///
+/// ```json
+/// { "SessionStart": [ { "hooks": [ … ] } ] }
+/// ```
+/// vs.
+/// ```json
+/// { "hooks": { "SessionStart": [ { "hooks": [ … ] } ] } }
+/// ```
 fn load_cc_hooks_file(path: &Path) -> Option<CCHooksMap> {
     let raw = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<CCHooksMap>(&raw).ok()
+    if let Ok(map) = serde_json::from_str::<CCHooksMap>(&raw) {
+        return Some(map);
+    }
+    // Wrapped form: `{ "hooks": { … } }`. Deserialize into a helper and unwrap.
+    #[derive(serde::Deserialize)]
+    struct HooksWrapper {
+        hooks: CCHooksMap,
+    }
+    serde_json::from_str::<HooksWrapper>(&raw)
+        .ok()
+        .map(|w| w.hooks)
 }
 
 /// File-based plugin hooks, drilling the CC default layout: `hooks/hooks.json`
@@ -361,6 +383,24 @@ mod tests {
         assert_eq!(hooks.len(), 1);
         assert_eq!(hooks[0].event, "PreToolUse");
         assert_eq!(hooks[0].matcher.as_deref(), Some("Bash"));
+    }
+
+    #[test]
+    fn file_cc_hooks_parses_wrapped_settings_format() {
+        // Claude Code settings.json / superpowers style: outer `{ "hooks": { … } }`.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("hooks")).unwrap();
+        std::fs::write(
+            dir.join("hooks/hooks.json"),
+            r#"{"hooks":{"SessionStart":[{"matcher":"startup|clear|compact","hooks":[{"type":"command","command":"echo wrapped","shell":"bash","async":false}]}]}}"#,
+        )
+        .unwrap();
+        let hooks = plugin_file_cc_hooks(dir);
+        assert_eq!(hooks.len(), 1, "wrapped hooks must be parsed");
+        assert_eq!(hooks[0].event, "SessionStart");
+        assert_eq!(hooks[0].command, "echo wrapped");
+        assert_eq!(hooks[0].matcher.as_deref(), Some("startup|clear|compact"));
     }
 
     #[test]

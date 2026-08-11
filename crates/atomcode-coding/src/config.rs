@@ -7,65 +7,6 @@ use std::time::Duration;
 use atomcode_config::locale::Locale;
 use atomcode_kernel::agent::ToolLoopPolicy;
 
-/// Resolve the immutable price snapshot for one runtime generation.
-///
-/// Explicit config (including CodingPlan's all-zero entitlement price) wins.
-/// models.dev is only a best-effort fallback for an exact provider/model or
-/// official API URL/model match.
-pub fn resolve_provider_pricing(
-    provider_name: &str,
-    provider: &atomcode_config::config::provider::ProviderConfig,
-) -> Option<atomcode_capabilities::session::ModelPricing> {
-    let pricing = provider
-        .pricing
-        .and_then(|pricing| pricing.validated())
-        .map(|pricing| atomcode_capabilities::provider::CatalogPricing {
-            input_per_million: pricing.input_per_million,
-            output_per_million: pricing.output_per_million,
-            cached_input_per_million: pricing.cached_input_per_million,
-        })
-        .or_else(|| {
-            atomcode_capabilities::provider::resolve_models_dev_pricing(
-                provider_name,
-                provider.base_url.as_deref().unwrap_or_default(),
-                &provider.model,
-            )
-        })?;
-    Some(atomcode_capabilities::session::ModelPricing {
-        input_per_million: pricing.input_per_million,
-        output_per_million: pricing.output_per_million,
-        cached_input_per_million: pricing.cached_input_per_million,
-    })
-}
-
-/// Pricing for an already-resolved model selection — the new resolution path
-/// (design §14.1/§14.5). Mirrors [`resolve_provider_pricing`] but reads the
-/// flattened [`ResolvedModelConfig`] instead of a raw `ProviderConfig`.
-pub fn resolve_resolved_pricing(
-    resolved: &atomcode_config::config::provider::ResolvedModelConfig,
-) -> Option<atomcode_capabilities::session::ModelPricing> {
-    let pricing = resolved
-        .pricing
-        .and_then(|pricing| pricing.validated())
-        .map(|pricing| atomcode_capabilities::provider::CatalogPricing {
-            input_per_million: pricing.input_per_million,
-            output_per_million: pricing.output_per_million,
-            cached_input_per_million: pricing.cached_input_per_million,
-        })
-        .or_else(|| {
-            atomcode_capabilities::provider::resolve_models_dev_pricing(
-                &resolved.selection_id,
-                resolved.base_url.as_deref().unwrap_or_default(),
-                &resolved.model,
-            )
-        })?;
-    Some(atomcode_capabilities::session::ModelPricing {
-        input_per_million: pricing.input_per_million,
-        output_per_million: pricing.output_per_million,
-        cached_input_per_million: pricing.cached_input_per_million,
-    })
-}
-
 /// Everything [`build_coding_agent`](crate::build_coding_agent) needs: provider
 /// credentials, the working directory the tools are scoped to, and liveness bounds.
 ///
@@ -77,6 +18,9 @@ pub struct CodingAgentConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    /// Final image-input capability resolved from the model profile override or
+    /// the backwards-compatible Auto heuristic.
+    pub supports_vision: bool,
     /// Preferred language for natural-language commit subjects and bodies.
     /// `None` means follow the current conversation language.
     pub preferred_language: Option<Locale>,
@@ -119,9 +63,6 @@ pub struct CodingAgentConfig {
     /// headless/daemon/ACP paths do not incur a hidden model request before they
     /// implement the corresponding UI. The interactive TUI opts in explicitly.
     pub next_prompt_suggestions: bool,
-    /// Immutable price snapshot for this runtime generation. `None` means the
-    /// configured model's price is unknown.
-    pub pricing: Option<atomcode_capabilities::session::ModelPricing>,
     /// Exact no-progress loop policy. `None` disables it for explicitly intentional
     /// identical repetition. Defaults to 3/4 and is configurable through
     /// `ATOMCODE_TOOL_LOOP_WARNING_THRESHOLD` / `ATOMCODE_TOOL_LOOP_STOP_THRESHOLD`;
@@ -179,6 +120,9 @@ pub struct CodingAgentConfig {
     /// /unknown ⇒ Exa. Mirrors v1's `[web_search] provider` config knob — without this the
     /// tool was hardwired to Exa with no way to opt into DDG.
     pub web_search_provider: Option<String>,
+    /// Opt-in read-only LSP policy. The manager is created by this runtime's tool
+    /// assembly, so provider/session reloads cannot create a second hidden owner.
+    pub lsp: atomcode_capabilities::codeintel::LspSettings,
     /// On Ctrl-C / cancel: `false` (default) ⇒ CANCEL = UNDO (roll back the interrupted
     /// turn). `true` ⇒ PRESERVE the partial turn + backfill dangling tool_calls + inject
     /// an interruption marker, forwarded to the kernel `Agent` builder
@@ -244,7 +188,32 @@ pub struct CodingRuntimeConfig {
     /// Driver opt-in for ephemeral next-prompt sampling. Default false;
     /// currently only the interactive TUI renders and accepts the result.
     pub next_prompt_suggestions: bool,
-    pub pricing: Option<atomcode_capabilities::session::ModelPricing>,
+    pub supports_vision: bool,
+    pub lsp: atomcode_capabilities::codeintel::LspSettings,
+}
+
+pub fn lsp_settings_from_config(
+    config: &atomcode_config::config::LspConfig,
+) -> atomcode_capabilities::codeintel::LspSettings {
+    atomcode_capabilities::codeintel::LspSettings {
+        enabled: config.enabled,
+        auto_detect: config.auto_detect,
+        settle_delay_ms: config.diagnostics_settle_delay_ms,
+        servers: config
+            .servers
+            .iter()
+            .map(|(extension, server)| {
+                (
+                    extension.clone(),
+                    atomcode_capabilities::codeintel::LspServerSetting {
+                        command: server.command.clone(),
+                        args: server.args.clone(),
+                        root_markers: server.root_markers.clone(),
+                    },
+                )
+            })
+            .collect(),
+    }
 }
 
 impl CodingRuntimeConfig {
@@ -274,12 +243,12 @@ impl CodingRuntimeConfig {
             ids.into_iter()
                 .find_map(|id| config.resolve_model(Some(&id)).ok())
         });
-        let pricing = resolved.as_ref().and_then(resolve_resolved_pricing);
         let r = resolved.as_ref();
         Self {
             api_key: r.and_then(|r| r.api_key.clone()).unwrap_or_default(),
             base_url: r.and_then(|r| r.base_url.clone()).unwrap_or_default(),
             model: r.map(|r| r.model.clone()).unwrap_or_default(),
+            supports_vision: r.map(|r| r.supports_vision).unwrap_or(false),
             preferred_language: Some(atomcode_config::i18n::resolve_initial_locale(
                 None,
                 config.language,
@@ -318,7 +287,7 @@ impl CodingRuntimeConfig {
             // TUI spawn sites and `event_loop::reload_runtime_provider_from`).
             round_cap_checkpoint: false,
             next_prompt_suggestions: false,
-            pricing,
+            lsp: lsp_settings_from_config(&config.lsp),
         }
     }
 
@@ -330,6 +299,7 @@ impl CodingRuntimeConfig {
             &self.working_dir,
         );
         config.context_window = self.context_window;
+        config.supports_vision = self.supports_vision;
         config.preferred_language = self.preferred_language;
         config.todo = self.todo.clone();
         config.provider_name = self.provider_name.clone();
@@ -356,7 +326,7 @@ impl CodingRuntimeConfig {
         config.keep_interrupted_context = self.keep_interrupted_context;
         config.round_cap_checkpoint = self.round_cap_checkpoint;
         config.next_prompt_suggestions = self.next_prompt_suggestions;
-        config.pricing = self.pricing;
+        config.lsp = self.lsp.clone();
         config
     }
 }
@@ -366,7 +336,7 @@ pub fn apply_provider_config(
     provider: &atomcode_config::config::provider::ProviderConfig,
 ) {
     config.model = provider.model.clone();
-    config.pricing = resolve_provider_pricing(&config.provider_name, provider);
+    config.supports_vision = provider.accepts_images();
     if let Some(base_url) = &provider.base_url {
         config.base_url = base_url.clone();
     }
@@ -632,6 +602,7 @@ impl CodingAgentConfig {
             api_key: api_key.into(),
             base_url: base_url.into(),
             provider_name: model.clone(),
+            supports_vision: atomcode_capabilities::provider::model_suggests_vision(&model),
             model,
             preferred_language: None,
             todo: Default::default(),
@@ -643,7 +614,6 @@ impl CodingAgentConfig {
             max_rounds: default_turn_max_rounds(),
             round_cap_checkpoint: false,
             next_prompt_suggestions: false,
-            pricing: None,
             tool_loop_policy: default_tool_loop_policy(),
             goal_max_rounds: default_goal_max_rounds(),
             goal_max_duration_secs: default_goal_max_duration_secs(),
@@ -658,6 +628,7 @@ impl CodingAgentConfig {
             thinking_keep: None,
             compact_threshold: 0.7,
             web_search_provider: None,
+            lsp: Default::default(),
             keep_interrupted_context: false,
             user_agent: None,
             skip_tls_verify: false,
@@ -681,6 +652,41 @@ mod tests {
         // The wall-clock cap is OFF by default (0 = disabled); the goal is bounded
         // by the round cap + evaluator instead. Re-enable via env if ever needed.
         assert_eq!(c.goal_max_duration_secs, 0);
+    }
+
+    #[test]
+    fn lsp_config_maps_to_runtime_and_agent_without_becoming_default_on() {
+        let mut config = atomcode_config::config::Config::default();
+        assert!(!config.lsp.enabled);
+        config.lsp.enabled = true;
+        config.lsp.auto_detect = false;
+        config.lsp.diagnostics_settle_delay_ms = 725;
+        config.lsp.servers.insert(
+            ".rs".into(),
+            atomcode_config::lsp_registry::LspServerConfig {
+                command: "custom-ra".into(),
+                args: vec!["--stdio".into()],
+                root_markers: vec!["Cargo.toml".into()],
+            },
+        );
+        let runtime = CodingRuntimeConfig::from_config(
+            &config,
+            std::path::Path::new("/workspace"),
+            None,
+            None,
+            false,
+            false,
+        );
+        assert!(runtime.lsp.enabled);
+        assert!(!runtime.lsp.auto_detect);
+        assert_eq!(runtime.lsp.settle_delay_ms, 725);
+        let agent = runtime.agent_config();
+        let rust = agent.lsp.servers.get(".rs").unwrap();
+        assert_eq!(rust.command, "custom-ra");
+        assert_eq!(rust.args, vec!["--stdio"]);
+
+        let defaults = CodingAgentConfig::new("", "", "", "/workspace");
+        assert!(!defaults.lsp.enabled);
     }
 
     #[test]
@@ -867,25 +873,37 @@ mod tests {
     }
 
     #[test]
-    fn explicit_provider_pricing_wins_without_a_catalog() {
-        let provider: atomcode_config::config::provider::ProviderConfig =
-            serde_json::from_value(serde_json::json!({
-                "type": "openai",
-                "model": "custom-model",
-                "base_url": "https://custom-proxy.example/v1",
-                "system_prompt": null,
-                "pricing": {
-                    "input_per_million": 1.25,
-                    "output_per_million": 2.5,
-                    "cached_input_per_million": 0.5
+    fn explicit_vision_override_reaches_runtime_agent_config() {
+        let source: atomcode_config::config::Config = serde_json::from_value(serde_json::json!({
+            "default_model": "custom/qwen",
+            "provider_accounts": {
+                "custom": {
+                    "provider": "openai",
+                    "api_key": "sk-custom",
+                    "base_url": "https://example.invalid/v1"
                 }
-            }))
-            .unwrap();
+            },
+            "models": {
+                "custom/qwen": {
+                    "account": "custom",
+                    "model": "qwen3.8max",
+                    "supports_vision": true
+                }
+            }
+        }))
+        .unwrap();
 
-        let pricing = resolve_provider_pricing("deepseek", &provider).unwrap();
-        assert_eq!(pricing.input_per_million, 1.25);
-        assert_eq!(pricing.output_per_million, 2.5);
-        assert_eq!(pricing.cached_input_per_million, 0.5);
+        let runtime = CodingRuntimeConfig::from_config(
+            &source,
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            true,
+        );
+
+        assert!(runtime.supports_vision);
+        assert!(runtime.agent_config().supports_vision);
     }
 
     #[test]

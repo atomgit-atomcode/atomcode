@@ -49,6 +49,11 @@ use atomcode_telemetry::{
 /// and on Windows can panic if the console handle isn't a real TTY.
 static HEADLESS_MODE: AtomicBool = AtomicBool::new(false);
 
+/// Set once the startup synchronous upgrade check has run this launch, so the
+/// post-parse detached stager can skip a redundant second `latest.json` fetch —
+/// the sync path already checked (and applied, if newer) on this same launch.
+static SYNC_UPGRADE_CHECKED: AtomicBool = AtomicBool::new(false);
+
 /// Restore terminal state if (and only if) we ever entered TUI mode.
 /// No-op in headless mode — see [`HEADLESS_MODE`].
 ///
@@ -347,6 +352,193 @@ async fn run_prepare_upgrade_worker() -> i32 {
     }
 }
 
+/// Whether the startup-time SYNCHRONOUS upgrade path should fire. Restored (with the
+/// detached stager kept alongside) after 31daa6ee removed it: the everyday startup cost
+/// this guards is only a small `latest.json` fetch, so a fresh release is applied on THIS launch
+/// instead of requiring two restarts. Returns false for `.bak`, dev, `ATOMCODE_PLAIN`,
+/// headless `-p`, subcommands, `auto_update = false`, or offline mode.
+fn should_try_sync_upgrade() -> bool {
+    if is_running_as_backup() {
+        return false;
+    }
+    if is_dev_mode() {
+        return false;
+    }
+    // Package-managed (distro-pm / HarmonyBrew) builds: upgrades belong to the package
+    // manager. Match the detached stager's gate so we don't spin up the check for a
+    // guaranteed no-op (`prepare_deferred_upgrade` early-returns on pm builds anyway).
+    if atomcode_updater::is_package_managed() {
+        return false;
+    }
+
+    // PlainRenderer 模式（ATOMCODE_PLAIN=1）：跳过同步自更新检查。
+    // 自更新用 eprintln! 直接写 stderr，和 PlainRenderer 的 stdout
+    // 流式输出交错，破坏启动体验。后台异步自更新不受影响，用户仍可
+    // 手动 /upgrade。
+    if std::env::var("ATOMCODE_PLAIN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_some()
+    {
+        return false;
+    }
+
+    let args: Vec<String> = std::env::args().collect();
+    let any = |needle: &[&str]| {
+        args.iter().skip(1).any(|a| {
+            needle
+                .iter()
+                .any(|n| a == n || a.starts_with(&format!("{}=", n)))
+        })
+    };
+
+    if any(&["-p", "--prompt", "--prompt-file"]) {
+        return false;
+    }
+    if args.iter().skip(1).any(|a| {
+        matches!(
+            a.as_str(),
+            "login"
+                | "logout"
+                | "status"
+                | "upgrade"
+                | "rollback"
+                | "uninstall"
+                | "mcp"
+                | "telemetry"
+                | "completion"
+                | "--version"
+                | "-V"
+                | "--help"
+                | "-h"
+        )
+    }) {
+        return false;
+    }
+
+    // Load config once to honor both `auto_update = false` and `offline_mode`.
+    // Runs pre-seed, so offline is resolved directly rather than via the process
+    // verdict. Env wins over config; only forced On skips. Failure to load = assume
+    // defaults (auto_update true, offline Off) — fresh installs benefit.
+    let path = atomcode_config::config::Config::default_path();
+    let offline_mode = if path.exists() {
+        if let Ok(cfg) = atomcode_config::config::Config::load(&path) {
+            if !cfg.auto_update {
+                return false;
+            }
+            cfg.offline_mode
+        } else {
+            atomcode_config::config::offline::OfflineMode::Off
+        }
+    } else {
+        atomcode_config::config::offline::OfflineMode::Off
+    };
+    // Offline (env wins over config; only forced On skips) disables binary self-update,
+    // same as auto_update=false. Works even with no config file (e.g. air-gapped container).
+    if atomcode_config::config::offline::offline_resolved(
+        offline_mode,
+        std::env::var(atomcode_config::config::offline::ATOMCODE_OFFLINE_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        return false;
+    }
+
+    true
+}
+
+/// Synchronous startup upgrade: fetch the manifest, and if a newer version is out,
+/// stage + apply it NOW and re-exec, so the user gets the new binary on THIS launch.
+/// Bounded by a 120s timeout; on timeout/error it just continues (the detached stager
+/// and `/upgrade` remain as fallbacks). Restored verbatim from the pre-31daa6ee path.
+async fn sync_stage_and_apply_if_newer() {
+    use atomcode_updater::{self as self_update, UpgradeEvent};
+
+    let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UpgradeEvent>();
+
+    // Progress consumer: renders ManifestFetched / Downloading / Verifying
+    // as a single-line updating status on stderr. Percent-debounced so a
+    // 15 MB download at 64 KiB chunks doesn't flood the terminal.
+    let progress = tokio::spawn(async move {
+        use std::io::Write;
+        let mut last_pct: i32 = -1;
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                UpgradeEvent::ManifestFetched { version } => {
+                    eprintln!("✨ New version available: {}", version);
+                }
+                UpgradeEvent::Downloading { bytes, total } => {
+                    let pct = if total == 0 {
+                        0
+                    } else {
+                        ((bytes * 100) / total) as i32
+                    };
+                    if pct != last_pct {
+                        eprint!(
+                            "\r   Downloading {}% ({:.1} / {:.1} MB)      ",
+                            pct,
+                            bytes as f64 / 1_048_576.0,
+                            total as f64 / 1_048_576.0
+                        );
+                        let _ = std::io::stderr().flush();
+                        last_pct = pct;
+                    }
+                }
+                UpgradeEvent::Verifying => {
+                    eprintln!("\n✓ Verifying sha256");
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        self_update::prepare_deferred_upgrade(&current, tx),
+    )
+    .await;
+
+    // Wait briefly for the progress consumer to drain — it closes when
+    // the sender drops at the end of prepare_deferred_upgrade.
+    let _ = progress.await;
+
+    match outcome {
+        Ok(Ok(Some(_staged))) => {
+            // Staged successfully. Apply right now so the user gets the new
+            // binary on this same invocation.
+            match self_update::apply_pending_upgrade() {
+                Ok(Some(applied)) => {
+                    eprintln!("✓ Upgrading to {}...", applied.version);
+                    // Save the CURRENT version (before upgrade) so TUI can show "Upgraded old → new"
+                    std::env::set_var(UPGRADED_FROM_ENV, &current);
+                    match self_update::re_exec_self(Some(&applied.exe)) {
+                        Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
+                        Err(e) => {
+                            eprintln!(
+                                "Upgrade applied but re-exec failed ({}). The new version will be used on the next launch.",
+                                e
+                            );
+                            std::env::remove_var(UPGRADED_FROM_ENV);
+                        }
+                    }
+                }
+                _ => {
+                    // Stage succeeded but apply didn't — weird, just continue.
+                }
+            }
+        }
+        Ok(Ok(None)) => {
+            // Already latest, no-op.
+        }
+        Ok(Err(_)) | Err(_) => {
+            // Network error or 120 s timeout. Don't spam the user —
+            // `/upgrade` will surface the real error if they ask.
+            eprintln!("Note: could not check for updates at startup (will retry in background).");
+        }
+    }
+}
+
 /// Spawn a detached copy of this binary that runs the upgrade-prep worker
 /// and exits. "Detached" means:
 ///   * New session on Unix (`setsid`) — parent's Ctrl+C goes to parent's
@@ -406,8 +598,16 @@ const VERSION: &str = concat!(
     ")"
 );
 
+/// The name this binary is invoked as, taken from `[[bin]] name` rather than
+/// repeated as a literal. It reaches the user in three places that must agree:
+/// the `Usage:` line, the `--help` header, and the `complete -F` registration a
+/// generated completion script installs. Renaming the bin used to leave all
+/// three claiming the old name — and shell completion bound to a command that
+/// no longer exists.
+const BIN_NAME: &str = env!("CARGO_BIN_NAME");
+
 #[derive(Parser)]
-#[command(name = "atomcode", version = VERSION, about = "AI coding assistant in your terminal")]
+#[command(name = BIN_NAME, version = VERSION, about = "AI coding assistant in your terminal")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -519,8 +719,8 @@ enum Commands {
     Mcp(McpCli),
     /// Start the HTTP daemon for IDE integration (VS Code extension connects to this)
     Daemon {
-        /// Port to listen on (default: 13456)
-        #[arg(long, default_value = "13456")]
+        /// Port to listen on
+        #[arg(long, default_value_t = atomcode_config::distribution::DAEMON_PORT)]
         port: u16,
         /// Client identifier for telemetry (e.g. "vscode", "atomcode-air")
         #[arg(long)]
@@ -687,7 +887,7 @@ fn completion_command() -> clap::Command {
         .cloned()
         .collect::<Vec<_>>();
 
-    clap::Command::new("atomcode")
+    clap::Command::new(BIN_NAME)
         .version(VERSION)
         .about("AI coding assistant in your terminal")
         .args(source.get_arguments().cloned())
@@ -697,7 +897,7 @@ fn completion_command() -> clap::Command {
 
 fn print_shell_completion(shell: Shell, out: &mut dyn Write) {
     let mut command = completion_command();
-    clap_complete::generate(shell, &mut command, "atomcode", out);
+    clap_complete::generate(shell, &mut command, BIN_NAME, out);
 }
 
 /// Subcommands for hooks management
@@ -831,6 +1031,8 @@ pub enum TelemetryAction {
     },
     /// Clear queued events (does not change enabled state)
     Clear,
+    /// Recover legacy .partial files after all older AtomCode processes stop
+    Recover,
 }
 
 /// Environment variable set by this process for its re-exec'd child, so
@@ -854,6 +1056,12 @@ fn main() {
     if try_print_shell_completion() {
         return;
     }
+
+    // Settle where the config tree is before anything reads it, so all eight
+    // resolvers — and every child process that inherits our environment —
+    // agree by construction. Deliberately AFTER the completion fast path: that
+    // branch touches no config, and the comment above asks for it to stay bare.
+    atomcode_config::distribution::bootstrap_home();
 
     // Run the entire program on a thread with a large, explicit stack.
     // Rust gives the *main* OS thread the platform-default stack — on
@@ -987,7 +1195,21 @@ async fn async_main() {
                     }
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                // Nothing was staged by a prior session. Do a fresh synchronous
+                // check → stage → apply so a newly-released version is picked up on
+                // THIS launch (restores the pre-31daa6ee "one restart upgrades you"
+                // behavior). The everyday no-update case is just a small latest.json
+                // fetch; should_try_sync_upgrade's gates + a 120s timeout keep
+                // headless / opted-out / offline runs fast, and the detached stager
+                // below stays as the survives-quick-exit fallback.
+                if should_try_sync_upgrade() {
+                    // Remember we checked, so the post-parse detached stager doesn't
+                    // re-fetch the manifest a second time this launch.
+                    SYNC_UPGRADE_CHECKED.store(true, Ordering::Relaxed);
+                    sync_stage_and_apply_if_newer().await;
+                }
+            }
             Err(e) => {
                 eprintln!("Note: pending upgrade could not be applied ({}). Continuing with current version.", e);
             }
@@ -1214,8 +1436,12 @@ async fn run() -> Result<i32> {
                 eprintln!("Press Ctrl+C to stop.");
                 // Run the bundled server IN-PROCESS (same `run_server` the webui uses),
                 // instead of re-exec'ing into a separate `atomcode-daemon` binary that
-                // may not be installed. `webui_tokens: None` ⇒ enforce_token=false
-                // (headless), so loopback channel clients get interactive approval.
+                // may not be installed. This is an equivalent daemon entrypoint to the
+                // standalone `atomcode-daemon` binary, so it MUST enforce the local token
+                // identically (mirror of `atomcode-daemon/src/main.rs`): mint/resolve a
+                // token, enable enforcement, and write `~/.atomcode/daemon-<port>.json`.
+                // Otherwise `atomcode daemon` would be an unauthenticated bypass of the
+                // very surface the token guards.
                 let idle = idle_timeout
                     .or_else(|| {
                         std::env::var("ATOMCODE_DAEMON_IDLE_TIMEOUT")
@@ -1230,6 +1456,11 @@ async fn run() -> Result<i32> {
                     Some("atomcode-air") => atomcode_telemetry::SessionMode::AtomcodeAir,
                     _ => atomcode_telemetry::SessionMode::Ide,
                 };
+                let token_store = atomcode_daemon::auth_token::WebuiTokenStore::new();
+                let daemon_token = atomcode_daemon::resolve_daemon_token(
+                    std::env::var("ATOMCODE_DAEMON_TOKEN").ok(),
+                    &token_store,
+                );
                 let res = atomcode_daemon::run_server(atomcode_daemon::ServerOpts {
                     host: "127.0.0.1".to_string(),
                     port,
@@ -1238,11 +1469,12 @@ async fn run() -> Result<i32> {
                     },
                     idle_timeout_secs: idle,
                     startup_mode,
-                    webui_tokens: None,
+                    webui_tokens: Some(token_store),
                     quiet: false,
                     working_dir_override: None,
                     prebound_listener: None,
                     app_user_id: None,
+                    daemon_token_file: Some(daemon_token),
                 })
                 .await;
                 telemetry
@@ -1281,6 +1513,7 @@ async fn run() -> Result<i32> {
                         telemetry_cmd::dump(&atomcode_dir, last, pretty)?
                     }
                     TelemetryAction::Clear => telemetry_cmd::clear(&atomcode_dir)?,
+                    TelemetryAction::Recover => telemetry_cmd::recover(&atomcode_dir)?,
                 }
                 // Flush telemetry before exiting.
                 telemetry
@@ -1313,9 +1546,6 @@ async fn run() -> Result<i32> {
                     cli.model.as_deref(),
                 );
                 let working_dir = resolve_working_dir(cli.dir.clone());
-                if !atomcode_config::config::offline::is_offline_active() {
-                    atomcode_capabilities::provider::spawn_models_dev_catalog_refresh();
-                }
                 let runtime_cfg = runtime_config_from(
                     &config,
                     &working_dir,
@@ -1497,17 +1727,6 @@ async fn run() -> Result<i32> {
     // config, so the `tool_registry`/`tool_context` assembled above are no longer
     // wired to an agent loop; they remain constructed (unchanged lifetime) pending
     // a follow-up cleanup.
-    let pricing_refresh_spawned = !atomcode_config::config::offline::is_offline_active();
-    if pricing_refresh_spawned {
-        atomcode_capabilities::provider::spawn_models_dev_catalog_refresh();
-    }
-    tracing::info!(
-        target: "atomcode::startup",
-        stage = "pricing_refresh_spawned",
-        spawned = pricing_refresh_spawned,
-        total_ms = run_start.elapsed().as_millis() as u64,
-        "optional metadata refresh detached from startup"
-    );
     let mut runtime_cfg = runtime_config_from(
         &config,
         &working_dir,
@@ -1721,6 +1940,11 @@ async fn run() -> Result<i32> {
                 && !is_running_as_backup()
                 && !cli.dev
                 && !atomcode_updater::is_package_managed()
+                // Skip when the startup synchronous path already checked (and applied,
+                // if newer) this launch — otherwise both fetch `latest.json`. The
+                // detached stager stays as the fallback for launches where the sync
+                // path was skipped (e.g. ATOMCODE_PLAIN).
+                && !SYNC_UPGRADE_CHECKED.load(Ordering::Relaxed)
             {
                 spawn_detached_upgrade_prep();
             }
@@ -1742,6 +1966,7 @@ async fn run() -> Result<i32> {
             let (runtime, coding_cfg) = native_tui_runtime
                 .take()
                 .expect("native TUI runtime built above");
+            let provider_selection = coding_cfg.provider_name.clone();
             let tui_runtime = into_tui_native_runtime(runtime, coding_cfg);
             // Same as the headless arm: don't `?` — a TUI run that ends in an
             // error must still reach the shutdown/flush below. Ok(()) → exit 0;
@@ -1758,6 +1983,7 @@ async fn run() -> Result<i32> {
             );
             match atomcode_tuix::run(
                 config,
+                provider_selection,
                 model_name,
                 provider_selection_mode,
                 atomcode_config::ConfigStore::new(config_path.clone()),
@@ -2152,6 +2378,7 @@ pub(crate) async fn spawn_native_cli_runtime(
         None => (atomcode_coding::SessionMode::Fresh, None, None),
     };
     let prepare = atomcode_coding::PrepareOptions {
+        subagents: atomcode_coding::SubagentPolicy::Enabled,
         session,
         plugin_skill_dirs: atomcode_daemon::gather_plugin_skill_dirs_for(&cfg.working_dir),
         mcp: cfg.mcp,
@@ -3376,7 +3603,7 @@ fn run_codingplan_core(
 static CRASH_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Synchronously append a panic's location + message + backtrace to
-/// `~/.atomcode/logs/panic.log`, then `flush` + `sync_all` so the bytes are
+/// `$ATOMCODE_HOME/logs/panic.log`, then `flush` + `sync_all` so the bytes are
 /// durable **before** the hook returns and the runtime calls `abort()`
 /// (`panic = "abort"` in the release profile).
 ///
@@ -3392,10 +3619,16 @@ fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) {
     if CRASH_LOGGED.swap(true, Ordering::SeqCst) {
         return;
     }
-    let Some(home) = atomcode_config::util::real_home_dir() else {
-        return;
-    };
-    let dir = home.join(".atomcode").join("logs");
+    // Same `logs/` dir as [`atomcode_log_path`], so it must resolve the same
+    // way: that one goes through `Config::config_dir()`, this one used to hard-
+    // code `~/.atomcode`, and with `$ATOMCODE_HOME` set the two split into
+    // different trees — `atomcode.log` where the user configured it, the crash
+    // report somewhere they never look.
+    //
+    // This also drops the old give-up-if-no-home arm: with nothing resolvable
+    // the report now lands in a cwd-relative dir, matching every other path the
+    // process writes, rather than being silently discarded.
+    let dir = atomcode_config::config::Config::config_dir().join("logs");
     let _ = std::fs::create_dir_all(&dir);
     let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)

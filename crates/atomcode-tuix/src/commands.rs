@@ -156,10 +156,9 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "clear",   desc: "Start a new conversation (clears context + screen)", needs_args: false, hidden: false },
     Command { name: "session", desc: "Start a new session (clears conversation)", needs_args: false, hidden: false },
     Command { name: "usage",   desc: "Show CodingPlan usage (tabs: current / overview / models)", needs_args: false, hidden: false },
-    // `/cost` reports THIS SESSION's token cost from local accounting × the model
-    // price table — works for ANY model, including self-integrated ones the
-    // gateway-only `/usage` modal can't see.
-    Command { name: "cost",    desc: "Show this session's token cost (any model)", needs_args: false, hidden: false },
+    // `/cost` reports THIS SESSION's local token accounting for any model,
+    // including self-integrated ones the gateway-only `/usage` modal can't see.
+    Command { name: "cost",    desc: "Show this session's token usage (any model)", needs_args: false, hidden: false },
     Command { name: "context", desc: "Show context budget breakdown", needs_args: false, hidden: false },
     Command { name: "compact", desc: "Compact conversation history", needs_args: false, hidden: false },
     Command { name: "remember", desc: "Save a fact to memory (/remember --global for global)", needs_args: true, hidden: false },
@@ -189,6 +188,9 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // requires the condition text; `/goal status` / `/goal clear` still work by
     // typing the sub-command + Enter.
     Command { name: "goal",    desc: "Set a completion goal (autonomous loop until met)", needs_args: true, hidden: false },
+    // Palette selection completes to `/team ` and waits for the management
+    // subcommand instead of immediately executing the default status action.
+    Command { name: "team",    desc: "Show or manage the Team Agent panel", needs_args: true, hidden: false },
     Command { name: "loop",    desc: "Repeat a prompt/command on an interval, or let the model self-pace", needs_args: true, hidden: false },
     Command { name: "help",    desc: "Show this help", needs_args: false, hidden: false },
     Command { name: "guide",   desc: "Ask atomcode-guide how to use", needs_args: true, hidden: false },
@@ -284,6 +286,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "goal" => Msg::CmdDescGoal,
         "proxy" => Msg::CmdDescProxy,
         "todo" => Msg::CmdDescTodo,
+        "team" => Msg::CmdDescTeam,
         "loop" => Msg::CmdDescLoop,
         "schedule" => Msg::CmdDescSchedule,
         "desktop" => Msg::CmdDescDesktop,
@@ -519,6 +522,16 @@ mod tests {
         assert!(
             goal.needs_args,
             "/goal selection must wait for the goal text"
+        );
+    }
+
+    #[test]
+    fn team_needs_args_so_selection_waits_for_subcommand() {
+        let reg = CommandRegistry::builtin();
+        let team = reg.find("team").expect("/team must be a built-in command");
+        assert!(
+            team.needs_args,
+            "/team selection must wait for show/hide/status/clear"
         );
     }
 

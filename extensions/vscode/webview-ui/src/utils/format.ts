@@ -2,6 +2,11 @@ import type { MsgKey } from '../i18n';
 
 type Translator = (key: MsgKey, params?: Record<string, string | number | boolean>) => string;
 
+/** Build a data: URL from an in-memory base64 image payload. */
+export function imageDataUrl(img: { media_type: string; data: string }): string {
+  return `data:${img.media_type};base64,${img.data}`;
+}
+
 export function formatTokenCount(total: number, t?: Translator): string {
   if (total < 1000) return t ? t('token.count', { count: total }) : `${total} tokens`;
   const count = (total / 1000).toFixed(1);

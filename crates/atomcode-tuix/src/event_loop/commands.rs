@@ -30,7 +30,7 @@ use crate::custom_commands::ArgsRequirement;
 use crate::i18n::{t, Msg};
 use crate::modals::usage::{UsageData, UsageModal};
 use crate::modals::{
-    DiffViewer, DirPicker, FileViewer, LanguagePicker, Modal, ModelPicker, ProxyPicker,
+    ConfigPanel, DiffViewer, DirPicker, FileViewer, LanguagePicker, Modal, ModelPicker, ProxyPicker,
 };
 use crate::render::{Renderer, UiLine};
 use crate::session::{Session, SessionId};
@@ -563,9 +563,35 @@ fn live_provider_selection(config: &Config) -> Result<String, String> {
     }
 }
 
+fn current_live_goal(state: &UiState) -> Option<atomcode_coding::GoalProgress> {
+    let condition = state.goal_condition.as_ref()?.clone();
+    let phase = state.goal_phase;
+    let terminal = match phase {
+        atomcode_coding::GoalPhase::Satisfied => Some(atomcode_coding::GoalTerminal::Met),
+        atomcode_coding::GoalPhase::PausedAtCap => {
+            Some(atomcode_coding::GoalTerminal::Stopped)
+        }
+        _ => None,
+    };
+    Some(atomcode_coding::GoalProgress {
+        active: phase == atomcode_coding::GoalPhase::Pursuing,
+        terminal,
+        phase,
+        round: state.goal_round,
+        max_rounds: None,
+        elapsed_secs: state
+            .goal_started_at
+            .map(|started| started.elapsed().as_secs())
+            .unwrap_or(0),
+        condition,
+        last_reason: None,
+    })
+}
+
 pub(crate) fn attach_live_runtime(
     ctx: &mut LoopCtx,
     mode: AgentMode,
+    state: &UiState,
     renderer: &mut dyn Renderer,
 ) -> Result<(), String> {
     let snapshot = ctx.current_session.to_conversation_snapshot();
@@ -586,6 +612,13 @@ pub(crate) fn attach_live_runtime(
         std::sync::Arc::new(ctx.runtime.clone()),
     )
     .map_err(|error| format!("共享当前 runtime 失败：{error:?}"))?;
+    // Binding the already-running TUI runtime starts a fresh live hub. Seed
+    // its initial Goal state from the TUI presentation so `/app` can include
+    // it in the first snapshot even when no GoalChanged event is replayable.
+    if let Some(goal) = current_live_goal(state) {
+        atomcode_daemon::native_live::seed_goal_progress(&binding, goal)
+        .map_err(|error| format!("同步当前 Goal 状态失败：{error:?}"))?;
+    }
     // The runtime binding owns execution; the process-level mode seeds the first
     // live snapshot before any ModeChanged event exists.
     atomcode_daemon::live_set_mode(mode);
@@ -719,6 +752,24 @@ impl Renderer for CaptureRenderer<'_> {
     }
     fn on_resize(&mut self, cols: u16, rows: u16) {
         self.inner.on_resize(cols, rows);
+    }
+    fn begin_sync(&mut self) {
+        self.inner.begin_sync();
+    }
+    fn end_sync(&mut self) {
+        self.inner.end_sync();
+    }
+    fn begin_initial_history_replay(&mut self) {
+        self.inner.begin_initial_history_replay();
+    }
+    fn end_initial_history_replay(&mut self) {
+        self.inner.end_initial_history_replay();
+    }
+    fn set_history_replay_max_rows(&mut self, max_rows: Option<usize>) {
+        self.inner.set_history_replay_max_rows(max_rows);
+    }
+    fn set_suppress_auto_copy(&mut self, suppress: bool) {
+        self.inner.set_suppress_auto_copy(suppress);
     }
 }
 
@@ -1126,8 +1177,17 @@ fn resolve_relay_client_bin() -> Option<String> {
     None
 }
 
+/// relay-client 的缓存目录：`$ATOMCODE_HOME/bin`。
+///
+/// 走 `Config::config_dir()` 而不是硬拼 `~/.atomcode`：设了 `$ATOMCODE_HOME`
+/// 时,下载的二进制本该和其它数据落在同一棵树里 —— 否则 `uninstall` 扫不到它,
+/// 而且提示语指的目录和实际写入的目录会对不上。
+fn relay_client_cache_dir() -> PathBuf {
+    atomcode_config::config::Config::config_dir().join("bin")
+}
+
 /// 确保 relay-client 二进制可用。
-/// 先尝试本地查找（环境变量 → 同目录 → 缓存），都不存在则自动下载到 ~/.atomcode/bin/。
+/// 先尝试本地查找（环境变量 → 同目录 → 缓存），都不存在则自动下载到缓存目录。
 fn ensure_relay_client_bin() -> Result<String, String> {
     // 先尝试环境变量和同目录
     if let Some(bin) = resolve_relay_client_bin() {
@@ -1140,9 +1200,7 @@ fn ensure_relay_client_bin() -> Result<String, String> {
         "atomcode-relay-client"
     };
 
-    let cache_dir = dirs::home_dir()
-        .map(|h| h.join(".atomcode").join("bin"))
-        .unwrap_or_else(|| PathBuf::from(".atomcode/bin"));
+    let cache_dir = relay_client_cache_dir();
     let cache_path = cache_dir.join(bare_name);
     let version_path = cache_dir.join(".version");
 
@@ -1153,18 +1211,21 @@ fn ensure_relay_client_bin() -> Result<String, String> {
 
     // 跳过下载标志
     if std::env::var("ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD").is_ok_and(|v| v == "1") {
-        return Err("自动下载已禁用（ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD=1），\
-                    请手动将 relay-client 放入 ~/.atomcode/bin/ 目录"
-            .to_string());
+        return Err(format!(
+            "自动下载已禁用（ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD=1），\
+             请手动将 relay-client 放入 {} 目录",
+            cache_dir.display()
+        ));
     }
 
     // 检测平台
     let target = relay_client_target();
     if target == "unknown" {
         return Err(format!(
-            "不支持的平台：{}/{}。请手动编译 relay-client 并放到 ~/.atomcode/bin/ 中",
+            "不支持的平台：{}/{}。请手动编译 relay-client 并放到 {} 中",
             std::env::consts::OS,
-            std::env::consts::ARCH
+            std::env::consts::ARCH,
+            cache_dir.display()
         ));
     }
 
@@ -1262,14 +1323,15 @@ fn ensure_relay_client_bin() -> Result<String, String> {
                  1. 打开浏览器访问\n\
                     https://gitcode.com/atomgit_atomcode/atomcode-relay-release/releases\n\
                  2. 下载对应平台的 binary\n\
-                 3. 保存到 ~/.atomcode/bin/atomcode-relay-client\n\
-                 4. chmod +x ~/.atomcode/bin/atomcode-relay-client\n\
+                 3. 保存到 {cache}/atomcode-relay-client\n\
+                 4. chmod +x {cache}/atomcode-relay-client\n\
                  5. /app 重试\n\
                  \n\
                  快速安装：\n\
                  curl -fsSL https://raw.gitcode.com/atomgit_atomcode/atomcode-relay-release/raw/main/scripts/install.sh | sh\n\
                  && /app 重试",
-                e
+                e,
+                cache = cache_dir.display()
             );
             Err(msg)
         }
@@ -1658,40 +1720,13 @@ fn execute_slash_command_impl(
             submit_agent_turn(ctx, state, review_prompt(arg));
         }
         "config" => {
-            // Head: current active provider + config path so users know
-            // which provider is talking and where to edit.
-            let config_path = ctx.config_store.path().display().to_string();
-            let mut txt = t(Msg::ConfigProviderLabel {
-                provider: &ctx.config.default_provider,
-                path: &config_path,
-            })
-            .into_owned();
-            // Body: one minimal runnable example + pointer to the full
-            // reference so users know where to get Claude / OpenAI /
-            // Ollama variants without flooding the terminal here.
-            txt.push_str(
-                "  Example:\n\
-                 \n\
-                 ```toml\n\
-                 default_provider = \"deepseek\"\n\
-                 \n\
-                 [providers.deepseek]\n\
-                 type           = \"openai\"\n\
-                 api_key        = \"sk-...\"\n\
-                 model          = \"deepseek-chat\"\n\
-                 base_url       = \"https://api.deepseek.com/v1\"\n\
-                 context_window = 64000\n\
-                 ```\n\
-                 \n\
-                 Full reference: docs/config.example.toml (every field, every provider flavour).\n\
-                 Edit the file, then run /reload — no restart needed.\n",
-            );
-            renderer.render(UiLine::CommandOutput(txt));
-            renderer.flush();
+            *active_modal = Some(Box::new(ConfigPanel::open()));
+            return Ok(());
         }
         "reload" => {
             match reload_persisted_config(ctx) {
                 Ok(PersistedConfigReload::Applied { provider, model }) => {
+                    crate::sync_history_replay_config(renderer, &ctx.config, &ctx.caps);
                     state.on_model_window_changed(ctx.config.default_context_window());
                     renderer.render(UiLine::CommandOutput(
                         t(Msg::CmdReloadDone {
@@ -2083,7 +2118,7 @@ fn execute_slash_command_impl(
                     "127.0.0.1".to_string()
                 }
                 let host = parse_host(a);
-                if let Err(error) = attach_live_runtime(ctx, state.agent_mode, renderer) {
+                if let Err(error) = attach_live_runtime(ctx, state.agent_mode, state, renderer) {
                     renderer.render(UiLine::Error(error));
                     renderer.flush();
                     return Ok(());
@@ -2112,7 +2147,7 @@ fn execute_slash_command_impl(
                     Err(error) => renderer.render(UiLine::Error(error)),
                 }
             } else {
-                if let Err(error) = attach_live_runtime(ctx, state.agent_mode, renderer) {
+                if let Err(error) = attach_live_runtime(ctx, state.agent_mode, state, renderer) {
                     renderer.render(UiLine::Error(error));
                 }
             }
@@ -2318,8 +2353,9 @@ fn execute_slash_command_impl(
                                         match cmd.spawn() {
                                             Err(e) => format!(
                                                 "启动 relay-client 失败（{e}）。已尝试路径 `{bin}`。\
-                                                 请确认 relay-client 在 ~/.atomcode/bin/ 目录下，\
-                                                 或删除该目录后重试 /app 自动下载。"
+                                                 请确认 relay-client 在 {cache} 目录下，\
+                                                 或删除该目录后重试 /app 自动下载。",
+                                                cache = relay_client_cache_dir().display()
                                             ),
                                             Ok(child) => {
                                                 if let Some(mut old) = ctx.app_relay_child.take() {
@@ -2338,7 +2374,7 @@ fn execute_slash_command_impl(
                                                     m_param
                                                 );
                                                 // 6) 手机视图复用 TUI 当前 CodingRuntime。
-                                                if let Err(error) = attach_live_runtime(ctx, state.agent_mode, renderer) {
+                                                if let Err(error) = attach_live_runtime(ctx, state.agent_mode, state, renderer) {
                                                     if let Some(mut child) = ctx.app_relay_child.take() {
                                                         let _ = child.start_kill();
                                                     }
@@ -2594,6 +2630,7 @@ fn execute_slash_command_impl(
                     // this fresh foreground session has no todos, so drop the prior
                     // session's list (mirrors reset_to_new_session / native SessionChanged).
                     state.active_todos = None;
+                    crate::event_loop::clear_pending_todo_calls(state);
                     crate::event_loop::sync_todo_titles(state); // drop prior session's titles
                     state.approval_panel = None;
                     // One DECSET 2026 envelope around the wipe + welcome
@@ -3332,6 +3369,31 @@ fn execute_slash_command_impl(
                 }
             }
         }
+        "team" => {
+            match arg.trim() {
+                "" | "status" => {
+                    renderer.render(UiLine::CommandOutput(state.team.summary()));
+                }
+                "show" => {
+                    state.team.show();
+                    renderer.render(UiLine::CommandOutput("Team panel shown.".into()));
+                }
+                "hide" => {
+                    state.team.hide();
+                    renderer.render(UiLine::CommandOutput("Team panel hidden.".into()));
+                }
+                "clear" => {
+                    state.team.clear();
+                    renderer.render(UiLine::CommandOutput("Team panel cleared.".into()));
+                }
+                _ => {
+                    renderer.render(UiLine::CommandOutput(
+                        "Usage: /team [show|hide|status|clear]".into(),
+                    ));
+                }
+            }
+            renderer.flush();
+        }
         "goal" => {
             // Sub-commands aligned with Claude Code's /goal (v2.1.139+):
             //   /goal <condition>             → set a new goal
@@ -3349,6 +3411,13 @@ fn execute_slash_command_impl(
                 .map(|(h, r)| (h, r.trim()))
                 .unwrap_or((trimmed, ""));
             match head {
+                "__app_arm" => {
+                    // Mobile App selected Goal mode but has not supplied the
+                    // condition yet. The next idle TUI submit becomes the
+                    // condition and is executed through this same command arm.
+                    state.goal_armed = true;
+                    renderer.flush();
+                }
                 "" | "status" => {
                     if let Some(ref cond) = state.goal_condition {
                         // Display 1-based, consistent with the footer goal row.
@@ -3382,6 +3451,7 @@ fn execute_slash_command_impl(
                     state.goal_condition = None;
                     state.goal_round = 0;
                     state.goal_started_at = None;
+                    state.goal_armed = false;
                     renderer.render(UiLine::CommandOutput(
                         crate::i18n::t(crate::i18n::Msg::GoalCleared).into_owned(),
                     ));
@@ -3408,6 +3478,7 @@ fn execute_slash_command_impl(
                         return Ok(());
                     }
                     state.goal_condition = Some(condition.clone());
+                    state.goal_armed = false;
                     state.goal_round = 0;
                     state.goal_started_at = Some(std::time::Instant::now());
                     if submit_agent_text(ctx, condition) {
@@ -5079,15 +5150,13 @@ fn open_usage(renderer: &mut dyn Renderer, active_modal: &mut Option<Box<dyn Mod
     }
 }
 
-/// `/cost` 的用量报告文本：本会话累计 token × 模型价目表。与 `/usage`（只查
-/// CodingPlan 网关）不同，这是本地统计，任何模型（含自接入）都能出数。TUI arm
-/// 与手机远程执行共用。
+/// `/cost` 的本会话 Token 报告。与 `/usage`（只查 CodingPlan 网关）不同，
+/// 这是本地统计，任何模型（含自接入）都能出数。TUI 与手机远程执行共用。
 pub(crate) fn build_cost_report_text(
     mut report: atomcode_capabilities::session::SessionCostReport,
     config: &atomcode_config::config::Config,
     current_provider: &str,
     current_model: &str,
-    current_pricing: Option<atomcode_capabilities::session::ModelPricing>,
 ) -> String {
     if !report
         .models
@@ -5100,8 +5169,6 @@ pub(crate) fn build_cost_report_text(
                 provider_id: current_provider.to_string(),
                 model_id: current_model.to_string(),
                 tokens: Default::default(),
-                estimated_cost_usd: current_pricing.map(|_| 0.0),
-                explicitly_free: current_pricing.is_some_and(|pricing| pricing.is_free()),
             });
     }
 
@@ -5126,35 +5193,13 @@ pub(crate) fn build_cost_report_text(
             cached.saturating_mul(100) / prompt
         };
         let total = prompt.saturating_add(completion);
-        let body = if item.explicitly_free {
-            let cost = t(Msg::CostFree);
-            t(Msg::CostReport {
-                prompt,
-                completion,
-                cached,
-                cache_rate,
-                total,
-                cost: &cost,
-            })
-        } else if let Some(estimated) = item.estimated_cost_usd {
-            let cost = crate::pricing::format_cost(estimated);
-            t(Msg::CostReport {
-                prompt,
-                completion,
-                cached,
-                cache_rate,
-                total,
-                cost: &cost,
-            })
-        } else {
-            t(Msg::CostTokenReport {
-                prompt,
-                completion,
-                cached,
-                cache_rate,
-                total,
-            })
-        };
+        let body = t(Msg::CostTokenReport {
+            prompt,
+            completion,
+            cached,
+            cache_rate,
+            total,
+        });
         sections.push(format!(
             "{} · {}\n{}",
             account_of(&item.provider_id),
@@ -5179,10 +5224,6 @@ fn build_session_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
     // stale legacy `default_provider` — otherwise the row mislabels e.g.
     // "agnes-ai · GLM-5.2".
     let provider = ctx.config.effective_model_selection().unwrap_or_default();
-    let pricing = ctx
-        .config
-        .provider_config_for_selection(&provider)
-        .and_then(|config| atomcode_coding::resolve_provider_pricing(&provider, &config));
     let manager = session_manager_for_cost(
         ctx.current_session_project_bucket.as_deref(),
         &ctx.current_session.working_dir,
@@ -5202,7 +5243,6 @@ fn build_session_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
                 models: Vec::new(),
                 unattributed_tokens,
                 total_tokens: unattributed_tokens,
-                estimated_cost_usd: None,
             }
         }
     };
@@ -5225,11 +5265,6 @@ fn build_session_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
                 .tokens
                 .cached_input
                 .saturating_add(live_tokens.cached_input);
-            match (model.estimated_cost_usd.as_mut(), pricing) {
-                (Some(cost), Some(price)) => *cost += price.estimate(live_tokens),
-                _ => model.estimated_cost_usd = None,
-            }
-            model.explicitly_free &= pricing.is_some_and(|price| price.is_free());
         } else {
             report
                 .models
@@ -5237,14 +5272,11 @@ fn build_session_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
                     provider_id: provider.to_string(),
                     model_id: ctx.model_name.clone(),
                     tokens: live_tokens,
-                    estimated_cost_usd: pricing.map(|price| price.estimate(live_tokens)),
-                    explicitly_free: pricing.is_some_and(|price| price.is_free()),
                 });
         }
         report.total_tokens = report.total_tokens.saturating_add(live_tokens.total());
-        report.estimated_cost_usd = None;
     }
-    build_cost_report_text(report, &ctx.config, &provider, &ctx.model_name, pricing)
+    build_cost_report_text(report, &ctx.config, &provider, &ctx.model_name)
 }
 
 fn session_manager_for_cost(
@@ -6992,19 +7024,9 @@ pub(crate) fn format_todo_command(
     messages: &[atomcode_kernel::message::Message],
     unicode: bool,
 ) -> String {
-    // Fold the FULL transcript via the canonical `reduce_todos` (baseline = last full-list plan;
-    // then apply every `{action}` update after it), so `/todo` shows the CURRENT statuses — not
-    // just the initial plan. Shape-based, matching the merged `todowrite` tool + the live panel.
-    // kernel `Message.tool_calls` is a flat field, so no content-variant match.
-    let calls: Vec<(&str, &str)> = messages
-        .iter()
-        .flat_map(|m| {
-            m.tool_calls
-                .iter()
-                .map(|c| (c.name.as_str(), c.arguments.as_str()))
-        })
-        .collect();
-    let todos = atomcode_capabilities::tools::todo::reduce_todos(calls);
+    // Match the runtime hook, daemon command, and resume panel: failed calls do
+    // not become current state, while successful legacy calls remain readable.
+    let todos = atomcode_capabilities::tools::todo::derive_current_todos(messages);
     if todos.is_empty() {
         return t(Msg::TodoNoList).into_owned();
     }
@@ -7417,6 +7439,111 @@ mod expand_cd_target_tests {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct ReplayLifecycleProbe {
+        begin_sync: usize,
+        end_sync: usize,
+        begin_replay: usize,
+        end_replay: usize,
+        caps: Vec<Option<usize>>,
+        suppress: Vec<bool>,
+    }
+
+    impl Renderer for ReplayLifecycleProbe {
+        fn render(&mut self, _line: UiLine) {}
+        fn flush(&mut self) {}
+        fn shutdown(&mut self) {}
+        fn reset(&mut self) {}
+        fn clear_screen(&mut self) {}
+        fn suspend_for_external(&mut self) {}
+        fn resume_from_external(&mut self) {}
+        fn flush_deferred(&mut self) {}
+        fn begin_sync(&mut self) {
+            self.begin_sync += 1;
+        }
+        fn end_sync(&mut self) {
+            self.end_sync += 1;
+        }
+        fn begin_initial_history_replay(&mut self) {
+            self.begin_replay += 1;
+        }
+        fn end_initial_history_replay(&mut self) {
+            self.end_replay += 1;
+        }
+        fn set_history_replay_max_rows(&mut self, max_rows: Option<usize>) {
+            self.caps.push(max_rows);
+        }
+        fn set_suppress_auto_copy(&mut self, suppress: bool) {
+            self.suppress.push(suppress);
+        }
+    }
+
+    #[test]
+    fn capture_renderer_forwards_resume_lifecycle() {
+        let mut inner = ReplayLifecycleProbe::default();
+        let mut captured = CaptureRenderer {
+            inner: &mut inner,
+            captured: String::new(),
+        };
+        captured.begin_sync();
+        captured.begin_initial_history_replay();
+        captured.set_history_replay_max_rows(Some(321));
+        captured.set_suppress_auto_copy(true);
+        captured.set_suppress_auto_copy(false);
+        captured.end_initial_history_replay();
+        captured.end_sync();
+        drop(captured);
+
+        assert_eq!(inner.begin_sync, 1);
+        assert_eq!(inner.end_sync, 1);
+        assert_eq!(inner.begin_replay, 1);
+        assert_eq!(inner.end_replay, 1);
+        assert_eq!(inner.caps, vec![Some(321)]);
+        assert_eq!(inner.suppress, vec![true, false]);
+    }
+
+    #[test]
+    fn live_user_text_shaped_like_a_reminder_is_still_echoed() {
+        let input = atomcode_coding::UserInput {
+            text: atomcode_capabilities::reminder::system_reminder(
+                "Explain why this appears.",
+            ),
+            images: Vec::new(),
+        };
+
+        assert!(matches!(
+            project_live_view_event(
+                atomcode_daemon::live_hub::LiveViewEvent::InputAccepted {
+                    input,
+                    client_input_id: Some("web-input".into()),
+                }
+            ),
+            Some(crate::event_loop::ui_event::UiEvent::UserEcho(text))
+                if text == atomcode_capabilities::reminder::system_reminder(
+                    "Explain why this appears."
+                )
+        ));
+    }
+
+    #[test]
+    fn live_user_text_that_only_mentions_reminder_tag_is_still_echoed() {
+        let input = atomcode_coding::UserInput {
+            text: "Why is <system-reminder> visible?".into(),
+            images: Vec::new(),
+        };
+
+        assert!(matches!(
+            project_live_view_event(
+                atomcode_daemon::live_hub::LiveViewEvent::InputAccepted {
+                    input,
+                    client_input_id: Some("web-input".into()),
+                }
+            ),
+            Some(crate::event_loop::ui_event::UiEvent::UserEcho(text))
+                if text == "Why is <system-reminder> visible?"
+        ));
+    }
+
     #[test]
     fn live_request_resolution_projects_to_correlated_tui_event() {
         let event =
@@ -7486,9 +7613,9 @@ mod tests {
         assert!(review_prompt("staged").contains(
             r#"{"scope":{"kind":"staged"}}"#
         ));
-        let range = review_prompt("release/v5.0.5");
+        let range = review_prompt("release/v5.0.6");
         assert!(range.contains(
-            r#"{"scope":{"kind":"range","base":"release/v5.0.5","head":"HEAD"}}"#
+            r#"{"scope":{"kind":"range","base":"release/v5.0.6","head":"HEAD"}}"#
         ));
         assert!(!range.contains(r#"{"base":"#));
     }
@@ -8334,6 +8461,32 @@ mod todo_command_tests {
     }
 
     #[test]
+    fn todo_command_ignores_failed_mutations() {
+        use atomcode_kernel::message::Message;
+
+        let mut msgs = vec![tool_call_msg(vec![ToolCall {
+            id: "ok".into(),
+            name: "todowrite".into(),
+            arguments:
+                r#"{"todos":[{"content":"keep","status":"in_progress"}]}"#.into(),
+        }])];
+        msgs.push(Message::tool_result("ok", "1 task", false));
+        msgs.push(tool_call_msg(vec![ToolCall {
+            id: "failed".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"action":"add","content":"must not appear"}"#.into(),
+        }]));
+        msgs.push(Message::tool_result("failed", "invalid todo", true));
+
+        let out = format_todo_command(&msgs, false);
+        assert!(out.contains("keep"), "successful state remains: {out}");
+        assert!(
+            !out.contains("must not appear"),
+            "failed mutation must not enter current state: {out}"
+        );
+    }
+
+    #[test]
     fn dispatch_required_nonempty_arg_submits() {
         // Sanity counterpart: Required + a real argument must submit the
         // rendered template, never Reject. Guards against an overly-broad
@@ -8592,7 +8745,7 @@ mod todo_command_tests {
     }
 
     #[test]
-    fn cost_report_keeps_models_separate_and_hides_unknown_price() {
+    fn cost_report_keeps_models_separate_and_reports_tokens_only() {
         use crate::event_loop::commands::build_cost_report_text;
         use atomcode_capabilities::session::{ModelCostSummary, SessionCostReport, TokenBreakdown};
         let out = build_cost_report_text(
@@ -8605,17 +8758,13 @@ mod todo_command_tests {
                         output: 567,
                         cached_input: 89,
                     },
-                    estimated_cost_usd: None,
-                    explicitly_free: false,
                 }],
                 unattributed_tokens: 0,
                 total_tokens: 1890,
-                estimated_cost_usd: None,
             },
             &atomcode_config::config::Config::default(),
             "provider-b",
             "model-b",
-            None,
         );
         // Unknown ids (not in the catalog) fall back to the raw id; separator is `·`.
         assert!(out.contains("provider-a · model-a"));
@@ -8623,8 +8772,7 @@ mod todo_command_tests {
         assert!(out.contains("1323"));
         assert!(out.contains("567"));
         assert!(out.contains("89"));
-        assert!(!out.contains("Estimated cost"));
-        assert!(!out.contains("unknown"));
+        assert!(!out.contains('$'));
     }
 }
 

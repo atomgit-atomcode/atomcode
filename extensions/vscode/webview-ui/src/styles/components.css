@@ -411,6 +411,106 @@
   animation: fadeIn 0.15s ease-out;
 }
 
+/* === Image Lightbox === */
+.image-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--app-modal-background);
+  animation: fadeIn 0.15s ease-out;
+}
+
+.image-lightbox-stage {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  max-width: 92vw;
+  max-height: 92vh;
+}
+
+.image-lightbox-stage img {
+  max-width: 92vw;
+  max-height: 92vh;
+  object-fit: contain;
+  border-radius: var(--corner-radius-small);
+  box-shadow: 0 8px 40px #00000059;
+  user-select: none;
+  cursor: zoom-out;
+}
+
+.image-lightbox-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 50%;
+  background: var(--app-primary-background);
+  color: var(--app-primary-foreground);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 8px #00000040;
+}
+
+.image-lightbox-close:hover {
+  background: var(--app-accent-color);
+  color: var(--app-accent-foreground, #ffffff);
+}
+
+.image-lightbox-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: 50%;
+  background: var(--app-primary-background);
+  color: var(--app-primary-foreground);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 8px #00000040;
+}
+
+.image-lightbox-nav:hover {
+  background: var(--app-accent-color);
+  color: var(--app-accent-foreground, #ffffff);
+}
+
+.image-lightbox-prev {
+  left: 12px;
+}
+
+.image-lightbox-next {
+  right: 12px;
+}
+
+.image-lightbox-counter {
+  position: absolute;
+  bottom: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: #0000008c;
+  color: #ffffff;
+  font-size: 12px;
+  line-height: 1;
+  user-select: none;
+}
+
 .session-list {
   position: absolute;
   top: 0;

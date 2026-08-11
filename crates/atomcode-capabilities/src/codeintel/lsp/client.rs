@@ -9,32 +9,146 @@
 
 use super::jsonrpc;
 use super::registry::LspServerConfig;
-use super::types::{Diagnostic, DiagnosticSeverity};
+use super::types::{Diagnostic, DiagnosticSeverity, Location};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
 type BoxWrite = Box<dyn AsyncWrite + Send + Unpin>;
 type BoxRead = Box<dyn AsyncRead + Send + Unpin>;
+type SharedWrite = Arc<AsyncMutex<BoxWrite>>;
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, Value>>>>>;
 type DiagMap = Arc<Mutex<HashMap<PathBuf, Vec<Diagnostic>>>>;
+
+async fn write_value(writer: &SharedWrite, value: Value) -> Result<(), String> {
+    let body = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
+    let framed = jsonrpc::encode(&body);
+    let mut writer = writer.lock().await;
+    writer
+        .write_all(&framed)
+        .await
+        .map_err(|error| error.to_string())?;
+    writer.flush().await.map_err(|error| error.to_string())
+}
+
+async fn handle_server_request(
+    message: &Value,
+    root_uri: &str,
+    writer: &SharedWrite,
+    supports_pull_diagnostics: &AtomicBool,
+) {
+    let Some(id) = message.get("id").cloned() else {
+        return;
+    };
+    let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+    let result = match method {
+        "workspace/configuration" => {
+            let count = message
+                .pointer("/params/items")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            Value::Array(vec![Value::Null; count])
+        }
+        "workspace/workspaceFolders" => json!([{
+            "uri": root_uri,
+            "name": "workspace"
+        }]),
+        "client/registerCapability" => {
+            if message
+                .pointer("/params/registrations")
+                .and_then(Value::as_array)
+                .is_some_and(|registrations| {
+                    registrations.iter().any(|registration| {
+                        registration.get("method").and_then(Value::as_str)
+                            == Some("textDocument/diagnostic")
+                    })
+                })
+            {
+                supports_pull_diagnostics.store(true, Ordering::Release);
+            }
+            Value::Null
+        }
+        "client/unregisterCapability" => {
+            let registrations = message
+                .pointer("/params/unregisterations")
+                .or_else(|| message.pointer("/params/unregistrations"))
+                .and_then(Value::as_array);
+            if registrations.is_some_and(|registrations| {
+                registrations.iter().any(|registration| {
+                    registration.get("method").and_then(Value::as_str)
+                        == Some("textDocument/diagnostic")
+                })
+            }) {
+                supports_pull_diagnostics.store(false, Ordering::Release);
+            }
+            Value::Null
+        }
+        "window/workDoneProgress/create" | "window/showMessageRequest" => Value::Null,
+        "workspace/applyEdit" => {
+            json!({ "applied": false, "failureReason": "AtomCode LSP integration is read-only" })
+        }
+        "window/showDocument" => json!({ "success": false }),
+        _ => {
+            let _ = write_value(
+                writer,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32601, "message": format!("unsupported server request: {method}") }
+                }),
+            )
+            .await;
+            return;
+        }
+    };
+    let _ = write_value(
+        writer,
+        json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+    )
+    .await;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PositionEncoding {
+    Utf8,
+    Utf16,
+    Utf32,
+}
+
+impl PositionEncoding {
+    fn from_initialize(result: &Value) -> Self {
+        match result
+            .pointer("/capabilities/positionEncoding")
+            .and_then(Value::as_str)
+        {
+            Some("utf-8") => Self::Utf8,
+            Some("utf-32") => Self::Utf32,
+            _ => Self::Utf16,
+        }
+    }
+}
 
 pub struct LspClient {
     next_id: AtomicU64,
     pending: Pending,
+    closed: Arc<AtomicBool>,
     diagnostics: DiagMap,
-    writer: AsyncMutex<BoxWrite>,
+    writer: SharedWrite,
+    position_encoding: Mutex<PositionEncoding>,
+    supports_pull_diagnostics: Arc<AtomicBool>,
     /// path → current document version (didOpen = 1, didChange increments).
     opened: Mutex<HashMap<PathBuf, i64>>,
+    sync_lock: AsyncMutex<()>,
     root_uri: String,
     reader_handle: Mutex<Option<JoinHandle<()>>>,
     /// `Some` for a spawned server (kept alive + killed on shutdown); `None` for an
@@ -50,10 +164,20 @@ impl LspClient {
         root_uri: String,
     ) -> Result<Self, String> {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let closed = Arc::new(AtomicBool::new(false));
         let diagnostics: DiagMap = Arc::new(Mutex::new(HashMap::new()));
+        let writer = Arc::new(AsyncMutex::new(writer));
+        let supports_pull_diagnostics = Arc::new(AtomicBool::new(false));
 
         // Background reader: dispatch responses (by id) and publishDiagnostics.
-        let (rp, rd) = (pending.clone(), diagnostics.clone());
+        let (rp, rd, reader_closed, response_writer, pull_diagnostics) = (
+            pending.clone(),
+            diagnostics.clone(),
+            closed.clone(),
+            writer.clone(),
+            supports_pull_diagnostics.clone(),
+        );
+        let request_root_uri = root_uri.clone();
         let reader_handle = tokio::spawn(async move {
             let mut r = BufReader::new(reader);
             loop {
@@ -76,7 +200,16 @@ impl LspClient {
                         }
                         continue;
                     }
-                    // server→client request (e.g. client/registerCapability): ignored.
+                }
+                if msg.get("id").is_some() && msg.get("method").is_some() {
+                    handle_server_request(
+                        &msg,
+                        &request_root_uri,
+                        &response_writer,
+                        &pull_diagnostics,
+                    )
+                    .await;
+                    continue;
                 }
                 if msg.get("method").and_then(Value::as_str)
                     == Some("textDocument/publishDiagnostics")
@@ -86,14 +219,26 @@ impl LspClient {
                     }
                 }
             }
+            // A server can exit between process spawn and the first request (for
+            // example, a rustup shim whose component is not installed). Wake every
+            // waiter immediately instead of leaving requests parked until timeout.
+            reader_closed.store(true, Ordering::Release);
+            let waiters = std::mem::take(&mut *rp.lock().unwrap());
+            for (_, waiter) in waiters {
+                let _ = waiter.send(Err(json!({ "message": "language server stream closed" })));
+            }
         });
 
         let client = Self {
             next_id: AtomicU64::new(1),
             pending,
+            closed,
             diagnostics,
-            writer: AsyncMutex::new(writer),
+            writer,
+            position_encoding: Mutex::new(PositionEncoding::Utf16),
+            supports_pull_diagnostics,
             opened: Mutex::new(HashMap::new()),
+            sync_lock: AsyncMutex::new(()),
             root_uri,
             reader_handle: Mutex::new(Some(reader_handle)),
             child: Mutex::new(None),
@@ -104,14 +249,33 @@ impl LspClient {
             "processId": Value::Null,
             "rootUri": client.root_uri,
             "capabilities": {
+                "general": { "positionEncodings": ["utf-8", "utf-16", "utf-32"] },
+                "workspace": {
+                    "configuration": true,
+                    "workspaceFolders": true,
+                    "applyEdit": false
+                },
                 "textDocument": {
                     "publishDiagnostics": { "relatedInformation": true },
-                    "synchronization": { "didOpen": true, "didChange": true }
+                    "synchronization": { "didOpen": true, "didChange": true },
+                    "definition": { "dynamicRegistration": true },
+                    "references": { "dynamicRegistration": true },
+                    "hover": { "dynamicRegistration": true },
+                    "diagnostic": { "dynamicRegistration": true }
                 }
             },
             "clientInfo": { "name": "atomcode-capabilities", "version": env!("CARGO_PKG_VERSION") }
         });
-        client.send_request("initialize", init).await?;
+        let initialize = client.send_request("initialize", init).await?;
+        *client.position_encoding.lock().unwrap() = PositionEncoding::from_initialize(&initialize);
+        if initialize
+            .pointer("/capabilities/diagnosticProvider")
+            .is_some_and(|provider| !provider.is_null() && provider != &Value::Bool(false))
+        {
+            client
+                .supports_pull_diagnostics
+                .store(true, Ordering::Release);
+        }
         client.send_notification("initialized", json!({})).await?;
         Ok(client)
     }
@@ -142,28 +306,72 @@ impl LspClient {
     }
 
     async fn write_msg(&self, value: Value) -> Result<(), String> {
-        let body = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
-        let framed = jsonrpc::encode(&body);
-        let mut w = self.writer.lock().await;
-        w.write_all(&framed).await.map_err(|e| e.to_string())?;
-        w.flush().await.map_err(|e| e.to_string())
+        write_value(&self.writer, value).await
     }
 
     async fn send_request(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.send_request_inner(method, params, None).await
+    }
+
+    async fn send_request_cancellable(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: &CancellationToken,
+    ) -> Result<Value, String> {
+        self.send_request_inner(method, params, Some(cancel)).await
+    }
+
+    async fn send_request_inner(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
-        self.write_msg(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
-            .await?;
-        match tokio::time::timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), rx).await {
-            Ok(Ok(Ok(v))) => Ok(v),
-            Ok(Ok(Err(e))) => Err(format!("LSP {method} error: {e}")),
-            Ok(Err(_)) => Err(format!("LSP {method}: response channel closed")),
-            Err(_) => {
-                self.pending.lock().unwrap().remove(&id);
-                Err(format!("LSP {method}: timed out"))
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if self.closed.load(Ordering::Acquire) {
+                return Err(format!("LSP {method}: language server stream closed"));
             }
+            pending.insert(id, tx);
         }
+        if let Err(error) = self
+            .write_msg(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+            .await
+        {
+            self.pending.lock().unwrap().remove(&id);
+            return Err(error);
+        }
+        let response = async {
+            match tokio::time::timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), rx).await {
+                Ok(Ok(Ok(value))) => Ok(value),
+                Ok(Ok(Err(error))) => Err(format!("LSP {method} error: {error}")),
+                Ok(Err(_)) => Err(format!("LSP {method}: response channel closed")),
+                Err(_) => Err(format!("LSP {method}: timed out")),
+            }
+        };
+        let result = if let Some(cancel) = cancel {
+            tokio::select! {
+                result = response => result,
+                _ = cancel.cancelled() => {
+                    self.pending.lock().unwrap().remove(&id);
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(100),
+                        self.send_notification("$/cancelRequest", json!({ "id": id })),
+                    )
+                    .await;
+                    return Err(format!("LSP {method}: cancelled"));
+                }
+            }
+        } else {
+            response.await
+        };
+        if result.is_err() {
+            self.pending.lock().unwrap().remove(&id);
+        }
+        result
     }
 
     async fn send_notification(&self, method: &str, params: Value) -> Result<(), String> {
@@ -178,33 +386,167 @@ impl LspClient {
         content: &str,
         language_id: &str,
     ) -> Result<(), String> {
+        let _sync_guard = self.sync_lock.lock().await;
         let uri = path_to_uri(path)?;
-        let version = {
-            let mut opened = self.opened.lock().unwrap();
-            match opened.get_mut(path) {
-                Some(v) => {
-                    *v += 1;
-                    *v
-                }
-                None => {
-                    opened.insert(path.to_path_buf(), 1);
-                    0 // sentinel: signals "first open" below
-                }
-            }
-        };
-        if version == 0 {
+        // Never return diagnostics published for an older document version. Servers
+        // that omit the optional publishDiagnostics.version field are common, so clear
+        // the cache before every sync and only surface messages published afterwards.
+        self.diagnostics.lock().unwrap().remove(path);
+        let previous_version = self.opened.lock().unwrap().get(path).copied();
+        let version = previous_version
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| "LSP document version overflow".to_string())?;
+        if previous_version.is_none() {
             self.send_notification(
                 "textDocument/didOpen",
-                json!({ "textDocument": { "uri": uri, "languageId": language_id, "version": 1, "text": content } }),
+                json!({ "textDocument": { "uri": uri, "languageId": language_id, "version": version, "text": content } }),
             )
-            .await
+            .await?;
         } else {
             self.send_notification(
                 "textDocument/didChange",
                 json!({ "textDocument": { "uri": uri, "version": version }, "contentChanges": [{ "text": content }] }),
             )
-            .await
+            .await?;
         }
+        self.opened
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), version);
+        Ok(())
+    }
+
+    /// Resolve the definition at a zero-based LSP position.
+    pub async fn definition(
+        &self,
+        path: &Path,
+        line: u32,
+        character: u32,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Location>, String> {
+        let result = self
+            .position_request(
+                "textDocument/definition",
+                path,
+                line,
+                character,
+                None,
+                cancel,
+            )
+            .await?;
+        Ok(parse_locations(&result))
+    }
+
+    /// Resolve semantic references at a zero-based LSP position.
+    pub async fn references(
+        &self,
+        path: &Path,
+        line: u32,
+        character: u32,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Location>, String> {
+        let result = self
+            .position_request(
+                "textDocument/references",
+                path,
+                line,
+                character,
+                Some(json!({ "includeDeclaration": true })),
+                cancel,
+            )
+            .await?;
+        Ok(parse_locations(&result))
+    }
+
+    /// Return hover contents at a zero-based LSP position. The value is kept as
+    /// JSON because servers legitimately return strings, MarkupContent, or arrays.
+    pub async fn hover(
+        &self,
+        path: &Path,
+        line: u32,
+        character: u32,
+        cancel: &CancellationToken,
+    ) -> Result<Value, String> {
+        self.position_request("textDocument/hover", path, line, character, None, cancel)
+            .await
+    }
+
+    async fn position_request(
+        &self,
+        method: &str,
+        path: &Path,
+        line: u32,
+        character: u32,
+        context: Option<Value>,
+        cancel: &CancellationToken,
+    ) -> Result<Value, String> {
+        let mut params = json!({
+            "textDocument": { "uri": path_to_uri(path)? },
+            "position": { "line": line, "character": character }
+        });
+        if let Some(context) = context {
+            params["context"] = context;
+        }
+        self.send_request_cancellable(method, params, cancel).await
+    }
+
+    pub fn wire_position(
+        &self,
+        content: &str,
+        one_based_line: u32,
+        one_based_character: u32,
+    ) -> Result<(u32, u32), String> {
+        let line_index = one_based_line
+            .checked_sub(1)
+            .ok_or_else(|| "line must be one-based".to_string())?;
+        let character_index = one_based_character
+            .checked_sub(1)
+            .ok_or_else(|| "character must be one-based".to_string())?
+            as usize;
+        let line = content
+            .split('\n')
+            .nth(line_index as usize)
+            .ok_or_else(|| format!("line {one_based_line} is outside the file"))?;
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let prefix: String = line.chars().take(character_index).collect();
+        if prefix.chars().count() != character_index {
+            return Err(format!(
+                "character {one_based_character} is outside line {one_based_line}"
+            ));
+        }
+        let character = match *self.position_encoding.lock().unwrap() {
+            PositionEncoding::Utf8 => prefix.len(),
+            PositionEncoding::Utf16 => prefix.encode_utf16().count(),
+            PositionEncoding::Utf32 => prefix.chars().count(),
+        };
+        let character = u32::try_from(character)
+            .map_err(|_| "character offset exceeds the LSP range".to_string())?;
+        Ok((line_index, character))
+    }
+
+    pub async fn refresh_pull_diagnostics(
+        &self,
+        path: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<(), String> {
+        if !self.supports_pull_diagnostics.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let result = self
+            .send_request_cancellable(
+                "textDocument/diagnostic",
+                json!({ "textDocument": { "uri": path_to_uri(path)? } }),
+                cancel,
+            )
+            .await?;
+        if let Some(items) = result.get("items").and_then(Value::as_array) {
+            handle_publish(
+                &json!({ "uri": path_to_uri(path)?, "diagnostics": items }),
+                &self.diagnostics,
+            );
+        }
+        Ok(())
     }
 
     pub fn diagnostics(&self, path: &Path) -> Vec<Diagnostic> {
@@ -266,6 +608,42 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
     url::Url::parse(uri).ok()?.to_file_path().ok()
 }
 
+/// LSP permits a single Location, an array of Location values, LocationLink values,
+/// or null for definition-like requests. Normalize the useful subset and ignore
+/// malformed entries rather than inventing positions.
+fn parse_locations(value: &Value) -> Vec<Location> {
+    let values: Vec<&Value> = match value {
+        Value::Array(items) => items.iter().collect(),
+        Value::Object(_) => vec![value],
+        _ => Vec::new(),
+    };
+    values
+        .into_iter()
+        .filter_map(|item| {
+            let uri = item
+                .get("uri")
+                .or_else(|| item.get("targetUri"))?
+                .as_str()?;
+            let range = item
+                .get("range")
+                .or_else(|| item.get("targetSelectionRange"))
+                .or_else(|| item.get("targetRange"))?;
+            let start = range.get("start")?;
+            let line = u32::try_from(start.get("line")?.as_u64()?)
+                .ok()?
+                .checked_add(1)?;
+            let column = u32::try_from(start.get("character")?.as_u64()?)
+                .ok()?
+                .checked_add(1)?;
+            Some(Location {
+                file: uri_to_path(uri)?.display().to_string(),
+                line,
+                column,
+            })
+        })
+        .collect()
+}
+
 /// Parse a `textDocument/publishDiagnostics` params object into our `Diagnostic`s,
 /// keyed by the file path. An empty list clears that file's entry.
 fn handle_publish(params: &Value, diagnostics: &DiagMap) {
@@ -292,17 +670,18 @@ fn handle_publish(params: &Value, diagnostics: &DiagMap) {
             // malformed diagnostic rather than inventing a (1,1) position.
             let range = d.get("range")?;
             let start = range.get("start")?;
-            let line = start.get("line").and_then(Value::as_u64)? as u32 + 1;
-            let column = start.get("character").and_then(Value::as_u64)? as u32 + 1;
+            let one_based = |value: &Value| u32::try_from(value.as_u64()?).ok()?.checked_add(1);
+            let line = one_based(start.get("line")?)?;
+            let column = one_based(start.get("character")?)?;
             let end = range.get("end");
             let end_line = end
                 .and_then(|e| e.get("line"))
                 .and_then(Value::as_u64)
-                .map(|l| l as u32 + 1);
+                .and_then(|value| u32::try_from(value).ok()?.checked_add(1));
             let end_column = end
                 .and_then(|e| e.get("character"))
                 .and_then(Value::as_u64)
-                .map(|c| c as u32 + 1);
+                .and_then(|value| u32::try_from(value).ok()?.checked_add(1));
             let severity = DiagnosticSeverity::from_lsp(
                 d.get("severity").and_then(Value::as_u64).unwrap_or(1),
             );
@@ -388,6 +767,31 @@ mod tests {
                         .await;
                     let _ = writer.flush().await;
                 }
+                "textDocument/definition" | "textDocument/references" | "textDocument/hover" => {
+                    let id = msg.get("id").and_then(Value::as_u64).unwrap();
+                    let pos = msg
+                        .pointer("/params/position")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let result = match method {
+                        "textDocument/definition" => json!({
+                            "uri": if cfg!(windows) { "file:///C:/proj/def.rs" } else { "file:///proj/def.rs" },
+                            "range": { "start": { "line": 6, "character": 2 }, "end": { "line": 6, "character": 5 } }
+                        }),
+                        "textDocument/references" => json!([{
+                            "uri": if cfg!(windows) { "file:///C:/proj/ref.rs" } else { "file:///proj/ref.rs" },
+                            "range": { "start": { "line": 8, "character": 4 }, "end": { "line": 8, "character": 7 } }
+                        }]),
+                        _ => {
+                            json!({ "contents": { "kind": "markdown", "value": format!("position={pos}") } })
+                        }
+                    };
+                    let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+                    let _ = writer
+                        .write_all(&jsonrpc::encode(&serde_json::to_vec(&resp).unwrap()))
+                        .await;
+                    let _ = writer.flush().await;
+                }
                 _ => {}
             }
         }
@@ -416,6 +820,11 @@ mod tests {
         let client = LspClient::connect(Box::new(cr), Box::new(cw), "file:///proj".into())
             .await
             .expect("handshake");
+        assert_eq!(
+            client.wire_position("你😀x\n", 1, 3).unwrap(),
+            (0, 3),
+            "default LSP encoding is UTF-16: Chinese=1 unit, emoji=2 units"
+        );
         let path = if cfg!(windows) {
             PathBuf::from("C:\\proj\\a.rs")
         } else {
@@ -434,6 +843,272 @@ mod tests {
         assert_eq!(diags[0].severity, DiagnosticSeverity::Error);
         assert_eq!(diags[0].code.as_deref(), Some("E0001"));
         assert!(diags[0].display_line().contains("[ERROR]"));
+    }
+
+    #[tokio::test]
+    async fn semantic_queries_use_wire_positions_and_normalize_locations() {
+        let (client_end, server_end) = tokio::io::duplex(16 * 1024);
+        let (cr, cw) = tokio::io::split(client_end);
+        let (sr, sw) = tokio::io::split(server_end);
+        tokio::spawn(mock_server(sr, sw));
+        let client = LspClient::connect(Box::new(cr), Box::new(cw), "file:///proj".into())
+            .await
+            .expect("handshake");
+        let path = if cfg!(windows) {
+            PathBuf::from("C:\\proj\\a.rs")
+        } else {
+            PathBuf::from("/proj/a.rs")
+        };
+
+        let cancel = CancellationToken::new();
+        let definitions = client.definition(&path, 2, 3, &cancel).await.unwrap();
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].line, 7);
+        assert_eq!(definitions[0].column, 3);
+        assert!(definitions[0].file.ends_with("def.rs"));
+
+        let references = client.references(&path, 2, 3, &cancel).await.unwrap();
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].line, 9);
+        assert_eq!(references[0].column, 5);
+
+        let hover = client.hover(&path, 2, 3, &cancel).await.unwrap();
+        assert_eq!(
+            hover.pointer("/contents/value").and_then(Value::as_str),
+            Some("position={\"character\":3,\"line\":2}")
+        );
+    }
+
+    #[tokio::test]
+    async fn server_exit_wakes_pending_requests_without_waiting_for_timeout() {
+        let (client_end, server_end) = tokio::io::duplex(16 * 1024);
+        let (cr, cw) = tokio::io::split(client_end);
+        let (sr, mut sw) = tokio::io::split(server_end);
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(sr);
+            let initialize = jsonrpc::read_message(&mut reader).await.unwrap();
+            let initialize: Value = serde_json::from_slice(&initialize).unwrap();
+            let response = json!({
+                "jsonrpc": "2.0",
+                "id": initialize["id"],
+                "result": { "capabilities": {} }
+            });
+            sw.write_all(&jsonrpc::encode(&serde_json::to_vec(&response).unwrap()))
+                .await
+                .unwrap();
+            sw.flush().await.unwrap();
+            let _initialized = jsonrpc::read_message(&mut reader).await.unwrap();
+            // Drop both halves to simulate a language server exiting unexpectedly.
+        });
+        let client = LspClient::connect(Box::new(cr), Box::new(cw), "file:///proj".into())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let path = if cfg!(windows) {
+            PathBuf::from("C:\\proj\\a.rs")
+        } else {
+            PathBuf::from("/proj/a.rs")
+        };
+        let cancel = CancellationToken::new();
+        let result =
+            tokio::time::timeout(Duration::from_secs(1), client.hover(&path, 0, 0, &cancel))
+                .await
+                .expect("closed server should fail promptly");
+        assert!(result.unwrap_err().contains("stream closed"));
+    }
+
+    #[tokio::test]
+    async fn answers_server_configuration_and_dynamic_registration_requests() {
+        let (client_end, server_end) = tokio::io::duplex(32 * 1024);
+        let (cr, cw) = tokio::io::split(client_end);
+        let (sr, mut sw) = tokio::io::split(server_end);
+        let server = tokio::spawn(async move {
+            let mut reader = BufReader::new(sr);
+            let initialize = jsonrpc::read_message(&mut reader).await.unwrap();
+            let initialize: Value = serde_json::from_slice(&initialize).unwrap();
+            let response = json!({
+                "jsonrpc": "2.0",
+                "id": initialize["id"],
+                "result": { "capabilities": { "positionEncoding": "utf-8" } }
+            });
+            sw.write_all(&jsonrpc::encode(&serde_json::to_vec(&response).unwrap()))
+                .await
+                .unwrap();
+            sw.flush().await.unwrap();
+            let _initialized = jsonrpc::read_message(&mut reader).await.unwrap();
+
+            let configuration = json!({
+                "jsonrpc": "2.0",
+                "id": "config-1",
+                "method": "workspace/configuration",
+                "params": { "items": [{"section":"rust-analyzer"}, {"section":"other"}] }
+            });
+            sw.write_all(&jsonrpc::encode(
+                &serde_json::to_vec(&configuration).unwrap(),
+            ))
+            .await
+            .unwrap();
+            sw.flush().await.unwrap();
+            let response = jsonrpc::read_message(&mut reader).await.unwrap();
+            let response: Value = serde_json::from_slice(&response).unwrap();
+            assert_eq!(response["id"], "config-1");
+            assert_eq!(response["result"], json!([null, null]));
+
+            let registration = json!({
+                "jsonrpc": "2.0",
+                "id": 77,
+                "method": "client/registerCapability",
+                "params": { "registrations": [{"id":"diag","method":"textDocument/diagnostic"}] }
+            });
+            sw.write_all(&jsonrpc::encode(
+                &serde_json::to_vec(&registration).unwrap(),
+            ))
+            .await
+            .unwrap();
+            sw.flush().await.unwrap();
+            let response = jsonrpc::read_message(&mut reader).await.unwrap();
+            let response: Value = serde_json::from_slice(&response).unwrap();
+            assert_eq!(response["id"], 77);
+            assert!(response["result"].is_null());
+        });
+
+        let client = LspClient::connect(Box::new(cr), Box::new(cw), "file:///proj".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            client.wire_position("你😀x", 1, 3).unwrap(),
+            (0, 7),
+            "server-negotiated UTF-8 counts bytes"
+        );
+        server.await.unwrap();
+        assert!(client.supports_pull_diagnostics.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn cancellation_sends_cancel_request_and_returns_promptly() {
+        let (client_end, server_end) = tokio::io::duplex(32 * 1024);
+        let (cr, cw) = tokio::io::split(client_end);
+        let (sr, mut sw) = tokio::io::split(server_end);
+        let (observed_tx, observed_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(sr);
+            let initialize = jsonrpc::read_message(&mut reader).await.unwrap();
+            let initialize: Value = serde_json::from_slice(&initialize).unwrap();
+            let response =
+                json!({ "jsonrpc":"2.0", "id":initialize["id"], "result":{"capabilities":{}} });
+            sw.write_all(&jsonrpc::encode(&serde_json::to_vec(&response).unwrap()))
+                .await
+                .unwrap();
+            sw.flush().await.unwrap();
+            let _initialized = jsonrpc::read_message(&mut reader).await.unwrap();
+            let request = jsonrpc::read_message(&mut reader).await.unwrap();
+            let request: Value = serde_json::from_slice(&request).unwrap();
+            let request_id = request["id"].clone();
+            let cancel = jsonrpc::read_message(&mut reader).await.unwrap();
+            let cancel: Value = serde_json::from_slice(&cancel).unwrap();
+            let _ = observed_tx.send((request_id, cancel));
+        });
+        let client = LspClient::connect(Box::new(cr), Box::new(cw), "file:///proj".into())
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let cancel_trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancel_trigger.cancel();
+        });
+        let path = if cfg!(windows) {
+            PathBuf::from("C:\\proj\\a.rs")
+        } else {
+            PathBuf::from("/proj/a.rs")
+        };
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), client.hover(&path, 0, 0, &cancel))
+                .await
+                .expect("cancellation should be prompt")
+                .unwrap_err();
+        assert!(error.contains("cancelled"));
+        let (request_id, cancel_message) = observed_rx.await.unwrap();
+        assert_eq!(cancel_message["method"], "$/cancelRequest");
+        assert_eq!(cancel_message["params"]["id"], request_id);
+        assert!(client.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pull_diagnostics_are_cached_when_server_advertises_support() {
+        let (client_end, server_end) = tokio::io::duplex(32 * 1024);
+        let (cr, cw) = tokio::io::split(client_end);
+        let (sr, mut sw) = tokio::io::split(server_end);
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(sr);
+            let initialize = jsonrpc::read_message(&mut reader).await.unwrap();
+            let initialize: Value = serde_json::from_slice(&initialize).unwrap();
+            let response = json!({
+                "jsonrpc":"2.0",
+                "id":initialize["id"],
+                "result":{"capabilities":{"diagnosticProvider":{"interFileDependencies":false}}}
+            });
+            sw.write_all(&jsonrpc::encode(&serde_json::to_vec(&response).unwrap()))
+                .await
+                .unwrap();
+            sw.flush().await.unwrap();
+            let _initialized = jsonrpc::read_message(&mut reader).await.unwrap();
+            let request = jsonrpc::read_message(&mut reader).await.unwrap();
+            let request: Value = serde_json::from_slice(&request).unwrap();
+            assert_eq!(request["method"], "textDocument/diagnostic");
+            let response = json!({
+                "jsonrpc":"2.0",
+                "id":request["id"],
+                "result":{
+                    "kind":"full",
+                    "items":[{
+                        "range":{"start":{"line":1,"character":2},"end":{"line":1,"character":3}},
+                        "severity":2,
+                        "message":"pulled warning"
+                    }]
+                }
+            });
+            sw.write_all(&jsonrpc::encode(&serde_json::to_vec(&response).unwrap()))
+                .await
+                .unwrap();
+            sw.flush().await.unwrap();
+        });
+        let client = LspClient::connect(Box::new(cr), Box::new(cw), "file:///proj".into())
+            .await
+            .unwrap();
+        let path = if cfg!(windows) {
+            PathBuf::from("C:\\proj\\a.rs")
+        } else {
+            PathBuf::from("/proj/a.rs")
+        };
+        client
+            .refresh_pull_diagnostics(&path, &CancellationToken::new())
+            .await
+            .unwrap();
+        let diagnostics = client.diagnostics(&path);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].message, "pulled warning");
+        assert_eq!(diagnostics[0].line, 2);
+    }
+
+    #[tokio::test]
+    async fn resync_clears_diagnostics_from_the_previous_document_version() {
+        let (client_end, server_end) = tokio::io::duplex(16 * 1024);
+        let (cr, cw) = tokio::io::split(client_end);
+        let (sr, sw) = tokio::io::split(server_end);
+        tokio::spawn(mock_server(sr, sw));
+        let client = LspClient::connect(Box::new(cr), Box::new(cw), "file:///proj".into())
+            .await
+            .unwrap();
+        let path = if cfg!(windows) {
+            PathBuf::from("C:\\proj\\a.rs")
+        } else {
+            PathBuf::from("/proj/a.rs")
+        };
+        client.sync_document(&path, "old", "rust").await.unwrap();
+        assert_eq!(wait_for_diags(&client, &path).await.len(), 1);
+        client.sync_document(&path, "new", "rust").await.unwrap();
+        assert!(client.diagnostics(&path).is_empty());
     }
 
     #[tokio::test]

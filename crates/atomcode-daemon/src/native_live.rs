@@ -117,6 +117,13 @@ pub fn publish_unsequenced(
     hub().publish_unsequenced(binding, event)
 }
 
+pub fn seed_goal_progress(
+    binding: &LiveBinding,
+    progress: atomcode_coding::GoalProgress,
+) -> Result<(), HubError> {
+    hub().seed_goal_progress(binding, progress)
+}
+
 pub fn join() -> Result<LiveJoin, HubError> {
     hub().join()
 }
@@ -173,6 +180,15 @@ pub async fn respond_confirmed(
     value: serde_json::Value,
 ) -> Result<(), HubError> {
     hub().respond_confirmed(id, value).await
+}
+
+pub async fn resolve_policy_intervention(
+    intervention_id: u64,
+    action: atomcode_kernel::event::PolicyRecoveryAction,
+) -> Result<(), HubError> {
+    hub()
+        .resolve_policy_intervention(intervention_id, action)
+        .await
 }
 
 pub async fn respond_pending_kind_confirmed(

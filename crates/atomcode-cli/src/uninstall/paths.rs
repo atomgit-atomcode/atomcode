@@ -83,7 +83,7 @@ pub fn windows_install_dir_candidates() -> Vec<PathBuf> {
         out.push(PathBuf::from(p));
     }
     if let Some(p) = std::env::var_os("LOCALAPPDATA") {
-        out.push(PathBuf::from(p).join("AtomCode"));
+        out.push(PathBuf::from(p).join(atomcode_config::distribution::WINDOWS_INSTALL_DIR));
     }
     out
 }

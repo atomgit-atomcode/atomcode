@@ -19,8 +19,6 @@ pub(crate) struct CostModelResult {
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
-    estimated_cost_usd: Option<f64>,
-    free: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -94,7 +92,6 @@ pub(crate) enum CommandResult {
         turn_count: usize,
         models: Vec<CostModelResult>,
         unattributed_tokens: u64,
-        estimated_cost_usd: Option<f64>,
     },
     Todo {
         items: Vec<TodoItemJson>,
@@ -740,12 +737,9 @@ fn exec_cost(
                 input_tokens: model.tokens.input,
                 output_tokens: model.tokens.output,
                 cached_tokens: model.tokens.cached_input,
-                estimated_cost_usd: model.estimated_cost_usd,
-                free: model.explicitly_free,
             })
             .collect(),
         unattributed_tokens: report.unattributed_tokens,
-        estimated_cost_usd: report.estimated_cost_usd,
     })
 }
 
@@ -763,19 +757,10 @@ fn exec_todo(
 }
 
 fn todo_items_from_messages(messages: &[atomcode_kernel::message::Message]) -> Vec<TodoItemJson> {
-    // Fold the kernel-native tool-call stream via the canonical reducer. This shows CURRENT
-    // statuses in `/todo`, matching the merged `todowrite` tool + the TUI.
-    use atomcode_capabilities::tools::todo::{reduce_todos, TodoStatus};
-    let calls: Vec<(&str, &str)> = messages
-        .iter()
-        .flat_map(|message| {
-            message
-                .tool_calls
-                .iter()
-                .map(|call| (call.name.as_str(), call.arguments.as_str()))
-        })
-        .collect();
-    let todos = reduce_todos(calls);
+    // Fold the kernel-native call/result stream through the canonical projection. This shows
+    // current successful state in `/todo`, matching the merged `todowrite` tool + the TUI.
+    use atomcode_capabilities::tools::todo::{derive_current_todos, TodoStatus};
+    let todos = derive_current_todos(messages);
 
     todos
         .into_iter()
@@ -1222,6 +1207,38 @@ mod tests {
         assert_eq!(todos.len(), 2);
         assert_eq!(todos[0].content, "写测试");
         assert_eq!(todos[1].content, "提交");
+    }
+
+    #[test]
+    fn todo_ignores_failed_todowrite_call() {
+        use atomcode_kernel::message::Message;
+        use atomcode_kernel::tool::ToolCall;
+
+        let messages = vec![
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "ok".into(),
+                    name: "todowrite".into(),
+                    arguments:
+                        r#"{"todos":[{"content":"保留任务","status":"in_progress"}]}"#.into(),
+                }],
+            ),
+            Message::tool_result("ok", "1 task", false),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "failed".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"action":"add","content":"不应出现"}"#.into(),
+                }],
+            ),
+            Message::tool_result("failed", "invalid todo", true),
+        ];
+
+        let todos = todo_items_from_messages(&messages);
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].content, "保留任务");
     }
 
     #[test]

@@ -172,7 +172,7 @@ Current mappings are:
 | `find_references` | `Read` |
 | `list_symbols` | `Read` |
 | `read_symbol` | `Read` |
-| `diagnostics` with `file_path` | `Read` |
+| `lsp` (all phase-one operations) | `Read` |
 | `list_directory` | `Enumerate` |
 | `glob` | `Enumerate` |
 | `cd` | `Enumerate` |

@@ -124,7 +124,7 @@ mod tests {
             .unwrap();
         let provider = UsageRecordingProvider::new(
             Arc::new(Canned),
-            DetachedUsageRecorder::new(manager.clone(), "s1", "fast", "child-model", None),
+            DetachedUsageRecorder::new(manager.clone(), "s1", "fast", "child-model"),
         );
 
         let mut stream = provider
@@ -152,7 +152,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = Arc::new(SessionManager::with_root(dir.path()));
         let status = SnapshotPersistenceStatus::default();
-        let recorder = DetachedUsageRecorder::new(manager, "missing", "fast", "child-model", None)
+        let recorder = DetachedUsageRecorder::new(manager, "missing", "fast", "child-model")
             .with_persistence_status(status.clone());
 
         assert!(recorder

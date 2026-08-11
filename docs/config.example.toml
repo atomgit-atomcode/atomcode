@@ -122,6 +122,15 @@ model = "deepseek-ai/DeepSeek-V3"
 base_url = "https://api.siliconflow.cn/v1"
 context_window = 64000
 
+# -------- 小米 MiMo ----------
+[providers.xiaomi-mimo]
+type = "openai"
+api_key = "sk-..."
+model = "mimo-v2.5-pro"
+base_url = "https://api.xiaomimimo.com/v1"
+context_window = 1000000
+max_tokens = 131072
+
 # -------- AtomGit CodingPlan（OAuth 自动配置）----------
 # /login 命令会自动写入，无需手动填写 api_key
 # 以下仅为展示格式，实际由系统自动生成。
@@ -285,4 +294,6 @@ auto_update_marketplaces = true
 # =============================================================================
 [ui]
 theme = "auto"
-auto_copy_on_select = true
+# /resume 初次回放到终端原生 scrollback 的视觉行上限。
+# 省略时按终端自动选择；0 表示完整回放（长会话恢复会更慢）。
+# history_replay_max_rows = 5000

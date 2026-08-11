@@ -647,7 +647,10 @@ fn last_assistant_reply_markdown(messages: &[atomcode_kernel::message::Message])
 
 fn is_real_user_message(message: &atomcode_kernel::message::Message) -> bool {
     use atomcode_kernel::message::Role;
-    matches!(message.role, Role::User) && !message.synthetic
+    matches!(message.role, Role::User)
+        && !message.synthetic
+        // Compatibility only: old snapshots predate reliable synthetic provenance.
+        && !atomcode_capabilities::reminder::is_system_reminder(&message.text)
 }
 
 pub(crate) fn replay_session(
@@ -665,6 +668,7 @@ pub(crate) fn replay_session(
     // final frame inside the envelope and closes it. No-op on renderers
     // without synchronized output (plain/pipe mode).
     renderer.begin_sync();
+    renderer.begin_initial_history_replay();
     // Suppress auto-copy during replay so we don't overwrite the user's
     // clipboard or inject stale "Copied" hints (issue #699 P1).
     renderer.set_suppress_auto_copy(true);
@@ -749,11 +753,12 @@ pub(crate) fn replay_session(
                     // rows, and remember the call ids so their individual tool
                     // RESULT rows are suppressed below — matching the compact live
                     // batch view the user saw before the resume.
-                    let (header, children) = crate::event_loop::build_replay_tool_batch(
-                        &m.tool_calls,
-                        &result_of,
-                        &state.todo_titles,
-                    );
+                    let (header, children, edit_displays) =
+                        crate::event_loop::build_replay_tool_batch(
+                            &m.tool_calls,
+                            &result_of,
+                            &state.todo_titles,
+                        );
                     for tc in &m.tool_calls {
                         if !tc.id.is_empty() {
                             batched_result_ids.insert(tc.id.clone());
@@ -764,6 +769,18 @@ pub(crate) fn replay_session(
                         header,
                         children,
                     });
+                    // Live batches append edit diffs only after every child has
+                    // completed, so the retained group is no longer mutable.
+                    // Replay groups are already final; restore the same durable
+                    // diff rows immediately from persisted ToolResult text.
+                    for display in edit_displays {
+                        renderer.render(UiLine::ToolResult {
+                            success: true,
+                            summary: display.summary,
+                            diff_stats: Some(display.diff_stats),
+                        });
+                        renderer.render(UiLine::EditDiffBlock(display.entries));
+                    }
                 } else {
                     for tc in &m.tool_calls {
                         // todowrite → no inline block; the persistent panel is the sole
@@ -823,6 +840,7 @@ pub(crate) fn replay_session(
     }
     renderer.render(UiLine::TurnComplete);
     renderer.render(UiLine::TurnSeparator { label: resumed });
+    renderer.end_initial_history_replay();
     renderer.flush();
     renderer.set_suppress_auto_copy(false);
     renderer.end_sync();
@@ -1391,8 +1409,8 @@ mod tests {
             ),
             Message::tool_result("r1", "file contents", false),
             // A FAILED todowrite (is_error=true): its error result must NOT be
-            // suppressed (parity with live's `… && success` suppression). It IS
-            // the last valid call, so the panel is seeded from it (task C).
+            // suppressed (parity with live's `… && success` suppression), and
+            // its requested state must not replace the last successful panel.
             Message::assistant(
                 "",
                 vec![ToolCall {
@@ -1422,14 +1440,15 @@ mod tests {
                 .any(|s| s.contains("task A") || s.contains("task B") || s.contains("task C")),
             "todowrite no longer renders an inline block on replay: {cmd_out:?}"
         );
-        // Panel seeded from the transcript's LAST valid todowrite (task C, 1 pending).
+        // Panel stays on the last SUCCESSFUL todowrite (task A/B); the rejected
+        // task C call is not allowed to resurrect during transcript replay.
         let panel = state
             .active_todos
             .clone()
             .expect("panel seeded from transcript");
         assert_eq!(
-            panel.total, 1,
-            "last todowrite (task C) seeds the panel: {panel:?}"
+            panel.total, 2,
+            "failed task C call must preserve the prior task A/B panel: {panel:?}"
         );
 
         let tool_call_names: Vec<&str> = rec
@@ -1558,6 +1577,80 @@ mod tests {
                 .iter()
                 .any(|l| matches!(l, UiLine::ToolResult { .. })),
             "batched results are folded into child rows, not shown expanded"
+        );
+    }
+
+    #[test]
+    fn replay_restores_batched_edit_diffs_in_call_order() {
+        use atomcode_kernel::message::Message;
+        use atomcode_kernel::tool::ToolCall;
+
+        #[derive(Default)]
+        struct Rec {
+            lines: Vec<UiLine>,
+        }
+        impl Renderer for Rec {
+            fn render(&mut self, line: UiLine) {
+                self.lines.push(line);
+            }
+            fn flush(&mut self) {}
+            fn shutdown(&mut self) {}
+            fn reset(&mut self) {}
+            fn clear_screen(&mut self) {}
+            fn suspend_for_external(&mut self) {}
+            fn resume_from_external(&mut self) {}
+            fn flush_deferred(&mut self) {}
+        }
+
+        let mut session = Session::new(PathBuf::from("/tmp/x"));
+        session.messages = vec![
+            Message::user("edit both"),
+            Message::assistant(
+                "",
+                vec![
+                    ToolCall {
+                        id: "e1".into(),
+                        name: "edit_file".into(),
+                        arguments: r#"{"file_path":"src/a.rs"}"#.into(),
+                    },
+                    ToolCall {
+                        id: "e2".into(),
+                        name: "edit_file".into(),
+                        arguments: r#"{"file_path":"src/b.rs"}"#.into(),
+                    },
+                ],
+            ),
+            Message::tool_result(
+                "e1",
+                "Edited src/a.rs (1 replacement)\n@@ -1 +1 @@\n-old-a\n+new-a",
+                false,
+            ),
+            Message::tool_result(
+                "e2",
+                "Edited src/b.rs (1 replacement)\n@@ -1 +1 @@\n-old-b\n+new-b",
+                false,
+            ),
+        ];
+
+        let mut state = UiState::with_unicode(true);
+        let mut rec = Rec::default();
+        replay_session(&mut rec, &mut state, &session, false);
+
+        let summaries: Vec<&str> = rec
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                UiLine::ToolResult { summary, .. } => Some(summary.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(summaries, vec!["Edited src/a.rs", "Edited src/b.rs"]);
+        assert_eq!(
+            rec.lines
+                .iter()
+                .filter(|line| matches!(line, UiLine::EditDiffBlock(_)))
+                .count(),
+            2
         );
     }
 

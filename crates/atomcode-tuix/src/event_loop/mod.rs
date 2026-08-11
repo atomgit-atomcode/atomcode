@@ -94,6 +94,27 @@ fn reload_runtime_provider_from(
     ctx: &LoopCtx,
     source: &Config,
 ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+    let agent_cfg = coding_agent_config_from(ctx, source);
+    ctx.runtime.reload_provider(
+        agent_cfg,
+        ctx.foreground_runtime_id,
+        ctx.runtime_event_tx.clone(),
+    )
+}
+
+fn reprepare_runtime_config_from(
+    ctx: &LoopCtx,
+    source: &Config,
+) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+    let agent_cfg = coding_agent_config_from(ctx, source);
+    ctx.runtime.reprepare_config(
+        agent_cfg,
+        ctx.foreground_runtime_id,
+        ctx.runtime_event_tx.clone(),
+    )
+}
+
+fn coding_agent_config_from(ctx: &LoopCtx, source: &Config) -> atomcode_coding::CodingAgentConfig {
     let mut config = atomcode_coding::CodingRuntimeConfig::from_config(
         source,
         &ctx.working_dir,
@@ -110,11 +131,7 @@ fn reload_runtime_provider_from(
     let mut agent_cfg = config.agent_config();
     agent_cfg.round_cap_checkpoint = true; // TUI implements the checkpoint panel (Task 3+)
     agent_cfg.next_prompt_suggestions = true;
-    ctx.runtime.reload_provider(
-        agent_cfg,
-        ctx.foreground_runtime_id,
-        ctx.runtime_event_tx.clone(),
-    )
+    agent_cfg
 }
 
 pub(crate) fn request_context_stats_render(
@@ -549,9 +566,9 @@ pub(crate) fn echo_text_with_image_markers(text: String, image_count: usize) -> 
 /// (`VisionPreprocessorUnresolvable`, which names the typo'd value) so the
 /// message stops telling users who DID configure a preprocessor that it is
 /// "未配置". Shared by every gate that surfaces the rejection to the user.
-fn image_attach_reject_line(config: &Config, model: &str) -> Option<String> {
+fn image_attach_reject_line(config: &Config, selection: &str, model: &str) -> Option<String> {
     use atomcode_config::config::ImageAttachSupport as S;
-    match config.image_attach_support_for_model(model) {
+    match config.image_attach_support_for_selection(Some(selection), model) {
         S::Supported => None,
         S::Unconfigured => {
             Some(crate::i18n::t(crate::i18n::Msg::ModelNoImageSupport { model }).into_owned())
@@ -1634,6 +1651,25 @@ fn hold_interrupt_wait_phase(state: &mut UiState, armed: bool) {
     }
 }
 
+/// A non-capturing modal can outlive the presentation terminal that was drawn
+/// before the runtime-owned `TurnFinished` reached this loop.  When there is no
+/// replay payload to protect and the runtime already reports no active turn,
+/// keeping the interrupt latch armed only strands the visible modal behind the
+/// Streaming key route (its Enter key appears to do nothing).
+fn should_release_stale_modal_interrupt_wait(
+    phase: UiPhase,
+    interrupt_armed: bool,
+    has_non_capturing_modal: bool,
+    runtime_has_active_turn: bool,
+    has_replay_payload: bool,
+) -> bool {
+    interrupt_armed
+        && matches!(phase, UiPhase::Streaming)
+        && has_non_capturing_modal
+        && !runtime_has_active_turn
+        && !has_replay_payload
+}
+
 /// What a runtime event is allowed to do to a fixed-interval prompt loop.
 /// A normal runtime-owned terminal releases the next scheduled iteration;
 /// every authoritative failure tears the loop down. Presentation-only natural
@@ -1730,6 +1766,19 @@ fn is_provider_reload_failure(event: &bg_runtime::RuntimeEventPayload) -> bool {
         bg_runtime::RuntimeEventPayload::SequencedNative(envelope) => matches!(
             &envelope.event,
             CodingRuntimeEvent::ProviderReloadFinished(Err(_))
+        ),
+        _ => false,
+    }
+}
+
+fn is_provider_reload_terminal(event: &bg_runtime::RuntimeEventPayload) -> bool {
+    match event {
+        bg_runtime::RuntimeEventPayload::Native(CodingRuntimeEvent::ProviderReloadFinished(_)) => {
+            true
+        }
+        bg_runtime::RuntimeEventPayload::SequencedNative(envelope) => matches!(
+            &envelope.event,
+            CodingRuntimeEvent::ProviderReloadFinished(_)
         ),
         _ => false,
     }
@@ -1902,6 +1951,42 @@ mod submit_hold_tests {
     }
 
     #[test]
+    fn visible_modal_releases_stale_interrupt_wait_after_runtime_is_ready() {
+        assert!(should_release_stale_modal_interrupt_wait(
+            UiPhase::Streaming,
+            true,
+            true,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn modal_never_bypasses_live_turn_or_pending_replay() {
+        assert!(!should_release_stale_modal_interrupt_wait(
+            UiPhase::Streaming,
+            true,
+            true,
+            true,
+            false,
+        ));
+        assert!(!should_release_stale_modal_interrupt_wait(
+            UiPhase::Streaming,
+            true,
+            true,
+            false,
+            true,
+        ));
+        assert!(!should_release_stale_modal_interrupt_wait(
+            UiPhase::Streaming,
+            true,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
     fn interrupt_staging_preserves_fifo_and_existing_type_ahead() {
         fn queued(text: &str, marker: usize) -> crate::state::QueuedMessage {
             crate::state::QueuedMessage {
@@ -1943,6 +2028,13 @@ mod submit_hold_tests {
         assert!(!should_stage_interrupt(true, false, true));
         assert!(!should_stage_interrupt(true, true, false));
         assert!(should_stage_interrupt(true, true, true));
+    }
+
+    #[test]
+    fn accepted_startup_cancel_does_not_wait_for_a_turn_terminal() {
+        assert!(!should_arm_interrupt_wait(true, false));
+        assert!(!should_arm_interrupt_wait(false, true));
+        assert!(should_arm_interrupt_wait(true, true));
     }
 
     #[test]
@@ -2297,6 +2389,12 @@ enum ReadyRuntimeRequest {
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     },
+    ResolvePolicyIntervention {
+        intervention_id: u64,
+        action: atomcode_kernel::event::PolicyRecoveryAction,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
     RestoreSnapshot {
         snapshot: atomcode_kernel::message::SessionSnapshot,
         correlation_id: u64,
@@ -2325,6 +2423,11 @@ enum ReadyRuntimeRequest {
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     },
     ReloadProvider {
+        next: atomcode_coding::CodingAgentConfig,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    },
+    ReprepareConfig {
         next: atomcode_coding::CodingAgentConfig,
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
@@ -2384,6 +2487,7 @@ impl ReadyRuntimeControl {
         let phase = self.handle.status().phase;
         let allowed = match &request {
             ReadyRuntimeRequest::ReloadProvider { .. }
+            | ReadyRuntimeRequest::ReprepareConfig { .. }
             | ReadyRuntimeRequest::DeactivateProvider { .. } => matches!(
                 phase,
                 atomcode_coding::RuntimePhase::Ready
@@ -2393,6 +2497,9 @@ impl ReadyRuntimeControl {
                     | atomcode_coding::RuntimePhase::Failed
             ),
             ReadyRuntimeRequest::Dispatch(command) => self.handle.accepts(command),
+            ReadyRuntimeRequest::ResolvePolicyIntervention { .. } => {
+                phase == atomcode_coding::RuntimePhase::Ready
+            }
             ReadyRuntimeRequest::Compact(_)
             | ReadyRuntimeRequest::Undo { .. }
             | ReadyRuntimeRequest::RewindCatalog { .. }
@@ -2503,6 +2610,27 @@ impl ReadyRuntimeControl {
                         CodingRuntimeEvent::ContextStatsRefreshed(result),
                     );
                 }
+                ReadyRuntimeRequest::ResolvePolicyIntervention {
+                    intervention_id,
+                    action,
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self
+                        .handle
+                        .resolve_policy_intervention(intervention_id, action)
+                        .await;
+                    let _ = event_tx.send(bg_runtime::RuntimeEvent {
+                        runtime_id,
+                        event: bg_runtime::RuntimeEventPayload::Driver(
+                            bg_runtime::DriverEvent::PolicyInterventionResolutionFinished {
+                                intervention_id,
+                                action,
+                                result,
+                            },
+                        ),
+                    });
+                }
                 ReadyRuntimeRequest::RestoreSnapshot {
                     snapshot,
                     correlation_id,
@@ -2593,6 +2721,22 @@ impl ReadyRuntimeControl {
                     event_tx,
                 } => {
                     let result = self.handle.reassemble_provider(next).await;
+                    RuntimeControl::send_native_result(
+                        &event_tx,
+                        runtime_id,
+                        CodingRuntimeEvent::ProviderReloadFinished(result),
+                    );
+                }
+                ReadyRuntimeRequest::ReprepareConfig {
+                    next,
+                    runtime_id,
+                    event_tx,
+                } => {
+                    let result = self
+                        .handle
+                        .reprepare_config(next)
+                        .await
+                        .map(|changed| changed.generation);
                     RuntimeControl::send_native_result(
                         &event_tx,
                         runtime_id,
@@ -2834,6 +2978,50 @@ impl RuntimeControl {
                 deferred.send(atomcode_coding::DriverCommand::Compact(focus))
             }
             Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    pub fn resolve_policy_intervention(
+        &self,
+        intervention_id: u64,
+        action: atomcode_kernel::event::PolicyRecoveryAction,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::ResolvePolicyIntervention {
+                intervention_id,
+                action,
+                runtime_id,
+                event_tx,
+            }),
+            Self::Deferred(_) => {
+                let handle = self
+                    .active_handle()
+                    .ok_or(atomcode_coding::RuntimeUnavailable)?;
+                if !handle.accepts(&atomcode_coding::DriverCommand::ResolvePolicyIntervention {
+                    intervention_id,
+                    action,
+                }) {
+                    return Err(atomcode_coding::RuntimeUnavailable);
+                }
+                tokio::spawn(async move {
+                    let result = handle
+                        .resolve_policy_intervention(intervention_id, action)
+                        .await;
+                    let _ = event_tx.send(bg_runtime::RuntimeEvent {
+                        runtime_id,
+                        event: bg_runtime::RuntimeEventPayload::Driver(
+                            bg_runtime::DriverEvent::PolicyInterventionResolutionFinished {
+                                intervention_id,
+                                action,
+                                result,
+                            },
+                        ),
+                    });
+                });
+                Ok(())
+            }
         }
     }
 
@@ -3134,6 +3322,25 @@ impl RuntimeControl {
             }),
             Self::Deferred(deferred) if deferred.provider_operation_allowed() => {
                 deferred.send(atomcode_coding::DriverCommand::ReloadProvider(next))
+            }
+            Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
+        }
+    }
+
+    pub fn reprepare_config(
+        &self,
+        next: atomcode_coding::CodingAgentConfig,
+        runtime_id: bg_runtime::RuntimeId,
+        event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
+        match self {
+            Self::Ready(ready) => ready.enqueue(ReadyRuntimeRequest::ReprepareConfig {
+                next,
+                runtime_id,
+                event_tx,
+            }),
+            Self::Deferred(deferred) if deferred.provider_operation_allowed() => {
+                deferred.send(atomcode_coding::DriverCommand::ReprepareConfig(next))
             }
             Self::Deferred(_) => Err(atomcode_coding::RuntimeUnavailable),
         }
@@ -3540,6 +3747,7 @@ pub(crate) struct PendingProviderReload {
     desired_config: Config,
     persisted_revision: Option<ConfigRevision>,
     rollback_persisted_config: Option<Config>,
+    rollback_persisted_document: Option<String>,
     rollback_runtime_config: Option<Config>,
     previous_model_name: Option<String>,
     announce: Option<String>,
@@ -3579,11 +3787,20 @@ impl AuthObservation {
 
 pub struct LoopCtx {
     pub config: Config,
+    /// Exact active model selection id. Unlike `model_name`, this remains
+    /// unambiguous when two accounts expose the same wire model.
+    pub provider_selection: String,
     pub model_name: String,
     pub(crate) provider_selection_mode: crate::ProviderSelectionMode,
     pub(crate) config_store: ConfigStore,
     pub(crate) observed_config_revision: Option<ConfigRevision>,
     pub(crate) pending_provider_reload: Option<PendingProviderReload>,
+    /// Last model candidate whose reload was initiated by F2/Shift+F2.
+    ///
+    /// This is navigation state only; `config` and the coding runtime remain the
+    /// authorities for the active model. It survives a failed reload so the next
+    /// shortcut can move past an unavailable candidate, and is cleared on success.
+    pub(crate) model_cycle_anchor: Option<String>,
     pub(crate) pending_provider_projection: Option<ProviderProjectionObservation>,
     pub(crate) observed_auth: Option<AuthObservation>,
     pub(crate) pending_provider_deactivation: bool,
@@ -5452,21 +5669,35 @@ mod buffer_tests {
     }
 
     #[test]
-    fn submit_strips_compact_prompt_char_without_space() {
-        // Prompt chars other than `$` have no competing syntax, so a compact
-        // PS1 with no trailing space (`❯git`) is still cleaned — unlike `$`,
-        // which is only stripped before a space so `$skill` survives.
-        match commit_of("❯git status") {
-            BufferResult::Commit(s) => assert_eq!(s, "git status"),
-            _ => panic!("expected Commit"),
+    fn submit_preserves_prompt_like_chars_without_space() {
+        for source in ["#8，。。。。", "#标题", ">quote", "%value", "λx", "❯git status"] {
+            match commit_of(source) {
+                BufferResult::Commit(s) => assert_eq!(s, source),
+                _ => panic!("expected Commit for {source:?}"),
+            }
         }
     }
 
     #[test]
-    fn submit_bare_dollar_is_empty() {
-        // `$` alone is not a skill invocation; it collapses to an empty line
-        // (Redraw), same as before this fix.
-        assert!(matches!(commit_of("$"), BufferResult::Redraw));
+    fn submit_preserves_bare_prompt_characters() {
+        for source in ["$", "#", ">", "%", "λ", "❯"] {
+            match commit_of(source) {
+                BufferResult::Commit(s) => assert_eq!(s, source),
+                _ => panic!("expected Commit for {source:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn submit_strips_prompt_characters_followed_by_whitespace() {
+        for source in ["# ls", "> status", "% pwd", "λ cargo test", "❯ git log"] {
+            let prefix_len = source.chars().next().unwrap().len_utf8();
+            let expected = source[prefix_len..].trim_start();
+            match commit_of(source) {
+                BufferResult::Commit(s) => assert_eq!(s, expected),
+                _ => panic!("expected Commit for {source:?}"),
+            }
+        }
     }
 }
 
@@ -7362,6 +7593,37 @@ mod tool_format_tests {
     }
 
     #[test]
+    fn credential_policy_block_matches_only_the_stable_reason() {
+        let result = format!(
+            "blocked: {}",
+            atomcode_capabilities::tools::credential_bash_gate::CREDENTIAL_BASH_DENIAL_REASON
+        );
+        assert!(credential_policy_blocked(&result, false));
+        assert!(!credential_policy_blocked(
+            "blocked: plugin supplied arbitrary reason",
+            false
+        ));
+        assert!(!credential_policy_blocked(
+            "blocked: plan mode is active",
+            false
+        ));
+        assert!(!credential_policy_blocked(&result, true));
+    }
+
+    #[test]
+    fn batched_edit_display_preserves_diff_and_stats() {
+        let output = "Edited src/main.rs (1 replacement)\n@@ -1,2 +1,2 @@\n-old\n+new\n context";
+        let display = batched_edit_display("edit_file", output, true).expect("edit display");
+
+        assert_eq!(display.summary, "Edited src/main.rs");
+        assert_eq!(display.diff_stats, (1, 1));
+        assert_eq!(display.entries.len(), 3);
+        assert!(batched_edit_display("read_file", output, true).is_none());
+        assert!(batched_edit_display("edit_file", output, false).is_none());
+        assert!(batched_edit_display("edit_file", "Edited src/main.rs", true).is_none());
+    }
+
+    #[test]
     fn approval_denial_label_detects_denials() {
         // Policy denial → calm label (non-empty).
         let label = approval_denial_label(
@@ -8403,6 +8665,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     && ctx.pending_provider_reload.is_none()
                     && retry_pending_provider_projection(&mut ctx, &mut app.state, renderer);
                 let config_changed = idle_boundary && poll_external_config(&mut ctx);
+                if config_changed {
+                    crate::sync_history_replay_config(renderer, &ctx.config, &ctx.caps);
+                }
                 let auth_changed = poll_external_auth(&mut ctx);
                 let clipboard_hint_changed = idle_boundary
                     && clipboard_image_hint_changed(
@@ -8593,6 +8858,8 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             maybe = ctx.runtime_event_rx.recv() => {
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let redraw_modal_after_terminal =
+                        is_provider_reload_terminal(&runtime_event.event);
                     let provider_reload_failed =
                         is_provider_reload_failure(&runtime_event.event);
                     let base_queue_action = type_ahead_queue_action(&runtime_event.event);
@@ -8644,7 +8911,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         // The end of a turn is the first safe provider reload
                         // boundary. Reconcile before draining type-ahead so the
                         // next queued message cannot start on the stale model.
-                        let config_redraw = poll_shared_state(&mut ctx);
+                        let config_redraw = poll_shared_state(&mut ctx, renderer);
                         // Pop exactly one FIFO entry only when a natural
                         // TurnFinished (or an explicitly held idle submit)
                         // authorized it. Other idle events may redraw, but can
@@ -8683,6 +8950,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         } else {
                             crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
                             redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                        }
+                    }
+                    if redraw_modal_after_terminal {
+                        if let Some(modal) = app.active_modal.as_ref() {
+                            modal.draw(&app.buf, &app.state, &ctx, renderer);
                         }
                     }
                 } else {
@@ -8770,6 +9042,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     && ctx.pending_provider_reload.is_none()
                     && retry_pending_provider_projection(&mut ctx, &mut app.state, renderer);
                 let config_changed = idle_boundary && poll_external_config(&mut ctx);
+                if config_changed {
+                    crate::sync_history_replay_config(renderer, &ctx.config, &ctx.caps);
+                }
                 let auth_changed = poll_external_auth(&mut ctx);
                 let clipboard_hint_changed = idle_boundary
                     && clipboard_image_hint_changed(
@@ -8985,6 +9260,8 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             maybe = ctx.runtime_event_rx.recv() => {
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let redraw_modal_after_terminal =
+                        is_provider_reload_terminal(&runtime_event.event);
                     let provider_reload_failed =
                         is_provider_reload_failure(&runtime_event.event);
                     let base_queue_action = type_ahead_queue_action(&runtime_event.event);
@@ -9033,7 +9310,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     }
                     if matches!(app.state.phase, UiPhase::Idle) {
-                        let config_redraw = poll_shared_state(&mut ctx);
+                        let config_redraw = poll_shared_state(&mut ctx, renderer);
                         if !app.queue_drain_authorized {
                             redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                         } else if provider_transition_blocks_queue_drain(
@@ -9068,6 +9345,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         } else {
                             crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
                             redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                        }
+                    }
+                    if redraw_modal_after_terminal {
+                        if let Some(modal) = app.active_modal.as_ref() {
+                            modal.draw(&app.buf, &app.state, &ctx, renderer);
                         }
                     }
                 } else {
@@ -9416,6 +9698,7 @@ mod external_config_tests {
                 model: model.into(),
                 base_url: Some(base_url.into()),
                 system_prompt: None,
+                supports_vision: None,
                 user_agent: None,
                 context_window: 128_000,
                 max_tokens: None,
@@ -9428,7 +9711,6 @@ mod external_config_tests {
                 skip_tls_verify: false,
                 ephemeral,
                 capable_model: None,
-                pricing: None,
             },
         );
         config
@@ -10371,6 +10653,7 @@ fn reconcile_persisted_config(
             ));
         }
         ctx.config = desired;
+        ctx.provider_selection = provider.clone();
         ctx.model_name = model.clone();
         atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
         ctx.observed_config_revision = Some(snapshot.revision);
@@ -10396,6 +10679,7 @@ fn reconcile_persisted_config(
         desired_config: desired,
         persisted_revision: Some(snapshot.revision),
         rollback_persisted_config: None,
+        rollback_persisted_document: None,
         rollback_runtime_config: None,
         previous_model_name: None,
         announce: None,
@@ -10432,6 +10716,109 @@ pub(crate) fn reload_persisted_config(
         }
         ManualReloadDisposition::Start => reconcile_persisted_config(ctx, snapshot, true),
     }
+}
+
+/// Apply a document-level `/config` commit through the existing runtime owner.
+/// Runtime-affecting settings force the same generation-checked reprepare used
+/// by provider reloads; all other settings update the driver projection only.
+/// The exact pre-edit TOML is retained for CAS rollback until the authoritative
+/// reload terminal arrives.
+pub(crate) fn apply_config_panel_commit(
+    ctx: &mut LoopCtx,
+    commit: ConfigCommit,
+    previous_document: String,
+    force_agent_reassemble: bool,
+    force_capability_reprepare: bool,
+    success_message: String,
+) -> Result<PersistedConfigReload, anyhow::Error> {
+    if provider_transition_pending(ctx) {
+        let rollback = ctx.config_store.replace_document_if_revision(
+            &commit.snapshot.revision,
+            &previous_document,
+        )?;
+        if rollback.is_some() {
+            ctx.observed_config_revision = rollback.map(|commit| commit.snapshot.revision);
+        }
+        anyhow::bail!("a runtime configuration transition is already in progress");
+    }
+    let desired = desired_config_from_snapshot(ctx, commit.snapshot.config, false);
+    let auth_available = AuthObservation::read().is_available();
+    let wants_reload = force_agent_reassemble
+        || force_capability_reprepare
+        || should_reload_provider(
+            ctx.provider_selection_mode,
+            &ctx.config,
+            &desired,
+            ctx.runtime.ui_availability(),
+            auth_available,
+        )
+        || active_provider_config_changed(&ctx.config, &desired);
+
+    if !wants_reload {
+        let (provider, model) = resolved_provider_and_model(&desired);
+        if ctx.config.language != desired.language {
+            crate::i18n::set_locale(atomcode_config::i18n::resolve_initial_locale(
+                None,
+                desired.language,
+            ));
+        }
+        ctx.config = desired;
+        ctx.provider_selection = provider.clone();
+        ctx.model_name = model.clone();
+        atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
+        ctx.observed_config_revision = Some(commit.snapshot.revision);
+        ctx.observed_auth = None;
+        return Ok(PersistedConfigReload::Applied { provider, model });
+    }
+
+    let previous_runtime_config = ctx.config.clone();
+    let previous_model_name = ctx.model_name.clone();
+    let origin_generation = ctx.runtime.current_generation();
+    atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
+    let start = if force_capability_reprepare {
+        reprepare_runtime_config_from(ctx, &desired)
+    } else {
+        reload_runtime_provider_from(ctx, &desired)
+    };
+    if let Err(error) = start {
+        let rollback = rollback_pending_provider_reload(
+            ctx,
+            PendingProviderReload {
+                origin_generation,
+                desired_config: desired,
+                persisted_revision: Some(commit.snapshot.revision),
+                rollback_persisted_config: None,
+                rollback_persisted_document: Some(previous_document),
+                rollback_runtime_config: Some(previous_runtime_config),
+                previous_model_name: Some(previous_model_name),
+                announce: None,
+                language_change_notice: LanguageChangeNotice::None,
+                manual_reload_announce: false,
+                selection_mode_after_success: None,
+            },
+        );
+        let suffix = rollback
+            .error
+            .map(|rollback_error| format!("; config rollback failed: {rollback_error}"))
+            .unwrap_or_default();
+        anyhow::bail!("runtime reprepare could not be started: {error}{suffix}");
+    }
+
+    ctx.observed_config_revision = Some(commit.snapshot.revision.clone());
+    ctx.pending_provider_reload = Some(PendingProviderReload {
+        origin_generation,
+        desired_config: desired,
+        persisted_revision: Some(commit.snapshot.revision),
+        rollback_persisted_config: None,
+        rollback_persisted_document: Some(previous_document),
+        rollback_runtime_config: Some(previous_runtime_config),
+        previous_model_name: Some(previous_model_name),
+        announce: Some(success_message),
+        language_change_notice: LanguageChangeNotice::None,
+        manual_reload_announce: false,
+        selection_mode_after_success: None,
+    });
+    Ok(PersistedConfigReload::Queued)
 }
 
 /// Observe the shared config at an idle boundary. Normal interactive sessions
@@ -10512,6 +10899,7 @@ fn poll_external_auth(ctx: &mut LoopCtx) -> bool {
                     desired_config: ctx.config.clone(),
                     persisted_revision: None,
                     rollback_persisted_config: None,
+                    rollback_persisted_document: None,
                     rollback_runtime_config: None,
                     previous_model_name: None,
                     announce: None,
@@ -10551,8 +10939,11 @@ fn poll_external_auth(ctx: &mut LoopCtx) -> bool {
     true
 }
 
-fn poll_shared_state(ctx: &mut LoopCtx) -> bool {
+fn poll_shared_state(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> bool {
     let config_changed = poll_external_config(ctx);
+    if config_changed {
+        crate::sync_history_replay_config(renderer, &ctx.config, &ctx.caps);
+    }
     let auth_changed = poll_external_auth(ctx);
     config_changed || auth_changed
 }
@@ -10620,7 +11011,11 @@ fn attach_image_to_input(
     let Some((img, hash)) = img_hash else {
         return Ok(false);
     };
-    if let Some(reject) = image_attach_reject_line(&ctx.config, &ctx.model_name) {
+    if let Some(reject) = image_attach_reject_line(
+        &ctx.config,
+        &ctx.provider_selection,
+        &ctx.model_name,
+    ) {
         renderer.render(UiLine::Error(reject));
         renderer.flush();
         if matches!(app.state.phase, UiPhase::Idle) {
@@ -10680,7 +11075,7 @@ fn attach_typed_image_paths(
     images: &mut Vec<ImageContent>,
     kept_markers: &mut Vec<usize>,
 ) {
-    if image_attach_reject_line(&ctx.config, &ctx.model_name).is_some() {
+    if image_attach_reject_line(&ctx.config, &ctx.provider_selection, &ctx.model_name).is_some() {
         return;
     }
     // Snapshot tokens before mutating `text`. The `/` `\` / `@` pre-filter
@@ -10780,9 +11175,29 @@ fn handle_input(
 ) -> Result<()> {
     use crate::modals::ModalAction;
 
+    let has_non_capturing_modal = app
+        .active_modal
+        .as_ref()
+        .is_some_and(|modal| !modal.captures_all_keys());
+    let has_replay_payload = !app.message_queue.is_empty() || !app.state.pending_steers.is_empty();
+    if should_release_stale_modal_interrupt_wait(
+        app.state.phase,
+        app.interrupt_drain_pending,
+        has_non_capturing_modal,
+        ctx.runtime.has_active_turn(),
+        has_replay_payload,
+    ) {
+        crate::tuix_trace!(
+            "KEY",
+            "release stale interrupt wait before routing visible modal"
+        );
+        app.interrupt_drain_pending = false;
+        app.state.phase = UiPhase::Idle;
+    }
+
     if matches!(app.state.phase, UiPhase::Idle)
         && app.active_modal.is_none()
-        && poll_shared_state(ctx)
+        && poll_shared_state(ctx, renderer)
     {
         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
     }
@@ -11381,24 +11796,19 @@ fn parse_dollar_line(line: &str) -> Option<(String, String)> {
 /// terminal). Returns the `trim_start`ed remainder if a char was stripped,
 /// else `None`.
 ///
-/// The five unambiguous prompt chars (`❯ > # % λ`) are stripped whenever they
-/// lead, matching the long-standing cleanup. `$` is special: it is ALSO the
-/// `$skill` invocation prefix, so it is only treated as a pasted prompt when
-/// followed by a space (`$ ls`). A glued `$brainstorming` is intentional syntax
-/// and is kept verbatim — otherwise a `$skill` recalled from history (which
-/// bypasses the `$` menu) would lose its `$` and commit as plain text.
+/// A prompt char is stripped only when followed by whitespace (`# ls`,
+/// `❯ git status`). Glued text such as `#8`, `>quote`, or `$brainstorming` is
+/// intentional user input and must survive submission unchanged.
 fn strip_pasted_prompt_prefix(line: &str) -> Option<&str> {
     let mut chars = line.chars();
     let first = chars.next()?;
     let rest = chars.as_str();
-    match first {
-        '$' => match rest.strip_prefix(' ') {
-            Some(after) => Some(after.trim_start()), // `$ ls` → pasted prompt
-            None if rest.is_empty() => Some(rest),   // bare `$` → collapses to empty
-            None => None,                            // `$brainstorming` → keep verbatim
-        },
-        '❯' | '>' | '#' | '%' | 'λ' => Some(rest.trim_start()),
-        _ => None,
+    if matches!(first, '❯' | '>' | '#' | '%' | 'λ' | '$')
+        && rest.chars().next().is_some_and(char::is_whitespace)
+    {
+        Some(rest.trim_start())
+    } else {
+        None
     }
 }
 
@@ -11675,7 +12085,7 @@ fn handle_idle_key(
             } else {
                 pause_active_goal(ctx)
             };
-            if sent && has_active_turn {
+            if should_arm_interrupt_wait(sent, has_active_turn) {
                 app.interrupt_drain_pending = true;
             }
             clear_capturing_modal_on_cancel(app);
@@ -12114,10 +12524,16 @@ fn handle_idle_key(
     // order. This idle-path handler runs after modal dispatch, so it cannot
     // mutate a running turn or steal F2 from an active picker.
     if let Some(direction) = crate::modals::model_picker::model_cycle_direction(code, modifiers) {
-        if let Some(provider) =
-            crate::modals::model_picker::adjacent_provider(&ctx.config, direction)
-        {
-            set_default_provider_and_reload(ctx, &provider, renderer);
+        if let Some(provider) = crate::modals::model_picker::adjacent_provider_from(
+            &ctx.config,
+            direction,
+            ctx.model_cycle_anchor.as_deref(),
+        ) {
+            if set_default_provider_and_reload(ctx, &provider, renderer) {
+                // Record only accepted reloads. Key-repeat events received while a
+                // transition is pending must not silently race through the catalog.
+                ctx.model_cycle_anchor = Some(provider);
+            }
         }
         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
         return Ok(());
@@ -12134,7 +12550,11 @@ fn handle_idle_key(
             // ModelArts.81001 "message[N].content[0] has invalid
             // field(s): text, type" for GLM-5.1). Helper in
             // `Config::can_handle_attached_images`.
-            if let Some(reject) = image_attach_reject_line(&ctx.config, &ctx.model_name) {
+            if let Some(reject) = image_attach_reject_line(
+                &ctx.config,
+                &ctx.provider_selection,
+                &ctx.model_name,
+            ) {
                 renderer.render(UiLine::Error(reject));
                 renderer.flush();
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
@@ -12306,7 +12726,11 @@ fn handle_idle_key(
             // Reject before clearing the editor when neither the live model nor
             // a configured VL preprocessor can consume it; otherwise the raw
             // path reaches the model and it falls back to a futile read_file.
-            if let Some(reject) = image_attach_reject_line(&ctx.config, &ctx.model_name) {
+            if let Some(reject) = image_attach_reject_line(
+                &ctx.config,
+                &ctx.provider_selection,
+                &ctx.model_name,
+            ) {
                 if contains_attachable_at_image(&line, &ctx.working_dir) {
                     renderer.render(UiLine::Error(reject));
                     renderer.flush();
@@ -12618,6 +13042,22 @@ fn handle_idle_key(
                         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                         renderer.flush();
                     } else {
+                        if app.state.goal_armed {
+                            // A mobile client may arm Goal before either side
+                            // has entered the first condition. The first TUI
+                            // text submit is therefore the Goal condition.
+                            app.state.goal_armed = false;
+                            execute_slash_command(
+                                "goal",
+                                &expanded,
+                                &mut app.state,
+                                ctx,
+                                renderer,
+                                &mut app.active_modal,
+                                &mut app.setup_pending,
+                            )?;
+                            return Ok(());
+                        }
                         let submitted =
                             submit_foreground_runtime(ctx, runtime_user_input(expanded, images));
                         if submitted {
@@ -13374,12 +13814,30 @@ fn rollback_pending_provider_reload(
     let PendingProviderReload {
         persisted_revision,
         rollback_persisted_config,
+        rollback_persisted_document,
         rollback_runtime_config,
         previous_model_name,
         ..
     } = pending;
-    let (error, persisted_superseded) = match (persisted_revision, rollback_persisted_config) {
-        (Some(revision), Some(previous)) => {
+    let (error, persisted_superseded) = match (
+        persisted_revision,
+        rollback_persisted_document,
+        rollback_persisted_config,
+    ) {
+        (Some(revision), Some(previous), _) => {
+            match ctx
+                .config_store
+                .replace_document_if_revision(&revision, &previous)
+            {
+                Ok(Some(commit)) => {
+                    ctx.observed_config_revision = Some(commit.snapshot.revision);
+                    (None, false)
+                }
+                Ok(None) => (None, true),
+                Err(error) => (Some(error.to_string()), true),
+            }
+        }
+        (Some(revision), None, Some(previous)) => {
             match ctx.config_store.update_if_revision(&revision, |config| {
                 *config = previous;
                 Ok(())
@@ -13392,14 +13850,15 @@ fn rollback_pending_provider_reload(
                 Err(error) => (Some(error.to_string()), true),
             }
         }
-        (Some(revision), None) => match ctx.config_store.read() {
+        (Some(revision), None, None) => match ctx.config_store.read() {
             Ok(snapshot) => (None, snapshot.revision != revision),
             Err(error) => (Some(error.to_string()), true),
         },
-        (None, _) => (None, false),
+        (None, _, _) => (None, false),
     };
     if let Some(previous) = rollback_runtime_config {
         ctx.config = previous;
+        ctx.provider_selection = resolved_provider_and_model(&ctx.config).0;
     }
     if let Some(model) = previous_model_name {
         ctx.model_name = model;
@@ -13573,6 +14032,7 @@ fn stage_committed_config_reload(
                 desired_config: desired,
                 persisted_revision: Some(commit.snapshot.revision),
                 rollback_persisted_config,
+                rollback_persisted_document: None,
                 rollback_runtime_config,
                 previous_model_name: Some(previous_model_name),
                 announce: None,
@@ -13597,6 +14057,7 @@ fn stage_committed_config_reload(
         desired_config: desired,
         persisted_revision: Some(commit.snapshot.revision),
         rollback_persisted_config,
+        rollback_persisted_document: None,
         rollback_runtime_config,
         previous_model_name: Some(previous_model_name),
         announce: Some(success_message),
@@ -13763,6 +14224,7 @@ pub(crate) fn select_provider_and_reload(
         desired_config: desired,
         persisted_revision: None,
         rollback_persisted_config: None,
+        rollback_persisted_document: None,
         rollback_runtime_config: None,
         previous_model_name: None,
         announce: Some(
@@ -13879,6 +14341,7 @@ pub(crate) fn set_default_provider_and_reload(
                 desired_config: desired,
                 persisted_revision: Some(commit.snapshot.revision),
                 rollback_persisted_config: previous_persisted,
+                rollback_persisted_document: None,
                 rollback_runtime_config: Some(ctx.config.clone()),
                 previous_model_name: Some(ctx.model_name.clone()),
                 announce: None,
@@ -13904,6 +14367,7 @@ pub(crate) fn set_default_provider_and_reload(
         desired_config: desired,
         persisted_revision: Some(commit.snapshot.revision),
         rollback_persisted_config: previous_persisted,
+        rollback_persisted_document: None,
         rollback_runtime_config: Some(ctx.config.clone()),
         previous_model_name: Some(ctx.model_name.clone()),
         announce: Some(
@@ -14006,6 +14470,13 @@ fn stage_pending_steers(
 
 fn should_stage_interrupt(send_ok: bool, bare_esc: bool, has_pending: bool) -> bool {
     send_ok && bare_esc && has_pending
+}
+
+/// A successfully queued Cancel is not necessarily waiting on a turn terminal:
+/// deferred runtimes deliberately accept Cancel while still starting.  Only a
+/// command sent while a turn is authoritative may arm the terminal drain latch.
+fn should_arm_interrupt_wait(command_sent: bool, had_active_turn: bool) -> bool {
+    command_sent && had_active_turn
 }
 
 /// Slash commands allowed to EXECUTE while a turn is running. Everything else is
@@ -14127,8 +14598,9 @@ fn handle_streaming_key(
     // the type-ahead queue: a user yanking the escape cord doesn't
     // want queued messages to auto-fire after the current one dies.
     if code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        let had_active_turn = ctx.runtime.has_active_turn();
         let send_ok = cancel_active_turn(ctx);
-        if send_ok {
+        if should_arm_interrupt_wait(send_ok, had_active_turn) {
             app.interrupt_drain_pending = true;
         }
         clear_capturing_modal_on_cancel(app);
@@ -14185,6 +14657,7 @@ fn handle_streaming_key(
     // Placed before menu navigation because stopping the stream is the higher
     // value action mid-turn (Ctrl+U remains available for clearing input).
     if code == KeyCode::Esc {
+        let had_active_turn = ctx.runtime.has_active_turn();
         let send_ok = if app.state.goal_condition.is_some()
             && app.state.goal_phase == atomcode_coding::GoalPhase::Pursuing
         {
@@ -14192,12 +14665,13 @@ fn handle_streaming_key(
         } else {
             cancel_active_turn(ctx)
         };
+        let waits_for_terminal = should_arm_interrupt_wait(send_ok, had_active_turn);
         let interrupt_and_send = should_stage_interrupt(
-            send_ok,
+            waits_for_terminal,
             modifiers.is_empty(),
             !app.state.pending_steers.is_empty(),
         ) && stage_pending_steers_for_interrupt(app);
-        if send_ok {
+        if waits_for_terminal {
             app.interrupt_drain_pending = true;
         }
         clear_capturing_modal_on_cancel(app);
@@ -14652,7 +15126,8 @@ fn handle_streaming_key(
         BufferResult::Exit => {
             // Ctrl+C on empty buf during streaming — treat as cancel
             // (consistent with the explicit Ctrl+C branch above).
-            if cancel_active_turn(ctx) {
+            let had_active_turn = ctx.runtime.has_active_turn();
+            if should_arm_interrupt_wait(cancel_active_turn(ctx), had_active_turn) {
                 app.interrupt_drain_pending = true;
             }
             clear_capturing_modal_on_cancel(app);
@@ -15752,6 +16227,9 @@ fn handle_user_input_key(
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
     use atomcode_capabilities::tools::request_user_input::UserInputMode;
+    if app.state.pending_policy_intervention.is_some() {
+        return handle_policy_intervention_key(app, ctx, renderer, code, modifiers);
+    }
     // A multi-question batch is handled by its own self-contained handler (keeps the
     // single-question path below untouched → N==1 behavior is literally unchanged).
     if app.state.user_input_batch.is_some() {
@@ -15909,6 +16387,210 @@ fn handle_user_input_key(
     Ok(())
 }
 
+fn handle_policy_intervention_key(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> Result<()> {
+    use atomcode_kernel::event::PolicyRecoveryAction;
+
+    // Ctrl+C dismisses the driver-owned recovery panel (the turn already ended,
+    // so there is nothing to cancel) — mirror the request_user_input handler's
+    // Ctrl+C contract instead of leaving the app's universal escape hatch inert.
+    // Checked before the Char arm so it never falls through to the digit branch.
+    if code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        request_policy_intervention_resolution(
+            &mut app.state,
+            ctx,
+            renderer,
+            PolicyRecoveryAction::EndTask,
+        );
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
+    // The runtime owner has not acknowledged the previous choice yet. Preserve
+    // the panel and ignore repeats so a fast double key press cannot race two
+    // decisions against the same intervention.
+    if app.state.pending_policy_resolution.is_some() {
+        return Ok(());
+    }
+
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(panel) = app.state.user_input_panel.as_mut() {
+                panel.move_up();
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(panel) = app.state.user_input_panel.as_mut() {
+                panel.move_down();
+            }
+        }
+        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+            if let Some(panel) = app.state.user_input_panel.as_mut() {
+                let index = (c as usize) - ('1' as usize);
+                if index < panel.options.len() {
+                    panel.cursor = index;
+                }
+            }
+        }
+        KeyCode::Esc => {
+            request_policy_intervention_resolution(
+                &mut app.state,
+                ctx,
+                renderer,
+                PolicyRecoveryAction::EndTask,
+            );
+        }
+        KeyCode::Enter => {
+            let index = app
+                .state
+                .user_input_panel
+                .as_ref()
+                .map(|panel| panel.cursor)
+                .unwrap_or(0);
+            let action = app
+                .state
+                .pending_policy_intervention
+                .as_ref()
+                .and_then(|intervention| intervention.actions.get(index))
+                .copied();
+            match action {
+                Some(PolicyRecoveryAction::ViewSafeInstructions) => {
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::PolicyRecoverySafeInstructions)
+                            .into_owned(),
+                    ));
+                    renderer.flush();
+                }
+                Some(PolicyRecoveryAction::CompleteExternally)
+                | Some(PolicyRecoveryAction::SkipStep) => {
+                    let action = action.expect("matched action");
+                    // Recovery acknowledgement is driver-owned. Never turn it into
+                    // model input: the prior transcript may contain credential-like
+                    // material that a fresh model turn could reconstruct or repeat.
+                    request_policy_intervention_resolution(
+                        &mut app.state,
+                        ctx,
+                        renderer,
+                        action,
+                    );
+                }
+                Some(PolicyRecoveryAction::EndTask) | None => {
+                    request_policy_intervention_resolution(
+                        &mut app.state,
+                        ctx,
+                        renderer,
+                        PolicyRecoveryAction::EndTask,
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+        _ => return Ok(()),
+    }
+    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    Ok(())
+}
+
+fn request_policy_intervention_resolution(
+    state: &mut UiState,
+    ctx: &LoopCtx,
+    renderer: &mut dyn Renderer,
+    action: atomcode_kernel::event::PolicyRecoveryAction,
+) -> bool {
+    if state.pending_policy_resolution.is_some() {
+        return false;
+    }
+    let Some(intervention_id) = state
+        .pending_policy_intervention
+        .as_ref()
+        .map(|intervention| intervention.id)
+    else {
+        return false;
+    };
+    let queued = ctx
+        .runtime
+        .resolve_policy_intervention(
+            intervention_id,
+            action,
+            ctx.foreground_runtime_id,
+            ctx.runtime_event_tx.clone(),
+        )
+        .is_ok();
+    if queued {
+        state.pending_policy_resolution = Some((intervention_id, action));
+    } else {
+        renderer.render(UiLine::Error(
+            crate::i18n::t(crate::i18n::Msg::PolicyRecoverySubmitError).into_owned(),
+        ));
+        renderer.flush();
+    }
+    queued
+}
+
+fn complete_policy_intervention_resolution(
+    state: &mut UiState,
+    intervention_id: u64,
+    action: atomcode_kernel::event::PolicyRecoveryAction,
+    renderer: &mut dyn Renderer,
+) -> bool {
+    let correlated = state.pending_policy_resolution == Some((intervention_id, action))
+        || state
+            .pending_policy_intervention
+            .as_ref()
+            .is_some_and(|intervention| {
+                intervention.id == intervention_id && intervention.actions.contains(&action)
+            });
+    if !correlated {
+        return false;
+    }
+
+    state.pending_policy_resolution = None;
+    state.pending_policy_intervention = None;
+    state.user_input_panel = None;
+    state.phase = UiPhase::Idle;
+    if let Some(message) = policy_recovery_local_message(action) {
+        renderer.render(UiLine::CommandOutput(crate::i18n::t(message).into_owned()));
+        renderer.flush();
+    }
+    true
+}
+
+fn reject_policy_intervention_resolution(
+    state: &mut UiState,
+    intervention_id: u64,
+    action: atomcode_kernel::event::PolicyRecoveryAction,
+    renderer: &mut dyn Renderer,
+) -> bool {
+    if state.pending_policy_resolution != Some((intervention_id, action)) {
+        return false;
+    }
+    state.pending_policy_resolution = None;
+    renderer.render(UiLine::Error(
+        crate::i18n::t(crate::i18n::Msg::PolicyRecoverySubmitError).into_owned(),
+    ));
+    renderer.flush();
+    true
+}
+
+fn policy_recovery_local_message(
+    action: atomcode_kernel::event::PolicyRecoveryAction,
+) -> Option<crate::i18n::Msg<'static>> {
+    use atomcode_kernel::event::PolicyRecoveryAction;
+
+    match action {
+        PolicyRecoveryAction::CompleteExternally => {
+            Some(crate::i18n::Msg::PolicyRecoveryCompletedLocally)
+        }
+        PolicyRecoveryAction::SkipStep => Some(crate::i18n::Msg::PolicyRecoverySkippedLocally),
+        _ => None,
+    }
+}
+
 /// Key handling for a multi-question `request_user_input` batch. Tab/Shift+Tab move
 /// between questions (and the Submit stop); within a question the keys mirror the
 /// single-question handler on the current panel; Enter on the Submit stop delivers
@@ -15961,11 +16643,30 @@ fn handle_user_input_batch_key(
 
     // On the Submit stop: Enter delivers all answers (untouched → declined).
     if batch.on_submit_stop() {
-        if code == KeyCode::Enter {
-            let resps = batch.build_batch_response();
-            app.state.on_user_input_resolved();
-            deliver_user_input_batch(ctx, id, resps);
-            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        match code {
+            KeyCode::Enter => {
+                let resps = batch.build_batch_response();
+                app.state.on_user_input_resolved();
+                deliver_user_input_batch(ctx, id, resps);
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            }
+            KeyCode::PageUp => {
+                app.state
+                    .user_input_batch
+                    .as_mut()
+                    .unwrap()
+                    .page_submit_up();
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            }
+            KeyCode::PageDown => {
+                app.state
+                    .user_input_batch
+                    .as_mut()
+                    .unwrap()
+                    .page_submit_down();
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            }
+            _ => {}
         }
         return Ok(()); // other keys are no-ops on the Submit stop
     }
@@ -16387,14 +17088,35 @@ pub(super) fn handle_upgrade_event(
 /// `flush_pending_separator` path so both stay localized and consistent.
 fn turn_summary_label(
     state: &mut UiState,
-    errored: bool,
+    stop_reason: ui_event::UiTurnStopReason,
     turn_count: usize,
     tool_call_count: usize,
     total_tokens: usize,
     cached_pct: Option<u8>,
     dur: &str,
 ) -> String {
-    if errored {
+    if matches!(stop_reason, ui_event::UiTurnStopReason::PolicyDenied) {
+        // Always fold a sanitized policy reason into the terminal separator when
+        // available. A mid-stream red line can be overwritten by the retained
+        // Streaming→Idle redraw; the separator is the reliable final surface.
+        let reason = state
+            .last_policy_denial_reason
+            .take()
+            .map(|reason| summary_reason_headline(&reason));
+        // A policy terminal also closes the turn. Discard any unrelated provider
+        // error retained from an abnormal path, but never present it as policy context.
+        state.last_turn_error = None;
+        state.turn_error_line_shown = false;
+        crate::i18n::t(crate::i18n::Msg::TurnSummaryPolicyDenied {
+            turn_count,
+            tool_call_count,
+            duration: dur,
+            total_tokens,
+            reason: reason.as_deref(),
+        })
+        .into_owned()
+    } else if turn_is_incomplete(stop_reason) {
+        state.last_policy_denial_reason = None;
         // FOLD the captured failure cause into the separator itself
         // (`✗ 已中断：账户余额不足（HTTP 402） · …`) so the reason rides the
         // always-visible summary — the standalone mid-turn red line is emitted
@@ -16429,8 +17151,18 @@ fn turn_summary_label(
         // produced no summary (SnapshotUnavailable / RuntimeStopped), so it can
         // never fold into a LATER errored summary.
         state.last_turn_error = None;
+        state.last_policy_denial_reason = None;
         state.turn_error_line_shown = false;
-        let done = state.next_done_label();
+        // A turn that DISPATCHED async team work isn't "done" — its members keep
+        // running in the background panel below. Show a neutral, accurate label
+        // instead of a celebratory rotation. Keyed on whether THIS turn dispatched
+        // (a RunStarted arrived), not on global active runs — so an unrelated turn
+        // isn't mislabeled while an old background team happens to still run.
+        let done = if state.team_dispatched_this_turn {
+            "Dispatched"
+        } else {
+            state.next_done_label()
+        };
         crate::i18n::t(crate::i18n::Msg::TurnSummary {
             done,
             turn_count,
@@ -16604,6 +17336,133 @@ mod background_notice_tests {
         ));
         assert!(state.deferred_background_notices.is_empty());
     }
+
+    #[test]
+    fn credential_policy_error_is_redacted_rendered_and_saved_for_terminal_fallback() {
+        let mut state = crate::state::UiState::new();
+        let mut renderer = CaptureRenderer::default();
+
+        render_credential_policy_error(&mut state, &mut renderer);
+
+        let saved = state
+            .last_policy_denial_reason
+            .as_deref()
+            .expect("saved reason");
+        assert!(saved.contains("安全策略") || saved.contains("security policy"));
+        assert!(!saved.contains("WECOM_WEBHOOK_URL"));
+        assert!(state.turn_error_line_shown);
+        let [UiLine::Error(message)] = renderer.lines.as_slice() else {
+            panic!("credential policy denial must render one sanitized error");
+        };
+        assert_eq!(message, saved);
+    }
+
+    #[test]
+    fn policy_intervention_opens_a_closed_driver_owned_choice_panel() {
+        let mut state = crate::state::UiState::new();
+        state.pending_policy_intervention =
+            Some(atomcode_kernel::event::PolicyIntervention::credential_shell_blocked());
+
+        activate_policy_intervention(&mut state);
+
+        assert_eq!(state.phase, crate::state::UiPhase::UserInput);
+        let panel = state.user_input_panel.as_ref().expect("recovery panel");
+        assert_eq!(panel.options.len(), 4);
+        assert!(
+            !panel.custom,
+            "policy recovery must not offer free-form input"
+        );
+        let rendered = panel
+            .options
+            .iter()
+            .flat_map(|(label, description)| [label.as_str(), description.as_deref().unwrap_or("")])
+            .collect::<String>();
+        assert!(!rendered.contains("WECOM_WEBHOOK_URL"));
+        assert!(!rendered.contains(
+            atomcode_capabilities::tools::credential_bash_gate::CREDENTIAL_BASH_DENIAL_REASON
+        ));
+    }
+
+    #[test]
+    fn policy_recovery_acknowledgements_are_driver_local() {
+        use atomcode_kernel::event::PolicyRecoveryAction;
+
+        assert_eq!(
+            policy_recovery_local_message(PolicyRecoveryAction::CompleteExternally),
+            Some(crate::i18n::Msg::PolicyRecoveryCompletedLocally)
+        );
+        assert_eq!(
+            policy_recovery_local_message(PolicyRecoveryAction::SkipStep),
+            Some(crate::i18n::Msg::PolicyRecoverySkippedLocally)
+        );
+        assert_eq!(
+            policy_recovery_local_message(PolicyRecoveryAction::ViewSafeInstructions),
+            None
+        );
+    }
+
+    #[test]
+    fn policy_recovery_closes_only_after_authoritative_success() {
+        use atomcode_kernel::event::{PolicyIntervention, PolicyRecoveryAction};
+
+        let mut state = crate::state::UiState::new();
+        let intervention = PolicyIntervention::credential_shell_blocked();
+        let intervention_id = intervention.id;
+        state.pending_policy_intervention = Some(intervention);
+        state.pending_policy_resolution = Some((intervention_id, PolicyRecoveryAction::SkipStep));
+        let mut renderer = CaptureRenderer::default();
+
+        assert!(!complete_policy_intervention_resolution(
+            &mut state,
+            intervention_id + 1,
+            PolicyRecoveryAction::SkipStep,
+            &mut renderer,
+        ));
+        assert!(state.pending_policy_intervention.is_some());
+
+        assert!(complete_policy_intervention_resolution(
+            &mut state,
+            intervention_id,
+            PolicyRecoveryAction::SkipStep,
+            &mut renderer,
+        ));
+        assert!(state.pending_policy_intervention.is_none());
+        assert!(state.pending_policy_resolution.is_none());
+        assert!(matches!(
+            renderer.lines.as_slice(),
+            [UiLine::CommandOutput(_)]
+        ));
+
+        assert!(!complete_policy_intervention_resolution(
+            &mut state,
+            intervention_id,
+            PolicyRecoveryAction::SkipStep,
+            &mut renderer,
+        ));
+        assert_eq!(renderer.lines.len(), 1, "late duplicate must be ignored");
+    }
+
+    #[test]
+    fn rejected_policy_recovery_keeps_the_intervention_retryable() {
+        use atomcode_kernel::event::{PolicyIntervention, PolicyRecoveryAction};
+
+        let mut state = crate::state::UiState::new();
+        let intervention = PolicyIntervention::credential_shell_blocked();
+        let intervention_id = intervention.id;
+        state.pending_policy_intervention = Some(intervention);
+        state.pending_policy_resolution = Some((intervention_id, PolicyRecoveryAction::SkipStep));
+        let mut renderer = CaptureRenderer::default();
+
+        assert!(reject_policy_intervention_resolution(
+            &mut state,
+            intervention_id,
+            PolicyRecoveryAction::SkipStep,
+            &mut renderer,
+        ));
+        assert!(state.pending_policy_intervention.is_some());
+        assert!(state.pending_policy_resolution.is_none());
+        assert!(matches!(renderer.lines.as_slice(), [UiLine::Error(_)]));
+    }
 }
 
 /// Squeeze a captured failure reason into a SHORT headline that folds cleanly
@@ -16643,7 +17502,15 @@ mod turn_error_reason_tests {
         let mut state = UiState::new();
         state.last_turn_error = Some("账户余额不足（HTTP 402）".to_string());
         assert!(!state.turn_error_line_shown);
-        let label = turn_summary_label(&mut state, true, 0, 0, 0, None, "3.2s");
+        let label = turn_summary_label(
+            &mut state,
+            ui_event::UiTurnStopReason::Error,
+            0,
+            0,
+            0,
+            None,
+            "3.2s",
+        );
         // Reason folded into the separator label (not a separate line).
         assert!(label.contains("账户余额不足（HTTP 402）"), "{label}");
         assert!(
@@ -16661,7 +17528,15 @@ mod turn_error_reason_tests {
         let mut state = UiState::new();
         state.last_turn_error = Some("API key 未授权或已失效（HTTP 401）".to_string());
         state.turn_error_line_shown = true;
-        let label = turn_summary_label(&mut state, true, 0, 0, 0, None, "697ms");
+        let label = turn_summary_label(
+            &mut state,
+            ui_event::UiTurnStopReason::Error,
+            0,
+            0,
+            0,
+            None,
+            "697ms",
+        );
         // Still an interrupted summary…
         assert!(
             label.contains("已中断") || label.contains("Stopped"),
@@ -16697,7 +17572,15 @@ mod turn_error_reason_tests {
 
         // Deferred flush restores the snapshot before building the summary.
         state.turn_error_line_shown = snapshot;
-        let label = turn_summary_label(&mut state, true, 0, 0, 0, None, "697ms");
+        let label = turn_summary_label(
+            &mut state,
+            ui_event::UiTurnStopReason::Error,
+            0,
+            0,
+            0,
+            None,
+            "697ms",
+        );
         assert!(
             !label.contains("401"),
             "deferred errored summary should dedup via snapshot: {label}"
@@ -16709,7 +17592,15 @@ mod turn_error_reason_tests {
         let mut state = UiState::new();
         // A stale reason from a prior no-summary error path.
         state.last_turn_error = Some("陈旧原因".to_string());
-        let label = turn_summary_label(&mut state, false, 1, 0, 0, None, "1s");
+        let label = turn_summary_label(
+            &mut state,
+            ui_event::UiTurnStopReason::Natural,
+            1,
+            0,
+            0,
+            None,
+            "1s",
+        );
         assert!(!label.contains("陈旧原因"), "{label}");
         // Cleared so it can't fold into a LATER errored summary.
         assert!(state.last_turn_error.is_none());
@@ -16724,6 +17615,53 @@ mod turn_error_reason_tests {
         // Multi-line collapses to the first line.
         assert_eq!(summary_reason_headline("头一行\n第二行"), "头一行");
     }
+
+    #[test]
+    fn policy_denial_has_a_distinct_security_terminal_label() {
+        let mut state = UiState::new();
+        state.last_policy_denial_reason = Some("sanitized credential policy reason".into());
+        state.turn_error_line_shown = true;
+        let label = turn_summary_label(
+            &mut state,
+            ui_event::UiTurnStopReason::PolicyDenied,
+            4,
+            6,
+            31_340,
+            None,
+            "23.4s",
+        );
+        assert!(
+            label.contains("安全策略已终止本回合")
+                || label.contains("Turn stopped by security policy"),
+            "{label}"
+        );
+        assert!(!label.contains("已中断"), "{label}");
+        assert!(
+            label.contains("sanitized credential policy reason"),
+            "{label}"
+        );
+        assert!(state.last_policy_denial_reason.is_none());
+        assert!(!state.turn_error_line_shown);
+    }
+
+    #[test]
+    fn policy_denial_never_folds_a_stale_provider_error() {
+        let mut state = UiState::new();
+        state.last_turn_error = Some("stale provider error".into());
+
+        let label = turn_summary_label(
+            &mut state,
+            ui_event::UiTurnStopReason::PolicyDenied,
+            1,
+            1,
+            0,
+            None,
+            "10ms",
+        );
+
+        assert!(!label.contains("stale provider error"), "{label}");
+        assert!(state.last_turn_error.is_none());
+    }
 }
 
 fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_goal_end: bool) {
@@ -16735,7 +17673,19 @@ fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_
         .cached_pct
         .map(|p| format!(" · {p}% cached"))
         .unwrap_or_default();
-    let label = if as_goal_end {
+    let label = if matches!(ps.stop_reason, ui_event::UiTurnStopReason::PolicyDenied) {
+        state.turn_error_line_shown = ps.error_line_shown;
+        state.last_policy_denial_reason = ps.policy_denial_reason;
+        turn_summary_label(
+            state,
+            ps.stop_reason,
+            ps.turn_count,
+            ps.tool_call_count,
+            ps.total_tokens,
+            ps.cached_pct,
+            &dur,
+        )
+    } else if as_goal_end {
         format!(
             "{} tools · {} · {} tokens{}",
             ps.tool_call_count,
@@ -16776,7 +17726,7 @@ fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_
         state.turn_error_line_shown = ps.error_line_shown;
         turn_summary_label(
             state,
-            ps.errored,
+            ps.stop_reason,
             ps.turn_count,
             ps.tool_call_count,
             ps.total_tokens,
@@ -16833,8 +17783,8 @@ mod approval_retract_tests {
 }
 
 /// Map the TUI turn-stop reason onto the notification layer's own
-/// `NotifyStopReason`. Total
-/// 1:1 mapping — the two enums mirror each other variant-for-variant.
+/// `NotifyStopReason`. The notification API has no policy-specific surface yet,
+/// so a hard policy denial remains a failed notification rather than success.
 fn notify_stop_reason(
     reason: ui_event::UiTurnStopReason,
 ) -> atomcode_capabilities::notify::NotifyStopReason {
@@ -16843,7 +17793,7 @@ fn notify_stop_reason(
     match reason {
         T::Natural => N::Natural,
         T::Cancelled => N::Cancelled,
-        T::Error => N::Error,
+        T::PolicyDenied | T::Error => N::Error,
         T::TurnLimit => N::TurnLimit,
         T::StepLimit => N::StepLimit,
     }
@@ -16974,6 +17924,20 @@ fn ephemeral_tool_activity<'a>(tool_display: Option<&str>, chunk: &'a str) -> Op
     supported.then_some(activity)
 }
 
+fn todo_panel_is_active(state: &crate::state::UiState) -> bool {
+    effective_todo_progress(state)
+        .is_some_and(|todo| todo.total > 0 && todo.completed < todo.total)
+}
+
+fn effective_todo_progress(
+    state: &crate::state::UiState,
+) -> Option<&crate::render::TodoProgress> {
+    state
+        .pending_todo_preview
+        .as_ref()
+        .or(state.active_todos.as_ref())
+}
+
 fn subtask_progress_from_args(
     call_id: &str,
     arguments: &str,
@@ -17092,7 +18056,7 @@ fn update_subtask_progress(
     };
     let was_terminal = matches!(
         item.status,
-        SubtaskStatus::Completed | SubtaskStatus::Failed
+        SubtaskStatus::Completed | SubtaskStatus::Stopped | SubtaskStatus::Failed
     );
     if was_terminal {
         return None;
@@ -17114,7 +18078,10 @@ fn update_subtask_progress(
     {
         item.output_tokens = item.output_tokens.max(tokens);
     }
-    let terminal_line = if matches!(status, SubtaskStatus::Completed | SubtaskStatus::Failed) {
+    let terminal_line = if matches!(
+        status,
+        SubtaskStatus::Completed | SubtaskStatus::Stopped | SubtaskStatus::Failed
+    ) {
         let elapsed = item
             .started_at
             .map(|started_at| started_at.elapsed())
@@ -17133,6 +18100,23 @@ fn update_subtask_progress(
         .filter(|item| item.status == SubtaskStatus::Completed)
         .count();
     terminal_line
+}
+
+fn task_call_id_from_team_run(run_id: &str) -> Option<&str> {
+    run_id.strip_prefix("task:").filter(|call_id| !call_id.is_empty())
+}
+
+fn correlate_task_team_progress(
+    state: &mut crate::state::UiState,
+    run_id: &str,
+    mut progress: crate::render::SubtaskProgress,
+    finished: bool,
+) -> crate::render::SubtaskProgress {
+    if let Some(call_id) = task_call_id_from_team_run(run_id) {
+        progress.call_id = call_id.to_string();
+        state.active_subtasks = (!finished).then(|| progress.clone());
+    }
+    progress
 }
 
 /// Inspect only generated top-level `<task ...>` headers. Child output is
@@ -17180,8 +18164,8 @@ fn completed_task_detail(
 #[cfg(test)]
 mod subtask_progress_projection_tests {
     use super::{
-        completed_task_detail, should_defer_task_approval_row, subtask_progress_from_args,
-        update_subtask_progress,
+        completed_task_detail, correlate_task_team_progress, should_defer_task_approval_row,
+        subtask_progress_from_args, task_call_id_from_team_run, update_subtask_progress,
     };
     use crate::render::SubtaskStatus;
 
@@ -17319,6 +18303,65 @@ mod subtask_progress_projection_tests {
         assert_eq!(
             progress.completed, 1,
             "failed is finished but not completed"
+        );
+    }
+
+    #[test]
+    fn task_team_run_recovers_the_parent_tool_call_id() {
+        assert_eq!(
+            task_call_id_from_team_run("task:call-task-7"),
+            Some("call-task-7")
+        );
+        assert_eq!(task_call_id_from_team_run("task-legacy-7"), None);
+        assert_eq!(task_call_id_from_team_run("native-team-run"), None);
+    }
+
+    #[test]
+    fn task_team_terminal_keeps_parent_projection_after_tool_result_cleared_state() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let mut state = crate::state::UiState::new();
+        state.active_subtasks = None; // ToolResult won the cross-channel race.
+        let progress = correlate_task_team_progress(
+            &mut state,
+            "task:call-task-9",
+            SubtaskProgress {
+                call_id: "team:task:call-task-9".into(),
+                completed: 1,
+                total: 1,
+                items: vec![SubtaskItem {
+                    label: "reviewer#1".into(),
+                    description: "audit".into(),
+                    model: "model".into(),
+                    activity: "done".into(),
+                    started_at: None,
+                    output_tokens: 10,
+                    status: SubtaskStatus::Completed,
+                }],
+            },
+            true,
+        );
+
+        assert_eq!(progress.call_id, "call-task-9");
+        assert!(state.active_subtasks.is_none());
+    }
+
+    #[test]
+    fn task_team_progress_updates_state_even_without_a_todo_panel() {
+        let mut state = crate::state::UiState::new();
+        let progress = subtask_progress_from_args(
+            "team:task:call-task-10",
+            r#"{"tasks":[{"description":"audit","prompt":"a"}]}"#,
+        )
+        .unwrap();
+
+        let progress =
+            correlate_task_team_progress(&mut state, "task:call-task-10", progress, false);
+
+        assert_eq!(progress.call_id, "call-task-10");
+        assert_eq!(
+            state.active_subtasks.as_ref().map(|p| p.call_id.as_str()),
+            Some("call-task-10")
         );
     }
 
@@ -17472,6 +18515,7 @@ fn kernel_stop_reason(reason: atomcode_kernel::event::StopReason) -> ui_event::U
         Kernel::MaxRounds | Kernel::MaxContinuations => Core::TurnLimit,
         Kernel::RepeatLoop | Kernel::ToolLoopDetected => Core::StepLimit,
         Kernel::Cancelled => Core::Cancelled,
+        Kernel::PolicyDenied => Core::PolicyDenied,
         Kernel::ProviderError | Kernel::Timeout | Kernel::PromptRejected | Kernel::RateLimited => {
             Core::Error
         }
@@ -17503,12 +18547,20 @@ mod kernel_terminal_projection_tests {
     }
 
     #[test]
+    fn policy_denial_keeps_its_security_identity_in_the_tui() {
+        let reason = kernel_stop_reason(StopReason::PolicyDenied);
+        assert_eq!(reason, UiTurnStopReason::PolicyDenied);
+        assert!(turn_is_incomplete(reason));
+    }
+
+    #[test]
     fn every_non_natural_terminal_is_persisted_as_incomplete() {
         assert!(!turn_is_incomplete(UiTurnStopReason::Natural));
         for reason in [
             UiTurnStopReason::TurnLimit,
             UiTurnStopReason::StepLimit,
             UiTurnStopReason::Cancelled,
+            UiTurnStopReason::PolicyDenied,
             UiTurnStopReason::Error,
         ] {
             assert!(turn_is_incomplete(reason));
@@ -17522,6 +18574,7 @@ mod kernel_terminal_projection_tests {
             UiTurnStopReason::TurnLimit,
             UiTurnStopReason::StepLimit,
             UiTurnStopReason::Cancelled,
+            UiTurnStopReason::PolicyDenied,
             UiTurnStopReason::Error,
         ] {
             assert!(!should_run_setup_post_turn(reason));
@@ -17634,6 +18687,9 @@ fn project_kernel_event(
                 duration: started.elapsed(),
             })
         }
+        Kernel::PolicyIntervention { intervention } => {
+            Some(AgentEvent::PolicyIntervention(intervention))
+        }
         Kernel::Usage(meta) => Some(project_token_usage(meta)),
         Kernel::Error { message, .. } => Some(AgentEvent::Error {
             error: message,
@@ -17672,6 +18728,7 @@ fn apply_provider_projection(
     provider: String,
     model: String,
 ) {
+    ctx.provider_selection = provider.clone();
     ctx.model_name = model;
     atomcode_config::proxy::apply_process_proxy_config(&ctx.config.network.proxy);
     state.on_model_window_changed(ctx.config.default_context_window());
@@ -18028,6 +19085,41 @@ fn handle_runtime_event(
                 ctx.pending_runtime_request_id = Some(request.id);
             }
             match event {
+                CodingRuntimeEvent::Team { generation, event } => {
+                    let run_id = event.run_id.to_string();
+                    // A new run started THIS turn → the completion banner should say
+                    // "Dispatched" rather than a celebratory "done".
+                    if matches!(
+                        event.payload,
+                        atomcode_capabilities::team::TeamEventPayload::RunStarted { .. }
+                    ) {
+                        state.team_dispatched_this_turn = true;
+                    }
+                    let run_finished = matches!(
+                        &event.payload,
+                        atomcode_capabilities::team::TeamEventPayload::RunFinished { .. }
+                    );
+                    state.team.apply(generation.0, event);
+                    if let Some(mut progress) = state.team.progress_for_run(&run_id) {
+                        let finished = run_finished;
+                        // RunStarted arrives before queued member metadata. Wait
+                        // for the complete stable row set so retained updates
+                        // never need to insert rows mid-block.
+                        if progress.items.len() == progress.total || finished {
+                            // Structured Task Team events are the lifecycle
+                            // authority. Re-key them to the parent tool call
+                            // before presentation, independently of whether the
+                            // Todo panel currently owns the footer.
+                            progress =
+                                correlate_task_team_progress(state, &run_id, progress, finished);
+                            if todo_panel_is_active(state) && !ctx.is_plain_renderer {
+                                renderer.render(UiLine::AgentGroup { progress, finished });
+                                renderer.flush();
+                            }
+                        }
+                    }
+                    return;
+                }
                 CodingRuntimeEvent::Agent(event) => {
                     if let Some(event) = project_kernel_event(event, ctx) {
                         handle_agent_event(
@@ -18041,6 +19133,34 @@ fn handle_runtime_event(
                             reasoning_buffer,
                             buf,
                         );
+                    }
+                    return;
+                }
+                CodingRuntimeEvent::PolicyInterventionResolved {
+                    intervention_id,
+                    action,
+                } => {
+                    if complete_policy_intervention_resolution(
+                        state,
+                        intervention_id,
+                        action,
+                        renderer,
+                    ) {
+                        redraw_idle_plain(buf, state, ctx, renderer);
+                    }
+                    return;
+                }
+                CodingRuntimeEvent::PolicyInterventionCleared { intervention_id } => {
+                    if state
+                        .pending_policy_intervention
+                        .as_ref()
+                        .is_some_and(|intervention| intervention.id == intervention_id)
+                    {
+                        state.pending_policy_resolution = None;
+                        state.pending_policy_intervention = None;
+                        state.user_input_panel = None;
+                        state.phase = UiPhase::Idle;
+                        redraw_idle_plain(buf, state, ctx, renderer);
                     }
                     return;
                 }
@@ -18677,6 +19797,9 @@ fn handle_runtime_event(
                         );
                         return;
                     }
+                    // A successful runtime transition establishes a new authoritative
+                    // selection. Future F2 navigation starts from that selection.
+                    ctx.model_cycle_anchor = None;
                     let expected_persisted_revision = ctx
                         .pending_provider_reload
                         .as_ref()
@@ -18710,6 +19833,7 @@ fn handle_runtime_event(
                     let previous_language = ctx.config.language;
                     let (provider, model) = resolved_provider_and_model(&desired_config);
                     ctx.config = desired_config;
+                    crate::sync_history_replay_config(renderer, &ctx.config, &ctx.caps);
                     let language_changed = previous_language != ctx.config.language;
                     if language_changed {
                         crate::i18n::set_locale(atomcode_config::i18n::resolve_initial_locale(
@@ -18833,6 +19957,19 @@ fn handle_runtime_event(
                 renderer.render(UiLine::CommandOutput(output));
             }
             renderer.flush();
+        }
+        bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::PolicyInterventionResolutionFinished {
+                intervention_id,
+                action,
+                result,
+            },
+        ) => {
+            if result.is_err()
+                && reject_policy_intervention_resolution(state, intervention_id, action, renderer)
+            {
+                redraw_idle_plain(buf, state, ctx, renderer);
+            }
         }
         bg_runtime::RuntimeEventPayload::Driver(
             bg_runtime::DriverEvent::SessionResumePrepared {
@@ -19220,6 +20357,13 @@ fn commit_native_session_changed(
     state.loop_label = None;
     state.loop_round = 0;
     state.loop_started_at = None;
+    // Goal mode is session-scoped. Never carry a mobile pre-arm or a
+    // persistent goal into the replacement session.
+    state.goal_armed = false;
+    state.goal_condition = None;
+    state.goal_round = 0;
+    state.goal_started_at = None;
+    state.goal_phase = atomcode_coding::GoalPhase::Ended;
     state.total_tokens = 0;
     state.prompt_tokens = 0;
     state.completion_tokens = 0;
@@ -19230,6 +20374,7 @@ fn commit_native_session_changed(
     state.on_turn_complete();
     state.on_session_replaced();
     state.active_todos = None;
+    clear_pending_todo_calls(state);
     state.active_subtasks = None;
     sync_todo_titles(state);
     state.approval_panel = None;
@@ -20113,37 +21258,17 @@ fn handle_agent_event(
             // the incremental `{action}` shape; a resumed session may also carry legacy `todo`
             // calls. Distinguish by ARG SHAPE, not tool name.
             let is_todo_call = name == "todowrite" || name == "todo";
+            if is_todo_call {
+                stage_todo_call_preview(state, &id, &arguments);
+            }
             let todo_plan = if is_todo_call {
                 todo_progress_from_args(&arguments)
             } else {
                 None
             };
-            let is_todo_action = is_todo_call
-                && todo_plan.is_none()
-                && serde_json::from_str::<serde_json::Value>(&arguments)
-                    .ok()
-                    .is_some_and(|v| v.get("action").and_then(|a| a.as_str()).is_some());
-
-            // Incremental action (add / update id=N status): fold it into the live footer panel
-            // + title cache HERE — ABOVE the batch / approval early-returns below — so batched
-            // and approval-gated action calls update the panel too (they return before the
-            // generic tool path). Unlike a full-list plan we do NOT suppress the row; the compact
-            // `#N → status` line is a useful marker.
-            if is_todo_action {
-                patch_live_todos_from_action(state, &arguments);
-            }
-
-            // A full-list PLAN (`{todos:[…]}`) must populate the footer panel HERE —
-            // ABOVE the batch / approval early-returns below. When the model packs the
-            // todowrite into a BATCH (a group of calls submitted together — batch
-            // MEMBERSHIP, not parallel execution: the kernel may run them serially) or
-            // it's approval-gated, those paths early-return before the plan-assignment
-            // block, so setting `active_todos` only there left a batched plan's panel
-            // permanently empty. Mirrors the incremental-action patch above.
-            if let Some(progress) = todo_plan.as_ref() {
-                state.active_todos = Some(progress.clone());
-                sync_todo_titles(state); // titles follow the new plan (id = position)
-            }
+            // Todo state is staged above but committed only by a successful
+            // ToolCallResult. This keeps the live panel aligned with transcript
+            // replay when middleware, cancellation, or validation rejects a call.
 
             // Task fan-out owns a fixed footer panel while it runs. Seed the
             // stable child rows from the call arguments before any batch /
@@ -20157,6 +21282,13 @@ fn handle_agent_event(
             if let Some(progress) = task_panel.as_ref() {
                 state.active_subtasks = Some(progress.clone());
                 state.subagent_activity = None;
+                if todo_panel_is_active(state) && !ctx.is_plain_renderer {
+                    renderer.render(UiLine::AgentGroup {
+                        progress: progress.clone(),
+                        finished: false,
+                    });
+                    renderer.flush();
+                }
             }
 
             // If this call is part of an active batch, the
@@ -20188,10 +21320,10 @@ fn handle_agent_event(
                 return;
             }
 
-            // todowrite (non-batch, non-approval): the persistent footer PANEL is the
-            // sole view — `active_todos` was already set above; here we only SUPPRESS
-            // the tool CALL + RESULT rows. On a parse failure (`todo_plan` is None) fall
-            // through to the normal tool row so the error surfaces.
+            // todowrite (non-batch, non-approval): a valid plan will be committed
+            // to the persistent footer panel when its successful result arrives;
+            // suppress the tool rows meanwhile. On a parse failure (`todo_plan` is
+            // None), fall through so the eventual error remains visible.
             if todo_plan.is_some() {
                 // call_rendered=true ⇒ ToolCallResult suppresses the result row.
                 pending_tools.insert(id, (display.clone(), detail, true));
@@ -20243,15 +21375,22 @@ fn handle_agent_event(
                 .as_ref()
                 .is_some_and(|progress| progress.call_id == call_id)
             {
-                let terminal_line = state
-                    .active_subtasks
-                    .as_mut()
-                    .and_then(|progress| update_subtask_progress(progress, &chunk));
+                let (terminal_line, agent_progress) = {
+                    let progress = state.active_subtasks.as_mut().expect("checked above");
+                    let terminal_line = update_subtask_progress(progress, &chunk);
+                    (terminal_line, progress.clone())
+                };
                 if let Some(terminal_line) = terminal_line {
                     // Running activity belongs to the fixed panel, but a terminal
                     // child is historical information. Commit it once so completed
                     // and failed children remain visible above the live panel.
                     renderer.render(UiLine::CommandOutput(terminal_line));
+                }
+                if todo_panel_is_active(state) && !ctx.is_plain_renderer {
+                    renderer.render(UiLine::AgentGroup {
+                        progress: agent_progress,
+                        finished: false,
+                    });
                 }
                 state.subagent_activity = None;
                 renderer.flush();
@@ -20282,6 +21421,18 @@ fn handle_agent_event(
             success,
             duration,
         } => {
+            let todo_owned_footer_before_result = todo_panel_is_active(state);
+            commit_todo_call_result(state, &call_id, &name, success);
+            if todo_owned_footer_before_result
+                && !todo_panel_is_active(state)
+                && !ctx.is_plain_renderer
+            {
+                // Todo no longer owns the footer. Freeze every conversation
+                // Agent block at its latest snapshot; normal Task/Team footer
+                // projection resumes on the next frame.
+                renderer.render(UiLine::AgentGroupsFreeze);
+            }
+            let credential_policy_block = credential_policy_blocked(&output, success);
             // A result for this call arrived while an approval prompt is still up ⇒ the
             // approval was resolved WITHOUT the user answering (headless timeout fail-close,
             // a displaced second approval, or a cancel). Retract the orphaned "Waiting for
@@ -20297,6 +21448,34 @@ fn handle_agent_event(
                     .as_ref()
                     .is_some_and(|progress| progress.call_id == call_id)
                 {
+                    if todo_panel_is_active(state) && !ctx.is_plain_renderer {
+                        let mut progress = state.active_subtasks.clone().expect("checked above");
+                        for item in &mut progress.items {
+                            if matches!(
+                                item.status,
+                                crate::render::SubtaskStatus::Pending
+                                    | crate::render::SubtaskStatus::Running
+                            ) {
+                                item.status = if success {
+                                    crate::render::SubtaskStatus::Completed
+                                } else {
+                                    crate::render::SubtaskStatus::Failed
+                                };
+                                item.activity = if success { "done" } else { "failed" }.into();
+                            }
+                        }
+                        progress.completed = progress
+                            .items
+                            .iter()
+                            .filter(|item| {
+                                item.status == crate::render::SubtaskStatus::Completed
+                            })
+                            .count();
+                        renderer.render(UiLine::AgentGroup {
+                            progress,
+                            finished: true,
+                        });
+                    }
                     state.active_subtasks = None;
                 }
             }
@@ -20316,6 +21495,11 @@ fn handle_agent_event(
             // to in-place checkmarks on the existing child rows instead
             // of appending new lines.
             if let Some(batch_id) = state.call_id_to_batch.get(&call_id).cloned() {
+                if let Some(display) = batched_edit_display(&name, &output, success) {
+                    if let Some(batch) = state.active_tool_batches.get_mut(&batch_id) {
+                        batch.edit_displays.insert(call_id.clone(), display);
+                    }
+                }
                 // CC-style result-data update: `⎿ Read(mod.rs) → 200 lines`.
                 // The result snippet is generic line count of the
                 // output (works across read/grep/glob/bash without
@@ -20373,6 +21557,12 @@ fn handle_agent_event(
                     call_id: call_id.clone(),
                     new_text: format!("  {} {}{}", child_glyph, prefix, suffix),
                 });
+                // Batch children normally collapse failures to a compact `✗`.
+                // A local security denial is different: hiding its reason leaves
+                // a blank-looking termination with no actionable explanation.
+                if credential_policy_block {
+                    render_credential_policy_error(state, renderer);
+                }
                 renderer.flush();
                 return;
             }
@@ -20433,6 +21623,7 @@ fn handle_agent_event(
             // already render it — otherwise we'd print it twice.
             if !call_rendered
                 && (!suppress_body_echo || (name == "task" && output.contains("<task ")))
+                && !(credential_policy_block && safe_name == "(invalid)")
             {
                 renderer.render(UiLine::ToolCall {
                     name: safe_name.clone(),
@@ -20440,10 +21631,12 @@ fn handle_agent_event(
                 });
             }
             if !suppress_body_echo {
+                if credential_policy_block {
+                    render_credential_policy_error(state, renderer);
                 // A plan-mode interception isn't a failure — render it as a calm `○`
                 // hint (with the gate's reason) instead of a ✗ error, so the user
                 // sees WHY the tool didn't run and that they should review the plan.
-                if is_incomplete_review_result(&name, &output, success) {
+                } else if is_incomplete_review_result(&name, &output, success) {
                     renderer.render(UiLine::Warning(summarise(&output)));
                 } else if let Some(reason) = plan_mode_block_reason(&output, success) {
                     renderer.render(UiLine::CommandOutput(format!("  ○ {reason}\n")));
@@ -20656,6 +21849,10 @@ fn handle_agent_event(
             state.on_tool_call_streaming(&display_tool_name(&name));
         }
         AgentEvent::PhaseChange(_) => {}
+        AgentEvent::PolicyIntervention(intervention) => {
+            state.pending_policy_intervention = Some(intervention);
+            state.pending_policy_resolution = None;
+        }
         AgentEvent::TurnComplete {
             duration,
             total_tokens,
@@ -20695,7 +21892,7 @@ fn handle_agent_event(
             }
             renderer.render(UiLine::AssistantLineBreak);
             pending_tools.clear();
-            let errored = turn_is_incomplete(stop_reason);
+            clear_pending_todo_calls(state);
             // Footer token count: bill output + UNCACHED input (re-reading the
             // cached prefix each round is near-free). The event's `total_tokens`
             // is the v2 gross sum (prompt+completion per round) which overstates
@@ -20727,8 +21924,9 @@ fn handle_agent_event(
                     total_tokens,
                     was_goal_round: true,
                     was_loop_round: false,
-                    errored,
+                    stop_reason,
                     error_line_shown: state.turn_error_line_shown,
+                    policy_denial_reason: state.last_policy_denial_reason.take(),
                     cached_pct,
                 });
             } else if state.loop_label.is_some() {
@@ -20743,8 +21941,9 @@ fn handle_agent_event(
                     total_tokens,
                     was_goal_round: false,
                     was_loop_round: true,
-                    errored,
+                    stop_reason,
                     error_line_shown: state.turn_error_line_shown,
+                    policy_denial_reason: state.last_policy_denial_reason.take(),
                     cached_pct,
                 });
             } else {
@@ -20752,7 +21951,7 @@ fn handle_agent_event(
                 let dur = crate::render::fmt_dur(duration);
                 let label = turn_summary_label(
                     state,
-                    errored,
+                    stop_reason,
                     turn_count,
                     tool_call_count,
                     total_tokens,
@@ -20763,6 +21962,25 @@ fn handle_agent_event(
             }
             renderer.flush();
             complete_turn_presentation(state, renderer);
+            if matches!(stop_reason, ui_event::UiTurnStopReason::PolicyDenied) {
+                if ctx.caps.tty {
+                    activate_policy_intervention(state);
+                } else if state.pending_policy_intervention.take().is_some() {
+                    // A pipe/CI consumer cannot answer an interactive choice panel.
+                    // Emit fixed local guidance and remain idle instead of hanging.
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::PolicyRecoverySafeInstructions)
+                            .into_owned(),
+                    ));
+                }
+                redraw_idle_plain(buf, state, ctx, renderer);
+            } else {
+                // A persistence/runtime failure may replace the kernel's policy
+                // terminal after the intervention event was forwarded. Never
+                // carry that recovery contract into an unrelated later turn.
+                state.pending_policy_intervention = None;
+                state.pending_policy_resolution = None;
+            }
 
             // Reset the think stripper between turns. If the previous turn
             // left an unclosed `<think>` in flight (cancelled mid-stream,
@@ -20846,6 +22064,25 @@ fn handle_agent_event(
         AgentEvent::TurnCancelled { snapshot } => {
             // Seal the reply buffer (partial reply still copyable via `/copy`).
             state.response_finalized = true;
+            if todo_panel_is_active(state) && !ctx.is_plain_renderer {
+                if let Some(mut progress) = state.active_subtasks.clone() {
+                    for item in &mut progress.items {
+                        if matches!(
+                            item.status,
+                            crate::render::SubtaskStatus::Pending
+                                | crate::render::SubtaskStatus::Running
+                        ) {
+                            item.status = crate::render::SubtaskStatus::Stopped;
+                            item.activity = "cancelled".into();
+                        }
+                    }
+                    renderer.render(UiLine::AgentGroup {
+                        progress,
+                        finished: true,
+                    });
+                }
+            }
+            clear_pending_todo_calls(state);
             atomcode_capabilities::notify::notify(
                 &ctx.config.notifications,
                 atomcode_capabilities::notify::NotificationEvent::TurnFinished(
@@ -21071,6 +22308,32 @@ fn handle_agent_event(
             }
         }
         AgentEvent::RemoteSlashCommand(line) => {
+            // Goal is the one stateful command exposed to the mobile App. It
+            // must go through the normal TUI command handler so the TUI's
+            // local goal_condition/phase state and the shared CodingRuntime
+            // are updated together. Keep the other remote slash commands
+            // read-only below.
+            let remote = line.trim().trim_start_matches('/');
+            let (remote_name, remote_arg) = remote
+                .split_once(char::is_whitespace)
+                .map(|(name, arg)| (name, arg.trim()))
+                .unwrap_or((remote, ""));
+            if remote_name.eq_ignore_ascii_case("goal") {
+                let mut active_modal = None;
+                if let Err(error) = commands::execute_slash_command(
+                    "goal",
+                    remote_arg,
+                    state,
+                    ctx,
+                    renderer,
+                    &mut active_modal,
+                    setup_pending,
+                ) {
+                    renderer.render(UiLine::Error(format!("Goal 执行失败：{error}")));
+                    renderer.flush();
+                }
+                return;
+            }
             // 手机端发来的斜杠命令：只放行只读信息类白名单（status/cost/whoami/
             // diff），在桌面同样渲染一份（让桌面用户知道手机做了什么），输出经
             // CommandOutput 广播回手机。交互式/桌面专属命令礼貌拒绝。
@@ -21315,7 +22578,13 @@ fn handle_agent_event(
             }
             state
                 .active_tool_batches
-                .insert(batch_id.clone(), crate::state::ActiveToolBatch { call_ids });
+                .insert(
+                    batch_id.clone(),
+                    crate::state::ActiveToolBatch {
+                        call_ids,
+                        edit_displays: std::collections::HashMap::new(),
+                    },
+                );
             // Anchor the spinner clock to the batch start. The interleaved
             // per-tool events that follow won't reset it (they no-op the reset
             // while a batch is active), so the elapsed-ms ticks steadily instead
@@ -21422,6 +22691,7 @@ fn handle_agent_event(
                             }
                         }
                         state.goal_condition = None;
+                        state.goal_armed = false;
                         state.goal_round = 0;
                         state.goal_started_at = None;
                         // Reflect the true terminal state (not a lying "Pursuing").
@@ -21488,10 +22758,26 @@ fn handle_agent_event(
             //
             // Just clear batch state so subsequent per-call events
             // fall back to the standard single-tool render path.
-            if let Some(b) = state.active_tool_batches.remove(&batch_id) {
-                for cid in b.call_ids {
-                    state.call_id_to_batch.remove(&cid);
+            if let Some(mut b) = state.active_tool_batches.remove(&batch_id) {
+                for cid in &b.call_ids {
+                    state.call_id_to_batch.remove(cid);
                 }
+                // Appending permanent diff rows while the group is live would
+                // freeze it and make later child updates disappear. Completion
+                // is the first safe point: every child is terminal, so render
+                // cached edit results now in the model's original call order.
+                for cid in b.call_ids {
+                    let Some(display) = b.edit_displays.remove(&cid) else {
+                        continue;
+                    };
+                    renderer.render(UiLine::ToolResult {
+                        success: true,
+                        summary: display.summary,
+                        diff_stats: Some(display.diff_stats),
+                    });
+                    renderer.render(UiLine::EditDiffBlock(display.entries));
+                }
+                renderer.flush();
             }
         }
         AgentEvent::SubAgentDispatchStart { tasks } => {
@@ -22574,13 +23860,13 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
                 .map(|t| t.elapsed().as_secs())
                 .unwrap_or(0),
         });
-    // Todo panel source: the persistent `active_todos` cache. Hidden when the
-    // list is empty (`total == 0`) or fully done (`completed == total`) so a
-    // finished panel disappears — otherwise it stands across turns and resume.
-    let todo = state
-        .active_todos
-        .clone()
+    // Todo panel source: an in-flight presentation preview when present,
+    // otherwise the persistent `active_todos` cache. The preview is discarded
+    // on failure/cancel and never becomes session authority without success.
+    let todo = effective_todo_progress(state)
+        .cloned()
         .filter(|p| p.total > 0 && p.completed < p.total);
+    let todo_owns_footer = todo.is_some();
     let approval = state
         .approval_panel
         .as_ref()
@@ -22599,6 +23885,16 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         let idx = b.current.min(total.saturating_sub(1));
         let p = &b.questions[idx];
         let answered = (0..total).map(|i| b.is_answered(i)).collect();
+        let summaries = b
+            .questions
+            .iter()
+            .enumerate()
+            .map(|(i, question)| crate::render::UserInputAnswerSummary {
+                header: question.header.clone(),
+                question: question.question.clone(),
+                answer: b.answer_summary(i),
+            })
+            .collect();
         Some(crate::render::UserInputPanelView {
             header: p.header.clone(),
             question: p.question.clone(),
@@ -22609,7 +23905,11 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             text: p.text.clone(),
             custom_text: p.custom_text.clone(),
             custom: p.custom,
-            scroll_offset: p.scroll_offset,
+            scroll_offset: if b.on_submit_stop() {
+                b.submit_scroll_offset
+            } else {
+                p.scroll_offset
+            },
             batch: Some(crate::render::UserInputBatchMeta {
                 total,
                 // 1-based current question; clamped so the Submit stop (current==total)
@@ -22617,6 +23917,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
                 // contract honest).
                 index: (b.current + 1).min(total),
                 answered,
+                summaries,
                 on_submit: b.on_submit_stop(),
             }),
         })
@@ -22664,7 +23965,11 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         goal,
         loop_status,
         todo,
-        subtasks: state.active_subtasks.clone(),
+        subtasks: if todo_owns_footer {
+            None
+        } else {
+            state.active_subtasks.clone().or_else(|| state.team.panel())
+        },
         approval,
         user_input,
         round_cap_panel: state.round_cap_panel.as_ref().map(|p| {
@@ -23569,7 +24874,11 @@ pub(crate) fn build_replay_tool_batch(
     calls: &[atomcode_kernel::tool::ToolCall],
     result_of: &std::collections::HashMap<String, (bool, String)>,
     todo_titles: &std::collections::HashMap<u64, String>,
-) -> (String, Vec<crate::render::ToolGroupChild>) {
+) -> (
+    String,
+    Vec<crate::render::ToolGroupChild>,
+    Vec<crate::state::BatchedEditDisplay>,
+) {
     let count = calls.len();
     let unique_names: std::collections::HashSet<&str> =
         calls.iter().map(|c| c.name.as_str()).collect();
@@ -23655,7 +24964,14 @@ pub(crate) fn build_replay_tool_batch(
             }
         })
         .collect();
-    (header, children)
+    let edit_displays = calls
+        .iter()
+        .filter_map(|call| {
+            let (success, output) = result_of.get(&call.id)?;
+            batched_edit_display(&call.name, output, *success)
+        })
+        .collect();
+    (header, children, edit_displays)
 }
 
 pub(crate) fn summarise(output: &str) -> String {
@@ -23949,6 +25265,121 @@ pub(crate) fn plan_mode_block_reason(output: &str, success: bool) -> Option<&str
     reason.starts_with("plan mode").then_some(reason)
 }
 
+/// Match only the stable, policy-authored credential denial. Do not classify an
+/// arbitrary `blocked:` middleware reason as security-sensitive or reflect its
+/// model/plugin-controlled text into a privileged-looking red error.
+pub(crate) fn credential_policy_blocked(output: &str, success: bool) -> bool {
+    !success
+        && output.strip_prefix("blocked: ")
+            == Some(
+                atomcode_capabilities::tools::credential_bash_gate::CREDENTIAL_BASH_DENIAL_REASON,
+            )
+}
+
+pub(crate) fn batched_edit_display(
+    name: &str,
+    output: &str,
+    success: bool,
+) -> Option<crate::state::BatchedEditDisplay> {
+    if !success
+        || !matches!(
+            name,
+            "edit_file" | "write_file" | "create_file" | "search_replace"
+        )
+    {
+        return None;
+    }
+    let entries = crate::render::diff::parse_unified_diff(output, 120);
+    if entries.is_empty() {
+        return None;
+    }
+    let mut summary = summarise(output);
+    if name == "edit_file" {
+        if let Some((file, _)) = summary.split_once(" (") {
+            summary = file.to_string();
+        }
+    }
+    let added = entries
+        .iter()
+        .filter(|entry| entry.kind == crate::render::DiffKind::Add)
+        .count();
+    let removed = entries
+        .iter()
+        .filter(|entry| entry.kind == crate::render::DiffKind::Del)
+        .count();
+    Some(crate::state::BatchedEditDisplay {
+        summary,
+        diff_stats: (added, removed),
+        entries,
+    })
+}
+
+fn render_credential_policy_error(state: &mut UiState, renderer: &mut dyn Renderer) {
+    let message = crate::i18n::t(crate::i18n::Msg::ToolBlockedBySecurityPolicy).into_owned();
+    // Keep the sanitized, driver-owned message for the PolicyDenied terminal
+    // separator. Never store the rejected command or raw middleware reason here.
+    state.last_policy_denial_reason = Some(message.clone());
+    state.turn_error_line_shown = true;
+    renderer.render(UiLine::Error(message));
+}
+
+fn activate_policy_intervention(state: &mut UiState) {
+    use atomcode_capabilities::tools::request_user_input::{
+        UserInputMode, UserInputOption, UserInputRequest,
+    };
+    use atomcode_kernel::event::PolicyRecoveryAction;
+
+    let Some(intervention) = state.pending_policy_intervention.as_ref() else {
+        return;
+    };
+    let options = intervention
+        .actions
+        .iter()
+        .map(|action| {
+            let (label, description) = match action {
+                PolicyRecoveryAction::CompleteExternally => (
+                    crate::i18n::Msg::PolicyRecoveryComplete,
+                    crate::i18n::Msg::PolicyRecoveryCompleteDesc,
+                ),
+                PolicyRecoveryAction::SkipStep => (
+                    crate::i18n::Msg::PolicyRecoverySkip,
+                    crate::i18n::Msg::PolicyRecoverySkipDesc,
+                ),
+                PolicyRecoveryAction::ViewSafeInstructions => (
+                    crate::i18n::Msg::PolicyRecoveryInstructions,
+                    crate::i18n::Msg::PolicyRecoveryInstructionsDesc,
+                ),
+                PolicyRecoveryAction::EndTask => (
+                    crate::i18n::Msg::PolicyRecoveryEnd,
+                    crate::i18n::Msg::PolicyRecoveryEndDesc,
+                ),
+                _ => (
+                    crate::i18n::Msg::PolicyRecoveryEnd,
+                    crate::i18n::Msg::PolicyRecoveryEndDesc,
+                ),
+            };
+            UserInputOption {
+                label: crate::i18n::t(label).into_owned(),
+                description: Some(crate::i18n::t(description).into_owned()),
+            }
+        })
+        .collect();
+    let request = UserInputRequest {
+        header: crate::i18n::t(crate::i18n::Msg::PolicyRecoveryHeader).into_owned(),
+        question: crate::i18n::t(crate::i18n::Msg::PolicyRecoveryQuestion).into_owned(),
+        mode: UserInputMode::Single,
+        options,
+        custom: false,
+    };
+    let mut panel = crate::state::UserInputPanel::new(0, &request);
+    // Model-authored choice requests force an Other row. This is a driver-owned
+    // closed recovery contract, so remove that escape hatch explicitly.
+    panel.custom = false;
+    panel.checked.truncate(panel.options.len());
+    state.user_input_panel = Some(panel);
+    state.phase = UiPhase::UserInput;
+}
+
 /// A tool result that is an approval/user DENIAL → a calm compact label
 /// (localized "denied"), NOT the red ✗ error. Detects the deny messages from
 /// approval.rs / write_approval.rs ("denied by approval policy: ...") and
@@ -24074,36 +25505,112 @@ pub(crate) fn sync_todo_titles(state: &mut crate::state::UiState) {
         .unwrap_or_default();
 }
 
-/// Fold ONE incremental `todo` action into the live footer panel + title cache, mirroring the
-/// canonical `reduce_todos`. Called for EVERY dispatch path so the panel never goes stale. A
-/// `todo update` while the panel is empty is a no-op (unknown id); a `todo add` from empty
-/// creates the panel.
-pub(crate) fn patch_live_todos_from_action(state: &mut crate::state::UiState, args: &str) {
-    use atomcode_capabilities::tools::todo::{apply_todo_action, TodoItem};
-    let mut items: Vec<TodoItem> = state
-        .active_todos
-        .as_ref()
-        .map(|p| {
-            p.items
+fn commit_todo_call_result(
+    state: &mut crate::state::UiState,
+    call_id: &str,
+    name: &str,
+    success: bool,
+) {
+    if name != "todowrite" && name != "todo" {
+        return;
+    }
+    if !state.pending_todo_calls.contains_key(call_id) {
+        return;
+    }
+    state
+        .pending_todo_results
+        .insert(call_id.to_string(), success);
+    rebuild_pending_todo_projections(state);
+    if state
+        .pending_todo_order
+        .iter()
+        .all(|id| state.pending_todo_results.contains_key(id))
+    {
+        clear_pending_todo_calls(state);
+    }
+}
+
+fn stage_todo_call_preview(state: &mut crate::state::UiState, call_id: &str, args: &str) {
+    if state.pending_todo_order.is_empty() {
+        state.pending_todo_base = Some(todo_items_from_progress(state.active_todos.as_ref()));
+    }
+    if !state.pending_todo_calls.contains_key(call_id) {
+        state.pending_todo_order.push(call_id.to_string());
+    }
+    state
+        .pending_todo_calls
+        .insert(call_id.to_string(), args.to_string());
+    rebuild_pending_todo_projections(state);
+}
+
+fn todo_items_from_progress(
+    progress: Option<&crate::render::TodoProgress>,
+) -> Vec<atomcode_capabilities::tools::todo::TodoItem> {
+    use atomcode_capabilities::tools::todo::TodoItem;
+    progress
+        .map(|progress| {
+            progress
+                .items
                 .iter()
-                .map(|(s, c)| TodoItem {
-                    status: *s,
-                    content: c.clone(),
+                .map(|(status, content)| TodoItem {
+                    status: *status,
+                    content: content.clone(),
                 })
                 .collect()
         })
-        .unwrap_or_default();
-    apply_todo_action(&mut items, args);
-    state.active_todos = if items.is_empty() {
-        None
+        .unwrap_or_default()
+}
+
+fn apply_todo_mutation(
+    items: &mut Vec<atomcode_capabilities::tools::todo::TodoItem>,
+    args: &str,
+) {
+    if let Some(progress) = todo_progress_from_args(args) {
+        *items = todo_items_from_progress(Some(&progress));
     } else {
-        Some(todo_progress_from_items(&items))
+        atomcode_capabilities::tools::todo::apply_new_todo_action(items, args);
+    }
+}
+
+fn rebuild_pending_todo_projections(state: &mut crate::state::UiState) {
+    let Some(base) = state.pending_todo_base.clone() else {
+        state.pending_todo_preview = None;
+        return;
     };
+    let mut committed = base.clone();
+    let mut preview = base;
+    let mut has_unresolved = false;
+    for call_id in &state.pending_todo_order {
+        let Some(args) = state.pending_todo_calls.get(call_id) else {
+            continue;
+        };
+        match state.pending_todo_results.get(call_id).copied() {
+            Some(true) => {
+                apply_todo_mutation(&mut committed, args);
+                apply_todo_mutation(&mut preview, args);
+            }
+            Some(false) => {}
+            None => {
+                has_unresolved = true;
+                apply_todo_mutation(&mut preview, args);
+            }
+        }
+    }
+    state.active_todos = (!committed.is_empty()).then(|| todo_progress_from_items(&committed));
     sync_todo_titles(state);
+    state.pending_todo_preview = has_unresolved.then(|| todo_progress_from_items(&preview));
+}
+
+pub(crate) fn clear_pending_todo_calls(state: &mut crate::state::UiState) {
+    state.pending_todo_calls.clear();
+    state.pending_todo_order.clear();
+    state.pending_todo_results.clear();
+    state.pending_todo_base = None;
+    state.pending_todo_preview = None;
 }
 
 pub(crate) fn todo_progress_from_args(args: &str) -> Option<crate::render::TodoProgress> {
-    atomcode_capabilities::tools::todo::parse_todos(args)
+    atomcode_capabilities::tools::todo::validate_new_todo_plan(args)
         .ok()
         .map(|todos| todo_progress_from_items(&todos))
 }
@@ -24117,17 +25624,9 @@ pub(crate) fn todo_progress_from_args(args: &str) -> Option<crate::render::TodoP
 pub(crate) fn todo_progress_from_messages(
     messages: &[atomcode_kernel::message::Message],
 ) -> Option<crate::render::TodoProgress> {
-    // Fold `todowrite` (replace) + `todo` (add/update) in transcript order through the SAME
-    // reducer capabilities uses, so a resumed session's panel reflects incremental updates —
-    // not just the last full-list todowrite. Collect (name, args) in order first.
-    // kernel `Message.tool_calls` is a flat field (non-empty only on assistant
-    // messages that requested tools), so no content-variant match is needed.
-    let calls: Vec<(&str, &str)> = messages
-        .iter()
-        .flat_map(|m| m.tool_calls.iter())
-        .map(|c| (c.name.as_str(), c.arguments.as_str()))
-        .collect();
-    let todos = atomcode_capabilities::tools::todo::reduce_todos(calls);
+    // Use the canonical transcript projection so a resumed panel reflects incremental
+    // updates while excluding calls whose correlated tool result failed.
+    let todos = atomcode_capabilities::tools::todo::derive_current_todos(messages);
     if todos.is_empty() {
         return None; // no list, or the last valid todowrite cleared it → hide panel
     }
@@ -24137,6 +25636,123 @@ pub(crate) fn todo_progress_from_messages(
 #[cfg(test)]
 mod todo_block_tests {
     use super::*;
+
+    #[test]
+    fn failed_live_todo_result_discards_staged_mutation() {
+        let mut state = crate::state::UiState::new();
+        state.active_todos = todo_progress_from_args(
+            r#"{"todos":[{"content":"keep","status":"in_progress"}]}"#,
+        );
+        stage_todo_call_preview(
+            &mut state,
+            "failed",
+            r#"{"action":"add","content":"must not appear"}"#,
+        );
+
+        commit_todo_call_result(&mut state, "failed", "todowrite", false);
+
+        let progress = state.active_todos.expect("prior list remains");
+        assert_eq!(progress.items.len(), 1);
+        assert_eq!(progress.items[0].1, "keep");
+        assert!(!state.pending_todo_calls.contains_key("failed"));
+    }
+
+    #[test]
+    fn in_flight_todo_preview_updates_footer_without_committing_authoritative_state() {
+        let mut state = crate::state::UiState::new();
+        state.active_todos = todo_progress_from_args(
+            r#"{"todos":[{"content":"done","status":"completed"},{"content":"run agents","status":"pending"}]}"#,
+        );
+        let args = r#"{"action":"update","id":2,"status":"in_progress"}"#;
+        stage_todo_call_preview(&mut state, "preview", args);
+
+        assert_eq!(state.active_todos.as_ref().unwrap().in_progress, 0);
+        let preview = effective_todo_progress(&state).expect("preview drives live footer");
+        assert_eq!(preview.in_progress, 1);
+        assert_eq!(preview.current.as_deref(), Some("run agents"));
+        assert!(todo_panel_is_active(&state));
+
+        commit_todo_call_result(&mut state, "preview", "todowrite", false);
+        assert!(state.pending_todo_preview.is_none());
+        assert_eq!(state.active_todos.as_ref().unwrap().in_progress, 0);
+    }
+
+    #[test]
+    fn successful_todo_preview_becomes_authoritative() {
+        let mut state = crate::state::UiState::new();
+        state.active_todos = todo_progress_from_args(
+            r#"{"todos":[{"content":"run agents","status":"pending"}]}"#,
+        );
+        let args = r#"{"action":"update","id":1,"status":"in_progress"}"#;
+        stage_todo_call_preview(&mut state, "preview", args);
+
+        commit_todo_call_result(&mut state, "preview", "todowrite", true);
+
+        assert!(state.pending_todo_preview.is_none());
+        assert_eq!(state.active_todos.as_ref().unwrap().in_progress, 1);
+    }
+
+    #[test]
+    fn successful_live_todo_result_commits_full_plan_and_action() {
+        let mut state = crate::state::UiState::new();
+        stage_todo_call_preview(
+            &mut state,
+            "plan",
+            r#"{"todos":[{"content":"first","status":"in_progress"}]}"#,
+        );
+        commit_todo_call_result(&mut state, "plan", "todowrite", true);
+        assert_eq!(
+            state.active_todos.as_ref().unwrap().items[0].1,
+            "first"
+        );
+
+        stage_todo_call_preview(
+            &mut state,
+            "add",
+            r#"{"action":"add","content":"second"}"#,
+        );
+        commit_todo_call_result(&mut state, "add", "todowrite", true);
+
+        let progress = state.active_todos.expect("successful action is committed");
+        assert_eq!(progress.items.len(), 2);
+        assert_eq!(progress.items[1].1, "second");
+    }
+
+    #[test]
+    fn concurrent_todo_previews_replay_in_call_order_and_exclude_failures() {
+        let mut state = crate::state::UiState::new();
+        state.active_todos = todo_progress_from_args(
+            r#"{"todos":[{"content":"first","status":"pending"}]}"#,
+        );
+        stage_todo_call_preview(
+            &mut state,
+            "a",
+            r#"{"action":"update","id":1,"status":"in_progress"}"#,
+        );
+        stage_todo_call_preview(
+            &mut state,
+            "b",
+            r#"{"action":"add","content":"second"}"#,
+        );
+
+        let preview = effective_todo_progress(&state).unwrap();
+        assert_eq!(preview.in_progress, 1);
+        assert_eq!(preview.items.len(), 2);
+
+        // Resolve out of order: b succeeds while a is still optimistic.
+        commit_todo_call_result(&mut state, "b", "todowrite", true);
+        let preview = effective_todo_progress(&state).unwrap();
+        assert_eq!(preview.in_progress, 1);
+        assert_eq!(preview.items.len(), 2);
+
+        // a fails, so only b remains in the authoritative list.
+        commit_todo_call_result(&mut state, "a", "todowrite", false);
+        assert!(state.pending_todo_preview.is_none());
+        let committed = state.active_todos.as_ref().unwrap();
+        assert_eq!(committed.in_progress, 0);
+        assert_eq!(committed.items.len(), 2);
+        assert_eq!(committed.items[1].1, "second");
+    }
 
     #[test]
     fn todo_progress_from_args_carries_current_and_distinguishes_clear() {
@@ -24369,6 +25985,7 @@ mod install_password_modal_tests {
             legacy_conhost: false,
             jediterm: false,
             modern_emulator: false,
+            kitty_keyboard: false,
         }
     }
 

@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { useChatContext } from '../state/ChatProvider';
 import { formatTokenCount } from '../utils/format';
+import { imageDataUrl } from '../utils/format';
 import { SlashPicker } from './SlashPicker';
 import { ModelSelector } from './ModelSelector';
 import { ModeSelector } from './ModeSelector';
@@ -50,10 +51,6 @@ function fileToImageData(file: File): Promise<ImageData | null> {
     };
     reader.readAsDataURL(file);
   });
-}
-
-function imageDataUrl(img: ImageData): string {
-  return `data:${img.media_type};base64,${img.data}`;
 }
 
 export function InputArea() {

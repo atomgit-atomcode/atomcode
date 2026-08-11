@@ -4,6 +4,9 @@ use agent_client_protocol::schema::v1::{
 };
 use atomcode_kernel::event::AgentEvent;
 
+const POLICY_INTERVENTION_NOTICE: &str =
+    "Credential protection blocked an unsafe shell operation. Complete the authenticated step in a separate terminal and then ask AtomCode to continue, skip the blocked step, or end the task. Do not paste credentials into chat.";
+
 pub fn tool_kind(name: &str) -> ToolKind {
     let n = name.to_ascii_lowercase();
     if n.contains("read") || n.contains("cat") {
@@ -59,6 +62,11 @@ pub fn event_to_update(ev: &AgentEvent) -> Option<SessionUpdate> {
                 fields,
             )))
         }
+        AgentEvent::PolicyIntervention { .. } => {
+            Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                ContentBlock::Text(TextContent::new(POLICY_INTERVENTION_NOTICE.to_string())),
+            )))
+        }
         _ => None,
     }
 }
@@ -111,6 +119,19 @@ mod tests {
     #[test]
     fn usage_has_no_update() {
         assert!(event_to_update(&AgentEvent::TurnStarted).is_none());
+    }
+
+    #[test]
+    fn policy_intervention_exposes_safe_recovery_without_secret_material() {
+        let event = AgentEvent::PolicyIntervention {
+            intervention: atomcode_kernel::event::PolicyIntervention::credential_shell_blocked(),
+        };
+        let update = event_to_update(&event).expect("policy recovery notice");
+        let value = serde_json::to_value(update).unwrap();
+        let text = value["content"]["text"].as_str().unwrap();
+        assert!(text.contains("separate terminal"));
+        assert!(text.contains("skip"));
+        assert!(!text.contains("TOKEN="));
     }
 
     #[test]

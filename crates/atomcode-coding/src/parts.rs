@@ -25,7 +25,6 @@ use atomcode_capabilities::codeintel::register_codeintel_tools;
 use atomcode_capabilities::datalog::DatalogHook;
 use atomcode_capabilities::mcp::{self, McpConnectEvent, McpRegistry};
 use atomcode_capabilities::memory::MemoryHook;
-use atomcode_capabilities::provider::model_suggests_vision;
 use atomcode_capabilities::session::snapshot::SnapshotPersistenceStatus;
 use atomcode_capabilities::session::{
     PresentationFile, RecallTool, SessionContextHook, SessionLease, SessionManager, SessionMeta,
@@ -51,6 +50,7 @@ use atomcode_review::{ReviewTool, ReviewToolConfig, SharedReviewProvider};
 use crate::config::CodingAgentConfig;
 use crate::discipline::VerifyCadenceHook;
 use crate::execution_policy::TurnExecutionPolicy;
+use crate::mcp_instructions::McpInstructionsHook;
 #[cfg(test)]
 use crate::persona::coding_persona;
 use crate::persona::coding_persona_with_capabilities;
@@ -76,6 +76,29 @@ pub enum SessionMode {
     },
     /// No persistence (CI / one-shot / review-style runs).
     Disabled,
+}
+
+/// Driver-owned policy for mounting child-agent capabilities. The library default
+/// is fail-closed; interactive drivers must opt in explicitly.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SubagentPolicy {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+impl SubagentPolicy {
+    fn resolve(self, env: Option<&str>) -> bool {
+        if self == Self::Disabled {
+            return false;
+        }
+        env.is_none_or(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off" | "no"
+            )
+        })
+    }
 }
 
 /// Capability inputs for [`prepare`] — what to wire beyond the always-on core
@@ -107,6 +130,9 @@ pub struct PrepareOptions {
     /// in-session via the review specialization). Reuses the host provider (set at
     /// assemble), so it works on a signing gateway. `false` ⇒ not mounted.
     pub review: bool,
+    /// Mount `task` and `team`. Drivers must opt in explicitly; the environment
+    /// may still disable an enabled driver with `ATOMCODE_SUBAGENT=0`.
+    pub subagents: SubagentPolicy,
     /// Mount the structured `request_user_input` tool. Drivers without a typed
     /// request/response protocol must set this false instead of advertising a tool
     /// they can only fail with `Null`.
@@ -125,6 +151,7 @@ impl Default for PrepareOptions {
             memory: true,
             web: true,
             review: true,
+            subagents: SubagentPolicy::Disabled,
             request_user_input: true,
             rate_limit_source: None,
         }
@@ -237,8 +264,14 @@ pub struct CodingParts {
     /// Host-provider fallback slot for the `task` subagent tool, filled by [`assemble`].
     /// Configured fast/capable tiers are resolved through the runtime-owned cells on
     /// [`CodingAgentConfig`].
-    /// `None` when the `ATOMCODE_SUBAGENT` env gate is off.
+    /// `None` when the driver policy or `ATOMCODE_SUBAGENT` override disables it.
     pub subagent_provider: Option<SharedReviewProvider>,
+    /// Child-agent assembly prepared from the same live tier-provider cells and
+    /// execution policy as `task`. The `team` tool is mounted in the next phase.
+    pub team_runner: Option<crate::team::TeamRunnerFactory>,
+    /// Runtime-owned Team Agent orchestration. The manager is shared with the
+    /// mounted tool, while lifecycle termination is driven only by CodingRuntime.
+    pub team_manager: crate::team::TeamRunManager,
     /// User/project CC external hooks (`$ATOMCODE_HOME/hooks.json` + `<root>/.hooks.json`).
     /// ONE instance is registered as BOTH a [`LifecycleHooks`] (already pushed into `hooks`)
     /// and a [`ToolMiddleware`](atomcode_kernel::middleware::ToolMiddleware) (registered by
@@ -287,7 +320,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // model can't accept a pasted image yet refuse a read_file image. NOTE: this is the
     // PREPARE-time flag; `assemble` re-registers read_file on every model swap (see there)
     // so a `/model` change to/from a VL model can't leave it stale.
-    register_coding_tools_with_vision(&mut registry, model_suggests_vision(&cfg.model));
+    register_coding_tools_with_vision(&mut registry, cfg.supports_vision);
     names.extend(
         atomcode_capabilities::tools::coding_tool_names()
             .iter()
@@ -296,6 +329,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     let request_user_input_enabled =
         opts.request_user_input && crate::persona::request_user_input_switch_enabled();
     let todo_enabled = crate::persona::todo_switch_enabled_for(cfg.todo.enabled);
+    let subagents_enabled = opts.subagents.resolve(
+        std::env::var("ATOMCODE_SUBAGENT").ok().as_deref(),
+    );
     if !todo_enabled {
         names.retain(|name| name != "todowrite");
     }
@@ -308,6 +344,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             .iter()
             .map(|s| s.to_string()),
     );
+    if atomcode_capabilities::codeintel::register_lsp_tool(&mut registry, &cfg.lsp) {
+        names.push("lsp".into());
+    }
 
     #[cfg(feature = "atomgit")]
     crate::assemble::register_atomgit_capabilities(&mut registry, &mut names)
@@ -361,11 +400,30 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         None
     };
 
-    // `task` subagent tool (env-gated, default ON; opt out with ATOMCODE_SUBAGENT=0). Configured fast/capable tiers use
+    // `task`/`team` are mounted only when the driver policy resolves enabled. An
+    // explicit ATOMCODE_SUBAGENT value overrides that policy for compatibility.
+    // Configured fast/capable tiers use
     // runtime-owned provider cells; missing/same-as-host tiers reuse the host slot.
     // Child tools: read-only `explore` vs edit-capable `worker`.
+    // One runtime-owned manager projects both persistent `team` runs and
+    // synchronous legacy `task` batches into the same typed event stream.
+    let subagent_cfg = cfg
+        .subagent_config
+        .as_ref()
+        .map(|config| config.subagent.clone())
+        .unwrap_or_default();
+    let (subagent_max_concurrent, subagent_max_rounds) = subagent_runtime_knobs(
+        &subagent_cfg,
+        std::env::var("ATOMCODE_SUBAGENT_MAX_ROUNDS")
+            .ok()
+            .as_deref(),
+    );
+    let team_manager = crate::team::TeamRunManager::new(crate::team::TeamRuntimeConfig {
+        max_concurrent: subagent_max_concurrent,
+        ..Default::default()
+    });
     let subagent_provider: Option<SharedReviewProvider> =
-        if subagent_enabled_from_env(std::env::var("ATOMCODE_SUBAGENT").ok().as_deref()) {
+        if subagents_enabled {
             use atomcode_capabilities::tools::TaskTool;
 
             let slot: SharedReviewProvider = Arc::new(std::sync::RwLock::new(None));
@@ -434,17 +492,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
 
             // `[subagent]` live knobs. `timeout_secs` remains parse-only compatibility:
             // a productive child is never cancelled for total wall-clock age.
-            let subagent_cfg = cfg
-                .subagent_config
-                .as_ref()
-                .map(|c| c.subagent.clone())
-                .unwrap_or_default();
-            let (max_concurrent, max_rounds) = subagent_runtime_knobs(
-                &subagent_cfg,
-                std::env::var("ATOMCODE_SUBAGENT_MAX_ROUNDS")
-                    .ok()
-                    .as_deref(),
-            );
+            let task_team_manager = team_manager.clone();
             registry.register(Arc::new(
                 TaskTool::new(
                     make_fast,
@@ -452,16 +500,81 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                     make_explore_tools,
                     make_worker_tools,
                 )
-                .with_max_concurrent(max_concurrent)
-                .with_max_rounds(max_rounds)
+                .with_max_concurrent(subagent_max_concurrent)
+                .with_max_rounds(subagent_max_rounds)
                 .with_tool_loop_policy(cfg.tool_loop_policy)
-                .with_worker_middleware(turn_execution_policy.clone()),
+                .with_worker_middleware(turn_execution_policy.clone())
+                .with_team_event_sink(Arc::new(move |event| {
+                    task_team_manager.publish_external(event);
+                })),
             ));
             names.push("task".to_string());
             Some(slot)
         } else {
             None
         };
+
+    let team_runner = subagent_provider.as_ref().map(|slot| {
+        use atomcode_capabilities::team::{TeamDifficulty, TeamPermission};
+
+        let mut child_registry = atomcode_kernel::tool::ToolRegistry::new();
+        atomcode_capabilities::tools::register_coding_tools_with_vision(&mut child_registry, false);
+        let child_registry = Arc::new(child_registry);
+        let provider_slot = slot.clone();
+        let fast_cell = cfg.subagent_fast_provider.clone();
+        let capable_cell = cfg.subagent_capable_provider.clone();
+        let providers = Arc::new(move |difficulty| {
+            let tier = match difficulty {
+                TeamDifficulty::Simple => fast_cell.as_ref(),
+                TeamDifficulty::Hard => capable_cell.as_ref(),
+            };
+            tier.and_then(|cell| cell.get()).unwrap_or_else(|| {
+                provider_slot
+                    .read()
+                    .ok()
+                    .and_then(|provider| provider.clone())
+                    .expect("team provider slot filled at assemble before any turn")
+            })
+        });
+        let tools_registry = Arc::clone(&child_registry);
+        let tools = Arc::new(move |permission| {
+            let names: &[&str] = match permission {
+                TeamPermission::Explore => &["read_file", "grep", "glob", "list_directory"],
+                // Bash is intentionally absent. DenyTeamBash remains a second
+                // fail-closed gate if this registry is broadened later.
+                TeamPermission::Worker => &[
+                    "read_file",
+                    "edit_file",
+                    "write_file",
+                    "grep",
+                    "glob",
+                    "search_replace",
+                    "list_directory",
+                ],
+            };
+            tools_registry.mount(names)
+        });
+        let runner = crate::team::TeamRunnerFactory::new(providers, tools, cfg.working_dir.clone())
+            .with_runtime_policy(
+                (subagent_max_rounds > 0).then_some(subagent_max_rounds),
+                cfg.tool_loop_policy,
+                Some(cfg.stream_timeout),
+                cfg.request_timeout,
+            )
+            .with_worker_middleware(turn_execution_policy.clone());
+        registry.register(Arc::new(crate::team::TeamTool::new(
+            team_manager.clone(),
+            runner.job_factory(),
+            runner.model_factory(),
+        )));
+        names.push("team".to_string());
+        runner
+    });
+
+    // Build the context hook once so skill-catalog ranking and later context
+    // injection observe the exact same instruction-file precedence and bytes.
+    let session_context_hook = Arc::new(SessionContextHook::new(&cfg.working_dir));
+    let instruction_text = session_context_hook.instruction_text();
 
     // Skills: standard home+project precedence unless the caller supplied dirs.
     let skill_dirs = opts.skill_dirs.clone().unwrap_or_else(|| {
@@ -480,7 +593,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // Render the catalog BEFORE the registry is moved into the tools; injected as a
     // leading system message by SkillCatalogHook below (without it the model never
     // learns which skills exist — only the use_skill/list_skills tools were mounted).
-    let skill_catalog = skills.render_catalog();
+    let skill_catalog = skills.render_catalog_prioritizing(&instruction_text);
     register_skill_tools(&mut registry, skills);
     names.extend(
         atomcode_capabilities::skills::skill_tool_names()
@@ -504,6 +617,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     } else {
         (None, None)
     };
+    let mcp_tool_names = Arc::new(std::sync::RwLock::new(Vec::new()));
 
     // Session binding: the id's single owner.
     let session = match &opts.session {
@@ -597,6 +711,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     //    prefix, so they compose (the insert position is computed live each time).
     // 2b. SkillCatalogHook — session_start: inject the AVAILABLE SKILLS catalog after
     //    memory (persona → context → memory → skills). Same header-prefix reconcile.
+    // 2c. McpInstructionsHook — pre_request append-only projection of live,
+    //     server-scoped instructions for currently mounted MCP tools. Ephemeral:
+    //     never persists external server guidance into the session snapshot.
     // 3. SnapshotHook  — turn_complete: persist .snapshot + .meta.
     // 4. TranscriptHook— turn_complete: append the .jsonl record. (No coupling with
     //    3 — the order is fixed purely for determinism.)
@@ -609,7 +726,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     let mut snapshot_hook_handle = None;
     let mut snapshot_persistence_status = None;
     // Env / project-instructions / git context — unconditional (v1 parity: always present).
-    hooks.push(Arc::new(SessionContextHook::new(&cfg.working_dir)));
+    hooks.push(session_context_hook);
     if opts.memory {
         hooks.push(Arc::new(MemoryHook::for_project(&cfg.working_dir)));
     }
@@ -620,12 +737,18 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // (registered below) uses it to stay a no-op when there's nothing to trigger.
     let has_skills = skill_catalog.as_ref().is_some_and(|c| !c.trim().is_empty());
     hooks.push(Arc::new(SkillCatalogHook::new(skill_catalog)));
+    if let Some(registry) = &mcp_registry {
+        hooks.push(Arc::new(McpInstructionsHook::new(
+            Arc::clone(registry),
+            Arc::clone(&mcp_tool_names),
+        )));
+    }
     if let Some(b) = &session {
         let wd = cfg.working_dir.to_string_lossy().into_owned();
         let snapshot_hook = Arc::new(
             SnapshotHook::new(b.manager.clone(), &b.id, &wd)
                 .with_lease(b.lease.clone())
-                .with_model_attribution(&cfg.provider_name, &cfg.model, cfg.pricing),
+                .with_model_attribution(&cfg.provider_name, &cfg.model),
         );
         snapshot_persistence_status = Some(snapshot_hook.persistence_status());
         compaction_checkpoint = Some(snapshot_hook.clone());
@@ -738,7 +861,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         tool_names: names,
         todo_enabled,
         request_user_input_enabled,
-        mcp_tool_names: Arc::new(std::sync::RwLock::new(Vec::new())),
+        mcp_tool_names,
         mounted_tools: None,
         mounted_tools_publisher: None,
         mcp_connect_rx,
@@ -756,6 +879,8 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         mcp_registry,
         review_provider,
         subagent_provider,
+        team_runner,
+        team_manager,
         cc_external_hooks: cc_external,
         rate_limit_source: opts.rate_limit_source,
     })
@@ -1178,9 +1303,7 @@ pub fn assemble(
     // `review_provider` slot below.
     parts
         .registry
-        .register(Arc::new(ReadFileTool::new(model_suggests_vision(
-            &cfg.model,
-        ))));
+        .register(Arc::new(ReadFileTool::new(cfg.supports_vision)));
 
     // Session-bound: reload the complete canonical aggregate. Only a fresh
     // runtime intentionally staged in memory is allowed to assemble before its
@@ -1196,6 +1319,7 @@ pub fn assemble(
                     parts.todo_enabled,
                     parts.request_user_input_enabled,
                     parts.review_provider.is_some(),
+                    parts.subagent_provider.is_some(),
                 );
                 b.resume = Some(snap);
             }
@@ -1217,7 +1341,6 @@ pub fn assemble(
                 &session.id,
                 &cfg.provider_name,
                 &cfg.model,
-                cfg.pricing,
             );
             if let Some(status) = parts.snapshot_persistence_status() {
                 recorder = recorder.with_persistence_status(status);
@@ -1317,6 +1440,7 @@ pub fn assemble(
             parts.todo_enabled,
             parts.request_user_input_enabled,
             parts.review_provider.is_some(),
+            parts.subagent_provider.is_some(),
         ))
         // Repair model-produced arguments before any observer or policy gate reads them.
         // Approval must inspect the same bytes that the tool executes.
@@ -1529,16 +1653,14 @@ pub fn assemble(
                 let install_recorder = |cell: &Arc<crate::config::TierProvider>, key: &str| {
                     // `key` is a model-selection id (design §14.2); resolve it the
                     // same way the tier provider was built so usage attribution
-                    // (model name + pricing) matches.
+                    // uses the same model identity.
                     if let Ok(resolved) = registry.resolve_model(Some(key)) {
-                        let pricing = crate::resolve_resolved_pricing(&resolved);
                         let mut recorder =
                             atomcode_capabilities::session::DetachedUsageRecorder::new(
                                 b.manager.clone(),
                                 &b.id,
                                 key,
                                 &resolved.model,
-                                pricing,
                             );
                         if let Some(status) = parts.snapshot_persistence_status() {
                             recorder = recorder.with_persistence_status(status);
@@ -1564,6 +1686,7 @@ pub fn assemble(
             parts.todo_enabled,
             parts.request_user_input_enabled,
             parts.review_provider.is_some(),
+            parts.subagent_provider.is_some(),
         );
         builder = builder.resume(snapshot);
     }
@@ -1590,7 +1713,7 @@ pub fn assemble(
     // succeeded. ReassembleProvider stops the old agent before entering here,
     // so no accepted turn can observe a half-switched attribution.
     if let Some(snapshot_hook) = &parts.snapshot_hook {
-        snapshot_hook.set_model_attribution(&cfg.provider_name, &cfg.model, cfg.pricing);
+        snapshot_hook.set_model_attribution(&cfg.provider_name, &cfg.model);
     }
     Ok(agent)
 }
@@ -1613,6 +1736,7 @@ fn reconcile_coding_persona(
     todo_enabled: bool,
     request_user_input_enabled: bool,
     review_enabled: bool,
+    subagents_enabled: bool,
 ) {
     let persona = coding_persona_with_capabilities(
         &cfg.model,
@@ -1620,6 +1744,7 @@ fn reconcile_coding_persona(
         todo_enabled,
         request_user_input_enabled,
         review_enabled,
+        subagents_enabled,
     );
     let is_persona = |message: &Message| {
         message.role == Role::System && message.text.starts_with(ATOMCODE_PERSONA_PREFIX)
@@ -1696,9 +1821,8 @@ fn check_snapshot_version(snap: &SessionSnapshot) -> io::Result<()> {
     Ok(())
 }
 
-/// env `ATOMCODE_SUBAGENT` gate: default ON; only `0`/`false`/`off` (case-insensitive)
-/// disables — unset or any other value = on. (Now matches `ATOMCODE_TODO` /
-/// `ATOMCODE_MEMORY_TOOL`; opt out with `ATOMCODE_SUBAGENT=0`.)
+/// Legacy environment-only resolver retained for callers that have not yet adopted
+/// [`SubagentPolicy`]. New runtime assembly resolves the explicit driver policy first.
 pub fn subagent_enabled_from_env(var: Option<&str>) -> bool {
     match var {
         None => true,
@@ -1776,6 +1900,15 @@ mod tests {
     }
 
     #[test]
+    fn subagent_policy_is_driver_explicit_and_env_can_disable() {
+        assert!(!SubagentPolicy::Disabled.resolve(None));
+        assert!(SubagentPolicy::Enabled.resolve(None));
+        assert!(!SubagentPolicy::Enabled.resolve(Some("0")));
+        assert!(!SubagentPolicy::Disabled.resolve(Some("1")));
+        assert!(SubagentPolicy::Enabled.resolve(Some("1")));
+    }
+
+    #[test]
     fn subagent_runtime_knobs_ignore_legacy_timeout_and_floor_concurrency() {
         use super::subagent_runtime_knobs;
         use atomcode_config::config::SubAgentConfig;
@@ -1826,6 +1959,7 @@ mod tests {
             true,
             true,
             true,
+            true,
         );
 
         assert!(snapshot.messages[0]
@@ -1840,7 +1974,7 @@ mod tests {
         let mut snapshot = SessionSnapshot::new(vec![Message::system("SESSION CONTEXT")]);
         let cfg = agent_config("deepseek-v4-flash");
 
-        reconcile_coding_persona(&mut snapshot, &cfg, false, true, true);
+        reconcile_coding_persona(&mut snapshot, &cfg, false, true, true, true);
 
         assert!(!snapshot.messages[0].text.contains("## TASK TRACKING"));
         assert!(snapshot.messages[0]
@@ -1868,6 +2002,7 @@ mod tests {
         reconcile_coding_persona(
             &mut snapshot,
             &agent_config("deepseek-v4-flash"),
+            true,
             true,
             true,
             true,
@@ -1914,8 +2049,8 @@ mod tests {
             Message::assistant("I am model-a", vec![]),
         ]);
 
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true);
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-c"), true, true, true);
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true, true);
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-c"), true, true, true, true);
 
         let transitions: Vec<_> = snapshot
             .messages
@@ -1953,6 +2088,7 @@ mod tests {
             true,
             true,
             true,
+            true,
         );
 
         assert_eq!(snapshot.messages[0].text, persona);
@@ -1977,7 +2113,7 @@ mod tests {
         let mut cfg = agent_config("model-a");
         cfg.preferred_language = Some(Locale::ZhCn);
 
-        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, true);
 
         assert!(snapshot.messages[0]
             .text
@@ -2004,12 +2140,12 @@ mod tests {
             )),
             Message::assistant("I am model-a", vec![]),
         ]);
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true);
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true, true);
         let transition = snapshot.messages.last().cloned().unwrap();
         let mut cfg = agent_config("model-b");
         cfg.preferred_language = Some(Locale::ZhCn);
 
-        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, true);
 
         assert_eq!(snapshot.messages.last(), Some(&transition));
         assert_eq!(
@@ -2055,6 +2191,7 @@ mod tests {
             memory: false,
             web: false,
             review: false,
+            subagents: SubagentPolicy::Disabled,
             request_user_input: true,
             rate_limit_source: None,
         };
@@ -2123,6 +2260,7 @@ mod tests {
             memory: false,
             web: false,
             review: false,
+            subagents: SubagentPolicy::Disabled,
             request_user_input: true,
             rate_limit_source: None,
         }

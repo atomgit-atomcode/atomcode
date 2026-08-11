@@ -56,6 +56,14 @@ pub struct EnvView {
     /// launchers that don't propagate `TERMINAL_EMULATOR` into our process
     /// (so auto-detect misses), and (b) A/B testing the path on-device.
     pub force_jediterm: Option<bool>,
+    /// `ATOMCODE_KITTY` explicit keyboard-protocol override. `true` forces
+    /// Kitty CSI-u on, `false` forces it off, unset uses conservative terminal
+    /// identification. This is intentionally tri-state so browser terminals
+    /// that only advertise generic `xterm-256color` are not assumed capable.
+    pub force_kitty_keyboard: Option<bool>,
+    pub kitty_window_id: Option<String>,
+    pub wezterm_version: Option<String>,
+    pub alacritty_socket: Option<String>,
 }
 
 impl EnvView {
@@ -76,8 +84,32 @@ impl EnvView {
             force_jediterm: std::env::var("ATOMCODE_JEDITERM")
                 .ok()
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+            force_kitty_keyboard: std::env::var("ATOMCODE_KITTY")
+                .ok()
+                .and_then(|v| parse_bool_override(&v)),
+            kitty_window_id: std::env::var("KITTY_WINDOW_ID").ok(),
+            wezterm_version: std::env::var("WEZTERM_VERSION").ok(),
+            alacritty_socket: std::env::var("ALACRITTY_SOCKET").ok(),
         }
     }
+}
+
+fn parse_bool_override(value: &str) -> Option<bool> {
+    match value.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        value if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes") => {
+            Some(true)
+        }
+        value if value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("no") => {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+fn is_non_empty(value: &Option<String>) -> bool {
+    value.as_deref().is_some_and(|value| !value.trim().is_empty())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -139,6 +171,11 @@ pub struct TerminalCaps {
     /// SSH regardless of the client, since SSH doesn't forward these client-side
     /// vars to the remote where atomcode runs.
     pub modern_emulator: bool,
+    /// Whether this terminal should receive Kitty CSI-u keyboard enhancement.
+    /// Generic terminal names such as `xterm-256color` are insufficient:
+    /// JumpServer and other xterm.js web terminals commonly expose that value
+    /// while only partially implementing enhanced key reporting.
+    pub kitty_keyboard: bool,
 }
 
 impl TerminalCaps {
@@ -198,6 +235,28 @@ impl TerminalCaps {
             .force_jediterm
             .unwrap_or_else(|| env.terminal_emulator.as_deref() == Some("JetBrains-JediTerm"));
 
+        let term_program = env
+            .term_program
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let term = env.term.as_deref().unwrap_or_default().to_ascii_lowercase();
+        let known_kitty_keyboard = is_non_empty(&env.kitty_window_id)
+            || is_non_empty(&env.wezterm_version)
+            || is_non_empty(&env.alacritty_socket)
+            || term.contains("kitty")
+            || matches!(
+                term_program.as_str(),
+                "kitty"
+                    | "wezterm"
+                    | "alacritty"
+                    | "ghostty"
+                    | "iterm.app"
+                    | "iterm2"
+                    | "warpterminal"
+            );
+        let kitty_keyboard = env.force_kitty_keyboard.unwrap_or(known_kitty_keyboard) && !jediterm;
+
         Self {
             tty,
             colors: tty && !env.no_color && !is_dumb,
@@ -209,6 +268,7 @@ impl TerminalCaps {
             legacy_conhost: windows_legacy_console,
             jediterm,
             modern_emulator: on_modern_emulator,
+            kitty_keyboard,
         }
     }
 
@@ -225,20 +285,6 @@ impl TerminalCaps {
             "\u{276f} "
         } else {
             "> "
-        }
-    }
-
-    /// Continuation-row left bar for a multi-line user message — a full-height
-    /// marker under the `❯` chevron so the block reads as one unit. `▎` (left
-    /// one-eighth block) when unicode is available, ASCII `|` otherwise (Windows
-    /// legacy conhost / no-unicode fonts — same `unicode_symbols` gate as the
-    /// chevron, so it never renders a tofu glyph). Both are exactly 2 display
-    /// columns, matching `prompt_chevron`, so wrapped-row alignment is identical.
-    pub fn prompt_continuation_bar(&self) -> &'static str {
-        if self.unicode_symbols {
-            "\u{258e} "
-        } else {
-            "| "
         }
     }
 }
@@ -266,6 +312,10 @@ mod tests {
             term_program: None,
             terminal_emulator: None,
             force_jediterm: None,
+            force_kitty_keyboard: None,
+            kitty_window_id: None,
+            wezterm_version: None,
+            alacritty_socket: None,
         }
     }
 
@@ -567,20 +617,91 @@ mod tests {
             ..env()
         });
         assert!(!crate::should_enable_kitty_keyboard(&forced));
-        // A plain non-JediTerm TTY still gets the push — but only where the
-        // protocol is usable (the predicate is hard-false on Windows).
+        // A generic xterm TTY (including JumpServer/xterm.js web terminals)
+        // is deliberately conservative: TERM alone does not prove CSI-u.
         let plain = TerminalCaps::from_env(env());
-        assert_eq!(
-            crate::should_enable_kitty_keyboard(&plain),
-            cfg!(not(windows)),
-            "non-JediTerm TTY: push iff non-Windows"
-        );
+        assert!(!crate::should_enable_kitty_keyboard(&plain));
         // Never pushed when stdout isn't a TTY, JediTerm or not.
         let not_tty = TerminalCaps::from_env(EnvView {
             is_stdout_tty: false,
             ..env()
         });
         assert!(!crate::should_enable_kitty_keyboard(&not_tty));
+    }
+
+    #[test]
+    fn known_terminals_enable_kitty_keyboard_on_supported_platforms() {
+        for term_program in [
+            "kitty",
+            "WezTerm",
+            "Alacritty",
+            "ghostty",
+            "iTerm.app",
+            "WarpTerminal",
+        ] {
+            let caps = TerminalCaps::from_env(EnvView {
+                term_program: Some(term_program.to_string()),
+                ..env()
+            });
+            assert_eq!(
+                crate::should_enable_kitty_keyboard(&caps),
+                cfg!(not(windows)),
+                "{term_program} should use enhanced keys where crossterm can decode CSI-u"
+            );
+        }
+    }
+
+    #[test]
+    fn atomcode_kitty_override_controls_generic_terminal() {
+        let forced_on = TerminalCaps::from_env(EnvView {
+            force_kitty_keyboard: Some(true),
+            ..env()
+        });
+        assert_eq!(
+            crate::should_enable_kitty_keyboard(&forced_on),
+            cfg!(not(windows))
+        );
+
+        let forced_off = TerminalCaps::from_env(EnvView {
+            term_program: Some("kitty".to_string()),
+            force_kitty_keyboard: Some(false),
+            ..env()
+        });
+        assert!(!crate::should_enable_kitty_keyboard(&forced_off));
+    }
+
+    #[test]
+    fn jediterm_safety_wins_over_kitty_force_on() {
+        let caps = TerminalCaps::from_env(EnvView {
+            terminal_emulator: Some("JetBrains-JediTerm".to_string()),
+            force_kitty_keyboard: Some(true),
+            ..env()
+        });
+        assert!(!crate::should_enable_kitty_keyboard(&caps));
+    }
+
+    #[test]
+    fn empty_terminal_markers_do_not_enable_kitty_keyboard() {
+        let caps = TerminalCaps::from_env(EnvView {
+            kitty_window_id: Some(String::new()),
+            wezterm_version: Some("  ".to_string()),
+            alacritty_socket: Some(String::new()),
+            ..env()
+        });
+        assert!(!crate::should_enable_kitty_keyboard(&caps));
+    }
+
+    #[test]
+    fn atomcode_kitty_override_parser_is_strict_and_case_insensitive() {
+        for value in ["1", " true ", "YES"] {
+            assert_eq!(parse_bool_override(value), Some(true));
+        }
+        for value in ["0", " false ", "NO"] {
+            assert_eq!(parse_bool_override(value), Some(false));
+        }
+        for value in ["", "on", "off", "invalid"] {
+            assert_eq!(parse_bool_override(value), None);
+        }
     }
 
     #[test]

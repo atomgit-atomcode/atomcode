@@ -82,6 +82,9 @@ pub async fn check(mw: Arc<dyn ToolMiddleware>) -> ConformanceReport {
                 BeforeOutcome::DenyTurn { reason } => {
                     format!("DenyTurn — blocked and turn terminated: {reason}")
                 }
+                BeforeOutcome::DenyTurnWithIntervention { reason, .. } => {
+                    format!("DenyTurn — blocked with recovery contract: {reason}")
+                }
             },
         ),
         Ok(Err(p)) => r.record(

@@ -47,12 +47,14 @@ pub mod plugin_hooks;
 pub mod provider_factory;
 pub mod runtime;
 pub mod session_title;
+pub mod team;
 pub mod telemetry;
 pub mod vision;
 
 mod assemble;
 mod execution_policy;
 mod init_prompt;
+mod mcp_instructions;
 mod next_prompt_suggestion;
 mod rate_limit;
 mod skill_first;
@@ -64,8 +66,8 @@ pub use assemble::{build_coding_agent, build_coding_agent_with, try_build_coding
 /// so driver crates can implement the hook without naming `atomcode_kernel`.
 pub use atomcode_kernel::message::ImageContent;
 pub use config::{
-    apply_provider_config, resolve_loop_max_rounds, resolve_provider_pricing,
-    resolve_resolved_pricing, resolve_turn_max_rounds, CodingAgentConfig, CodingRuntimeConfig,
+    apply_provider_config, resolve_loop_max_rounds, resolve_turn_max_rounds, CodingAgentConfig,
+    CodingRuntimeConfig,
     SubagentProvider, TierProvider,
 };
 pub use controllers::{GoalPhase, GoalProgress, GoalTerminal, LoopProgress};
@@ -74,6 +76,7 @@ pub use init_prompt::INIT_PROMPT;
 pub use parts::{
     assemble, prepare, prepare_with_plugin_hook_source, prepare_with_plugin_hooks,
     subagent_enabled_from_env, CodingParts, PrepareOptions, SessionBinding, SessionMode,
+    SubagentPolicy,
 };
 pub use persona::{coding_persona, coding_persona_with_language, commit_language_guidance};
 pub use plan_mode::PlanModeGate;

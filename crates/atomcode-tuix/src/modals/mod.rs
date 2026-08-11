@@ -19,6 +19,7 @@ use crate::event_loop::{Buffer, LoopCtx};
 use crate::render::Renderer;
 use crate::state::UiState;
 
+pub mod config_panel;
 pub mod diff_viewer;
 pub mod dir_picker;
 pub mod file_viewer;
@@ -34,6 +35,7 @@ pub mod rewind;
 pub mod session_picker;
 pub mod usage;
 pub mod usage_render;
+pub use config_panel::ConfigPanel;
 pub use diff_viewer::DiffViewer;
 pub use dir_picker::DirPicker;
 pub use file_viewer::FileViewer;

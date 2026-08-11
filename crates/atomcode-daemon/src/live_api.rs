@@ -39,6 +39,17 @@ pub(crate) fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecisi
 /// Web/TUI 共同显示并下发给 Coding Runtime 的审批模式。
 static LIVE_APPROVAL_MODE: StdMutex<ApprovalMode> = StdMutex::new(ApprovalMode::Build);
 
+#[derive(Serialize)]
+pub(crate) struct LiveGoalSnapshot {
+    active: bool,
+    round: u32,
+    elapsed_secs: u64,
+    condition: String,
+    terminal: Option<String>,
+    phase: String,
+    last_reason: Option<String>,
+}
+
 /// 读取当前生效的审批模式。`pub(crate)` 以便 `/chat` 路径（非 sync webui）也据此
 /// 选择 PermissionDecider——否则模式 pill 只在 sync 模式生效。
 pub(crate) fn live_current_approval_mode() -> ApprovalMode {
@@ -286,6 +297,7 @@ pub(crate) fn chat_runtime_config(
         api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
         model: p.map(|p| p.model.clone()).unwrap_or_default(),
+        supports_vision: p.is_some_and(|p| p.accepts_images()),
         preferred_language: Some(atomcode_config::i18n::resolve_initial_locale(
             None,
             config.language,
@@ -331,9 +343,7 @@ pub(crate) fn chat_runtime_config(
         // WebUI/daemon projection is intentionally deferred; avoid a hidden
         // auxiliary model request until that driver renders the suggestion.
         next_prompt_suggestions: false,
-        pricing: p.and_then(|provider| {
-            atomcode_coding::resolve_provider_pricing(provider_name, provider)
-        }),
+        lsp: atomcode_coding::config::lsp_settings_from_config(&config.lsp),
     }
 }
 
@@ -411,7 +421,12 @@ pub(crate) async fn run_chat_turn_v2(
     // model conversation below (`user_images = Vec::new()`), so a reloading client refills
     // the thumbnail from the sidecar. The /chat path previously skipped this, so the image
     // was lost after refresh for anyone loading the session fresh from disk. Mirrors /live.
-    stash_vl_display_images(&runtime_cfg.working_dir, &session_id, &user_text, &user_images);
+    stash_vl_display_images(
+        &runtime_cfg.working_dir,
+        &session_id,
+        &user_text,
+        &user_images,
+    );
     let naming_session_id = session_id.clone();
     let naming_project_bucket =
         atomcode_capabilities::session::SessionManager::project_hash(&runtime_cfg.working_dir);
@@ -634,6 +649,9 @@ pub(crate) enum LiveWireEvent {
         /// 当前工作目录，让 App 端能展示项目名。
         #[serde(rename = "working_dir")]
         working_dir: String,
+        /// Goal controller state is not persisted in SessionSnapshot, so the
+        /// initial wire snapshot carries it explicitly for late subscribers.
+        goal: Option<LiveGoalSnapshot>,
     },
     #[serde(rename = "provider")]
     Provider { provider: String },
@@ -641,6 +659,18 @@ pub(crate) enum LiveWireEvent {
     /// webui 各 tab 的「模式」pill 据此同步。
     #[serde(rename = "mode")]
     Mode { mode: String },
+    /// Goal controller progress. This is deliberately structured so mobile
+    /// clients can distinguish completion, failure and user cancellation.
+    #[serde(rename = "goal_changed")]
+    GoalChanged {
+        active: bool,
+        round: u32,
+        elapsed_secs: u64,
+        condition: String,
+        terminal: Option<String>,
+        phase: String,
+        last_reason: Option<String>,
+    },
     /// 斜杠命令的文本输出（如 /status 报告）。`text` 首行即 `/cmd` 标头，
     /// 前端整体显示为一条系统消息即可。
     #[serde(rename = "command_output")]
@@ -719,6 +749,19 @@ pub(crate) enum LiveWireEvent {
     },
     #[serde(rename = "user_input_resolved")]
     UserInputResolved { request_id: u64 },
+    #[serde(rename = "policy_intervention")]
+    PolicyIntervention {
+        intervention_id: u64,
+        code: atomcode_kernel::event::PolicyInterventionCode,
+        actions: Vec<atomcode_kernel::event::PolicyRecoveryAction>,
+    },
+    #[serde(rename = "policy_intervention_resolved")]
+    PolicyInterventionResolved {
+        intervention_id: u64,
+        action: atomcode_kernel::event::PolicyRecoveryAction,
+    },
+    #[serde(rename = "policy_intervention_cleared")]
+    PolicyInterventionCleared { intervention_id: u64 },
     /// One or more live inputs were folded into the active turn. The exact
     /// payload lets browser clients acknowledge their FIFO pending-steer UI
     /// without guessing from text deltas or turn terminals.
@@ -844,6 +887,11 @@ impl NativeLiveWireProjector {
                         duration_ms: started.elapsed().as_millis() as u64,
                     }
                 }
+                Kernel::PolicyIntervention { intervention } => LiveWireEvent::PolicyIntervention {
+                    intervention_id: intervention.id,
+                    code: intervention.code,
+                    actions: intervention.actions,
+                },
                 Kernel::Usage(meta) => LiveWireEvent::Tokens {
                     prompt: meta.tokens.prompt as usize,
                     completion: meta.tokens.completion as usize,
@@ -952,6 +1000,29 @@ impl NativeLiveWireProjector {
                     mode: mode.wire().into(),
                 }
             }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::GoalChanged(progress)) => {
+                use atomcode_coding::{GoalPhase, GoalTerminal};
+                LiveWireEvent::GoalChanged {
+                    active: progress.active,
+                    round: progress.round,
+                    elapsed_secs: progress.elapsed_secs,
+                    condition: progress.condition,
+                    terminal: progress.terminal.map(|terminal| match terminal {
+                        GoalTerminal::Met => "met",
+                        GoalTerminal::Stopped => "stopped",
+                        GoalTerminal::Failed => "failed",
+                        GoalTerminal::Cancelled => "cancelled",
+                    }.into()),
+                    phase: match progress.phase {
+                        GoalPhase::Pursuing => "pursuing",
+                        GoalPhase::Paused => "paused",
+                        GoalPhase::PausedAtCap => "paused_at_cap",
+                        GoalPhase::Satisfied => "satisfied",
+                        GoalPhase::Ended => "ended",
+                    }.into(),
+                    last_reason: progress.last_reason,
+                }
+            }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ProviderChanged {
                 provider, ..
             }) => LiveWireEvent::Provider { provider },
@@ -961,6 +1032,16 @@ impl NativeLiveWireProjector {
                     name,
                 }
             }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::PolicyInterventionResolved {
+                intervention_id,
+                action,
+            }) => LiveWireEvent::PolicyInterventionResolved {
+                intervention_id,
+                action,
+            },
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::PolicyInterventionCleared {
+                intervention_id,
+            }) => LiveWireEvent::PolicyInterventionCleared { intervention_id },
             crate::live_hub::LiveViewEvent::Runtime(Runtime::SessionChanged(changed)) => {
                 let session_id = changed.session_id?;
                 self.session_id = session_id.clone();
@@ -1032,6 +1113,30 @@ impl NativeLiveWireProjector {
             }
             crate::live_hub::LiveViewEvent::Runtime(_) => return None,
         })
+    }
+}
+
+fn goal_snapshot(progress: &atomcode_coding::GoalProgress) -> LiveGoalSnapshot {
+    use atomcode_coding::{GoalPhase, GoalTerminal};
+    LiveGoalSnapshot {
+        active: progress.active,
+        round: progress.round,
+        elapsed_secs: progress.elapsed_secs,
+        condition: progress.condition.clone(),
+        terminal: progress.terminal.map(|terminal| match terminal {
+            GoalTerminal::Met => "met",
+            GoalTerminal::Stopped => "stopped",
+            GoalTerminal::Failed => "failed",
+            GoalTerminal::Cancelled => "cancelled",
+        }.into()),
+        phase: match progress.phase {
+            GoalPhase::Pursuing => "pursuing",
+            GoalPhase::Paused => "paused",
+            GoalPhase::PausedAtCap => "paused_at_cap",
+            GoalPhase::Satisfied => "satisfied",
+            GoalPhase::Ended => "ended",
+        }.into(),
+        last_reason: progress.last_reason.clone(),
     }
 }
 
@@ -1107,6 +1212,7 @@ pub(crate) async fn live_stream(
         }
     };
     let project_hash = crate::hash_path(&snapshot_wd);
+    let initial_goal = join.goal_progress.clone();
     let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
     let mut snapshot_messages: Vec<crate::MessageInfo> = join
         .snapshot
@@ -1130,11 +1236,22 @@ pub(crate) async fn live_stream(
         provider: join.binding.provider.clone(),
         mode: live_current_mode_wire(),
         working_dir: snapshot_wd.to_string_lossy().to_string(),
+        goal: initial_goal.as_ref().map(goal_snapshot),
     });
     let mut projector = NativeLiveWireProjector {
         session_id: join.binding.session_id.clone(),
         ..Default::default()
     };
+    // Goal is controller state rather than persisted conversation history. It
+    // is therefore restored separately from the message snapshot so an App
+    // connecting after the TUI turn has finished still sees the Goal badge.
+    if let Some(goal) = join.goal_progress {
+        if let Some(w) = projector.project(crate::live_hub::LiveViewEvent::Runtime(
+            atomcode_coding::CodingRuntimeEvent::GoalChanged(goal),
+        )) {
+            let _ = tx.send(w);
+        }
+    }
     for observation in join.replay {
         if let Some(w) = projector.project(observation.event) {
             let _ = tx.send(w);
@@ -1211,7 +1328,7 @@ pub(crate) struct LiveMessageReq {
 /// already contains either the VL description or an explicit failure marker.
 pub(crate) async fn preprocess_image_caption(
     config: &Config,
-    active_model: &str,
+    supports_vision: bool,
     working_dir: &std::path::Path,
     telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     session_id: Option<&str>,
@@ -1222,7 +1339,7 @@ pub(crate) async fn preprocess_image_caption(
         run_vl_caption, should_skip, vl_model_display, PreprocessOutcome,
     };
     // Short-circuit: no images, or the main model already accepts images.
-    if should_skip(active_model, !images.is_empty()) {
+    if should_skip(supports_vision, !images.is_empty()) {
         return message.to_string();
     }
     // Nothing configured (None or empty) ⇒ pass through unchanged (Skipped).
@@ -1328,8 +1445,8 @@ fn stash_vl_display_images(
 /// 对 live 输入做视觉预处理：主模型不支持视觉时，用 VL 模型把图片转文字拼进 caption
 /// （原图始终保留在 MultiPart 里用于缩略图渲染）。与 `/chat` 路径共享
 /// [`preprocess_image_caption`]；任何 config/provider 加载失败都降级为原文，不阻断发送。
-/// `provider_name` 为本轮已解析的主 provider，
-/// 仅用其模型名判定是否原生支持视觉。
+/// `provider_name` 为本轮已解析的 selection id；显式能力覆盖优先，Auto
+/// 才回退到模型名启发式判断。
 async fn preprocess_live_caption(
     message: &str,
     images: &[ImageContent],
@@ -1345,16 +1462,16 @@ async fn preprocess_live_caption(
         Ok(c) => c,
         Err(_) => return message.to_string(),
     };
-    // The main model name is what decides vision-capability (`should_skip`); the
+    // The resolved model capability decides whether preprocessing is needed; the
     // one-off VL request rides `session_id` onto the same upstream account.
     let name = resolve_provider_name(&config, provider_name);
-    let active_model = match config.provider_config_for_selection(&name) {
-        Some(pc) => pc.model.clone(),
+    let supports_vision = match config.provider_config_for_selection(&name) {
+        Some(pc) => pc.accepts_images(),
         None => return message.to_string(),
     };
     preprocess_image_caption(
         &config,
-        &active_model,
+        supports_vision,
         working_dir,
         telemetry,
         session_id,
@@ -1391,6 +1508,7 @@ pub(crate) async fn live_message(
     };
     let active_provider = join.binding.provider.clone();
     let mut provider_name = active_provider.clone();
+    let mut provider_change_applied = true;
     if let Some(requested_provider) = requested_provider {
         let config = match Config::load(&Config::default_path()) {
             Ok(config) => config,
@@ -1427,21 +1545,31 @@ pub(crate) async fn live_message(
                 state.telemetry.clone(),
             );
             let next = crate::kernel_runtime::coding_config_from_runtime(&runtime_config);
-            if let Err(error) =
-                crate::native_live::reload_provider(&join.binding, next, requested_fingerprint)
-                    .await
+            match crate::native_live::reload_provider(&join.binding, next, requested_fingerprint)
+                .await
             {
-                // Same active-turn flag as /live/provider so the client can tell the
-                // user to stop the turn rather than showing a raw error.
-                let active_turn = matches!(error, crate::live_hub::HubError::ActiveTurn);
-                return Json(serde_json::json!({
-                    "accepted": false,
-                    "active_turn": active_turn,
-                    "error": format!("provider reload rejected: {error:?}"),
-                }));
+                Ok(_) => {
+                    provider_name = requested_provider;
+                }
+                // A turn is active, so this /live/message is a STEER that folds into
+                // the current turn — which cannot switch providers. Accept the steer
+                // with the active provider and tell the client the optimistic provider
+                // selection was not applied. We deliberately do not claim this is
+                // queued: a later idle request must explicitly switch again.
+                Err(crate::live_hub::HubError::ActiveTurn) => {
+                    provider_change_applied = false;
+                }
+                Err(error) => {
+                    return Json(serde_json::json!({
+                        "accepted": false,
+                        "active_turn": false,
+                        "error": format!("provider reload rejected: {error:?}"),
+                    }));
+                }
             }
+        } else {
+            provider_name = requested_provider;
         }
-        provider_name = requested_provider;
     }
     let original_images: Vec<ImageContent> = req
         .images
@@ -1485,6 +1613,8 @@ pub(crate) async fn live_message(
             "disposition": "started",
             "generation": generation,
             "turn_id": turn_id,
+            "provider": provider_name,
+            "provider_change_applied": provider_change_applied,
         })),
         Ok(atomcode_coding::SubmitReceipt::Steered {
             generation,
@@ -1494,6 +1624,8 @@ pub(crate) async fn live_message(
             "disposition": "steered",
             "generation": generation,
             "turn_id": turn_id,
+            "provider": provider_name,
+            "provider_change_applied": provider_change_applied,
         })),
         Err(error) => Json(serde_json::json!({
             "accepted": false,
@@ -1512,9 +1644,8 @@ pub(crate) async fn live_message(
 /// caption (the image description the text model needs) while the echo keeps the
 /// user's ORIGINAL words, so the machine caption never overwrites what the user typed.
 ///
-/// NOTE: relies on the active adapter degrading images for a non-vision model. That
-/// holds for the default openai_compat providers; a non-degrading adapter (ollama with
-/// a text-only model) would need its own `supports_vision` gate — tracked separately.
+/// Every shipped adapter receives the same resolved `supports_vision` capability and
+/// degrades images before constructing a text-only wire request.
 fn split_live_inputs(
     message: String,
     original_images: Vec<atomcode_kernel::message::ImageContent>,
@@ -1967,6 +2098,26 @@ pub(crate) async fn live_user_input(
 }
 
 #[derive(serde::Deserialize)]
+pub(crate) struct PolicyInterventionResolutionReq {
+    pub intervention_id: u64,
+    pub action: atomcode_kernel::event::PolicyRecoveryAction,
+}
+
+/// Resolve a pending security intervention without creating model input.
+pub(crate) async fn live_policy_intervention_resolution(
+    State(_state): State<AppState>,
+    Json(req): Json<PolicyInterventionResolutionReq>,
+) -> impl IntoResponse {
+    match crate::native_live::resolve_policy_intervention(req.intervention_id, req.action).await {
+        Ok(()) => axum::Json(serde_json::json!({ "accepted": true })),
+        Err(error) => axum::Json(serde_json::json!({
+            "accepted": false,
+            "error": format!("policy intervention resolution was not accepted: {error:?}"),
+        })),
+    }
+}
+
+#[derive(serde::Deserialize)]
 pub(crate) struct LiveCommandReq {
     /// 形如 `/status` 的斜杠命令行（带不带前导 `/` 都接受）。
     pub command: String,
@@ -1991,6 +2142,66 @@ pub(crate) async fn live_command(
 pub(crate) async fn live_cancel(State(_state): State<AppState>) -> impl IntoResponse {
     let cancelled = crate::native_live::cancel_confirmed().await.is_ok();
     Json(serde_json::json!({ "cancelled": cancelled }))
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct LiveGoalReq {
+    pub condition: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// POST /live/goal/start —— start the native CodingRuntime goal controller.
+pub(crate) async fn live_goal_start(
+    State(state): State<AppState>,
+    Json(req): Json<LiveGoalReq>,
+) -> impl IntoResponse {
+    let condition = req.condition.unwrap_or_default().trim().to_string();
+    if condition.is_empty() {
+        return Json(serde_json::json!({"accepted": false, "error": "goal condition is empty"}));
+    }
+    // When the TUI owns the embedded runtime, route through its command
+    // boundary as well. The TUI keeps a presentation/input Goal state of its
+    // own; dispatching only a Runtime control would make App and TUI diverge
+    // (App enters Goal, but the next TUI submit is ordinary text).
+    if crate::native_live::embedded_binding().is_some() {
+        let command = format!("/goal {condition}");
+        let accepted = crate::native_live::send_remote_command(command);
+        return Json(serde_json::json!({"accepted": accepted, "delegated": accepted}));
+    }
+    let working_dir = { state.project.read().await.working_dir.clone() };
+    let sid = parse_session_id(req.session_id);
+    if let Err(error) = crate::native_live::ensure_headless_runtime(
+        live_current_working_dir(&working_dir),
+        state.telemetry.clone(),
+        live_current_provider(),
+        native_runtime_mode(live_current_approval_mode()),
+        sid,
+    ).await {
+        return Json(serde_json::json!({"accepted": false, "error": error}));
+    }
+    let accepted = crate::native_live::dispatch(atomcode_coding::DriverCommand::StartGoal(condition)).is_ok();
+    Json(serde_json::json!({"accepted": accepted}))
+}
+
+/// POST /live/goal/stop —— stop the native Goal controller (not just one turn).
+pub(crate) async fn live_goal_stop(State(_state): State<AppState>) -> impl IntoResponse {
+    if crate::native_live::embedded_binding().is_some() {
+        let accepted = crate::native_live::send_remote_command("/goal clear".into());
+        return Json(serde_json::json!({"accepted": accepted, "delegated": accepted}));
+    }
+    let accepted = crate::native_live::dispatch(atomcode_coding::DriverCommand::StopGoal).is_ok();
+    Json(serde_json::json!({"accepted": accepted}))
+}
+
+/// POST /live/goal/arm — synchronize the mobile composer's pre-send Goal mode
+/// with an attached TUI. No condition is known until either side submits text.
+pub(crate) async fn live_goal_arm(State(_state): State<AppState>) -> impl IntoResponse {
+    if crate::native_live::embedded_binding().is_some() {
+        let accepted = crate::native_live::send_remote_command("/goal __app_arm".into());
+        return Json(serde_json::json!({"accepted": accepted}));
+    }
+    Json(serde_json::json!({"accepted": true}))
 }
 
 /// POST /live/compact —— webui/手机端在 sync 模式请求对共享实时运行时执行一次
@@ -2496,11 +2707,8 @@ mod tests {
     #[tokio::test]
     async fn chat_user_input_wait_degrades_to_null_at_driver_timeout() {
         let (_tx, rx) = tokio::sync::oneshot::channel();
-        let value = await_chat_user_input_response(
-            rx,
-            Some(std::time::Duration::from_millis(1)),
-        )
-        .await;
+        let value =
+            await_chat_user_input_response(rx, Some(std::time::Duration::from_millis(1))).await;
         assert!(value.is_null());
     }
 
@@ -2509,11 +2717,8 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         tx.send(serde_json::json!({ "selected": ["Blue"] }))
             .unwrap();
-        let value = await_chat_user_input_response(
-            rx,
-            Some(std::time::Duration::from_secs(1)),
-        )
-        .await;
+        let value =
+            await_chat_user_input_response(rx, Some(std::time::Duration::from_secs(1))).await;
         assert_eq!(value["selected"][0], "Blue");
     }
 
@@ -2616,6 +2821,41 @@ mod tests {
         assert_eq!(json["reset_label"], "5h");
         assert_eq!(json["secs_until_reset"], 7200);
         assert_eq!(json["server_message"], "provider quota exhausted");
+    }
+
+    #[test]
+    fn native_live_projector_preserves_policy_recovery_contract() {
+        let mut projector = NativeLiveWireProjector::default();
+        let wire = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::PolicyIntervention {
+                    intervention:
+                        atomcode_kernel::event::PolicyIntervention::credential_shell_blocked(),
+                }),
+            ))
+            .expect("policy intervention must reach the live wire");
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "policy_intervention");
+        assert_eq!(json["code"], "credential_shell_blocked");
+        assert_eq!(json["actions"].as_array().map(Vec::len), Some(4));
+        assert!(!json.to_string().contains("WECOM_WEBHOOK_URL"));
+    }
+
+    #[test]
+    fn native_live_projector_exposes_policy_resolution() {
+        let mut projector = NativeLiveWireProjector::default();
+        let wire = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::PolicyInterventionResolved {
+                    intervention_id: 42,
+                    action: atomcode_kernel::event::PolicyRecoveryAction::SkipStep,
+                },
+            ))
+            .expect("policy resolution must reach every live client");
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "policy_intervention_resolved");
+        assert_eq!(json["intervention_id"], 42);
+        assert_eq!(json["action"], "skip_step");
     }
 
     #[test]

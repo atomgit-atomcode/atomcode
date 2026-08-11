@@ -173,6 +173,7 @@ pub async fn code(args: CodeArgs) -> Result<()> {
     };
 
     let opts = PrepareOptions {
+        subagents: atomcode_coding::SubagentPolicy::Enabled,
         session,
         skill_dirs: None,
         plugin_skill_dirs: Vec::new(),

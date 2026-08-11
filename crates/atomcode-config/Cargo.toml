@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+toml_edit = "0.22"
 anyhow = "1"
 url = "2"
 atomcode-telemetry = { path = "../atomcode-telemetry" }

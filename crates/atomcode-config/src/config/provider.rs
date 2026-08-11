@@ -1,28 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-/// Optional local estimate in USD per million tokens. Absence means pricing is
-/// unknown; an explicitly configured all-zero value means the model is free.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct ProviderPricing {
-    pub input_per_million: f64,
-    pub output_per_million: f64,
-    #[serde(default)]
-    pub cached_input_per_million: f64,
-}
-
-impl ProviderPricing {
-    pub fn validated(self) -> Option<Self> {
-        [
-            self.input_per_million,
-            self.output_per_million,
-            self.cached_input_per_million,
-        ]
-        .into_iter()
-        .all(|value| value.is_finite() && value >= 0.0)
-        .then_some(self)
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     #[serde(rename = "type")]
@@ -32,6 +9,11 @@ pub struct ProviderConfig {
     pub model: String,
     pub base_url: Option<String>,
     pub system_prompt: Option<String>,
+    /// Explicit image-input capability override. `None` keeps automatic model-name
+    /// detection; `Some(true/false)` is authoritative for custom model ids and
+    /// compatibility gateways whose wire name does not advertise its modalities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
     /// Override User-Agent for this provider (useful when the upstream blocks generic UAs).
     /// Defaults to `atomcode/<version>` if not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,9 +82,6 @@ pub struct ProviderConfig {
     /// tier; fewer than 2 (or a non-participating host) ⇒ the subagent uses the current model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capable_model: Option<i64>,
-    /// Optional price snapshot used for local `/cost` estimates.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pricing: Option<ProviderPricing>,
 }
 
 /// A provider *account*: a reusable connection + credential identity (new schema,
@@ -152,6 +131,9 @@ pub struct ModelProfileConfig {
     /// design §14.5). Projected from a legacy provider's `system_prompt`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    /// Explicit image-input capability override. `None` means Auto.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
     #[serde(default = "default_context_window")]
     pub context_window: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,8 +154,6 @@ pub struct ModelProfileConfig {
     pub thinking_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_budget: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pricing: Option<ProviderPricing>,
 }
 
 /// One flattened, immutable resolution of a model selection (design §3.4). This
@@ -193,6 +173,8 @@ pub struct ResolvedModelConfig {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub model: String,
+    /// Final capability after applying the profile override and Auto fallback.
+    pub supports_vision: bool,
     pub context_window: usize,
     pub max_tokens: Option<usize>,
     pub system_prompt: Option<String>,
@@ -205,7 +187,6 @@ pub struct ResolvedModelConfig {
     pub thinking_enabled: Option<bool>,
     pub thinking_budget: Option<u32>,
     pub capable_model: Option<i64>,
-    pub pricing: Option<ProviderPricing>,
 }
 
 impl std::fmt::Debug for ResolvedModelConfig {
@@ -237,6 +218,7 @@ impl ResolvedModelConfig {
             model: self.model.clone(),
             base_url: self.base_url.clone(),
             system_prompt: self.system_prompt.clone(),
+            supports_vision: Some(self.supports_vision),
             user_agent: self.user_agent.clone(),
             context_window: self.context_window,
             max_tokens: self.max_tokens,
@@ -249,19 +231,17 @@ impl ResolvedModelConfig {
             skip_tls_verify: self.skip_tls_verify,
             ephemeral: false,
             capable_model: self.capable_model,
-            pricing: self.pricing,
         }
     }
 }
 
 impl ProviderConfig {
     /// True if this provider's active model can accept image inputs.
-    /// Driven entirely by the model-name heuristic in
-    /// `provider::model_name_suggests_vision` — if a future model isn't
-    /// recognised, extend the heuristic rather than threading a
-    /// per-provider config flag (no user-facing knob to discover).
+    /// An explicit config value wins; otherwise use the backwards-compatible
+    /// model-name heuristic.
     pub fn accepts_images(&self) -> bool {
-        crate::util::model_name_suggests_vision(&self.model)
+        self.supports_vision
+            .unwrap_or_else(|| crate::util::model_name_suggests_vision(&self.model))
     }
 
     /// Resolve the API key for this provider, taking environment variables into account.
@@ -297,6 +277,7 @@ impl ProviderConfig {
             "openai" | "openai-compat" | "openai_compat" => "OPENAI_API_KEY",
             "claude" | "anthropic" => "ANTHROPIC_API_KEY",
             "ollama" => "OLLAMA_API_KEY",
+            "opencode" => "OPENCODE_API_KEY",
             _ => "",
         };
 
@@ -399,46 +380,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pricing_is_optional_and_explicit_zero_means_free() {
-        let unknown: ProviderConfig = toml::from_str(
-            r#"
-type = "openai"
-model = "custom"
-base_url = "https://example.test/v1"
-"#,
-        )
-        .unwrap();
-        assert_eq!(unknown.pricing, None);
-
-        let free: ProviderConfig = toml::from_str(
-            r#"
-type = "openai"
-model = "custom"
-base_url = "https://example.test/v1"
-[pricing]
-input_per_million = 0
-output_per_million = 0
-"#,
-        )
-        .unwrap();
-        assert_eq!(
-            free.pricing,
-            Some(ProviderPricing {
-                input_per_million: 0.0,
-                output_per_million: 0.0,
-                cached_input_per_million: 0.0,
-            })
-        );
-        assert!(ProviderPricing {
-            input_per_million: -1.0,
-            output_per_million: 0.0,
-            cached_input_per_million: 0.0,
-        }
-        .validated()
-        .is_none());
-    }
-
-    #[test]
     fn accepts_images_false_for_text_only_model() {
         // Regression for the user's GLM-5.1 case: heuristic rejects
         // text-only models so the TUI's Ctrl+V handler refuses image
@@ -462,6 +403,39 @@ output_per_million = 0
         "#;
         let cfg: ProviderConfig = toml::from_str(toml_str).expect("parse");
         assert!(cfg.accepts_images());
+    }
+
+    #[test]
+    fn explicit_vision_override_wins_over_auto_heuristic() {
+        let enabled: ProviderConfig = toml::from_str(
+            r#"
+                type = "openai"
+                model = "qwen3.8max"
+                supports_vision = true
+            "#,
+        )
+        .expect("parse enabled override");
+        assert!(enabled.accepts_images());
+
+        let disabled: ProviderConfig = toml::from_str(
+            r#"
+                type = "openai"
+                model = "gpt-4o"
+                supports_vision = false
+            "#,
+        )
+        .expect("parse disabled override");
+        assert!(!disabled.accepts_images());
+
+        let auto: ProviderConfig = toml::from_str(
+            r#"
+                type = "openai"
+                model = "gpt-4o"
+            "#,
+        )
+        .expect("parse auto");
+        assert_eq!(auto.supports_vision, None);
+        assert!(!toml::to_string(&auto).unwrap().contains("supports_vision"));
     }
 
     #[test]
@@ -527,6 +501,7 @@ output_per_million = 0
             model: "gpt-4o".into(),
             base_url: None,
             system_prompt: None,
+            supports_vision: None,
             user_agent: None,
             context_window: 128000,
             max_tokens: None,
@@ -539,7 +514,6 @@ output_per_million = 0
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
-            pricing: None,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
@@ -556,6 +530,7 @@ output_per_million = 0
             model: "gpt-4o".into(),
             base_url: Some("https://self-signed.example.com/v1".into()),
             system_prompt: None,
+            supports_vision: None,
             user_agent: None,
             context_window: 128000,
             max_tokens: None,
@@ -568,7 +543,6 @@ output_per_million = 0
             skip_tls_verify: true,
             ephemeral: false,
             capable_model: None,
-            pricing: None,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
@@ -594,7 +568,6 @@ output_per_million = 0
         assert!(s.contains("capable_model = 1"), "set rank must serialize");
         let none_cfg = ProviderConfig {
             capable_model: None,
-            pricing: None,
             ..cfg
         };
         let s2 = toml::to_string(&none_cfg).expect("serialize");
@@ -633,6 +606,7 @@ output_per_million = 0
             model: "gpt-4o".into(),
             base_url: None,
             system_prompt: None,
+            supports_vision: None,
             user_agent: None,
             context_window: 128000,
             max_tokens: None,
@@ -645,7 +619,6 @@ output_per_million = 0
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
-            pricing: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-from-env-var".to_string()));
@@ -661,6 +634,7 @@ output_per_million = 0
             model: "gpt-4o".into(),
             base_url: None,
             system_prompt: None,
+            supports_vision: None,
             user_agent: None,
             context_window: 128000,
             max_tokens: None,
@@ -673,7 +647,6 @@ output_per_million = 0
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
-            pricing: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-custom-123".to_string()));
@@ -689,6 +662,7 @@ output_per_million = 0
             model: "gpt-4o".into(),
             base_url: None,
             system_prompt: None,
+            supports_vision: None,
             user_agent: None,
             context_window: 128000,
             max_tokens: None,
@@ -701,7 +675,6 @@ output_per_million = 0
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
-            pricing: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-openai-std".to_string()));

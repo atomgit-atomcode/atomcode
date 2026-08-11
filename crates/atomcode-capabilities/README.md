@@ -34,7 +34,7 @@ provider 的构建不会编译 MCP/skills 的传递依赖：
 - `web`：`web_fetch` / `web_search`（基于 `tools`，拉 HTTP 栈）。
 - `atomgit`：AtomGit REST 工具（repo / pr / issue）。
 - `codeintel`：代码智能（`list_symbols` / `read_symbol`，tree-sitter 符号提取）。
-- `lsp`：LSP 诊断（spawn 外部语言服务器，JSON-RPC over stdio）。
+- `lsp`：只读 LSP 查询（definition、references、hover、diagnostics）；按需启动本机已有语言服务器，JSON-RPC over stdio。
 - `notify`：桌面 / 终端通知（turn-finished + approval-needed），读取 `atomcode-config` 的 `NotificationConfig`。
 - `skills`：markdown/frontmatter skill 加载器 + `use_skill` / `list_skills` 工具。
 - `cc-hooks`：CC 兼容外部 hooks（`hooks.json`），在 kernel seam 上运行用户命令。

@@ -130,9 +130,9 @@ pub const PRESETS: &[ProviderPreset] = &[
         id: "xiaomi-mimo",
         display_name: "Xiaomi MiMo",
         provider_type: ProviderType::OpenAi,
-        default_base_url: None,
+        default_base_url: Some("https://api.xiaomimimo.com/v1"),
         auth_kind: AuthKind::ApiKey,
-        api_key_env: None,
+        api_key_env: Some("MIMO_API_KEY"),
         model_source: ModelSource::Manual,
     },
     ProviderPreset {
@@ -188,6 +188,15 @@ pub const PRESETS: &[ProviderPreset] = &[
         auth_kind: AuthKind::ApiKey,
         api_key_env: Some("OPENROUTER_API_KEY"),
         model_source: ModelSource::DiscoveryApi,
+    },
+    ProviderPreset {
+        id: "opencode",
+        display_name: "OpenCode Zen (OpenAI-compatible)",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some("https://opencode.ai/zen/v1"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: Some("OPENCODE_API_KEY"),
+        model_source: ModelSource::Manual,
     },
     ProviderPreset {
         id: "openai",
@@ -256,6 +265,7 @@ mod tests {
             "minimax",
             "siliconflow",
             "openrouter",
+            "opencode",
             "taotoken",
             "openai",
             "anthropic",
@@ -289,6 +299,20 @@ mod tests {
     }
 
     #[test]
+    fn opencode_uses_its_openai_compatible_endpoint() {
+        let opencode = preset("opencode").expect("opencode preset");
+        assert_eq!(opencode.display_name, "OpenCode Zen (OpenAI-compatible)");
+        assert_eq!(opencode.provider_type, ProviderType::OpenAi);
+        assert_eq!(
+            opencode.default_base_url,
+            Some("https://opencode.ai/zen/v1")
+        );
+        assert_eq!(opencode.auth_kind, AuthKind::ApiKey);
+        assert_eq!(opencode.api_key_env, Some("OPENCODE_API_KEY"));
+        assert_eq!(opencode.model_source, ModelSource::Manual);
+    }
+
+    #[test]
     fn every_preset_has_required_stable_fields() {
         for p in PRESETS {
             assert!(!p.id.is_empty(), "empty id");
@@ -298,11 +322,11 @@ mod tests {
                 p.id
             );
             // Concrete hosted vendors ship a default base_url. The generic
-            // `*-compatible` presets and open-weights models without a fixed
-            // public endpoint (Xiaomi MiMo) legitimately leave it unset.
+            // `*-compatible` presets legitimately leave it unset (the user
+            // fills in the endpoint on the custom row).
             let endpoint_optional = matches!(
                 p.id,
-                "openai-compatible" | "anthropic-compatible" | "xiaomi-mimo"
+                "openai-compatible" | "anthropic-compatible"
             );
             if !endpoint_optional {
                 assert!(

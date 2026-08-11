@@ -111,6 +111,17 @@ The daemon and CLI share the same on-disk identity and queue:
 | `~/.atomcode/device_id` | Stable device UUID (created on first run by whichever process starts first) |
 | `~/.atomcode/telemetry/queue/` | NDJSON event queue — both processes write segments concurrently using a claim-based mechanism to avoid corruption |
 
+New AtomCode versions mark and lock active `.partial` segments. A marked file
+left by an interrupted process is validated and recovered automatically while
+keeping every event's original timestamp. Unmarked legacy partials are never
+recovered automatically because older versions did not hold a compatible lock;
+after stopping all older AtomCode processes, recover them explicitly with
+`atomcode telemetry recover`. Segments older than the 90-day raw retention
+window are removed; malformed segments are quarantined locally and bounded by
+the queue limits rather than uploaded. `atomcode telemetry clear` removes all
+inactive ready, partial, and quarantined data while skipping files locked by a
+running process.
+
 No daemon-specific files are introduced. Both processes read the same
 `~/.atomcode/config.toml` for the `[telemetry].enabled` setting.
 

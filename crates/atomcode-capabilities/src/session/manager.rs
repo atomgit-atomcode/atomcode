@@ -493,7 +493,11 @@ impl SessionMeta {
         }
         let Some(text) = messages
             .iter()
-            .filter(|message| message.role == Role::User && !message.synthetic)
+            .filter(|message| {
+                message.role == Role::User
+                    && !message.synthetic
+                    && !crate::reminder::is_system_reminder(&message.text)
+            })
             .map(|message| strip_leading_image_markers(message.text.trim()))
             .find(|text| !text.is_empty())
         else {
@@ -674,38 +678,11 @@ impl TokenBreakdown {
     }
 }
 
-/// Price snapshot in USD per million tokens. `None` on [`ModelUsageStat`]
-/// means unknown pricing; an all-zero snapshot means explicitly free.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct ModelPricing {
-    pub input_per_million: f64,
-    pub output_per_million: f64,
-    #[serde(default)]
-    pub cached_input_per_million: f64,
-}
-
-impl ModelPricing {
-    pub fn estimate(self, tokens: TokenBreakdown) -> f64 {
-        (tokens.input as f64 * self.input_per_million
-            + tokens.output as f64 * self.output_per_million
-            + tokens.cached_input as f64 * self.cached_input_per_million)
-            / 1_000_000.0
-    }
-
-    pub fn is_free(self) -> bool {
-        self.input_per_million == 0.0
-            && self.output_per_million == 0.0
-            && self.cached_input_per_million == 0.0
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelUsageStat {
     pub provider_id: String,
     pub model_id: String,
     pub tokens: TokenBreakdown,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pricing: Option<ModelPricing>,
 }
 
 /// Session-scoped writer for model calls that run outside the primary agent
@@ -717,7 +694,6 @@ pub struct DetachedUsageRecorder {
     session_id: String,
     provider_id: String,
     model_id: String,
-    pricing: Option<ModelPricing>,
     persistence_status: Option<super::snapshot::SnapshotPersistenceStatus>,
 }
 
@@ -727,14 +703,12 @@ impl DetachedUsageRecorder {
         session_id: impl Into<String>,
         provider_id: impl Into<String>,
         model_id: impl Into<String>,
-        pricing: Option<ModelPricing>,
     ) -> Self {
         Self {
             manager,
             session_id: session_id.into(),
             provider_id: provider_id.into(),
             model_id: model_id.into(),
-            pricing,
             persistence_status: None,
         }
     }
@@ -758,7 +732,6 @@ impl DetachedUsageRecorder {
                     provider_id: self.provider_id.clone(),
                     model_id: self.model_id.clone(),
                     tokens,
-                    pricing: self.pricing,
                 },
             );
         });
@@ -777,7 +750,6 @@ fn merge_model_usage(records: &mut Vec<ModelUsageStat>, usage: ModelUsageStat) {
     if let Some(existing) = records.iter_mut().find(|existing| {
         existing.provider_id == usage.provider_id
             && existing.model_id == usage.model_id
-            && existing.pricing == usage.pricing
     }) {
         existing.tokens.add_assign(usage.tokens);
     } else {
@@ -789,7 +761,6 @@ fn subtract_model_usage(records: &mut Vec<ModelUsageStat>, usage: &ModelUsageSta
     if let Some(existing) = records.iter_mut().find(|existing| {
         existing.provider_id == usage.provider_id
             && existing.model_id == usage.model_id
-            && existing.pricing == usage.pricing
     }) {
         existing.tokens.sub_assign(usage.tokens);
     }
@@ -801,9 +772,6 @@ pub struct ModelCostSummary {
     pub provider_id: String,
     pub model_id: String,
     pub tokens: TokenBreakdown,
-    /// `None` when any grouped record had unknown pricing.
-    pub estimated_cost_usd: Option<f64>,
-    pub explicitly_free: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -811,28 +779,19 @@ pub struct SessionCostReport {
     pub models: Vec<ModelCostSummary>,
     pub unattributed_tokens: u64,
     pub total_tokens: u64,
-    /// Sum of model estimates only when every attributed group has known
-    /// pricing and there is no unattributed legacy usage.
-    pub estimated_cost_usd: Option<f64>,
 }
 
 pub fn aggregate_session_cost(meta: &SessionMeta) -> SessionCostReport {
     use std::collections::BTreeMap;
 
-    let mut grouped: BTreeMap<(String, String), (TokenBreakdown, Option<f64>, bool)> =
-        BTreeMap::new();
+    let mut grouped: BTreeMap<(String, String), TokenBreakdown> = BTreeMap::new();
     let mut unattributed_tokens = meta.detached_unattributed_tokens;
 
     let mut add_usage = |usage: &ModelUsageStat| {
         let entry = grouped
             .entry((usage.provider_id.clone(), usage.model_id.clone()))
-            .or_insert((TokenBreakdown::default(), Some(0.0), true));
-        entry.0.add_assign(usage.tokens);
-        match (entry.1.as_mut(), usage.pricing) {
-            (Some(cost), Some(pricing)) => *cost += pricing.estimate(usage.tokens),
-            _ => entry.1 = None,
-        }
-        entry.2 &= usage.pricing.is_some_and(ModelPricing::is_free);
+            .or_default();
+        entry.add_assign(usage.tokens);
     };
 
     for turn in &meta.turn_stats {
@@ -851,13 +810,11 @@ pub fn aggregate_session_cost(meta: &SessionMeta) -> SessionCostReport {
     let models: Vec<_> = grouped
         .into_iter()
         .map(
-            |((provider_id, model_id), (tokens, estimated_cost_usd, explicitly_free))| {
+            |((provider_id, model_id), tokens)| {
                 ModelCostSummary {
                     provider_id,
                     model_id,
                     tokens,
-                    estimated_cost_usd,
-                    explicitly_free,
                 }
             },
         )
@@ -866,25 +823,10 @@ pub fn aggregate_session_cost(meta: &SessionMeta) -> SessionCostReport {
         total.saturating_add(model.tokens.total())
     });
     let total_tokens = attributed_total.saturating_add(unattributed_tokens);
-    let estimated_cost_usd = if unattributed_tokens == 0
-        && models
-            .iter()
-            .all(|model| model.estimated_cost_usd.is_some())
-    {
-        Some(
-            models
-                .iter()
-                .filter_map(|model| model.estimated_cost_usd)
-                .sum(),
-        )
-    } else {
-        None
-    };
     SessionCostReport {
         models,
         unattributed_tokens,
         total_tokens,
-        estimated_cost_usd,
     }
 }
 
@@ -4063,6 +4005,18 @@ mod tests {
     }
 
     #[test]
+    fn fallback_name_skips_injected_system_reminder() {
+        let mut meta = SessionMeta::new("reminder-session", "/project", 1);
+
+        meta.auto_name_from_messages(&[
+            Message::user(crate::reminder::system_reminder("我就在任务1上！继续任务2！")),
+            Message::user("修复登录错误"),
+        ]);
+
+        assert_eq!(meta.name, "修复登录错误");
+    }
+
+    #[test]
     fn fallback_name_preserves_real_bracketed_first_user_message() {
         let mut meta = SessionMeta::new("bracket-session", "/project", 1);
 
@@ -6503,7 +6457,7 @@ mod tests {
     }
 
     #[test]
-    fn session_cost_groups_by_provider_and_model_without_relabeling_legacy_usage() {
+    fn session_tokens_group_by_provider_and_model_without_relabeling_legacy_usage() {
         let mut meta = SessionMeta::new("cost", "/project", 1);
         let stat = |turn_id, usage: Vec<ModelUsageStat>, legacy_total| TurnStat {
             after_message: turn_id as usize * 2,
@@ -6518,11 +6472,6 @@ mod tests {
             ctx_window: 0,
             model_usage: usage,
         };
-        let paid = Some(ModelPricing {
-            input_per_million: 1.0,
-            output_per_million: 3.0,
-            cached_input_per_million: 0.1,
-        });
         meta.turn_stats.push(stat(
             1,
             vec![ModelUsageStat {
@@ -6533,7 +6482,6 @@ mod tests {
                     output: 20,
                     cached_input: 50,
                 },
-                pricing: paid,
             }],
             170,
         ));
@@ -6547,7 +6495,6 @@ mod tests {
                     output: 0,
                     cached_input: 0,
                 },
-                pricing: None,
             }],
             10,
         ));
@@ -6557,50 +6504,30 @@ mod tests {
         assert_eq!(report.models.len(), 2);
         assert_eq!(report.models[0].provider_id, "provider-a");
         assert_eq!(report.models[0].tokens.total(), 170);
-        assert!(report.models[0].estimated_cost_usd.is_some());
         assert_eq!(report.models[1].provider_id, "provider-b");
         assert_eq!(report.models[1].tokens.total(), 10);
-        assert_eq!(report.models[1].estimated_cost_usd, None);
         assert_eq!(report.unattributed_tokens, 40);
         assert_eq!(report.total_tokens, 220);
-        assert_eq!(report.estimated_cost_usd, None);
     }
 
     #[test]
-    fn explicit_zero_pricing_is_distinct_from_unknown_pricing() {
-        let free = ModelPricing {
-            input_per_million: 0.0,
-            output_per_million: 0.0,
-            cached_input_per_million: 0.0,
-        };
-        let mut meta = SessionMeta::new("free", "/project", 1);
-        meta.turn_stats.push(TurnStat {
-            after_message: 2,
-            position_valid: true,
-            turn_id: 1,
-            round_count: 1,
-            tool_call_count: 0,
-            duration_ms: 1,
-            total_tokens: 12,
-            errored: false,
-            used_tokens: 0,
-            ctx_window: 0,
-            model_usage: vec![ModelUsageStat {
-                provider_id: "local".into(),
-                model_id: "free-model".into(),
-                tokens: TokenBreakdown {
-                    input: 10,
-                    output: 2,
-                    cached_input: 0,
-                },
-                pricing: Some(free),
-            }],
-        });
+    fn legacy_model_usage_pricing_is_ignored_and_not_rewritten() {
+        let source = r#"{
+            "provider_id": "provider-a",
+            "model_id": "model-a",
+            "tokens": {"input": 10, "output": 2, "cached_input": 3},
+            "pricing": {
+                "input_per_million": 1.0,
+                "output_per_million": 2.0,
+                "cached_input_per_million": 0.5
+            }
+        }"#;
 
-        let report = aggregate_session_cost(&meta);
-        assert_eq!(report.models[0].estimated_cost_usd, Some(0.0));
-        assert!(report.models[0].explicitly_free);
-        assert_eq!(report.estimated_cost_usd, Some(0.0));
+        let usage: ModelUsageStat = serde_json::from_str(source).unwrap();
+        assert_eq!(usage.tokens.total(), 15);
+        let rendered = serde_json::to_string(&usage).unwrap();
+        assert!(!rendered.contains("pricing"));
+        assert!(!rendered.contains("per_million"));
     }
 
     #[test]
@@ -6614,7 +6541,6 @@ mod tests {
                 output: 2,
                 cached_input: 3,
             },
-            pricing: None,
         });
 
         let report = aggregate_session_cost(&meta);
@@ -6626,7 +6552,7 @@ mod tests {
     }
 
     #[test]
-    fn archiving_turn_stats_preserves_attributed_and_legacy_cost() {
+    fn archiving_turn_stats_preserves_attributed_and_legacy_tokens() {
         let mut meta = SessionMeta::new("archive", "/p", 1);
         meta.turn_stats.push(TurnStat {
             after_message: 2,
@@ -6647,7 +6573,6 @@ mod tests {
                     output: 2,
                     cached_input: 0,
                 },
-                pricing: None,
             }],
         });
         meta.turn_stats.push(TurnStat {
@@ -6684,7 +6609,6 @@ mod tests {
                     output: 0,
                     cached_input: 0,
                 },
-                pricing: None,
             },
         );
         meta.detached_unattributed_tokens += 3;

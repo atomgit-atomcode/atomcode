@@ -5,6 +5,7 @@ import {
   completeModeSwitch,
   failModeSwitch,
   initModeState,
+  modeForQueuedPrompt,
   type ApprovalMode,
 } from './modeSwitch.ts';
 
@@ -60,4 +61,12 @@ test('mode switch supports accept_edits', () => {
     confirmedMode: 'accept_edits' satisfies ApprovalMode,
     displayMode: 'accept_edits' satisfies ApprovalMode,
   });
+});
+
+test('queued prompts defer mode binding while a switch is pending', () => {
+  assert.equal(modeForQueuedPrompt(initModeState('build')), 'build');
+  assert.equal(
+    modeForQueuedPrompt(beginModeSwitch(initModeState('build'), 'bypass')),
+    undefined,
+  );
 });

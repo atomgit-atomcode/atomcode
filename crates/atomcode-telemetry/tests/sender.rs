@@ -171,6 +171,102 @@ async fn track_writes_to_disk_queue() {
 }
 
 #[tokio::test]
+async fn shutdown_attempts_one_bounded_send_after_persisting() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/events"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let d = tempfile::TempDir::new().unwrap();
+    let cfg = ResolvedConfig {
+        state: TelemetryState::Enabled,
+        endpoint: format!("{}/v1/events", server.uri()),
+        atomcode_dir: d.path().to_path_buf(),
+    };
+    let tel = Telemetry::init(cfg, "test".into());
+    tel.track(Event::OpenAtomcode {
+        dangerously_skip_permissions: false,
+    });
+    tel.shutdown(std::time::Duration::from_secs(2)).await;
+
+    let q = Queue::open(d.path().join("telemetry/queue")).unwrap();
+    assert!(q.ready_segments_sorted().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn shutdown_drains_backlog_including_latest_event() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/events"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let d = tempfile::TempDir::new().unwrap();
+    let qdir = d.path().join("telemetry/queue");
+    let mut queue = Queue::open(qdir.clone()).unwrap();
+    for _ in 0..2 {
+        queue.append(&rec()).unwrap();
+        queue.force_roll().unwrap();
+    }
+    let cfg = ResolvedConfig {
+        state: TelemetryState::Enabled,
+        endpoint: format!("{}/v1/events", server.uri()),
+        atomcode_dir: d.path().to_path_buf(),
+    };
+    let tel = Telemetry::init(cfg, "test".into());
+    tel.track(Event::TelemetryDisabled);
+    tel.shutdown(std::time::Duration::from_secs(2)).await;
+
+    assert!(Queue::open(qdir)
+        .unwrap()
+        .ready_segments_sorted()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn shutdown_timeout_restores_cancelled_claim() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/events"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(2)))
+        .mount(&server)
+        .await;
+
+    let d = tempfile::TempDir::new().unwrap();
+    let cfg = ResolvedConfig {
+        state: TelemetryState::Enabled,
+        endpoint: format!("{}/v1/events", server.uri()),
+        atomcode_dir: d.path().to_path_buf(),
+    };
+    let tel = Telemetry::init(cfg, "test".into());
+    tel.track(Event::OpenAtomcode {
+        dangerously_skip_permissions: false,
+    });
+    tel.shutdown(std::time::Duration::from_millis(50)).await;
+
+    let qdir = d.path().join("telemetry/queue");
+    let names: Vec<String> = std::fs::read_dir(&qdir)
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .collect();
+    assert!(names.iter().all(|name| !name.contains(".sending-")));
+    assert_eq!(
+        Queue::open(qdir)
+            .unwrap()
+            .ready_segments_sorted()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn counters_increment_on_post() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -209,4 +305,107 @@ async fn counters_increment_on_post() {
         snap.last_post_iso
     );
     assert!(health_path.exists(), "health.json should be written");
+}
+
+#[tokio::test]
+async fn transient_server_error_restores_segment_then_retry_succeeds() {
+    let server = MockServer::start().await;
+    // First POST returns a transient 5xx; the retry succeeds.
+    Mock::given(method("POST"))
+        .and(path("/v1/events"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/events"))
+        .respond_with(ResponseTemplate::new(200))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    let d = TempDir::new().unwrap();
+    let mut q = Queue::open(d.path().to_path_buf()).unwrap();
+    q.append(&rec()).unwrap();
+    q.force_roll().unwrap();
+
+    let q = Arc::new(Mutex::new(q));
+    let http = HttpSender::new(format!("{}/v1/events", server.uri()), "test".into());
+    let counters = Arc::new(atomcode_telemetry::Counters::default());
+    let health_path = d.path().join("health.json");
+    let rt = SenderRuntime::new(q.clone(), http, counters, health_path);
+
+    // 5xx is a transient error: the claimed segment must be restored to ready.
+    let first = rt.flush_one().await;
+    assert!(
+        matches!(
+            first,
+            Err(atomcode_telemetry::sender::http::SendError::Server(_))
+        ),
+        "expected transient server error, got {first:?}"
+    );
+    assert_eq!(
+        q.lock()
+            .await
+            .ready_segments_sorted()
+            .unwrap()
+            .len(),
+        1,
+        "segment must be restored to ready after a transient error"
+    );
+
+    // The next flush retries and succeeds; the segment is deleted.
+    let second = rt.flush_one().await;
+    assert!(
+        second.is_ok(),
+        "retry after transient error should succeed, got {second:?}"
+    );
+    assert!(
+        q.lock().await.ready_segments_sorted().unwrap().is_empty(),
+        "segment must be deleted after the successful retry"
+    );
+}
+
+#[tokio::test]
+async fn payload_too_large_drops_segment_instead_of_retrying_forever() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/events"))
+        .respond_with(ResponseTemplate::new(413))
+        .mount(&server)
+        .await;
+
+    let d = TempDir::new().unwrap();
+    let mut q = Queue::open(d.path().to_path_buf()).unwrap();
+    q.append(&rec()).unwrap();
+    q.force_roll().unwrap();
+
+    let q = Arc::new(Mutex::new(q));
+    let http = HttpSender::new(format!("{}/v1/events", server.uri()), "test".into());
+    let counters = Arc::new(atomcode_telemetry::Counters::default());
+    let rt = SenderRuntime::new(q.clone(), http, counters, d.path().join("health.json"));
+
+    // 413 is a permanent client error — retrying the identical oversized body will
+    // always fail. It must be dropped (like 400) so it never blocks the oldest-first
+    // queue, not restored to be re-claimed forever.
+    let result = rt.flush_one().await;
+    assert!(
+        matches!(
+            result,
+            Err(atomcode_telemetry::sender::http::SendError::PayloadTooLarge)
+        ),
+        "expected PayloadTooLarge, got {result:?}"
+    );
+    assert!(
+        q.lock().await.ready_segments_sorted().unwrap().is_empty(),
+        "oversized segment must not be restored to ready"
+    );
+    let names: Vec<String> = std::fs::read_dir(d.path())
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .collect();
+    assert!(
+        names.iter().all(|n| !n.contains(".sending-")),
+        "oversized segment's claim must be dropped, found {names:?}"
+    );
 }

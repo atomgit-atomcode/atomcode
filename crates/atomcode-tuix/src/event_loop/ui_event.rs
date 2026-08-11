@@ -47,6 +47,7 @@ pub enum UiEvent {
         success: bool,
         duration: Duration,
     },
+    PolicyIntervention(atomcode_kernel::event::PolicyIntervention),
     ApprovalNeeded {
         tool_name: String,
         reason: String,
@@ -202,6 +203,7 @@ pub enum UiTurnStopReason {
     TurnLimit,
     StepLimit,
     Cancelled,
+    PolicyDenied,
     Error,
 }
 
@@ -212,6 +214,7 @@ impl UiTurnStopReason {
             Self::TurnLimit => "turn_limit",
             Self::StepLimit => "step_limit",
             Self::Cancelled => "cancelled",
+            Self::PolicyDenied => "policy_denied",
             Self::Error => "error",
         }
     }

@@ -56,6 +56,17 @@ pub fn repair_tool_args(tool_name: &str, args: &str) -> String {
             }
         }
     }
+    // Specialized: `task` ships free-text subtask prompts that weak models often
+    // leave with unescaped quotes. Reconstruct the tasks array from known keys
+    // instead of letting the generic extractor flatten the nested array to a
+    // truncated string (which loses every subtask).
+    if tool_name.eq_ignore_ascii_case("task") {
+        if let Some(v) = extract_task_args(&pre) {
+            if let Ok(s) = serde_json::to_string(&v) {
+                return s;
+            }
+        }
+    }
     // Last resort: key-value field extraction. Only return this if it actually
     // recovered something — an empty object is no better than the original garbage.
     let extracted = extract_json_fields(&pre);
@@ -752,12 +763,28 @@ pub fn extract_json_fields(s: &str) -> serde_json::Value {
 
         // Read value
         if chars[i] == '"' {
-            // String value — extract and unescape JSON escape sequences
+            // String value — extract and unescape JSON escape sequences.
+            // A `"` closes the string only in structural position (followed by
+            // `,` `}` `]` or end, ignoring whitespace); an interior `"` that the
+            // model failed to escape is treated as a literal quote rather than a
+            // premature terminator. This is best-effort: a literal `",` inside
+            // prose can still terminate early, but it no longer truncates at the
+            // first embedded quote.
             let start = i + 1;
             i = start;
-            while i < len && chars[i] != '"' {
+            while i < len {
                 if chars[i] == '\\' {
-                    i += 1;
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == '"' {
+                    let mut j = i + 1;
+                    while j < len && chars[j].is_whitespace() {
+                        j += 1;
+                    }
+                    if j >= len || matches!(chars[j], ',' | '}' | ']') {
+                        break;
+                    }
                 }
                 i += 1;
             }
@@ -887,6 +914,238 @@ fn unescape_field_value_end(raw: &str) -> String {
         .unwrap_or(inner.len());
     let content = &inner[..end];
     unescape_json_string_contents(content)
+}
+
+/// Known `task` subtask fields, in schema-declared order. `description` and
+/// `prompt` are required (no serde default); the rest carry defaults.
+const TASK_SUBTASK_KEYS: &[&str] =
+    &[
+        "description",
+        "prompt",
+        "subagent_type",
+        "difficulty",
+        "role",
+        "scope",
+    ];
+
+/// Specialized salvage for `task` arguments when JSON parsing fails.
+///
+/// Weak models routinely emit a subtask `prompt`/`description` containing raw
+/// (unescaped) double-quotes, e.g. `Find all "TODO" comments`, which makes the
+/// whole `{"tasks":[…]}` payload invalid JSON. The generic last-resort extractor
+/// mangles this further (it reads the `tasks` array as a truncated string), so —
+/// mirroring `extract_edit_file_args` — this parser reconstructs the tasks array
+/// from the KNOWN field keys instead of trusting JSON structure.
+///
+/// It anchors only on the known keys in *key position* (preceded by `{`/`,`/`[`,
+/// followed by `:`), so a key-like word inside prose (`the "prompt" field`) is
+/// not mistaken for a field. Each string value runs to the last `"` before the
+/// next anchor, tolerating interior unescaped quotes. Object boundaries are
+/// detected by a repeated key rather than by braces (which prose can contain).
+///
+/// Returns `None` unless at least one subtask has a non-empty `description` AND
+/// `prompt` — so a hopeless payload still surfaces the real parse error to the
+/// model rather than dispatching a garbled subtask.
+pub fn extract_task_args(raw: &str) -> Option<serde_json::Value> {
+    // Scope to the tasks array so a stray earlier key can't seed a phantom object.
+    let region = match raw.find("\"tasks\"") {
+        Some(p) => match raw[p..].find('[') {
+            Some(b) => &raw[p + b..],
+            None => return None,
+        },
+        None => raw,
+    };
+
+    let anchors = find_task_key_anchors(region);
+    if anchors.is_empty() {
+        return None;
+    }
+
+    let mut tasks: Vec<serde_json::Value> = Vec::new();
+    let mut current = serde_json::Map::new();
+
+    for (i, (_pos, key, val_start)) in anchors.iter().enumerate() {
+        // A repeated key means we've rolled into the next subtask object.
+        // `mem::take` leaves `current` as a fresh empty map.
+        if current.contains_key(*key) {
+            if let Some(obj) = finish_task_object(std::mem::take(&mut current)) {
+                tasks.push(obj);
+            }
+        }
+
+        let val_end = anchors.get(i + 1).map(|a| a.0).unwrap_or(region.len());
+        let slice = &region[*val_start..val_end];
+
+        if *key == "scope" {
+            if let Some(arr) = parse_scope_slice(slice) {
+                current.insert((*key).to_string(), arr);
+            }
+        } else if let Some(s) = parse_task_string_slice(slice) {
+            current.insert((*key).to_string(), serde_json::Value::String(s));
+        }
+    }
+    if let Some(obj) = finish_task_object(current) {
+        tasks.push(obj);
+    }
+
+    if tasks.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({ "tasks": tasks }))
+}
+
+/// Keep only subtask objects that carry both required fields, so the salvaged
+/// JSON re-parses cleanly through serde downstream.
+fn finish_task_object(obj: serde_json::Map<String, serde_json::Value>) -> Option<serde_json::Value> {
+    let ok = |k: &str| {
+        obj.get(k)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+    };
+    if ok("description") && ok("prompt") {
+        Some(serde_json::Value::Object(obj))
+    } else {
+        None
+    }
+}
+
+/// Locate `"<known_key>"` occurrences in key position within `region`. Returns
+/// `(byte pos of the opening quote, key, byte index just past the `:`)`.
+fn find_task_key_anchors(region: &str) -> Vec<(usize, &'static str, usize)> {
+    let bytes = region.as_bytes();
+    let mut anchors = Vec::new();
+    let mut idx = 0;
+    while idx < region.len() {
+        if bytes[idx] == b'"' {
+            if let Some((key, after)) = match_task_key_at(region, idx) {
+                anchors.push((idx, key, after));
+                idx = after;
+                continue;
+            }
+        }
+        idx += 1;
+    }
+    anchors
+}
+
+/// If a known key begins at the opening quote `qpos` and sits in key position,
+/// return the key and the byte index just after its `:`.
+fn match_task_key_at(region: &str, qpos: usize) -> Option<(&'static str, usize)> {
+    let bytes = region.as_bytes();
+    // Preceding non-whitespace char must open a value slot: `{`, `,`, or `[`
+    // (or the very start of the region).
+    let mut b = qpos;
+    let mut prev = None;
+    while b > 0 {
+        b -= 1;
+        if !bytes[b].is_ascii_whitespace() {
+            prev = Some(bytes[b]);
+            break;
+        }
+    }
+    if let Some(c) = prev {
+        if !matches!(c, b'{' | b',' | b'[') {
+            return None;
+        }
+    }
+
+    let rest = &region[qpos + 1..];
+    for key in TASK_SUBTASK_KEYS {
+        if let Some(after_key) = rest.strip_prefix(key) {
+            if let Some(after_quote) = after_key.strip_prefix('"') {
+                let trimmed = after_quote.trim_start();
+                if let Some(after_colon) = trimmed.strip_prefix(':') {
+                    // byte index just past the colon, relative to `region`.
+                    let consumed = region.len() - after_colon.len();
+                    return Some((key, consumed));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Given `s` positioned just after a string's opening quote, return the byte
+/// offset of the closing quote: the first `"` in *structural position* (followed,
+/// ignoring whitespace, by `,`/`}`/`]`/end). Interior unescaped quotes are skipped,
+/// so a free-text value keeps embedded quotes while still stopping at the real
+/// boundary rather than swallowing a following field. Returns `None` if no such
+/// quote exists (e.g. a truncated payload with no trailing structure).
+fn find_structural_close_quote(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'"' => {
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j >= bytes.len() || matches!(bytes[j], b',' | b'}' | b']') {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Extract a quoted string value from a raw slice that starts at (or before) the
+/// opening `"` and ends at (or before) the next anchor. The closing quote is the
+/// first `"` in structural position, so a trailing field the model appended after
+/// this value (a key not in `TASK_SUBTASK_KEYS`, which leaves no anchor) is not
+/// swallowed. Interior unescaped quotes are preserved as literals; a payload with
+/// no structural close falls back to the last quote.
+fn parse_task_string_slice(slice: &str) -> Option<String> {
+    let inner = slice.trim_start().strip_prefix('"')?;
+    let close = find_structural_close_quote(inner).or_else(|| inner.rfind('"'))?;
+    Some(unescape_json_string_contents(&inner[..close]))
+}
+
+/// Parse a `scope` array slice (`[…]`), best-effort. Returns `None` (field
+/// omitted) if the bracketed span isn't a valid JSON array. The close bracket is
+/// found by depth-counting (ignoring `[`/`]` inside strings) so trailing `]}` from
+/// the enclosing `tasks` array isn't swept in.
+fn parse_scope_slice(slice: &str) -> Option<serde_json::Value> {
+    let bytes = slice.as_bytes();
+    let start = slice.find('[')?;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut end = None;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    serde_json::from_str::<serde_json::Value>(&slice[start..=end?])
+        .ok()
+        .filter(serde_json::Value::is_array)
 }
 
 /// Single-pass JSON-string unescape.
@@ -1063,6 +1322,126 @@ mod tests {
         let input = r#"{"file_path": "/src/lib.rs", "old_string": "foo", "new_string": "bar", "replace_all": true}"#;
         let result = extract_edit_file_args(input).expect("should parse");
         assert_eq!(result["replace_all"], true);
+    }
+
+    // --- extract_task_args tests ---
+
+    #[test]
+    fn extract_task_args_does_not_absorb_unknown_trailing_field_into_prompt() {
+        // A field not in TASK_SUBTASK_KEYS (here `notes`) must not be swallowed into
+        // the preceding prompt value.
+        let input = r#"{"tasks":[{"description":"a","prompt":"do X","notes":"see comment"}]}"#;
+        let v = extract_task_args(input).expect("should salvage");
+        assert_eq!(v["tasks"][0]["prompt"], "do X");
+        assert_eq!(v["tasks"][0]["description"], "a");
+    }
+
+    #[test]
+    fn extract_task_args_recovers_unescaped_quote_in_prompt() {
+        // GLM-5.2 emitted a task call with a raw (unescaped) quote inside the prompt.
+        let input = r#"{"tasks":[{"description":"analyze","prompt":"Find all "TODO" comments","subagent_type":"explore"}]}"#;
+        let v = extract_task_args(input).expect("should salvage the tasks array");
+        let tasks = v["tasks"].as_array().expect("tasks is an array");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["description"], "analyze");
+        assert_eq!(tasks[0]["prompt"], "Find all \"TODO\" comments");
+        assert_eq!(tasks[0]["subagent_type"], "explore");
+    }
+
+    #[test]
+    fn extract_task_args_recovers_multiple_tasks_with_quotes() {
+        let input = r#"{"tasks":[{"description":"a","prompt":"say "hi"","subagent_type":"explore"},{"description":"b","prompt":"do "x" now","subagent_type":"worker","scope":["src/**"]}]}"#;
+        let v = extract_task_args(input).expect("should salvage");
+        let tasks = v["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0]["prompt"], "say \"hi\"");
+        assert_eq!(tasks[1]["prompt"], "do \"x\" now");
+        assert_eq!(tasks[1]["subagent_type"], "worker");
+        assert_eq!(tasks[1]["scope"], serde_json::json!(["src/**"]));
+    }
+
+    #[test]
+    fn extract_task_args_handles_properly_escaped_quotes() {
+        let input = r#"{"tasks":[{"description":"a","prompt":"say \"hi\"","subagent_type":"explore"}]}"#;
+        let v = extract_task_args(input).expect("should salvage");
+        assert_eq!(v["tasks"][0]["prompt"], "say \"hi\"");
+    }
+
+    #[test]
+    fn extract_task_args_preserves_role() {
+        let input = r#"{"tasks":[{"description":"a","prompt":"say "hi"","subagent_type":"explore","role":"reviewer"}]}"#;
+        let value = extract_task_args(input).expect("should salvage task role");
+        assert_eq!(value["tasks"][0]["role"], "reviewer");
+    }
+
+    #[test]
+    fn extract_task_args_preserves_utf8_prompt() {
+        let input = r#"{"tasks":[{"description":"分析","prompt":"找出所有 "待办" 注释","subagent_type":"explore"}]}"#;
+        let v = extract_task_args(input).expect("should salvage");
+        assert_eq!(v["tasks"][0]["prompt"], "找出所有 \"待办\" 注释");
+    }
+
+    #[test]
+    fn extract_task_args_returns_none_when_required_fields_missing() {
+        assert!(extract_task_args("garbage with no keys at all").is_none());
+        // subagent_type only — missing required description + prompt.
+        assert!(extract_task_args(r#"{"tasks":[{"subagent_type":"explore"}]}"#).is_none());
+    }
+
+    #[test]
+    fn extract_task_args_ignores_key_like_words_inside_prose() {
+        // "prompt" appears inside the description prose but not in key position.
+        let input = r#"{"tasks":[{"description":"explain the "prompt" field","prompt":"go","subagent_type":"explore"}]}"#;
+        let v = extract_task_args(input).expect("should salvage");
+        let tasks = v["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["description"], "explain the \"prompt\" field");
+        assert_eq!(tasks[0]["prompt"], "go");
+    }
+
+    #[test]
+    fn repair_tool_args_task_recovers_unescaped_quote() {
+        // End-to-end: the middleware path (repair_tool_args) must yield valid task JSON.
+        let input = r#"{"tasks":[{"description":"analyze","prompt":"Find all "TODO" comments","subagent_type":"explore"}]}"#;
+        let out = repair_tool_args("task", input);
+        let v: serde_json::Value =
+            serde_json::from_str(&out).expect("repaired task args must be valid JSON");
+        assert_eq!(v["tasks"][0]["prompt"], "Find all \"TODO\" comments");
+        assert_eq!(v["tasks"][0]["description"], "analyze");
+    }
+
+    #[test]
+    fn extract_json_fields_keeps_embedded_quote_in_string_value() {
+        // Latent bug: the generic last-resort extractor truncated string values at the
+        // first embedded quote. A quote is a terminator only in structural position.
+        let input = r#"{"prompt": "Find all "TODO" comments"}"#;
+        let v = extract_json_fields(input);
+        assert_eq!(v["prompt"], "Find all \"TODO\" comments");
+    }
+
+    #[test]
+    fn extract_json_fields_keeps_all_fields_when_commas_present() {
+        // Regression guard for the structural-terminator change: when commas ARE
+        // present (the common case), every field must still be extracted — the
+        // interior-quote tolerance must not swallow the following field.
+        let input = r#"{"path": "src", "depth": "2", "name": "x"}"#;
+        let v = extract_json_fields(input);
+        assert_eq!(v["path"], "src");
+        assert_eq!(v["depth"], "2");
+        assert_eq!(v["name"], "x");
+    }
+
+    #[test]
+    fn extract_json_fields_missing_comma_merges_fields_known_limitation() {
+        // Documents the narrow limitation of structural-position termination: with a
+        // MISSING comma, the first value runs to the next structural quote and absorbs
+        // the following field. This path is only reachable when `repair_json` (which
+        // fixes missing commas — see `repair_missing_comma_between_fields`) also fails;
+        // the common pure-missing-comma case is repaired before reaching here.
+        let input = r#"{"a": "x" "b": "y"}"#;
+        let v = extract_json_fields(input);
+        assert!(v["a"].as_str().unwrap().contains('x'));
+        assert!(v.get("b").is_none());
     }
 
     // --- repair_tool_args tests ---

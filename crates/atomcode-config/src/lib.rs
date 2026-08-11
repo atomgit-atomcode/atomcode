@@ -21,6 +21,10 @@ pub mod proxy;
 /// today's value as the default.
 pub mod endpoints;
 
+/// Every name this build occupies locally — config dir, ports, executables,
+/// self-update scratch files. The local-resources companion to `endpoints`.
+pub mod distribution;
+
 /// TLS-version policy for the explicit process-wide env ceiling and the
 /// endpoint-scoped first-party fallback latch. Pure URL/env/atomic logic; HTTP
 /// clients remain in their owning leaf/provider crates.
@@ -36,6 +40,9 @@ pub mod config;
 
 /// Transactional, cross-process-safe access to `config.toml`.
 pub mod store;
+
+/// Safe, UI-neutral catalog of editable non-provider settings.
+pub mod settings;
 
 /// Pure parsers for OS system-proxy descriptions: Windows ProxyServer/ProxyOverride
 /// and macOS `scutil --proxy` output → normalized HTTP(S)_PROXY / NO_PROXY values.

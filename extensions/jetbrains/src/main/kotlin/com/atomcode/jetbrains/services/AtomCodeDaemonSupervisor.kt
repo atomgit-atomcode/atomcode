@@ -4,6 +4,7 @@ import com.atomcode.jetbrains.daemon.AtomCodeDaemonClient
 import com.atomcode.jetbrains.daemon.AtomCodeDaemonProcess
 import com.atomcode.jetbrains.daemon.ConnectionErrorKind
 import com.atomcode.jetbrains.daemon.DaemonAuth
+import com.atomcode.jetbrains.daemon.DaemonTokenFile
 import com.atomcode.jetbrains.daemon.DaemonLaunchResult
 import com.atomcode.jetbrains.daemon.DaemonProcessExit
 import com.atomcode.jetbrains.daemon.DaemonProcessLauncher
@@ -134,7 +135,18 @@ internal class DaemonSupervisorEngine(
     ): CompletableFuture<DaemonReady> {
         val launcher = processFactory.create(settings)
         val expectation = DaemonExpectation(launcher.expectedVersion(), launcher.expectedHash())
-        val probe = controlFactory.create(settings, DAEMON_PROBE_TIMEOUT_MS, auth)
+        // Read the token fresh rather than trusting the caller's construction-time
+        // `auth` (which is null on cold start, before the daemon wrote its file).
+        // A running daemon has already written the file, so probing an existing
+        // daemon — and, on a version mismatch, POSTing the protected /shutdown in
+        // acceptOrRestart — carries the correct token instead of 401ing. If the
+        // daemon is down, read() is null but the probe fails with a connection
+        // error (not 401) and control passes to the launch path, which re-reads.
+        val probe = controlFactory.create(
+            settings,
+            DAEMON_PROBE_TIMEOUT_MS,
+            DaemonAuth(DaemonTokenFile.read(settings.port)),
+        )
         return probe.health()
             .handle { health, error -> HealthAttempt(health, error?.let(::unwrapCompletion)) }
             .thenCompose { attempt ->
@@ -154,7 +166,7 @@ internal class DaemonSupervisorEngine(
                             val startupControl = controlFactory.create(
                                 settings,
                                 DAEMON_STARTUP_PROBE_TIMEOUT_MS,
-                                auth,
+                                DaemonAuth(DaemonTokenFile.read(settings.port)),
                             )
                             awaitReady(
                                 key = key,
@@ -255,7 +267,11 @@ internal class DaemonSupervisorEngine(
                         "AtomCode daemon supervisor was disposed during startup.",
                     )
                 }
-                val control = controlFactory.create(settings, DAEMON_STARTUP_PROBE_TIMEOUT_MS, auth)
+                val control = controlFactory.create(
+                    settings,
+                    DAEMON_STARTUP_PROBE_TIMEOUT_MS,
+                    DaemonAuth(DaemonTokenFile.read(settings.port)),
+                )
                 awaitReady(
                     key = key,
                     control = control,

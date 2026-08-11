@@ -27,7 +27,7 @@
 
 import { VNode } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, postLiveCompact, postLiveUserInput, postChatUserInput, type CommandResult, UserInputRequestEvent } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, postLiveCompact, postLiveUserInput, postChatUserInput, postLivePolicyInterventionResolution, type CommandResult, UserInputRequestEvent, type PolicyInterventionEvent } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -37,7 +37,7 @@ import {
   type SlashHandlers,
 } from '../lib/slashCommands';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
-import { beginModeSwitch, completeModeSwitch, failModeSwitch, initModeState } from '../lib/modeSwitch';
+import { beginModeSwitch, completeModeSwitch, failModeSwitch, initModeState, modeForQueuedPrompt } from '../lib/modeSwitch';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
 import { ModeSelector } from './ModeSelector';
@@ -45,6 +45,7 @@ import { AttachMenu } from './AttachMenu';
 import { FilePicker } from './FilePicker';
 import { PermissionCard } from './PermissionCard';
 import { UserInputCard } from './UserInputCard';
+import { PolicyInterventionCard } from './PolicyInterventionCard';
 import { useT } from '../settings';
 import type { MsgKey } from '../i18n';
 import {
@@ -54,8 +55,10 @@ import {
   splitAtToken,
 } from '../lib/atMention';
 import { toolResultStatus, updateToolProgress, upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
+import { commitTodoCall, todoToolDetail, type TodoTitles } from '../lib/todoToolDetail';
 import { isInternalHistoryAssistantMessage, isInternalHistoryUserMessage } from '../lib/historyMessages';
 import {
+  activeTurnSubmissionDisposition,
   chatRecoveryPolicy,
   classifyChatDone,
   createLiveLifecycleState,
@@ -73,9 +76,13 @@ import {
 } from '../lib/chatTerminal';
 import {
   acknowledgeLiveSteers,
+  isSteerPending,
   pendingSteersToDraft,
+  reconcileSteerReceipt,
+  shouldApplySteerProviderFallback,
   type PendingLiveSteer,
 } from '../lib/liveSteer';
+import { hasCoarsePointer, shouldSendComposerOnEnter } from '../lib/composerKeyboard';
 
 interface Message {
   role: 'user' | 'assistant' | 'system';
@@ -95,7 +102,7 @@ interface QueuedMessage {
   id: number;
   text: string;
   images?: ImageData[];
-  approvalMode: ApprovalMode;
+  approvalMode?: ApprovalMode;
 }
 
 /** Concatenate all text segments (error-detection, skill-title, etc.). */
@@ -306,7 +313,9 @@ function displayToolName(name: string): string {
 // JSON). `argsJson` is the stored arguments string; the full raw args stay
 // available by expanding the row. Returns '' when there's nothing useful to
 // show (the header then shows just the name, like the TUI).
-function formatToolDetail(name: string, argsJson: string): string {
+function formatToolDetail(name: string, argsJson: string, todoTitles: TodoTitles = new Map()): string {
+  const todoDetail = todoToolDetail(name, argsJson, todoTitles);
+  if (todoDetail !== null) return todoDetail;
   let v: Record<string, unknown>;
   try {
     const parsed = JSON.parse(argsJson);
@@ -376,19 +385,6 @@ function formatToolDetail(name: string, argsJson: string): string {
         .filter((x): x is string => x !== null)
         .join(', ');
     }
-    case 'todo': {
-      const action = getStr('action');
-      if (action === 'add') return getStr('content');
-      if (action === 'update') {
-        const id = typeof v.id === 'number' ? v.id : '';
-        const status = getStr('status');
-        if (id && status) return `#${id} → ${status}`;
-        if (id) return `#${id}`;
-        return status;
-      }
-      if (action === 'list') return 'list all';
-      return '';
-    }
     case 'use_skill':
       return getStr('name');
     default: {
@@ -432,11 +428,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusyState] = useState(false);
   // Mirror of `busy` in a ref so pushCommandNotice can read it synchronously
   // without a stale closure (refs always reflect the latest render value).
   const busyRef = useRef(false);
   busyRef.current = busy;
+  function setBusy(next: boolean) {
+    // SSE callbacks and composer events can occur before Preact commits the
+    // next render. Keep the ref authoritative synchronously so an active
+    // `/chat` turn cannot be mistaken for an idle direct-send window.
+    busyRef.current = next;
+    setBusyState(next);
+  }
   const [chatRecovery, setChatRecovery] = useState<ChatRecoveryState>('ready');
   const chatRecoveryRef = useRef<ChatRecoveryState>('ready');
   chatRecoveryRef.current = chatRecovery;
@@ -503,9 +506,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // 正在拉取某会话历史：用于抑制落地页，避免切到「有内容的会话」时先闪一下落地页。
   const [loading, setLoading] = useState(false);
   const [provider, setProvider] = useState<string | null>(null);
+  const providerRef = useRef<string | null>(null);
   const providerPinnedRef = useRef(false);
   const followDefaultProvider = useCallback((name: string) => {
-    if (!providerPinnedRef.current) setProvider(name);
+    if (!providerPinnedRef.current) {
+      providerRef.current = name;
+      setProvider(name);
+    }
   }, []);
   // 审批模式（build / accept_edits / bypass / plan）。进程级 runtime 状态，
   // 由 /live snapshot + 'mode' 事件同步，切换调 postLiveMode（下一轮生效）。
@@ -538,6 +545,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // Pending structured input from either transport. The event's optional session_id
   // selects `/chat/user-input`; live requests answer the bound `/live` runtime.
   const [userInputReq, setUserInputReq] = useState<UserInputRequestEvent | null>(null);
+  const [policyIntervention, setPolicyIntervention] = useState<PolicyInterventionEvent | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef<string | null>(null);
   const liveAbortRef = useRef<AbortController | null>(null);
@@ -556,6 +564,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const atBottomRef = useRef(true);
   const [showJumpBtn, setShowJumpBtn] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [coarsePointer, setCoarsePointer] = useState(hasCoarsePointer);
   const slashRef = useRef<HTMLDivElement>(null);
   const atRef = useRef<HTMLDivElement>(null);
   // 当前 Chat 正在显示的会话 id。用于区分「外部切换会话(需重置+加载历史)」
@@ -583,6 +592,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return;
+    const media = window.matchMedia('(pointer: coarse)');
+    const update = () => setCoarsePointer(media.matches);
+    update();
+    media.addEventListener?.('change', update);
+    return () => media.removeEventListener?.('change', update);
+  }, []);
   // 实时（/live）总线对应的会话 id（来自 snapshot）。用于门控实时事件：仅当用户当前
   // 查看的就是这个实时会话时才把输出渲染进画布——否则用户从侧栏打开了别的历史会话，
   // 实时输出会串进错误页面、且刷新即消失（刷新会按真实会话重载）。
@@ -604,6 +621,20 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // artifact_end can reconstruct the original markdown code block.
   const artifactLangRef = useRef('');
   const artifactBufRef = useRef('');
+  const todoTitlesRef = useRef<TodoTitles>(new Map());
+  const pendingTodoCallsRef = useRef<Map<string, { name: string; args: string }>>(new Map());
+
+  function restoreTodoTitles(messages: Message[]) {
+    todoTitlesRef.current.clear();
+    pendingTodoCallsRef.current.clear();
+    for (const message of messages) {
+      for (const part of message.parts) {
+        if (part.kind === 'tool' && part.tool.status === 'done') {
+          commitTodoCall(part.tool.name, part.tool.args, todoTitlesRef.current);
+        }
+      }
+    }
+  }
 
   // 切换/恢复会话时重置画布并加载历史。依赖 project_hash：刷新后 sessionId 先于
   // 元数据就绪，此时只显示提示；待 App 从会话列表回填 project_hash，本 effect 因
@@ -640,6 +671,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       }
 
       activeIdRef.current = sessionId;
+      todoTitlesRef.current.clear();
+      pendingTodoCallsRef.current.clear();
       providerPinnedRef.current = false;
       loadedForRef.current = null;
       optimisticFiredRef.current = false;
@@ -669,10 +702,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       setQueued([]);
       setLivePending(null);
       setUserInputReq(null);
+      setPolicyIntervention(null);
       onPermissionResolved?.(null);
 
       const cached = sessionId ? messageCacheRef.current.get(sessionId) : undefined;
       if (cached && cached.length > 0) {
+        restoreTodoTitles(cached);
         setMessages(cached);
       } else {
         setMessages([]);
@@ -822,7 +857,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // programmatic scroll lands immediately and the next scroll event reads "at bottom".
   useEffect(() => {
     if (atBottomRef.current) bottomRef.current?.scrollIntoView({ behavior: 'auto' });
-  }, [messages, tokens]);
+  }, [messages, tokens, queued.length]);
 
   // Abort the live (/live) stream + cancel any pending reconnect timer if the
   // component unmounts while sync is on.
@@ -1041,6 +1076,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // ── Shared history → display conversion (reused by session load AND live snapshot) ──
   function sessionMessagesToDisplay(msgs: SessionMessage[]): Message[] {
     const loaded: Message[] = [];
+    const todoTitles: TodoTitles = new Map();
+    const pendingTodoCalls = new Map<string, { name: string; args: string }>();
     for (const msg of msgs) {
       if (msg.role === 'user') {
         if (isInternalHistoryUserMessage(msg.content ?? '', msg.synthetic)) continue;
@@ -1057,15 +1094,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         const parts: MsgPart[] = [];
         if (msg.content) parts.push({ kind: 'text', text: msg.content });
         for (const tc of msg.tool_calls ?? []) {
+          const args = tc.arguments || tc.display || '';
           parts.push({
             kind: 'tool',
             tool: {
               id: tc.id,
               name: tc.name,
-              args: tc.arguments || tc.display || '',
+              args,
+              detail: formatToolDetail(tc.name, args, todoTitles),
               status: 'done',
             },
           });
+          pendingTodoCalls.set(tc.id, { name: tc.name, args });
         }
         loaded.push({ role: 'assistant', parts, ts: msg.created_at });
       } else if (msg.role === 'tool' && msg.tool_result) {
@@ -1077,6 +1117,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             if (p.kind === 'tool' && p.tool.id === result.call_id) {
               p.tool.output = result.summary;
               p.tool.status = toolResultStatus(result.success, result.summary);
+              const pending = pendingTodoCalls.get(result.call_id);
+              if (result.success && pending) {
+                commitTodoCall(pending.name, pending.args, todoTitles);
+              }
+              pendingTodoCalls.delete(result.call_id);
               break outer;
             }
           }
@@ -1084,6 +1129,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       }
       // system messages: skip
     }
+    todoTitlesRef.current = todoTitles;
+    pendingTodoCallsRef.current = pendingTodoCalls;
     return loaded;
   }
 
@@ -1146,6 +1193,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       setHistoryHint(null);
       // 连上时回显当前生效的模型，让下拉框与 TUI / 其他端保持一致。
       if (e.provider && !providerPinnedRef.current) {
+        providerRef.current = e.provider;
         setProvider(e.provider);
       }
       // 同步当前审批模式，让新 tab 显示正确的模式 pill（含别的 tab 切成的 Auto/Plan）。
@@ -1168,6 +1216,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // pin——pin 只用于防止「重连快照」回退一次尚未传播的本地切换，不该挡真实的变更事件，
     // 否则本端切过一次模型后就永远不再跟随 TUI 的模型切换（S1）。
     if (e.type === 'provider') {
+      providerRef.current = e.provider;
       setProvider(e.provider);
       providerPinnedRef.current = false;
       return;
@@ -1209,6 +1258,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       if (!alreadyViewing) {
         sessionGenerationRef.current += 1;
         onSessionId(e.session_id);
+        todoTitlesRef.current.clear();
+        pendingTodoCallsRef.current.clear();
         setMessages([]);
         // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
         setSearch('');
@@ -1271,18 +1322,30 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         });
         liveLifecycleRef.current = lifecycle.state;
         setBusy(lifecycle.state.running);
-        if (lifecycle.terminal) {
-          // A submit whose HTTP receipt is still in flight may belong to the
-          // next turn; only confirmed steers are recoverable at this terminal.
-          restorePendingSteers(false);
-          if (lifecycle.terminal.discardQueued) {
+        const terminal = lifecycle.terminal;
+        if (terminal) {
+          if (terminal.discardQueued) {
+            // Abnormal terminal (cancel / error): the kernel CLEARS its steer
+            // buffer (agent.rs Cancel/Shutdown), so a leftover steer is NOT
+            // re-run. Recover its text to the composer instead of stranding the
+            // optimistic bubble with no re-run to fill it.
+            restorePendingSteers(false);
             setQueued([]);
-            pushNoticeToLastAssistant(t('chat.incomplete', { msg: lifecycle.terminal.detail }));
+            pushNoticeToLastAssistant(t('chat.incomplete', { msg: terminal.detail }));
+          } else {
+            // Normal completion: the kernel re-runs any steer that did not fold
+            // as the next turn (agent.rs leftover-steer drain), so drop the
+            // pending markers and let that authoritative re-run reconcile the
+            // optimistic echo — matching the TUI, which never returns the text to
+            // the input. Unconfirmed steers keep their marker; their in-flight
+            // receipt lands as `release` (terminal now consumed) and drops it.
+            setPendingSteers((pending) => pending.filter((item) => !item.confirmed));
           }
           // 回合结束（idle）时不可能再有待批准项：清掉因对端(TUI)批准或回合收尾而
           // 残留的审批卡片，否则 webui 会一直挂着一张「等待批准…」的卡片直到刷新。
           setLivePending(null);
           setUserInputReq(null);
+          if (e.stop_reason !== 'policy_denied') setPolicyIntervention(null);
           // turn 完成后 session 已落盘，通知 App 刷新侧栏列表。
           onLiveTurnDone?.();
         }
@@ -1319,6 +1382,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       }
       case 'user_input_resolved': {
         setUserInputReq((current) => resolveUserInputRequest(current, e.request_id));
+        break;
+      }
+      case 'policy_intervention': {
+        setPolicyIntervention(e);
+        break;
+      }
+      case 'policy_intervention_resolved': {
+        setPolicyIntervention((current) => current?.intervention_id === e.intervention_id ? null : current);
+        break;
+      }
+      case 'policy_intervention_cleared': {
+        setPolicyIntervention((current) => current?.intervention_id === e.intervention_id ? null : current);
         break;
       }
       default: {
@@ -1457,19 +1532,25 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   function switchProvider(name: string) {
     providerPinnedRef.current = true;
     if (!sync) {
+      providerRef.current = name;
       setProvider(name);
       return;
     }
     const previous = provider;
+    providerRef.current = name;
     setProvider(name);
     void postLiveProvider(name, sessionId).then((res) => {
       if (res.ok) return;
+      if (providerRef.current !== name) return;
       // Rejected (e.g. a turn is running): undo the optimistic selection and unpin
       // so the selector resumes following the runtime's authoritative model.
+      providerRef.current = previous;
       setProvider(previous);
       providerPinnedRef.current = false;
       pushCommandNotice(res.activeTurn ? t('cmd.model.syncBusy') : (res.error ?? t('cmd.model.syncBusy')));
     }).catch((error) => {
+      if (providerRef.current !== name) return;
+      providerRef.current = previous;
       setProvider(previous);
       providerPinnedRef.current = false;
       setHistoryHint(t('chat.connError', { msg: String(error) }));
@@ -1544,7 +1625,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           ]);
           return;
         }
-        return deliver(text, [], modeState.confirmedMode);
+        void deliver(text, [], modeState.confirmedMode);
       },
       execServerCommand: async (command, arg) => {
         const SESSION_MUTATING = new Set(['undo', 'compact']);
@@ -1737,6 +1818,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   function handleEvent(event: SSEEvent) {
     switch (event.type) {
       case 'runtime_info':
+        providerRef.current = event.provider;
         setProvider(event.provider);
         break;
       case 'session_assigned':
@@ -1758,10 +1840,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
       case 'tool_start': {
         const argsStr = formatArgs(event.arguments);
+        pendingTodoCallsRef.current.set(event.id, { name: event.name, args: argsStr });
         addToolToLastAssistant({
           id: event.id,
           name: event.name,
           args: argsStr,
+          detail: formatToolDetail(event.name, argsStr, todoTitlesRef.current),
           status: 'pending',
         });
         break;
@@ -1784,6 +1868,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         break;
 
       case 'tool_result':
+        {
+          const pending = pendingTodoCallsRef.current.get(event.id);
+          if (event.success && pending) {
+            commitTodoCall(pending.name, pending.args, todoTitlesRef.current);
+          }
+          pendingTodoCallsRef.current.delete(event.id);
+        }
         updateToolInLastAssistant(event.id, {
           status: toolResultStatus(event.success, event.output),
           duration_ms: event.duration_ms,
@@ -1814,6 +1905,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setUserInputReq(event);
         break;
 
+      case 'policy_intervention':
+        setPolicyIntervention(event);
+        break;
+
       case 'done': {
         // 标记这是本 Chat 自己产生的会话 id，避免下面的 useEffect 误把当前对话清空，
         // 并标记其历史「已就位」（就是当前画布），防止 project_hash 回填后重新加载覆盖。
@@ -1835,6 +1930,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setBusy(false);
         onPermissionResolved?.(null); // 回合结束：兜底清掉任何残留审批卡片
         setUserInputReq(null);
+        if (event.stop_reason !== 'policy_denied') setPolicyIntervention(null);
         break;
       }
 
@@ -1940,10 +2036,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     text: string,
     images: ImageData[],
     approvalMode: ApprovalMode = modeState.confirmedMode,
-  ) {
+  ): Promise<boolean> {
     if (!chatRecoveryPolicy(chatRecoveryRef.current).allowSend) {
       pushCommandNotice(t('chat.recoveryBlocked'));
-      return;
+      return false;
     }
     // Actually sending a message (immediate OR drained from the queue) re-engages
     // auto-follow — the user wants to see their message + the reply. Placed HERE, not in
@@ -1990,6 +2086,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       // emit `steered` on SSE before the submit response reaches this tab.
       setPendingSteers((pending) => [...pending, pendingSteer]);
       try {
+        const submittedProvider = provider;
         const receipt = await postLiveMessage(
           text,
           images.length ? images : undefined,
@@ -1997,15 +2094,35 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           activeIdRef.current,
           pendingSteer.id,
         );
-        // The receipt is authoritative. The browser's busy flag can race a
-        // terminal event, so reconcile pending ownership in either direction.
-        if (receipt.disposition === 'started') {
-          setPendingSteers((pending) => pending.filter((item) => item.id !== pendingSteer.id));
-        } else {
+        if (shouldApplySteerProviderFallback(
+          submittedProvider,
+          providerRef.current,
+          receipt.providerChangeApplied,
+          receipt.provider,
+        )) {
+          // A mid-turn message is a steer and cannot reload the runtime provider.
+          // Follow the daemon's authoritative provider instead of leaving the
+          // selector pinned to a model that never became active.
+          providerRef.current = receipt.provider;
+          setProvider(receipt.provider);
+          providerPinnedRef.current = false;
+          pushCommandNotice(t('cmd.model.syncBusy'));
+        }
+        // The receipt is authoritative. Reconcile from the lifecycle's observed
+        // terminal — NOT the transient `running` flag, which is false for a tab
+        // that attached mid-turn. A `steered` submit is never bounced back to the
+        // composer: the runtime folds it, or (if the turn already ended) re-runs
+        // it as the next turn, matching the TUI.
+        const outcome = reconcileSteerReceipt(receipt.disposition, liveLifecycleRef.current);
+        if (outcome === 'confirm') {
           setPendingSteers((pending) => pending.map((item) => (
             item.id === pendingSteer.id ? { ...item, confirmed: true } : item
           )));
-          if (!liveLifecycleRef.current.running) restorePendingSteers(false);
+        } else {
+          // 'clear': a new turn began; the submit IS that turn's input.
+          // 'release': the steer raced the turn terminal; the runtime re-runs it
+          //   as the next turn, so drop the marker and defer to that re-run.
+          setPendingSteers((pending) => pending.filter((item) => item.id !== pendingSteer.id));
         }
       } catch (error) {
         // Roll back the optimistic append — the send never reached the server.
@@ -2023,12 +2140,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         }
         setQueued([]);
         setHistoryHint(t('chat.connError', { msg: String(error) }));
-        return;
+        return false;
       }
       // 消息发出后延迟刷新侧栏列表，给后端落盘时间；
       // turn 完成后 state(running=false) 会再刷一次确保更新。
       setTimeout(() => onLiveTurnDone?.(), 200);
-      return;
+      return true;
     }
 
     // ── Normal path ──
@@ -2113,19 +2230,21 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         !keepStopAlias
       ) requestIdRef.current = null;
     }
+    return !keepStopAlias;
   }
 
   function sendMessage() {
     const text = input.trim();
     const images = pendingImages;
-    if (modeState.pendingMode) return;
-    if (compactingRef.current) return;
     if (!text && images.length === 0) return;
 
     // 斜杠命令拦截：命中已知命令则执行且不作为聊天发送。带图时不拦截（命令不处理图片）。
     if (images.length === 0) {
       const parsed = parseSlashCommand(text);
       if (parsed && slashCommandMap.has(parsed.name)) {
+        // Preserve the existing command gate: this fix only makes ordinary
+        // prompts queueable while a turn is active.
+        if (modeState.pendingMode || compactingRef.current) return;
         setInput('');
         if (textareaRef.current) textareaRef.current.style.height = 'auto';
         setSlashOpen(false);
@@ -2135,6 +2254,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         return;
       }
     }
+
+    // Active turns accept ordinary input before transient mode/compaction
+    // gates: /chat queues it for the next turn and /live treats it as a steer.
+    // Those gates only prevent starting a new idle turn.
+    const disposition = activeTurnSubmissionDisposition(
+      busyRef.current,
+      syncRef.current,
+      Boolean(modeState.pendingMode),
+      compactingRef.current,
+    );
+    if (disposition === 'blocked') return;
 
     if (!chatRecoveryPolicy(chatRecoveryRef.current).allowSend) {
       pushCommandNotice(t('chat.recoveryBlocked'));
@@ -2148,26 +2278,23 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setHistoryHint(null);
 
-    // Sync mode shares the native runtime, so an active-turn submit is an
-    // authoritative steer. The legacy /chat path has no steer transport and
-    // intentionally keeps its next-turn queue semantics.
-    if (busy) {
-      if (sync) {
-        void deliver(text, images);
-        return;
-      }
+    // Read the synchronous projection, not the render closure: an SSE state
+    // transition and a click/Enter can land before Preact commits a frame.
+    if (disposition === 'queue') {
       setQueued((q) => [
         ...q,
         {
           id: queueIdRef.current++,
           text,
           images: images.length ? images : undefined,
-          approvalMode: modeState.confirmedMode,
+          approvalMode: modeForQueuedPrompt(modeState),
         },
       ]);
       return;
     }
 
+    // `deliver` itself distinguishes a live steer from a new live turn.
+    // For an idle turn this is an ordinary send; for active `/live` it is steer.
     void deliver(text, images);
   }
 
@@ -2237,7 +2364,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       }
     }
 
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (shouldSendComposerOnEnter(e, coarsePointer)) {
       e.preventDefault();
       sendMessage();
     }
@@ -2644,6 +2771,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         rows={2}
         placeholder={t('chat.inputPlaceholder')}
         value={input}
+        enterkeyhint={coarsePointer ? 'enter' : 'send'}
         onInput={handleInput}
         onKeyDown={handleKeyDown}
         onPaste={handlePaste}
@@ -2706,7 +2834,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
                   <button
                     class="btn-send"
                     onClick={sendMessage}
-                    disabled={Boolean(modeState.pendingMode)}
                     title={sync ? t('chat.steer') : t('chat.queue')}
                     aria-label={sync ? t('chat.steer') : t('chat.queue')}
                   >
@@ -2753,7 +2880,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         )}
         <span class="input-cwd-chevron">▾</span>
       </button>
-      <span class="input-hint">{t('chat.kbdHint')}</span>
+      <span class="input-hint">
+        {t(coarsePointer ? 'chat.kbdHintMobile' : 'chat.kbdHint')}
+      </span>
     </div>
   );
 
@@ -2784,6 +2913,31 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       submitAnswer={(body) => userInputReq.session_id
         ? postChatUserInput(userInputReq.session_id, body)
         : postLiveUserInput(body)}
+    />
+  );
+
+  // The kernel event precedes the authoritative terminal by design. Keep the
+  // Keep the card mounted while its control-plane acknowledgement is pending so
+  // loading/error state can render. Gate the action — not mounting — on `busy`:
+  // the runtime accepts a resolution only after the interrupted turn is idle.
+  const policyInterventionCard = policyIntervention && (
+    <PolicyInterventionCard
+      intervention={policyIntervention}
+      busy={busy}
+      onClose={() => setPolicyIntervention(null)}
+      onResolve={async (action) => {
+        if (sync) {
+          await postLivePolicyInterventionResolution(policyIntervention.intervention_id, action);
+        }
+        pushCommandNotice(t(
+          action === 'complete_externally'
+            ? 'policyRecovery.completedLocally'
+            : action === 'skip_step'
+              ? 'policyRecovery.skippedLocally'
+              : 'policyRecovery.endedLocally',
+        ));
+        return true;
+      }}
     />
   );
 
@@ -2836,6 +2990,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         {filePickerModal}
         {livePermissionCard}
         {userInputCard}
+        {policyInterventionCard}
       </>
     );
   }
@@ -2923,6 +3078,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
                   timeFull={timeFull}
                   search={search}
                   isActiveSearchMatch={isActiveSearchMatch}
+                  steerPending={isSteerPending(msg.pendingSteerId, pendingSteers)}
                 />
               );
             }
@@ -2969,7 +3125,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
         {/* 排队中的消息：执行中输入、待当前回合结束后自动发送，可点 × 撤回。 */}
         {queued.map((q) => (
-          <div key={`q-${q.id}`} class="user-message-wrapper queued">
+          <div
+            key={`q-${q.id}`}
+            class="user-message-wrapper queued"
+            role="status"
+            aria-label={t('chat.queued')}
+          >
             <div class="user-message-bubble">
               {q.images && q.images.length > 0 && (
                 <div class="msg-images">
@@ -3122,6 +3283,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       {filePickerModal}
       {livePermissionCard}
       {userInputCard}
+      {policyInterventionCard}
     </>
   );
 }
@@ -3312,6 +3474,7 @@ function UserMessageView({
   timeFull,
   search,
   isActiveSearchMatch,
+  steerPending,
 }: {
   msg: Message;
   searchRef?: (el: HTMLElement | null) => void;
@@ -3319,6 +3482,7 @@ function UserMessageView({
   timeFull?: string;
   search: string;
   isActiveSearchMatch: boolean;
+  steerPending?: boolean;
 }) {
   const t = useT();
   // 技能/文档型消息默认折叠为一行徽章，点击展开查看原文。
@@ -3362,7 +3526,15 @@ function UserMessageView({
     </button>
   );
 
-  const wrapperClass = 'user-message-wrapper' + (isActiveSearchMatch ? ' is-active-search-match' : '');
+  const wrapperClass = 'user-message-wrapper'
+    + (isActiveSearchMatch ? ' is-active-search-match' : '')
+    + (steerPending ? ' steer-pending' : '');
+  // A steer accepted mid-turn stays badged until the runtime folds it into the
+  // turn (the fold ack drops it from pendingSteers) — so the user can see, on
+  // their own message, exactly when it goes from "queued" to applied.
+  const steerBadge = steerPending && (
+    <div class="steer-pending-badge" role="status">{t('chat.steerBadge')}</div>
+  );
 
   if (skillTitle && !expanded) {
     return (
@@ -3377,6 +3549,7 @@ function UserMessageView({
           <span class="skill-badge-label">{skillTitle}</span>
           <span class="skill-badge-hint">{t('chat.skillExpand')}</span>
         </button>
+        {steerBadge}
         {timeLabel && <div class="msg-time msg-time-user" title={timeFull}>{timeLabel}</div>}
       </div>
     );
@@ -3398,6 +3571,7 @@ function UserMessageView({
       <div class="msg-actions">
         {copyBtn}
       </div>
+      {steerBadge}
       {/* PR #562 send-time label — below the bubble, right-aligned to match
           the user side; full timestamp on hover. */}
       {timeLabel && <div class="msg-time msg-time-user" title={timeFull}>{timeLabel}</div>}
@@ -3571,7 +3745,7 @@ function ToolRowView({ tool }: { tool: ToolRow }) {
       <div class="tool-header" onClick={() => setExpanded((e) => !e)}>
         <ToolTypeIcon name={tool.name} />
         <span class="tool-name">{displayToolName(tool.name)}</span>
-        <span class="tool-name-secondary">{abbreviateArgs(formatToolDetail(tool.name, tool.args))}</span>
+        <span class="tool-name-secondary">{abbreviateArgs(tool.detail ?? formatToolDetail(tool.name, tool.args))}</span>
         {annotation && (
           <span class={'tool-annotation ' + annotation.cls}>
             <ToolStatusIcon cls={annotation.cls} />

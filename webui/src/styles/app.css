@@ -539,6 +539,31 @@ body {
   color: var(--app-secondary-foreground);
   font-size: 11px;
 }
+/* A steer message stays visibly "pending" on its own bubble until the runtime
+   folds it into the turn (the fold ack unmounts the badge) — a gentle pulse
+   makes the queued→applied transition easy to catch. */
+.user-message-wrapper.steer-pending .user-message-bubble {
+  border: 1px dashed color-mix(in srgb, var(--app-brand), transparent 55%);
+}
+.steer-pending-badge {
+  align-self: flex-end;
+  margin: 3px 4px 6px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  background: color-mix(in srgb, var(--app-brand), transparent 82%);
+  color: var(--app-brand);
+  animation: steer-pending-pulse 1.4s ease-in-out infinite;
+}
+@keyframes steer-pending-pulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .steer-pending-badge { animation: none; opacity: 0.9; }
+}
 .queued-remove:hover { color: var(--app-primary-foreground); }
 
 /* 技能/文档型用户消息折叠徽章：把 TUI 注入的整段 SKILL.md 收起为一行 */
@@ -2128,6 +2153,31 @@ body {
   line-height: 1.4;
 }
 
+.policy-recovery-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 12px;
+}
+.policy-recovery-action {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+}
+.policy-recovery-action:disabled { cursor: wait; opacity: 0.6; }
+.policy-recovery-instructions {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: var(--corner-radius-small);
+  background: var(--app-tool-background);
+  color: var(--app-secondary-foreground);
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-line;
+}
+
 /* Single-line text input (Other option in single/multiple mode). */
 .user-input-text {
   width: 100%;
@@ -2792,9 +2842,6 @@ body {
 
   /* Leave room at the header's left edge for the floating menu button. */
   .session-header { padding: 10px 12px 10px 54px; }
-
-  /* Keyboard hint is desktop-only affordance; drop it to save room. */
-  .input-hint { display: none; }
 
   /* Sidebar becomes off-canvas drawer */
   .session-list {
