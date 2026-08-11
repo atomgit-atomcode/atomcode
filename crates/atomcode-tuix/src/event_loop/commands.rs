@@ -7613,9 +7613,9 @@ mod tests {
         assert!(review_prompt("staged").contains(
             r#"{"scope":{"kind":"staged"}}"#
         ));
-        let range = review_prompt("release/v5.0.5");
+        let range = review_prompt("release/v5.0.6");
         assert!(range.contains(
-            r#"{"scope":{"kind":"range","base":"release/v5.0.5","head":"HEAD"}}"#
+            r#"{"scope":{"kind":"range","base":"release/v5.0.6","head":"HEAD"}}"#
         ));
         assert!(!range.contains(r#"{"base":"#));
     }

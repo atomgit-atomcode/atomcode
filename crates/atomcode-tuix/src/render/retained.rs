@@ -10648,7 +10648,7 @@ mod tests {
         r.caps.unicode_symbols = true;
         let row = r.build_top_rule_with_context(
             80,
-            Some("release/v5.0.5"),
+            Some("release/v5.0.6"),
             Some(crate::render::HistoryPosition {
                 current: 999,
                 total: 1000,
@@ -10662,7 +10662,7 @@ mod tests {
             .map(|cell| cell.ch)
             .collect();
         assert!(visible.contains("History 999/1000"), "{visible:?}");
-        assert!(visible.contains("release/v5.0.5"), "{visible:?}");
+        assert!(visible.contains("release/v5.0.6"), "{visible:?}");
     }
 
     #[test]
