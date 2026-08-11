@@ -7404,11 +7404,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.screen.width(),
             self.caps.unicode_symbols,
         );
-        let child_style = if crate::highlight::theme::is_light_for_render() {
+        let completed_child_style = if crate::highlight::theme::is_light_for_render() {
             self.style_for(Role::Muted)
         } else {
             self.style_faint(Role::Muted)
         };
+        let active_child_style = self.style_for(Role::Secondary);
+        let stopped_child_style = self.style_for(Role::Warning);
+        let failed_child_style = self.style_for(Role::Error);
         let child_rows = progress
             .items
             .iter()
@@ -7440,12 +7443,29 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     text.push_str(&format!(" · {}", item.model));
                 }
                 text.push_str(&format!(" · {state}"));
-                if item.output_tokens > 0 {
-                    text.push_str(&format!(" · ↑ {} tokens", item.output_tokens));
-                }
+                let text = if item.started_at.is_some() || item.output_tokens > 0 {
+                    let elapsed = item
+                        .started_at
+                        .map(|started_at| crate::render::fmt_dur(started_at.elapsed()))
+                        .unwrap_or_else(|| "0s".into());
+                    format_subtask_progress(
+                        &text,
+                        &elapsed,
+                        item.output_tokens,
+                        self.screen.width() as usize,
+                    )
+                } else {
+                    crate::width::truncate_with_ellipsis(&text, self.screen.width() as usize)
+                };
+                let child_style = match item.status {
+                    SubtaskStatus::Pending | SubtaskStatus::Running => &active_child_style,
+                    SubtaskStatus::Completed => &completed_child_style,
+                    SubtaskStatus::Stopped => &stopped_child_style,
+                    SubtaskStatus::Failed => &failed_child_style,
+                };
                 build_one_row(
                     &text,
-                    &child_style,
+                    child_style,
                     self.screen.width(),
                     self.caps.unicode_symbols,
                 )
@@ -16565,6 +16585,27 @@ mod tests {
             .get("team:runtime")
             .cloned()
             .expect("live agent block");
+        let active_style = r.style_for(Role::Secondary);
+        assert!(
+            r.body_lines[group.child_indices[0]]
+                .iter()
+                .filter(|cell| !cell.ch.is_whitespace())
+                .all(|cell| cell.style == active_style),
+            "running Agent rows must remain readable instead of muted"
+        );
+        let running_text = r.body_lines[group.child_indices[0]]
+            .iter()
+            .map(|cell| cell.ch)
+            .collect::<String>();
+        assert!(running_text.contains("tokens"), "token metadata must survive clipping");
+        assert!(running_text.contains('↑'), "token marker must stay visible");
+        assert!(
+            r.body_lines[group.child_indices[1]]
+                .iter()
+                .filter(|cell| !cell.ch.is_whitespace())
+                .all(|cell| cell.style == active_style),
+            "pending Agent rows are still active work and must not be muted"
+        );
 
         r.render(UiLine::CommandOutput("parent task remains visible\n".into()));
         assert!(
@@ -16606,6 +16647,18 @@ mod tests {
             .map(|cell| cell.ch)
             .collect::<String>();
         assert!(header.contains("2/2 finished"));
+        let terminal_style = if crate::highlight::theme::is_light_for_render() {
+            r.style_for(Role::Muted)
+        } else {
+            r.style_faint(Role::Muted)
+        };
+        assert!(
+            r.body_lines[group.child_indices[0]]
+                .iter()
+                .filter(|cell| !cell.ch.is_whitespace())
+                .all(|cell| cell.style == terminal_style),
+            "completed Agent rows must be muted"
+        );
 
         r.reflow_body_to_current_width();
         let body = r
@@ -16615,6 +16668,45 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(body.contains("2/2 finished"), "resize replay keeps frozen Agent block");
+    }
+
+    #[test]
+    fn failed_and_stopped_agent_rows_remain_visually_distinct_from_completed() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (r, _buf) = new_capturing(100, 24);
+        let progress = SubtaskProgress {
+            call_id: "team:terminal-styles".into(),
+            completed: 1,
+            total: 3,
+            items: [
+                ("done", SubtaskStatus::Completed),
+                ("stopped", SubtaskStatus::Stopped),
+                ("failed", SubtaskStatus::Failed),
+            ]
+            .into_iter()
+            .map(|(label, status)| SubtaskItem {
+                label: label.into(),
+                description: String::new(),
+                model: String::new(),
+                activity: label.into(),
+                started_at: None,
+                output_tokens: 0,
+                status,
+            })
+            .collect(),
+        };
+        let (_, rows) = r.agent_group_rows(&progress, true);
+        let first_style = |row: &[Cell]| {
+            row.iter()
+                .find(|cell| !cell.ch.is_whitespace())
+                .expect("styled content")
+                .style
+                .clone()
+        };
+        assert_ne!(first_style(&rows[0]), first_style(&rows[1]));
+        assert_eq!(first_style(&rows[1]).fg, r.style_for(Role::Warning).fg);
+        assert_eq!(first_style(&rows[2]).fg, r.style_for(Role::Error).fg);
     }
 
     #[test]

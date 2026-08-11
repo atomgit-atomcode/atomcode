@@ -776,7 +776,13 @@ export async function postLiveMessage(
   provider?: string,
   sessionId?: string | null,
   clientInputId?: string,
-): Promise<{ disposition: 'started' | 'steered'; generation: number; turn_id: number }> {
+): Promise<{
+  disposition: 'started' | 'steered';
+  generation: number;
+  turn_id: number;
+  provider?: string;
+  providerChangeApplied?: boolean;
+}> {
   const resp = await fetch('/live/message', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
@@ -794,6 +800,8 @@ export async function postLiveMessage(
     disposition?: 'started' | 'steered';
     generation?: number;
     turn_id?: number;
+    provider?: string;
+    provider_change_applied?: boolean;
     error?: string;
   };
   if (!body.accepted) throw new Error(body.error ?? 'live runtime rejected the message');
@@ -814,6 +822,10 @@ export async function postLiveMessage(
     disposition: body.disposition,
     generation: body.generation,
     turn_id: body.turn_id,
+    ...(typeof body.provider === 'string' ? { provider: body.provider } : {}),
+    ...(typeof body.provider_change_applied === 'boolean'
+      ? { providerChangeApplied: body.provider_change_applied }
+      : {}),
   };
 }
 

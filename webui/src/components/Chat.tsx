@@ -77,6 +77,7 @@ import {
   acknowledgeLiveSteers,
   pendingSteersToDraft,
   reconcileSteerReceipt,
+  shouldApplySteerProviderFallback,
   type PendingLiveSteer,
 } from '../lib/liveSteer';
 
@@ -513,9 +514,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // 正在拉取某会话历史：用于抑制落地页，避免切到「有内容的会话」时先闪一下落地页。
   const [loading, setLoading] = useState(false);
   const [provider, setProvider] = useState<string | null>(null);
+  const providerRef = useRef<string | null>(null);
   const providerPinnedRef = useRef(false);
   const followDefaultProvider = useCallback((name: string) => {
-    if (!providerPinnedRef.current) setProvider(name);
+    if (!providerPinnedRef.current) {
+      providerRef.current = name;
+      setProvider(name);
+    }
   }, []);
   // 审批模式（build / accept_edits / bypass / plan）。进程级 runtime 状态，
   // 由 /live snapshot + 'mode' 事件同步，切换调 postLiveMode（下一轮生效）。
@@ -1158,6 +1163,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       setHistoryHint(null);
       // 连上时回显当前生效的模型，让下拉框与 TUI / 其他端保持一致。
       if (e.provider && !providerPinnedRef.current) {
+        providerRef.current = e.provider;
         setProvider(e.provider);
       }
       // 同步当前审批模式，让新 tab 显示正确的模式 pill（含别的 tab 切成的 Auto/Plan）。
@@ -1180,6 +1186,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // pin——pin 只用于防止「重连快照」回退一次尚未传播的本地切换，不该挡真实的变更事件，
     // 否则本端切过一次模型后就永远不再跟随 TUI 的模型切换（S1）。
     if (e.type === 'provider') {
+      providerRef.current = e.provider;
       setProvider(e.provider);
       providerPinnedRef.current = false;
       return;
@@ -1493,19 +1500,25 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   function switchProvider(name: string) {
     providerPinnedRef.current = true;
     if (!sync) {
+      providerRef.current = name;
       setProvider(name);
       return;
     }
     const previous = provider;
+    providerRef.current = name;
     setProvider(name);
     void postLiveProvider(name, sessionId).then((res) => {
       if (res.ok) return;
+      if (providerRef.current !== name) return;
       // Rejected (e.g. a turn is running): undo the optimistic selection and unpin
       // so the selector resumes following the runtime's authoritative model.
+      providerRef.current = previous;
       setProvider(previous);
       providerPinnedRef.current = false;
       pushCommandNotice(res.activeTurn ? t('cmd.model.syncBusy') : (res.error ?? t('cmd.model.syncBusy')));
     }).catch((error) => {
+      if (providerRef.current !== name) return;
+      providerRef.current = previous;
       setProvider(previous);
       providerPinnedRef.current = false;
       setHistoryHint(t('chat.connError', { msg: String(error) }));
@@ -1773,6 +1786,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   function handleEvent(event: SSEEvent) {
     switch (event.type) {
       case 'runtime_info':
+        providerRef.current = event.provider;
         setProvider(event.provider);
         break;
       case 'session_assigned':
@@ -2031,6 +2045,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       // emit `steered` on SSE before the submit response reaches this tab.
       setPendingSteers((pending) => [...pending, pendingSteer]);
       try {
+        const submittedProvider = provider;
         const receipt = await postLiveMessage(
           text,
           images.length ? images : undefined,
@@ -2038,6 +2053,20 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           activeIdRef.current,
           pendingSteer.id,
         );
+        if (shouldApplySteerProviderFallback(
+          submittedProvider,
+          providerRef.current,
+          receipt.providerChangeApplied,
+          receipt.provider,
+        )) {
+          // A mid-turn message is a steer and cannot reload the runtime provider.
+          // Follow the daemon's authoritative provider instead of leaving the
+          // selector pinned to a model that never became active.
+          providerRef.current = receipt.provider;
+          setProvider(receipt.provider);
+          providerPinnedRef.current = false;
+          pushCommandNotice(t('cmd.model.syncBusy'));
+        }
         // The receipt is authoritative. Reconcile from the lifecycle's observed
         // terminal — NOT the transient `running` flag, which is false for a tab
         // that attached mid-turn. A `steered` submit is never bounced back to the

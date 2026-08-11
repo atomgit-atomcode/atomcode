@@ -51,6 +51,30 @@ test('postLiveMessage accepts the legacy accepted-only receipt without retrying'
   }
 });
 
+test('postLiveMessage exposes the provider actually used for a busy-turn steer', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    accepted: true,
+    disposition: 'steered',
+    generation: 4,
+    turn_id: 9,
+    provider: 'provider-active',
+    provider_change_applied: false,
+  }), { status: 200 })) as typeof fetch;
+  try {
+    const { postLiveMessage } = await import('./api.ts');
+    assert.deepEqual(await postLiveMessage('continue', undefined, 'provider-requested'), {
+      disposition: 'steered',
+      generation: 4,
+      turn_id: 9,
+      provider: 'provider-active',
+      providerChangeApplied: false,
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('postLiveProvider scopes the runtime switch to the active session', async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   const originalFetch = globalThis.fetch;

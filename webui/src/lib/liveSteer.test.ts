@@ -1,6 +1,26 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { acknowledgeLiveSteers, pendingSteersToDraft, reconcileSteerReceipt } from './liveSteer.ts';
+import {
+  acknowledgeLiveSteers,
+  pendingSteersToDraft,
+  reconcileSteerReceipt,
+  shouldApplySteerProviderFallback,
+} from './liveSteer.ts';
+
+test('provider fallback applies only to the selection submitted with the steer', () => {
+  assert.equal(
+    shouldApplySteerProviderFallback('requested', 'requested', false, 'active'),
+    true,
+  );
+  assert.equal(
+    shouldApplySteerProviderFallback('requested', 'newer-selection', false, 'active'),
+    false,
+  );
+  assert.equal(
+    shouldApplySteerProviderFallback('requested', 'requested', true, 'active'),
+    false,
+  );
+});
 
 test('reconcileSteerReceipt keeps a steered submit pending when no terminal was observed', () => {
   // The bug: a tab that observes a live turn without a fresh `state{running:true}`

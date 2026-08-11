@@ -17925,10 +17925,17 @@ fn ephemeral_tool_activity<'a>(tool_display: Option<&str>, chunk: &'a str) -> Op
 }
 
 fn todo_panel_is_active(state: &crate::state::UiState) -> bool {
-    state
-        .active_todos
-        .as_ref()
+    effective_todo_progress(state)
         .is_some_and(|todo| todo.total > 0 && todo.completed < todo.total)
+}
+
+fn effective_todo_progress(
+    state: &crate::state::UiState,
+) -> Option<&crate::render::TodoProgress> {
+    state
+        .pending_todo_preview
+        .as_ref()
+        .or(state.active_todos.as_ref())
 }
 
 fn subtask_progress_from_args(
@@ -20285,7 +20292,7 @@ fn commit_native_session_changed(
     state.on_turn_complete();
     state.on_session_replaced();
     state.active_todos = None;
-    state.pending_todo_calls.clear();
+    clear_pending_todo_calls(state);
     state.active_subtasks = None;
     sync_todo_titles(state);
     state.approval_panel = None;
@@ -21170,9 +21177,7 @@ fn handle_agent_event(
             // calls. Distinguish by ARG SHAPE, not tool name.
             let is_todo_call = name == "todowrite" || name == "todo";
             if is_todo_call {
-                state
-                    .pending_todo_calls
-                    .insert(id.clone(), arguments.clone());
+                stage_todo_call_preview(state, &id, &arguments);
             }
             let todo_plan = if is_todo_call {
                 todo_progress_from_args(&arguments)
@@ -21805,7 +21810,7 @@ fn handle_agent_event(
             }
             renderer.render(UiLine::AssistantLineBreak);
             pending_tools.clear();
-            state.pending_todo_calls.clear();
+            clear_pending_todo_calls(state);
             // Footer token count: bill output + UNCACHED input (re-reading the
             // cached prefix each round is near-free). The event's `total_tokens`
             // is the v2 gross sum (prompt+completion per round) which overstates
@@ -21995,6 +22000,7 @@ fn handle_agent_event(
                     });
                 }
             }
+            clear_pending_todo_calls(state);
             atomcode_capabilities::notify::notify(
                 &ctx.config.notifications,
                 atomcode_capabilities::notify::NotificationEvent::TurnFinished(
@@ -23772,12 +23778,11 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
                 .map(|t| t.elapsed().as_secs())
                 .unwrap_or(0),
         });
-    // Todo panel source: the persistent `active_todos` cache. Hidden when the
-    // list is empty (`total == 0`) or fully done (`completed == total`) so a
-    // finished panel disappears — otherwise it stands across turns and resume.
-    let todo = state
-        .active_todos
-        .clone()
+    // Todo panel source: an in-flight presentation preview when present,
+    // otherwise the persistent `active_todos` cache. The preview is discarded
+    // on failure/cancel and never becomes session authority without success.
+    let todo = effective_todo_progress(state)
+        .cloned()
         .filter(|p| p.total > 0 && p.completed < p.total);
     let todo_owns_footer = todo.is_some();
     let approval = state
@@ -25418,51 +25423,108 @@ pub(crate) fn sync_todo_titles(state: &mut crate::state::UiState) {
         .unwrap_or_default();
 }
 
-/// Fold ONE successfully completed incremental `todo` action into the live footer panel + title
-/// cache, mirroring the canonical transcript projection. A `todo update` while the panel is empty
-/// is a no-op (unknown id); a `todo add` from empty creates the panel.
-pub(crate) fn patch_live_todos_from_action(state: &mut crate::state::UiState, args: &str) {
-    use atomcode_capabilities::tools::todo::{apply_new_todo_action, TodoItem};
-    let mut items: Vec<TodoItem> = state
-        .active_todos
-        .as_ref()
-        .map(|p| {
-            p.items
-                .iter()
-                .map(|(s, c)| TodoItem {
-                    status: *s,
-                    content: c.clone(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    apply_new_todo_action(&mut items, args);
-    state.active_todos = if items.is_empty() {
-        None
-    } else {
-        Some(todo_progress_from_items(&items))
-    };
-    sync_todo_titles(state);
-}
-
 fn commit_todo_call_result(
     state: &mut crate::state::UiState,
     call_id: &str,
     name: &str,
     success: bool,
 ) {
-    let Some(arguments) = state.pending_todo_calls.remove(call_id) else {
+    if name != "todowrite" && name != "todo" {
+        return;
+    }
+    if !state.pending_todo_calls.contains_key(call_id) {
+        return;
+    }
+    state
+        .pending_todo_results
+        .insert(call_id.to_string(), success);
+    rebuild_pending_todo_projections(state);
+    if state
+        .pending_todo_order
+        .iter()
+        .all(|id| state.pending_todo_results.contains_key(id))
+    {
+        clear_pending_todo_calls(state);
+    }
+}
+
+fn stage_todo_call_preview(state: &mut crate::state::UiState, call_id: &str, args: &str) {
+    if state.pending_todo_order.is_empty() {
+        state.pending_todo_base = Some(todo_items_from_progress(state.active_todos.as_ref()));
+    }
+    if !state.pending_todo_calls.contains_key(call_id) {
+        state.pending_todo_order.push(call_id.to_string());
+    }
+    state
+        .pending_todo_calls
+        .insert(call_id.to_string(), args.to_string());
+    rebuild_pending_todo_projections(state);
+}
+
+fn todo_items_from_progress(
+    progress: Option<&crate::render::TodoProgress>,
+) -> Vec<atomcode_capabilities::tools::todo::TodoItem> {
+    use atomcode_capabilities::tools::todo::TodoItem;
+    progress
+        .map(|progress| {
+            progress
+                .items
+                .iter()
+                .map(|(status, content)| TodoItem {
+                    status: *status,
+                    content: content.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn apply_todo_mutation(
+    items: &mut Vec<atomcode_capabilities::tools::todo::TodoItem>,
+    args: &str,
+) {
+    if let Some(progress) = todo_progress_from_args(args) {
+        *items = todo_items_from_progress(Some(&progress));
+    } else {
+        atomcode_capabilities::tools::todo::apply_new_todo_action(items, args);
+    }
+}
+
+fn rebuild_pending_todo_projections(state: &mut crate::state::UiState) {
+    let Some(base) = state.pending_todo_base.clone() else {
+        state.pending_todo_preview = None;
         return;
     };
-    if (name != "todowrite" && name != "todo") || !success {
-        return;
+    let mut committed = base.clone();
+    let mut preview = base;
+    let mut has_unresolved = false;
+    for call_id in &state.pending_todo_order {
+        let Some(args) = state.pending_todo_calls.get(call_id) else {
+            continue;
+        };
+        match state.pending_todo_results.get(call_id).copied() {
+            Some(true) => {
+                apply_todo_mutation(&mut committed, args);
+                apply_todo_mutation(&mut preview, args);
+            }
+            Some(false) => {}
+            None => {
+                has_unresolved = true;
+                apply_todo_mutation(&mut preview, args);
+            }
+        }
     }
-    if let Some(progress) = todo_progress_from_args(&arguments) {
-        state.active_todos = (progress.total > 0).then_some(progress);
-        sync_todo_titles(state);
-    } else {
-        patch_live_todos_from_action(state, &arguments);
-    }
+    state.active_todos = (!committed.is_empty()).then(|| todo_progress_from_items(&committed));
+    sync_todo_titles(state);
+    state.pending_todo_preview = has_unresolved.then(|| todo_progress_from_items(&preview));
+}
+
+pub(crate) fn clear_pending_todo_calls(state: &mut crate::state::UiState) {
+    state.pending_todo_calls.clear();
+    state.pending_todo_order.clear();
+    state.pending_todo_results.clear();
+    state.pending_todo_base = None;
+    state.pending_todo_preview = None;
 }
 
 pub(crate) fn todo_progress_from_args(args: &str) -> Option<crate::render::TodoProgress> {
@@ -25499,9 +25561,10 @@ mod todo_block_tests {
         state.active_todos = todo_progress_from_args(
             r#"{"todos":[{"content":"keep","status":"in_progress"}]}"#,
         );
-        state.pending_todo_calls.insert(
-            "failed".into(),
-            r#"{"action":"add","content":"must not appear"}"#.into(),
+        stage_todo_call_preview(
+            &mut state,
+            "failed",
+            r#"{"action":"add","content":"must not appear"}"#,
         );
 
         commit_todo_call_result(&mut state, "failed", "todowrite", false);
@@ -25513,11 +25576,47 @@ mod todo_block_tests {
     }
 
     #[test]
+    fn in_flight_todo_preview_updates_footer_without_committing_authoritative_state() {
+        let mut state = crate::state::UiState::new();
+        state.active_todos = todo_progress_from_args(
+            r#"{"todos":[{"content":"done","status":"completed"},{"content":"run agents","status":"pending"}]}"#,
+        );
+        let args = r#"{"action":"update","id":2,"status":"in_progress"}"#;
+        stage_todo_call_preview(&mut state, "preview", args);
+
+        assert_eq!(state.active_todos.as_ref().unwrap().in_progress, 0);
+        let preview = effective_todo_progress(&state).expect("preview drives live footer");
+        assert_eq!(preview.in_progress, 1);
+        assert_eq!(preview.current.as_deref(), Some("run agents"));
+        assert!(todo_panel_is_active(&state));
+
+        commit_todo_call_result(&mut state, "preview", "todowrite", false);
+        assert!(state.pending_todo_preview.is_none());
+        assert_eq!(state.active_todos.as_ref().unwrap().in_progress, 0);
+    }
+
+    #[test]
+    fn successful_todo_preview_becomes_authoritative() {
+        let mut state = crate::state::UiState::new();
+        state.active_todos = todo_progress_from_args(
+            r#"{"todos":[{"content":"run agents","status":"pending"}]}"#,
+        );
+        let args = r#"{"action":"update","id":1,"status":"in_progress"}"#;
+        stage_todo_call_preview(&mut state, "preview", args);
+
+        commit_todo_call_result(&mut state, "preview", "todowrite", true);
+
+        assert!(state.pending_todo_preview.is_none());
+        assert_eq!(state.active_todos.as_ref().unwrap().in_progress, 1);
+    }
+
+    #[test]
     fn successful_live_todo_result_commits_full_plan_and_action() {
         let mut state = crate::state::UiState::new();
-        state.pending_todo_calls.insert(
-            "plan".into(),
-            r#"{"todos":[{"content":"first","status":"in_progress"}]}"#.into(),
+        stage_todo_call_preview(
+            &mut state,
+            "plan",
+            r#"{"todos":[{"content":"first","status":"in_progress"}]}"#,
         );
         commit_todo_call_result(&mut state, "plan", "todowrite", true);
         assert_eq!(
@@ -25525,15 +25624,52 @@ mod todo_block_tests {
             "first"
         );
 
-        state.pending_todo_calls.insert(
-            "add".into(),
-            r#"{"action":"add","content":"second"}"#.into(),
+        stage_todo_call_preview(
+            &mut state,
+            "add",
+            r#"{"action":"add","content":"second"}"#,
         );
         commit_todo_call_result(&mut state, "add", "todowrite", true);
 
         let progress = state.active_todos.expect("successful action is committed");
         assert_eq!(progress.items.len(), 2);
         assert_eq!(progress.items[1].1, "second");
+    }
+
+    #[test]
+    fn concurrent_todo_previews_replay_in_call_order_and_exclude_failures() {
+        let mut state = crate::state::UiState::new();
+        state.active_todos = todo_progress_from_args(
+            r#"{"todos":[{"content":"first","status":"pending"}]}"#,
+        );
+        stage_todo_call_preview(
+            &mut state,
+            "a",
+            r#"{"action":"update","id":1,"status":"in_progress"}"#,
+        );
+        stage_todo_call_preview(
+            &mut state,
+            "b",
+            r#"{"action":"add","content":"second"}"#,
+        );
+
+        let preview = effective_todo_progress(&state).unwrap();
+        assert_eq!(preview.in_progress, 1);
+        assert_eq!(preview.items.len(), 2);
+
+        // Resolve out of order: b succeeds while a is still optimistic.
+        commit_todo_call_result(&mut state, "b", "todowrite", true);
+        let preview = effective_todo_progress(&state).unwrap();
+        assert_eq!(preview.in_progress, 1);
+        assert_eq!(preview.items.len(), 2);
+
+        // a fails, so only b remains in the authoritative list.
+        commit_todo_call_result(&mut state, "a", "todowrite", false);
+        assert!(state.pending_todo_preview.is_none());
+        let committed = state.active_todos.as_ref().unwrap();
+        assert_eq!(committed.in_progress, 0);
+        assert_eq!(committed.items.len(), 2);
+        assert_eq!(committed.items[1].1, "second");
     }
 
     #[test]

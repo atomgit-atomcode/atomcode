@@ -51,6 +51,22 @@ export type SteerReceiptDisposition = 'started' | 'steered';
 export type SteerReceiptOutcome = 'clear' | 'confirm' | 'release';
 
 /**
+ * A `/live/message` response may arrive after the user has selected another
+ * provider. Only let the response undo the exact provider selection that was
+ * submitted with that request; otherwise it is stale UI state.
+ */
+export function shouldApplySteerProviderFallback(
+  submittedProvider: string | null,
+  currentProvider: string | null,
+  providerChangeApplied: boolean | undefined,
+  effectiveProvider: string | undefined,
+): effectiveProvider is string {
+  return providerChangeApplied === false
+    && Boolean(effectiveProvider)
+    && currentProvider === submittedProvider;
+}
+
+/**
  * Reconcile a locally-submitted steer against its `/live/message` receipt.
  *
  * A `steered` receipt is authoritative: the runtime accepted the input into the

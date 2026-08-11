@@ -2630,7 +2630,7 @@ fn execute_slash_command_impl(
                     // this fresh foreground session has no todos, so drop the prior
                     // session's list (mirrors reset_to_new_session / native SessionChanged).
                     state.active_todos = None;
-                    state.pending_todo_calls.clear();
+                    crate::event_loop::clear_pending_todo_calls(state);
                     crate::event_loop::sync_todo_titles(state); // drop prior session's titles
                     state.approval_panel = None;
                     // One DECSET 2026 envelope around the wipe + welcome

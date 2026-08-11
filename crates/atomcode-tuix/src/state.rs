@@ -1230,6 +1230,16 @@ pub struct UiState {
     /// Todo mutations staged at ToolCallStarted and committed only after the
     /// matching successful ToolCallResult. Keyed by the kernel-global call id.
     pub pending_todo_calls: std::collections::HashMap<String, String>,
+    /// Stable tool-call order for replaying concurrent Todo mutations.
+    pub pending_todo_order: Vec<String>,
+    /// Correlated terminal result for each staged Todo call (`true` = success).
+    pub pending_todo_results: std::collections::HashMap<String, bool>,
+    /// Todo list captured before the first concurrent mutation. Both committed
+    /// and optimistic projections are deterministically replayed from this base.
+    pub pending_todo_base: Option<Vec<atomcode_capabilities::tools::todo::TodoItem>>,
+    /// Presentation-only projection including successful and unresolved Todo
+    /// mutations in call order. Failed mutations are excluded.
+    pub pending_todo_preview: Option<crate::render::TodoProgress>,
     /// Current reasoning_effort level for the active provider.
     pub reasoning_effort: Option<String>,
     /// Active goal condition string, if a `/goal` is running.
@@ -1426,6 +1436,10 @@ impl UiState {
             todo_titles: std::collections::HashMap::new(),
             active_todos: None,
             pending_todo_calls: std::collections::HashMap::new(),
+            pending_todo_order: Vec::new(),
+            pending_todo_results: std::collections::HashMap::new(),
+            pending_todo_base: None,
+            pending_todo_preview: None,
             reasoning_effort: None,
             goal_condition: None,
             goal_armed: false,
@@ -1750,6 +1764,7 @@ impl UiState {
         // leave a stale `explore#4 · …` pinned onto the next turn's spinner.
         self.subagent_activity = None;
         self.active_subtasks = None;
+        self.pending_todo_preview = None;
         // Safety clear: if a turn ends without resolving an approval (e.g. error
         // path or session switch), ensure the panel is not left stale.
         self.approval_panel = None;
@@ -1779,6 +1794,7 @@ impl UiState {
         self.turn_saw_reasoning = false;
         self.subagent_activity = None;
         self.active_subtasks = None;
+        self.pending_todo_preview = None;
         self.approval_panel = None;
         self.user_input_panel = None;
         self.user_input_batch = None;
@@ -1808,6 +1824,7 @@ impl UiState {
         self.footer_usage = None;
         self.subagent_activity = None;
         self.active_subtasks = None;
+        self.pending_todo_preview = None;
         self.team.clear();
         self.pending_policy_intervention = None;
         self.pending_policy_resolution = None;

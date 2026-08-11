@@ -1508,6 +1508,7 @@ pub(crate) async fn live_message(
     };
     let active_provider = join.binding.provider.clone();
     let mut provider_name = active_provider.clone();
+    let mut provider_change_applied = true;
     if let Some(requested_provider) = requested_provider {
         let config = match Config::load(&Config::default_path()) {
             Ok(config) => config,
@@ -1551,12 +1552,13 @@ pub(crate) async fn live_message(
                     provider_name = requested_provider;
                 }
                 // A turn is active, so this /live/message is a STEER that folds into
-                // the current turn — which cannot switch providers. Do NOT reject it:
-                // keep the active provider and submit the steer, matching the TUI
-                // (where mid-turn input never reloads the provider). Any requested
-                // provider change takes effect on the next idle turn. `reload_provider`
-                // checks `turn_in_progress()` before mutating, so nothing was applied.
-                Err(crate::live_hub::HubError::ActiveTurn) => {}
+                // the current turn — which cannot switch providers. Accept the steer
+                // with the active provider and tell the client the optimistic provider
+                // selection was not applied. We deliberately do not claim this is
+                // queued: a later idle request must explicitly switch again.
+                Err(crate::live_hub::HubError::ActiveTurn) => {
+                    provider_change_applied = false;
+                }
                 Err(error) => {
                     return Json(serde_json::json!({
                         "accepted": false,
@@ -1611,6 +1613,8 @@ pub(crate) async fn live_message(
             "disposition": "started",
             "generation": generation,
             "turn_id": turn_id,
+            "provider": provider_name,
+            "provider_change_applied": provider_change_applied,
         })),
         Ok(atomcode_coding::SubmitReceipt::Steered {
             generation,
@@ -1620,6 +1624,8 @@ pub(crate) async fn live_message(
             "disposition": "steered",
             "generation": generation,
             "turn_id": turn_id,
+            "provider": provider_name,
+            "provider_change_applied": provider_change_applied,
         })),
         Err(error) => Json(serde_json::json!({
             "accepted": false,
