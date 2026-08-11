@@ -133,6 +133,11 @@
   .section-hint{margin-top:6px;color:var(--faint);font-size:12px}
   .announcement-date{padding:8px 12px;border:1px solid var(--line);border-radius:8px;background:rgba(255,255,255,.035);font-size:12px;color:var(--muted);white-space:nowrap}
   .announcement-date b{color:#fff;font-weight:500}
+  .period{display:flex;align-items:center;gap:10px;padding:6px 8px;border:1px solid var(--line);border-radius:9px;background:rgba(255,255,255,.035);font-size:12px;color:var(--muted);white-space:nowrap}
+  .period b{display:inline-flex;align-items:center;min-height:28px;padding:0 4px;color:#fff}
+  .period-arrow{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border:1px solid rgba(255,255,255,.18);border-radius:7px;background:rgba(255,255,255,.06);color:rgba(255,255,255,.76);font-size:13px;line-height:1;cursor:pointer;transition:background .2s,color .2s,border-color .2s,box-shadow .2s}
+  .period-arrow:hover{color:#fff;border-color:rgba(232,160,80,.55);background:rgba(232,160,80,.14);box-shadow:0 0 0 3px rgba(232,160,80,.10)}
+
   .announcement-card{margin-bottom:18px}
   .announcement-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 24px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.025)}
   .announcement-title{display:flex;align-items:center;gap:12px;font-size:16px;font-weight:700}
@@ -177,6 +182,10 @@
   html.light .panel-title,html.light .section-title,html.light .user-name,html.light .announcement-title,html.light .announcement-body strong,html.light .announcement-item h3,html.light .resource-card h3,html.light .announcement-date b{color:#0d0d0d}
   html.light .panel-meta,html.light .user-id,html.light .metric-label,html.light .metric-note{color:rgba(0,0,0,.48)}
   html.light .announcement-date{color:rgba(0,0,0,.58);border-color:rgba(0,0,0,.14);background:rgba(255,255,255,.5)}
+  html.light .period{color:rgba(0,0,0,.62);border-color:rgba(0,0,0,.16);background:rgba(255,255,255,.64);box-shadow:0 8px 24px rgba(0,0,0,.06)}
+  html.light .period b{color:#0d0d0d}
+  html.light .period-arrow{color:#8a4f12;border-color:rgba(200,118,24,.38);background:rgba(200,118,24,.12)}
+  html.light .period-arrow:hover{color:#fff;border-color:#c87618;background:#c87618;box-shadow:0 0 0 3px rgba(200,118,24,.16)}
   html.light .announcement-body{color:rgba(0,0,0,.7)}
   html.light .announcement-item{border-color:rgba(0,0,0,.12);background:rgba(255,255,255,.45)}
   html.light .announcement-item p{color:rgba(0,0,0,.58)}
@@ -382,6 +391,11 @@
             <span data-i18n="panel.mine">我的专属邀请面板</span>
           </div>
           <div class="panel-meta"><span data-i18n="panel.meta.prefix">数据更新时间：</span><span class="js-updated-at">--</span></div>
+          <div class="period" id="summary-period">
+            <button class="period-arrow" id="summary-prev" title="上一周" aria-label="上一周" onclick="changeSummaryWeek(-1)">◂</button>
+            <b id="summary-week-label" aria-live="polite" aria-atomic="true">--</b>
+            <button class="period-arrow" id="summary-next" title="下一周" aria-label="下一周" onclick="changeSummaryWeek(1)">▸</button>
+          </div>
         </div>
         <div class="panel-body">
           <div class="user-strip">
@@ -487,6 +501,9 @@ const T = {
   'toast.lang.zh': { zh: '已切换到 简体中文', en: 'Switched to 简体中文' },
   'toast.lang.en': { zh: '已切换到 English', en: 'Switched to English' },
   'toast.copied': { zh: '✓ 已复制 · 粘贴到终端运行', en: '✓ Copied · paste into your terminal' },
+  'board.prev': { zh: '上一周', en: 'Previous week' },
+  'board.next': { zh: '下一周', en: 'Next week' },
+  'time.now': { zh: '刚刚', en: 'Just now' },
   'announcement.section.title': { zh: '活动公告', en: 'Program Notice' },
   'announcement.section.hint': { zh: '「邀请有礼」裂变计划收官说明与后续安排。', en: 'Closure notice and follow-up arrangements for the Referral Rewards program.' },
   'announcement.date.label': { zh: '公告日期：', en: 'Published: ' },
@@ -627,6 +644,9 @@ let currentSid = null;
 let currentCode = null;
 let currentUser = null;
 let currentSummary = { devices: 0, active: 0, attributions: 0, rate: 0, amount: 0 };
+let summaryReqSeq = 0;
+let lastLandedReqId = 0;
+let lastDisplayedWeek = '';
 
 function getSid() {
   if (currentSid) return currentSid;
@@ -670,10 +690,28 @@ async function login() {
     alert('login failed: ' + e.message);
   }
 }
-function logout() { clearSid(); currentCode = null; currentUser = null; showState('unauth'); renderAnnouncement('public-announcement'); }
+function resetSummaryState() {
+  currentSummary = { devices: 0, active: 0, attributions: 0, rate: 0, amount: 0 };
+  lastLandedReqId = summaryReqSeq; // 作废在途响应，防止旧账号数据落地
+  lastDisplayedWeek = '';
+  const periodEl = document.getElementById('summary-period');
+  if (periodEl) periodEl.dataset.weekStart = '';
+  const labelEl = document.getElementById('summary-week-label');
+  if (labelEl) labelEl.textContent = '--';
+  document.querySelectorAll('.js-updated-at').forEach(function(el) { el.textContent = '--'; });
+  renderSummary(currentSummary);
+}
+function logout() { clearSid(); currentCode = null; currentUser = null; resetSummaryState(); showState('unauth'); renderAnnouncement('public-announcement'); }
 
-async function apiCall(endpoint, sid, method = 'GET') {
-  const url = API_BASE + '/' + endpoint + (sid ? '?sid=' + encodeURIComponent(sid) : '');
+async function apiCall(endpoint, sid, method = 'GET', extra = null) {
+  const qs = [];
+  if (sid) qs.push('sid=' + encodeURIComponent(sid));
+  if (extra) {
+    for (const key of Object.keys(extra)) {
+      if (key in extra) qs.push(key + '=' + encodeURIComponent(extra[key]));
+    }
+  }
+  const url = API_BASE + '/' + endpoint + (qs.length ? '?' + qs.join('&') : '');
   const opts = { credentials: 'omit' };
   if (method !== 'GET') opts.method = method;
   const resp = await fetch(url, opts);
@@ -682,7 +720,9 @@ async function apiCall(endpoint, sid, method = 'GET') {
 }
 async function fetchReferralMe() { return apiCall('me', getSid()); }
 async function postInviteCode() { return apiCall('invite-code', getSid(), 'POST'); }
-async function fetchSummary() { return apiCall('summary', getSid()); }
+async function fetchSummary(weekStart) {
+  return apiCall('summary', getSid(), 'GET', weekStart ? { week_start: weekStart } : null);
+}
 async function fetchRecords() { return apiCall('records', getSid()); }
 
 function showState(name) {
@@ -705,6 +745,7 @@ async function initPage() {
         clearSid();
         currentCode = null;
         currentUser = null;
+        resetSummaryState();
         renderAnnouncement('public-announcement');
         showState('unauth');
         return;
@@ -779,15 +820,77 @@ async function copyInviteLink() {
   setTimeout(() => { btn.textContent = t('cmd.copy'); btn.classList.remove('copied'); }, 1600);
 }
 
-async function loadSummary() {
+async function loadSummary(weekStart) {
+  const reqId = ++summaryReqSeq;
   try {
-    const data = await fetchSummary();
+    const data = await fetchSummary(weekStart);
+    // 过期响应丢弃：已被更新的响应落地，或已被更新的导航请求取代（初始默认加载的响应除外，避免面板落到全零）
+    if (reqId <= lastLandedReqId || (reqId !== summaryReqSeq && weekStart !== undefined)) return;
+    lastLandedReqId = reqId;
     currentSummary = normalizeSummary(data);
     renderSummary(currentSummary);
+    const labelEl = document.getElementById('summary-week-label');
+    if (labelEl) labelEl.textContent = data.week_label || (weekStart || '--');
+    const periodEl = document.getElementById('summary-period');
+    if (periodEl) {
+      if (/^\d{4}-\d{2}-\d{2}$/.test(data.week_start || '')) {
+        periodEl.dataset.weekStart = data.week_start;
+        lastDisplayedWeek = data.week_start;
+      } else if (weekStart) {
+        periodEl.dataset.weekStart = weekStart;
+        lastDisplayedWeek = weekStart;
+      } else {
+        periodEl.dataset.weekStart = '';
+        lastDisplayedWeek = '';
+      }
+    }
+    var timeText = data.refreshed_at ? timeAgo(data.refreshed_at) : '--';
+    document.querySelectorAll('.js-updated-at').forEach(function(el) {
+      el.textContent = timeText;
+    });
   } catch (e) {
+    if (reqId !== summaryReqSeq) return; // 过期失败，忽略
     console.error('Failed to load summary', e);
+    const periodEl = document.getElementById('summary-period');
+    if (periodEl) periodEl.dataset.weekStart = lastDisplayedWeek;
     renderSummary(currentSummary);
   }
+}
+function changeSummaryWeek(delta) {
+  const period = document.getElementById('summary-period');
+  if (!period) return;
+  const current = period.dataset.weekStart || '';
+  const base = current ? new Date(current + 'T00:00:00') : getMonday();
+  base.setDate(base.getDate() + delta * 7);
+  const newStart = formatLocalDate(base);
+  period.dataset.weekStart = newStart; // 乐观更新导航锚点，连点基于最近请求的周
+  loadSummary(newStart);
+}
+function getMonday() {
+  const d = new Date();
+  d.setDate(d.getDate() - (d.getDay() + 6) % 7);
+  return d;
+}
+function formatLocalDate(date) {
+  return date.getFullYear() + '-' +
+    String(date.getMonth() + 1).padStart(2, '0') + '-' +
+    String(date.getDate()).padStart(2, '0');
+}
+function timeAgo(isoStr) {
+  if (!isoStr) return t('time.now');
+  var then = new Date(isoStr);
+  if (isNaN(then.getTime())) return '--';
+  var diff = Date.now() - then.getTime();
+  var seconds = Math.floor(diff / 1000);
+  if (seconds < 10) return t('time.now');
+  var minutes = Math.floor(seconds / 60);
+  if (minutes < 1) return t('time.now');
+  if (minutes < 60) return minutes + (LANG === 'en' ? ' min ago' : '分钟前');
+  var hours = Math.floor(minutes / 60);
+  if (hours < 24) return hours + (LANG === 'en' ? ' h ago' : '小时前');
+  var days = Math.floor(hours / 24);
+  if (days < 30) return days + (LANG === 'en' ? ' d ago' : '天前');
+  return formatLocalDate(then);
 }
 function normalizeSummary(data) {
   const devices = parseNumber(data.devices ?? data.installs ?? data.install_count ?? data.device_count);
@@ -951,6 +1054,14 @@ function normalizeRate(value, devices, active) {
     renderInviteLink();
     renderSummary(currentSummary);
     rerenderDynamicSections();
+    var prevBtn = document.getElementById('summary-prev');
+    var nextBtn = document.getElementById('summary-next');
+    if (prevBtn) { prevBtn.title = t('board.prev'); prevBtn.setAttribute('aria-label', t('board.prev')); }
+    if (nextBtn) { nextBtn.title = t('board.next'); nextBtn.setAttribute('aria-label', t('board.next')); }
+    var timeText = currentSummary.refreshedAt ? timeAgo(currentSummary.refreshedAt) : '--';
+    document.querySelectorAll('.js-updated-at').forEach(function(el) {
+      el.textContent = timeText;
+    });
   }
   applyAll();
   btn.addEventListener('click',()=>{
