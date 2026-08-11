@@ -43,6 +43,13 @@ test('provider fallback applies only to the selection submitted with the steer',
     shouldApplySteerProviderFallback('requested', 'requested', true, 'active'),
     false,
   );
+  // Same model, only a fingerprint mismatch: the runtime kept the user's model
+  // (submitted === effective), so there is nothing to fall back to and no reason
+  // to tell the user to stop the turn to switch models. Must NOT fire.
+  assert.equal(
+    shouldApplySteerProviderFallback('deepseek-v4-flash', 'deepseek-v4-flash', false, 'deepseek-v4-flash'),
+    false,
+  );
 });
 
 test('reconcileSteerReceipt keeps a steered submit pending when no terminal was observed', () => {

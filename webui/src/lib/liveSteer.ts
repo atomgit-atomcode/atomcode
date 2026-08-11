@@ -54,6 +54,12 @@ export type SteerReceiptOutcome = 'clear' | 'confirm' | 'release';
  * A `/live/message` response may arrive after the user has selected another
  * provider. Only let the response undo the exact provider selection that was
  * submitted with that request; otherwise it is stale UI state.
+ *
+ * The fallback (and its "stop the turn to switch models" notice) only makes
+ * sense when the runtime is actually on a DIFFERENT model than the user asked
+ * for. A same-name mismatch (only the provider fingerprint changed) leaves the
+ * user's selection effectively active, so it must not fire — otherwise merely
+ * sending a mid-turn steer spuriously nags the user about switching models.
  */
 export function shouldApplySteerProviderFallback(
   submittedProvider: string | null,
@@ -63,7 +69,8 @@ export function shouldApplySteerProviderFallback(
 ): effectiveProvider is string {
   return providerChangeApplied === false
     && Boolean(effectiveProvider)
-    && currentProvider === submittedProvider;
+    && currentProvider === submittedProvider
+    && submittedProvider !== effectiveProvider;
 }
 
 /**
