@@ -421,7 +421,15 @@ def cmd_verify():
                 invalid += 1
                 details.append((entry, sid[:12], issues))
             else:
-                snap_size = os.path.getsize(snap_path)
+                try:
+                    snap_size = os.path.getsize(snap_path)
+                except OSError:
+                    # Snapshot vanished between the isfile check and here
+                    # (e.g. another process cleaned it up); treat as invalid
+                    # instead of crashing the whole verification pass.
+                    invalid += 1
+                    details.append((entry, sid[:12], ["snapshot vanished"]))
+                    continue
                 if snap_size > 100:
                     valid += 1
                 else:
