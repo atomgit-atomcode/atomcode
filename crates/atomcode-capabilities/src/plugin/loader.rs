@@ -87,9 +87,31 @@ fn expand_cc_hooks(cc_map: &CCHooksMap, plugin_root: &Path) -> Vec<PluginCcHook>
 }
 
 /// Parse a CC-format hooks file. `None` on missing/malformed (skip, never wedge).
+///
+/// Accepts two equivalent shapes — the bare event map and the settings-style
+/// `{ "hooks": { … } }` wrapper used by `~/.claude/settings.json` and several
+/// third-party plugins (e.g. superpowers' `hooks/hooks.json`):
+///
+/// ```json
+/// { "SessionStart": [ { "hooks": [ … ] } ] }
+/// ```
+/// vs.
+/// ```json
+/// { "hooks": { "SessionStart": [ { "hooks": [ … ] } ] } }
+/// ```
 fn load_cc_hooks_file(path: &Path) -> Option<CCHooksMap> {
     let raw = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<CCHooksMap>(&raw).ok()
+    if let Ok(map) = serde_json::from_str::<CCHooksMap>(&raw) {
+        return Some(map);
+    }
+    // Wrapped form: `{ "hooks": { … } }`. Deserialize into a helper and unwrap.
+    #[derive(serde::Deserialize)]
+    struct HooksWrapper {
+        hooks: CCHooksMap,
+    }
+    serde_json::from_str::<HooksWrapper>(&raw)
+        .ok()
+        .map(|w| w.hooks)
 }
 
 /// File-based plugin hooks, drilling the CC default layout: `hooks/hooks.json`
