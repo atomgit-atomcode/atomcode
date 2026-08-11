@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +12,8 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
+use tokio_util::sync::CancellationToken;
 
 use super::client::McpClient;
 use super::types::{
@@ -34,7 +35,7 @@ pub struct StdioClient {
     env: BTreeMap<String, String>,
     timeout_ms: u64,
     status: Arc<Mutex<ServerStatus>>,
-    next_id: AtomicU64,
+    next_id: Arc<AtomicU64>,
     process: Arc<Mutex<Option<Child>>>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     reader: Arc<Mutex<Option<BufReader<ChildStdout>>>>,
@@ -53,10 +54,22 @@ pub struct StdioClient {
     /// Serializes teardown + respawn. Concurrent callers that observe the same
     /// dead pipe share one reconnect instead of spawning duplicate servers.
     reconnect_lock: Arc<Mutex<()>>,
+    /// Wakes operations that arrived while an uncertain tool call's transport
+    /// was being rebuilt in the background.
+    recovery_notify: Arc<Notify>,
+    /// Remains true for the complete detached-recovery lifecycle. This cannot
+    /// be inferred from `status`: reconnect deliberately transitions through
+    /// `Failed` while tearing down the old generation.
+    recovery_in_progress: Arc<AtomicBool>,
+    /// Cancels detached recovery when the registry drops the owning client.
+    recovery_cancel: CancellationToken,
+    /// Only the registry-owned instance tears down the shared subprocess.
+    /// Internal recovery clones must leave it alive when their task completes.
+    owns_transport_lifetime: bool,
     /// Advances after every successful initialize handshake. A waiter compares
     /// its failed generation after taking `reconnect_lock` to detect that another
     /// caller already repaired the connection.
-    connection_generation: AtomicU64,
+    connection_generation: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -93,7 +106,7 @@ impl StdioClient {
             env,
             timeout_ms: timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
             status: Arc::new(Mutex::new(ServerStatus::Disconnected)),
-            next_id: AtomicU64::new(1),
+            next_id: Arc::new(AtomicU64::new(1)),
             process: Arc::new(Mutex::new(None)),
             stdin: Arc::new(Mutex::new(None)),
             reader: Arc::new(Mutex::new(None)),
@@ -101,7 +114,11 @@ impl StdioClient {
             request_lock: Arc::new(Mutex::new(())),
             operation_lock: Arc::new(Mutex::new(())),
             reconnect_lock: Arc::new(Mutex::new(())),
-            connection_generation: AtomicU64::new(0),
+            recovery_notify: Arc::new(Notify::new()),
+            recovery_in_progress: Arc::new(AtomicBool::new(false)),
+            recovery_cancel: CancellationToken::new(),
+            owns_transport_lifetime: true,
+            connection_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -195,7 +212,19 @@ impl StdioClient {
 
         // Write request (NDJSON).
         {
-            let mut stdin = self.stdin.lock().await;
+            let mut stdin = tokio::time::timeout_at(deadline, self.stdin.lock())
+                .await
+                .with_context(|| {
+                    format!(
+                        "MCP request {method} timed out after {}ms waiting for stdin",
+                        self.timeout_ms
+                    )
+                })
+                .map_err(|error| RequestAttemptError {
+                    error,
+                    generation,
+                    request_may_have_been_sent: false,
+                })?;
             let stdin = stdin.as_mut().ok_or_else(|| RequestAttemptError {
                 error: anyhow::Error::new(StdioConnectionClosed("MCP stdin closed")),
                 generation,
@@ -362,6 +391,72 @@ impl StdioClient {
         }
     }
 
+    async fn wait_for_background_recovery(&self) -> Result<()> {
+        loop {
+            let notified = self.recovery_notify.notified();
+            if !self.recovery_in_progress.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            tokio::time::timeout(Duration::from_millis(self.timeout_ms), notified)
+                .await
+                .context("MCP stdio connection recovery timed out")?;
+        }
+    }
+
+    async fn reconnect_unknown_tool_in_background(
+        &self,
+        failed_generation: u64,
+        first_error: String,
+    ) {
+        // Publish the barrier before spawning: a queued operation must never
+        // race ahead and write another request into the uncertain generation.
+        self.recovery_in_progress.store(true, Ordering::Release);
+        *self.status.lock().await = ServerStatus::Connecting;
+        let client = self.clone_for_recovery();
+        tokio::spawn(async move {
+            let error = anyhow::anyhow!(first_error);
+            tokio::select! {
+                _ = client.recovery_cancel.cancelled() => {
+                    // The registry/runtime owner went away while recovery was
+                    // in flight. Finish teardown here in case the owner's
+                    // best-effort Drop could not acquire the process lock.
+                    client.clear_transport().await;
+                }
+                _ = client.reconnect_after_failure(failed_generation, &error) => {}
+            }
+            client.recovery_in_progress.store(false, Ordering::Release);
+            client.recovery_notify.notify_waiters();
+        });
+    }
+
+    /// Clone the shared transport state for one detached recovery task.
+    ///
+    /// This is intentionally not a public `Clone` implementation: only the
+    /// registry-owned instance controls the subprocess lifetime.
+    fn clone_for_recovery(&self) -> Self {
+        Self {
+            server_name: self.server_name.clone(),
+            command: self.command.clone(),
+            args: self.args.clone(),
+            env: self.env.clone(),
+            timeout_ms: self.timeout_ms,
+            status: self.status.clone(),
+            next_id: self.next_id.clone(),
+            process: self.process.clone(),
+            stdin: self.stdin.clone(),
+            reader: self.reader.clone(),
+            preread_line: self.preread_line.clone(),
+            request_lock: self.request_lock.clone(),
+            operation_lock: self.operation_lock.clone(),
+            reconnect_lock: self.reconnect_lock.clone(),
+            recovery_notify: self.recovery_notify.clone(),
+            recovery_in_progress: self.recovery_in_progress.clone(),
+            recovery_cancel: self.recovery_cancel.clone(),
+            owns_transport_lifetime: false,
+            connection_generation: self.connection_generation.clone(),
+        }
+    }
+
     async fn send_request_with_reconnect(
         &self,
         method: &str,
@@ -369,26 +464,24 @@ impl StdioClient {
         retry_after_send: bool,
     ) -> Result<serde_json::Value> {
         let _operation = self.operation_lock.lock().await;
+        self.wait_for_background_recovery().await?;
         match self.send_request(method, params.clone()).await {
             Ok(value) => Ok(value),
             Err(attempt) if is_reconnectable_stdio_error(&attempt.error) => {
+                if attempt.request_may_have_been_sent && !retry_after_send {
+                    let first_error = format!("{:#}", attempt.error);
+                    self.reconnect_unknown_tool_in_background(attempt.generation, first_error)
+                        .await;
+                    return Err(attempt.error).context(
+                        "MCP tool execution result is unknown; request was not replayed to avoid \
+                         duplicate side effects, and stdio recovery continues in the background",
+                    );
+                }
                 if let Err(reconnect_error) = self
                     .reconnect_after_failure(attempt.generation, &attempt.error)
                     .await
                 {
-                    if attempt.request_may_have_been_sent && !retry_after_send {
-                        return Err(reconnect_error).context(
-                            "MCP tool execution result is unknown and the stdio connection \
-                             could not be recovered",
-                        );
-                    }
                     return Err(reconnect_error);
-                }
-                if attempt.request_may_have_been_sent && !retry_after_send {
-                    return Err(attempt.error).context(
-                        "MCP connection recovered, but tool execution result is unknown; \
-                         request was not replayed to avoid duplicate side effects",
-                    );
                 }
                 match self.send_request(method, params).await {
                     Ok(value) => Ok(value),
@@ -676,6 +769,10 @@ fn windows_wrap_command(command: &str, args: &[String]) -> (String, Vec<String>)
 
 impl Drop for StdioClient {
     fn drop(&mut self) {
+        if !self.owns_transport_lifetime {
+            return;
+        }
+        self.recovery_cancel.cancel();
         // Try to kill the subprocess gracefully
         if let Ok(mut process) = self.process.try_lock() {
             if let Some(mut child) = process.take() {
@@ -779,5 +876,35 @@ mod tests {
         let (cmd, args) = wrap_cmd_script("python", &["-m".into(), "server".into()], "cmd.exe");
         assert_eq!(cmd, "python");
         assert_eq!(args, vec!["-m", "server"]);
+    }
+
+    #[tokio::test]
+    async fn background_recovery_barrier_survives_transient_failed_status() {
+        let client = StdioClient::new(
+            "test".to_string(),
+            "unused".to_string(),
+            Vec::new(),
+            BTreeMap::new(),
+            Some(1_000),
+        );
+        client.recovery_in_progress.store(true, Ordering::Release);
+        *client.status.lock().await = ServerStatus::Failed("tearing down".to_string());
+
+        let waiter_client = client.clone_for_recovery();
+        let mut waiter =
+            tokio::spawn(async move { waiter_client.wait_for_background_recovery().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiter)
+                .await
+                .is_err(),
+            "a transient Failed status must not let requests bypass recovery"
+        );
+
+        client.recovery_in_progress.store(false, Ordering::Release);
+        client.recovery_notify.notify_waiters();
+        waiter
+            .await
+            .expect("waiter task should complete")
+            .expect("recovery barrier should open");
     }
 }

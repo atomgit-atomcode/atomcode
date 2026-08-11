@@ -29,22 +29,28 @@ fn main() -> io::Result<()> {
 
         let id = request.get("id").cloned();
         let response = match method {
-            "initialize" => id.map(|id| {
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "protocolVersion": "2025-11-05",
-                        "capabilities": {
-                            "tools": {}
-                        },
-                        "serverInfo": {
-                            "name": "mcp-test-server",
-                            "version": "0.1.0"
+            "initialize" => {
+                sleep_from_env_when_marker_exists(
+                    "MCP_TEST_INITIALIZE_DELAY_MARKER",
+                    "MCP_TEST_INITIALIZE_DELAY_MS",
+                )?;
+                id.map(|id| {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": "2025-11-05",
+                            "capabilities": {
+                                "tools": {}
+                            },
+                            "serverInfo": {
+                                "name": "mcp-test-server",
+                                "version": "0.1.0"
+                            }
                         }
-                    }
+                    })
                 })
-            }),
+            }
             "tools/list" => id.map(|id| {
                 if std::env::var_os("MCP_TEST_EXIT_ON_EVERY_TOOLS_LIST").is_some() {
                     std::process::exit(0);
@@ -162,6 +168,16 @@ fn sleep_from_env(name: &str) -> io::Result<()> {
         .parse::<u64>()
         .map_err(io::Error::other)?;
     std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+    Ok(())
+}
+
+fn sleep_from_env_when_marker_exists(marker_name: &str, delay_name: &str) -> io::Result<()> {
+    let Some(marker) = std::env::var_os(marker_name) else {
+        return Ok(());
+    };
+    if std::path::Path::new(&marker).exists() {
+        sleep_from_env(delay_name)?;
+    }
     Ok(())
 }
 
