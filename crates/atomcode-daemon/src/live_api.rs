@@ -749,6 +749,11 @@ pub(crate) enum LiveWireEvent {
     },
     #[serde(rename = "user_input_resolved")]
     UserInputResolved { request_id: u64 },
+    #[serde(rename = "policy_intervention")]
+    PolicyIntervention {
+        code: atomcode_kernel::event::PolicyInterventionCode,
+        actions: Vec<atomcode_kernel::event::PolicyRecoveryAction>,
+    },
     /// One or more live inputs were folded into the active turn. The exact
     /// payload lets browser clients acknowledge their FIFO pending-steer UI
     /// without guessing from text deltas or turn terminals.
@@ -874,6 +879,10 @@ impl NativeLiveWireProjector {
                         duration_ms: started.elapsed().as_millis() as u64,
                     }
                 }
+                Kernel::PolicyIntervention { intervention } => LiveWireEvent::PolicyIntervention {
+                    code: intervention.code,
+                    actions: intervention.actions,
+                },
                 Kernel::Usage(meta) => LiveWireEvent::Tokens {
                     prompt: meta.tokens.prompt as usize,
                     completion: meta.tokens.completion as usize,
@@ -2758,6 +2767,24 @@ mod tests {
         assert_eq!(json["reset_label"], "5h");
         assert_eq!(json["secs_until_reset"], 7200);
         assert_eq!(json["server_message"], "provider quota exhausted");
+    }
+
+    #[test]
+    fn native_live_projector_preserves_policy_recovery_contract() {
+        let mut projector = NativeLiveWireProjector::default();
+        let wire = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::PolicyIntervention {
+                    intervention:
+                        atomcode_kernel::event::PolicyIntervention::credential_shell_blocked(),
+                }),
+            ))
+            .expect("policy intervention must reach the live wire");
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "policy_intervention");
+        assert_eq!(json["code"], "credential_shell_blocked");
+        assert_eq!(json["actions"].as_array().map(Vec::len), Some(4));
+        assert!(!json.to_string().contains("WECOM_WEBHOOK_URL"));
     }
 
     #[test]

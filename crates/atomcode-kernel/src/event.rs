@@ -11,6 +11,48 @@ pub const ROUND_CAP_CHECKPOINT_KIND: &str = "round_cap_checkpoint";
 
 pub type RequestId = u64;
 
+/// Stable machine-readable reason for a hard policy intervention. Drivers use
+/// this code to select trusted, localized presentation; it never carries model
+/// input, rejected command bytes, or credentials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PolicyInterventionCode {
+    CredentialShellBlocked,
+}
+
+/// Recovery actions a driver may safely offer after a hard policy terminal.
+/// None of these actions authorizes the rejected generic-shell operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PolicyRecoveryAction {
+    CompleteExternally,
+    SkipStep,
+    ViewSafeInstructions,
+    EndTask,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyIntervention {
+    pub code: PolicyInterventionCode,
+    pub actions: Vec<PolicyRecoveryAction>,
+}
+
+impl PolicyIntervention {
+    pub fn credential_shell_blocked() -> Self {
+        Self {
+            code: PolicyInterventionCode::CredentialShellBlocked,
+            actions: vec![
+                PolicyRecoveryAction::CompleteExternally,
+                PolicyRecoveryAction::SkipStep,
+                PolicyRecoveryAction::ViewSafeInstructions,
+                PolicyRecoveryAction::EndTask,
+            ],
+        }
+    }
+}
+
 /// A user input that was authoritatively folded into an already-running turn.
 /// Kept separate from persisted [`crate::message::Message`]: this is a transient
 /// acknowledgement payload for drivers correlating their local pending UI.
@@ -177,6 +219,12 @@ pub enum AgentEvent {
     },
     ToolResult {
         result: ToolResult,
+    },
+    /// A hard policy boundary stopped the turn, with a driver-safe recovery
+    /// contract. Emitted only after every tool call in the batch has a paired
+    /// result and immediately before the authoritative PolicyDenied terminal.
+    PolicyIntervention {
+        intervention: PolicyIntervention,
     },
     /// Generic middleware ↔ driver round-trip. Kernel is agnostic to kind/payload.
     Request {

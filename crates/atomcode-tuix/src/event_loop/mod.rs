@@ -16132,6 +16132,9 @@ fn handle_user_input_key(
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
     use atomcode_capabilities::tools::request_user_input::UserInputMode;
+    if app.state.pending_policy_intervention.is_some() {
+        return handle_policy_intervention_key(app, ctx, renderer, code);
+    }
     // A multi-question batch is handled by its own self-contained handler (keeps the
     // single-question path below untouched → N==1 behavior is literally unchanged).
     if app.state.user_input_batch.is_some() {
@@ -16283,6 +16286,92 @@ fn handle_user_input_key(
             }
         }
         // Any other key is ignored (no state change, no repaint needed).
+        _ => return Ok(()),
+    }
+    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    Ok(())
+}
+
+fn handle_policy_intervention_key(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    code: KeyCode,
+) -> Result<()> {
+    use atomcode_kernel::event::PolicyRecoveryAction;
+
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(panel) = app.state.user_input_panel.as_mut() {
+                panel.move_up();
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(panel) = app.state.user_input_panel.as_mut() {
+                panel.move_down();
+            }
+        }
+        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+            if let Some(panel) = app.state.user_input_panel.as_mut() {
+                let index = (c as usize) - ('1' as usize);
+                if index < panel.options.len() {
+                    panel.cursor = index;
+                }
+            }
+        }
+        KeyCode::Esc => {
+            app.state.pending_policy_intervention = None;
+            app.state.user_input_panel = None;
+            app.state.phase = UiPhase::Idle;
+        }
+        KeyCode::Enter => {
+            let index = app
+                .state
+                .user_input_panel
+                .as_ref()
+                .map(|panel| panel.cursor)
+                .unwrap_or(0);
+            let action = app
+                .state
+                .pending_policy_intervention
+                .as_ref()
+                .and_then(|intervention| intervention.actions.get(index))
+                .copied();
+            match action {
+                Some(PolicyRecoveryAction::ViewSafeInstructions) => {
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::PolicyRecoverySafeInstructions)
+                            .into_owned(),
+                    ));
+                    renderer.flush();
+                }
+                Some(PolicyRecoveryAction::CompleteExternally)
+                | Some(PolicyRecoveryAction::SkipStep) => {
+                    let text = if matches!(action, Some(PolicyRecoveryAction::CompleteExternally)) {
+                        POLICY_RECOVERY_COMPLETE_EXTERNALLY_MESSAGE
+                    } else {
+                        POLICY_RECOVERY_SKIP_STEP_MESSAGE
+                    };
+                    if submit_foreground_runtime(ctx, runtime_user_input(text.to_string(), vec![]))
+                    {
+                        app.state.pending_policy_intervention = None;
+                        app.state.user_input_panel = None;
+                        app.state.on_submit();
+                    } else {
+                        renderer.render(UiLine::Error(
+                            "policy recovery could not start a new turn".into(),
+                        ));
+                        renderer.flush();
+                    }
+                }
+                Some(PolicyRecoveryAction::EndTask) | None => {
+                    app.state.pending_policy_intervention = None;
+                    app.state.user_input_panel = None;
+                    app.state.phase = UiPhase::Idle;
+                }
+                Some(_) => {}
+            }
+        }
         _ => return Ok(()),
     }
     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
@@ -17040,9 +17129,35 @@ mod background_notice_tests {
         assert!(saved.contains("安全策略") || saved.contains("security policy"));
         assert!(!saved.contains("WECOM_WEBHOOK_URL"));
         assert!(state.turn_error_line_shown);
-        assert!(matches!(
-            renderer.lines.as_slice(),
-            [UiLine::Error(message)] if message == saved
+        let [UiLine::Error(message)] = renderer.lines.as_slice() else {
+            panic!("credential policy denial must render one sanitized error");
+        };
+        assert_eq!(message, saved);
+    }
+
+    #[test]
+    fn policy_intervention_opens_a_closed_driver_owned_choice_panel() {
+        let mut state = crate::state::UiState::new();
+        state.pending_policy_intervention =
+            Some(atomcode_kernel::event::PolicyIntervention::credential_shell_blocked());
+
+        activate_policy_intervention(&mut state);
+
+        assert_eq!(state.phase, crate::state::UiPhase::UserInput);
+        let panel = state.user_input_panel.as_ref().expect("recovery panel");
+        assert_eq!(panel.options.len(), 4);
+        assert!(
+            !panel.custom,
+            "policy recovery must not offer free-form input"
+        );
+        let rendered = panel
+            .options
+            .iter()
+            .flat_map(|(label, description)| [label.as_str(), description.as_deref().unwrap_or("")])
+            .collect::<String>();
+        assert!(!rendered.contains("WECOM_WEBHOOK_URL"));
+        assert!(!rendered.contains(
+            atomcode_capabilities::tools::credential_bash_gate::CREDENTIAL_BASH_DENIAL_REASON
         ));
     }
 }
@@ -18178,6 +18293,9 @@ fn project_kernel_event(
                 success: !result.is_error,
                 duration: started.elapsed(),
             })
+        }
+        Kernel::PolicyIntervention { intervention } => {
+            Some(AgentEvent::PolicyIntervention(intervention))
         }
         Kernel::Usage(meta) => Some(project_token_usage(meta)),
         Kernel::Error { message, .. } => Some(AgentEvent::Error {
@@ -21213,6 +21331,9 @@ fn handle_agent_event(
             state.on_tool_call_streaming(&display_tool_name(&name));
         }
         AgentEvent::PhaseChange(_) => {}
+        AgentEvent::PolicyIntervention(intervention) => {
+            state.pending_policy_intervention = Some(intervention);
+        }
         AgentEvent::TurnComplete {
             duration,
             total_tokens,
@@ -21322,6 +21443,24 @@ fn handle_agent_event(
             }
             renderer.flush();
             complete_turn_presentation(state, renderer);
+            if matches!(stop_reason, ui_event::UiTurnStopReason::PolicyDenied) {
+                if ctx.caps.tty {
+                    activate_policy_intervention(state);
+                } else if state.pending_policy_intervention.take().is_some() {
+                    // A pipe/CI consumer cannot answer an interactive choice panel.
+                    // Emit fixed local guidance and remain idle instead of hanging.
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::PolicyRecoverySafeInstructions)
+                            .into_owned(),
+                    ));
+                }
+                redraw_idle_plain(buf, state, ctx, renderer);
+            } else {
+                // A persistence/runtime failure may replace the kernel's policy
+                // terminal after the intervention event was forwarded. Never
+                // carry that recovery contract into an unrelated later turn.
+                state.pending_policy_intervention = None;
+            }
 
             // Reset the think stripper between turns. If the previous turn
             // left an unclosed `<think>` in flight (cancelled mid-stream,
@@ -24639,6 +24778,68 @@ fn render_credential_policy_error(state: &mut UiState, renderer: &mut dyn Render
     state.last_policy_denial_reason = Some(message.clone());
     state.turn_error_line_shown = true;
     renderer.render(UiLine::Error(message));
+}
+
+const POLICY_RECOVERY_COMPLETE_EXTERNALLY_MESSAGE: &str =
+    "The blocked authenticated step was completed externally. Continue from the next step. Do not request, read, or expose credentials.";
+const POLICY_RECOVERY_SKIP_STEP_MESSAGE: &str =
+    "Skip the blocked authenticated step and continue with the remaining task. Do not retry credential extraction or generic-shell secret handling.";
+
+fn activate_policy_intervention(state: &mut UiState) {
+    use atomcode_capabilities::tools::request_user_input::{
+        UserInputMode, UserInputOption, UserInputRequest,
+    };
+    use atomcode_kernel::event::PolicyRecoveryAction;
+
+    let Some(intervention) = state.pending_policy_intervention.as_ref() else {
+        return;
+    };
+    let options = intervention
+        .actions
+        .iter()
+        .map(|action| {
+            let (label, description) = match action {
+                PolicyRecoveryAction::CompleteExternally => (
+                    crate::i18n::Msg::PolicyRecoveryComplete,
+                    crate::i18n::Msg::PolicyRecoveryCompleteDesc,
+                ),
+                PolicyRecoveryAction::SkipStep => (
+                    crate::i18n::Msg::PolicyRecoverySkip,
+                    crate::i18n::Msg::PolicyRecoverySkipDesc,
+                ),
+                PolicyRecoveryAction::ViewSafeInstructions => (
+                    crate::i18n::Msg::PolicyRecoveryInstructions,
+                    crate::i18n::Msg::PolicyRecoveryInstructionsDesc,
+                ),
+                PolicyRecoveryAction::EndTask => (
+                    crate::i18n::Msg::PolicyRecoveryEnd,
+                    crate::i18n::Msg::PolicyRecoveryEndDesc,
+                ),
+                _ => (
+                    crate::i18n::Msg::PolicyRecoveryEnd,
+                    crate::i18n::Msg::PolicyRecoveryEndDesc,
+                ),
+            };
+            UserInputOption {
+                label: crate::i18n::t(label).into_owned(),
+                description: Some(crate::i18n::t(description).into_owned()),
+            }
+        })
+        .collect();
+    let request = UserInputRequest {
+        header: crate::i18n::t(crate::i18n::Msg::PolicyRecoveryHeader).into_owned(),
+        question: crate::i18n::t(crate::i18n::Msg::PolicyRecoveryQuestion).into_owned(),
+        mode: UserInputMode::Single,
+        options,
+        custom: false,
+    };
+    let mut panel = crate::state::UserInputPanel::new(0, &request);
+    // Model-authored choice requests force an Other row. This is a driver-owned
+    // closed recovery contract, so remove that escape hatch explicitly.
+    panel.custom = false;
+    panel.checked.truncate(panel.options.len());
+    state.user_input_panel = Some(panel);
+    state.phase = UiPhase::UserInput;
 }
 
 /// A tool result that is an approval/user DENIAL → a calm compact label

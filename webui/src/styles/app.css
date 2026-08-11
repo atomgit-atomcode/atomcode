@@ -2128,6 +2128,31 @@ body {
   line-height: 1.4;
 }
 
+.policy-recovery-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 12px;
+}
+.policy-recovery-action {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+}
+.policy-recovery-action:disabled { cursor: wait; opacity: 0.6; }
+.policy-recovery-instructions {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: var(--corner-radius-small);
+  background: var(--app-tool-background);
+  color: var(--app-secondary-foreground);
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-line;
+}
+
 /* Single-line text input (Other option in single/multiple mode). */
 .user-input-text {
   width: 100%;

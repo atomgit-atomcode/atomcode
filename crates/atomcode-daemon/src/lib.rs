@@ -3086,6 +3086,13 @@ pub enum ChatEvent {
         #[serde(flatten)]
         payload: serde_json::Value,
     },
+    /// A security policy stopped the turn and offers only driver-owned, safe
+    /// recovery actions. Rejected commands and credentials are never included.
+    #[serde(rename = "policy_intervention")]
+    PolicyIntervention {
+        code: atomcode_kernel::event::PolicyInterventionCode,
+        actions: Vec<atomcode_kernel::event::PolicyRecoveryAction>,
+    },
     /// Chat was stopped by user
     #[serde(rename = "stopped")]
     Stopped,
@@ -3222,6 +3229,22 @@ mod chat_event_type_tests {
             }]
         ));
         assert_eq!(projector.total_tokens, 12);
+    }
+
+    #[test]
+    fn native_policy_intervention_reaches_non_live_chat_without_secret_material() {
+        let mut projector = ChatRuntimeProjector::default();
+        let events =
+            projector.project_agent(atomcode_kernel::event::AgentEvent::PolicyIntervention {
+                intervention: atomcode_kernel::event::PolicyIntervention::credential_shell_blocked(
+                ),
+            });
+
+        let json = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(json["type"], "policy_intervention");
+        assert_eq!(json["code"], "credential_shell_blocked");
+        assert!(json.get("command").is_none());
+        assert!(json.get("credential").is_none());
     }
 
     #[test]
@@ -3890,6 +3913,12 @@ impl ChatRuntimeProjector {
                 vec![ChatEvent::Warning { message }]
             }
             Agent::Warning(message) => vec![ChatEvent::Warning { message }],
+            Agent::PolicyIntervention { intervention } => {
+                vec![ChatEvent::PolicyIntervention {
+                    code: intervention.code,
+                    actions: intervention.actions,
+                }]
+            }
             Agent::RateLimited {
                 reset_at_display,
                 reset_label,

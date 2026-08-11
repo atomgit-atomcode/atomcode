@@ -398,6 +398,17 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ToolDenied => "已拒绝".into(),
         Msg::ToolBlockedBySecurityPolicy =>
             "安全策略已阻止工具调用：凭据不能通过通用 shell 参数、临时文件或环境变量传递".into(),
+        Msg::PolicyRecoveryHeader => "需要安全决策".into(),
+        Msg::PolicyRecoveryQuestion => "凭据操作已被拦截，AtomCode 下一步应如何处理？".into(),
+        Msg::PolicyRecoveryComplete => "我已在外部完成".into(),
+        Msg::PolicyRecoveryCompleteDesc => "从下一步骤开启新回合，不暴露凭据".into(),
+        Msg::PolicyRecoverySkip => "跳过该步骤".into(),
+        Msg::PolicyRecoverySkipDesc => "继续其余工作，不再尝试提取凭据".into(),
+        Msg::PolicyRecoveryInstructions => "查看安全执行指引".into(),
+        Msg::PolicyRecoveryInstructionsDesc => "仅展示本地固定指引和占位符".into(),
+        Msg::PolicyRecoveryEnd => "结束任务".into(),
+        Msg::PolicyRecoveryEndDesc => "关闭本次介入，不调用模型".into(),
+        Msg::PolicyRecoverySafeInstructions => "安全手动路径：\n  1. 打开一个由你控制的独立终端。\n  2. 使用服务官方登录流程或凭据感知的专用工具。\n  3. 在该终端完成认证操作；不要把密钥粘贴到 AtomCode。\n  4. 返回这里并选择“我已在外部完成”。\nAtomCode 不会重构或展示刚才被拒绝的命令。".into(),
 
         Msg::CmdSwitchedAutoMode => "  已切换到自动模式(所有工具自动批准)。\n".into(),
         Msg::CmdSwitchedAcceptEditsMode => "  已切换到自动接受编辑模式(文件编辑免审批;bash 仍会询问)。\n".into(),

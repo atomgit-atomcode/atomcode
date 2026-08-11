@@ -826,9 +826,33 @@ impl LiveViewHub {
                 replay = true;
             }
             CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { snapshot, .. }) => {
+                // A policy intervention is a terminal, driver-owned recovery
+                // contract rather than in-flight transcript. Keep only that
+                // structured event across the snapshot commit so a reconnect
+                // can still present the safe choices. The next accepted input,
+                // session transition, or runtime replacement clears replay.
+                let terminal_intervention = match &event {
+                    CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                        reason: atomcode_kernel::event::StopReason::PolicyDenied,
+                        ..
+                    }) => state
+                        .replay
+                        .iter()
+                        .find(|observation| {
+                            matches!(
+                                &observation.event,
+                                LiveViewEvent::Runtime(CodingRuntimeEvent::Agent(
+                                    AgentEvent::PolicyIntervention { .. }
+                                ))
+                            )
+                        })
+                        .cloned(),
+                    _ => None,
+                };
                 state.snapshot = Some(snapshot.clone());
                 state.snapshot_error = None;
                 state.replay.clear();
+                state.replay.extend(terminal_intervention);
                 state.pending_requests.clear();
                 state.pending_web_steers.clear();
                 state.turn_active = false;
@@ -1506,6 +1530,75 @@ mod tests {
             during.replay[0].event,
             LiveViewEvent::Runtime(CodingRuntimeEvent::Agent(AgentEvent::TurnStarted))
         ));
+    }
+
+    #[test]
+    fn policy_terminal_keeps_only_safe_intervention_for_reconnect() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind("session-1", PathBuf::from("/one"), snapshot("old"), control)
+            .unwrap();
+        for (sequence, event) in [
+            (1, CodingRuntimeEvent::Agent(AgentEvent::TurnStarted)),
+            (
+                2,
+                CodingRuntimeEvent::Agent(AgentEvent::PolicyIntervention {
+                    intervention:
+                        atomcode_kernel::event::PolicyIntervention::credential_shell_blocked(),
+                }),
+            ),
+        ] {
+            hub.publish(
+                &binding,
+                SequencedRuntimeEvent {
+                    generation: 1,
+                    sequence,
+                    event,
+                },
+            )
+            .unwrap();
+        }
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 3,
+                event: CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                    turn_id: 1,
+                    reason: atomcode_kernel::event::StopReason::PolicyDenied,
+                    snapshot: Arc::new(snapshot("committed")),
+                    stats: Default::default(),
+                }),
+            },
+        )
+        .unwrap();
+
+        let joined = hub.join().unwrap();
+        assert_eq!(joined.replay.len(), 1);
+        assert!(matches!(
+            &joined.replay[0].event,
+            LiveViewEvent::Runtime(CodingRuntimeEvent::Agent(
+                AgentEvent::PolicyIntervention { .. }
+            ))
+        ));
+
+        hub.submit(UserInput {
+            text: "continue safely".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
+        assert!(hub
+            .join()
+            .unwrap()
+            .replay
+            .iter()
+            .all(|observation| !matches!(
+                &observation.event,
+                LiveViewEvent::Runtime(CodingRuntimeEvent::Agent(
+                    AgentEvent::PolicyIntervention { .. }
+                ))
+            )));
     }
 
     #[test]

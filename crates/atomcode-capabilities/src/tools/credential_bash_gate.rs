@@ -1,6 +1,7 @@
 //! Fail-closed guard for extracting credentials through the generic bash tool.
 
 use async_trait::async_trait;
+use atomcode_kernel::event::PolicyIntervention;
 use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
 use atomcode_kernel::request::RequestCtx;
 use atomcode_kernel::tool::{Tool, ToolCall};
@@ -217,7 +218,10 @@ impl ToolMiddleware for CredentialBashGate {
             // Hard boundary: stop before the model can retry the same extraction
             // through a different shell spelling. The kernel persists the paired
             // blocked ToolResult before emitting PolicyDenied.
-            Some(reason) => BeforeOutcome::deny_turn(reason),
+            Some(reason) => BeforeOutcome::deny_turn_with_intervention(
+                reason,
+                PolicyIntervention::credential_shell_blocked(),
+            ),
             None => BeforeOutcome::Proceed,
         }
     }
@@ -266,7 +270,10 @@ mod tests {
             "ssh host 'grep TOKEN /srv/app/.env.prod'",
         ] {
             assert!(
-                matches!(outcome(command).await, BeforeOutcome::DenyTurn { .. }),
+                matches!(
+                    outcome(command).await,
+                    BeforeOutcome::DenyTurnWithIntervention { .. }
+                ),
                 "must deny and terminate the turn: {command}"
             );
         }

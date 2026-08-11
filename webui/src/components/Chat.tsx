@@ -27,7 +27,7 @@
 
 import { VNode } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, postLiveCompact, postLiveUserInput, postChatUserInput, type CommandResult, UserInputRequestEvent } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, postLiveCompact, postLiveUserInput, postChatUserInput, type CommandResult, UserInputRequestEvent, type PolicyInterventionEvent } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -45,6 +45,7 @@ import { AttachMenu } from './AttachMenu';
 import { FilePicker } from './FilePicker';
 import { PermissionCard } from './PermissionCard';
 import { UserInputCard } from './UserInputCard';
+import { PolicyInterventionCard } from './PolicyInterventionCard';
 import { useT } from '../settings';
 import type { MsgKey } from '../i18n';
 import {
@@ -546,6 +547,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // Pending structured input from either transport. The event's optional session_id
   // selects `/chat/user-input`; live requests answer the bound `/live` runtime.
   const [userInputReq, setUserInputReq] = useState<UserInputRequestEvent | null>(null);
+  const [policyIntervention, setPolicyIntervention] = useState<PolicyInterventionEvent | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef<string | null>(null);
   const liveAbortRef = useRef<AbortController | null>(null);
@@ -677,6 +679,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       setQueued([]);
       setLivePending(null);
       setUserInputReq(null);
+      setPolicyIntervention(null);
       onPermissionResolved?.(null);
 
       const cached = sessionId ? messageCacheRef.current.get(sessionId) : undefined;
@@ -1291,6 +1294,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           // 残留的审批卡片，否则 webui 会一直挂着一张「等待批准…」的卡片直到刷新。
           setLivePending(null);
           setUserInputReq(null);
+          if (e.stop_reason !== 'policy_denied') setPolicyIntervention(null);
           // turn 完成后 session 已落盘，通知 App 刷新侧栏列表。
           onLiveTurnDone?.();
         }
@@ -1327,6 +1331,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       }
       case 'user_input_resolved': {
         setUserInputReq((current) => resolveUserInputRequest(current, e.request_id));
+        break;
+      }
+      case 'policy_intervention': {
+        setPolicyIntervention(e);
         break;
       }
       default: {
@@ -1552,7 +1560,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           ]);
           return;
         }
-        return deliver(text, [], modeState.confirmedMode);
+        void deliver(text, [], modeState.confirmedMode);
       },
       execServerCommand: async (command, arg) => {
         const SESSION_MUTATING = new Set(['undo', 'compact']);
@@ -1822,6 +1830,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setUserInputReq(event);
         break;
 
+      case 'policy_intervention':
+        setPolicyIntervention(event);
+        break;
+
       case 'done': {
         // 标记这是本 Chat 自己产生的会话 id，避免下面的 useEffect 误把当前对话清空，
         // 并标记其历史「已就位」（就是当前画布），防止 project_hash 回填后重新加载覆盖。
@@ -1843,6 +1855,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setBusy(false);
         onPermissionResolved?.(null); // 回合结束：兜底清掉任何残留审批卡片
         setUserInputReq(null);
+        if (event.stop_reason !== 'policy_denied') setPolicyIntervention(null);
         break;
       }
 
@@ -1948,10 +1961,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     text: string,
     images: ImageData[],
     approvalMode: ApprovalMode = modeState.confirmedMode,
-  ) {
+  ): Promise<boolean> {
     if (!chatRecoveryPolicy(chatRecoveryRef.current).allowSend) {
       pushCommandNotice(t('chat.recoveryBlocked'));
-      return;
+      return false;
     }
     // Actually sending a message (immediate OR drained from the queue) re-engages
     // auto-follow — the user wants to see their message + the reply. Placed HERE, not in
@@ -2031,12 +2044,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         }
         setQueued([]);
         setHistoryHint(t('chat.connError', { msg: String(error) }));
-        return;
+        return false;
       }
       // 消息发出后延迟刷新侧栏列表，给后端落盘时间；
       // turn 完成后 state(running=false) 会再刷一次确保更新。
       setTimeout(() => onLiveTurnDone?.(), 200);
-      return;
+      return true;
     }
 
     // ── Normal path ──
@@ -2121,6 +2134,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         !keepStopAlias
       ) requestIdRef.current = null;
     }
+    return !keepStopAlias;
   }
 
   function sendMessage() {
@@ -2793,6 +2807,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     />
   );
 
+  // The kernel event precedes the authoritative terminal by design. Do not
+  // allow a recovery submit until the runtime has actually returned to idle.
+  const policyInterventionCard = policyIntervention && !busy && (
+    <PolicyInterventionCard
+      intervention={policyIntervention}
+      onClose={() => setPolicyIntervention(null)}
+      onSubmit={(message) => deliver(message, [])}
+    />
+  );
+
   // 落地页快捷提示胶囊：点击把文本填入输入框并聚焦（不自动发送，便于二次编辑）。
   const quickChips: { label: string; insert: string }[] = [
     { label: t('chat.chipReview'), insert: '/review ' },
@@ -2842,6 +2866,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         {filePickerModal}
         {livePermissionCard}
         {userInputCard}
+        {policyInterventionCard}
       </>
     );
   }
@@ -3133,6 +3158,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       {filePickerModal}
       {livePermissionCard}
       {userInputCard}
+      {policyInterventionCard}
     </>
   );
 }

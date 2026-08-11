@@ -273,6 +273,19 @@ const zh = {
   'userInput.other': 'Other',
   'userInput.error': '提交失败，请重试',
 
+  'policyRecovery.title': '安全策略需要你的选择',
+  'policyRecovery.question': '凭据保护已阻止不安全的 shell 操作。请选择安全的后续处理方式：',
+  'policyRecovery.complete': '我已在外部完成',
+  'policyRecovery.completeDesc': '在独立终端完成认证步骤后，从下一安全步骤继续。',
+  'policyRecovery.skip': '跳过此步骤',
+  'policyRecovery.skipDesc': '不执行被拦截的认证步骤，继续其余安全工作。',
+  'policyRecovery.instructions': '查看安全操作说明',
+  'policyRecovery.instructionsDesc': '仅在本地显示说明，不向模型或 shell 传递凭据。',
+  'policyRecovery.end': '结束任务',
+  'policyRecovery.endDesc': '保持当前安全拦截结果，不再继续本轮任务。',
+  'policyRecovery.safeInstructions': '请在独立终端中使用服务官方登录流程或凭据感知工具完成认证。不要把密钥、令牌或认证文件内容粘贴到对话中。AtomCode 不会还原或展示被拦截的命令。完成后选择“我已在外部完成”。',
+  'policyRecovery.submitError': '无法启动恢复回合，请重试或结束任务。',
+
   // Sync toggle
   'sync.toggle': '同步当前会话',
   'sync.on': '已同步（多端实时）',
@@ -598,6 +611,19 @@ const en: Record<MsgKey, string> = {
   'userInput.close': 'Close and skip',
   'userInput.other': 'Other',
   'userInput.error': 'Submit failed, please retry',
+
+  'policyRecovery.title': 'Security policy needs your decision',
+  'policyRecovery.question': 'Credential protection blocked an unsafe shell operation. Choose a safe next step:',
+  'policyRecovery.complete': 'I completed it externally',
+  'policyRecovery.completeDesc': 'Complete authentication in a separate terminal, then continue from the next safe step.',
+  'policyRecovery.skip': 'Skip this step',
+  'policyRecovery.skipDesc': 'Do not run the blocked authenticated step; continue with the remaining safe work.',
+  'policyRecovery.instructions': 'View safe instructions',
+  'policyRecovery.instructionsDesc': 'Show local guidance without sending a credential to the model or shell.',
+  'policyRecovery.end': 'End task',
+  'policyRecovery.endDesc': 'Keep the security denial and do not continue this task.',
+  'policyRecovery.safeInstructions': 'Use the service\'s official login flow or a credential-aware tool in a separate terminal. Do not paste secrets, tokens, or authentication-file contents into chat. AtomCode will not reconstruct or display the rejected command. When finished, choose “I completed it externally”.',
+  'policyRecovery.submitError': 'Could not start the recovery turn. Retry or end the task.',
 
   // Sync toggle
   'sync.toggle': 'Sync current session',

@@ -34,6 +34,7 @@ export type SSEEvent =
   | { type: 'warning'; message: string }
   | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
+  | PolicyInterventionEvent
   // Artifact events: the daemon's ArtifactDetector strips fenced code blocks from
   // TextDelta and emits them as separate artifact_start / artifact_content / artifact_end
   // events (see ArtifactDetector in crates/atomcode-daemon/src/lib.rs). Without handling
@@ -696,6 +697,18 @@ export interface ApprovalModeResponse {
   mode: ApprovalMode;
 }
 
+export type PolicyRecoveryAction =
+  | 'complete_externally'
+  | 'skip_step'
+  | 'view_safe_instructions'
+  | 'end_task';
+
+export interface PolicyInterventionEvent {
+  type: 'policy_intervention';
+  code: string;
+  actions: PolicyRecoveryAction[];
+}
+
 export type LiveWireEvent =
   | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; mode: ApprovalMode }
   | { type: 'provider'; provider: string }
@@ -716,6 +729,7 @@ export type LiveWireEvent =
   | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string }
   | { type: 'user_input_request'; request_id: number; header: string; question: string; mode: 'single' | 'multiple' | 'text'; options: { label: string; description?: string }[] }
   | { type: 'user_input_resolved'; request_id: number }
+  | PolicyInterventionEvent
   | { type: 'steered'; count: number; inputs: { text: string; images: ImageData[] }[]; client_input_ids: Array<string | null> }
   | { type: 'session_switched'; session_id: string }
   | { type: 'session_renamed'; session_id: string; name: string }

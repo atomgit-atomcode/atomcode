@@ -47,6 +47,7 @@ pub enum UiEvent {
         success: bool,
         duration: Duration,
     },
+    PolicyIntervention(atomcode_kernel::event::PolicyIntervention),
     ApprovalNeeded {
         tool_name: String,
         reason: String,

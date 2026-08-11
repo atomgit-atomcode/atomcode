@@ -419,6 +419,17 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ToolDenied => "denied".into(),
         Msg::ToolBlockedBySecurityPolicy =>
             "Tool call blocked by security policy: credentials cannot be passed through generic shell arguments, temporary files, or environment variables".into(),
+        Msg::PolicyRecoveryHeader => "Security decision required".into(),
+        Msg::PolicyRecoveryQuestion => "The credential operation was blocked. What should AtomCode do next?".into(),
+        Msg::PolicyRecoveryComplete => "I completed it externally".into(),
+        Msg::PolicyRecoveryCompleteDesc => "Start a new turn from the next step without exposing credentials".into(),
+        Msg::PolicyRecoverySkip => "Skip this step".into(),
+        Msg::PolicyRecoverySkipDesc => "Continue with the remaining work and do not retry credential extraction".into(),
+        Msg::PolicyRecoveryInstructions => "View safe instructions".into(),
+        Msg::PolicyRecoveryInstructionsDesc => "Show fixed local guidance with placeholders only".into(),
+        Msg::PolicyRecoveryEnd => "End task".into(),
+        Msg::PolicyRecoveryEndDesc => "Close this intervention without calling the model".into(),
+        Msg::PolicyRecoverySafeInstructions => "Safe manual path:\n  1. Open a separate terminal you control.\n  2. Use the service's documented login flow or a credential-aware typed tool.\n  3. Complete the authenticated operation there; do not paste the secret into AtomCode.\n  4. Return here and choose ‘I completed it externally’.\nAtomCode intentionally does not reconstruct or display the rejected command.".into(),
 
         Msg::CmdSwitchedAutoMode => "  Switched to auto mode (all tools auto-approved).\n".into(),
         Msg::CmdSwitchedAcceptEditsMode => {

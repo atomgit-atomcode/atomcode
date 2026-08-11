@@ -456,6 +456,17 @@ pub enum Msg<'a> {
     /// The credential-aware Bash policy rejected a tool call. Fixed text only:
     /// never reflect the rejected command or model-controlled middleware output.
     ToolBlockedBySecurityPolicy,
+    PolicyRecoveryHeader,
+    PolicyRecoveryQuestion,
+    PolicyRecoveryComplete,
+    PolicyRecoveryCompleteDesc,
+    PolicyRecoverySkip,
+    PolicyRecoverySkipDesc,
+    PolicyRecoveryInstructions,
+    PolicyRecoveryInstructionsDesc,
+    PolicyRecoveryEnd,
+    PolicyRecoveryEndDesc,
+    PolicyRecoverySafeInstructions,
 
     // ── Execution mode ──
     CmdSwitchedAutoMode,

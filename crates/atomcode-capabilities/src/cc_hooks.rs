@@ -849,7 +849,7 @@ fn stronger(a: BeforeOutcome, b: BeforeOutcome) -> BeforeOutcome {
             BeforeOutcome::Allow { .. } => 1,
             BeforeOutcome::Ask { .. } => 2,
             BeforeOutcome::Deny { .. } => 3,
-            BeforeOutcome::DenyTurn { .. } => 4,
+            BeforeOutcome::DenyTurn { .. } | BeforeOutcome::DenyTurnWithIntervention { .. } => 4,
         }
     }
     if rank(&b) >= rank(&a) {

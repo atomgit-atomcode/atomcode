@@ -1,6 +1,6 @@
 use crate::checkpoint::{CompactionCheckpoint, CompactionCheckpointError};
 use crate::clock::{Clock, SystemClock};
-use crate::event::{AgentCommand, AgentEvent, StopReason, ToolBatchCall};
+use crate::event::{AgentCommand, AgentEvent, PolicyIntervention, StopReason, ToolBatchCall};
 use crate::hook::{
     Continuation, ContinuationKind, ContinuationVisibility, HookChain, LifecycleHooks, TurnCtx,
 };
@@ -3052,6 +3052,7 @@ impl RunningAgent {
             }
             let mut plans: Vec<CallPlan> = Vec::with_capacity(pending_calls.len());
             let mut terminal_policy_denial_seen = false;
+            let mut policy_intervention: Option<PolicyIntervention> = None;
             for mut call in pending_calls {
                 // ── DUPLICATE TOOL-CALL DEDUP GATE ──
                 // Some (esp. thinking-mode / weak) models emit the SAME tool_call
@@ -3166,6 +3167,14 @@ impl RunningAgent {
                                     break;
                                 }
                                 BeforeOutcome::DenyTurn { reason } => {
+                                    blocked = Some((reason, true));
+                                    break;
+                                }
+                                BeforeOutcome::DenyTurnWithIntervention {
+                                    reason,
+                                    intervention,
+                                } => {
+                                    policy_intervention = Some(intervention);
                                     blocked = Some((reason, true));
                                     break;
                                 }
@@ -3531,6 +3540,10 @@ impl RunningAgent {
                 });
             }
             if policy_denied {
+                if let Some(intervention) = policy_intervention {
+                    self.rt
+                        .emit(AgentEvent::PolicyIntervention { intervention });
+                }
                 self.finish_turn(convo, StopReason::PolicyDenied, &turn_ctx)
                     .await;
                 return;
