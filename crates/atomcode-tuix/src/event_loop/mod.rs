@@ -25331,6 +25331,7 @@ mod install_password_modal_tests {
             legacy_conhost: false,
             jediterm: false,
             modern_emulator: false,
+            kitty_keyboard: false,
         }
     }
 

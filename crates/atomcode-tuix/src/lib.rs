@@ -88,14 +88,14 @@ struct TerminalGuard {
 
 /// Whether to push the Kitty keyboard protocol (CSI u progressive
 /// enhancement) for this terminal. True only on a real non-Windows TTY
-/// that is not JediTerm. Windows has no `CSI u` decoder and JediTerm
+/// positively identified as compatible. Windows has no `CSI u` decoder and JediTerm
 /// mis-frames mouse reports as kitty key events once the protocol is
 /// armed — both leak raw bytes into the input box (see the call site for
 /// the full rationale). Pure so it can be unit-tested without touching
 /// the real stdout. Mirrored by the resume-path gate in
 /// `RetainedRenderer::resume_after_external`.
 pub(crate) fn should_enable_kitty_keyboard(caps: &TerminalCaps) -> bool {
-    caps.tty && !cfg!(windows) && !caps.jediterm
+    caps.tty && !cfg!(windows) && caps.kitty_keyboard
 }
 
 /// Kitty keyboard features used by the TUI.
@@ -952,6 +952,7 @@ mod panic_restore_tests {
             legacy_conhost: false,
             jediterm: false,
             modern_emulator: true,
+            kitty_keyboard: true,
         }
     }
 

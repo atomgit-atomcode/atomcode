@@ -8405,7 +8405,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // Without this the terminal keeps sending CSI u sequences
         // (e.g. `9;5:3u`) for every keypress after we exit, and
         // the parent shell echoes them as literal gibberish.
-        if self.caps.tty {
+        if crate::should_enable_kitty_keyboard(&self.caps) {
             let _ = execute!(self.out, PopKeyboardEnhancementFlags);
         }
         // Be defensive: re-enable autowrap, release any DECSTBM, then
@@ -8616,7 +8616,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // that the cooked-mode child process then echoes back as
         // gibberish. `execute!` is best-effort — terminals that never
         // accepted the push silently ignore the pop.
-        if self.caps.tty {
+        if crate::should_enable_kitty_keyboard(&self.caps) {
             let _ = execute!(self.out, PopKeyboardEnhancementFlags);
         }
         if self.caps.bracketed_paste {
@@ -18129,7 +18129,14 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let sink = CapturingSink(buf.clone());
         let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
+        r.caps.kitty_keyboard = true;
+        assert!(crate::should_enable_kitty_keyboard(&r.caps));
         r.suspend_for_external();
+        let suspend_bytes = buf.lock().unwrap().clone();
+        assert!(
+            String::from_utf8_lossy(&suspend_bytes).contains("\x1b[<1u"),
+            "suspend must pop the CSI-u level AtomCode pushed"
+        );
         buf.lock().unwrap().clear();
 
         r.resume_from_external();
@@ -18139,6 +18146,49 @@ mod tests {
         assert!(
             output.contains("\x1b[>1u") && !output.contains("\x1b[>3u"),
             "resume must enable disambiguation without release reports: {output:?}"
+        );
+    }
+
+    #[test]
+    fn retained_resume_keeps_generic_web_terminal_on_legacy_keys() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink(buf.clone());
+        let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
+        assert!(!r.caps.kitty_keyboard, "generic xterm must be conservative");
+        r.suspend_for_external();
+        let suspend_bytes = buf.lock().unwrap().clone();
+        let suspend_output = String::from_utf8_lossy(&suspend_bytes);
+        assert!(
+            !suspend_output.contains("\x1b[<1u"),
+            "suspend must not pop CSI-u when AtomCode never pushed it: {suspend_output:?}"
+        );
+        buf.lock().unwrap().clear();
+
+        r.resume_from_external();
+
+        let bytes = buf.lock().unwrap().clone();
+        let output = String::from_utf8_lossy(&bytes);
+        assert!(
+            !output.contains("\x1b[>1u"),
+            "resume must not arm CSI-u on a generic web terminal: {output:?}"
+        );
+    }
+
+    #[test]
+    fn retained_shutdown_does_not_pop_generic_web_terminal_keyboard_state() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink(buf.clone());
+        let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
+        assert!(!r.caps.kitty_keyboard, "generic xterm must be conservative");
+        buf.lock().unwrap().clear();
+
+        r.shutdown();
+
+        let bytes = buf.lock().unwrap().clone();
+        let output = String::from_utf8_lossy(&bytes);
+        assert!(
+            !output.contains("\x1b[<1u"),
+            "shutdown must not pop CSI-u when AtomCode never pushed it: {output:?}"
         );
     }
 

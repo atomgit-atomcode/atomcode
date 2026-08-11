@@ -676,6 +676,7 @@ mod tests {
             legacy_conhost: false,
             jediterm: false,
             modern_emulator: false,
+            kitty_keyboard: false,
         }
     }
 
@@ -695,6 +696,7 @@ mod tests {
             legacy_conhost: false,
             jediterm: true,
             modern_emulator: false,
+            kitty_keyboard: false,
         }
     }
 
