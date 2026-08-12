@@ -1903,6 +1903,11 @@ pub enum Msg<'a> {
     /// when it usually isn't. The elapsed timer already conveys duration; this adds
     /// only the one thing not otherwise surfaced mid-stream — that esc cancels.
     StreamStalled,
+    StreamRecoveryRunning {
+        attempt: u32,
+        max_attempts: u32,
+    },
+    StreamRecoverySucceeded,
 
     // ── legacy Windows console (conhost) one-shot hint ──
     /// Shown once at startup ONLY on the classic Windows console host

@@ -380,11 +380,7 @@ pub(crate) fn cluster_width(g: &str) -> usize {
             max_w = w;
         }
     }
-    if has_emoji_marker {
-        2
-    } else {
-        max_w
-    }
+    if has_emoji_marker { 2 } else { max_w }
 }
 
 /// Terminal column width of a string, CJK- and emoji-cluster-aware.
@@ -624,6 +620,73 @@ pub fn truncate_with_ellipsis(s: &str, max_cols: usize) -> String {
     acc
 }
 
+/// Project a single-line editable value into `max_cols`, keeping a visible
+/// caret at `cursor_byte` and adding ellipses on either hidden side. The cursor
+/// must be on a UTF-8 boundary; callers that edit by grapheme naturally satisfy
+/// that invariant.
+pub fn editable_value_projection(value: &str, cursor_byte: usize, max_cols: usize) -> String {
+    const CARET: &str = "│";
+    const ELLIPSIS: &str = "…";
+
+    if max_cols == 0 {
+        return String::new();
+    }
+    if max_cols == 1 {
+        return CARET.to_string();
+    }
+
+    let cursor = cursor_byte.min(value.len());
+    let before = &value[..cursor];
+    let after = &value[cursor..];
+    let before_width = display_width(before);
+    let after_width = display_width(after);
+    let text_budget = max_cols - 1;
+    if before_width + after_width <= text_budget {
+        return format!("{before}{CARET}{after}");
+    }
+
+    let mut left_budget = text_budget / 2;
+    let mut right_budget = text_budget - left_budget;
+    if after_width < right_budget {
+        left_budget += right_budget - after_width;
+        right_budget = after_width;
+    }
+    if before_width < left_budget {
+        right_budget += left_budget - before_width;
+        left_budget = before_width;
+    }
+
+    let left_hidden = before_width > left_budget;
+    let right_hidden = after_width > right_budget;
+    if left_hidden {
+        left_budget = left_budget.saturating_sub(1);
+    }
+    if right_hidden {
+        right_budget = right_budget.saturating_sub(1);
+    }
+
+    let mut left_width = 0usize;
+    let mut left_parts = Vec::new();
+    for grapheme in before.graphemes(true).rev() {
+        let width = display_width(grapheme);
+        if left_width + width > left_budget {
+            break;
+        }
+        left_parts.push(grapheme);
+        left_width += width;
+    }
+    let left = left_parts.into_iter().rev().collect::<String>();
+    let right = truncate_to_width(after, right_budget);
+    format!(
+        "{}{}{}{}{}",
+        if left_hidden { ELLIPSIS } else { "" },
+        left,
+        CARET,
+        right,
+        if right_hidden { ELLIPSIS } else { "" }
+    )
+}
+
 /// Truncate a file-system path to `max_cols` display columns, using a
 /// path-aware strategy that preserves the **last segment** (the project or
 /// folder name — the most useful bit) and replaces leading segments with
@@ -704,8 +767,8 @@ mod tests {
         assert!(is_wide_emoji_symbol('❄')); // U+2744 snowflake
         assert!(is_wide_emoji_symbol('⭐')); // U+2B50 star
         assert!(is_wide_emoji_symbol('⚡')); // U+26A1 high voltage
-                                             // NOT emoji — must stay narrow, or we'd regress ordinary ambiguous
-                                             // text symbols (the whole point of scoping to the Emoji set).
+        // NOT emoji — must stay narrow, or we'd regress ordinary ambiguous
+        // text symbols (the whole point of scoping to the Emoji set).
         assert!(!is_wide_emoji_symbol('✓')); // U+2713 check mark (Emoji=No)
         assert!(!is_wide_emoji_symbol('°')); // U+00B0 degree sign
         assert!(!is_wide_emoji_symbol('◆')); // U+25C6 black diamond
@@ -723,7 +786,7 @@ mod tests {
         let sun = if emoji_wide_enabled() { 2 } else { 1 };
         assert_eq!(display_width("☀"), sun);
         assert_eq!(display_width("☀ 晴"), sun + 1 + 2); // sun + space + CJK
-                                                        // Ambiguous-but-not-emoji content is never widened by this path.
+        // Ambiguous-but-not-emoji content is never widened by this path.
         assert_eq!(display_width("✓"), 1);
         assert_eq!(display_width("20°C"), 4);
     }
@@ -736,13 +799,13 @@ mod tests {
         assert!(is_narrow_emoji_1f000('\u{1F396}')); // 🎖 military medal
         assert!(is_narrow_emoji_1f000('\u{1F5FA}')); // 🗺 world map
         assert!(is_narrow_emoji_1f000('\u{1F700}')); // 🜀 alchemical symbol
-                                                     // U+1F1E6..=U+1F1FF (Regional Indicator) are excluded.
+        // U+1F1E6..=U+1F1FF (Regional Indicator) are excluded.
         assert!(!is_narrow_emoji_1f000('\u{1F1E6}')); // 🇦 Regional Indicator A
         assert!(!is_narrow_emoji_1f000('\u{1F1FF}')); // 🇿 Regional Indicator Z
-                                                      // Wide emoji (EA=W) are NOT in this set — they're already width 2.
+        // Wide emoji (EA=W) are NOT in this set — they're already width 2.
         assert!(!is_narrow_emoji_1f000('\u{1F4C5}')); // 📅 calendar (EA=W)
         assert!(!is_narrow_emoji_1f000('\u{1F4A7}')); // 💧 droplet (EA=W)
-                                                      // Outside range.
+        // Outside range.
         assert!(!is_narrow_emoji_1f000('a'));
         assert!(!is_narrow_emoji_1f000('你'));
     }
@@ -785,6 +848,15 @@ mod tests {
     #[test]
     fn truncate_to_width_preserves_under_limit() {
         assert_eq!(truncate_to_width("hi", 10), "hi");
+    }
+
+    #[test]
+    fn editable_projection_tracks_middle_cursor_without_splitting_graphemes() {
+        assert_eq!(editable_value_projection("abcdefghij", 5, 8), "…de│fgh…");
+        let text = "a👨‍👩‍👧‍👦好z";
+        let cursor = "a👨‍👩‍👧‍👦".len();
+        let shown = editable_value_projection(text, cursor, 8);
+        assert!(shown.contains("👨‍👩‍👧‍👦│好"), "{shown}");
     }
 
     #[test]

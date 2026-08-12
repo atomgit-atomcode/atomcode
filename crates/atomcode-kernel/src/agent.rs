@@ -124,6 +124,8 @@ const MAX_PROVIDER_RETRIES: u32 = 3;
 /// (partial output discarded), with exponential backoff. Distinct from
 /// `MAX_PROVIDER_RETRIES` (which covers failures at OPEN, before any token).
 const MAX_STREAM_RETRIES: u32 = 5;
+const MAX_PARTIAL_STREAM_RECOVERIES: u32 = 1;
+const PARTIAL_STREAM_RESUME_NUDGE: &str = "[The previous assistant stream timed out after partial output. The preserved assistant message and any interrupted tool results above are authoritative. Continue from that saved progress. Do not repeat completed tool calls or restart the task.]";
 
 /// Safety fuse: maximum consecutive `WaitAndRetry` rate-limit sleeps within a
 /// single turn before the kernel forces a `Pause` stop (RateLimited), regardless
@@ -1855,6 +1857,14 @@ impl RunningAgent {
         // deliberately NOT reset on `open` (a re-open must not refill it mid-round,
         // else a permanently-stalling stream would retry forever within one round).
         let mut stream_retry: u32 = 0;
+        // A partial stream may already contain visible text or complete tool calls.
+        // Replaying that request can duplicate output or side effects, so recover at
+        // most once by preserving it and opening a NEW continuation in this turn.
+        let mut partial_stream_recoveries: u32 = 0;
+        // One-shot marker consumed immediately after breaking out of the stalled
+        // stream. Keep it separate from the turn-wide recovery counter: later 429
+        // retries must retain their normal same-round accounting.
+        let mut retry_is_partial_continuation = false;
         // RATE-LIMIT WaitAndRetry counter for the WHOLE turn: incremented on each
         // WaitAndRetry sleep (OPEN or mid-stream); reset to 0 on a successful open
         // (the window has reopened). Capped at MAX_RATE_LIMIT_WAITS to prevent a
@@ -2157,9 +2167,8 @@ impl RunningAgent {
                     } else {
                         self.hooks.on_rate_limit(&hint).await
                     };
-                    let quiet_first_eligible = host_verdict.is_none()
-                        && hint.retry_after_secs.is_none()
-                        && !hint.terminal;
+                    let quiet_first_eligible =
+                        host_verdict.is_none() && hint.retry_after_secs.is_none() && !hint.terminal;
                     let decision = host_verdict
                         .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint));
                     match decision {
@@ -2340,7 +2349,10 @@ impl RunningAgent {
                         // per-round accumulators reset on `continue`, so partial output is
                         // discarded and never pushed), with exponential backoff. Only after
                         // the budget is spent do we take the clean-fail path.
-                        if !saw_stream_content && stream_retry < MAX_STREAM_RETRIES {
+                        if !saw_stream_content
+                            && partial_stream_recoveries == 0
+                            && stream_retry < MAX_STREAM_RETRIES
+                        {
                             stream_retry += 1;
                             self.rt.emit(AgentEvent::Warning(format!(
                                 "stream idle timeout — reconnecting ({stream_retry}/{MAX_STREAM_RETRIES})"
@@ -2372,8 +2384,30 @@ impl RunningAgent {
                                 &pending_calls,
                                 suppress_internal_stream,
                             );
+                            if partial_stream_recoveries < MAX_PARTIAL_STREAM_RECOVERIES {
+                                partial_stream_recoveries += 1;
+                                self.rt.emit(AgentEvent::StreamRecovery {
+                                    attempt: partial_stream_recoveries,
+                                    max_attempts: MAX_PARTIAL_STREAM_RECOVERIES,
+                                    recovered: false,
+                                });
+                                convo.push(Message::synthetic_user(
+                                    PARTIAL_STREAM_RESUME_NUDGE.to_string(),
+                                ));
+                                stream_retry = 0;
+                                retry_this_round = true;
+                                retry_is_partial_continuation = true;
+                                // This is a new continuation, not a replay of the timed-out
+                                // provider request. Keep the same accepted turn and let the
+                                // outer loop mint a fresh request id/round.
+                                break;
+                            }
                         }
-                        let msg = if saw_stream_content {
+                        let msg = if partial_stream_recoveries
+                            >= MAX_PARTIAL_STREAM_RECOVERIES
+                        {
+                            "stream timed out again after one safe continuation; current progress was preserved; send 'continue' to resume"
+                        } else if saw_stream_content {
                             "stream timeout after partial response; to avoid duplicate output or tool execution, the request was not replayed; partial response preserved"
                         } else {
                             "stream timeout after automatic reconnects"
@@ -2659,7 +2693,13 @@ impl RunningAgent {
             // broke out. Re-issue the same logical round (round was already
             // incremented at the top of the outer loop, so decrement to neutralize).
             if retry_this_round {
-                round -= 1;
+                // A partial-output recovery is an explicit continuation and keeps
+                // its new round number. A content-free reconnect is a replay and
+                // neutralizes the round increment as before.
+                if !retry_is_partial_continuation {
+                    round -= 1;
+                }
+                retry_is_partial_continuation = false;
                 continue;
             }
             // The stream reached a natural end rather than another 429, so this
@@ -2951,6 +2991,13 @@ impl RunningAgent {
                     self.rt.emit(AgentEvent::Warning(
                         "response truncated: finish_reason=length".into(),
                     ));
+                }
+                if partial_stream_recoveries > 0 {
+                    self.rt.emit(AgentEvent::StreamRecovery {
+                        attempt: partial_stream_recoveries,
+                        max_attempts: MAX_PARTIAL_STREAM_RECOVERIES,
+                        recovered: true,
+                    });
                 }
                 self.finish_turn(convo, StopReason::Stopped, &turn_ctx)
                     .await;

@@ -1,5 +1,45 @@
 // crates/atomcode-tuix/src/state.rs
 
+use unicode_segmentation::UnicodeSegmentation;
+
+fn previous_grapheme_boundary(text: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(text.len());
+    text.grapheme_indices(true)
+        .map(|(index, _)| index)
+        .filter(|index| *index < cursor)
+        .next_back()
+        .unwrap_or(0)
+}
+
+fn next_grapheme_boundary(text: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(text.len());
+    text.grapheme_indices(true)
+        .map(|(index, _)| index)
+        .find(|index| *index > cursor)
+        .unwrap_or(text.len())
+}
+
+fn insert_at_cursor(text: &mut String, cursor: &mut usize, inserted: &str) {
+    *cursor = (*cursor).min(text.len());
+    text.insert_str(*cursor, inserted);
+    *cursor += inserted.len();
+}
+
+fn backspace_at_cursor(text: &mut String, cursor: &mut usize) {
+    let start = previous_grapheme_boundary(text, *cursor);
+    if start < *cursor {
+        text.drain(start..*cursor);
+        *cursor = start;
+    }
+}
+
+fn delete_at_cursor(text: &mut String, cursor: &mut usize) {
+    let end = next_grapheme_boundary(text, *cursor);
+    if *cursor < end {
+        text.drain(*cursor..end);
+    }
+}
+
 /// Execution mode (unified). Alias of the shared coding runtime enum so TUI, daemon,
 /// webui share one type. Build = interactive approval; Auto = auto-approve all
 /// (bypass); Plan = read-only. Cycled by Tab / Shift+Tab.
@@ -110,9 +150,13 @@ pub struct UserInputPanel {
     pub checked: Vec<bool>,
     /// Free-form buffer (text mode only) — the standalone `text` mode's input.
     pub text: String,
+    /// UTF-8 byte cursor for `text`, always kept on a grapheme boundary.
+    pub text_cursor_byte: usize,
     /// Free-text buffer for the always-appended "Other" row in single/multiple
     /// mode. Distinct from `text` (which is the standalone text-mode input).
     pub custom_text: String,
+    /// UTF-8 byte cursor for `custom_text`, always kept on a grapheme boundary.
+    pub custom_text_cursor_byte: usize,
     /// Whether the "Other" free-text row is offered. Human-authored choice
     /// questions always set this; internal fixed checkpoints may disable it.
     pub custom: bool,
@@ -151,7 +195,9 @@ impl UserInputPanel {
             cursor: 0,
             checked,
             text: String::new(),
+            text_cursor_byte: 0,
             custom_text: String::new(),
+            custom_text_cursor_byte: 0,
             custom,
             scroll_offset: 0,
         }
@@ -228,6 +274,7 @@ impl UserInputPanel {
                 // concrete option supersedes any typed custom text.
                 if self.cursor < self.options.len() {
                     self.custom_text.clear();
+                    self.custom_text_cursor_byte = 0;
                 }
             }
             Multiple => {
@@ -256,11 +303,69 @@ impl UserInputPanel {
     /// already be on the "Other" row). Inclusion of the custom answer is derived
     /// from `custom_text.trim()` being non-empty — no separate checkbox state.
     pub fn push_custom(&mut self, c: char) {
-        self.custom_text.push(c);
+        insert_at_cursor(
+            &mut self.custom_text,
+            &mut self.custom_text_cursor_byte,
+            c.encode_utf8(&mut [0; 4]),
+        );
     }
     /// Backspace on the "Other" row.
     pub fn pop_custom(&mut self) {
-        self.custom_text.pop();
+        backspace_at_cursor(&mut self.custom_text, &mut self.custom_text_cursor_byte);
+    }
+    pub fn insert_text_char(&mut self, c: char) {
+        insert_at_cursor(
+            &mut self.text,
+            &mut self.text_cursor_byte,
+            c.encode_utf8(&mut [0; 4]),
+        );
+    }
+    pub fn backspace_text(&mut self) {
+        backspace_at_cursor(&mut self.text, &mut self.text_cursor_byte);
+    }
+    pub fn move_text_cursor_left(&mut self) {
+        self.text_cursor_byte = previous_grapheme_boundary(&self.text, self.text_cursor_byte);
+    }
+    pub fn move_text_cursor_right(&mut self) {
+        self.text_cursor_byte = next_grapheme_boundary(&self.text, self.text_cursor_byte);
+    }
+    pub fn move_custom_cursor_left(&mut self) {
+        self.custom_text_cursor_byte =
+            previous_grapheme_boundary(&self.custom_text, self.custom_text_cursor_byte);
+    }
+    pub fn move_custom_cursor_right(&mut self) {
+        self.custom_text_cursor_byte =
+            next_grapheme_boundary(&self.custom_text, self.custom_text_cursor_byte);
+    }
+    pub fn move_active_cursor_home(&mut self) {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        match self.mode {
+            UserInputMode::Text => self.text_cursor_byte = 0,
+            UserInputMode::Single | UserInputMode::Multiple if self.is_other_row() => {
+                self.custom_text_cursor_byte = 0;
+            }
+            _ => {}
+        }
+    }
+    pub fn move_active_cursor_end(&mut self) {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        match self.mode {
+            UserInputMode::Text => self.text_cursor_byte = self.text.len(),
+            UserInputMode::Single | UserInputMode::Multiple if self.is_other_row() => {
+                self.custom_text_cursor_byte = self.custom_text.len();
+            }
+            _ => {}
+        }
+    }
+    pub fn delete_active_cursor(&mut self) {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        match self.mode {
+            UserInputMode::Text => delete_at_cursor(&mut self.text, &mut self.text_cursor_byte),
+            UserInputMode::Single | UserInputMode::Multiple if self.is_other_row() => {
+                delete_at_cursor(&mut self.custom_text, &mut self.custom_text_cursor_byte);
+            }
+            _ => {}
+        }
     }
     /// Insert pasted text into whichever free-text buffer the keyboard would
     /// currently edit: the standalone `text` buffer (Text mode) or the "Other"
@@ -279,10 +384,16 @@ impl UserInputPanel {
             return;
         }
         match self.mode {
-            UserInputMode::Text => self.text.push_str(&flattened),
+            UserInputMode::Text => {
+                insert_at_cursor(&mut self.text, &mut self.text_cursor_byte, &flattened)
+            }
             UserInputMode::Single | UserInputMode::Multiple => {
                 if self.is_other_row() {
-                    self.custom_text.push_str(&flattened);
+                    insert_at_cursor(
+                        &mut self.custom_text,
+                        &mut self.custom_text_cursor_byte,
+                        &flattened,
+                    );
                 }
             }
         }
@@ -562,9 +673,25 @@ mod user_input_custom_tests {
     #[test]
     fn paste_appends_to_text_mode_buffer() {
         let mut p = UserInputPanel::new(1, &req(UserInputMode::Text, false));
-        p.text.push_str("ab");
+        p.insert_paste("ab");
         p.insert_paste("cd");
         assert_eq!(p.text, "abcd", "paste appends to the text-mode buffer");
+        assert_eq!(p.text_cursor_byte, 4);
+    }
+
+    #[test]
+    fn free_text_cursor_edits_on_grapheme_boundaries() {
+        let mut p = UserInputPanel::new(1, &req(UserInputMode::Text, false));
+        p.insert_paste("a👨‍👩‍👧‍👦好");
+        p.move_text_cursor_left();
+        p.insert_text_char('!');
+        assert_eq!(p.text, "a👨‍👩‍👧‍👦!好");
+        p.move_text_cursor_left();
+        p.backspace_text();
+        assert_eq!(p.text, "a!好", "backspace removes the whole family emoji");
+        p.move_active_cursor_home();
+        p.delete_active_cursor();
+        assert_eq!(p.text, "!好");
     }
 
     #[test]
@@ -702,10 +829,7 @@ mod user_input_batch_tests {
 
     #[test]
     fn answer_summary_formats_selected_text_and_unanswered_questions() {
-        let mut b = UserInputBatch::new(
-            1,
-            &[single_q("choice"), text_q("text"), text_q("empty")],
-        );
+        let mut b = UserInputBatch::new(1, &[single_q("choice"), text_q("text"), text_q("empty")]);
         b.questions[0].select_current_option();
         b.questions[1].text.push_str("  atomcode  ");
 
@@ -1459,11 +1583,7 @@ impl UiState {
     /// is available, three ASCII dots (`...`) otherwise. Used by the
     /// spinner label and any other "still working…" suffix.
     pub fn ellipsis(&self) -> &'static str {
-        if self.unicode_symbols {
-            "…"
-        } else {
-            "..."
-        }
+        if self.unicode_symbols { "…" } else { "..." }
     }
 
     /// Merge one `AgentEvent::ContextStats` emission into the cached
@@ -1662,7 +1782,7 @@ impl UiState {
         )
     }
 
-    fn current_thinking(&self) -> &'static str {
+    pub(crate) fn current_thinking(&self) -> &'static str {
         THINKING_LABELS[self.thinking_idx % THINKING_LABELS.len()]
     }
 
@@ -2744,14 +2864,13 @@ mod tests {
         s.on_submit();
         s.on_tool_batch_started();
         let anchor = s.phase_started_at.unwrap();
-        s.active_tool_batches
-            .insert(
-                "b1".into(),
-                ActiveToolBatch {
-                    call_ids: vec![],
-                    edit_displays: std::collections::HashMap::new(),
-                },
-            );
+        s.active_tool_batches.insert(
+            "b1".into(),
+            ActiveToolBatch {
+                call_ids: vec![],
+                edit_displays: std::collections::HashMap::new(),
+            },
+        );
         std::thread::sleep(std::time::Duration::from_millis(15));
         s.on_tool_call_streaming("Bash(a)");
         assert_eq!(
@@ -2791,14 +2910,13 @@ mod tests {
         s.on_submit();
         s.on_tool_batch_started();
         let anchor = s.phase_started_at.unwrap();
-        s.active_tool_batches
-            .insert(
-                "b1".into(),
-                ActiveToolBatch {
-                    call_ids: vec![],
-                    edit_displays: std::collections::HashMap::new(),
-                },
-            );
+        s.active_tool_batches.insert(
+            "b1".into(),
+            ActiveToolBatch {
+                call_ids: vec![],
+                edit_displays: std::collections::HashMap::new(),
+            },
+        );
         std::thread::sleep(std::time::Duration::from_millis(15));
         s.on_thinking();
         assert_eq!(

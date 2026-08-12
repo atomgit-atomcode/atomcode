@@ -6,14 +6,14 @@
 
 use anyhow::Result;
 use atomcode_config::config::provider::{ModelProfileConfig, ProviderAccountConfig};
-use atomcode_config::config::{provider_preset, Config};
+use atomcode_config::config::{Config, provider_preset};
 use crossterm::event::{KeyCode, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::{tab_chip, Modal, ModalAction};
+use super::{Modal, ModalAction, tab_chip};
 use crate::event_loop::{
-    build_status, set_default_provider_and_reload, update_config_and_reload, Buffer,
-    ConfigReloadSelection, LoopCtx,
+    Buffer, ConfigReloadSelection, LoopCtx, build_status, set_default_provider_and_reload,
+    update_config_and_reload,
 };
 use crate::render::{MenuKind, MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
@@ -289,79 +289,9 @@ fn delete_at_cursor(text: &mut String, cursor: &mut usize) {
     }
 }
 
-fn tail_graphemes_to_width(text: &str, max_cols: usize) -> String {
-    let mut kept = Vec::new();
-    let mut width = 0;
-    for grapheme in text.graphemes(true).rev() {
-        let grapheme_width = crate::width::display_width(grapheme);
-        if width + grapheme_width > max_cols {
-            break;
-        }
-        kept.push(grapheme);
-        width += grapheme_width;
-    }
-    kept.into_iter().rev().collect()
-}
-
 /// Build the transient value projection for a focused form field. The source
 /// value is never changed: the visible caret and ellipses exist only in the
 /// `PluginInfo` row sent to the renderer.
-fn editable_value_projection(value: &str, cursor_byte: usize, max_cols: usize) -> String {
-    const CARET: &str = "│";
-    const ELLIPSIS: &str = "…";
-
-    if max_cols == 0 {
-        return String::new();
-    }
-    if max_cols == 1 {
-        return CARET.to_string();
-    }
-
-    let cursor = cursor_byte.min(value.len());
-    let before = &value[..cursor];
-    let after = &value[cursor..];
-    let before_width = crate::width::display_width(before);
-    let after_width = crate::width::display_width(after);
-    let text_budget = max_cols - 1; // reserve the visible caret
-
-    if before_width + after_width <= text_budget {
-        return format!("{before}{CARET}{after}");
-    }
-
-    // Keep the caret near the centre while editing in the middle. At either
-    // endpoint, donate the unused half to the side that still has content.
-    let mut left_budget = text_budget / 2;
-    let mut right_budget = text_budget - left_budget;
-    if after_width < right_budget {
-        left_budget += right_budget - after_width;
-        right_budget = after_width;
-    }
-    if before_width < left_budget {
-        right_budget += left_budget - before_width;
-        left_budget = before_width;
-    }
-
-    let left_hidden = before_width > left_budget;
-    let right_hidden = after_width > right_budget;
-    if left_hidden {
-        left_budget = left_budget.saturating_sub(1);
-    }
-    if right_hidden {
-        right_budget = right_budget.saturating_sub(1);
-    }
-
-    let left = tail_graphemes_to_width(before, left_budget);
-    let right = crate::width::truncate_to_width(after, right_budget);
-    format!(
-        "{}{}{}{}{}",
-        if left_hidden { ELLIPSIS } else { "" },
-        left,
-        CARET,
-        right,
-        if right_hidden { ELLIPSIS } else { "" }
-    )
-}
-
 fn editable_field_row(
     label: &str,
     value: &str,
@@ -373,7 +303,7 @@ fn editable_field_row(
     let prefix = format!("{marker}{label}: ");
     let value_cols = max_cols.saturating_sub(crate::width::display_width(&prefix));
     let displayed = if focused {
-        editable_value_projection(value, cursor_byte, value_cols)
+        crate::width::editable_value_projection(value, cursor_byte, value_cols)
     } else {
         crate::width::truncate_with_ellipsis(value, value_cols)
     };
@@ -1582,8 +1512,8 @@ impl Modal for ProviderPanel {
 
         let mut selected = items.len(); // nothing highlighted by default
         let hint: String; // assigned once per match arm below
-                          // Forms use the box-less `PluginInfo` layout; the list uses the `Plugin`
-                          // layout whose reserved index-2 slot is rendered as the search box.
+        // Forms use the box-less `PluginInfo` layout; the list uses the `Plugin`
+        // layout whose reserved index-2 slot is rendered as the search box.
         let mut kind = MenuKind::PluginInfo;
         let mut buf = String::new();
         // PluginInfo rows are flush-left inside a one-column rule margin.
@@ -2056,7 +1986,7 @@ mod tests {
     #[test]
     fn editable_projection_keeps_the_url_tail_visible_at_end() {
         let url = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1";
-        let shown = editable_value_projection(url, url.len(), 28);
+        let shown = crate::width::editable_value_projection(url, url.len(), 28);
         assert!(
             shown.starts_with('…'),
             "expected hidden-left marker: {shown}"
@@ -2073,7 +2003,7 @@ mod tests {
     fn editable_projection_marks_both_hidden_sides_around_middle_cursor() {
         let url = "https://example.test/a/very/long/provider/path/v1";
         let cursor = url.find("provider").expect("provider segment");
-        let shown = editable_value_projection(url, cursor, 20);
+        let shown = crate::width::editable_value_projection(url, cursor, 20);
         assert!(shown.starts_with('…'), "left marker missing: {shown}");
         assert!(shown.ends_with('…'), "right marker missing: {shown}");
         assert!(shown.contains('│'), "caret missing: {shown}");
@@ -2083,7 +2013,7 @@ mod tests {
     #[test]
     fn editable_projection_keeps_complete_value_when_it_fits() {
         assert_eq!(
-            editable_value_projection("https://x/v1", "https://".len(), 40),
+            crate::width::editable_value_projection("https://x/v1", "https://".len(), 40),
             "https://│x/v1"
         );
     }
@@ -2107,7 +2037,7 @@ mod tests {
         assert!(!acc.is_legacy);
         assert_eq!(acc.base_url, "https://mirror/v1");
         assert!(acc.api_key.is_empty()); // blank = keep existing
-                                         // deepseek is openai-wire → OpenAI-compatible toggle.
+        // deepseek is openai-wire → OpenAI-compatible toggle.
         assert_eq!(acc.protocol_label(), "OpenAI");
     }
 
@@ -2436,14 +2366,18 @@ mod tests {
         // CodingPlan uses the gateway signer — never prompt.
         assert!(!account_needs_key(&cfg, "AtomGit"));
         // The model form shows an api_key field only for the keyless provider.
-        assert!(ModelForm::new_add(&cfg, Some("custom"))
-            .unwrap()
-            .fields()
-            .contains(&ModelField::ApiKey));
-        assert!(!ModelForm::new_add(&cfg, Some("keyed"))
-            .unwrap()
-            .fields()
-            .contains(&ModelField::ApiKey));
+        assert!(
+            ModelForm::new_add(&cfg, Some("custom"))
+                .unwrap()
+                .fields()
+                .contains(&ModelField::ApiKey)
+        );
+        assert!(
+            !ModelForm::new_add(&cfg, Some("keyed"))
+                .unwrap()
+                .fields()
+                .contains(&ModelField::ApiKey)
+        );
     }
 
     #[test]

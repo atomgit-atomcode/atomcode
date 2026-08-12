@@ -23,8 +23,8 @@ pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
 pub(crate) mod ui_event;
 pub(crate) mod usage_monitor;
+pub use commands::{MAX_SESSION_NAME_LEN, perform_session_rename, validate_session_name};
 use commands::{execute_slash_command, format_rate_limited_line};
-pub use commands::{perform_session_rename, validate_session_name, MAX_SESSION_NAME_LEN};
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -32,8 +32,8 @@ use std::time::Duration;
 
 use crate::session::{Session, SessionId};
 use anyhow::Result;
-use atomcode_coding::runtime::{CodingRuntimeEvent, CompactTrigger, CompactionCompletion};
 use atomcode_coding::CodingRuntimeHandle;
+use atomcode_coding::runtime::{CodingRuntimeEvent, CompactTrigger, CompactionCompletion};
 use atomcode_config::config::Config;
 use atomcode_config::{ConfigCommit, ConfigRevision, ConfigSnapshot, ConfigStore};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
@@ -43,11 +43,11 @@ use ui_event::{UiAgentPhase as AgentPhase, UiEvent as AgentEvent};
 use atomcode_kernel::message::ImageContent;
 use base64::Engine;
 
-use crate::commands::{parse_bash_command, parse_slash_line, CommandRegistry};
+use crate::commands::{CommandRegistry, parse_bash_command, parse_slash_line};
 use crate::custom_commands::ArgsRequirement;
-use crate::input::history::History;
-use crate::input::key_action::{classify, Action};
 use crate::input::InputEvent;
+use crate::input::history::History;
+use crate::input::key_action::{Action, classify};
 use crate::render::{Renderer, UiLine};
 use crate::state::{UiPhase, UiState};
 use crate::think::ThinkStripper;
@@ -809,11 +809,7 @@ fn try_attach_at_image_from_path(
     token: &str,
     working_dir: &std::path::Path,
 ) -> Option<(ImageContent, u64)> {
-    let path = resolve_at_image_path(
-        token,
-        working_dir,
-        crate::platform::home_dir().as_deref(),
-    )?;
+    let path = resolve_at_image_path(token, working_dir, crate::platform::home_dir().as_deref())?;
     try_attach_image_from_path(path.to_str()?)
 }
 
@@ -1371,8 +1367,8 @@ fn session_transition_matches(
 #[cfg(test)]
 mod session_resume_tests {
     use super::{
-        commit_pending_projection, session_resume_matches, PendingSessionResume,
-        SessionTransitionEffect,
+        PendingSessionResume, SessionTransitionEffect, commit_pending_projection,
+        session_resume_matches,
     };
     use crate::session::Session;
     use std::path::PathBuf;
@@ -2236,14 +2232,18 @@ mod submit_hold_tests {
             ),
             None
         );
-        assert!(provider_unavailable_announcement(
-            atomcode_coding::ProviderUnavailableReason::AuthenticationRequired
-        )
-        .is_some());
-        assert!(provider_unavailable_announcement(
-            atomcode_coding::ProviderUnavailableReason::UnsupportedBuild
-        )
-        .is_some());
+        assert!(
+            provider_unavailable_announcement(
+                atomcode_coding::ProviderUnavailableReason::AuthenticationRequired
+            )
+            .is_some()
+        );
+        assert!(
+            provider_unavailable_announcement(
+                atomcode_coding::ProviderUnavailableReason::UnsupportedBuild
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -3435,12 +3435,12 @@ pub type RuntimeSpawnOverride =
 #[cfg(test)]
 mod local_restore_scope_tests {
     use super::{
-        bg_runtime, bg_runtime::RuntimeId, complete_mcp_reload_notice,
-        request_context_stats_render, RuntimeControl, RuntimeUiAvailability,
+        RuntimeControl, RuntimeUiAvailability, bg_runtime, bg_runtime::RuntimeId,
+        complete_mcp_reload_notice, request_context_stats_render,
     };
     use atomcode_coding::runtime::{
-        coding_runtime_control_channel, noop_agent_handle, spawn_runtime_owner,
-        CodingRuntimeControl,
+        CodingRuntimeControl, coding_runtime_control_channel, noop_agent_handle,
+        spawn_runtime_owner,
     };
     use atomcode_coding::{
         CodingAgentConfig, DeferredRuntimeState, DriverCommand, ProviderUnavailableReason,
@@ -3582,9 +3582,11 @@ mod local_restore_scope_tests {
             runtime.ui_availability(),
             RuntimeUiAvailability::AwaitingProvider
         );
-        assert!(runtime
-            .dispatch(DriverCommand::Submit(UserInput::from("blocked")))
-            .is_err());
+        assert!(
+            runtime
+                .dispatch(DriverCommand::Submit(UserInput::from("blocked")))
+                .is_err()
+        );
 
         adapter.shutdown().await.unwrap();
     }
@@ -3622,9 +3624,11 @@ mod local_restore_scope_tests {
             runtime.ui_availability(),
             RuntimeUiAvailability::AwaitingProvider
         );
-        assert!(runtime
-            .dispatch(DriverCommand::Submit(UserInput::from("blocked")))
-            .is_err());
+        assert!(
+            runtime
+                .dispatch(DriverCommand::Submit(UserInput::from("blocked")))
+                .is_err()
+        );
         assert!(runtime.dispatch(DriverCommand::Shutdown).is_ok());
         assert!(matches!(
             command_rx.recv().await,
@@ -3657,13 +3661,15 @@ mod local_restore_scope_tests {
         let runtime = RuntimeControl::deferred(command_tx, state_rx);
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
 
-        assert!(runtime
-            .reload_provider(
-                CodingAgentConfig::new("", "", "model", "/project"),
-                RuntimeId::new(1),
-                event_tx,
-            )
-            .is_err());
+        assert!(
+            runtime
+                .reload_provider(
+                    CodingAgentConfig::new("", "", "model", "/project"),
+                    RuntimeId::new(1),
+                    event_tx,
+                )
+                .is_err()
+        );
         assert!(command_rx.try_recv().is_err());
     }
 
@@ -3682,16 +3688,20 @@ mod local_restore_scope_tests {
             command_rx.recv().await,
             Some(DriverCommand::Shutdown)
         ));
-        assert!(runtime
-            .reload_provider(
-                CodingAgentConfig::new("", "", "model", "/project"),
-                RuntimeId::new(1),
-                event_tx,
-            )
-            .is_err());
-        assert!(runtime
-            .dispatch_when_ready(DriverCommand::Submit(UserInput::from("late")))
-            .is_err());
+        assert!(
+            runtime
+                .reload_provider(
+                    CodingAgentConfig::new("", "", "model", "/project"),
+                    RuntimeId::new(1),
+                    event_tx,
+                )
+                .is_err()
+        );
+        assert!(
+            runtime
+                .dispatch_when_ready(DriverCommand::Submit(UserInput::from("late")))
+                .is_err()
+        );
         assert!(command_rx.try_recv().is_err());
 
         adapter.shutdown().await.unwrap();
@@ -5670,7 +5680,14 @@ mod buffer_tests {
 
     #[test]
     fn submit_preserves_prompt_like_chars_without_space() {
-        for source in ["#8，。。。。", "#标题", ">quote", "%value", "λx", "❯git status"] {
+        for source in [
+            "#8，。。。。",
+            "#标题",
+            ">quote",
+            "%value",
+            "λx",
+            "❯git status",
+        ] {
             match commit_of(source) {
                 BufferResult::Commit(s) => assert_eq!(s, source),
                 _ => panic!("expected Commit for {source:?}"),
@@ -6027,15 +6044,17 @@ mod menu_tests {
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         let lock = std::sync::RwLock::new(skills);
 
-        assert!(build_menu_items(
-            "/skills brainstorming why",
-            0,
-            &reg,
-            &custom,
-            Some(&lock),
-            None
-        )
-        .is_none());
+        assert!(
+            build_menu_items(
+                "/skills brainstorming why",
+                0,
+                &reg,
+                &custom,
+                Some(&lock),
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -6104,9 +6123,11 @@ mod menu_tests {
         let items = build_menu_items("/effort", 0, &reg, &custom, None, None)
             .expect("/effort gateway must appear");
         assert!(items.iter().any(|(n, _)| n == "effort"));
-        assert!(!items
-            .iter()
-            .any(|(n, _)| n == "high" || n == "max" || n == "off"));
+        assert!(
+            !items
+                .iter()
+                .any(|(n, _)| n == "high" || n == "max" || n == "off")
+        );
     }
 
     #[test]
@@ -9879,7 +9900,7 @@ mod external_config_tests {
 
         assert_eq!(merged.default_provider, "main"); // selection preserved
         assert_eq!(merged.providers["main"].context_window, 32_000); // edit applied
-                                                                     // And the change is detected, so the runtime is actually reconfigured.
+        // And the change is detected, so the runtime is actually reconfigured.
         assert!(active_provider_config_changed(&current, &merged));
     }
 
@@ -10034,12 +10055,14 @@ mod external_config_tests {
             Some(atomcode_config::locale::Locale::ZhCn),
             "the provider delta must not overwrite an unrelated concurrent edit"
         );
-        assert!(committed
-            .commit
-            .snapshot
-            .config
-            .provider_accounts
-            .contains_key("new-account"));
+        assert!(
+            committed
+                .commit
+                .snapshot
+                .config
+                .provider_accounts
+                .contains_key("new-account")
+        );
     }
 
     #[test]
@@ -10116,13 +10139,15 @@ mod external_config_tests {
         chinese.language = Some(atomcode_config::locale::Locale::ZhCn);
         let external = store.replace(&chinese).unwrap();
 
-        assert!(commit_language_without_reload(
-            &store,
-            Some(&observed.snapshot.revision),
-            &english,
-            atomcode_config::locale::Locale::En,
-        )
-        .is_err());
+        assert!(
+            commit_language_without_reload(
+                &store,
+                Some(&observed.snapshot.revision),
+                &english,
+                atomcode_config::locale::Locale::En,
+            )
+            .is_err()
+        );
         assert_eq!(store.read().unwrap().revision, external.snapshot.revision);
     }
 
@@ -10732,10 +10757,9 @@ pub(crate) fn apply_config_panel_commit(
     success_message: String,
 ) -> Result<PersistedConfigReload, anyhow::Error> {
     if provider_transition_pending(ctx) {
-        let rollback = ctx.config_store.replace_document_if_revision(
-            &commit.snapshot.revision,
-            &previous_document,
-        )?;
+        let rollback = ctx
+            .config_store
+            .replace_document_if_revision(&commit.snapshot.revision, &previous_document)?;
         if rollback.is_some() {
             ctx.observed_config_revision = rollback.map(|commit| commit.snapshot.revision);
         }
@@ -11011,11 +11035,9 @@ fn attach_image_to_input(
     let Some((img, hash)) = img_hash else {
         return Ok(false);
     };
-    if let Some(reject) = image_attach_reject_line(
-        &ctx.config,
-        &ctx.provider_selection,
-        &ctx.model_name,
-    ) {
+    if let Some(reject) =
+        image_attach_reject_line(&ctx.config, &ctx.provider_selection, &ctx.model_name)
+    {
         renderer.render(UiLine::Error(reject));
         renderer.flush();
         if matches!(app.state.phase, UiPhase::Idle) {
@@ -12076,8 +12098,8 @@ fn handle_idle_key(
         let is_ctrl_c = code == KeyCode::Char('c')
             && modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
         let is_bare_esc = code == KeyCode::Esc && app.buf.text.is_empty();
-        let should_pause = is_bare_esc
-            && app.state.goal_phase == atomcode_coding::GoalPhase::Pursuing;
+        let should_pause =
+            is_bare_esc && app.state.goal_phase == atomcode_coding::GoalPhase::Pursuing;
         if is_ctrl_c || should_pause {
             let has_active_turn = ctx.runtime.has_active_turn();
             let sent = if is_ctrl_c {
@@ -12550,11 +12572,9 @@ fn handle_idle_key(
             // ModelArts.81001 "message[N].content[0] has invalid
             // field(s): text, type" for GLM-5.1). Helper in
             // `Config::can_handle_attached_images`.
-            if let Some(reject) = image_attach_reject_line(
-                &ctx.config,
-                &ctx.provider_selection,
-                &ctx.model_name,
-            ) {
+            if let Some(reject) =
+                image_attach_reject_line(&ctx.config, &ctx.provider_selection, &ctx.model_name)
+            {
                 renderer.render(UiLine::Error(reject));
                 renderer.flush();
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
@@ -12726,11 +12746,9 @@ fn handle_idle_key(
             // Reject before clearing the editor when neither the live model nor
             // a configured VL preprocessor can consume it; otherwise the raw
             // path reaches the model and it falls back to a futile read_file.
-            if let Some(reject) = image_attach_reject_line(
-                &ctx.config,
-                &ctx.provider_selection,
-                &ctx.model_name,
-            ) {
+            if let Some(reject) =
+                image_attach_reject_line(&ctx.config, &ctx.provider_selection, &ctx.model_name)
+            {
                 if contains_attachable_at_image(&line, &ctx.working_dir) {
                     renderer.render(UiLine::Error(reject));
                     renderer.flush();
@@ -13336,7 +13354,7 @@ fn midturn_submit_route(streaming: bool) -> SubmitRoute {
 
 #[cfg(test)]
 mod midturn_submit_route_tests {
-    use super::{midturn_submit_route, phase_has_active_turn, SubmitRoute};
+    use super::{SubmitRoute, midturn_submit_route, phase_has_active_turn};
 
     #[test]
     fn midturn_submit_steers_native_runtime() {
@@ -13387,9 +13405,9 @@ pub(crate) fn set_agent_mode(
         .dispatch(atomcode_coding::DriverCommand::SetMode(runtime_mode(mode)))
         .ok();
     atomcode_daemon::live_set_mode(mode); // daemon ApprovalMode == core Mode
-                                          // The footer persistently shows the current mode, so a scrollback feedback line
-                                          // is redundant in the interactive renderer — and it spams on rapid Tab / Shift+Tab
-                                          // cycling. Emit it ONLY in plain mode (pipe / CI), which has no persistent footer.
+    // The footer persistently shows the current mode, so a scrollback feedback line
+    // is redundant in the interactive renderer — and it spams on rapid Tab / Shift+Tab
+    // cycling. Emit it ONLY in plain mode (pipe / CI), which has no persistent footer.
     if ctx.is_plain_renderer {
         let msg = match mode {
             crate::state::AgentMode::Auto => {
@@ -14574,7 +14592,9 @@ fn handle_streaming_key(
             "\x1b[2m"
         };
         let status = if app.state.show_tool_output {
-            format!("{mute}  ○ Verbose mode enabled (tool output + reasoning visible) (Ctrl+o to hide){reset}\n")
+            format!(
+                "{mute}  ○ Verbose mode enabled (tool output + reasoning visible) (Ctrl+o to hide){reset}\n"
+            )
         } else {
             format!(
                 "{mute}  ○ Verbose mode disabled (Ctrl+o to show tool output + reasoning){reset}\n"
@@ -15436,7 +15456,7 @@ fn bypass_approval_choice() -> ApprovalChoice {
 #[cfg(test)]
 mod bypass_approval_tests {
     use super::{
-        apply_startup_bypass, approval_choice_to_decision, bypass_approval_choice, ApprovalChoice,
+        ApprovalChoice, apply_startup_bypass, approval_choice_to_decision, bypass_approval_choice,
     };
     use atomcode_capabilities::tools::approval::PermissionDecision;
 
@@ -15671,7 +15691,7 @@ mod user_input_key_tests {
         p.move_down();
         p.toggle(); // check "B" (cursor 1)
         p.push_custom('x'); // custom_text="x"; no separate auto-check needed
-                            // Enter on option/Other rows is NOT a submit — returns None.
+        // Enter on option/Other rows is NOT a submit — returns None.
         assert!(
             user_input_response_for(&p, KeyCode::Enter).is_none(),
             "Enter on option row must NOT submit in multiple mode"
@@ -15700,7 +15720,7 @@ mod user_input_key_tests {
     fn multiple_custom_text_included_after_enter_on_other_row() {
         let mut p = panel(UserInputMode::Multiple);
         p.toggle(); // check "A"
-                    // Move to Other row and type custom text.
+        // Move to Other row and type custom text.
         p.move_down(); // cursor 1 (B)
         p.move_down(); // cursor 2 (Other)
         assert!(p.is_other_row());
@@ -15857,7 +15877,7 @@ mod user_input_key_tests {
         p.toggle_index(0); // '1' → check "A"
         p.toggle_index(1); // '2' → check "B"
         p.toggle_index(0); // '1' again → uncheck "A"
-                           // Navigate to Submit row and confirm.
+        // Navigate to Submit row and confirm.
         for _ in 0..=p.options.len() {
             p.move_down();
         }
@@ -15873,7 +15893,7 @@ mod user_input_key_tests {
     fn multiple_enter_on_option_row_does_not_submit() {
         let mut p = panel(UserInputMode::Multiple);
         p.toggle(); // check "A" at cursor 0
-                    // Enter on cursor 0 (option "A") must NOT resolve.
+        // Enter on cursor 0 (option "A") must NOT resolve.
         assert!(
             user_input_response_for(&p, KeyCode::Enter).is_none(),
             "Enter on option row in multiple must NOT submit"
@@ -16084,12 +16104,12 @@ fn handle_approval_key(
     }
     deliver_approval(ctx, choice);
     app.state.on_approval_resolved(); // clears approval_panel + phase → Streaming
-                                      // Repaint the footer NOW so the approval panel disappears immediately, the
-                                      // same way the `ApprovalNeeded` handler and the Up/Down arms redraw. Without
-                                      // this, the retained renderer keeps painting its cached `self.status`
-                                      // (approval still `Some`) until the next event that carries a fresh
-                                      // `StatusLine`, leaving a ghost panel over the input box (the inverse of
-                                      // issue #455's "输入框没了" — here the panel lingers after a decision).
+    // Repaint the footer NOW so the approval panel disappears immediately, the
+    // same way the `ApprovalNeeded` handler and the Up/Down arms redraw. Without
+    // this, the retained renderer keeps painting its cached `self.status`
+    // (approval still `Some`) until the next event that carries a fresh
+    // `StatusLine`, leaving a ghost panel over the input box (the inverse of
+    // issue #455's "输入框没了" — here the panel lingers after a decision).
     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
     Ok(())
 }
@@ -16284,13 +16304,66 @@ fn handle_user_input_key(
     match (mode, code) {
         (UserInputMode::Text, KeyCode::Char(c)) => {
             if let Some(p) = app.state.user_input_panel.as_mut() {
-                p.text.push(c);
+                p.insert_text_char(c);
             }
         }
         (UserInputMode::Text, KeyCode::Backspace) => {
             if let Some(p) = app.state.user_input_panel.as_mut() {
-                p.text.pop();
+                p.backspace_text();
             }
+        }
+        (UserInputMode::Text, KeyCode::Left) => {
+            app.state
+                .user_input_panel
+                .as_mut()
+                .unwrap()
+                .move_text_cursor_left();
+        }
+        (UserInputMode::Text, KeyCode::Right) => {
+            app.state
+                .user_input_panel
+                .as_mut()
+                .unwrap()
+                .move_text_cursor_right();
+        }
+        (_, KeyCode::Home) => {
+            app.state
+                .user_input_panel
+                .as_mut()
+                .unwrap()
+                .move_active_cursor_home();
+        }
+        (_, KeyCode::End) => {
+            app.state
+                .user_input_panel
+                .as_mut()
+                .unwrap()
+                .move_active_cursor_end();
+        }
+        (_, KeyCode::Delete) => {
+            app.state
+                .user_input_panel
+                .as_mut()
+                .unwrap()
+                .delete_active_cursor();
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Left)
+            if app.state.user_input_panel.as_ref().unwrap().is_other_row() =>
+        {
+            app.state
+                .user_input_panel
+                .as_mut()
+                .unwrap()
+                .move_custom_cursor_left();
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Right)
+            if app.state.user_input_panel.as_ref().unwrap().is_other_row() =>
+        {
+            app.state
+                .user_input_panel
+                .as_mut()
+                .unwrap()
+                .move_custom_cursor_right();
         }
         (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Up) => {
             if let Some(p) = app.state.user_input_panel.as_mut() {
@@ -16472,12 +16545,7 @@ fn handle_policy_intervention_key(
                     // Recovery acknowledgement is driver-owned. Never turn it into
                     // model input: the prior transcript may contain credential-like
                     // material that a fresh model turn could reconstruct or repeat.
-                    request_policy_intervention_resolution(
-                        &mut app.state,
-                        ctx,
-                        renderer,
-                        action,
-                    );
+                    request_policy_intervention_resolution(&mut app.state, ctx, renderer, action);
                 }
                 Some(PolicyRecoveryAction::EndTask) | None => {
                     request_policy_intervention_resolution(
@@ -16691,14 +16759,35 @@ fn handle_user_input_batch_key(
 
     match (mode, code) {
         (UserInputMode::Text, KeyCode::Char(c)) => {
-            app.state.user_input_batch.as_mut().unwrap().questions[cur]
-                .text
-                .push(c);
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].insert_text_char(c);
         }
         (UserInputMode::Text, KeyCode::Backspace) => {
-            app.state.user_input_batch.as_mut().unwrap().questions[cur]
-                .text
-                .pop();
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].backspace_text();
+        }
+        (UserInputMode::Text, KeyCode::Left) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].move_text_cursor_left();
+        }
+        (UserInputMode::Text, KeyCode::Right) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].move_text_cursor_right();
+        }
+        (_, KeyCode::Home) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].move_active_cursor_home();
+        }
+        (_, KeyCode::End) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].move_active_cursor_end();
+        }
+        (_, KeyCode::Delete) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].delete_active_cursor();
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Left)
+            if app.state.user_input_batch.as_ref().unwrap().questions[cur].is_other_row() =>
+        {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].move_custom_cursor_left();
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Right)
+            if app.state.user_input_batch.as_ref().unwrap().questions[cur].is_other_row() =>
+        {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].move_custom_cursor_right();
         }
         (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Up) => {
             app.state.user_input_batch.as_mut().unwrap().questions[cur].move_up();
@@ -17925,13 +18014,10 @@ fn ephemeral_tool_activity<'a>(tool_display: Option<&str>, chunk: &'a str) -> Op
 }
 
 fn todo_panel_is_active(state: &crate::state::UiState) -> bool {
-    effective_todo_progress(state)
-        .is_some_and(|todo| todo.total > 0 && todo.completed < todo.total)
+    effective_todo_progress(state).is_some_and(|todo| todo.total > 0 && todo.completed < todo.total)
 }
 
-fn effective_todo_progress(
-    state: &crate::state::UiState,
-) -> Option<&crate::render::TodoProgress> {
+fn effective_todo_progress(state: &crate::state::UiState) -> Option<&crate::render::TodoProgress> {
     state
         .pending_todo_preview
         .as_ref()
@@ -18103,7 +18189,9 @@ fn update_subtask_progress(
 }
 
 fn task_call_id_from_team_run(run_id: &str) -> Option<&str> {
-    run_id.strip_prefix("task:").filter(|call_id| !call_id.is_empty())
+    run_id
+        .strip_prefix("task:")
+        .filter(|call_id| !call_id.is_empty())
 }
 
 fn correlate_task_team_progress(
@@ -18230,22 +18318,26 @@ mod subtask_progress_projection_tests {
         assert_eq!(progress.items[0].model, "deepseek-v4-flash");
         assert!(progress.items[0].started_at.is_none());
 
-        assert!(update_subtask_progress(
-            &mut progress,
-            "\u{21bb} explore#1 \u{b7} deepseek-v4-flash \u{b7} inspect atomcode",
-        )
-        .is_none());
+        assert!(
+            update_subtask_progress(
+                &mut progress,
+                "\u{21bb} explore#1 \u{b7} deepseek-v4-flash \u{b7} inspect atomcode",
+            )
+            .is_none()
+        );
         assert_eq!(progress.items[0].status, SubtaskStatus::Running);
         assert_eq!(progress.items[0].model, "deepseek-v4-flash");
         assert!(progress.items[0].started_at.is_some());
         assert_eq!(progress.items[1].status, SubtaskStatus::Pending);
         assert!(progress.items[1].started_at.is_none());
 
-        assert!(update_subtask_progress(
-            &mut progress,
-            "\u{1e}explore#1 \u{b7} 已读取 commands.rs，正在分析内容 \u{b7} tokens=384",
-        )
-        .is_none());
+        assert!(
+            update_subtask_progress(
+                &mut progress,
+                "\u{1e}explore#1 \u{b7} 已读取 commands.rs，正在分析内容 \u{b7} tokens=384",
+            )
+            .is_none()
+        );
         assert_eq!(
             progress.items[0].activity,
             "已读取 commands.rs，正在分析内容"
@@ -18272,16 +18364,20 @@ mod subtask_progress_projection_tests {
             "replayed terminal events must not duplicate scrollback"
         );
 
-        assert!(update_subtask_progress(
-            &mut progress,
-            "\u{21bb} explore#2 \u{b7} deepseek-v4-flash \u{b7} inspect codex",
-        )
-        .is_none());
-        assert!(update_subtask_progress(
-            &mut progress,
-            "\u{1e}explore#2 \u{b7} checking completion \u{b7} tokens=725",
-        )
-        .is_none());
+        assert!(
+            update_subtask_progress(
+                &mut progress,
+                "\u{21bb} explore#2 \u{b7} deepseek-v4-flash \u{b7} inspect codex",
+            )
+            .is_none()
+        );
+        assert!(
+            update_subtask_progress(
+                &mut progress,
+                "\u{1e}explore#2 \u{b7} checking completion \u{b7} tokens=725",
+            )
+            .is_none()
+        );
         progress.items[1].started_at =
             Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
         let failed = update_subtask_progress(
@@ -18422,7 +18518,7 @@ fn is_incomplete_review_result(name: &str, output: &str, success: bool) -> bool 
 
 #[cfg(test)]
 mod tool_output_stream_gate_tests {
-    use super::{display_tool_name, streams_tool_output_by_default, DISPATCH_TOOL_RAW_NAME};
+    use super::{DISPATCH_TOOL_RAW_NAME, display_tool_name, streams_tool_output_by_default};
 
     #[test]
     fn dispatch_tool_streams_without_verbose() {
@@ -18592,7 +18688,7 @@ fn project_token_usage(meta: atomcode_kernel::message::MessageMeta) -> AgentEven
 
 #[cfg(test)]
 mod token_usage_projection_tests {
-    use super::{project_token_usage, AgentEvent};
+    use super::{AgentEvent, project_token_usage};
     use atomcode_kernel::message::MessageMeta;
     use atomcode_kernel::stream::TokenUsage;
 
@@ -18696,6 +18792,15 @@ fn project_kernel_event(
             snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
         }),
         Kernel::Warning(message) => Some(AgentEvent::Warning(message)),
+        Kernel::StreamRecovery {
+            attempt,
+            max_attempts,
+            recovered,
+        } => Some(AgentEvent::StreamRecovery {
+            attempt,
+            max_attempts,
+            recovered,
+        }),
         Kernel::RateLimited {
             reset_at_display,
             reset_label,
@@ -19166,8 +19271,8 @@ fn handle_runtime_event(
                 }
                 CodingRuntimeEvent::Request(request) => {
                     use atomcode_capabilities::tools::{
-                        request_user_input::{UserInputResponse, REQUEST_USER_INPUT_KIND},
-                        ApprovalRequest, APPROVAL_KIND,
+                        APPROVAL_KIND, ApprovalRequest,
+                        request_user_input::{REQUEST_USER_INPUT_KIND, UserInputResponse},
                     };
                     if request.kind == REQUEST_USER_INPUT_KIND {
                         match classify_tui_user_input(request.payload) {
@@ -19809,9 +19914,12 @@ fn handle_runtime_event(
                         match expected_persisted_revision.as_ref() {
                             Some(_) => match ctx.config_store.read() {
                                 Ok(snapshot) => (Some(snapshot.revision), None),
-                                Err(error) => (None, Some(format!(
-                                "runtime reloaded, but the active config revision could not be verified: {error}"
-                                ))),
+                                Err(error) => (
+                                    None,
+                                    Some(format!(
+                                        "runtime reloaded, but the active config revision could not be verified: {error}"
+                                    )),
+                                ),
                             },
                             None => (None, None),
                         };
@@ -20317,7 +20425,7 @@ fn apply_native_session_changed(
         Ok(None) => {
             return Err(format!(
                 "Session {session_id} disappeared after runtime switch"
-            ))
+            ));
         }
         Err(error) => return Err(format!("Failed to resolve session {session_id}: {error}")),
     };
@@ -21467,9 +21575,7 @@ fn handle_agent_event(
                         progress.completed = progress
                             .items
                             .iter()
-                            .filter(|item| {
-                                item.status == crate::render::SubtaskStatus::Completed
-                            })
+                            .filter(|item| item.status == crate::render::SubtaskStatus::Completed)
                             .count();
                         renderer.render(UiLine::AgentGroup {
                             progress,
@@ -22194,6 +22300,27 @@ fn handle_agent_event(
             renderer.render(UiLine::Warning(w));
             renderer.flush();
         }
+        AgentEvent::StreamRecovery {
+            attempt,
+            max_attempts,
+            recovered,
+        } => {
+            if recovered {
+                state.spinner_label = state.current_thinking().to_string();
+                renderer.render(UiLine::Muted(
+                    crate::i18n::t(crate::i18n::Msg::StreamRecoverySucceeded).into_owned(),
+                ));
+            } else {
+                state.spinner_label = crate::i18n::t(crate::i18n::Msg::StreamRecoveryRunning {
+                    attempt,
+                    max_attempts,
+                })
+                .into_owned();
+            }
+            // Keep the running state transient in the existing streaming row;
+            // only the recovered marker enters scrollback.
+            renderer.flush();
+        }
         AgentEvent::HookWarningHint(msg) => {
             if let Ok(mut slot) = ctx.hook_warning_hint.lock() {
                 *slot = Some(msg);
@@ -22576,15 +22703,13 @@ fn handle_agent_event(
                     (display_tool_name_short(&c.name), detail.clone(), true),
                 );
             }
-            state
-                .active_tool_batches
-                .insert(
-                    batch_id.clone(),
-                    crate::state::ActiveToolBatch {
-                        call_ids,
-                        edit_displays: std::collections::HashMap::new(),
-                    },
-                );
+            state.active_tool_batches.insert(
+                batch_id.clone(),
+                crate::state::ActiveToolBatch {
+                    call_ids,
+                    edit_displays: std::collections::HashMap::new(),
+                },
+            );
             // Anchor the spinner clock to the batch start. The interleaved
             // per-tool events that follow won't reset it (they no-op the reset
             // while a batch is active), so the elapsed-ms ticks steadily instead
@@ -22616,7 +22741,8 @@ fn handle_agent_event(
                 // goal) so the badge reads `round 1 · <fresh time>` — NOT on mid-Pursuing
                 // updates that also carry round==0 (e.g. AdjustGoalRounds), which would
                 // otherwise rewind a fresh goal's clock mid-first-turn.
-                if goal_clock_should_reset(entering_from_pursuing, state.goal_started_at.is_none()) {
+                if goal_clock_should_reset(entering_from_pursuing, state.goal_started_at.is_none())
+                {
                     state.goal_started_at = Some(std::time::Instant::now());
                 }
             } else {
@@ -23366,8 +23492,8 @@ fn clipboard_image_hint_changed(
 #[cfg(test)]
 mod clipboard_hint_tests {
     use super::{
-        active_clipboard_hint, apply_clipboard_observation, observe_clipboard_image,
-        publish_clipboard_hint, rgba_fingerprint, ClipboardCheckState,
+        ClipboardCheckState, active_clipboard_hint, apply_clipboard_observation,
+        observe_clipboard_image, publish_clipboard_hint, rgba_fingerprint,
     };
     use std::time::{Duration, Instant};
 
@@ -23903,7 +24029,9 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             cursor: p.cursor,
             checked: p.checked.clone(),
             text: p.text.clone(),
+            text_cursor_byte: p.text_cursor_byte,
             custom_text: p.custom_text.clone(),
+            custom_text_cursor_byte: p.custom_text_cursor_byte,
             custom: p.custom,
             scroll_offset: if b.on_submit_stop() {
                 b.submit_scroll_offset
@@ -23933,7 +24061,9 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
                 cursor: p.cursor,
                 checked: p.checked.clone(),
                 text: p.text.clone(),
+                text_cursor_byte: p.text_cursor_byte,
                 custom_text: p.custom_text.clone(),
+                custom_text_cursor_byte: p.custom_text_cursor_byte,
                 custom: p.custom,
                 scroll_offset: p.scroll_offset,
                 batch: None,
@@ -24064,7 +24194,7 @@ fn input_history_position(buf: &Buffer, total: usize) -> Option<crate::render::H
 
 #[cfg(test)]
 mod input_history_position_tests {
-    use super::{input_history_position, Buffer};
+    use super::{Buffer, input_history_position};
 
     #[test]
     fn visible_only_while_recalling_history() {
@@ -25191,7 +25321,7 @@ pub(crate) fn summarise_task_result(output: &str) -> String {
         };
         let block = &rest[start..]; // begins with "<task "
         let Some(gt) = block.find('>') else { break }; // end of opening tag
-                                                       // Close is searched strictly AFTER the opening tag ⇒ close index > gt, no reverse slice.
+        // Close is searched strictly AFTER the opening tag ⇒ close index > gt, no reverse slice.
         let Some(close_rel) = block[gt + 1..].find("</task>") else {
             break;
         };
@@ -25464,7 +25594,7 @@ pub(crate) fn install_password_modal(
 pub(crate) fn todo_progress_from_items(
     todos: &[atomcode_capabilities::tools::todo::TodoItem],
 ) -> crate::render::TodoProgress {
-    use atomcode_capabilities::tools::todo::{todo_counts, TodoStatus};
+    use atomcode_capabilities::tools::todo::{TodoStatus, todo_counts};
     let (completed, in_progress, total) = todo_counts(todos);
     let current = todos
         .iter()
@@ -25561,10 +25691,7 @@ fn todo_items_from_progress(
         .unwrap_or_default()
 }
 
-fn apply_todo_mutation(
-    items: &mut Vec<atomcode_capabilities::tools::todo::TodoItem>,
-    args: &str,
-) {
+fn apply_todo_mutation(items: &mut Vec<atomcode_capabilities::tools::todo::TodoItem>, args: &str) {
     if let Some(progress) = todo_progress_from_args(args) {
         *items = todo_items_from_progress(Some(&progress));
     } else {
@@ -25640,9 +25767,8 @@ mod todo_block_tests {
     #[test]
     fn failed_live_todo_result_discards_staged_mutation() {
         let mut state = crate::state::UiState::new();
-        state.active_todos = todo_progress_from_args(
-            r#"{"todos":[{"content":"keep","status":"in_progress"}]}"#,
-        );
+        state.active_todos =
+            todo_progress_from_args(r#"{"todos":[{"content":"keep","status":"in_progress"}]}"#);
         stage_todo_call_preview(
             &mut state,
             "failed",
@@ -25680,9 +25806,8 @@ mod todo_block_tests {
     #[test]
     fn successful_todo_preview_becomes_authoritative() {
         let mut state = crate::state::UiState::new();
-        state.active_todos = todo_progress_from_args(
-            r#"{"todos":[{"content":"run agents","status":"pending"}]}"#,
-        );
+        state.active_todos =
+            todo_progress_from_args(r#"{"todos":[{"content":"run agents","status":"pending"}]}"#);
         let args = r#"{"action":"update","id":1,"status":"in_progress"}"#;
         stage_todo_call_preview(&mut state, "preview", args);
 
@@ -25701,16 +25826,9 @@ mod todo_block_tests {
             r#"{"todos":[{"content":"first","status":"in_progress"}]}"#,
         );
         commit_todo_call_result(&mut state, "plan", "todowrite", true);
-        assert_eq!(
-            state.active_todos.as_ref().unwrap().items[0].1,
-            "first"
-        );
+        assert_eq!(state.active_todos.as_ref().unwrap().items[0].1, "first");
 
-        stage_todo_call_preview(
-            &mut state,
-            "add",
-            r#"{"action":"add","content":"second"}"#,
-        );
+        stage_todo_call_preview(&mut state, "add", r#"{"action":"add","content":"second"}"#);
         commit_todo_call_result(&mut state, "add", "todowrite", true);
 
         let progress = state.active_todos.expect("successful action is committed");
@@ -25721,19 +25839,14 @@ mod todo_block_tests {
     #[test]
     fn concurrent_todo_previews_replay_in_call_order_and_exclude_failures() {
         let mut state = crate::state::UiState::new();
-        state.active_todos = todo_progress_from_args(
-            r#"{"todos":[{"content":"first","status":"pending"}]}"#,
-        );
+        state.active_todos =
+            todo_progress_from_args(r#"{"todos":[{"content":"first","status":"pending"}]}"#);
         stage_todo_call_preview(
             &mut state,
             "a",
             r#"{"action":"update","id":1,"status":"in_progress"}"#,
         );
-        stage_todo_call_preview(
-            &mut state,
-            "b",
-            r#"{"action":"add","content":"second"}"#,
-        );
+        stage_todo_call_preview(&mut state, "b", r#"{"action":"add","content":"second"}"#);
 
         let preview = effective_todo_progress(&state).unwrap();
         assert_eq!(preview.in_progress, 1);
@@ -25762,7 +25875,7 @@ mod todo_block_tests {
         .expect("valid list");
         assert_eq!((p.completed, p.total), (1, 3));
         assert_eq!(p.current.as_deref(), Some("b")); // the in_progress task
-                                                     // No task in progress ⇒ current None, counts still populated.
+        // No task in progress ⇒ current None, counts still populated.
         let done =
             todo_progress_from_args(r#"{"todos":[{"content":"a","status":"completed"}]}"#).unwrap();
         assert_eq!((done.completed, done.total, done.current), (1, 1, None));
@@ -26200,7 +26313,7 @@ mod format_shell_command_tests {
 
 #[cfg(test)]
 mod user_input_mode_tests {
-    use super::{classify_tui_user_input, round_cap_should_auto_stop, TuiUserInputPresentation};
+    use super::{TuiUserInputPresentation, classify_tui_user_input, round_cap_should_auto_stop};
     use crate::state::AgentMode;
 
     #[test]

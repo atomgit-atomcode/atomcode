@@ -20,10 +20,11 @@ use atomcode_kernel::agent::Agent;
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::{
-    ApprovalMiddleware, EchoTool, MockProvider, RecorderHook, RiskyWriteTool, ScriptedProvider,
-    SilentStreamProvider, StallThenProvider,
+    ApprovalMiddleware, CountingTool, EchoTool, MockProvider, PartialStallThenProvider,
+    RecorderHook, RiskyWriteTool, ScriptedProvider, StallThenProvider,
 };
 use atomcode_kernel::tool::{ToolCall, ToolRegistry};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -117,6 +118,186 @@ async fn stream_timeout_reconnects_then_recovers() {
     assert!(
         log.contains(&"on_model_response".to_string()),
         "the success path must run on the recovered stream"
+    );
+}
+
+#[tokio::test]
+async fn partial_stream_timeout_continues_once_without_failing_the_turn() {
+    let reg = ToolRegistry::new();
+    let provider = Arc::new(PartialStallThenProvider::new(
+        vec![StreamEvent::TextDelta("partial".into())],
+        vec![
+            StreamEvent::TextDelta(" recovered".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ));
+    let mut handle = Agent::builder()
+        .provider(provider.clone())
+        .tools(reg.mount(&[] as &[&str]))
+        .stream_timeout(LIVENESS)
+        .build()
+        .spawn();
+
+    handle.commands.send(send("go")).unwrap();
+
+    let (phases, errors, reason) = tokio::time::timeout(OUTER_GUARD, async {
+        let mut phases = Vec::new();
+        let mut errors = Vec::new();
+        let reason = loop {
+            match handle.events.recv().await {
+                Some(AgentEvent::StreamRecovery {
+                    attempt,
+                    max_attempts,
+                    recovered,
+                }) => phases.push((attempt, max_attempts, recovered)),
+                Some(AgentEvent::Error { message, .. }) => errors.push(message),
+                Some(AgentEvent::TurnComplete { reason }) => break reason,
+                Some(_) => {}
+                None => panic!("event channel closed before terminal"),
+            }
+        };
+        (phases, errors, reason)
+    })
+    .await
+    .expect("partial stream recovery must finish within the outer guard");
+
+    assert_eq!(
+        provider.calls(),
+        2,
+        "one stalled request plus one continuation"
+    );
+    assert_eq!(phases, vec![(1, 1, false), (1, 1, true)]);
+    assert!(
+        errors.is_empty(),
+        "successful recovery must not emit an error"
+    );
+    assert_eq!(reason, atomcode_kernel::event::StopReason::Stopped);
+}
+
+#[tokio::test]
+async fn partial_stream_tool_call_is_preserved_but_never_executed_or_replayed() {
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(CountingTool::new(executions.clone())));
+    let provider = Arc::new(PartialStallThenProvider::new(
+        vec![StreamEvent::ToolCall(tool_call(
+            "unsafe-on-replay",
+            "count",
+            "{}",
+        ))],
+        vec![
+            StreamEvent::TextDelta("continued safely".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ));
+    let mut handle = Agent::builder()
+        .provider(provider.clone())
+        .tools(reg.mount(&["count"]))
+        .stream_timeout(LIVENESS)
+        .build()
+        .spawn();
+
+    handle.commands.send(send("go")).unwrap();
+    let reason = tokio::time::timeout(OUTER_GUARD, async {
+        loop {
+            if let Some(AgentEvent::TurnComplete { reason }) = handle.events.recv().await {
+                break reason;
+            }
+        }
+    })
+    .await
+    .expect("tool-call partial recovery must terminate");
+
+    assert_eq!(reason, atomcode_kernel::event::StopReason::Stopped);
+    assert_eq!(provider.calls(), 2);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let continuation = &requests[1];
+    assert_eq!(
+        continuation
+            .iter()
+            .filter(
+                |message| message.role == atomcode_kernel::message::Role::User
+                    && !message.synthetic
+            )
+            .count(),
+        1,
+        "the original user request must not be replayed as a new user turn"
+    );
+    assert!(
+        continuation.iter().any(|message| {
+            message.role == atomcode_kernel::message::Role::Assistant
+                && message
+                    .tool_calls
+                    .iter()
+                    .any(|call| call.id == "unsafe-on-replay")
+        }),
+        "the preserved partial assistant tool call must be in continuation history"
+    );
+    assert!(
+        continuation.iter().any(|message| {
+            message.role == atomcode_kernel::message::Role::Tool
+                && message.tool_call_id.as_deref() == Some("unsafe-on-replay")
+                && message.text.contains("interrupted")
+        }),
+        "the unknown tool call must have a paired interrupted result"
+    );
+    assert!(
+        continuation.iter().any(|message| {
+            message.role == atomcode_kernel::message::Role::User
+                && message.synthetic
+                && message.text.contains("Continue from that saved progress")
+        }),
+        "the second request must be an explicit synthetic continuation"
+    );
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        0,
+        "a call preserved from a timed-out stream has unknown status and must not execute"
+    );
+}
+
+#[tokio::test]
+async fn second_partial_stream_timeout_stops_after_the_single_safe_continuation() {
+    let reg = ToolRegistry::new();
+    let provider = Arc::new(
+        PartialStallThenProvider::new(
+            vec![StreamEvent::TextDelta("first partial".into())],
+            vec![StreamEvent::TextDelta("second partial".into())],
+        )
+        .with_recovered_stall(),
+    );
+    let mut handle = Agent::builder()
+        .provider(provider.clone())
+        .tools(reg.mount(&[] as &[&str]))
+        .stream_timeout(LIVENESS)
+        .build()
+        .spawn();
+
+    handle.commands.send(send("go")).unwrap();
+    let (error, reason) = tokio::time::timeout(OUTER_GUARD, async {
+        let mut error = None;
+        loop {
+            match handle.events.recv().await {
+                Some(AgentEvent::Error { message, .. }) => error = Some(message),
+                Some(AgentEvent::TurnComplete { reason }) => break (error, reason),
+                Some(_) => {}
+                None => panic!("event channel closed before terminal"),
+            }
+        }
+    })
+    .await
+    .expect("the second partial timeout must terminate without a retry ladder");
+
+    assert_eq!(
+        provider.calls(),
+        2,
+        "the continuation budget is exactly one"
+    );
+    assert_eq!(reason, atomcode_kernel::event::StopReason::Timeout);
+    assert!(
+        error.is_some_and(|message| message.contains("timed out again")),
+        "the terminal must explain that the one safe continuation was exhausted"
     );
 }
 

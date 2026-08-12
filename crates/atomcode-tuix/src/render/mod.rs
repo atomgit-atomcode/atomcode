@@ -497,9 +497,7 @@ impl MenuKind {
             // Leave one row for the surrounding footer rule/status chrome so
             // the complete `/cd` surface, not just its menu payload, stays at
             // roughly half of the terminal.
-            MenuKind::DirectoryList => {
-                item_count.min((screen_height / 2).saturating_sub(1).max(1))
-            }
+            MenuKind::DirectoryList => item_count.min((screen_height / 2).saturating_sub(1).max(1)),
             MenuKind::Plugin | MenuKind::SessionList => {
                 let plugin_count = item_count.saturating_sub(3);
                 let max_plugins = (screen_height / 4).max(2);
@@ -721,8 +719,10 @@ pub struct UserInputPanelView {
     pub checked: Vec<bool>,
     /// Standalone text-mode input buffer.
     pub text: String,
+    pub text_cursor_byte: usize,
     /// "Other" free-text row buffer for single/multiple mode.
     pub custom_text: String,
+    pub custom_text_cursor_byte: usize,
     /// Whether to render the "Other" free-text row (mirrors `UserInputPanel.custom`).
     pub custom: bool,
     /// Signed PageUp/PageDown displacement from the automatically selected
@@ -788,7 +788,9 @@ pub fn round_cap_view(cap: u32, base: u32, cursor: usize, stats: &str) -> UserIn
         cursor,
         checked: vec![],
         text: String::new(),
+        text_cursor_byte: 0,
         custom_text: String::new(),
+        custom_text_cursor_byte: 0,
         custom: false,
         scroll_offset: 0,
         batch: None,

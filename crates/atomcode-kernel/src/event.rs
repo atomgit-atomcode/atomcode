@@ -281,6 +281,14 @@ pub enum AgentEvent {
     Reasoning(String),
     /// Non-fatal advisory (e.g. a truncated response). The turn still completes.
     Warning(String),
+    /// A partial response timed out after replay-unsafe output had already been
+    /// observed. The kernel preserved that output and opened a fresh continuation
+    /// inside the SAME turn instead of replaying the original request.
+    StreamRecovery {
+        attempt: u32,
+        max_attempts: u32,
+        recovered: bool,
+    },
     /// A 429 rate-limit PAUSE (host decided the reset is too far to auto-wait).
     /// A driver renders this as a non-error pause line with the reset time, NOT
     /// as a red error. `secs_until_reset`/`reset_at_display` may be empty when the

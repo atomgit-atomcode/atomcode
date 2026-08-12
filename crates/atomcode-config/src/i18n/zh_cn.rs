@@ -1379,6 +1379,11 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
                  或将该 provider 指向带 api_key 的标准 OpenAI 兼容端点。"
             ).into(),
         Msg::StreamStalled => "按 esc 可取消".into(),
+        Msg::StreamRecoveryRunning { attempt, max_attempts } => format!(
+            "流响应超时，正在从已保存进度安全续接（{attempt}/{max_attempts}）…"
+        )
+        .into(),
+        Msg::StreamRecoverySucceeded => "✓ 已从流中断处恢复".into(),
         Msg::ConhostScrollHint =>
             "提示：经典 Windows 控制台功能受限——任务执行中无法上滚查看历史，字符与吉祥物也会降级显示。\
              换用 \x1b[1;96mWindows Terminal\x1b[0m 体验更佳。"

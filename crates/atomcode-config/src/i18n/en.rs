@@ -1415,6 +1415,11 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
                  plain OpenAI-compatible endpoint with an api_key."
             ).into(),
         Msg::StreamStalled => "esc to cancel".into(),
+        Msg::StreamRecoveryRunning { attempt, max_attempts } => format!(
+            "stream timed out; safely continuing from saved progress ({attempt}/{max_attempts})…"
+        )
+        .into(),
+        Msg::StreamRecoverySucceeded => "✓ recovered from the interrupted stream".into(),
         Msg::ConhostScrollHint =>
             "Tip: the classic Windows console is limited — no scroll-back while a task runs, \
              and glyphs/the mascot render degraded. \x1b[1;96mWindows Terminal\x1b[0m gives the full experience."
