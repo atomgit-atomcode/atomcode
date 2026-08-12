@@ -630,6 +630,19 @@ impl ReviewRun {
                 self.error = Some(message);
             }
             AgentEvent::Warning(w) => eprintln!("    [warn] {w}"),
+            AgentEvent::StreamRecovery {
+                attempt,
+                max_attempts,
+                recovered,
+            } => {
+                if recovered {
+                    eprintln!("    [ok] recovered from the interrupted stream");
+                } else {
+                    eprintln!(
+                        "    [retry] safely continuing from saved progress ({attempt}/{max_attempts})"
+                    );
+                }
+            }
             AgentEvent::TurnComplete { reason } => {
                 self.stop = reason;
                 return false;

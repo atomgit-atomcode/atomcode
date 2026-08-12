@@ -417,6 +417,19 @@ async fn drive_turn(
                 eprintln!("\n[error] {message}")
             }
             CodingRuntimeEvent::Agent(AgentEvent::Warning(w)) => eprintln!("[warn] {w}"),
+            CodingRuntimeEvent::Agent(AgentEvent::StreamRecovery {
+                attempt,
+                max_attempts,
+                recovered,
+            }) => {
+                if recovered {
+                    eprintln!("[ok] recovered from the interrupted stream");
+                } else {
+                    eprintln!(
+                        "[retry] safely continuing from saved progress ({attempt}/{max_attempts})"
+                    );
+                }
+            }
             CodingRuntimeEvent::CompactionStarted { trigger } => {
                 // The kernel fires this ONLY when a real drain/summary (a multi-second
                 // LLM call) will run — manual `/compact`, overflow tier 2, OR an auto
