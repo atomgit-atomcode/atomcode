@@ -16284,14 +16284,21 @@ fn handle_user_input_key(
     match (mode, code) {
         (UserInputMode::Text, KeyCode::Char(c)) => {
             if let Some(p) = app.state.user_input_panel.as_mut() {
-                p.text.push(c);
+                p.insert_text_char(c);
             }
         }
         (UserInputMode::Text, KeyCode::Backspace) => {
             if let Some(p) = app.state.user_input_panel.as_mut() {
-                p.text.pop();
+                p.backspace_text();
             }
         }
+        (UserInputMode::Text, KeyCode::Left) => app.state.user_input_panel.as_mut().unwrap().move_text_cursor_left(),
+        (UserInputMode::Text, KeyCode::Right) => app.state.user_input_panel.as_mut().unwrap().move_text_cursor_right(),
+        (_, KeyCode::Home) => app.state.user_input_panel.as_mut().unwrap().move_active_cursor_home(),
+        (_, KeyCode::End) => app.state.user_input_panel.as_mut().unwrap().move_active_cursor_end(),
+        (_, KeyCode::Delete) => app.state.user_input_panel.as_mut().unwrap().delete_active_cursor(),
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Left) if app.state.user_input_panel.as_ref().unwrap().is_other_row() => app.state.user_input_panel.as_mut().unwrap().move_custom_cursor_left(),
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Right) if app.state.user_input_panel.as_ref().unwrap().is_other_row() => app.state.user_input_panel.as_mut().unwrap().move_custom_cursor_right(),
         (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Up) => {
             if let Some(p) = app.state.user_input_panel.as_mut() {
                 p.move_up();
@@ -16691,15 +16698,18 @@ fn handle_user_input_batch_key(
 
     match (mode, code) {
         (UserInputMode::Text, KeyCode::Char(c)) => {
-            app.state.user_input_batch.as_mut().unwrap().questions[cur]
-                .text
-                .push(c);
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].insert_text_char(c);
         }
         (UserInputMode::Text, KeyCode::Backspace) => {
-            app.state.user_input_batch.as_mut().unwrap().questions[cur]
-                .text
-                .pop();
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].backspace_text();
         }
+        (UserInputMode::Text, KeyCode::Left) => app.state.user_input_batch.as_mut().unwrap().questions[cur].move_text_cursor_left(),
+        (UserInputMode::Text, KeyCode::Right) => app.state.user_input_batch.as_mut().unwrap().questions[cur].move_text_cursor_right(),
+        (_, KeyCode::Home) => app.state.user_input_batch.as_mut().unwrap().questions[cur].move_active_cursor_home(),
+        (_, KeyCode::End) => app.state.user_input_batch.as_mut().unwrap().questions[cur].move_active_cursor_end(),
+        (_, KeyCode::Delete) => app.state.user_input_batch.as_mut().unwrap().questions[cur].delete_active_cursor(),
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Left) if app.state.user_input_batch.as_ref().unwrap().questions[cur].is_other_row() => app.state.user_input_batch.as_mut().unwrap().questions[cur].move_custom_cursor_left(),
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Right) if app.state.user_input_batch.as_ref().unwrap().questions[cur].is_other_row() => app.state.user_input_batch.as_mut().unwrap().questions[cur].move_custom_cursor_right(),
         (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Up) => {
             app.state.user_input_batch.as_mut().unwrap().questions[cur].move_up();
         }
@@ -23903,7 +23913,9 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             cursor: p.cursor,
             checked: p.checked.clone(),
             text: p.text.clone(),
+            text_cursor_byte: p.text_cursor_byte,
             custom_text: p.custom_text.clone(),
+            custom_text_cursor_byte: p.custom_text_cursor_byte,
             custom: p.custom,
             scroll_offset: if b.on_submit_stop() {
                 b.submit_scroll_offset
@@ -23933,7 +23945,9 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
                 cursor: p.cursor,
                 checked: p.checked.clone(),
                 text: p.text.clone(),
+                text_cursor_byte: p.text_cursor_byte,
                 custom_text: p.custom_text.clone(),
+                custom_text_cursor_byte: p.custom_text_cursor_byte,
                 custom: p.custom,
                 scroll_offset: p.scroll_offset,
                 batch: None,

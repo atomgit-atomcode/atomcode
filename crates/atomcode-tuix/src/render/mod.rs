@@ -275,6 +275,7 @@ pub enum DiffPanelTone {
 #[derive(Debug, Clone)]
 pub struct DiffPanelSpan {
     pub text: String,
+    pub text_cursor_byte: usize,
     pub tone: DiffPanelTone,
     pub bold: bool,
 }
@@ -723,6 +724,7 @@ pub struct UserInputPanelView {
     pub text: String,
     /// "Other" free-text row buffer for single/multiple mode.
     pub custom_text: String,
+    pub custom_text_cursor_byte: usize,
     /// Whether to render the "Other" free-text row (mirrors `UserInputPanel.custom`).
     pub custom: bool,
     /// Signed PageUp/PageDown displacement from the automatically selected
@@ -788,7 +790,9 @@ pub fn round_cap_view(cap: u32, base: u32, cursor: usize, stats: &str) -> UserIn
         cursor,
         checked: vec![],
         text: String::new(),
+        text_cursor_byte: 0,
         custom_text: String::new(),
+        custom_text_cursor_byte: 0,
         custom: false,
         scroll_offset: 0,
         batch: None,

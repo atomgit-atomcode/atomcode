@@ -3776,15 +3776,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         } else {
                             budget
                         };
-                        let text = crate::width::truncate_with_ellipsis(
-                            &scrub_controls(&panel.custom_text),
-                            text_budget,
-                        );
+                        let safe_text = scrub_controls(&panel.custom_text);
+                        let text = if on_cursor {
+                            crate::modals::provider_panel::editable_value_projection(&safe_text, panel.custom_text_cursor_byte, budget)
+                        } else {
+                            crate::width::truncate_with_ellipsis(&safe_text, text_budget)
+                        };
                         push_str_cells(&mut row, &text, &text_style);
-                        if on_cursor {
-                            let cursor_glyph = if unicode { "\u{258f}" } else { "|" }; // ▏
-                            push_str_cells(&mut row, cursor_glyph, &chrome_style);
-                        }
                     }
                     out.push(row);
                     if on_cursor {
@@ -3881,7 +3879,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     let text_budget = inner_width
                         .saturating_sub(crate::width::display_width(prompt))
                         .saturating_sub(crate::width::display_width(caret));
-                    let buf = crate::width::truncate_with_ellipsis(&safe_text, text_budget);
+                    let buf = if panel.text.is_empty() { String::new() } else { crate::modals::provider_panel::editable_value_projection(&safe_text, panel.text_cursor_byte, text_budget + 1) };
                     let visible_text = if buf.is_empty() {
                         crate::width::truncate_with_ellipsis(placeholder, text_budget)
                     } else {
@@ -3895,7 +3893,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     // An empty field's insertion point is before its placeholder;
                     // once text exists the caret follows the typed content.
                     if panel.text.is_empty() {
-                        push_str_cells(&mut row, caret, &border_style);
                         push_str_cells(&mut row, &visible_text, &text_style);
                     } else {
                         push_str_cells(&mut row, &visible_text, &text_style);
@@ -17173,7 +17170,9 @@ mod tests {
                 cursor: 0,
                 checked: vec![false, false, false],
                 text: String::new(),
+                text_cursor_byte: 0,
                 custom_text: String::new(),
+                custom_text_cursor_byte: 0,
                 custom: true,
                 scroll_offset: 0,
                 batch: None,
@@ -17255,7 +17254,9 @@ mod tests {
                 cursor: 0,
                 checked: vec![true, false, true],
                 text: String::new(),
+                text_cursor_byte: 0,
                 custom_text: "Zig".into(),
+                custom_text_cursor_byte: 0,
                 custom: true,
                 scroll_offset: 0,
                 batch: None,
@@ -17318,7 +17319,9 @@ mod tests {
                 cursor: 0,
                 checked: vec![],
                 text: "atomcode".into(),
+                text_cursor_byte: 0,
                 custom_text: String::new(),
+                custom_text_cursor_byte: 0,
                 custom: true,
                 scroll_offset: 0,
                 batch: None,
@@ -17397,7 +17400,9 @@ mod tests {
             cursor: 2, // the custom-answer row (after the 2 options)
             checked: vec![false, false, false],
             text: String::new(),
-            custom_text: String::new(), // empty → placeholder shown
+                text_cursor_byte: 0,
+            custom_text: String::new(),
+                custom_text_cursor_byte: 0, // empty → placeholder shown
             custom: true,
             scroll_offset: 0,
             batch: None,
@@ -17444,7 +17449,9 @@ mod tests {
             cursor: 0,
             checked: Vec::new(),
             text: String::new(),
+                text_cursor_byte: 0,
             custom_text: String::new(),
+                custom_text_cursor_byte: 0,
             custom: false,
             scroll_offset: 0,
             batch: None,
@@ -17492,7 +17499,9 @@ mod tests {
             cursor: 1,
             checked: vec![false; 4],
             text: String::new(),
+                text_cursor_byte: 0,
             custom_text: String::new(),
+                custom_text_cursor_byte: 0,
             custom: true,
             scroll_offset: 0,
             batch: None,
@@ -17567,7 +17576,9 @@ mod tests {
             cursor: 0,
             checked: vec![false, false, false],
             text: String::new(),
+                text_cursor_byte: 0,
             custom_text: String::new(),
+                custom_text_cursor_byte: 0,
             custom: true,
             scroll_offset: 0,
             batch,
@@ -21818,7 +21829,9 @@ mod tests {
             cursor: 0,
             checked: vec![false; 3],
             text: String::new(),
+                text_cursor_byte: 0,
             custom_text: String::new(),
+                custom_text_cursor_byte: 0,
             custom: true,
             scroll_offset: 0,
             batch: None,
@@ -21896,7 +21909,9 @@ mod tests {
             cursor: 0,
             checked: Vec::new(),
             text: String::new(),
+                text_cursor_byte: 0,
             custom_text: String::new(),
+                custom_text_cursor_byte: 0,
             custom: false,
             scroll_offset: 0,
             batch: None,

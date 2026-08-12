@@ -306,7 +306,7 @@ fn tail_graphemes_to_width(text: &str, max_cols: usize) -> String {
 /// Build the transient value projection for a focused form field. The source
 /// value is never changed: the visible caret and ellipses exist only in the
 /// `PluginInfo` row sent to the renderer.
-fn editable_value_projection(value: &str, cursor_byte: usize, max_cols: usize) -> String {
+pub(crate) fn editable_value_projection(value: &str, cursor_byte: usize, max_cols: usize) -> String {
     const CARET: &str = "│";
     const ELLIPSIS: &str = "…";
 
