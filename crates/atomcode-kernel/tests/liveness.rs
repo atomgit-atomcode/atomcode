@@ -301,6 +301,100 @@ async fn second_partial_stream_timeout_stops_after_the_single_safe_continuation(
     );
 }
 
+#[tokio::test]
+async fn continuation_after_partial_recovery_still_reconnects_a_content_free_stall() {
+    // Regression guard: the partial recovery must not disable idle-reconnect for
+    // the REST of the turn. The fresh continuation round is a normal round, so a
+    // content-free (first-token) stall on it must still reconnect — not fail on
+    // the first stall.
+    let reg = ToolRegistry::new();
+    let provider = Arc::new(
+        PartialStallThenProvider::new(
+            vec![StreamEvent::TextDelta("partial".into())],
+            vec![], // continuation emits NOTHING before stalling → content-free stall
+        )
+        .with_recovered_stall(),
+    );
+    let mut handle = Agent::builder()
+        .provider(provider.clone())
+        .tools(reg.mount(&[] as &[&str]))
+        .stream_timeout(LIVENESS)
+        .build()
+        .spawn();
+
+    handle.commands.send(send("go")).unwrap();
+    let saw_reconnect = tokio::time::timeout(OUTER_GUARD, async {
+        loop {
+            match handle.events.recv().await {
+                Some(AgentEvent::Warning(m)) if m.contains("reconnecting") => break true,
+                Some(AgentEvent::TurnComplete { .. }) => break false,
+                Some(_) => {}
+                None => break false,
+            }
+        }
+    })
+    .await
+    .expect("must resolve within the guard");
+
+    assert!(
+        saw_reconnect,
+        "the continuation's content-free stall must still get idle-reconnects, \
+         not an immediate failure"
+    );
+}
+
+#[tokio::test]
+async fn tool_call_delta_only_stall_does_not_fire_a_bogus_recovery() {
+    // A stall after only ToolCallDelta (display-only, never assembled into a
+    // ToolCall) has NOTHING replay-unsafe to preserve. It must not emit a
+    // StreamRecovery / push a "continue from saved progress" nudge referencing a
+    // message that does not exist, nor burn the one-shot recovery.
+    let reg = ToolRegistry::new();
+    let provider = Arc::new(PartialStallThenProvider::new(
+        vec![StreamEvent::ToolCallDelta {
+            index: 0,
+            id: Some("call-1".into()),
+            name: Some("count".into()),
+            arguments: "{}".into(),
+        }],
+        vec![
+            StreamEvent::TextDelta("recovered".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ));
+    let mut handle = Agent::builder()
+        .provider(provider.clone())
+        .tools(reg.mount(&[] as &[&str]))
+        .stream_timeout(LIVENESS)
+        .build()
+        .spawn();
+
+    handle.commands.send(send("go")).unwrap();
+    let recoveries = tokio::time::timeout(OUTER_GUARD, async {
+        let mut recoveries = 0usize;
+        loop {
+            match handle.events.recv().await {
+                Some(AgentEvent::StreamRecovery { .. }) => recoveries += 1,
+                Some(AgentEvent::TurnComplete { .. }) => break recoveries,
+                Some(_) => {}
+                None => panic!("event channel closed before terminal"),
+            }
+        }
+    })
+    .await
+    .expect("must terminate within the guard");
+
+    assert_eq!(
+        recoveries, 0,
+        "a display-only ToolCallDelta stall preserves nothing, so it must not recover"
+    );
+    assert_eq!(
+        provider.calls(),
+        1,
+        "no continuation request is issued when there is no preserved progress"
+    );
+}
+
 // ── (1b) STREAM TIMEOUT → EXHAUST RETRIES → CLEAN-FAIL ───────────────────────
 //
 // PENDS FOREVER on every attempt. The kernel reconnects MAX_STREAM_RETRIES=5

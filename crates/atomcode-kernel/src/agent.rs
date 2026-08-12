@@ -2349,10 +2349,12 @@ impl RunningAgent {
                         // per-round accumulators reset on `continue`, so partial output is
                         // discarded and never pushed), with exponential backoff. Only after
                         // the budget is spent do we take the clean-fail path.
-                        if !saw_stream_content
-                            && partial_stream_recoveries == 0
-                            && stream_retry < MAX_STREAM_RETRIES
-                        {
+                        // A content-free (no-token) stall is a safe REPLAY, so
+                        // reconnect up to MAX_STREAM_RETRIES per round — including on
+                        // the fresh continuation round after a partial recovery
+                        // (`stream_retry` was reset to 0 for it). The recovery itself
+                        // stays capped by `partial_stream_recoveries` below.
+                        if !saw_stream_content && stream_retry < MAX_STREAM_RETRIES {
                             stream_retry += 1;
                             self.rt.emit(AgentEvent::Warning(format!(
                                 "stream idle timeout — reconnecting ({stream_retry}/{MAX_STREAM_RETRIES})"
@@ -2376,6 +2378,7 @@ impl RunningAgent {
                             break;
                         }
                         if saw_stream_content {
+                            let progress_len = convo.messages.len();
                             Self::persist_partial_assistant(
                                 convo,
                                 &assistant_text,
@@ -2384,7 +2387,15 @@ impl RunningAgent {
                                 &pending_calls,
                                 suppress_internal_stream,
                             );
-                            if partial_stream_recoveries < MAX_PARTIAL_STREAM_RECOVERIES {
+                            // `saw_stream_content` includes display-only ToolCallDelta,
+                            // which persists NOTHING. Only recover (and push the
+                            // "continue from saved progress" nudge) when something was
+                            // actually preserved — else the nudge references a message
+                            // that does not exist and burns the one-shot recovery.
+                            let preserved_progress = convo.messages.len() > progress_len;
+                            if preserved_progress
+                                && partial_stream_recoveries < MAX_PARTIAL_STREAM_RECOVERIES
+                            {
                                 partial_stream_recoveries += 1;
                                 self.rt.emit(AgentEvent::StreamRecovery {
                                     attempt: partial_stream_recoveries,

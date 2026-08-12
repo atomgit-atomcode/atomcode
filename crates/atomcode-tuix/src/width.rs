@@ -635,7 +635,13 @@ pub fn editable_value_projection(value: &str, cursor_byte: usize, max_cols: usiz
         return CARET.to_string();
     }
 
-    let cursor = cursor_byte.min(value.len());
+    // The caller's byte offset may not land on a char boundary of `value` — e.g.
+    // it was derived from a raw buffer while `value` was scrubbed (shortened)
+    // before this call. Snap down to the nearest boundary so slicing never panics.
+    let mut cursor = cursor_byte.min(value.len());
+    while cursor > 0 && !value.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
     let before = &value[..cursor];
     let after = &value[cursor..];
     let before_width = display_width(before);
@@ -857,6 +863,18 @@ mod tests {
         let cursor = "a👨‍👩‍👧‍👦".len();
         let shown = editable_value_projection(text, cursor, 8);
         assert!(shown.contains("👨‍👩‍👧‍👦│好"), "{shown}");
+    }
+
+    #[test]
+    fn editable_projection_snaps_cursor_off_a_char_boundary_without_panicking() {
+        // A raw-buffer cursor byte can land inside a multibyte char once the value
+        // it indexes was shortened (e.g. scrub_controls stripped a control byte
+        // before it). The projection must snap down to a boundary, never panic.
+        let out = editable_value_projection("好z", 1, 10); // byte 1 is inside 好 (3 bytes)
+        assert!(out.contains('好'), "{out}");
+        assert!(out.contains('│'), "{out}");
+        // An overshooting raw offset must also be safe.
+        let _ = editable_value_projection("好", 99, 10);
     }
 
     #[test]
