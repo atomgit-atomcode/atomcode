@@ -3,7 +3,7 @@ use std::sync::Arc;
 use atomcode_capabilities::provider::{
     atomgit_request_signer, is_atomgit_gateway, signer_available, AnthropicConfig,
     AnthropicProvider, OllamaConfig, OllamaProvider, OpenAiCompatConfig, OpenAiCompatProvider,
-    ReasoningPolicy, RequestSigner,
+    ReasoningPolicy, RequestSigner, RetryPolicy,
 };
 use atomcode_kernel::provider::LlmProvider;
 
@@ -119,6 +119,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 ac.thinking = cfg.thinking_enabled.unwrap_or(false);
                 ac.user_agent = Some(ua.clone());
                 ac.skip_tls_verify = cfg.skip_tls_verify;
+                ac.retry = retry_policy_for(cfg.retry_max_attempts);
                 Arc::new(
                     AnthropicProvider::new(ac)
                         .map_err(|e| ProviderBuildError::Adapter(e.message))?,
@@ -134,6 +135,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 oc.think = cfg.thinking_enabled.unwrap_or(false);
                 oc.user_agent = Some(ua.clone());
                 oc.skip_tls_verify = cfg.skip_tls_verify;
+                oc.retry = retry_policy_for(cfg.retry_max_attempts);
                 Arc::new(
                     OllamaProvider::new(oc).map_err(|e| ProviderBuildError::Adapter(e.message))?,
                 )
@@ -151,6 +153,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 pc.thinking_keep = cfg.thinking_keep.clone();
                 pc.user_agent = Some(ua);
                 pc.skip_tls_verify = cfg.skip_tls_verify;
+                pc.retry = retry_policy_for(cfg.retry_max_attempts);
                 if let Some(authenticator) = &self.authenticator {
                     pc.request_signer = authenticator.request_signer(&cfg.base_url)?;
                 }
@@ -169,6 +172,20 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
 
 pub fn default_max_tokens(context_window: u32) -> u32 {
     (context_window / 4).clamp(8_000, 16_384)
+}
+
+/// Build the adapter retry policy from the user's `retry_max_attempts` config
+/// knob. `None` ⇒ the adapter default (3 attempts incl. the first request);
+/// `Some(n)` ⇒ exactly `n` attempts (clamped to at least 1, so `0` cannot
+/// disable the request itself). `1` disables automatic retries.
+fn retry_policy_for(max_attempts: Option<u32>) -> RetryPolicy {
+    match max_attempts {
+        None => RetryPolicy::default_policy(),
+        Some(n) => RetryPolicy {
+            max_attempts: n.max(1),
+            ..RetryPolicy::default_policy()
+        },
+    }
 }
 
 pub fn derive_tier_config(

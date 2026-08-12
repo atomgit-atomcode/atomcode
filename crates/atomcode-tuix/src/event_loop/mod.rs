@@ -9711,6 +9711,7 @@ mod external_config_tests {
                 skip_tls_verify: false,
                 ephemeral,
                 capable_model: None,
+            retry_max_attempts: None,
             },
         );
         config

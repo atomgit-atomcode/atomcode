@@ -136,6 +136,10 @@ pub struct CodingAgentConfig {
     /// Disable TLS certificate verification (self-signed / internal gateways).
     /// Sourced from `ProviderConfig::skip_tls_verify`; default false.
     pub skip_tls_verify: bool,
+    /// Max attempts (including the first request) for transient HTTP 429 / 5xx /
+    /// timeout retries on the provider OPEN call. `None` ⇒ adapter default (3).
+    /// Sourced from `ProviderConfig::retry_max_attempts`.
+    pub retry_max_attempts: Option<u32>,
     /// Full provider registry used to resolve task-tool fast/capable tiers.
     pub subagent_config: Option<Arc<atomcode_config::config::Config>>,
     /// Swap-aware, lazily-built FAST-tier provider for the `task` tool. `None` ⇒ the fast
@@ -176,6 +180,9 @@ pub struct CodingRuntimeConfig {
     pub keep_interrupted_context: bool,
     pub user_agent: Option<String>,
     pub skip_tls_verify: bool,
+    /// Max attempts (including the first request) for transient HTTP 429 / 5xx /
+    /// timeout retries on the provider OPEN call. `None` ⇒ adapter default (3).
+    pub retry_max_attempts: Option<u32>,
     pub loop_max_rounds: u32,
     pub turn_max_rounds: u32,
     pub subagent_config: Option<Arc<atomcode_config::config::Config>>,
@@ -274,6 +281,7 @@ impl CodingRuntimeConfig {
             keep_interrupted_context: config.keep_interrupted_context,
             user_agent: r.and_then(|r| r.user_agent.clone()),
             skip_tls_verify: r.map(|r| r.skip_tls_verify).unwrap_or(false),
+            retry_max_attempts: r.and_then(|r| r.retry_max_attempts),
             loop_max_rounds: resolve_loop_max_rounds(
                 config.loop_config.max_rounds,
                 std::env::var("ATOMCODE_LOOP_MAX_ROUNDS").ok().as_deref(),
@@ -317,6 +325,7 @@ impl CodingRuntimeConfig {
         config.thinking_keep = self.thinking_keep.clone();
         config.user_agent = self.user_agent.clone();
         config.skip_tls_verify = self.skip_tls_verify;
+        config.retry_max_attempts = self.retry_max_attempts;
         config.loop_max_rounds = self.loop_max_rounds;
         config.max_rounds = self.turn_max_rounds;
         config.subagent_config = self.subagent_config.clone();
@@ -355,6 +364,7 @@ pub fn apply_provider_config(
     config.thinking_keep = provider.thinking_keep.clone();
     config.user_agent = provider.user_agent.clone();
     config.skip_tls_verify = provider.skip_tls_verify;
+    config.retry_max_attempts = provider.retry_max_attempts;
 }
 
 /// A thunk the runtime supplies that constructs a (gateway-signed) tier provider. `Some` on
@@ -632,6 +642,7 @@ impl CodingAgentConfig {
             keep_interrupted_context: false,
             user_agent: None,
             skip_tls_verify: false,
+            retry_max_attempts: None,
             subagent_config: None,
             subagent_fast_provider: None,
             subagent_capable_provider: None,

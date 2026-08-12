@@ -1331,6 +1331,7 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
         // Server-driven capability rank for subagent strong/weak routing (None ⇒ not
         // participating). Threaded verbatim so re-ranking models needs no client release.
         capable_model: entry.capable_model,
+        retry_max_attempts: None,
     }
 }
 
