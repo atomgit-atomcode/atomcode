@@ -92,7 +92,7 @@ Connect to any LLM that supports OpenAI's function-calling API:
 | Claude (Anthropic) | Yes | Claude Sonnet 4.5/4.6, Opus 4.6 |
 | OpenAI | Yes | GPT-4o, GPT-4.1 |
 | DeepSeek | Yes | DeepSeek V3, DeepSeek R1, DeepSeek V4 |
-| Zhipu (GLM) | Yes | GLM-4, GLM-5, GLM-5.2 |
+| Zhipu (GLM) | Yes | GLM-4, GLM-5, GLM-5.2 (AtomCode Pro plan exclusive model) |
 | Qwen (Alibaba) | Yes | Qwen-Plus, Qwen-Max |
 | SiliconFlow | Yes | Various open models |
 | Ollama (local) | Partial | Llama 3, Qwen2, etc. |
