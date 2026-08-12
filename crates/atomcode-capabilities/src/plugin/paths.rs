@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use super::state::InstallScope;
 
@@ -65,23 +65,58 @@ pub fn project_marketplaces_root(
 /// the global `plugins_root()` — the same state file would otherwise be read
 /// once per scope and every plugin enumerated twice. Callers (asset/status
 /// iteration, `plugin list`) should skip such scopes.
-pub fn scope_state_file_aliases_user_scope(
-    working_dir: &std::path::Path,
-    scope: &InstallScope,
-) -> bool {
+pub fn scope_state_file_aliases_user_scope(working_dir: &Path, scope: &InstallScope) -> bool {
     let Some(scope_file) = project_installed_plugins_file(working_dir, scope) else {
         return false;
     };
     let Some(user_file) = installed_plugins_file() else {
         return false;
     };
-    match (
+    let (scope_file, user_file) = match (
         std::fs::canonicalize(&scope_file),
         std::fs::canonicalize(&user_file),
     ) {
-        (Ok(a), Ok(b)) => a == b,
-        // Fall back to lexical comparison when either path is missing.
-        _ => scope_file == user_file,
+        (Ok(a), Ok(b)) => (a, b),
+        // State files need not exist yet (for example before the first install),
+        // so compare normalized absolute paths rather than raw PathBuf values.
+        _ => (
+            normalize_for_compare(&scope_file),
+            normalize_for_compare(&user_file),
+        ),
+    };
+    paths_equal(&scope_file, &user_file)
+}
+
+fn normalize_for_compare(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        a.to_string_lossy()
+            .eq_ignore_ascii_case(&b.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
     }
 }
 
@@ -133,11 +168,20 @@ mod tests {
         let _home = crate::plugin::test_support::isolated_home();
         let home_dir = _home.path().join("home");
         std::env::set_var("ATOMCODE_HOME", home_dir.join(".atomcode"));
-        assert!(scope_state_file_aliases_user_scope(&home_dir, &InstallScope::Project));
+        assert!(scope_state_file_aliases_user_scope(
+            &home_dir,
+            &InstallScope::Project
+        ));
         // Local scope 位于 <home>/.atomcode/plugins/local/，与 user 文件不同。
-        assert!(!scope_state_file_aliases_user_scope(&home_dir, &InstallScope::Local));
+        assert!(!scope_state_file_aliases_user_scope(
+            &home_dir,
+            &InstallScope::Local
+        ));
         // User scope 无 project 状态文件路径。
-        assert!(!scope_state_file_aliases_user_scope(&home_dir, &InstallScope::User));
+        assert!(!scope_state_file_aliases_user_scope(
+            &home_dir,
+            &InstallScope::User
+        ));
     }
 
     #[test]
@@ -148,6 +192,22 @@ mod tests {
         std::env::set_var("ATOMCODE_HOME", home_dir.join(".atomcode"));
         // 其他工作目录的 project scope 与 user scope 不是同一个文件。
         let other = _home.path().join("projects/myproj");
-        assert!(!scope_state_file_aliases_user_scope(&other, &InstallScope::Project));
+        assert!(!scope_state_file_aliases_user_scope(
+            &other,
+            &InstallScope::Project
+        ));
+    }
+
+    #[test]
+    fn normalize_for_compare_resolves_relative_dot_and_parent_components() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            normalize_for_compare(Path::new("project/../.atomcode/plugins")),
+            cwd.join(".atomcode/plugins")
+        );
+        assert_eq!(
+            normalize_for_compare(Path::new("./.atomcode/plugins")),
+            cwd.join(".atomcode/plugins")
+        );
     }
 }

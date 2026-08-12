@@ -203,6 +203,8 @@ pub fn installed_plugin_cc_hooks() -> Vec<PluginCcHook> {
 pub struct PluginHookTrust {
     pub plugin: String,
     pub marketplace: String,
+    /// Installation scope, used to explain otherwise identical installations.
+    pub scope: InstallScope,
     pub plugin_id: String,
     pub hook_count: usize,
     pub events: Vec<String>,
@@ -227,6 +229,7 @@ pub fn installed_plugin_hook_trust_status() -> Vec<PluginHookTrust> {
             trusted: crate::plugin::hook_trust::is_trusted(&trust, &id, &hash),
             plugin: assets.plugin,
             marketplace: assets.marketplace,
+            scope: assets.scope,
             plugin_id: id,
             hook_count: hooks.len(),
             events,

@@ -8,7 +8,6 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::collections::HashSet;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -3282,26 +3281,19 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                             println!("  uninstalled `{}@{}`", p.plugin, p.marketplace);
                         }
                         _ => {
-                            // The same `plugin@marketplace` may surface once per
-                            // scope; print each distinct target once so the list
-                            // never shows identical suggestions twice.
-                            let mut seen = HashSet::new();
-                            let unique: Vec<_> = matches
-                                .into_iter()
-                                .filter(|p| {
-                                    seen.insert((p.plugin.clone(), p.marketplace.clone()))
-                                })
-                                .collect();
                             let mut msg = format!(
                                 "plugin `{}` installed from multiple marketplaces, please specify:\n",
                                 plugin
                             );
-                            for p in &unique {
+                            for p in &matches {
                                 msg.push_str(&format!(
-                                    "  atomcode plugin uninstall {}@{}\n",
-                                    p.plugin, p.marketplace
+                                    "  {}@{} ({})\n",
+                                    p.plugin, p.marketplace, p.scope
                                 ));
                             }
+                            msg.push_str(
+                                "Use /plugin to select the installation scope to remove.\n",
+                            );
                             anyhow::bail!(msg.trim().to_string());
                         }
                     }
@@ -3316,15 +3308,7 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
             } else {
                 status.iter().filter(|s| s.plugin == name).collect()
             };
-            // The same `plugin@marketplace` may surface once per scope; collapse
-            // duplicates so a single trust target resolves and the error list
-            // never shows identical suggestions twice.
-            let mut seen = HashSet::new();
-            let unique: Vec<_> = matches
-                .into_iter()
-                .filter(|s| seen.insert(s.plugin_id.clone()))
-                .collect();
-            match unique.as_slice() {
+            match matches.as_slice() {
                 [] => anyhow::bail!("plugin `{name}` has no hooks (or is not installed)"),
                 [s] => {
                     atomcode_capabilities::plugin::hook_trust::trust(&s.plugin_id, &s.hash)?;
@@ -3337,13 +3321,14 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                 }
                 many => {
                     let mut msg =
-                        format!("plugin `{name}` installed from multiple marketplaces:\n");
+                        format!("plugin `{name}` has hooks in multiple installations:\n");
                     for s in many {
                         msg.push_str(&format!(
-                            "  atomcode plugin trust {}@{}\n",
-                            s.plugin, s.marketplace
+                            "  {}@{} ({})\n",
+                            s.plugin, s.marketplace, s.scope
                         ));
                     }
+                    msg.push_str("Use /plugin to inspect the installation scopes.\n");
                     anyhow::bail!(msg);
                 }
             }
@@ -3356,13 +3341,7 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
             } else {
                 status.iter().filter(|s| s.plugin == name).collect()
             };
-            // Collapse per-scope duplicates of the same plugin_id, mirroring Trust.
-            let mut seen = HashSet::new();
-            let unique: Vec<_> = matches
-                .into_iter()
-                .filter(|s| seen.insert(s.plugin_id.clone()))
-                .collect();
-            match unique.as_slice() {
+            match matches.as_slice() {
                 [] => anyhow::bail!("plugin `{name}` has no hooks (or is not installed)"),
                 [s] => {
                     atomcode_capabilities::plugin::hook_trust::untrust(&s.plugin_id)?;
@@ -3370,13 +3349,14 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                 }
                 many => {
                     let mut msg =
-                        format!("plugin `{name}` installed from multiple marketplaces:\n");
+                        format!("plugin `{name}` has hooks in multiple installations:\n");
                     for s in many {
                         msg.push_str(&format!(
-                            "  atomcode plugin untrust {}@{}\n",
-                            s.plugin, s.marketplace
+                            "  {}@{} ({})\n",
+                            s.plugin, s.marketplace, s.scope
                         ));
                     }
+                    msg.push_str("Use /plugin to inspect the installation scopes.\n");
                     anyhow::bail!(msg);
                 }
             }
