@@ -1893,9 +1893,15 @@ class AtomCodeChatPanel(
 
     private fun showModelPickerPopup() {
         val menu = JPopupMenu()
+        // 跟随 IDE 主题的选中背景色，退化到固定蓝调保证可读
+        val activeBg = UIManager.getColor("List.selectionBackground") ?: JBColor(0x2F5FA8, 0x2F5FA8)
         setupSnapshot?.models?.forEach { model ->
             menu.add(JMenuItem("${model.model} (${model.provider})").apply {
-                if (model.isDefault) font = font.deriveFont(java.awt.Font.BOLD)
+                if (model.isDefault) {
+                    font = font.deriveFont(java.awt.Font.BOLD)
+                    isOpaque = true
+                    background = activeBg
+                }
                 addActionListener { setDefaultModel(model) }
             })
         }
