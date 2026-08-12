@@ -57,6 +57,34 @@ pub fn project_marketplaces_root(
     project_plugins_root(working_dir, scope).map(|root| root.join("marketplaces"))
 }
 
+/// True when a project/local scope's `installed_plugins.json` resolves to the
+/// same file as the user-scope one.
+///
+/// This happens when `working_dir` IS the plugin home (e.g. running from
+/// `$HOME`), where `<working_dir>/.atomcode/plugins` is the same directory as
+/// the global `plugins_root()` — the same state file would otherwise be read
+/// once per scope and every plugin enumerated twice. Callers (asset/status
+/// iteration, `plugin list`) should skip such scopes.
+pub fn scope_state_file_aliases_user_scope(
+    working_dir: &std::path::Path,
+    scope: &InstallScope,
+) -> bool {
+    let Some(scope_file) = project_installed_plugins_file(working_dir, scope) else {
+        return false;
+    };
+    let Some(user_file) = installed_plugins_file() else {
+        return false;
+    };
+    match (
+        std::fs::canonicalize(&scope_file),
+        std::fs::canonicalize(&user_file),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        // Fall back to lexical comparison when either path is missing.
+        _ => scope_file == user_file,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,5 +123,31 @@ mod tests {
     fn project_plugins_root_user_scope_returns_none() {
         let dir = std::path::Path::new("/tmp/myproject");
         assert!(project_plugins_root(dir, &InstallScope::User).is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn scope_state_file_aliases_user_scope_when_cwd_is_home() {
+        // ATOMCODE_HOME 指向 <home>/.atomcode；cwd == <home> 时 project scope
+        // 的 installed_plugins.json 与 user scope 是同一个文件。
+        let _home = crate::plugin::test_support::isolated_home();
+        let home_dir = _home.path().join("home");
+        std::env::set_var("ATOMCODE_HOME", home_dir.join(".atomcode"));
+        assert!(scope_state_file_aliases_user_scope(&home_dir, &InstallScope::Project));
+        // Local scope 位于 <home>/.atomcode/plugins/local/，与 user 文件不同。
+        assert!(!scope_state_file_aliases_user_scope(&home_dir, &InstallScope::Local));
+        // User scope 无 project 状态文件路径。
+        assert!(!scope_state_file_aliases_user_scope(&home_dir, &InstallScope::User));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn scope_state_file_aliases_user_scope_false_for_other_dir() {
+        let _home = crate::plugin::test_support::isolated_home();
+        let home_dir = _home.path().join("home");
+        std::env::set_var("ATOMCODE_HOME", home_dir.join(".atomcode"));
+        // 其他工作目录的 project scope 与 user scope 不是同一个文件。
+        let other = _home.path().join("projects/myproj");
+        assert!(!scope_state_file_aliases_user_scope(&other, &InstallScope::Project));
     }
 }

@@ -781,6 +781,11 @@ pub fn list_installed() -> Result<Vec<InstalledPluginInfo>> {
     // Project and Local scopes.
     let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     for scope in [InstallScope::Project, InstallScope::Local] {
+        // Same file as the user-scope state (e.g. cwd == $HOME) would list
+        // every plugin twice; skip the aliased scope.
+        if paths::scope_state_file_aliases_user_scope(&working_dir, &scope) {
+            continue;
+        }
         if let Some(state_path) = paths::project_installed_plugins_file(&working_dir, &scope) {
             if state_path.exists() {
                 if let Ok(state) = load_installed_plugins_file(&state_path) {

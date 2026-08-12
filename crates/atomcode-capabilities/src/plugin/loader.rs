@@ -285,6 +285,12 @@ pub fn iter_installed_plugin_assets_for(working_dir: &Path) -> Vec<InstalledPlug
 
     // Project and Local scopes.
     for scope in [InstallScope::Project, InstallScope::Local] {
+        // When `working_dir` is the plugin home itself (e.g. running from
+        // `$HOME`), the project scope's installed_plugins.json IS the user
+        // scope's file — enumerating it again would duplicate every plugin.
+        if paths::scope_state_file_aliases_user_scope(working_dir, &scope) {
+            continue;
+        }
         if let Some(project_root) = paths::project_plugins_root(working_dir, &scope) {
             if let Some(state_path) = paths::project_installed_plugins_file(working_dir, &scope) {
                 if state_path.exists() {
@@ -772,5 +778,55 @@ mod tests {
             installed_plugin_skill_dirs(other.path()).is_empty(),
             "project plugin leaked into a different working directory"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn iter_assets_dedup_when_working_dir_is_home() {
+        let _home = isolated_home();
+        // ATOMCODE_HOME 指向 <home>/.atomcode；cwd == <home> 时 project scope 与
+        // user scope 指向同一 installed_plugins.json（复现真实 `cd ~` 场景）。
+        let home_dir = _home.path().join("home");
+        std::env::set_var("ATOMCODE_HOME", home_dir.join(".atomcode"));
+
+        // 构造 user scope 安装记录 + 真实插件目录。
+        let plugins_root = paths::plugins_root().unwrap();
+        let plugin_dir = plugins_root.join("installed/mp/probe");
+        std::fs::create_dir_all(plugin_dir.join("skills/check")).unwrap();
+        std::fs::write(
+            plugin_dir.join("skills/check/SKILL.md"),
+            "---\nname: check\ndescription: probe\n---\nbody\n",
+        )
+        .unwrap();
+        let mut state = super::super::state::InstalledPluginsFile::default();
+        state.plugins.insert(
+            super::super::state::plugin_id("probe", "mp"),
+            super::super::state::InstalledPluginEntry {
+                marketplace: "mp".into(),
+                plugin: "probe".into(),
+                plugin_dir: "installed/mp/probe".into(),
+                installed_at: "now".into(),
+                scope: InstallScope::User,
+            },
+        );
+        let state_path = paths::installed_plugins_file().unwrap();
+        super::super::state::save_installed_plugins_file(&state_path, &state).unwrap();
+
+        // 修复前：home 目录下 user + project scope 读同一文件，插件被枚举两次；
+        // 修复后只应出现一次。
+        let assets = iter_installed_plugin_assets_for(&home_dir);
+        assert_eq!(
+            assets.len(),
+            1,
+            "cwd == ATOMCODE_HOME 父目录时不得重复枚举 user 插件"
+        );
+        assert_eq!(assets[0].plugin, "probe");
+        assert_eq!(assets[0].scope, InstallScope::User);
+
+        // 其他工作目录不受影响，同样只枚举一次。
+        let other = _home.path().join("projects/other");
+        let assets2 = iter_installed_plugin_assets_for(&other);
+        assert_eq!(assets2.len(), 1);
+        assert_eq!(assets2[0].plugin, "probe");
     }
 }
