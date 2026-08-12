@@ -204,6 +204,8 @@ export interface ChatState {
   searchOpen: boolean;
   /** Derived from `messages` + `searchQuery` so the UI can navigate hits. */
   search: SearchState;
+  /** Fullscreen image preview (lightbox) state; `null` when closed. */
+  imagePreview: { images: ImageData[]; index: number } | null;
   locale?: string;
   approvalMode: ApprovalMode;
   approvalModePending: boolean;
@@ -260,6 +262,10 @@ export type ChatAction =
   | { type: 'CLEAR_CONTEXT' }
   | { type: 'TOGGLE_HISTORY' }
   | { type: 'TOGGLE_SETTINGS' }
+  | { type: 'OPEN_IMAGE_PREVIEW'; images: ImageData[]; index: number }
+  | { type: 'CLOSE_IMAGE_PREVIEW' }
+  | { type: 'IMAGE_PREVIEW_NEXT' }
+  | { type: 'IMAGE_PREVIEW_PREV' }
   | { type: 'PERMISSION_REQUEST'; id: string; sessionId: string; toolName: string; reason: string; args: string; isDestructive: boolean }
   | { type: 'PERMISSION_RESPOND'; id: string; decision: PermissionDecision }
   | { type: 'PERMISSION_RESPONSE_RESULT'; id: string; success: boolean; message?: string }

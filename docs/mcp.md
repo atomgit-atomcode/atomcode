@@ -158,6 +158,7 @@ MCP 总开关：`CodingRuntimeConfig.mcp` 默认 `true`；`atomcode-clix` 提供
 - **`MCP-Protocol-Version`**：HTTP 传输在握手之后的每个请求（含 `notifications/initialized` 与会话 DELETE）都回显**服务器同意的**修订；握手本身不带、空值不带、用户自钉该头时不覆盖。
 - **客户端能力**：`initialize` 声明**空** `capabilities: {}`——我们不实现 roots / sampling / elicitation。（历史上曾错误地声明 `{"tools": {}}`，`tools` 是服务器能力。）
 - **方法**：`initialize`、`tools/list`、`tools/call`。
+- **Server instructions**：读取 `initialize` 响应中的可选 `instructions`，并在模型请求前通过独立的 `<mcp-server-instructions>` 不可信边界临时注入（不得复用权威 `<system-reminder>`）。只有该 server 至少一个工具已挂载到当前 runtime 时才会注入；`/mcp reload`、禁用或撤销工具后立即停止。该内容不写入 session 快照，并被明确限制为该 server 的工具使用指引，不能覆盖 system、用户、项目、安全、权限或审批规则。每个 server 最多 4000 字符，单次请求合计最多 16000 字符；当前没有独立开关。
 - **stdio 帧**：标准 NDJSON（一行一条 JSON-RPC）；额外兼容读取旧式 `Content-Length:` + 正文；对启动期打到 stdout 的非协议日志行有容忍（上限 100 行）。
 - **stdio 断线重连**：进程退出 / EPIPE 等可恢复错误触发一次自动重连（generation 计数避免并发重复重启）。**已发出的 `tools/call` 不会自动重放**——副作用不明时宁可报错，不重复执行。
 - **HTTP**：默认 `Accept: application/json, text/event-stream`（用户未自定义时），响应支持单 JSON 或 SSE 帧；捕获并回送 `Mcp-Session-Id`（Figma Dev Mode 等有状态服务器要求），析构时尽力发 DELETE 释放会话。

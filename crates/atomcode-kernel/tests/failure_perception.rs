@@ -16,7 +16,9 @@
 
 use async_trait::async_trait;
 use atomcode_kernel::agent::{Agent, AutoRespond};
-use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
+use atomcode_kernel::event::{
+    AgentCommand, AgentEvent, PolicyIntervention, PolicyRecoveryAction, StopReason,
+};
 use atomcode_kernel::hook::LifecycleHooks;
 use atomcode_kernel::message::Conversation;
 use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
@@ -58,6 +60,58 @@ impl ToolMiddleware for TerminalDeny {
             BeforeOutcome::deny_turn("credential policy denied; do not retry")
         } else {
             BeforeOutcome::Proceed
+        }
+    }
+}
+
+struct RecoverableTerminalDeny;
+
+#[async_trait]
+impl ToolMiddleware for RecoverableTerminalDeny {
+    async fn before(
+        &self,
+        _call: &mut ToolCall,
+        _tool: &Arc<dyn Tool>,
+        _rt: &RequestCtx,
+    ) -> BeforeOutcome {
+        BeforeOutcome::deny_turn_with_intervention(
+            "credential policy denied; do not retry",
+            PolicyIntervention::credential_shell_blocked(),
+        )
+    }
+}
+
+#[tokio::test]
+async fn policy_intervention_precedes_the_authoritative_terminal() {
+    let provider = Arc::new(ScriptedProvider::events(vec![
+        StreamEvent::ToolCall(tool_call("c1", "echo", r#"{"text":"secret"}"#)),
+        StreamEvent::Done { truncated: false },
+    ]));
+    let handle = Agent::builder()
+        .provider(provider)
+        .tools(echo_tools())
+        .middleware(Arc::new(RecoverableTerminalDeny))
+        .build()
+        .spawn();
+    handle.commands.send(send("go")).unwrap();
+    let mut events = handle.events;
+    let mut intervention_seen = false;
+    loop {
+        match tokio::time::timeout(OUTER_GUARD, events.recv()).await {
+            Ok(Some(AgentEvent::PolicyIntervention { intervention })) => {
+                intervention_seen = true;
+                assert_eq!(intervention.actions.len(), 4);
+                assert!(intervention
+                    .actions
+                    .contains(&PolicyRecoveryAction::CompleteExternally));
+            }
+            Ok(Some(AgentEvent::TurnComplete { reason })) => {
+                assert_eq!(reason, StopReason::PolicyDenied);
+                assert!(intervention_seen, "recovery contract must precede terminal");
+                break;
+            }
+            Ok(Some(_)) => {}
+            other => panic!("event stream ended before policy terminal: {other:?}"),
         }
     }
 }

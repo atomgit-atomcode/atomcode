@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
+use toml_edit::DocumentMut;
 
 use crate::Config;
 
@@ -59,7 +60,49 @@ impl ConfigStore {
 
     /// Read one internally-consistent config + revision snapshot.
     pub fn read(&self) -> Result<ConfigSnapshot> {
+        // Best-effort one-time schema cleanup. Failure to rewrite (for example a
+        // read-only config mounted into a container) must not turn a readable
+        // configuration into a startup failure.
+        let _ = self.remove_legacy_pricing();
         read_snapshot_tolerant(&self.path)
+    }
+
+    /// Remove the retired provider/model `pricing` tables without disturbing
+    /// comments, ordering, unknown keys, or quarantined provider text.
+    pub(crate) fn remove_legacy_pricing(&self) -> Result<bool> {
+        self.with_lock(false, |disk| {
+            let Some(_disk) = disk else {
+                return Ok(false);
+            };
+            let source = std::fs::read_to_string(&self.path).with_context(|| {
+                format!("Failed to read config document: {}", self.path.display())
+            })?;
+            if !source.contains("pricing") {
+                return Ok(false);
+            }
+            let mut document = source.parse::<DocumentMut>().with_context(|| {
+                format!("Failed to parse config document: {}", self.path.display())
+            })?;
+            let mut changed = false;
+            for section in ["providers", "models"] {
+                let Some(entries) = document
+                    .get_mut(section)
+                    .and_then(toml_edit::Item::as_table_like_mut)
+                else {
+                    continue;
+                };
+                for (_, entry) in entries.iter_mut() {
+                    let Some(table) = entry.as_table_like_mut() else {
+                        continue;
+                    };
+                    changed |= table.remove("pricing").is_some();
+                }
+            }
+            if changed {
+                self.persist_document_locked(&document.to_string())?;
+            }
+            Ok(changed)
+        })
     }
 
     /// Apply one delta to the latest disk snapshot while holding the process-shared lock.
@@ -75,6 +118,61 @@ impl ConfigStore {
             mutate(&mut next)?;
             let snapshot = self.persist_locked(&next, disk.as_ref().map(|s| &s.config))?;
             Ok(ConfigCommit { snapshot })
+        })
+    }
+
+    /// Patch the latest TOML document while holding the same process-shared lock
+    /// used by typed config transactions.
+    ///
+    /// Unlike [`Self::update`], this preserves comments, ordering, unknown keys,
+    /// and provider sections byte-for-byte wherever `toml_edit` does not touch
+    /// them. The resulting document is parsed through the tolerant config loader
+    /// before it replaces the file, so a UI editor cannot persist an invalid
+    /// non-provider setting or accidentally discard quarantined providers.
+    pub fn update_document<F>(&self, mutate: F) -> Result<ConfigCommit>
+    where
+        F: FnOnce(&mut DocumentMut) -> Result<()>,
+    {
+        self.with_lock(false, |disk| {
+            let source = match std::fs::read_to_string(&self.path) {
+                Ok(source) => source,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("Failed to read config document: {}", self.path.display())
+                    })
+                }
+            };
+            let mut document = source.parse::<DocumentMut>().with_context(|| {
+                format!("Failed to parse config document: {}", self.path.display())
+            })?;
+            mutate(&mut document)?;
+            let content = document.to_string();
+            let snapshot = self.persist_document_locked(&content)?;
+
+            // Keep the snapshot observed by `with_lock` alive until after the
+            // mutation. This makes it explicit that the document was patched
+            // against the same locked generation, not a pre-lock cached copy.
+            drop(disk);
+            Ok(ConfigCommit { snapshot })
+        })
+    }
+
+    /// Restore an exact TOML document only if no process has changed the file
+    /// since `expected_revision`. Intended for compensating a successful disk
+    /// commit whose runtime application subsequently failed.
+    pub fn replace_document_if_revision(
+        &self,
+        expected_revision: &ConfigRevision,
+        content: &str,
+    ) -> Result<Option<ConfigCommit>> {
+        self.with_lock(false, |disk| {
+            let Some(disk) = disk else { return Ok(None) };
+            if &disk.revision != expected_revision {
+                return Ok(None);
+            }
+            let snapshot = self.persist_document_locked(content)?;
+            Ok(Some(ConfigCommit { snapshot }))
         })
     }
 
@@ -168,6 +266,19 @@ impl ConfigStore {
             revision: ConfigRevision::from_bytes(content.as_bytes()),
         })
     }
+
+    fn persist_document_locked(&self, content: &str) -> Result<ConfigSnapshot> {
+        // Validate before replacement. Tolerant parsing intentionally accepts
+        // and quarantines malformed provider entries, matching all other store
+        // transactions, while syntax errors and invalid ordinary fields fail.
+        let (config, _warnings) = Config::parse_disk_content_tolerant(content, &self.path)?;
+        ensure_parent(&self.path)?;
+        atomic_replace(&self.path, content.as_bytes())?;
+        Ok(ConfigSnapshot {
+            config,
+            revision: ConfigRevision::from_bytes(content.as_bytes()),
+        })
+    }
 }
 
 fn read_snapshot_for_replace(path: &Path) -> Result<Option<ConfigSnapshot>> {
@@ -252,4 +363,130 @@ fn is_not_found(error: &anyhow::Error) -> bool {
             .downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_removes_only_legacy_pricing_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let source = r#"# keep this heading
+default_provider = "custom"
+mystery_flag = "pricing stays in this value"
+
+[providers.custom]
+type = "openai"
+model = "demo"
+custom_provider_key = 42
+
+[providers.custom.pricing]
+input_per_million = 1.0
+output_per_million = 2.0
+
+[provider_accounts.account]
+provider = "openai"
+
+[models.profile]
+account = "account"
+model = "profile-model"
+
+[models.profile.pricing]
+input_per_million = 3.0
+output_per_million = 4.0
+"#;
+        std::fs::write(&path, source).unwrap();
+
+        let snapshot = ConfigStore::new(&path).read().unwrap();
+        assert_eq!(snapshot.config.providers["custom"].model, "demo");
+        assert_eq!(snapshot.config.models["profile"].model, "profile-model");
+
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(migrated.contains("# keep this heading"));
+        assert!(migrated.contains("custom_provider_key = 42"));
+        assert!(migrated.contains("mystery_flag = \"pricing stays in this value\""));
+        assert!(!migrated.contains("[providers.custom.pricing]"));
+        assert!(!migrated.contains("[models.profile.pricing]"));
+        assert!(!migrated.contains("per_million"));
+    }
+
+    #[test]
+    fn document_update_preserves_comments_unknown_keys_and_provider_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let source = r#"# keep this heading
+auto_update = true # keep inline
+mystery_flag = "untouched"
+
+[telemetry]
+enabled = true
+
+[providers.Custom]
+type = "openai"
+api_key = "secret"
+model = "demo"
+base_url = "https://example.invalid/v1"
+custom_provider_key = 42
+"#;
+        std::fs::write(&path, source).unwrap();
+
+        ConfigStore::new(&path)
+            .update_document(|document| {
+                document["telemetry"]["enabled"] = toml_edit::value(false);
+                Ok(())
+            })
+            .unwrap();
+
+        let updated = std::fs::read_to_string(path).unwrap();
+        assert!(updated.contains("# keep this heading"));
+        assert!(updated.contains("auto_update = true # keep inline"));
+        assert!(updated.contains("mystery_flag = \"untouched\""));
+        assert!(updated.contains("custom_provider_key = 42"));
+        assert!(updated.contains("enabled = false"));
+    }
+
+    #[test]
+    fn invalid_document_update_does_not_replace_disk_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let source = "auto_update = true\n";
+        std::fs::write(&path, source).unwrap();
+
+        let result = ConfigStore::new(&path).update_document(|document| {
+            document["auto_update"] = toml_edit::value("not-a-boolean");
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+    }
+
+    #[test]
+    fn document_rollback_is_revision_guarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "auto_update = true # original\n";
+        std::fs::write(&path, original).unwrap();
+        let store = ConfigStore::new(&path);
+        let changed = store
+            .update_document(|document| {
+                document["auto_update"] = toml_edit::value(false);
+                Ok(())
+            })
+            .unwrap();
+
+        let rolled_back = store
+            .replace_document_if_revision(&changed.snapshot.revision, original)
+            .unwrap();
+        assert!(rolled_back.is_some());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        let stale = store
+            .replace_document_if_revision(&changed.snapshot.revision, "auto_update = false\n")
+            .unwrap();
+        assert!(stale.is_none());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
 }

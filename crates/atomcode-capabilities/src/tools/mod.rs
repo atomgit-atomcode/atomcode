@@ -112,7 +112,7 @@ pub use repair::{repair_tool_args, RepairToolArgsMiddleware};
 pub use report_finding::{Finding, ReportFindingTool};
 pub use search_replace::SearchReplaceTool;
 pub use sensitive_path::{path_is_sensitive, references_sensitive_path, SensitivePathGate};
-pub use task::TaskTool;
+pub use task::{subagent_child_middlewares, team_child_middlewares, TaskTool};
 pub use todo::TodoTool;
 #[cfg(feature = "web")]
 pub use web_fetch::WebFetchTool;

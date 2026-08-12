@@ -155,6 +155,11 @@ const zh = {
   'user.expand': '展开',
   'user.collapse': '收起',
 
+  'image.preview': '图片预览',
+  'image.previous': '上一张',
+  'image.next': '下一张',
+  'image.closePreview': '关闭预览',
+
   'provider.settingsTitle': 'AtomCode 设置',
   'provider.notSignedIn': '未登录',
   'provider.providers': 'Providers',
@@ -331,6 +336,11 @@ const en: Record<MsgKey, string> = {
   'user.imageUnavailable': 'Image unavailable',
   'user.expand': 'Expand',
   'user.collapse': 'Collapse',
+
+  'image.preview': 'Image preview',
+  'image.previous': 'Previous image',
+  'image.next': 'Next image',
+  'image.closePreview': 'Close preview',
 
   'provider.settingsTitle': 'AtomCode Settings',
   'provider.notSignedIn': 'Not signed in',

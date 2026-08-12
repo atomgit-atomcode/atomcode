@@ -25,6 +25,7 @@ async function main() {
     'session-list-regression.test.ts',
     'search.test.ts',
     'todo-regression.test.ts',
+    'daemon-client-token.test.ts',
   ];
 
   try {

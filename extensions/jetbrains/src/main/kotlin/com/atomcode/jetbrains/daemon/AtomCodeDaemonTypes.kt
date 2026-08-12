@@ -244,6 +244,7 @@ sealed interface ChatEvent {
     ) : ChatEvent
     data class Tokens(val prompt: Int, val completion: Int, val total: Int) : ChatEvent
     data class Warning(val message: String) : ChatEvent
+    data class PersistenceWarning(val message: String) : ChatEvent
     data class Done(val tokens: Int, val toolCalls: Int, val sessionId: String?) : ChatEvent
     data object Stopped : ChatEvent
     data class Error(val message: String) : ChatEvent

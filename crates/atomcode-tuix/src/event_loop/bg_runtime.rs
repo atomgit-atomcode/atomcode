@@ -50,6 +50,11 @@ pub enum DriverEvent {
     CapabilitiesReloadFinished {
         result: Result<atomcode_coding::SessionChanged, atomcode_coding::RuntimeError>,
     },
+    PolicyInterventionResolutionFinished {
+        intervention_id: u64,
+        action: atomcode_kernel::event::PolicyRecoveryAction,
+        result: Result<(), atomcode_coding::RuntimeError>,
+    },
     /// The `/resume` session catalog finished loading off the UI thread (the scan
     /// reads/parses every session file, which froze the event loop when done
     /// inline). Carries the current-project session list ready to install into the
@@ -809,6 +814,29 @@ impl BgRuntimeManager {
             }
             RuntimeEventPayload::Native(CodingRuntimeEvent::TurnFinished(completion)) => {
                 if let Some(bg) = self.backgrounds.slot_mut_for_runtime_id(runtime_id) {
+                    let policy_terminal = matches!(
+                        &completion,
+                        atomcode_coding::TurnCompletion::Completed {
+                            reason: atomcode_kernel::event::StopReason::PolicyDenied,
+                            ..
+                        }
+                    )
+                    .then(|| completion.clone());
+                    let policy_intervention = policy_terminal.as_ref().and_then(|_| {
+                        bg.buffered_events
+                            .iter()
+                            .find(|event| {
+                                matches!(
+                                    event,
+                                    RuntimeEventPayload::Native(CodingRuntimeEvent::Agent(
+                                        atomcode_kernel::event::AgentEvent::PolicyIntervention {
+                                            ..
+                                        }
+                                    ))
+                                )
+                            })
+                            .cloned()
+                    });
                     bg.pending_request = None;
                     match completion {
                         atomcode_coding::TurnCompletion::Completed {
@@ -834,6 +862,16 @@ impl BgRuntimeManager {
                                 ),
                             ));
                         }
+                    }
+                    if let Some(completion) = policy_terminal {
+                        // The intervention and its authoritative terminal must
+                        // be replayed together. The event stores the safe action
+                        // contract; the terminal opens it only after the runtime
+                        // is idle again.
+                        bg.buffered_events.extend(policy_intervention);
+                        bg.buffered_events.push(RuntimeEventPayload::Native(
+                            CodingRuntimeEvent::TurnFinished(completion),
+                        ));
                     }
                 }
                 false
@@ -1617,6 +1655,57 @@ mod tests {
 
             assert_eq!(manager.backgrounds.slots[0].state, RuntimeState::Error);
         }
+    }
+
+    #[test]
+    fn policy_intervention_and_terminal_survive_background_resume_together() {
+        use std::sync::Arc;
+
+        use atomcode_coding::{RuntimeTurnStats, TurnCompletion};
+        use atomcode_kernel::{event::StopReason, message::SessionSnapshot};
+
+        let mut manager =
+            BgRuntimeManager::new_for_test(Session::default_session(PathBuf::from("/tmp/project")));
+        manager
+            .push_test_background(session("guarded task"), RuntimeState::Running)
+            .unwrap();
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::Agent(
+                atomcode_kernel::event::AgentEvent::PolicyIntervention {
+                    intervention:
+                        atomcode_kernel::event::PolicyIntervention::credential_shell_blocked(),
+                },
+            )),
+        );
+        manager.apply_background_event(
+            RuntimeId::new(2),
+            RuntimeEventPayload::Native(CodingRuntimeEvent::TurnFinished(
+                TurnCompletion::Completed {
+                    turn_id: 1,
+                    reason: StopReason::PolicyDenied,
+                    snapshot: Arc::new(SessionSnapshot::new(Vec::new())),
+                    stats: RuntimeTurnStats::default(),
+                },
+            )),
+        );
+
+        let resumed = manager.resume_slot(1, RuntimeState::Idle).unwrap();
+        assert_eq!(resumed.resumed_state, RuntimeState::Error);
+        assert!(matches!(
+            resumed.replay_events.as_slice(),
+            [
+                RuntimeEventPayload::Native(CodingRuntimeEvent::Agent(
+                    atomcode_kernel::event::AgentEvent::PolicyIntervention { .. }
+                )),
+                RuntimeEventPayload::Native(CodingRuntimeEvent::TurnFinished(
+                    TurnCompletion::Completed {
+                        reason: StopReason::PolicyDenied,
+                        ..
+                    }
+                ))
+            ]
+        ));
     }
 
     #[test]

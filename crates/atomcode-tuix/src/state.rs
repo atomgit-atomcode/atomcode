@@ -391,6 +391,8 @@ pub struct UserInputBatch {
     pub request_id: u64,
     pub questions: Vec<UserInputPanel>,
     pub current: usize,
+    /// User-controlled displacement while reviewing the final answer summary.
+    pub submit_scroll_offset: isize,
 }
 
 impl UserInputBatch {
@@ -406,6 +408,7 @@ impl UserInputBatch {
             request_id,
             questions,
             current: 0,
+            submit_scroll_offset: 0,
         }
     }
 
@@ -439,6 +442,30 @@ impl UserInputBatch {
         } else {
             self.current - 1
         };
+    }
+
+    pub fn page_submit_up(&mut self) {
+        self.submit_scroll_offset = self.submit_scroll_offset.saturating_sub(5);
+    }
+
+    pub fn page_submit_down(&mut self) {
+        self.submit_scroll_offset = self.submit_scroll_offset.saturating_add(5);
+    }
+
+    /// Human-readable answer for the final review page. `None` deliberately
+    /// represents an unanswered question; wire serialization still maps that
+    /// state to a declined response for backward-compatible partial submit.
+    pub fn answer_summary(&self, i: usize) -> Option<String> {
+        let response = self.questions.get(i)?.build_response()?;
+        if !response.selected.is_empty() {
+            return Some(response.selected.join("、"));
+        }
+        response
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(ToOwned::to_owned)
     }
 
     /// Whether question `i` has real content (used for the ✓/○ navigator marker).
@@ -674,6 +701,29 @@ mod user_input_batch_tests {
     }
 
     #[test]
+    fn answer_summary_formats_selected_text_and_unanswered_questions() {
+        let mut b = UserInputBatch::new(
+            1,
+            &[single_q("choice"), text_q("text"), text_q("empty")],
+        );
+        b.questions[0].select_current_option();
+        b.questions[1].text.push_str("  atomcode  ");
+
+        assert_eq!(b.answer_summary(0).as_deref(), Some("x"));
+        assert_eq!(b.answer_summary(1).as_deref(), Some("atomcode"));
+        assert_eq!(b.answer_summary(2), None);
+    }
+
+    #[test]
+    fn submit_review_scroll_is_owned_by_the_batch() {
+        let mut b = UserInputBatch::new(1, &[text_q("a"), text_q("b")]);
+        b.page_submit_down();
+        assert_eq!(b.submit_scroll_offset, 5);
+        b.page_submit_up();
+        assert_eq!(b.submit_scroll_offset, 0);
+    }
+
+    #[test]
     fn paste_routes_to_the_current_batch_question() {
         let mut st = UiState::new();
         st.user_input_batch = Some(UserInputBatch::new(1, &[text_q("a"), text_q("b")]));
@@ -895,6 +945,15 @@ pub struct UiState {
     /// Structured, fixed-footer projection of the currently-running Task
     /// fan-out. Owned by the TUI driver and keyed by the parent tool call id.
     pub active_subtasks: Option<crate::render::SubtaskProgress>,
+    /// Process-local Team Agent projection. Unlike `active_subtasks`, Team runs
+    /// may outlive the foreground turn and are cleared on runtime generation or
+    /// session replacement rather than ordinary turn completion.
+    pub team: crate::team::TeamProjection,
+    /// Set when THIS turn dispatched an async team run (a `RunStarted` arrived),
+    /// cleared at each new submit. Used so the turn-completion banner says
+    /// "Dispatched" (not a celebratory "done") only for the turn that dispatched —
+    /// not for unrelated turns while an old background team happens to still run.
+    pub team_dispatched_this_turn: bool,
     /// Mirrors `TerminalCaps::unicode_symbols` — frozen at construction.
     /// When false, `tick_spinner` and the spinner-label ellipsis fall
     /// back to ASCII so terminals whose font lacks `◐` / `…` (notably
@@ -974,6 +1033,17 @@ pub struct UiState {
     /// to `None` when a CLEAN summary renders (`turn_summary_label`) so a reason
     /// from an error path that produced no summary can never fold into a later turn.
     pub last_turn_error: Option<String>,
+    /// Driver-owned, sanitized explanation for a credential policy denial.
+    /// Kept separate from `last_turn_error` so a provider/rate-limit failure can
+    /// never be presented as the cause of a later security-policy terminal.
+    pub last_policy_denial_reason: Option<String>,
+    /// Driver-safe recovery contract received from the kernel. It survives the
+    /// PolicyDenied terminal long enough for the TUI to open a local choice panel.
+    pub pending_policy_intervention: Option<atomcode_kernel::event::PolicyIntervention>,
+    /// Recovery action awaiting the runtime owner's authoritative response.
+    /// Keeping this separate from the intervention prevents repeated key presses
+    /// while preserving the panel when the runtime rejects a stale decision.
+    pub pending_policy_resolution: Option<(u64, atomcode_kernel::event::PolicyRecoveryAction)>,
     /// True once this turn already rendered a visible line carrying the failure
     /// cause (the red `UiLine::Error` line, or the muted rate-limit line). When
     /// set, `turn_summary_label` renders a bare `✗ 已中断 · …` and does NOT fold
@@ -1150,16 +1220,33 @@ pub struct UiState {
     /// cleared: ids are monotonic within a session, so a stale title is
     /// harmless and a known title outlives the batch that revealed it.
     pub todo_titles: std::collections::HashMap<u64, String>,
-    /// Active todo list for the persistent footer todo PANEL. Written from the
-    /// turn's `todowrite` calls, seeded from the transcript on resume/switch
-    /// (`replay_session`), reset on `/clear`/`/new` (`reset_to_new_session`).
+    /// Active todo list for the persistent footer todo PANEL. Committed from the
+    /// turn's successful `todowrite` results, seeded from the transcript on
+    /// resume/switch (`replay_session`), reset on `/clear`/`/new`
+    /// (`reset_to_new_session`).
     /// Unlike the old live-only row, this PERSISTS across turn boundaries — the
     /// panel is a standing view, hidden only when the list is empty or all done.
     pub active_todos: Option<crate::render::TodoProgress>,
+    /// Todo mutations staged at ToolCallStarted and committed only after the
+    /// matching successful ToolCallResult. Keyed by the kernel-global call id.
+    pub pending_todo_calls: std::collections::HashMap<String, String>,
+    /// Stable tool-call order for replaying concurrent Todo mutations.
+    pub pending_todo_order: Vec<String>,
+    /// Correlated terminal result for each staged Todo call (`true` = success).
+    pub pending_todo_results: std::collections::HashMap<String, bool>,
+    /// Todo list captured before the first concurrent mutation. Both committed
+    /// and optimistic projections are deterministically replayed from this base.
+    pub pending_todo_base: Option<Vec<atomcode_capabilities::tools::todo::TodoItem>>,
+    /// Presentation-only projection including successful and unresolved Todo
+    /// mutations in call order. Failed mutations are excluded.
+    pub pending_todo_preview: Option<crate::render::TodoProgress>,
     /// Current reasoning_effort level for the active provider.
     pub reasoning_effort: Option<String>,
     /// Active goal condition string, if a `/goal` is running.
     pub goal_condition: Option<String>,
+    /// Mobile App armed Goal mode before the first condition/message is sent.
+    /// The next idle TUI submit consumes this flag as the Goal condition.
+    pub goal_armed: bool,
     /// Current round number of the running goal loop.
     pub goal_round: u32,
     /// When the goal was started, for elapsed-time display.
@@ -1196,6 +1283,17 @@ pub struct UiState {
 #[derive(Debug, Clone)]
 pub struct ActiveToolBatch {
     pub call_ids: Vec<String>,
+    /// Completed edit-class results keyed by call id. Results may arrive out of
+    /// order, so `ToolBatchCompleted` walks `call_ids` and renders these in the
+    /// model's original order after the live group can no longer be updated.
+    pub edit_displays: std::collections::HashMap<String, BatchedEditDisplay>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchedEditDisplay {
+    pub summary: String,
+    pub diff_stats: (usize, usize),
+    pub entries: Vec<crate::render::DiffEntry>,
 }
 
 /// Stats captured at `TurnComplete` and held until the next event decides
@@ -1212,15 +1310,18 @@ pub struct PendingSeparator {
     /// Whether the turn ran inside an active `/loop` (decides `⚡ loop round N`
     /// vs the normal summary when flushed mid-loop).
     pub was_loop_round: bool,
-    /// Whether the turn ended abnormally (error, cancellation, or a safety
-    /// limit). Lets the deferred flush render the ✗ "stopped" summary instead
-    /// of a celebratory ✓ for an incomplete turn.
-    pub errored: bool,
+    /// Exact terminal projection retained across a deferred goal/loop separator.
+    /// In particular, policy denial must not collapse into the generic
+    /// "interrupted" label when the separator is flushed later.
+    pub stop_reason: crate::event_loop::ui_event::UiTurnStopReason,
     /// Snapshot of `UiState::turn_error_line_shown` at defer time. The deferred
     /// flush can land AFTER a later turn's `on_submit` has reset the live flag,
     /// so we capture it here to decide correctly whether the errored summary
     /// should fold the cause or render bare (the cause was already shown above).
     pub error_line_shown: bool,
+    /// Sanitized policy reason moved out of live state while a goal/loop
+    /// separator is deferred. This keeps it bound to the terminal that owns it.
+    pub policy_denial_reason: Option<String>,
     /// Cache-hit ratio over the turn's input, if the provider reported cached
     /// tokens. `None` ⇒ no annotation. Rendered as `· N% cached`.
     pub cached_pct: Option<u8>,
@@ -1276,6 +1377,8 @@ impl UiState {
             compaction_forced_streaming: false,
             subagent_activity: None,
             active_subtasks: None,
+            team: crate::team::TeamProjection::default(),
+            team_dispatched_this_turn: false,
             unicode_symbols,
             colors,
             total_tokens: 0,
@@ -1295,6 +1398,9 @@ impl UiState {
             last_assistant_response: String::new(),
             response_finalized: false,
             last_turn_error: None,
+            last_policy_denial_reason: None,
+            pending_policy_intervention: None,
+            pending_policy_resolution: None,
             turn_error_line_shown: false,
             prior_phase: None,
             prior_spinner_label: None,
@@ -1329,8 +1435,14 @@ impl UiState {
             call_id_to_batch: std::collections::HashMap::new(),
             todo_titles: std::collections::HashMap::new(),
             active_todos: None,
+            pending_todo_calls: std::collections::HashMap::new(),
+            pending_todo_order: Vec::new(),
+            pending_todo_results: std::collections::HashMap::new(),
+            pending_todo_base: None,
+            pending_todo_preview: None,
             reasoning_effort: None,
             goal_condition: None,
+            goal_armed: false,
             goal_round: 0,
             goal_started_at: None,
             goal_phase: atomcode_coding::GoalPhase::Pursuing,
@@ -1584,6 +1696,8 @@ impl UiState {
         self.spinner_label = self.current_thinking().to_string();
         self.spinner_frame = 0;
         self.thinking_idx = self.thinking_idx.wrapping_add(1);
+        // A fresh turn hasn't dispatched team work yet.
+        self.team_dispatched_this_turn = false;
         let now = std::time::Instant::now();
         self.turn_started_at = Some(now);
         self.phase_started_at = Some(now);
@@ -1650,6 +1764,7 @@ impl UiState {
         // leave a stale `explore#4 · …` pinned onto the next turn's spinner.
         self.subagent_activity = None;
         self.active_subtasks = None;
+        self.pending_todo_preview = None;
         // Safety clear: if a turn ends without resolving an approval (e.g. error
         // path or session switch), ensure the panel is not left stale.
         self.approval_panel = None;
@@ -1679,9 +1794,12 @@ impl UiState {
         self.turn_saw_reasoning = false;
         self.subagent_activity = None;
         self.active_subtasks = None;
+        self.pending_todo_preview = None;
         self.approval_panel = None;
         self.user_input_panel = None;
         self.user_input_batch = None;
+        self.pending_policy_intervention = None;
+        self.pending_policy_resolution = None;
         self.pending_steers.clear();
         self.round_cap_panel = None;
         // Streaming-only `/usage` tab panel — drop it on cancel too (mirrors
@@ -1706,6 +1824,11 @@ impl UiState {
         self.footer_usage = None;
         self.subagent_activity = None;
         self.active_subtasks = None;
+        self.pending_todo_preview = None;
+        self.team.clear();
+        self.pending_policy_intervention = None;
+        self.pending_policy_resolution = None;
+        self.user_input_panel = None;
     }
 
     /// The TUI dispatched a mid-turn steer to the kernel — one prompt now waiting
@@ -2276,6 +2399,30 @@ mod tests {
     }
 
     #[test]
+    fn policy_intervention_does_not_survive_cancel_or_session_replacement() {
+        let intervention = atomcode_kernel::event::PolicyIntervention::credential_shell_blocked();
+        let mut cancelled = UiState::new();
+        cancelled.pending_policy_intervention = Some(intervention.clone());
+        cancelled.pending_policy_resolution = Some((
+            intervention.id,
+            atomcode_kernel::event::PolicyRecoveryAction::SkipStep,
+        ));
+        cancelled.on_turn_cancelled();
+        assert!(cancelled.pending_policy_intervention.is_none());
+        assert!(cancelled.pending_policy_resolution.is_none());
+
+        let mut replaced = UiState::new();
+        replaced.pending_policy_resolution = Some((
+            intervention.id,
+            atomcode_kernel::event::PolicyRecoveryAction::EndTask,
+        ));
+        replaced.pending_policy_intervention = Some(intervention);
+        replaced.on_session_replaced();
+        assert!(replaced.pending_policy_intervention.is_none());
+        assert!(replaced.pending_policy_resolution.is_none());
+    }
+
+    #[test]
     fn turn_token_summary_reports_billable_and_cached_pct() {
         // A heavily-cached round: 118K context, 114.46K of it cached, 2K output.
         // Billable = output + uncached input = 2000 + (118000 - 114460) = 5540.
@@ -2598,7 +2745,13 @@ mod tests {
         s.on_tool_batch_started();
         let anchor = s.phase_started_at.unwrap();
         s.active_tool_batches
-            .insert("b1".into(), ActiveToolBatch { call_ids: vec![] });
+            .insert(
+                "b1".into(),
+                ActiveToolBatch {
+                    call_ids: vec![],
+                    edit_displays: std::collections::HashMap::new(),
+                },
+            );
         std::thread::sleep(std::time::Duration::from_millis(15));
         s.on_tool_call_streaming("Bash(a)");
         assert_eq!(
@@ -2639,7 +2792,13 @@ mod tests {
         s.on_tool_batch_started();
         let anchor = s.phase_started_at.unwrap();
         s.active_tool_batches
-            .insert("b1".into(), ActiveToolBatch { call_ids: vec![] });
+            .insert(
+                "b1".into(),
+                ActiveToolBatch {
+                    call_ids: vec![],
+                    edit_displays: std::collections::HashMap::new(),
+                },
+            );
         std::thread::sleep(std::time::Duration::from_millis(15));
         s.on_thinking();
         assert_eq!(

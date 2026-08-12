@@ -4,10 +4,10 @@ use crate::config::CodingAgentConfig;
 use crate::discipline::VerifyCadenceHook;
 use crate::execution_policy::TurnExecutionPolicy;
 use crate::persona::coding_persona_with_language;
-use atomcode_capabilities::codeintel::{codeintel_tool_names, register_codeintel_tools};
-use atomcode_capabilities::provider::{
-    model_suggests_vision, OpenAiCompatConfig, OpenAiCompatProvider,
+use atomcode_capabilities::codeintel::{
+    codeintel_tool_names, register_codeintel_tools, register_lsp_tool, LspSettings,
 };
+use atomcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider};
 use atomcode_capabilities::session::SessionContextHook;
 use atomcode_capabilities::tools::{
     coding_tool_names, register_coding_tools_with_vision, ApprovalMiddleware,
@@ -49,7 +49,7 @@ pub fn build_coding_agent(cfg: CodingAgentConfig) -> Result<Agent, String> {
     // Text-only models must NOT receive image content — a resumed conversation whose
     // history contains an image would otherwise 400 every turn. SAME canonical detector
     // as the tool-mount / read_file vision gate above.
-    provider_cfg.supports_vision = model_suggests_vision(&cfg.model);
+    provider_cfg.supports_vision = cfg.supports_vision;
     let provider = OpenAiCompatProvider::new(provider_cfg)
         .map_err(|e| format!("provider init failed: {}", e.message))?;
     try_build_coding_agent_with(&cfg, Arc::new(provider))
@@ -65,12 +65,12 @@ pub fn build_coding_agent(cfg: CodingAgentConfig) -> Result<Agent, String> {
 /// [`try_build_coding_agent_with`].
 pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmProvider>) -> Agent {
     let todo_enabled = crate::persona::todo_switch_enabled_for(cfg.todo.enabled);
-    match mount_coding_tools(model_suggests_vision(&cfg.model), todo_enabled) {
+    match mount_coding_tools(cfg.supports_vision, todo_enabled, &cfg.lsp) {
         Ok(tools) => build_coding_agent_from_tools(cfg, provider, tools, None),
         Err(_error) => build_coding_agent_from_tools(
             cfg,
             provider,
-            mount_base_coding_tools(model_suggests_vision(&cfg.model), todo_enabled),
+            mount_base_coding_tools(cfg.supports_vision, todo_enabled, &cfg.lsp),
             Some("AtomGit tools are unavailable because capability setup failed.".to_string()),
         ),
     }
@@ -83,8 +83,9 @@ pub fn try_build_coding_agent_with(
     provider: Arc<dyn LlmProvider>,
 ) -> Result<Agent, String> {
     let tools = mount_coding_tools(
-        model_suggests_vision(&cfg.model),
+        cfg.supports_vision,
         crate::persona::todo_switch_enabled_for(cfg.todo.enabled),
+        &cfg.lsp,
     )?;
     Ok(build_coding_agent_from_tools(cfg, provider, tools, None))
 }
@@ -203,8 +204,12 @@ fn build_coding_agent_from_tools(
 
 /// Register the neutral coding tools + codeintel into a fresh registry and mount the
 /// union (everything visible to the model).
-fn mount_coding_tools(vision: bool, todo_enabled: bool) -> Result<MountedTools, String> {
-    let (registry, names) = base_coding_tools(vision, todo_enabled);
+fn mount_coding_tools(
+    vision: bool,
+    todo_enabled: bool,
+    lsp: &LspSettings,
+) -> Result<MountedTools, String> {
+    let (registry, names) = base_coding_tools(vision, todo_enabled, lsp);
     #[cfg(feature = "atomgit")]
     let (registry, names) = {
         let (mut registry, mut names) = (registry, names);
@@ -215,22 +220,29 @@ fn mount_coding_tools(vision: bool, todo_enabled: bool) -> Result<MountedTools, 
     Ok(registry.mount(&refs))
 }
 
-fn mount_base_coding_tools(vision: bool, todo_enabled: bool) -> MountedTools {
-    let (registry, names) = base_coding_tools(vision, todo_enabled);
+fn mount_base_coding_tools(vision: bool, todo_enabled: bool, lsp: &LspSettings) -> MountedTools {
+    let (registry, names) = base_coding_tools(vision, todo_enabled, lsp);
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     registry.mount(&refs)
 }
 
-fn base_coding_tools(vision: bool, todo_enabled: bool) -> (ToolRegistry, Vec<String>) {
+fn base_coding_tools(
+    vision: bool,
+    todo_enabled: bool,
+    lsp: &LspSettings,
+) -> (ToolRegistry, Vec<String>) {
     let mut registry = ToolRegistry::new();
     register_coding_tools_with_vision(&mut registry, vision);
     register_codeintel_tools(&mut registry);
-    let names: Vec<String> = coding_tool_names()
+    let mut names: Vec<String> = coding_tool_names()
         .iter()
         .filter(|name| todo_enabled || **name != "todowrite")
         .chain(codeintel_tool_names().iter())
         .map(|name| (*name).to_string())
         .collect();
+    if register_lsp_tool(&mut registry, lsp) {
+        names.push("lsp".into());
+    }
     (registry, names)
 }
 
@@ -261,14 +273,46 @@ pub(crate) fn register_atomgit_capabilities(
 #[cfg(test)]
 mod tests {
     use super::mount_base_coding_tools;
+    use atomcode_capabilities::codeintel::{LspServerSetting, LspSettings};
 
     #[test]
     fn disabled_todo_is_not_exposed_to_the_model() {
-        let names: Vec<String> = mount_base_coding_tools(false, false)
+        let names: Vec<String> = mount_base_coding_tools(false, false, &Default::default())
             .defs()
             .into_iter()
             .map(|def| def.name)
             .collect();
         assert!(!names.iter().any(|name| name == "todowrite"));
+    }
+
+    #[test]
+    fn lsp_is_mounted_only_when_runtime_policy_enables_it() {
+        let disabled: Vec<_> = mount_base_coding_tools(false, true, &LspSettings::default())
+            .defs()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert!(!disabled.iter().any(|name| name == "lsp"));
+
+        let mut enabled = LspSettings {
+            enabled: true,
+            auto_detect: false,
+            ..Default::default()
+        };
+        enabled.servers.insert(
+            "rs".into(),
+            LspServerSetting {
+                command: "rust-analyzer".into(),
+                args: Vec::new(),
+                root_markers: vec!["Cargo.toml".into()],
+            },
+        );
+        let mounted: Vec<_> = mount_base_coding_tools(false, true, &enabled)
+            .defs()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert!(mounted.iter().any(|name| name == "lsp"));
+        assert!(!mounted.iter().any(|name| name == "diagnostics"));
     }
 }

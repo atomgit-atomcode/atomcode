@@ -43,3 +43,12 @@ export function failModeSwitch(state: ApprovalModeState): ApprovalModeState {
     displayMode: state.confirmedMode,
   };
 }
+
+/**
+ * Freeze the approval mode for a queued prompt only when it is authoritative.
+ * A pending selection is merely optimistic UI state; returning undefined lets
+ * queue draining use the daemon-confirmed (or rolled-back) mode at that time.
+ */
+export function modeForQueuedPrompt(state: ApprovalModeState): ApprovalMode | undefined {
+  return state.pendingMode ? undefined : state.confirmedMode;
+}

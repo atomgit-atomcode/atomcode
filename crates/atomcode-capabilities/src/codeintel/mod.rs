@@ -12,11 +12,12 @@
 //!   `file_dependencies`, backed by a shared, lazily-built [`CodeIndex`] (the symbol
 //!   layer's statelessness ends here — these tools HOLD an `Arc<CodeIndex>`).
 //!
-//! Deferred vs production: LSP diagnostics; visibility inference; import-aware call
+//! Deferred vs production: visibility inference; import-aware call
 //! resolution; background/incremental indexing (we rebuild on mtime change). Behind the
 //! opt-in `codeintel` cargo feature (12 grammars = heavy C compilation).
 
 use atomcode_kernel::tool::{ToolRegistry, ToolResult};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -33,11 +34,12 @@ pub mod trace_callees;
 pub mod trace_callers;
 pub mod trace_chain;
 
-/// LSP diagnostics (spawns external language servers). Opt-in `lsp` feature.
 #[cfg(feature = "lsp")]
 pub mod diagnostics;
 #[cfg(feature = "lsp")]
 pub mod lsp;
+#[cfg(feature = "lsp")]
+pub mod lsp_tool;
 
 pub use blast_radius::BlastRadiusTool;
 pub use file_deps::FileDependenciesTool;
@@ -56,25 +58,13 @@ pub use trace_chain::TraceChainTool;
 pub use diagnostics::DiagnosticsTool;
 #[cfg(feature = "lsp")]
 pub use lsp::LspManager;
+#[cfg(feature = "lsp")]
+pub use lsp_tool::LspTool;
 
 /// Names of the code-intelligence tools — pass to
-/// [`ToolRegistry::mount`](atomcode_kernel::tool::ToolRegistry::mount). Includes
-/// `diagnostics` only when the `lsp` feature is enabled.
-#[cfg(feature = "lsp")]
-pub fn codeintel_tool_names() -> &'static [&'static str] {
-    &[
-        "list_symbols",
-        "read_symbol",
-        "find_references",
-        "trace_callers",
-        "trace_callees",
-        "trace_chain",
-        "blast_radius",
-        "file_dependencies",
-        "diagnostics",
-    ]
-}
-#[cfg(not(feature = "lsp"))]
+/// [`ToolRegistry::mount`](atomcode_kernel::tool::ToolRegistry::mount). LSP is
+/// intentionally separate: a Cargo feature must not silently expose a process-spawning
+/// tool in every codeintel consumer.
 pub fn codeintel_tool_names() -> &'static [&'static str] {
     &[
         "list_symbols",
@@ -90,7 +80,7 @@ pub fn codeintel_tool_names() -> &'static [&'static str] {
 
 /// Register all code-intelligence tools. The 5 graph tools SHARE one lazily-built
 /// [`CodeIndex`]; the symbol tools and `find_references` are stateless. With the `lsp`
-/// feature, the `diagnostics` tool (sharing one [`LspManager`]) is also registered.
+/// feature, LSP is still registered separately by the L2 runtime owner.
 pub fn register_codeintel_tools(reg: &mut ToolRegistry) {
     reg.register(Arc::new(ListSymbolsTool));
     reg.register(Arc::new(ReadSymbolTool));
@@ -101,8 +91,68 @@ pub fn register_codeintel_tools(reg: &mut ToolRegistry) {
     reg.register(Arc::new(TraceChainTool::new(index.clone())));
     reg.register(Arc::new(BlastRadiusTool::new(index.clone())));
     reg.register(Arc::new(FileDependenciesTool::new(index)));
-    #[cfg(feature = "lsp")]
-    reg.register(Arc::new(DiagnosticsTool::new(Arc::new(LspManager::new()))));
+}
+
+/// A neutral language-server entry supplied by an L2 assembly. Capabilities cannot
+/// depend on a product config type, so the coding layer maps `[lsp.servers]` once.
+#[derive(Debug, Clone)]
+pub struct LspServerSetting {
+    pub command: String,
+    pub args: Vec<String>,
+    pub root_markers: Vec<String>,
+}
+
+/// Runtime policy for the optional LSP tool. Disabled by default and never downloads
+/// binaries; `auto_detect` only enables the built-in mapping to locally installed ones.
+#[derive(Debug, Clone)]
+pub struct LspSettings {
+    pub enabled: bool,
+    pub auto_detect: bool,
+    pub servers: HashMap<String, LspServerSetting>,
+    pub settle_delay_ms: u64,
+}
+
+impl Default for LspSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_detect: false,
+            servers: HashMap::new(),
+            settle_delay_ms: 150,
+        }
+    }
+}
+
+/// Register one shared, lazily-started `lsp` tool when the driver explicitly enables
+/// it. Returns whether registration occurred so callers only mount an existing tool.
+#[cfg(feature = "lsp")]
+pub fn register_lsp_tool(reg: &mut ToolRegistry, settings: &LspSettings) -> bool {
+    if !settings.enabled {
+        return false;
+    }
+    let mut servers = if settings.auto_detect {
+        lsp::LspServerRegistry::with_defaults()
+    } else {
+        lsp::LspServerRegistry::empty()
+    };
+    for (extension, server) in &settings.servers {
+        servers.insert(
+            extension.trim_start_matches('.').to_ascii_lowercase(),
+            lsp::LspServerConfig {
+                command: server.command.clone(),
+                args: server.args.clone(),
+                root_markers: server.root_markers.clone(),
+            },
+        );
+    }
+    let manager = LspManager::with_registry_and_delay(servers, settings.settle_delay_ms);
+    reg.register(Arc::new(LspTool::new(Arc::new(manager))));
+    true
+}
+
+#[cfg(not(feature = "lsp"))]
+pub fn register_lsp_tool(_reg: &mut ToolRegistry, _settings: &LspSettings) -> bool {
+    false
 }
 
 // Local path/result helpers (kept independent of the `tools` feature). Leading-`~`

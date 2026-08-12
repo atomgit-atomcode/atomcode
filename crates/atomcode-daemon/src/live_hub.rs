@@ -6,7 +6,7 @@ use atomcode_coding::{
     CodingRuntimeEvent, CodingRuntimeHandle, DriverCommand, RuntimePhase, RuntimeStatus,
     RuntimeUnavailable, SequencedRuntimeEvent, SubmitReceipt, TurnCompletion, UserInput,
 };
-use atomcode_kernel::event::{AgentEvent, RequestId};
+use atomcode_kernel::event::{AgentEvent, PolicyRecoveryAction, RequestId};
 use atomcode_kernel::message::SessionSnapshot;
 use tokio::sync::broadcast;
 
@@ -78,6 +78,9 @@ pub struct LiveObservation {
 pub struct LiveJoin {
     pub binding: LiveBinding,
     pub snapshot: Arc<SessionSnapshot>,
+    /// Latest Goal controller state. Unlike turn replay, this must survive a
+    /// completed turn so late `/live` subscribers can restore the Goal UI.
+    pub goal_progress: Option<atomcode_coding::GoalProgress>,
     pub replay: Vec<LiveObservation>,
     pub receiver: broadcast::Receiver<LiveObservation>,
 }
@@ -118,6 +121,7 @@ struct HubState {
     snapshot: Option<Arc<SessionSnapshot>>,
     snapshot_error: Option<String>,
     replay: Vec<LiveObservation>,
+    goal_progress: Option<atomcode_coding::GoalProgress>,
     pending_requests: HashMap<RequestId, String>,
     turn_active: bool,
     last_runtime_sequence: Option<u64>,
@@ -242,6 +246,7 @@ impl LiveViewHub {
         state.snapshot = Some(Arc::new(snapshot));
         state.snapshot_error = None;
         state.replay.clear();
+        state.goal_progress = None;
         state.pending_requests.clear();
         state.pending_web_steers.clear();
         state.turn_active = false;
@@ -275,6 +280,7 @@ impl LiveViewHub {
         Ok(LiveJoin {
             binding,
             snapshot,
+            goal_progress: state.goal_progress.clone(),
             replay: state.replay.clone(),
             receiver,
         })
@@ -307,6 +313,7 @@ impl LiveViewHub {
         state.snapshot = None;
         state.snapshot_error = None;
         state.replay.clear();
+        state.goal_progress = None;
         state.pending_requests.clear();
         state.pending_web_steers.clear();
         state.last_runtime_sequence = None;
@@ -353,6 +360,7 @@ impl LiveViewHub {
         state.snapshot = Some(Arc::new(snapshot));
         state.snapshot_error = None;
         state.replay.clear();
+        state.goal_progress = None;
         state.pending_requests.clear();
         state.pending_web_steers.clear();
         state.turn_active = false;
@@ -528,6 +536,18 @@ impl LiveViewHub {
         self.bound_handle()?
             .1
             .set_mode(mode)
+            .await
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))
+    }
+
+    pub async fn resolve_policy_intervention(
+        &self,
+        intervention_id: u64,
+        action: PolicyRecoveryAction,
+    ) -> Result<(), HubError> {
+        self.bound_handle()?
+            .1
+            .resolve_policy_intervention(intervention_id, action)
             .await
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))
     }
@@ -783,6 +803,7 @@ impl LiveViewHub {
             let current = state.binding.as_mut().expect("binding checked above");
             current.identity.generation = envelope.generation;
             state.replay.clear();
+            state.goal_progress = None;
             state.pending_requests.clear();
             state.pending_web_steers.clear();
             state.turn_active = false;
@@ -791,6 +812,10 @@ impl LiveViewHub {
         state.last_runtime_sequence = Some(envelope.sequence);
 
         let event = envelope.event;
+        if let CodingRuntimeEvent::GoalChanged(progress) = &event {
+            state.goal_progress = (progress.phase != atomcode_coding::GoalPhase::Ended)
+                .then(|| progress.clone());
+        }
         let mapped_steer = match &event {
             CodingRuntimeEvent::Agent(AgentEvent::Steered { count, inputs }) => Some((
                 *count,
@@ -802,6 +827,21 @@ impl LiveViewHub {
         let mut replay = state.turn_active;
         match &event {
             CodingRuntimeEvent::Agent(AgentEvent::TurnStarted) => {
+                // A new turn closes the prior driver-owned recovery window. A turn
+                // started outside `submit`/`submit_confirmed` (embedded TUI / sync
+                // mode drives the runtime handle directly, so those replay-clearing
+                // paths never run) would otherwise carry a lingering policy
+                // intervention into this turn's replay — a reconnecting client would
+                // then see a stale credential-recovery contract. Drop only that
+                // structured observation; ordinary replay is already empty here.
+                state.replay.retain(|observation| {
+                    !matches!(
+                        &observation.event,
+                        LiveViewEvent::Runtime(CodingRuntimeEvent::Agent(
+                            AgentEvent::PolicyIntervention { .. }
+                        ))
+                    )
+                });
                 state.turn_active = true;
                 replay = true;
             }
@@ -813,9 +853,33 @@ impl LiveViewHub {
                 replay = true;
             }
             CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { snapshot, .. }) => {
+                // A policy intervention is a terminal, driver-owned recovery
+                // contract rather than in-flight transcript. Keep only that
+                // structured event across the snapshot commit so a reconnect
+                // can still present the safe choices. The next accepted input,
+                // session transition, or runtime replacement clears replay.
+                let terminal_intervention = match &event {
+                    CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                        reason: atomcode_kernel::event::StopReason::PolicyDenied,
+                        ..
+                    }) => state
+                        .replay
+                        .iter()
+                        .find(|observation| {
+                            matches!(
+                                &observation.event,
+                                LiveViewEvent::Runtime(CodingRuntimeEvent::Agent(
+                                    AgentEvent::PolicyIntervention { .. }
+                                ))
+                            )
+                        })
+                        .cloned(),
+                    _ => None,
+                };
                 state.snapshot = Some(snapshot.clone());
                 state.snapshot_error = None;
                 state.replay.clear();
+                state.replay.extend(terminal_intervention);
                 state.pending_requests.clear();
                 state.pending_web_steers.clear();
                 state.turn_active = false;
@@ -837,6 +901,21 @@ impl LiveViewHub {
                 state.turn_active = false;
                 replay = false;
             }
+            CodingRuntimeEvent::PolicyInterventionResolved {
+                intervention_id, ..
+            }
+            | CodingRuntimeEvent::PolicyInterventionCleared { intervention_id } => {
+                state.replay.retain(|observation| {
+                    !matches!(
+                        &observation.event,
+                        LiveViewEvent::Runtime(CodingRuntimeEvent::Agent(
+                            AgentEvent::PolicyIntervention { intervention }
+                        ))
+                        if intervention.id == *intervention_id
+                    )
+                });
+                replay = false;
+            }
             CodingRuntimeEvent::SessionChanged(changed) => {
                 let current = state.binding.as_mut().expect("binding checked above");
                 let identity_changed = changed
@@ -854,6 +933,7 @@ impl LiveViewHub {
                     // session's snapshot during that window.
                     state.snapshot_error = Some("session snapshot pending".into());
                     state.replay.clear();
+                    state.goal_progress = None;
                     state.pending_requests.clear();
                     state.pending_web_steers.clear();
                     state.turn_active = false;
@@ -907,6 +987,29 @@ impl LiveViewHub {
             }
         };
         self.publish(binding, envelope)
+    }
+
+    /// Seed controller-only state when an already-running embedded TUI is
+    /// attached. This is deliberately outside the runtime sequence stream:
+    /// assigning sequence 0 here could make the runtime's first real event
+    /// (also sequence 0) look stale and drop it.
+    pub fn seed_goal_progress(
+        &self,
+        binding: &LiveBinding,
+        progress: atomcode_coding::GoalProgress,
+    ) -> Result<(), HubError> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let current = state.binding.as_ref().ok_or(HubError::Unbound)?;
+        if current.identity.id != binding.id {
+            return Err(HubError::StaleBinding);
+        }
+        state.goal_progress = Some(progress.clone());
+        self.publish_view_locked(
+            &mut state,
+            LiveViewEvent::Runtime(CodingRuntimeEvent::GoalChanged(progress)),
+            false,
+        );
+        Ok(())
     }
 
     fn dispatch_locked(state: &HubState, command: DriverCommand) -> Result<(), HubError> {
@@ -998,6 +1101,7 @@ impl LiveViewHub {
         if current.identity.generation < generation.0 {
             current.identity.generation = generation.0;
             state.replay.clear();
+            state.goal_progress = None;
             state.pending_requests.clear();
             state.pending_web_steers.clear();
             state.turn_active = false;
@@ -1095,10 +1199,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use atomcode_coding::{
-        CodingRuntimeEvent, DriverCommand, RuntimePhase, RuntimeStatus, RuntimeUnavailable,
-        SequencedRuntimeEvent, TurnCompletion, UserInput,
+        CodingRuntimeEvent, DriverCommand, GoalPhase, GoalProgress, RuntimePhase, RuntimeStatus,
+        RuntimeUnavailable, SequencedRuntimeEvent, TurnCompletion, UserInput,
     };
-    use atomcode_kernel::event::AgentEvent;
+    use atomcode_kernel::event::{AgentEvent, PolicyRecoveryAction};
     use atomcode_kernel::message::{Message, SessionSnapshot};
 
     use super::{
@@ -1128,6 +1232,80 @@ mod tests {
             vec![Some("web-1".into())]
         );
         assert!(state.pending_web_steers.is_empty());
+    }
+
+    #[test]
+    fn late_join_receives_goal_state_after_turn_replay_is_empty() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind("session-1", PathBuf::from("/one"), snapshot("one"), control)
+            .unwrap();
+
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 1,
+                event: CodingRuntimeEvent::GoalChanged(GoalProgress {
+                    active: true,
+                    terminal: None,
+                    phase: GoalPhase::Pursuing,
+                    round: 0,
+                    max_rounds: Some(3),
+                    elapsed_secs: 12,
+                    condition: "finish the task".into(),
+                    last_reason: None,
+                }),
+            },
+        )
+        .unwrap();
+
+        let join = hub.join().unwrap();
+        assert!(join.replay.is_empty());
+        assert_eq!(join.goal_progress.unwrap().elapsed_secs, 12);
+    }
+
+    #[test]
+    fn seeding_goal_does_not_consume_runtime_sequence_zero() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind("session-1", PathBuf::from("/one"), snapshot("one"), control)
+            .unwrap();
+        hub.seed_goal_progress(
+            &binding,
+            GoalProgress {
+                active: true,
+                terminal: None,
+                phase: GoalPhase::Pursuing,
+                round: 0,
+                max_rounds: None,
+                elapsed_secs: 0,
+                condition: "finish".into(),
+                last_reason: None,
+            },
+        )
+        .unwrap();
+
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 0,
+                event: CodingRuntimeEvent::GoalChanged(GoalProgress {
+                    active: true,
+                    terminal: None,
+                    phase: GoalPhase::Pursuing,
+                    round: 1,
+                    max_rounds: None,
+                    elapsed_secs: 1,
+                    condition: "finish".into(),
+                    last_reason: None,
+                }),
+            },
+        )
+        .expect("the first runtime event must not be treated as stale");
     }
 
     #[derive(Clone)]
@@ -1394,6 +1572,223 @@ mod tests {
             during.replay[0].event,
             LiveViewEvent::Runtime(CodingRuntimeEvent::Agent(AgentEvent::TurnStarted))
         ));
+    }
+
+    #[test]
+    fn policy_terminal_keeps_only_safe_intervention_for_reconnect() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind("session-1", PathBuf::from("/one"), snapshot("old"), control)
+            .unwrap();
+        let mut intervention =
+            atomcode_kernel::event::PolicyIntervention::credential_shell_blocked();
+        intervention.id = 42;
+        for (sequence, event) in [
+            (1, CodingRuntimeEvent::Agent(AgentEvent::TurnStarted)),
+            (
+                2,
+                CodingRuntimeEvent::Agent(AgentEvent::PolicyIntervention {
+                    intervention,
+                }),
+            ),
+        ] {
+            hub.publish(
+                &binding,
+                SequencedRuntimeEvent {
+                    generation: 1,
+                    sequence,
+                    event,
+                },
+            )
+            .unwrap();
+        }
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 3,
+                event: CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                    turn_id: 1,
+                    reason: atomcode_kernel::event::StopReason::PolicyDenied,
+                    snapshot: Arc::new(snapshot("committed")),
+                    stats: Default::default(),
+                }),
+            },
+        )
+        .unwrap();
+
+        let joined = hub.join().unwrap();
+        assert_eq!(joined.replay.len(), 1);
+        assert!(matches!(
+            &joined.replay[0].event,
+            LiveViewEvent::Runtime(CodingRuntimeEvent::Agent(
+                AgentEvent::PolicyIntervention { .. }
+            ))
+        ));
+
+        hub.submit(UserInput {
+            text: "continue safely".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
+        assert!(hub
+            .join()
+            .unwrap()
+            .replay
+            .iter()
+            .all(|observation| !matches!(
+                &observation.event,
+                LiveViewEvent::Runtime(CodingRuntimeEvent::Agent(
+                    AgentEvent::PolicyIntervention { .. }
+                ))
+            )));
+    }
+
+    #[test]
+    fn policy_resolution_clears_replay_and_is_broadcast_without_being_replayed() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind("session-1", PathBuf::from("/one"), snapshot("old"), control)
+            .unwrap();
+        let mut intervention =
+            atomcode_kernel::event::PolicyIntervention::credential_shell_blocked();
+        intervention.id = 42;
+        for (sequence, event) in [
+            (1, CodingRuntimeEvent::Agent(AgentEvent::TurnStarted)),
+            (
+                2,
+                CodingRuntimeEvent::Agent(AgentEvent::PolicyIntervention {
+                    intervention,
+                }),
+            ),
+            (
+                3,
+                CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                    turn_id: 1,
+                    reason: atomcode_kernel::event::StopReason::PolicyDenied,
+                    snapshot: Arc::new(snapshot("committed")),
+                    stats: Default::default(),
+                }),
+            ),
+        ] {
+            hub.publish(
+                &binding,
+                SequencedRuntimeEvent {
+                    generation: 1,
+                    sequence,
+                    event,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(hub.join().unwrap().replay.len(), 1);
+        let mut listener = hub.join().unwrap().receiver;
+
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 4,
+                event: CodingRuntimeEvent::PolicyInterventionResolved {
+                    intervention_id: 41,
+                    action: PolicyRecoveryAction::SkipStep,
+                },
+            },
+        )
+        .unwrap();
+        let _ = listener.try_recv().unwrap();
+        assert_eq!(hub.join().unwrap().replay.len(), 1);
+
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 5,
+                event: CodingRuntimeEvent::PolicyInterventionResolved {
+                    intervention_id: 42,
+                    action: PolicyRecoveryAction::SkipStep,
+                },
+            },
+        )
+        .unwrap();
+
+        let broadcast = listener.try_recv().unwrap();
+        assert!(matches!(
+            broadcast.event,
+            LiveViewEvent::Runtime(CodingRuntimeEvent::PolicyInterventionResolved {
+                intervention_id: 42,
+                action: PolicyRecoveryAction::SkipStep,
+            })
+        ));
+        assert!(hub.join().unwrap().replay.is_empty());
+    }
+
+    #[test]
+    fn a_new_turn_start_clears_a_lingering_policy_intervention() {
+        // A turn started outside `submit` (embedded TUI / sync mode drives the
+        // runtime handle directly) must not carry the prior turn's recovery
+        // contract into this turn's replay — a reconnecting client would else
+        // render a stale credential-recovery card for an unrelated turn.
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind("session-1", PathBuf::from("/one"), snapshot("old"), control)
+            .unwrap();
+        for (sequence, event) in [
+            (1, CodingRuntimeEvent::Agent(AgentEvent::TurnStarted)),
+            (
+                2,
+                CodingRuntimeEvent::Agent(AgentEvent::PolicyIntervention {
+                    intervention:
+                        atomcode_kernel::event::PolicyIntervention::credential_shell_blocked(),
+                }),
+            ),
+            (
+                3,
+                CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                    turn_id: 1,
+                    reason: atomcode_kernel::event::StopReason::PolicyDenied,
+                    snapshot: Arc::new(snapshot("committed")),
+                    stats: Default::default(),
+                }),
+            ),
+        ] {
+            hub.publish(
+                &binding,
+                SequencedRuntimeEvent {
+                    generation: 1,
+                    sequence,
+                    event,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(hub.join().unwrap().replay.len(), 1);
+
+        // The next turn begins straight from the runtime (no `submit`).
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 4,
+                event: CodingRuntimeEvent::Agent(AgentEvent::TurnStarted),
+            },
+        )
+        .unwrap();
+
+        assert!(hub
+            .join()
+            .unwrap()
+            .replay
+            .iter()
+            .all(|observation| !matches!(
+                &observation.event,
+                LiveViewEvent::Runtime(CodingRuntimeEvent::Agent(
+                    AgentEvent::PolicyIntervention { .. }
+                ))
+            )));
     }
 
     #[test]

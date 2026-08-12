@@ -44,6 +44,9 @@ pub mod datalog;
 /// Dependency-free, so it is always available regardless of capability features.
 pub mod reminder;
 
+/// Provider- and UI-neutral contracts shared by Team Agent orchestration and drivers.
+pub mod team;
+
 /// Claude-Code-compatible EXTERNAL hooks ([`cc_hooks::CCExternalHooks`]) — runs the
 /// user's `hooks.json` commands on the kernel's [`LifecycleHooks`]/[`ToolMiddleware`]
 /// seams (the port of core's hook engine onto the native stack). Opt-in: spawns

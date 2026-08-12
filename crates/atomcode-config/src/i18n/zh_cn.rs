@@ -300,12 +300,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("上下文窗口？[{current}] tokens（留空保持不变；如 128000 / 256000 / 512000 / 1000000，或 128k / 1m）").into(),
         Msg::ProviderContextWindowInvalid =>
             "上下文窗口必须是正整数 tokens，例如 128000 或 128k。".into(),
-        Msg::ProviderStepPricing =>
-            "每百万 token 价格（美元）？输入,输出,缓存输入（留空=未知/保持；输入 clear 可清除；如 2.5,10,0.25；免费填 0,0,0）".into(),
-        Msg::ProviderStepPricingWithHint { current } =>
-            format!("每百万 token 价格（美元）？[{current}]（留空保持；输入 clear 可清除）").into(),
-        Msg::ProviderPricingInvalid =>
-            "价格必须是三个有限且非负的数字：输入,输出,缓存输入。".into(),
         Msg::ProviderNameEmpty => "名称不能为空。".into(),
         Msg::ProviderBaseUrlEmpty => "Base URL 不能为空。".into(),
         Msg::ProviderUnknownType =>
@@ -351,6 +345,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelFieldBaseUrl => "Base URL".into(),
         Msg::ProviderPanelFieldApiKey => "API 密钥".into(),
         Msg::ProviderPanelFieldModel => "模型".into(),
+        Msg::ProviderPanelFieldVision => "图片输入".into(),
+        Msg::ProviderPanelVisionAuto => "自动".into(),
+        Msg::ProviderPanelVisionEnabled => "启用".into(),
+        Msg::ProviderPanelVisionDisabled => "禁用".into(),
         Msg::ProviderPanelFieldWindow => "上下文窗口".into(),
         Msg::ProviderPanelFieldMakeDefault => "设为默认".into(),
         Msg::ProviderPanelSwitchHint => "←→ 切换".into(),
@@ -361,7 +359,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "Tab 下一项  ←→ 切厂商  空格 勾选  ↵ 保存  Esc 返回".into(),
         Msg::ProviderPanelAccountFormHint => "Tab 切换  ↵ 保存  Esc 返回".into(),
         Msg::ProviderPanelModelFormHint =>
-            "Tab 下一项  ←→ 切账号  空格 勾选  ↵ 保存  Esc 返回".into(),
+            "Tab 下一项  ←→ 切选项  空格切换  ↵ 保存  Esc 返回".into(),
         // ── Model 选择器 ──
         Msg::ModelSwitched { provider, model } =>
             format!("  当前会话已切换到 {provider} · {model}\n").into(),
@@ -398,6 +396,22 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             }
         }
         Msg::ToolDenied => "已拒绝".into(),
+        Msg::ToolBlockedBySecurityPolicy =>
+            "安全策略已阻止工具调用：凭据不能通过通用 shell 参数、临时文件或环境变量传递".into(),
+        Msg::PolicyRecoveryHeader => "需要安全决策".into(),
+        Msg::PolicyRecoveryQuestion => "凭据操作已被拦截，AtomCode 下一步应如何处理？".into(),
+        Msg::PolicyRecoveryComplete => "我已在外部完成".into(),
+        Msg::PolicyRecoveryCompleteDesc => "确认外部操作已完成，不自动调用模型".into(),
+        Msg::PolicyRecoverySkip => "跳过该步骤".into(),
+        Msg::PolicyRecoverySkipDesc => "跳过认证步骤并结束本次恢复，不自动调用模型".into(),
+        Msg::PolicyRecoveryInstructions => "查看安全执行指引".into(),
+        Msg::PolicyRecoveryInstructionsDesc => "仅展示本地固定指引和占位符".into(),
+        Msg::PolicyRecoveryEnd => "结束任务".into(),
+        Msg::PolicyRecoveryEndDesc => "关闭本次介入，不调用模型".into(),
+        Msg::PolicyRecoverySafeInstructions => "安全手动路径：\n  1. 打开一个由你控制的独立终端。\n  2. 使用服务官方登录流程或凭据感知的专用工具。\n  3. 在该终端完成认证操作；不要把密钥粘贴到 AtomCode。\n  4. 返回这里并选择“我已在外部完成”。\nAtomCode 不会重构或展示刚才被拒绝的命令。".into(),
+        Msg::PolicyRecoveryCompletedLocally => "已确认认证步骤在外部完成。为避免重新生成敏感命令，本次恢复未调用模型；你可以继续提交不涉及凭据的任务。".into(),
+        Msg::PolicyRecoverySkippedLocally => "已跳过需要访问凭据的步骤。为避免重新生成敏感命令，本次恢复未调用模型；你可以继续提交其他安全任务。".into(),
+        Msg::PolicyRecoverySubmitError => "无法提交安全恢复选择，请重试。".into(),
 
         Msg::CmdSwitchedAutoMode => "  已切换到自动模式(所有工具自动批准)。\n".into(),
         Msg::CmdSwitchedAcceptEditsMode => "  已切换到自动接受编辑模式(文件编辑免审批;bash 仍会询问)。\n".into(),
@@ -618,17 +632,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  Provider：{}\n  配置文件：{}\n\n", provider, path).into(),
 
         // ── /cost ──
-        Msg::CostReport { prompt, completion, cached, cache_rate, total, cost } =>
-            format!(
-                "  提示 Token：       {}\n  补全 Token：       {}\n  缓存 Token：       {}（{}% 命中率）\n  Token 总计：       {}\n  预估费用：         {}\n",
-                prompt, completion, cached, cache_rate, total, cost
-            ).into(),
         Msg::CostTokenReport { prompt, completion, cached, cache_rate, total } =>
             format!(
                 "  提示 Token：       {}\n  补全 Token：       {}\n  缓存 Token：       {}（{}% 命中率）\n  Token 总计：       {}\n",
                 prompt, completion, cached, cache_rate, total
             ).into(),
-        Msg::CostFree => "免费".into(),
         Msg::CostUnattributed { tokens } =>
             format!("历史未归属用量\n  Token 总计：       {}", tokens).into(),
 
@@ -958,7 +966,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescDiff => "显示 git diff".into(),
         Msg::CmdDescClear => "清屏".into(),
         Msg::CmdDescSession => "开始新会话（清除对话）".into(),
-        Msg::CmdDescCost => "显示 Token 费用".into(),
+        Msg::CmdDescCost => "显示本会话 Token 用量".into(),
         Msg::CmdDescUsage => "显示 CodingPlan 用量（标签：当前窗口 / 总览 / 模型）".into(),
         Msg::CmdDescContext => "显示上下文预算明细".into(),
         Msg::CmdDescCompact => "压缩对话历史".into(),
@@ -1004,6 +1012,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescGoal => "设定完成目标（自主循环直到达成）".into(),
         Msg::CmdDescProxy => "切换出站代理模式".into(),
         Msg::CmdDescTodo => "显示当前任务清单；`/todo add <任务>` 追加一条，`/todo clear` 清空".into(),
+        Msg::CmdDescTeam => "显示或控制 Team Agent 进度面板".into(),
         Msg::CmdDescSchedule => "查看定时任务列表和下次运行时间".into(),
         Msg::CmdDescDesktop =>
             "打开 AtomCode 桌面端（已安装则启动，否则显示下载地址）".into(),
@@ -1096,6 +1105,10 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::TurnSummaryError { turn_count, tool_call_count, duration, total_tokens, reason } => {
             let cause = reason.map(|r| format!("：{r}")).unwrap_or_default();
             format!("✗ 已中断{cause} · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into()
+        }
+        Msg::TurnSummaryPolicyDenied { turn_count, tool_call_count, duration, total_tokens, reason } => {
+            let cause = reason.map(|r| format!("：{r}")).unwrap_or_default();
+            format!("✗ 安全策略已终止本回合{cause} · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into()
         }
         Msg::LoginQrHeader =>
             "  登录 AtomGit — 使用微信扫描下方二维码：\n\n".into(),

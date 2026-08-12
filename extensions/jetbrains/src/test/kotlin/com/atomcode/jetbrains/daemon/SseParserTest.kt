@@ -46,6 +46,18 @@ class SseParserTest {
     }
 
     @Test
+    fun parsesPersistenceWarningEvent() {
+        val parser = SseParser()
+        val events = parser.feed(
+            """data: {"type":"persistence_warning","message":"transcript write failed"}${"\n\n"}""",
+        )
+        assertEquals(
+            listOf(ChatEvent.PersistenceWarning("transcript write failed")),
+            events,
+        )
+    }
+
+    @Test
     fun parsesToolProgressEvent() {
         val parser = SseParser()
         val events = parser.feed(

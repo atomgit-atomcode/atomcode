@@ -48,6 +48,11 @@ pub fn download_base() -> &'static str {
 /// same value since the whole workspace shares one version).
 const ATOMCODE_USER_AGENT: &str = concat!("atomcode/", env!("CARGO_PKG_VERSION"));
 
+/// Leading component of a published release asset. [`binary_filename`] builds
+/// names with it and [`reconcile_after_external_upgrade`] reaps stale staged
+/// downloads by it — the two only work as a pair, so they read one constant.
+const ASSET_PREFIX: &str = atomcode_config::distribution::RELEASE_ASSET_PREFIX;
+
 /// Apply the process proxy policy to the download client: honor `no_proxy` mode,
 /// otherwise leave reqwest's env-based proxy detection intact. Same behavior as the
 /// retiring `atomcode_core::proxy::apply_async_proxy_policy`, using the config crate's
@@ -176,9 +181,9 @@ fn target_tag(os: &str, arch: &str) -> Option<&'static str> {
 /// what `scripts/release.sh` publishes to `dist/<version>/`.
 pub fn binary_filename(version: &str, target: &str) -> String {
     if target.starts_with("windows") {
-        format!("atomcode-{}-{}.exe", version, target)
+        format!("{}-{}-{}.exe", ASSET_PREFIX, version, target)
     } else {
-        format!("atomcode-{}-{}", version, target)
+        format!("{}-{}-{}", ASSET_PREFIX, version, target)
     }
 }
 
@@ -212,7 +217,7 @@ pub fn backup_path(exe: &Path) -> PathBuf {
 /// also so it's easy to identify-and-clean if a crash orphans it.
 fn download_path(exe: &Path) -> PathBuf {
     let dir = exe.parent().unwrap_or_else(|| Path::new("."));
-    dir.join(".atomcode.download")
+    dir.join(atomcode_config::distribution::update_download_name())
 }
 
 /// Same-dir temp used during a three-way rollback swap. Also reused by the
@@ -220,7 +225,7 @@ fn download_path(exe: &Path) -> PathBuf {
 /// before deleting the install dir, hence `pub` rather than `pub(crate)`.
 pub fn rolling_path(exe: &Path) -> PathBuf {
     let dir = exe.parent().unwrap_or_else(|| Path::new("."));
-    dir.join(".atomcode.rolling")
+    dir.join(atomcode_config::distribution::update_rolling_name())
 }
 
 /// Return `Ok(())` iff we can create a file alongside `exe`.
@@ -234,7 +239,7 @@ pub fn ensure_writable(exe: &Path) -> Result<()> {
     let dir = exe
         .parent()
         .ok_or_else(|| anyhow!("executable has no parent directory: {}", exe.display()))?;
-    let probe = dir.join(".atomcode.writable-probe");
+    let probe = dir.join(atomcode_config::distribution::update_probe_name());
     match std::fs::File::create(&probe) {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe);
@@ -689,7 +694,7 @@ pub async fn run_upgrade(
             let p = e.path();
             if p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("atomcode-"))
+                .is_some_and(|n| n.starts_with(&format!("{ASSET_PREFIX}-")))
             {
                 let _ = std::fs::remove_file(&p);
             }
@@ -1195,10 +1200,17 @@ mod tests {
 
     #[test]
     fn binary_url_shape() {
+        // The shape is `<download base>/<version>/<asset>`; the base itself
+        // follows the deployment, so derive it rather than spelling a host.
         assert_eq!(
             binary_url("v4.19.0", "darwin-arm64"),
-            "https://atomgit.com/atomgit_atomcode/atomcode/releases/download/v4.19.0/atomcode-v4.19.0-darwin-arm64"
+            format!(
+                "{}/v4.19.0/{}",
+                download_base(),
+                binary_filename("v4.19.0", "darwin-arm64")
+            )
         );
+        assert!(binary_url("v4.19.0", "darwin-arm64").starts_with(download_base()));
     }
 
     #[test]
@@ -1291,7 +1303,7 @@ mod tests {
     fn is_newer_semver() {
         assert!(is_newer("v4.19.0", "v4.18.2")); // latest, current
         assert!(is_newer("v4.19.0", "v4.18.9"));
-        assert!(is_newer("v5.0.5", "v4.99.99"));
+        assert!(is_newer("v5.0.6", "v4.99.99"));
         assert!(!is_newer("v4.19.0", "v4.19.0"));
         assert!(!is_newer("v4.18.0", "v4.19.0")); // latest is older than current
     }

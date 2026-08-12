@@ -9,6 +9,7 @@ fn provider(model: &str) -> ProviderConfig {
         model: model.into(),
         base_url: Some("https://example.test/v1".into()),
         system_prompt: None,
+        supports_vision: None,
         user_agent: None,
         context_window: 128_000,
         max_tokens: None,
@@ -21,7 +22,6 @@ fn provider(model: &str) -> ProviderConfig {
         skip_tls_verify: false,
         ephemeral: false,
         capable_model: None,
-        pricing: None,
     }
 }
 

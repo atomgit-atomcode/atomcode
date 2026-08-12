@@ -1,6 +1,7 @@
 use crate::message::{ImageContent, MessageMeta, SessionSnapshot};
 use crate::tool::{ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Driver round-trip `kind` for the round-cap checkpoint (kernel-initiated:
 /// the fuse pauses the turn and asks the driver "continue past the cap?").
@@ -10,6 +11,53 @@ use serde::{Deserialize, Serialize};
 pub const ROUND_CAP_CHECKPOINT_KIND: &str = "round_cap_checkpoint";
 
 pub type RequestId = u64;
+
+/// Stable machine-readable reason for a hard policy intervention. Drivers use
+/// this code to select trusted, localized presentation; it never carries model
+/// input, rejected command bytes, or credentials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PolicyInterventionCode {
+    CredentialShellBlocked,
+}
+
+/// Recovery actions a driver may safely offer after a hard policy terminal.
+/// None of these actions authorizes the rejected generic-shell operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PolicyRecoveryAction {
+    CompleteExternally,
+    SkipStep,
+    ViewSafeInstructions,
+    EndTask,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyIntervention {
+    /// Process-unique correlation id. Drivers must echo this id when resolving
+    /// the intervention so a delayed response cannot acknowledge a newer one.
+    pub id: u64,
+    pub code: PolicyInterventionCode,
+    pub actions: Vec<PolicyRecoveryAction>,
+}
+
+impl PolicyIntervention {
+    pub fn credential_shell_blocked() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            code: PolicyInterventionCode::CredentialShellBlocked,
+            actions: vec![
+                PolicyRecoveryAction::CompleteExternally,
+                PolicyRecoveryAction::SkipStep,
+                PolicyRecoveryAction::ViewSafeInstructions,
+                PolicyRecoveryAction::EndTask,
+            ],
+        }
+    }
+}
 
 /// A user input that was authoritatively folded into an already-running turn.
 /// Kept separate from persisted [`crate::message::Message`]: this is a transient
@@ -78,6 +126,17 @@ pub enum AgentCommand {
         text: String,
         #[serde(default)]
         images: Vec<ImageContent>,
+    },
+    /// One real user prompt with host-owned synthetic context prepended to the
+    /// SAME turn. The context is stored as `Message::synthetic_user`, then the
+    /// real prompt is stored normally; one command therefore has one turn and one
+    /// terminal. Used for deterministic resume context that must not become a
+    /// second automated turn or leak into user-facing prompt projections.
+    SendMessageWithContext {
+        text: String,
+        #[serde(default)]
+        images: Vec<ImageContent>,
+        context: String,
     },
     /// Host-injected synthetic prompt (e.g. an automated goal-mode continuation).
     /// Same execution path as `SendMessage` (user_prompt_submit hook, task-boundary
@@ -166,6 +225,16 @@ pub enum AgentEvent {
     },
     ToolResult {
         result: ToolResult,
+    },
+    /// A hard policy boundary stopped the turn, with a driver-safe recovery
+    /// contract. Emitted only after every tool call in the batch has a paired
+    /// result and immediately before the authoritative PolicyDenied terminal —
+    /// UNLESS the turn is concurrently cancelled, in which case the cancel
+    /// supersedes: this event and the PolicyDenied terminal are both dropped
+    /// together (the turn ends Cancelled) and drivers surface nothing. The hard
+    /// block itself still stands — its paired blocked ToolResult is persisted.
+    PolicyIntervention {
+        intervention: PolicyIntervention,
     },
     /// Generic middleware ↔ driver round-trip. Kernel is agnostic to kind/payload.
     Request {
@@ -306,6 +375,22 @@ mod tests {
         let json = serde_json::to_string(&cmd).unwrap();
         let back: AgentCommand = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, AgentCommand::SendSyntheticMessage { text } if text == "continue"));
+    }
+
+    #[test]
+    fn send_message_with_context_serde_roundtrip() {
+        let cmd = AgentCommand::SendMessageWithContext {
+            text: "continue".into(),
+            images: vec![],
+            context: "hidden recovery".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: AgentCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            AgentCommand::SendMessageWithContext { text, context, images }
+                if text == "continue" && context == "hidden recovery" && images.is_empty()
+        ));
     }
 
     #[test]

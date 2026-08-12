@@ -58,11 +58,27 @@ pub use live_api::live_set_mode;
 pub use live_api::live_set_working_dir;
 pub use live_api::live_switch_session;
 pub mod auth_token;
+mod daemon_token_file;
 pub mod permission_bridge;
 mod telemetry_scope;
 pub mod webui;
 
 pub(crate) use telemetry_scope::daemon_scope;
+
+/// 解析 daemon 本地 token：`ATOMCODE_DAEMON_TOKEN`（非空则原样用）否则随机 mint。
+/// 无论哪种来源，都会登记进 `store` 使其有效，并返回 token 字符串。
+pub fn resolve_daemon_token(
+    env_token: Option<String>,
+    store: &auth_token::WebuiTokenStore,
+) -> String {
+    match env_token.filter(|s| !s.is_empty()) {
+        Some(t) => {
+            store.insert(t.clone());
+            t
+        }
+        None => store.mint(),
+    }
+}
 
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
@@ -126,6 +142,10 @@ pub(crate) struct ProviderInfo {
     #[serde(rename = "type")]
     pub provider_type: String,
     pub model: String,
+    /// Effective capability after applying the Auto heuristic.
+    pub supports_vision: bool,
+    /// Persisted user override. `None` means Auto.
+    pub supports_vision_override: Option<bool>,
     pub base_url: Option<String>,
     pub has_api_key: bool,
     pub requires_login: bool,
@@ -140,7 +160,6 @@ pub(crate) struct ProviderInfo {
     pub reasoning_effort: Option<String>,
     pub skip_tls_verify: bool,
     pub ephemeral: bool,
-    pub pricing: Option<atomcode_config::config::provider::ProviderPricing>,
 }
 
 /// Login attempts stay addressable while a blocking poll is in flight. Per-record
@@ -1529,17 +1548,23 @@ fn list_all_sessions_in_root(
 fn resolve_session_in_root(
     sessions_root: &std::path::Path,
     id_prefix: &str,
-) -> std::io::Result<Option<SessionMetaWithProject>> {
+) -> atomcode_capabilities::session::SessionResult<Option<SessionMetaWithProject>> {
     if id_prefix.is_empty() {
         return Ok(None);
     }
-    catalog_scan_in_root(sessions_root)?
-        .find(id_prefix)
+    let scan = catalog_scan_in_root(sessions_root).map_err(|source| {
+        atomcode_capabilities::session::SessionStoreError::Io {
+            path: sessions_root.to_path_buf(),
+            source,
+        }
+    })?;
+    scan.find(id_prefix)
         .map(|entry| entry.as_ref().map(catalog_entry_with_project))
-        .map_err(std::io::Error::from)
 }
 
-fn resolve_session_by_id(id_prefix: &str) -> std::io::Result<Option<SessionMetaWithProject>> {
+fn resolve_session_by_id(
+    id_prefix: &str,
+) -> atomcode_capabilities::session::SessionResult<Option<SessionMetaWithProject>> {
     resolve_session_in_root(&NativeSessionManager::sessions_root(), id_prefix)
 }
 
@@ -1553,6 +1578,8 @@ pub struct HealthResponse {
     pub service: &'static str,
     pub binary_hash: &'static str,
     pub instance_id: String,
+    /// Feature flags let newer clients fail gracefully against older daemons.
+    pub capabilities: &'static [&'static str],
 }
 
 fn executable_sha256() -> &'static str {
@@ -1575,6 +1602,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         service: "atomcode-daemon",
         binary_hash: executable_sha256(),
         instance_id: state.daemon_instance_id.to_string(),
+        capabilities: &["goal"],
     })
 }
 
@@ -1895,6 +1923,21 @@ async fn resolve_session(Path(id): Path<String>) -> impl IntoResponse {
     match resolve_session_by_id(&id) {
         Ok(Some(s)) => Json(s).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, Json("Session not found")).into_response(),
+        Err(atomcode_capabilities::session::SessionStoreError::AmbiguousId { query, matches }) => {
+            let locations: Vec<String> = matches
+                .iter()
+                .map(|m| format!("{} (bucket {})", m.id, m.project_bucket))
+                .collect();
+            (
+                StatusCode::CONFLICT,
+                Json(format!(
+                    "session query {query:?} is ambiguous across {} locations: {}",
+                    locations.len(),
+                    locations.join(", ")
+                )),
+            )
+                .into_response()
+        }
         Err(e) => {
             let msg = format!("Failed to resolve session: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response()
@@ -2044,15 +2087,6 @@ fn merge_catalog_session_messages_for_display(
 ) -> anyhow::Result<Vec<MessageInfo>> {
     use atomcode_capabilities::session::{DisplayAnchor, PresentationRole};
 
-    let runtime_messages: Vec<_> = session
-        .snapshot
-        .messages
-        .iter()
-        .filter(|message| {
-            message.internal_origin.as_deref()
-                != Some(atomcode_kernel::message::LEGACY_COLD_SUMMARY_ORIGIN)
-        })
-        .collect();
     let mut presentation = std::collections::BTreeMap::<usize, Vec<_>>::new();
     for entry in &session.presentation.entries {
         let after_message = match entry.anchor {
@@ -2071,9 +2105,14 @@ fn merge_catalog_session_messages_for_display(
     }
     let timestamp = Some(u64::try_from(session.meta.updated_at.max(0)).unwrap_or(0));
     let mut messages =
-        Vec::with_capacity(runtime_messages.len() + session.presentation.entries.len());
+        Vec::with_capacity(session.snapshot.messages.len() + session.presentation.entries.len());
     let mut append_presentation = |position: usize, messages: &mut Vec<MessageInfo>| {
         for entry in presentation.remove(&position).unwrap_or_default() {
+            if entry.role == PresentationRole::User
+                && atomcode_capabilities::reminder::is_system_reminder(&entry.text)
+            {
+                continue;
+            }
             messages.push(MessageInfo {
                 role: match entry.role {
                     PresentationRole::User => "user",
@@ -2092,14 +2131,30 @@ fn merge_catalog_session_messages_for_display(
         }
     };
     append_presentation(0, &mut messages);
-    for (index, message) in runtime_messages.into_iter().enumerate() {
-        let mut info = MessageInfo::from_kernel(message);
-        info.created_at = timestamp;
-        messages.push(info);
+    for (index, message) in session.snapshot.messages.iter().enumerate() {
+        // Advance using the ORIGINAL snapshot position even for hidden entries: persisted
+        // PresentationFile anchors and turn_stats are expressed in that coordinate space.
+        // Compressing this iterator before applying `index + 1` moves presentation rows to
+        // the wrong turn.
+        let hidden_internal = message.internal_origin.as_deref()
+            == Some(atomcode_kernel::message::LEGACY_COLD_SUMMARY_ORIGIN)
+            || message.synthetic
+            || (message.role == atomcode_kernel::message::Role::User
+                && atomcode_capabilities::reminder::is_system_reminder(&message.text));
+        if !hidden_internal {
+            let mut info = MessageInfo::from_kernel(message);
+            info.created_at = timestamp;
+            messages.push(info);
+        }
         append_presentation(index + 1, &mut messages);
     }
     for (_, entries) in presentation {
         for entry in entries {
+            if entry.role == PresentationRole::User
+                && atomcode_capabilities::reminder::is_system_reminder(&entry.text)
+            {
+                continue;
+            }
             messages.push(MessageInfo {
                 role: match entry.role {
                     PresentationRole::User => "user",
@@ -3031,6 +3086,14 @@ pub enum ChatEvent {
         #[serde(flatten)]
         payload: serde_json::Value,
     },
+    /// A security policy stopped the turn and offers only driver-owned, safe
+    /// recovery actions. Rejected commands and credentials are never included.
+    #[serde(rename = "policy_intervention")]
+    PolicyIntervention {
+        intervention_id: u64,
+        code: atomcode_kernel::event::PolicyInterventionCode,
+        actions: Vec<atomcode_kernel::event::PolicyRecoveryAction>,
+    },
     /// Chat was stopped by user
     #[serde(rename = "stopped")]
     Stopped,
@@ -3167,6 +3230,22 @@ mod chat_event_type_tests {
             }]
         ));
         assert_eq!(projector.total_tokens, 12);
+    }
+
+    #[test]
+    fn native_policy_intervention_reaches_non_live_chat_without_secret_material() {
+        let mut projector = ChatRuntimeProjector::default();
+        let events =
+            projector.project_agent(atomcode_kernel::event::AgentEvent::PolicyIntervention {
+                intervention: atomcode_kernel::event::PolicyIntervention::credential_shell_blocked(
+                ),
+            });
+
+        let json = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(json["type"], "policy_intervention");
+        assert_eq!(json["code"], "credential_shell_blocked");
+        assert!(json.get("command").is_none());
+        assert!(json.get("credential").is_none());
     }
 
     #[test]
@@ -3835,6 +3914,13 @@ impl ChatRuntimeProjector {
                 vec![ChatEvent::Warning { message }]
             }
             Agent::Warning(message) => vec![ChatEvent::Warning { message }],
+            Agent::PolicyIntervention { intervention } => {
+                vec![ChatEvent::PolicyIntervention {
+                    intervention_id: intervention.id,
+                    code: intervention.code,
+                    actions: intervention.actions,
+                }]
+            }
             Agent::RateLimited {
                 reset_at_display,
                 reset_label,
@@ -4108,6 +4194,83 @@ async fn finalize_chat_task(
     cleanup_chats.complete(cleanup_operation_id).await;
 }
 
+/// Outcome of resolving which session a `/chat` request continues.
+#[derive(Debug)]
+struct ChatSessionResolution {
+    /// Canonical session id (newly allocated for a fresh chat).
+    session_id: String,
+    /// Initial messages loaded from the session (empty for a fresh chat).
+    initial_messages: Vec<atomcode_kernel::message::Message>,
+    /// Whether this is a brand-new session (no persisted aggregate).
+    is_new_session: bool,
+    /// Effective working dir the turn runs in: the session's own home when the
+    /// session was continued from another workspace bucket, otherwise the
+    /// request's working dir.
+    effective_working_dir: std::path::PathBuf,
+}
+
+/// Resolve the session a `/chat` request continues. Bucket-scoped lookup is
+/// tried first (the common same-workspace case); on a miss the global resolver
+/// locates the session's real bucket so a session created under a different
+/// workspace folder (different bucket) can still be continued instead of
+/// failing with "not found in project bucket". When the session lives in
+/// another bucket, the effective working dir is redirected to the session's own
+/// home so the runtime keeps persisting the session in its original bucket
+/// rather than the currently open workspace's bucket.
+fn resolve_chat_session(
+    working_dir: &std::path::Path,
+    session_id: Option<&str>,
+) -> anyhow::Result<ChatSessionResolution> {
+    let Some(session_id_str) = session_id else {
+        return Ok(ChatSessionResolution {
+            session_id: uuid::Uuid::new_v4().to_string(),
+            initial_messages: Vec::new(),
+            is_new_session: true,
+            effective_working_dir: working_dir.to_path_buf(),
+        });
+    };
+    let project_bucket = NativeSessionManager::project_hash(working_dir);
+    let session = match crate::legacy_convert::load_catalog_session_view_in_project(
+        &project_bucket,
+        session_id_str,
+    )? {
+        Some(session) => session,
+        None => {
+            let resolved = resolve_session_by_id(session_id_str).map_err(|error| {
+                anyhow::anyhow!("session {session_id_str:?} could not be resolved: {error}")
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "session {session_id_str:?} not found in project bucket {project_bucket}"
+                )
+            })?;
+            let session = crate::legacy_convert::load_catalog_session_view_in_project(
+                &resolved.project_hash,
+                &resolved.meta.id,
+            )?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "session {:?} resolved to bucket {} but could not be loaded",
+                    resolved.meta.id,
+                    resolved.project_hash
+                )
+            })?;
+            return Ok(ChatSessionResolution {
+                session_id: session.meta.id,
+                initial_messages: session.snapshot.messages,
+                is_new_session: false,
+                effective_working_dir: resolved.meta.working_dir.clone(),
+            });
+        }
+    };
+    Ok(ChatSessionResolution {
+        session_id: session.meta.id,
+        initial_messages: session.snapshot.messages,
+        is_new_session: false,
+        effective_working_dir: working_dir.to_path_buf(),
+    })
+}
+
 /// Process a chat request and stream events
 async fn process_chat_request(
     req: ChatRequest,
@@ -4144,26 +4307,27 @@ async fn process_chat_request(
     });
 
     // Get working directory
-    let working_dir = req
+    let mut working_dir = req
         .working_dir
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    // Remember the request's working dir so the cross-bucket redirect below can
+    // be detected when refreshing the telemetry repo_origin.
+    let requested_working_dir = working_dir.clone();
 
-    let (session_id, initial_messages, is_new_session) =
-        if let Some(ref session_id_str) = req.session_id {
-            let project_bucket = NativeSessionManager::project_hash(&working_dir);
-            let session = crate::legacy_convert::load_catalog_session_view_in_project(
-                &project_bucket,
-                session_id_str,
-            )?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "session {session_id_str:?} not found in project bucket {project_bucket}"
-                )
-            })?;
-            (session.meta.id, session.snapshot.messages, false)
-        } else {
-            (uuid::Uuid::new_v4().to_string(), Vec::new(), true)
-        };
+    // Resolve which session this turn continues. Bucket-scoped lookup first (the
+    // common same-workspace case); on a miss, fall back to the global resolver
+    // so a session created under a different workspace folder (different bucket)
+    // can still be continued from here instead of failing with "not found in
+    // project bucket". A cross-bucket hit redirects the turn's working dir to
+    // the session's own home so the runtime keeps persisting the session in its
+    // original bucket.
+    let ChatSessionResolution {
+        session_id,
+        initial_messages,
+        is_new_session,
+        effective_working_dir,
+    } = resolve_chat_session(&requested_working_dir, req.session_id.as_deref())?;
+    working_dir = effective_working_dir;
     active_chats
         .bind_session(&operation_id, &session_id)
         .await?;
@@ -4196,7 +4360,7 @@ async fn process_chat_request(
             .collect();
         let runtime_text = live_api::preprocess_image_caption(
             &config,
-            &provider_config.model,
+            provider_config.accepts_images(),
             &working_dir,
             telemetry.clone(),
             Some(&session_id),
@@ -4251,8 +4415,15 @@ async fn process_chat_request(
         return Ok(());
     }
 
-    // Capture CurrentContext so the inner spawn inherits mode/repo_origin/session_id
-    let tel_ctx = CurrentContext::current();
+    // Capture CurrentContext so the inner spawn inherits mode/repo_origin/session_id.
+    // The cross-bucket continuation redirect above moves the turn to the
+    // session's own home directory; refresh repo_origin so telemetry for the
+    // turn reflects the repo the runtime actually executes in, not the request's
+    // workspace.
+    let mut tel_ctx = CurrentContext::current();
+    if working_dir != requested_working_dir {
+        tel_ctx.repo_origin = Some(detect_repo_origin(&working_dir));
+    }
 
     // Run turn(s) in a background task on the native kernel stack; the
     // downstream native-event → ChatEvent projector shapes the HTTP stream.
@@ -4895,7 +5066,7 @@ fn primary_lan_ipv4() -> Option<String> {
 /// `/chat` 乃至 `/shutdown` 都会因缺 token 返回 401，扩展既用不了也停不掉它，表现为
 /// “daemon started but not responding”。让 webui 默认错开到 13457 即可彻底分离
 /// （webui 的访问 URL 是生成的，端口号对用户无感；被占时仍会向上扫描）。
-pub const WEBUI_DEFAULT_PORT: u16 = 13457;
+pub const WEBUI_DEFAULT_PORT: u16 = atomcode_config::distribution::WEBUI_PORT;
 
 /// 确保进程内 webui server 已起（已停止则重启），mint 一次性 token，开浏览器。
 ///
@@ -4953,6 +5124,8 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
             prebound_listener: Some(listener),
             // webui 模式不需要 app user_id 校验。
             app_user_id: None,
+            // 进程内 webui 不写 token 文件（token 通过 WebuiTokenStore 共享）。
+            daemon_token_file: None,
         };
         let task = tokio::spawn(async move {
             if let Err(e) = run_server(opts).await {
@@ -5053,7 +5226,7 @@ pub fn stop_server() -> String {
 
 /// `/app` 进程内 server 的默认端口。刻意错开 webui(13457)与独立守护(13456)，
 /// 三者各占一端口、互不踩；被占时由 [bind_scanning] 向上扫描。
-pub const APP_DEFAULT_PORT: u16 = 13458;
+pub const APP_DEFAULT_PORT: u16 = atomcode_config::distribution::APP_PORT;
 
 struct AppServerHandle {
     port: u16,
@@ -5110,6 +5283,8 @@ pub async fn ensure_app_server(
         working_dir_override: std::env::current_dir().ok(),
         prebound_listener: Some(listener),
         app_user_id: user_id,
+        // App 进程内启动器不写 token 文件（使用 require_app_user_id 校验）。
+        daemon_token_file: None,
     };
     let task = tokio::spawn(async move {
         if let Err(e) = run_server(opts).await {
@@ -5500,6 +5675,10 @@ pub struct ServerOpts {
     pub prebound_listener: Option<tokio::net::TcpListener>,
     /// App 远程访问模式期望的 user_id。非空时 daemon 启用 `X-Atom-User-Id` 请求头校验。
     pub app_user_id: Option<String>,
+    /// 独立/IDE daemon 模式：写入 `~/.atomcode/daemon-<port>.json` 的 token。
+    /// `Some(token)` 时 `run_server` bind 成功后写文件、退出时删除。
+    /// 进程内 webui / App 启动器传 None（不写文件）。
+    pub daemon_token_file: Option<String>,
 }
 
 /// Build and run the axum server until a shutdown signal is received.
@@ -5525,6 +5704,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         quiet,
         working_dir_override,
         prebound_listener,
+        daemon_token_file: token_file_token,
         ..
     } = opts;
 
@@ -5545,12 +5725,6 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
 
     // Seed the offline verdict + note ONCE from config + env, before any tool/telemetry assembly.
     atomcode_config::config::offline::seed_offline_from_config(startup_config.as_ref());
-    if !atomcode_config::config::offline::is_offline_active() {
-        // Best-effort metadata; failure leaves `/cost` token-only and never
-        // prevents daemon/provider startup.
-        atomcode_capabilities::provider::spawn_models_dev_catalog_refresh();
-    }
-
     // Step 2: Resolve telemetry state (R1.2, R2.1-R2.3, R2.5)
     let resolved = resolve(
         &cfg_telemetry,
@@ -5692,9 +5866,16 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/stop", post(live_api::live_stop))
         .route("/live/permission", post(live_api::live_permission))
         .route("/live/user-input", post(live_api::live_user_input))
+        .route(
+            "/live/policy-intervention",
+            post(live_api::live_policy_intervention_resolution),
+        )
         .route("/live/provider", post(live_api::live_provider))
         .route("/live/mode", post(live_api::live_mode))
         .route("/live/cancel", post(live_api::live_cancel))
+        .route("/live/goal/start", post(live_api::live_goal_start))
+        .route("/live/goal/arm", post(live_api::live_goal_arm))
+        .route("/live/goal/stop", post(live_api::live_goal_stop))
         .route("/live/compact", post(live_api::live_compact))
         .route("/live/command", post(live_api::live_command))
         .route("/live/mcp/trust", post(live_api::live_mcp_trust))
@@ -5877,6 +6058,16 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         },
     };
 
+    // 独立/IDE daemon：把本地 token 落到 `~/.atomcode/daemon-<port>.json`（0600），
+    // 供 VSCode / JetBrains 读取并作为 Bearer 携带。进程内启动器传 None，不写。
+    let daemon_token_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+    if let Some(ref token) = token_file_token {
+        match daemon_token_file::write(daemon_token_port, std::process::id(), token) {
+            Ok(p) => tracing::info!("daemon token file written: {}", p.display()),
+            Err(e) => tracing::warn!("failed to write daemon token file: {e}"),
+        }
+    }
+
     // Steps 10-11: Enter CurrentContext scope and emit OpenAtomcode (R4.1, R4.2)
     CurrentContext::scope(
         CurrentContext {
@@ -5898,6 +6089,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal(shutdown_rx))
         .await
         .unwrap_or_else(|e| tracing::error!(?e, "axum::serve error"));
+
+    if token_file_token.is_some() {
+        daemon_token_file::remove(daemon_token_port);
+    }
 
     // Step 14: Final telemetry flush before process exit (R10.2-R10.5)
     telemetry.shutdown(Duration::from_millis(500)).await;
@@ -5939,6 +6134,79 @@ mod fs_list_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_filter_preserves_snapshot_anchor_coordinates() {
+        use atomcode_capabilities::session::{
+            DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole, SessionMeta,
+            TurnStat,
+        };
+        use atomcode_kernel::message::{Message, SessionSnapshot};
+
+        let mut meta = SessionMeta::new("anchor-test", "/project", 1);
+        meta.turn_stats.push(TurnStat {
+            after_message: 2,
+            position_valid: true,
+            turn_id: 1,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 1,
+            errored: false,
+            used_tokens: 1,
+            ctx_window: 1_000,
+            model_usage: Vec::new(),
+        });
+        let session = crate::legacy_convert::CatalogSessionView {
+            snapshot: SessionSnapshot::new(vec![
+                atomcode_capabilities::reminder::synthetic_system_reminder("internal"),
+                Message::user("real user"),
+                Message::assistant("real assistant", vec![]),
+            ]),
+            meta,
+            presentation: PresentationFile {
+                v: atomcode_capabilities::session::presentation::PRESENTATION_VERSION,
+                entries: vec![PresentationEntry {
+                    anchor: DisplayAnchor::AfterTurn { turn_id: 1 },
+                    role: PresentationRole::Assistant,
+                    text: "anchored display".into(),
+                }],
+            },
+        };
+
+        let displayed = merge_catalog_session_messages_for_display(&session).unwrap();
+        let text = displayed
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(text, ["real user", "anchored display", "real assistant"]);
+    }
+
+    #[test]
+    fn display_filter_keeps_assistant_explanations_of_reminder_markup() {
+        use atomcode_capabilities::session::{
+            DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole, SessionMeta,
+        };
+        use atomcode_kernel::message::{Message, SessionSnapshot};
+
+        let wrapped = atomcode_capabilities::reminder::system_reminder("example");
+        let session = crate::legacy_convert::CatalogSessionView {
+            snapshot: SessionSnapshot::new(vec![Message::assistant(&wrapped, vec![])]),
+            meta: SessionMeta::new("assistant-wrapper", "/project", 1),
+            presentation: PresentationFile {
+                v: atomcode_capabilities::session::presentation::PRESENTATION_VERSION,
+                entries: vec![PresentationEntry {
+                    anchor: DisplayAnchor::AtStart,
+                    role: PresentationRole::Assistant,
+                    text: wrapped.clone(),
+                }],
+            },
+        };
+
+        let displayed = merge_catalog_session_messages_for_display(&session).unwrap();
+        assert_eq!(displayed.len(), 2);
+        assert!(displayed.iter().all(|message| message.content == wrapped));
+    }
 
     #[test]
     fn chat_resolves_new_schema_model_selection() {
@@ -6820,6 +7088,7 @@ mod tests {
             model: model.into(),
             base_url: Some(base_url),
             system_prompt: None,
+            supports_vision: None,
             user_agent: None,
             context_window: 128_000,
             max_tokens: Some(1024),
@@ -6832,7 +7101,6 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
-            pricing: None,
         }
     }
 
@@ -7319,6 +7587,119 @@ mod tests {
 
         // Unknown id → None.
         assert!(resolve_session_in_root(root, "zzzzzzzz").unwrap().is_none());
+    }
+
+    // 回归：同一会话 id 出现在多个桶时,全局解析必须返回结构化 AmbiguousId
+    // 错误(而不是被压平成 io::Error 后由 handler 报 500),由 /sessions/resolve
+    // 映射为 409 并列出冲突位置。
+    #[test]
+    fn resolve_session_ambiguous_id_reports_all_locations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mk = |bucket: &str, wd: &str, id: &str| {
+            use atomcode_capabilities::session::{
+                PresentationFile, SessionManager, SessionMeta, StorageOwner,
+            };
+            let manager = SessionManager::with_root(root.join(bucket));
+            let lease = manager.acquire_lease(id).unwrap();
+            let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+                atomcode_kernel::message::Message::user("fixture"),
+            ]);
+            let mut meta = SessionMeta::new(id, wd, 1);
+            meta.owner = StorageOwner::Native;
+            meta.message_count = 1;
+            manager
+                .commit_native_import(
+                    &lease,
+                    Some(&snapshot),
+                    Some(&PresentationFile::default()),
+                    &meta,
+                )
+                .unwrap();
+        };
+        let dup = "99999999-9999-4999-8999-999999999999";
+        mk("1111111111111111", "/proj/one", dup);
+        mk("2222222222222222", "/proj/two", dup);
+
+        match resolve_session_in_root(root, dup) {
+            Err(atomcode_capabilities::session::SessionStoreError::AmbiguousId {
+                query,
+                matches,
+            }) => {
+                assert_eq!(query, dup);
+                assert_eq!(matches.len(), 2);
+                let mut buckets: Vec<_> = matches
+                    .iter()
+                    .map(|location| location.project_bucket.as_str())
+                    .collect();
+                buckets.sort_unstable();
+                assert_eq!(buckets, vec!["1111111111111111", "2222222222222222"]);
+            }
+            other => panic!("expected AmbiguousId, got {other:?}"),
+        }
+    }
+
+    // 回归：/chat 跨工作区续聊。会话创建于工作区 B（桶 B），用户在工作区 A
+    // 打开该会话并发送消息时，process_chat_request 必须先全局解析真实桶，
+    // 加载 B 的历史，并把 turn 的 working_dir 重定向到 B，避免把新消息写进
+    // 当前工作区 A 的桶造成同 ID 双份。
+    #[test]
+    fn chat_continuation_loads_session_from_other_bucket_and_redirects_working_dir() {
+        let home = ScopedChatHome::new();
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+        // Seed a native session in bucket B.
+        {
+            use atomcode_capabilities::session::{
+                PresentationFile, SessionManager, SessionMeta, StorageOwner,
+            };
+            let manager = SessionManager::for_project(dir_b.path());
+            let lease = manager.acquire_lease(id).unwrap();
+            let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+                atomcode_kernel::message::Message::user("history from B"),
+            ]);
+            let mut meta = SessionMeta::new(id, dir_b.path().to_string_lossy(), 1);
+            meta.owner = StorageOwner::Native;
+            meta.message_count = 1;
+            manager
+                .commit_native_import(
+                    &lease,
+                    Some(&snapshot),
+                    Some(&PresentationFile::default()),
+                    &meta,
+                )
+                .unwrap();
+        }
+
+        // Continue from workspace A: bucket-scoped lookup misses, global resolve
+        // finds the session in bucket B and redirects working dir to B's home.
+        let ChatSessionResolution {
+            session_id,
+            initial_messages,
+            is_new_session,
+            effective_working_dir,
+        } = resolve_chat_session(dir_a.path(), Some(id)).unwrap();
+        assert_eq!(session_id, id);
+        assert!(!is_new_session);
+        assert_eq!(initial_messages.len(), 1);
+        assert_eq!(effective_working_dir, dir_b.path());
+
+        // Same-workspace continuation keeps the request working dir.
+        let same = resolve_chat_session(dir_b.path(), Some(id)).unwrap();
+        assert_eq!(same.session_id, id);
+        assert_eq!(same.effective_working_dir, dir_b.path());
+
+        // Fresh chat allocates a new session under the request working dir.
+        let fresh = resolve_chat_session(dir_a.path(), None).unwrap();
+        assert!(fresh.is_new_session);
+        assert!(fresh.initial_messages.is_empty());
+        assert_eq!(fresh.effective_working_dir, dir_a.path());
+
+        // Unknown id → explicit error, not a silent fallback.
+        let err = resolve_chat_session(dir_a.path(), Some("zzzzzzzz")).unwrap_err();
+        assert!(err.to_string().contains("not found in project bucket"));
     }
 
     // 回归：/chat (HTTP) 路径上非致命提示作为独立的 `warning` 事件下发,而不是 error。
@@ -7885,5 +8266,26 @@ mod channel_mode_tests {
         assert!(approval_mode_requires_responder(ApprovalMode::AcceptEdits));
         assert!(!approval_mode_requires_responder(ApprovalMode::Auto));
         assert!(!approval_mode_requires_responder(ApprovalMode::Plan));
+    }
+}
+
+#[cfg(test)]
+mod resolve_daemon_token_tests {
+    use super::*;
+
+    #[test]
+    fn env_token_takes_priority_and_registers() {
+        let store = auth_token::WebuiTokenStore::new();
+        let t = resolve_daemon_token(Some("env-tok".to_string()), &store);
+        assert_eq!(t, "env-tok");
+        assert!(store.is_valid("env-tok"));
+    }
+
+    #[test]
+    fn empty_env_falls_back_to_random_mint() {
+        let store = auth_token::WebuiTokenStore::new();
+        let t = resolve_daemon_token(None, &store);
+        assert!(!t.is_empty());
+        assert!(store.is_valid(&t));
     }
 }

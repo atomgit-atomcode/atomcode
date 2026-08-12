@@ -986,9 +986,9 @@ fn step_models_and_register(
     //   - None / AtomGit-* (i.e. previous /codingplan run): replace
     //     with first VL/OCR model's provider key from the new list,
     //     or clear to None when the new list has no VL candidate.
-    let vl_idx = names
+    let vl_idx = available
         .iter()
-        .position(|n| atomcode_config::util::model_name_suggests_vision(n));
+        .position(|model| model_entry_supports_vision(model));
     let new_vl_key = vl_idx.map(|i| provider_names[i].clone());
 
     let vision_preprocessor = {
@@ -1293,10 +1293,7 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
             .clone()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| PROVIDER_TYPE.to_string()),
-        api_key: entry
-            .api_key
-            .clone()
-            .filter(|key| !key.trim().is_empty()),
+        api_key: entry.api_key.clone().filter(|key| !key.trim().is_empty()),
         model: entry.display_model_name.clone(),
         base_url: Some(
             entry
@@ -1306,6 +1303,10 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
                 .unwrap_or_else(codingplan_llm_base_url),
         ),
         system_prompt: None,
+        // Prefer the gateway's explicit per-model capability. `None` is kept
+        // for older models-v2 payloads so the existing model-name heuristic
+        // remains the backward-compatible fallback at provider resolution.
+        supports_vision: entry.supports_vision,
         user_agent: None,
         // `context_window: 0` from a misconfigured row would degrade
         // every request to a zero-token window; treat that as
@@ -1330,14 +1331,16 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
         // Server-driven capability rank for subagent strong/weak routing (None ⇒ not
         // participating). Threaded verbatim so re-ranking models needs no client release.
         capable_model: entry.capable_model,
-        // CodingPlan models are covered by the plan entitlement rather than
-        // locally metered API billing.
-        pricing: Some(atomcode_config::config::provider::ProviderPricing {
-            input_per_million: 0.0,
-            output_per_million: 0.0,
-            cached_input_per_million: 0.0,
-        }),
     }
+}
+
+/// Resolve the effective image-input capability advertised by models-v2.
+/// An explicit server value is authoritative; older payloads without the field
+/// retain the historical model-name heuristic.
+fn model_entry_supports_vision(entry: &ModelEntry) -> bool {
+    entry.supports_vision.unwrap_or_else(|| {
+        atomcode_config::util::model_name_suggests_vision(&entry.display_model_name)
+    })
 }
 
 #[cfg(test)]
@@ -1364,11 +1367,23 @@ mod tests {
         Config::default()
     }
 
+    /// The configured provider prefix. Expectations derive from it rather than
+    /// naming a vendor, so a build whose `HOSTED_*` values were replaced still
+    /// exercises the same rules.
+    fn px() -> &'static str {
+        provider_prefix()
+    }
+
+    /// `<prefix>-<suffix>` — the shape `provider_names_for` writes.
+    fn pxn(suffix: &str) -> String {
+        format!("{}-{}", provider_prefix(), suffix)
+    }
+
     #[test]
     fn single_model_uses_bare_prefix() {
         let names = vec!["moonshotai/Kimi-K2-Instruct".into()];
         let p = provider_names_for(&names);
-        assert_eq!(p, vec!["AtomGit".to_string()]);
+        assert_eq!(p, vec![px().to_string()]);
     }
 
     #[test]
@@ -1382,9 +1397,9 @@ mod tests {
         assert_eq!(
             p,
             vec![
-                "AtomGit-moonshotai-Kimi-K2-Instruct".to_string(),
-                "AtomGit-anthropic-claude-3.5-sonnet".to_string(),
-                "AtomGit-openai-gpt-5".to_string(),
+                pxn("moonshotai-Kimi-K2-Instruct"),
+                pxn("anthropic-claude-3.5-sonnet"),
+                pxn("openai-gpt-5"),
             ]
         );
     }
@@ -1416,11 +1431,11 @@ mod tests {
         // the manual Anthropic one stays.
         let mut config = blank_config();
         config.providers.insert(
-            "AtomGit".to_string(),
+            px().to_string(),
             build_codingplan_provider(&entry("stale-MiniMax")),
         );
         config.providers.insert(
-            "AtomGit-legacy".to_string(),
+            pxn("legacy"),
             build_codingplan_provider(&entry("another-stale")),
         );
         config.providers.insert(
@@ -1448,44 +1463,42 @@ mod tests {
         }
         config.default_provider = provider_names[0].clone();
 
-        assert_eq!(config.providers.len(), 2, "claude + one fresh AtomGit");
+        assert_eq!(config.providers.len(), 2, "claude + one fresh CodingPlan entry");
         assert!(
             config.providers.contains_key("claude"),
             "unrelated entry kept"
         );
         assert!(
-            config.providers.contains_key("AtomGit"),
-            "fresh AtomGit added"
+            config.providers.contains_key(px()),
+            "fresh CodingPlan entry added"
         );
         assert!(
-            !config.providers.contains_key("AtomGit-legacy"),
+            !config.providers.contains_key(&pxn("legacy")),
             "stale removed"
         );
-        let fresh = &config.providers["AtomGit"];
+        let fresh = &config.providers[px()];
         assert_eq!(fresh.model, "meta-llama/Llama-3-70B");
         assert_eq!(
             fresh.base_url.as_deref(),
             Some(codingplan_llm_base_url().as_str())
         );
         assert_eq!(fresh.provider_type, PROVIDER_TYPE);
-        assert_eq!(config.default_provider, "AtomGit");
+        assert_eq!(config.default_provider, px());
     }
 
     #[test]
-    fn codingplan_llm_base_url_defaults_to_new_signed_gateway() {
-        // Lock in the default. If `ATOMCODE_CODINGPLAN_LLM_BASE_URL` is
-        // set in the test environment (CI / staging override / dev box
-        // with a stray export), honour it — otherwise the default must
-        // be the modern `llm-api.atomgit.com` host. Anything else (most
-        // notably the legacy `api-ai.gitcode.com`) silently disables
-        // codingplan request signing because `is_atomgit_gateway` in
-        // `coding_plan::crypto` also whitelists the legacy host.
+    fn codingplan_llm_base_url_matches_the_configured_gateway() {
+        // What this pins is the resolution contract, not a hostname: the env
+        // override wins when set, otherwise the value is whatever `endpoints`
+        // resolves. Naming a host here would break any build that retargets the
+        // gateway — which is the whole point of that module.
         //
-        // OnceLock caches across test threads, so this test reflects
-        // whatever the env was at the FIRST call site in the process.
-        // That's deliberate — it ensures every test in this module
-        // agrees on the URL, mirroring production behaviour where the
-        // value is fixed for the lifetime of one `atomcode` run.
+        // Whether requests to the resulting gateway are *signed* is a separate
+        // question owned by `gateway_crypto::is_atomgit_gateway`, tested there.
+        //
+        // OnceLock caches across test threads, so this reflects whatever the env
+        // was at the FIRST call site in the process. That's deliberate: it
+        // mirrors production, where the value is fixed for one `atomcode` run.
         let actual = codingplan_llm_base_url();
         let env_override = std::env::var("ATOMCODE_CODINGPLAN_LLM_BASE_URL")
             .ok()
@@ -1495,11 +1508,17 @@ mod tests {
             assert_eq!(actual, want, "env override must win when set");
         } else {
             assert_eq!(
-                actual, "https://llm-api.atomgit.com/v1",
-                "default must point at the signed gateway (NOT legacy api-ai.gitcode.com); \
-                 otherwise codingplan signing never engages"
+                actual,
+                atomcode_config::endpoints::codingplan_llm_base_url(),
+                "must resolve through endpoints, not a local default"
             );
         }
+        // A gateway URL the adapter can append `/chat/completions` to.
+        assert!(
+            actual.starts_with("http://") || actual.starts_with("https://"),
+            "gateway must be an absolute URL: {actual}"
+        );
+        assert!(!actual.ends_with('/'), "trailing slash would double up: {actual}");
     }
 
     #[test]
@@ -1541,6 +1560,31 @@ mod tests {
     }
 
     #[test]
+    fn build_provider_preserves_explicit_vision_capability() {
+        let enabled = super::super::types::ModelEntry {
+            supports_vision: Some(true),
+            ..entry("plain-model-name")
+        };
+        assert_eq!(
+            build_codingplan_provider(&enabled).supports_vision,
+            Some(true)
+        );
+
+        // An explicit server opt-out is authoritative even when the model name
+        // would otherwise trigger the local vision-name heuristic.
+        let disabled = super::super::types::ModelEntry {
+            supports_vision: Some(false),
+            ..entry("Qwen3-VL-8B-Instruct")
+        };
+        assert_eq!(
+            build_codingplan_provider(&disabled).supports_vision,
+            Some(false)
+        );
+        let legacy = entry("Qwen3-VL-8B-Instruct");
+        assert_eq!(build_codingplan_provider(&legacy).supports_vision, None);
+    }
+
+    #[test]
     fn build_provider_uses_server_overrides_when_present() {
         // Per-model server fields take precedence over the
         // hard-coded fallbacks. Mirrors the new wire shape:
@@ -1553,6 +1597,7 @@ mod tests {
             base_url: Some("https://custom.example.com/v1".into()),
             provider_type: Some("claude".into()),
             context_window: Some(128_000),
+            supports_vision: Some(true),
             plan_available: true,
             capable_model: None,
             api_key: None,
@@ -1562,6 +1607,7 @@ mod tests {
         assert_eq!(p.provider_type, "claude");
         assert_eq!(p.base_url.as_deref(), Some("https://custom.example.com/v1"));
         assert_eq!(p.context_window, 128_000);
+        assert_eq!(p.supports_vision, Some(true));
     }
 
     #[test]
@@ -1600,6 +1646,7 @@ mod tests {
             "base_url": "https://api-ai.gitcode.com/v1",
             "type": "openai",
             "context_window": 64000,
+            "supports_vision": true,
             "plan_available": true
         }]"#;
         let list: Vec<super::super::types::ModelEntry> =
@@ -1613,6 +1660,7 @@ mod tests {
         assert_eq!(m.base_url.as_deref(), Some("https://api-ai.gitcode.com/v1"));
         assert_eq!(m.provider_type.as_deref(), Some("openai"));
         assert_eq!(m.context_window, Some(64_000));
+        assert_eq!(m.supports_vision, Some(true));
         assert!(m.plan_available);
     }
 
@@ -1634,6 +1682,7 @@ mod tests {
         assert!(m.base_url.is_none());
         assert!(m.provider_type.is_none());
         assert!(m.context_window.is_none());
+        assert!(m.supports_vision.is_none());
         assert_eq!(m.is_infinity, 0);
     }
 
@@ -1655,8 +1704,8 @@ mod tests {
             claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["moonshotai/Kimi-K2-Instruct".into()],
-                provider_names: vec!["AtomGit".into()],
-                default_provider: "AtomGit".into(),
+                provider_names: vec![px().to_string()],
+                default_provider: px().to_string(),
                 vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
                 all_models: vec![],
             }),
@@ -1695,7 +1744,7 @@ mod tests {
         assert!(out.contains("theo@example.com"));
         assert!(out.contains("CodingPlan claimed"));
         assert!(out.contains("Kimi-K2-Instruct"));
-        assert!(out.contains("AtomGit"));
+        assert!(out.contains(px()));
         assert!(out.contains("(default)"));
         assert!(out.contains("CodingPlan Free"));
         assert!(out.contains("12:13"));
@@ -1712,8 +1761,8 @@ mod tests {
             claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["a/b".into()],
-                provider_names: vec!["AtomGit".into()],
-                default_provider: "AtomGit".into(),
+                provider_names: vec![px().to_string()],
+                default_provider: px().to_string(),
                 vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
                 all_models: vec![],
             }),
@@ -1750,8 +1799,8 @@ mod tests {
             claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["a/b".into()],
-                provider_names: vec!["AtomGit".into()],
-                default_provider: "AtomGit".into(),
+                provider_names: vec![px().to_string()],
+                default_provider: px().to_string(),
                 vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
                 all_models: vec![],
             }),
@@ -1870,8 +1919,8 @@ mod tests {
             claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["a/b".into()],
-                provider_names: vec!["AtomGit".into()],
-                default_provider: "AtomGit".into(),
+                provider_names: vec![px().to_string()],
+                default_provider: px().to_string(),
                 vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
                 all_models: vec![],
             }),
@@ -1907,8 +1956,8 @@ mod tests {
             claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["a/b".into()],
-                provider_names: vec!["AtomGit".into()],
-                default_provider: "AtomGit".into(),
+                provider_names: vec![px().to_string()],
+                default_provider: px().to_string(),
                 vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
                 all_models: vec![],
             }),
@@ -2253,11 +2302,11 @@ mod tests {
                     "openai/gpt-5".into(),
                 ],
                 provider_names: vec![
-                    "AtomGit-moonshotai-Kimi-K2-Instruct".into(),
-                    "AtomGit-anthropic-claude-3.5-sonnet".into(),
-                    "AtomGit-openai-gpt-5".into(),
+                    pxn("moonshotai-Kimi-K2-Instruct"),
+                    pxn("anthropic-claude-3.5-sonnet"),
+                    pxn("openai-gpt-5"),
                 ],
-                default_provider: "AtomGit-moonshotai-Kimi-K2-Instruct".into(),
+                default_provider: pxn("moonshotai-Kimi-K2-Instruct"),
                 vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
                 all_models: vec![
                     entry("moonshotai/Kimi-K2-Instruct"),
@@ -2274,8 +2323,8 @@ mod tests {
         let out = report.render();
         // Two folded accounts (openai=AtomGit, claude=AtomGit-anthropic), 3 models.
         assert!(out.contains("Added 2 accounts · 3 models"));
-        assert!(out.contains("AtomGit  ·  moonshotai/Kimi-K2-Instruct  (default)"));
-        assert!(out.contains("AtomGit-anthropic  ·  anthropic/claude-3.5-sonnet\n"));
+        assert!(out.contains(&format!("{}  ·  moonshotai/Kimi-K2-Instruct  (default)", px())));
+        assert!(out.contains(&format!("{}-anthropic  ·  anthropic/claude-3.5-sonnet\n", px())));
         assert!(
             !out.contains("anthropic/claude-3.5-sonnet  (default)"),
             "only first is default"
@@ -2351,8 +2400,8 @@ mod tests {
             claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["a/b".into()],
-                provider_names: vec!["AtomGit".into()],
-                default_provider: "AtomGit".into(),
+                provider_names: vec![px().to_string()],
+                default_provider: px().to_string(),
                 vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
                 all_models: vec![],
             }),
@@ -2467,9 +2516,9 @@ mod tests {
         );
         config.default_provider = default_provider.clone();
 
-        let vl_idx = names
+        let vl_idx = models
             .iter()
-            .position(|n| atomcode_config::util::model_name_suggests_vision(n));
+            .position(|model| model_entry_supports_vision(model));
         let new_vl_key = vl_idx.map(|i| provider_names[i].clone());
         let vision_preprocessor = {
             let current = config.vision_preprocessor_provider.clone();
@@ -2528,10 +2577,10 @@ mod tests {
     fn catalog_refresh_preserves_selected_codingplan_model_when_still_available() {
         let mut config = blank_config();
         config.providers.insert(
-            "AtomGit-old-key".into(),
+            pxn("old-key"),
             build_codingplan_provider(&vl_model_entry("selected-model")),
         );
-        config.default_provider = "AtomGit-old-key".into();
+        config.default_provider = pxn("old-key");
 
         let report = run_register(
             &mut config,
@@ -2542,10 +2591,11 @@ mod tests {
         );
 
         assert_eq!(
-            config.default_provider, "AtomGit-selected-model",
+            config.default_provider,
+            pxn("selected-model"),
             "refresh should keep the selected model even if provider keys are rebuilt"
         );
-        assert_eq!(report.default_provider, "AtomGit-selected-model");
+        assert_eq!(report.default_provider, pxn("selected-model"));
     }
 
     #[test]
@@ -2571,11 +2621,12 @@ mod tests {
 
         assert_eq!(latest.default_provider, "custom");
         assert!(latest.providers.contains_key("custom"));
-        // AtomGit is now persisted in the new account+model schema, not as a
-        // flat `[providers.*]` entry (single model → bare `AtomGit` id).
-        assert!(latest.provider_accounts.contains_key("AtomGit"));
-        assert!(latest.models.contains_key("AtomGit"));
-        assert!(!latest.providers.contains_key("AtomGit"));
+        // The CodingPlan entry is now persisted in the new account+model
+        // schema, not as a flat `[providers.*]` entry (single model → bare
+        // prefix as the id).
+        assert!(latest.provider_accounts.contains_key(px()));
+        assert!(latest.models.contains_key(px()));
+        assert!(!latest.providers.contains_key(px()));
         // The user's concurrent non-CodingPlan default is untouched.
         assert_eq!(latest.default_model, None);
     }
@@ -2599,15 +2650,12 @@ mod tests {
     fn a_default_written_under_the_historical_prefix_repoints_by_model_name() {
         let mut config = blank_config();
         config.providers.insert(
-            "AtomGit-GLM-5.2".into(),
+            pxn("GLM-5.2"),
             build_codingplan_provider(&entry("GLM-5.2")),
         );
 
         let model_names = vec!["GLM-5.2".to_string(), "Qwen".to_string()];
-        let provider_names = vec![
-            "Longyuan-GLM-5.2".to_string(),
-            "Longyuan-Qwen".to_string(),
-        ];
+        let provider_names = vec!["Longyuan-GLM-5.2".to_string(), "Longyuan-Qwen".to_string()];
 
         let resolved = refreshed_default_provider(
             &config,
@@ -2638,9 +2686,10 @@ mod tests {
     #[test]
     fn a_custom_default_survives_the_refresh() {
         let mut config = blank_config();
-        config
-            .providers
-            .insert("my-ollama".into(), build_codingplan_provider(&entry("llama")));
+        config.providers.insert(
+            "my-ollama".into(),
+            build_codingplan_provider(&entry("llama")),
+        );
         let resolved = refreshed_default_provider(
             &config,
             "my-ollama",
@@ -2710,11 +2759,11 @@ mod tests {
     fn persist_folds_flat_codingplan_into_grouped_new_schema() {
         let mut cfg = blank_config();
         cfg.providers.insert(
-            "AtomGit-GLM-5.2".into(),
+            pxn("GLM-5.2"),
             build_codingplan_provider(&entry("GLM-5.2")),
         );
         cfg.providers.insert(
-            "AtomGit-Qwen".into(),
+            pxn("Qwen"),
             build_codingplan_provider(&entry("Qwen")),
         );
         // A claude-wire model must land in its own account (an account carries
@@ -2724,32 +2773,32 @@ mod tests {
             ..entry("anthropic/claude-3.5")
         };
         cfg.providers.insert(
-            "AtomGit-anthropic-claude-3.5".into(),
+            pxn("anthropic-claude-3.5"),
             build_codingplan_provider(&claude_entry),
         );
-        cfg.default_provider = "AtomGit-GLM-5.2".into();
+        cfg.default_provider = pxn("GLM-5.2");
 
         persist_codingplan_as_new_schema(&mut cfg);
 
         // Two openai models collapse into one account; claude gets its own.
-        assert!(cfg.provider_accounts.contains_key("AtomGit"));
-        assert!(cfg.provider_accounts.contains_key("AtomGit-anthropic"));
-        assert_eq!(cfg.provider_accounts["AtomGit"].provider, "openai");
+        assert!(cfg.provider_accounts.contains_key(px()));
+        assert!(cfg.provider_accounts.contains_key(&pxn("anthropic")));
+        assert_eq!(cfg.provider_accounts[px()].provider, "openai");
         assert_eq!(
-            cfg.provider_accounts["AtomGit-anthropic"].provider,
+            cfg.provider_accounts[&pxn("anthropic")].provider,
             "anthropic"
         );
         // Model ids stay = legacy provider keys; only the parent account folds.
-        assert_eq!(cfg.models["AtomGit-GLM-5.2"].account, "AtomGit");
-        assert_eq!(cfg.models["AtomGit-Qwen"].account, "AtomGit");
+        assert_eq!(cfg.models[&pxn("GLM-5.2")].account, px());
+        assert_eq!(cfg.models[&pxn("Qwen")].account, px());
         assert_eq!(
-            cfg.models["AtomGit-anthropic-claude-3.5"].account,
-            "AtomGit-anthropic"
+            cfg.models[&pxn("anthropic-claude-3.5")].account,
+            pxn("anthropic")
         );
         // Flat providers are gone.
         assert!(!cfg.providers.keys().any(|k| is_codingplan_provider_name(k)));
         // The active selection is promoted to the canonical default_model.
-        assert_eq!(cfg.default_model.as_deref(), Some("AtomGit-GLM-5.2"));
+        assert_eq!(cfg.default_model.as_deref(), Some(pxn("GLM-5.2").as_str()));
         // And it still resolves through the single boundary.
         assert_eq!(cfg.resolve_model(None).unwrap().model, "GLM-5.2");
     }
@@ -2768,14 +2817,14 @@ mod tests {
             .unwrap(),
         );
         cfg.models.insert(
-            "AtomGit-GLM-5.2".into(),
+            pxn("GLM-5.2"),
             serde_json::from_value(serde_json::json!({
                 "account": "AtomGit", "model": "GLM-5.2", "context_window": 64000
             }))
             .unwrap(),
         );
         cfg.models.insert(
-            "AtomGit-Dropped".into(),
+            pxn("Dropped"),
             serde_json::from_value(serde_json::json!({
                 "account": "AtomGit", "model": "Dropped", "context_window": 8000
             }))
@@ -2785,14 +2834,14 @@ mod tests {
         // no "Dropped" model this time.
         let mut fresh = build_codingplan_provider(&entry("GLM-5.2"));
         fresh.context_window = 200_000;
-        cfg.providers.insert("AtomGit-GLM-5.2".into(), fresh);
+        cfg.providers.insert(pxn("GLM-5.2"), fresh);
 
         persist_codingplan_as_new_schema(&mut cfg);
 
         // Fresh data wins; the dropped model is gone.
-        assert_eq!(cfg.models["AtomGit-GLM-5.2"].context_window, 200_000);
-        assert!(!cfg.models.contains_key("AtomGit-Dropped"));
-        assert!(!cfg.providers.contains_key("AtomGit-GLM-5.2"));
+        assert_eq!(cfg.models[&pxn("GLM-5.2")].context_window, 200_000);
+        assert!(!cfg.models.contains_key(&pxn("Dropped")));
+        assert!(!cfg.providers.contains_key(&pxn("GLM-5.2")));
     }
 
     #[test]
@@ -2804,12 +2853,44 @@ mod tests {
             vl_model_entry("deepseek/deepseek-v4-flash"),
         ];
         let info = run_register(&mut config, models);
-        let expected = "AtomGit-Qwen-Qwen3-VL-32B-Instruct".to_string();
+        let expected = pxn("Qwen-Qwen3-VL-32B-Instruct");
         assert_eq!(
             info.vision_preprocessor,
             VisionPreprocessorOutcome::AutoSet(expected.clone())
         );
         assert_eq!(config.vision_preprocessor_provider, Some(expected));
+    }
+
+    #[test]
+    fn vision_preprocessor_uses_explicit_server_capability() {
+        let mut config = blank_config();
+        let models = vec![super::super::types::ModelEntry {
+            supports_vision: Some(true),
+            ..vl_model_entry("model-without-vision-name")
+        }];
+        let info = run_register(&mut config, models);
+        // A single model registers under the bare prefix, so the expectation is
+        // `px()` rather than a literal — see `single_model_uses_bare_prefix`.
+        assert_eq!(
+            info.vision_preprocessor,
+            VisionPreprocessorOutcome::AutoSet(px().into())
+        );
+        assert_eq!(config.vision_preprocessor_provider.as_deref(), Some(px()));
+    }
+
+    #[test]
+    fn vision_preprocessor_respects_explicit_server_opt_out() {
+        let mut config = blank_config();
+        let models = vec![super::super::types::ModelEntry {
+            supports_vision: Some(false),
+            ..vl_model_entry("Qwen/Qwen3-VL-32B-Instruct")
+        }];
+        let info = run_register(&mut config, models);
+        assert_eq!(
+            info.vision_preprocessor,
+            VisionPreprocessorOutcome::UnchangedNone
+        );
+        assert_eq!(config.vision_preprocessor_provider, None);
     }
 
     #[test]
@@ -2827,13 +2908,13 @@ mod tests {
     #[test]
     fn vision_preprocessor_overwrites_stale_atomgit_value() {
         let mut config = blank_config();
-        config.vision_preprocessor_provider = Some("AtomGit-Qwen-Qwen2-VL-72B".into());
+        config.vision_preprocessor_provider = Some(pxn("Qwen-Qwen2-VL-72B"));
         let models = vec![
             vl_model_entry("Kimi-K2-Instruct"),
             vl_model_entry("Qwen/Qwen3-VL-32B-Instruct"),
         ];
         let info = run_register(&mut config, models);
-        let expected = "AtomGit-Qwen-Qwen3-VL-32B-Instruct".to_string();
+        let expected = pxn("Qwen-Qwen3-VL-32B-Instruct");
         assert_eq!(
             info.vision_preprocessor,
             VisionPreprocessorOutcome::AutoSet(expected.clone())
@@ -2844,7 +2925,7 @@ mod tests {
     #[test]
     fn vision_preprocessor_cleared_when_stale_atomgit_and_list_has_no_vl() {
         let mut config = blank_config();
-        config.vision_preprocessor_provider = Some("AtomGit-Qwen-Qwen2-VL-72B".into());
+        config.vision_preprocessor_provider = Some(pxn("Qwen-Qwen2-VL-72B"));
         let models = vec![vl_model_entry("moonshotai/Kimi-K2-Instruct")];
         let info = run_register(&mut config, models);
         assert_eq!(info.vision_preprocessor, VisionPreprocessorOutcome::Cleared);
@@ -2878,7 +2959,7 @@ mod tests {
             vl_model_entry("PaddleOCR-2.0"),
         ];
         let info = run_register(&mut config, models);
-        let expected = "AtomGit-PaddleOCR-2.0".to_string();
+        let expected = pxn("PaddleOCR-2.0");
         assert_eq!(
             info.vision_preprocessor,
             VisionPreprocessorOutcome::AutoSet(expected.clone())
@@ -2902,12 +2983,12 @@ mod tests {
                     "Qwen/Qwen3-VL-32B-Instruct".into(),
                 ],
                 provider_names: vec![
-                    "AtomGit-Kimi-K2-Instruct".into(),
-                    "AtomGit-Qwen-Qwen3-VL-32B-Instruct".into(),
+                    pxn("Kimi-K2-Instruct"),
+                    pxn("Qwen-Qwen3-VL-32B-Instruct"),
                 ],
-                default_provider: "AtomGit-Kimi-K2-Instruct".into(),
+                default_provider: pxn("Kimi-K2-Instruct"),
                 vision_preprocessor: VisionPreprocessorOutcome::AutoSet(
-                    "AtomGit-Qwen-Qwen3-VL-32B-Instruct".into(),
+                    pxn("Qwen-Qwen3-VL-32B-Instruct"),
                 ),
                 all_models: vec![],
             }),
@@ -2917,7 +2998,10 @@ mod tests {
         let out = report.render();
         // Friendly account · model label, not the internal selection key.
         assert!(
-            out.contains("Vision preprocessor → AtomGit · Qwen/Qwen3-VL-32B-Instruct"),
+            out.contains(&format!(
+                "Vision preprocessor → {} · Qwen/Qwen3-VL-32B-Instruct",
+                px()
+            )),
             "render must include the auto-detected line: {out}",
         );
         assert!(out.contains("(auto-detected)"));
@@ -2935,8 +3019,8 @@ mod tests {
             claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["Kimi-K2-Instruct".into()],
-                provider_names: vec!["AtomGit-Kimi-K2-Instruct".into()],
-                default_provider: "AtomGit-Kimi-K2-Instruct".into(),
+                provider_names: vec![pxn("Kimi-K2-Instruct")],
+                default_provider: pxn("Kimi-K2-Instruct"),
                 vision_preprocessor: VisionPreprocessorOutcome::Cleared,
                 all_models: vec![],
             }),
@@ -2963,10 +3047,10 @@ mod tests {
                     "Qwen/Qwen3-VL-32B-Instruct".into(),
                 ],
                 provider_names: vec![
-                    "AtomGit-Kimi-K2-Instruct".into(),
-                    "AtomGit-Qwen-Qwen3-VL-32B-Instruct".into(),
+                    pxn("Kimi-K2-Instruct"),
+                    pxn("Qwen-Qwen3-VL-32B-Instruct"),
                 ],
-                default_provider: "AtomGit-Kimi-K2-Instruct".into(),
+                default_provider: pxn("Kimi-K2-Instruct"),
                 vision_preprocessor: VisionPreprocessorOutcome::UserSupplied(
                     "Qwen3-VL-32B-Instruct".into(),
                 ),
@@ -2992,8 +3076,8 @@ mod tests {
             claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["Kimi-K2-Instruct".into()],
-                provider_names: vec!["AtomGit-Kimi-K2-Instruct".into()],
-                default_provider: "AtomGit-Kimi-K2-Instruct".into(),
+                provider_names: vec![pxn("Kimi-K2-Instruct")],
+                default_provider: pxn("Kimi-K2-Instruct"),
                 vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
                 all_models: vec![],
             }),
@@ -3193,8 +3277,8 @@ mod tests {
             claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["lite/foo".into()],
-                provider_names: vec!["AtomGit".into()],
-                default_provider: "AtomGit".into(),
+                provider_names: vec![px().to_string()],
+                default_provider: px().to_string(),
                 vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
                 all_models: vec![avail, locked],
             }),
@@ -3208,7 +3292,7 @@ mod tests {
             "claim row must show tier:\n{out}"
         );
         // Available model: standard provider line.
-        assert!(out.contains("AtomGit") && out.contains("lite/foo"));
+        assert!(out.contains(px()) && out.contains("lite/foo"));
         // Locked model: `×` prefix immediately before the name, plus
         // the explicit `(requires Pro plan or higher)` suffix, all wrapped
         // in SGR 31 (red fg) → SGR 39 (default fg) so the terminal

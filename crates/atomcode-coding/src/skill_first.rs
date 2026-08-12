@@ -17,7 +17,7 @@
 //! unlike the Anthropic-strict rejection that makes `StatusReminderHook` skip round 1).
 
 use async_trait::async_trait;
-use atomcode_capabilities::reminder::system_reminder;
+use atomcode_capabilities::reminder::synthetic_system_reminder;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::Message;
 
@@ -59,7 +59,7 @@ impl LifecycleHooks for SkillFirstHook {
         if ctx.turn_id != 1 || ctx.round != 1 {
             return;
         }
-        messages.push(Message::user(system_reminder(Self::body())));
+        messages.push(synthetic_system_reminder(Self::body()));
     }
 }
 
@@ -90,6 +90,7 @@ mod tests {
         let mut msgs = vec![Message::system("s"), Message::user("hi")];
         hook.pre_request(&mut msgs, &ctx(1, 1)).await;
         assert_eq!(msgs.len(), 3, "opening turn appends exactly one reminder");
+        assert!(msgs[2].synthetic, "runtime reminders must carry provenance");
         assert!(
             msgs[2].text.starts_with("<system-reminder>") && msgs[2].text.contains("use_skill"),
             "wrapped skill-first reminder: {:?}",

@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.5</span>
+    <span class="dhdr-ver">v5.0.6</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -165,6 +165,7 @@ atomcode --dangerously-skip-permissions</code></pre>
         <li><code>Enter</code> 发送消息</li>
         <li><code>\</code> 后接 <code>Enter</code> 换行 —— 所有终端通用(行尾反斜杠会被识别为续行)</li>
         <li><code>Shift+Enter</code> / <code>Ctrl+Enter</code> 换行(需要 Kitty 键盘协议: kitty / WezTerm / Alacritty / iTerm2 ≥3.5 / Windows Terminal ≥1.21;Windows 上不可用)</li>
+        <li>JumpServer 等通用 WebTerminal 默认使用传统键盘上报。可设置 <code>ATOMCODE_KITTY=1</code> 强制启用 Kitty 键盘增强，或设置 <code>ATOMCODE_KITTY=0</code> 强制关闭。</li>
         <li><code>Alt+Enter</code> 换行(多数终端可用,但 Windows Terminal 默认绑给"切换全屏",需在设置里解绑)</li>
         <li>输入框高度会随内容自动增长</li>
       </ul>
@@ -247,9 +248,9 @@ atomcode --dangerously-skip-permissions</code></pre>
       </ul>
       <p>详细行为见 <a href="./sessions.html">会话与撤销</a>。</p>
 
-      <h2>查看成本和 diff</h2>
+      <h2>查看 Token 用量和 diff</h2>
       <ul>
-        <li><code>/cost</code> —— 本次会话输出 token 数和上下文用量(不支持 usage 的 API 会自动估算)</li>
+        <li><code>/cost</code> —— 按模型显示本次会话累计的提示、补全和缓存 Token</li>
         <li><code>/diff</code> —— 当前工作目录未提交改动的 git diff</li>
         <li><code>/undo</code> —— 回滚上一轮的所有文件编辑</li>
       </ul>

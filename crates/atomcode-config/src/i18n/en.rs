@@ -317,12 +317,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("Context window? [{current}] tokens (blank to keep; e.g. 128000 / 256000 / 512000 / 1000000, or 128k / 1m)").into(),
         Msg::ProviderContextWindowInvalid =>
             "Context window must be a positive number of tokens, e.g. 128000 or 128k.".into(),
-        Msg::ProviderStepPricing =>
-            "Pricing USD per 1M tokens? input,output,cached-input (blank = unknown/keep; `clear` removes; e.g. 2.5,10,0.25; free = 0,0,0)".into(),
-        Msg::ProviderStepPricingWithHint { current } =>
-            format!("Pricing USD per 1M tokens? [{current}] (blank to keep; `clear` removes)").into(),
-        Msg::ProviderPricingInvalid =>
-            "Pricing must be three finite non-negative numbers: input,output,cached-input.".into(),
         Msg::ProviderNameEmpty => "Name cannot be empty.".into(),
         Msg::ProviderBaseUrlEmpty => "Base URL cannot be empty.".into(),
         Msg::ProviderUnknownType =>
@@ -369,6 +363,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelFieldBaseUrl => "Base URL".into(),
         Msg::ProviderPanelFieldApiKey => "API key".into(),
         Msg::ProviderPanelFieldModel => "Model".into(),
+        Msg::ProviderPanelFieldVision => "Image input".into(),
+        Msg::ProviderPanelVisionAuto => "Auto".into(),
+        Msg::ProviderPanelVisionEnabled => "Enabled".into(),
+        Msg::ProviderPanelVisionDisabled => "Disabled".into(),
         Msg::ProviderPanelFieldWindow => "Context window".into(),
         Msg::ProviderPanelFieldMakeDefault => "Set as default".into(),
         Msg::ProviderPanelSwitchHint => "←→ to switch".into(),
@@ -379,7 +377,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "Tab Next  ←→ Switch provider  Space Toggle  ↵ Save  Esc Back".into(),
         Msg::ProviderPanelAccountFormHint => "Tab Switch  ↵ Save  Esc Back".into(),
         Msg::ProviderPanelModelFormHint =>
-            "Tab Next  ←→ Switch account  Space Toggle  ↵ Save  Esc Back".into(),
+            "Tab Next  ←→ Switch option  Space Toggle  ↵ Save  Esc Back".into(),
         // ── Model picker ──
         Msg::ModelSwitched { provider, model } =>
             format!("  Switched to {provider} · {model} for this session\n").into(),
@@ -419,6 +417,22 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             }
         }
         Msg::ToolDenied => "denied".into(),
+        Msg::ToolBlockedBySecurityPolicy =>
+            "Tool call blocked by security policy: credentials cannot be passed through generic shell arguments, temporary files, or environment variables".into(),
+        Msg::PolicyRecoveryHeader => "Security decision required".into(),
+        Msg::PolicyRecoveryQuestion => "The credential operation was blocked. What should AtomCode do next?".into(),
+        Msg::PolicyRecoveryComplete => "I completed it externally".into(),
+        Msg::PolicyRecoveryCompleteDesc => "Acknowledge external completion without calling the model".into(),
+        Msg::PolicyRecoverySkip => "Skip this step".into(),
+        Msg::PolicyRecoverySkipDesc => "Skip the authenticated step and end recovery without calling the model".into(),
+        Msg::PolicyRecoveryInstructions => "View safe instructions".into(),
+        Msg::PolicyRecoveryInstructionsDesc => "Show fixed local guidance with placeholders only".into(),
+        Msg::PolicyRecoveryEnd => "End task".into(),
+        Msg::PolicyRecoveryEndDesc => "Close this intervention without calling the model".into(),
+        Msg::PolicyRecoverySafeInstructions => "Safe manual path:\n  1. Open a separate terminal you control.\n  2. Use the service's documented login flow or a credential-aware typed tool.\n  3. Complete the authenticated operation there; do not paste the secret into AtomCode.\n  4. Return here and choose ‘I completed it externally’.\nAtomCode intentionally does not reconstruct or display the rejected command.".into(),
+        Msg::PolicyRecoveryCompletedLocally => "External completion acknowledged. To avoid regenerating sensitive commands, recovery did not call the model; you may now submit a task that does not involve credentials.".into(),
+        Msg::PolicyRecoverySkippedLocally => "The credential-dependent step was skipped. To avoid regenerating sensitive commands, recovery did not call the model; you may now submit another safe task.".into(),
+        Msg::PolicyRecoverySubmitError => "Could not submit the security recovery decision. Please retry.".into(),
 
         Msg::CmdSwitchedAutoMode => "  Switched to auto mode (all tools auto-approved).\n".into(),
         Msg::CmdSwitchedAcceptEditsMode => {
@@ -641,17 +655,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  Provider: {}\n  Config: {}\n\n", provider, path).into(),
 
         // ── /cost ──
-        Msg::CostReport { prompt, completion, cached, cache_rate, total, cost } =>
-            format!(
-                "  Prompt tokens:     {}\n  Completion tokens: {}\n  Cached tokens:     {} ({}% hit rate)\n  Total tokens:      {}\n  Estimated cost:    {}\n",
-                prompt, completion, cached, cache_rate, total, cost
-            ).into(),
         Msg::CostTokenReport { prompt, completion, cached, cache_rate, total } =>
             format!(
                 "  Prompt tokens:     {}\n  Completion tokens: {}\n  Cached tokens:     {} ({}% hit rate)\n  Total tokens:      {}\n",
                 prompt, completion, cached, cache_rate, total
             ).into(),
-        Msg::CostFree => "free".into(),
         Msg::CostUnattributed { tokens } =>
             format!("Unattributed legacy usage\n  Total tokens:      {}", tokens).into(),
 
@@ -984,7 +992,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescDiff => "Show git diff".into(),
         Msg::CmdDescClear => "Clear screen".into(),
         Msg::CmdDescSession => "Start a new session (clears conversation)".into(),
-        Msg::CmdDescCost => "Show token cost".into(),
+        Msg::CmdDescCost => "Show session token usage".into(),
         Msg::CmdDescUsage => "Show CodingPlan usage (tabs: current / overview / models)".into(),
         Msg::CmdDescContext => "Show context budget breakdown".into(),
         Msg::CmdDescCompact => "Compact conversation history".into(),
@@ -1030,6 +1038,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescGoal => "Set a completion goal (autonomous loop until met)".into(),
         Msg::CmdDescProxy => "Switch outbound proxy mode".into(),
         Msg::CmdDescTodo => "Show the current todo list; `/todo add <task>` appends one, `/todo clear` wipes it".into(),
+        Msg::CmdDescTeam => "Show or control the Team Agent progress panel".into(),
         Msg::CmdDescSchedule => "List scheduled tasks and next run times".into(),
         Msg::CmdDescDesktop =>
             "Open the AtomCode desktop app (launch it if installed, else show the download link)".into(),
@@ -1122,6 +1131,10 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::TurnSummaryError { turn_count, tool_call_count, duration, total_tokens, reason } => {
             let cause = reason.map(|r| format!(": {r}")).unwrap_or_default();
             format!("✗ Stopped{cause} · {turn_count} rounds · {tool_call_count} tools · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into()
+        }
+        Msg::TurnSummaryPolicyDenied { turn_count, tool_call_count, duration, total_tokens, reason } => {
+            let cause = reason.map(|r| format!(": {r}")).unwrap_or_default();
+            format!("✗ Turn stopped by security policy{cause} · {turn_count} rounds · {tool_call_count} tools · {duration} · {} tokens", super::fmt_tokens(total_tokens)).into()
         }
         Msg::LoginQrHeader =>
             "  Sign in to AtomGit — scan the QR code with your WeChat:\n\n".into(),

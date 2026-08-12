@@ -54,6 +54,7 @@ mod tests {
             model: model.into(),
             base_url: Some("https://gw.example/v1".into()),
             system_prompt: None,
+            supports_vision: None,
             user_agent: None,
             context_window: 65536,
             max_tokens: None,
@@ -66,7 +67,6 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: capable,
-            pricing: None,
         }
     }
 

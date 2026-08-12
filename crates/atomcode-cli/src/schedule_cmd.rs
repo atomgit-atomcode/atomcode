@@ -6,8 +6,8 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 
-use atomcode_config::schedule::{self, Schedule, ScheduleTask};
 use crate::schedule_os::{InstallState, OsScheduler};
+use atomcode_config::schedule::{self, Schedule, ScheduleTask};
 
 // ── CLI enum ──────────────────────────────────────────────────────────────────
 
@@ -109,7 +109,9 @@ fn parse_schedule(
         if !t.contains(':') {
             anyhow::bail!("--daily expects HH:MM format, got {:?}", t);
         }
-        return Ok(Schedule::Daily { time: t.to_string() });
+        return Ok(Schedule::Daily {
+            time: t.to_string(),
+        });
     }
     if let Some(w) = weekly {
         // Format: N@HH:MM
@@ -135,9 +137,12 @@ fn parse_schedule(
         let minutes_str = e
             .strip_suffix('m')
             .with_context(|| format!("--every expects format like '30m', got {:?}", e))?;
-        let every_minutes: u32 = minutes_str
-            .parse()
-            .with_context(|| format!("--every minutes value must be a positive integer, got {:?}", minutes_str))?;
+        let every_minutes: u32 = minutes_str.parse().with_context(|| {
+            format!(
+                "--every minutes value must be a positive integer, got {:?}",
+                minutes_str
+            )
+        })?;
         if every_minutes == 0 {
             anyhow::bail!("--every minutes must be > 0");
         }
@@ -147,7 +152,9 @@ fn parse_schedule(
         return Ok(Schedule::Hourly);
     }
     if let Some(expr) = cron {
-        return Ok(Schedule::Cron { expr: expr.to_string() });
+        return Ok(Schedule::Cron {
+            expr: expr.to_string(),
+        });
     }
     anyhow::bail!(
         "one frequency flag is required: --daily HH:MM | --weekly N@HH:MM | \
@@ -238,18 +245,15 @@ fn handle_add_with(os: &dyn OsScheduler, task: &ScheduleTask) -> Result<()> {
 fn handle_remove_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
     // best-effort — don't abort if already absent
     let _ = os.uninstall(id);
-    schedule::remove(id)
-        .with_context(|| format!("failed to remove task {:?}", id))?;
+    schedule::remove(id).with_context(|| format!("failed to remove task {:?}", id))?;
     Ok(())
 }
 
 /// Core logic for `schedule enable`.
 fn handle_enable_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
-    let mut task = schedule::load(id)
-        .with_context(|| format!("task {:?} not found", id))?;
+    let mut task = schedule::load(id).with_context(|| format!("task {:?} not found", id))?;
     task.enabled = true;
-    schedule::save(&task)
-        .with_context(|| format!("failed to save task {:?}", id))?;
+    schedule::save(&task).with_context(|| format!("failed to save task {:?}", id))?;
     if let Err(e) = os.install(&task) {
         eprintln!(
             "[schedule] warning: OS scheduler registration failed for {id}: {e}\n\
@@ -261,11 +265,9 @@ fn handle_enable_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
 
 /// Core logic for `schedule disable`.
 fn handle_disable_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
-    let mut task = schedule::load(id)
-        .with_context(|| format!("task {:?} not found", id))?;
+    let mut task = schedule::load(id).with_context(|| format!("task {:?} not found", id))?;
     task.enabled = false;
-    schedule::save(&task)
-        .with_context(|| format!("failed to save task {:?}", id))?;
+    schedule::save(&task).with_context(|| format!("failed to save task {:?}", id))?;
     // best-effort
     let _ = os.uninstall(id);
     Ok(())
@@ -459,8 +461,7 @@ async fn run_task(id: &str) -> Result<i32> {
     use atomcode_config::config::Config;
 
     // 1. Load task record.
-    let mut task = schedule::load(id)
-        .with_context(|| format!("task {:?} not found", id))?;
+    let mut task = schedule::load(id).with_context(|| format!("task {:?} not found", id))?;
 
     // 2. Skip if disabled.
     if !task.enabled {
@@ -499,10 +500,7 @@ async fn run_task(id: &str) -> Result<i32> {
     //    out-of-workspace bash regardless of permission_mode — no human is present.
     let mode = mode_from_str(&task.permission_mode);
     let runtime_cfg = crate::runtime_config_from(
-        &config,
-        &cwd,
-        None,
-        None, // no per-task telemetry arc needed
+        &config, &cwd, None, None,  // no per-task telemetry arc needed
         false, // dangerously_skip_permissions=false — scheduled: never full bypass
         false, // headless: fail-closed approval timeout
     );
@@ -568,9 +566,9 @@ async fn run_task(id: &str) -> Result<i32> {
         false,
         false,
         cwd.clone(),
-        false,          // skip_permissions=false — never bypass for scheduled runs
-        false,          // is_admin=false
-        true,           // strict_unattended=true — deny risky/out-of-workspace bash
+        false, // skip_permissions=false — never bypass for scheduled runs
+        false, // is_admin=false
+        true,  // strict_unattended=true — deny risky/out-of-workspace bash
     )
     .await?;
 
@@ -598,7 +596,10 @@ fn format_epoch(epoch_secs: i64) -> String {
     // Rough Gregorian calendar: good enough for display.
     // 2000-01-01 = day 10957 since epoch.
     let (year, month, day) = days_to_ymd(days);
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z", year, month, day, h, m, s)
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
+        year, month, day, h, m, s
+    )
 }
 
 fn days_to_ymd(mut days: i64) -> (i64, u32, u32) {
@@ -673,7 +674,9 @@ mod tests {
 
     #[test]
     fn build_task_daily_fields() {
-        let sched = Schedule::Daily { time: "09:00".into() };
+        let sched = Schedule::Daily {
+            time: "09:00".into(),
+        };
         let t = build_task("Brief", "summarize", "/tmp/p", sched, "plan", "important");
         assert_eq!(t.title, "Brief");
         assert_eq!(t.prompt, "summarize");
@@ -711,7 +714,10 @@ mod tests {
         assert_eq!(s, "task", "pure non-ASCII slug must be 'task', got: {s}");
         // Mixed ASCII + CJK: only ASCII letters survive
         let s2 = slug("My重要Task");
-        assert!(s2.chars().all(|c| c.is_ascii()), "slug must be all-ASCII: {s2}");
+        assert!(
+            s2.chars().all(|c| c.is_ascii()),
+            "slug must be all-ASCII: {s2}"
+        );
         assert!(s2.contains("my"), "ASCII part 'my' must survive: {s2}");
         assert!(s2.contains("task"), "ASCII part 'task' must survive: {s2}");
     }
@@ -789,7 +795,9 @@ mod tests {
                 "Brief",
                 "summarize",
                 "/tmp/p",
-                Schedule::Daily { time: "09:00".into() },
+                Schedule::Daily {
+                    time: "09:00".into(),
+                },
                 "plan",
                 "important",
             );
@@ -802,9 +810,9 @@ mod tests {
 
     // ── FakeScheduler — records install/uninstall calls ───────────────────────
 
-    use std::sync::{Mutex, OnceLock};
     use crate::schedule_os::{InstallState, OsScheduler};
     use atomcode_config::schedule::ScheduleTask;
+    use std::sync::{Mutex, OnceLock};
 
     /// Global lock to serialize tests that mutate ATOMCODE_HOME / the schedule store.
     fn store_lock() -> &'static Mutex<()> {
@@ -851,7 +859,9 @@ mod tests {
             title: "Test".into(),
             prompt: "do it".into(),
             cwd: "/tmp".into(),
-            schedule: Schedule::Daily { time: "09:00".into() },
+            schedule: Schedule::Daily {
+                time: "09:00".into(),
+            },
             permission_mode: "plan".into(),
             notify: "important".into(),
             enabled,
@@ -884,7 +894,9 @@ mod tests {
         }
 
         let _lock = store_lock().lock().unwrap_or_else(|p| p.into_inner());
-        let _env_guard = EnvGuard { prev: std::env::var_os("ATOMCODE_HOME") };
+        let _env_guard = EnvGuard {
+            prev: std::env::var_os("ATOMCODE_HOME"),
+        };
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMCODE_HOME", tmp.path());
         // `tmp` is kept alive until after `f()` returns (or unwinds), ensuring
@@ -978,15 +990,22 @@ mod tests {
                 fn install(&self, _task: &ScheduleTask) -> anyhow::Result<()> {
                     anyhow::bail!("simulated install failure")
                 }
-                fn uninstall(&self, _id: &str) -> anyhow::Result<()> { Ok(()) }
-                fn status(&self, _id: &str) -> InstallState { InstallState::Missing }
+                fn uninstall(&self, _id: &str) -> anyhow::Result<()> {
+                    Ok(())
+                }
+                fn status(&self, _id: &str) -> InstallState {
+                    InstallState::Missing
+                }
             }
 
             let task = make_task("sync-fail-abc123", true);
             atomcode_config::schedule::save(&task).unwrap();
 
             let errors = handle_sync_with(&FailInstallScheduler).unwrap();
-            assert!(errors > 0, "expected non-zero error count when install fails");
+            assert!(
+                errors > 0,
+                "expected non-zero error count when install fails"
+            );
         });
     }
 

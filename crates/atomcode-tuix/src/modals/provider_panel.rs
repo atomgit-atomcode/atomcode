@@ -8,6 +8,7 @@ use anyhow::Result;
 use atomcode_config::config::provider::{ModelProfileConfig, ProviderAccountConfig};
 use atomcode_config::config::{provider_preset, Config};
 use crossterm::event::{KeyCode, KeyModifiers};
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::{tab_chip, Modal, ModalAction};
 use crate::event_loop::{
@@ -55,6 +56,8 @@ struct AddForm {
     base_url: String,
     api_key: String,
     focus: FormField,
+    /// UTF-8 byte cursor for the currently focused text field.
+    cursor_byte: usize,
 }
 
 /// The `PRESETS` index of the custom `openai-compatible` / `anthropic-compatible`
@@ -80,6 +83,7 @@ impl AddForm {
             base_url: String::new(),
             api_key: String::new(),
             focus: FormField::Name,
+            cursor_byte: 0,
         }
     }
 
@@ -115,6 +119,16 @@ impl AddForm {
             (cur + fields.len() - 1) % fields.len()
         };
         self.focus = fields[next];
+        self.cursor_byte = self.focused_text().map(str::len).unwrap_or(0);
+    }
+
+    fn focused_text(&self) -> Option<&str> {
+        match self.focus {
+            FormField::Name => Some(&self.name),
+            FormField::BaseUrl => Some(&self.base_url),
+            FormField::ApiKey => Some(&self.api_key),
+            FormField::Preset => None,
+        }
     }
 
     fn cycle_preset(&mut self, _forward: bool) {
@@ -169,6 +183,8 @@ struct EditForm {
     api_key: String,
     base_url: String,
     focus: FormField,
+    /// UTF-8 byte cursor for the currently focused text field.
+    cursor_byte: usize,
 }
 
 impl EditForm {
@@ -209,6 +225,15 @@ impl EditForm {
             (cur + fields.len() - 1) % fields.len()
         };
         self.focus = fields[next];
+        self.cursor_byte = self.focused_text().map(str::len).unwrap_or(0);
+    }
+
+    fn focused_text(&self) -> Option<&str> {
+        match self.focus {
+            FormField::BaseUrl => Some(&self.base_url),
+            FormField::ApiKey => Some(&self.api_key),
+            FormField::Name | FormField::Preset => None,
+        }
     }
 
     fn cycle_preset(&mut self, _forward: bool) {
@@ -226,12 +251,142 @@ impl EditForm {
     }
 }
 
+fn previous_grapheme_boundary(text: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(text.len());
+    text.grapheme_indices(true)
+        .map(|(index, _)| index)
+        .filter(|index| *index < cursor)
+        .next_back()
+        .unwrap_or(0)
+}
+
+fn next_grapheme_boundary(text: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(text.len());
+    text.grapheme_indices(true)
+        .map(|(index, _)| index)
+        .find(|index| *index > cursor)
+        .unwrap_or(text.len())
+}
+
+fn insert_at_cursor(text: &mut String, cursor: &mut usize, inserted: &str) {
+    *cursor = (*cursor).min(text.len());
+    text.insert_str(*cursor, inserted);
+    *cursor += inserted.len();
+}
+
+fn backspace_at_cursor(text: &mut String, cursor: &mut usize) {
+    let start = previous_grapheme_boundary(text, *cursor);
+    if start < *cursor {
+        text.drain(start..*cursor);
+        *cursor = start;
+    }
+}
+
+fn delete_at_cursor(text: &mut String, cursor: &mut usize) {
+    let end = next_grapheme_boundary(text, *cursor);
+    if *cursor < end {
+        text.drain(*cursor..end);
+    }
+}
+
+fn tail_graphemes_to_width(text: &str, max_cols: usize) -> String {
+    let mut kept = Vec::new();
+    let mut width = 0;
+    for grapheme in text.graphemes(true).rev() {
+        let grapheme_width = crate::width::display_width(grapheme);
+        if width + grapheme_width > max_cols {
+            break;
+        }
+        kept.push(grapheme);
+        width += grapheme_width;
+    }
+    kept.into_iter().rev().collect()
+}
+
+/// Build the transient value projection for a focused form field. The source
+/// value is never changed: the visible caret and ellipses exist only in the
+/// `PluginInfo` row sent to the renderer.
+fn editable_value_projection(value: &str, cursor_byte: usize, max_cols: usize) -> String {
+    const CARET: &str = "│";
+    const ELLIPSIS: &str = "…";
+
+    if max_cols == 0 {
+        return String::new();
+    }
+    if max_cols == 1 {
+        return CARET.to_string();
+    }
+
+    let cursor = cursor_byte.min(value.len());
+    let before = &value[..cursor];
+    let after = &value[cursor..];
+    let before_width = crate::width::display_width(before);
+    let after_width = crate::width::display_width(after);
+    let text_budget = max_cols - 1; // reserve the visible caret
+
+    if before_width + after_width <= text_budget {
+        return format!("{before}{CARET}{after}");
+    }
+
+    // Keep the caret near the centre while editing in the middle. At either
+    // endpoint, donate the unused half to the side that still has content.
+    let mut left_budget = text_budget / 2;
+    let mut right_budget = text_budget - left_budget;
+    if after_width < right_budget {
+        left_budget += right_budget - after_width;
+        right_budget = after_width;
+    }
+    if before_width < left_budget {
+        right_budget += left_budget - before_width;
+        left_budget = before_width;
+    }
+
+    let left_hidden = before_width > left_budget;
+    let right_hidden = after_width > right_budget;
+    if left_hidden {
+        left_budget = left_budget.saturating_sub(1);
+    }
+    if right_hidden {
+        right_budget = right_budget.saturating_sub(1);
+    }
+
+    let left = tail_graphemes_to_width(before, left_budget);
+    let right = crate::width::truncate_to_width(after, right_budget);
+    format!(
+        "{}{}{}{}{}",
+        if left_hidden { ELLIPSIS } else { "" },
+        left,
+        CARET,
+        right,
+        if right_hidden { ELLIPSIS } else { "" }
+    )
+}
+
+fn editable_field_row(
+    label: &str,
+    value: &str,
+    focused: bool,
+    cursor_byte: usize,
+    max_cols: usize,
+) -> (String, String) {
+    let marker = if focused { "▸ " } else { "  " };
+    let prefix = format!("{marker}{label}: ");
+    let value_cols = max_cols.saturating_sub(crate::width::display_width(&prefix));
+    let displayed = if focused {
+        editable_value_projection(value, cursor_byte, value_cols)
+    } else {
+        crate::width::truncate_with_ellipsis(value, value_cols)
+    };
+    (format!("{prefix}{displayed}"), String::new())
+}
+
 /// Which model-form field has focus.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ModelField {
     Account,
     ApiKey,
     Model,
+    Vision,
     Window,
     MakeDefault,
 }
@@ -264,6 +419,8 @@ struct ModelForm {
     account_idx: usize,
     api_key: String,
     model: String,
+    /// `None` = Auto, `Some(true)` = Enabled, `Some(false)` = Disabled.
+    supports_vision: Option<bool>,
     window: String,
     make_default: bool,
     focus: ModelField,
@@ -292,6 +449,7 @@ impl ModelForm {
             account_idx,
             api_key: String::new(),
             model: String::new(),
+            supports_vision: None,
             window: String::new(),
             make_default: true,
             focus: ModelField::Account,
@@ -307,6 +465,7 @@ impl ModelForm {
             account_idx: 0,
             api_key: String::new(),
             model: m.model.clone(),
+            supports_vision: m.supports_vision,
             window: m.context_window.to_string(),
             make_default: config.effective_model_selection().as_deref() == Some(id),
             focus: ModelField::Model,
@@ -335,6 +494,7 @@ impl ModelForm {
             }
         }
         v.push(ModelField::Model);
+        v.push(ModelField::Vision);
         v.push(ModelField::Window);
         v.push(ModelField::MakeDefault);
         v
@@ -364,6 +524,27 @@ impl ModelForm {
         // The ApiKey field appears/disappears with the account.
         if !self.fields().contains(&self.focus) {
             self.focus = ModelField::Account;
+        }
+    }
+
+    fn cycle_vision(&mut self, forward: bool) {
+        self.supports_vision = match (self.supports_vision, forward) {
+            (None, true) => Some(true),
+            (Some(true), true) => Some(false),
+            (Some(false), true) => None,
+            (None, false) => Some(false),
+            (Some(false), false) => Some(true),
+            (Some(true), false) => None,
+        };
+    }
+
+    fn vision_label(&self) -> String {
+        match self.supports_vision {
+            None => crate::i18n::t(crate::i18n::Msg::ProviderPanelVisionAuto).into_owned(),
+            Some(true) => crate::i18n::t(crate::i18n::Msg::ProviderPanelVisionEnabled).into_owned(),
+            Some(false) => {
+                crate::i18n::t(crate::i18n::Msg::ProviderPanelVisionDisabled).into_owned()
+            }
         }
     }
 }
@@ -418,14 +599,22 @@ impl ProviderPanel {
         let clean = text.trim().split(['\r', '\n']).next().unwrap_or("").trim();
         match &mut self.mode {
             Mode::Add(form) => match form.focus {
-                FormField::ApiKey => form.api_key.push_str(clean),
-                FormField::BaseUrl => form.base_url.push_str(clean),
-                FormField::Name => form.name.push_str(clean),
+                FormField::ApiKey => {
+                    insert_at_cursor(&mut form.api_key, &mut form.cursor_byte, clean)
+                }
+                FormField::BaseUrl => {
+                    insert_at_cursor(&mut form.base_url, &mut form.cursor_byte, clean)
+                }
+                FormField::Name => insert_at_cursor(&mut form.name, &mut form.cursor_byte, clean),
                 FormField::Preset => {}
             },
             Mode::EditAccount(form) => match form.focus {
-                FormField::ApiKey => form.api_key.push_str(clean),
-                FormField::BaseUrl => form.base_url.push_str(clean),
+                FormField::ApiKey => {
+                    insert_at_cursor(&mut form.api_key, &mut form.cursor_byte, clean)
+                }
+                FormField::BaseUrl => {
+                    insert_at_cursor(&mut form.base_url, &mut form.cursor_byte, clean)
+                }
                 FormField::Name | FormField::Preset => {}
             },
             Mode::Model(form) => match form.focus {
@@ -434,7 +623,7 @@ impl ProviderPanel {
                 ModelField::Window => form
                     .window
                     .extend(clean.chars().filter(char::is_ascii_digit)),
-                ModelField::Account | ModelField::MakeDefault => {}
+                ModelField::Account | ModelField::Vision | ModelField::MakeDefault => {}
             },
             Mode::List => {
                 self.query.push_str(clean);
@@ -483,7 +672,7 @@ impl ProviderPanel {
         // the trailing custom row; the AtomGit gateway (id "atomgit", matched
         // case-insensitively vs the CodingPlan "AtomGit" fold) must go through
         // the OAuth signer via /login; and presets without a default base_url
-        // (e.g. xiaomi-mimo) have nothing to dispatch against.
+        // (the `*-compatible` presets) have nothing to dispatch against.
         for p in provider_preset::PRESETS {
             let has_dispatchable_endpoint = p
                 .default_base_url
@@ -750,12 +939,17 @@ impl ProviderPanel {
             vendor_locked,
             protocol_locked: virtual_preset,
             api_key: String::new(),
-            base_url: effective_base_url.unwrap_or_default(),
+            base_url: effective_base_url.clone().unwrap_or_default(),
             // Locked accounts start on the only editable field.
             focus: if vendor_locked || virtual_preset {
                 FormField::BaseUrl
             } else {
                 FormField::Preset
+            },
+            cursor_byte: if vendor_locked || virtual_preset {
+                effective_base_url.as_deref().map(str::len).unwrap_or(0)
+            } else {
+                0
             },
         }
     }
@@ -862,6 +1056,7 @@ impl ProviderPanel {
     fn save_model(&self, form: &ModelForm, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> bool {
         let account_id = form.account_id().to_string();
         let model_name = form.model.trim().to_string();
+        let supports_vision = form.supports_vision;
         if model_name.is_empty() {
             return false;
         }
@@ -926,9 +1121,11 @@ impl ProviderPanel {
                 let selection_id = if let Some(id) = &edit_id {
                     if let Some(model) = persisted.models.get_mut(id) {
                         model.model = model_name.clone();
+                        model.supports_vision = supports_vision;
                         model.context_window = context_window;
                     } else if let Some(provider) = persisted.providers.get_mut(id) {
                         provider.model = model_name.clone();
+                        provider.supports_vision = supports_vision;
                         provider.context_window = context_window;
                     } else {
                         anyhow::bail!("model {id:?} changed; reopen /provider");
@@ -956,6 +1153,7 @@ impl ProviderPanel {
                             model: model_name.clone(),
                             display_name: None,
                             system_prompt: None,
+                            supports_vision,
                             context_window,
                             max_tokens: None,
                             capable_model: None,
@@ -965,7 +1163,6 @@ impl ProviderPanel {
                             reasoning_effort: None,
                             thinking_enabled: None,
                             thinking_budget: None,
-                            pricing: None,
                         },
                     );
                     model_id
@@ -1074,22 +1271,54 @@ impl Modal for ProviderPanel {
                 KeyCode::BackTab | KeyCode::Up => form.advance_focus(false),
                 KeyCode::Left if form.focus == FormField::Preset => form.cycle_preset(false),
                 KeyCode::Right if form.focus == FormField::Preset => form.cycle_preset(true),
-                KeyCode::Char(c) => match form.focus {
-                    FormField::Name => form.name.push(c),
-                    FormField::BaseUrl => form.base_url.push(c),
-                    FormField::ApiKey => form.api_key.push(c),
+                KeyCode::Left => {
+                    if let Some(text) = form.focused_text() {
+                        form.cursor_byte = previous_grapheme_boundary(text, form.cursor_byte);
+                    }
+                }
+                KeyCode::Right => {
+                    if let Some(text) = form.focused_text() {
+                        form.cursor_byte = next_grapheme_boundary(text, form.cursor_byte);
+                    }
+                }
+                KeyCode::Home => form.cursor_byte = 0,
+                KeyCode::End => {
+                    form.cursor_byte = form.focused_text().map(str::len).unwrap_or(0);
+                }
+                KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => match form.focus {
+                    FormField::Name => insert_at_cursor(
+                        &mut form.name,
+                        &mut form.cursor_byte,
+                        c.encode_utf8(&mut [0; 4]),
+                    ),
+                    FormField::BaseUrl => insert_at_cursor(
+                        &mut form.base_url,
+                        &mut form.cursor_byte,
+                        c.encode_utf8(&mut [0; 4]),
+                    ),
+                    FormField::ApiKey => insert_at_cursor(
+                        &mut form.api_key,
+                        &mut form.cursor_byte,
+                        c.encode_utf8(&mut [0; 4]),
+                    ),
                     _ => {}
                 },
                 KeyCode::Backspace => match form.focus {
-                    FormField::Name => {
-                        form.name.pop();
-                    }
+                    FormField::Name => backspace_at_cursor(&mut form.name, &mut form.cursor_byte),
                     FormField::BaseUrl => {
-                        form.base_url.pop();
+                        backspace_at_cursor(&mut form.base_url, &mut form.cursor_byte)
                     }
                     FormField::ApiKey => {
-                        form.api_key.pop();
+                        backspace_at_cursor(&mut form.api_key, &mut form.cursor_byte)
                     }
+                    _ => {}
+                },
+                KeyCode::Delete => match form.focus {
+                    FormField::Name => delete_at_cursor(&mut form.name, &mut form.cursor_byte),
+                    FormField::BaseUrl => {
+                        delete_at_cursor(&mut form.base_url, &mut form.cursor_byte)
+                    }
+                    FormField::ApiKey => delete_at_cursor(&mut form.api_key, &mut form.cursor_byte),
                     _ => {}
                 },
                 KeyCode::Enter => {
@@ -1115,17 +1344,46 @@ impl Modal for ProviderPanel {
                 KeyCode::BackTab | KeyCode::Up => form.advance_focus(false),
                 KeyCode::Left if form.focus == FormField::Preset => form.cycle_preset(false),
                 KeyCode::Right if form.focus == FormField::Preset => form.cycle_preset(true),
-                KeyCode::Char(c) => match form.focus {
-                    FormField::ApiKey => form.api_key.push(c),
-                    FormField::BaseUrl => form.base_url.push(c),
+                KeyCode::Left => {
+                    if let Some(text) = form.focused_text() {
+                        form.cursor_byte = previous_grapheme_boundary(text, form.cursor_byte);
+                    }
+                }
+                KeyCode::Right => {
+                    if let Some(text) = form.focused_text() {
+                        form.cursor_byte = next_grapheme_boundary(text, form.cursor_byte);
+                    }
+                }
+                KeyCode::Home => form.cursor_byte = 0,
+                KeyCode::End => {
+                    form.cursor_byte = form.focused_text().map(str::len).unwrap_or(0);
+                }
+                KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => match form.focus {
+                    FormField::ApiKey => insert_at_cursor(
+                        &mut form.api_key,
+                        &mut form.cursor_byte,
+                        c.encode_utf8(&mut [0; 4]),
+                    ),
+                    FormField::BaseUrl => insert_at_cursor(
+                        &mut form.base_url,
+                        &mut form.cursor_byte,
+                        c.encode_utf8(&mut [0; 4]),
+                    ),
                     _ => {}
                 },
                 KeyCode::Backspace => match form.focus {
                     FormField::ApiKey => {
-                        form.api_key.pop();
+                        backspace_at_cursor(&mut form.api_key, &mut form.cursor_byte)
                     }
                     FormField::BaseUrl => {
-                        form.base_url.pop();
+                        backspace_at_cursor(&mut form.base_url, &mut form.cursor_byte)
+                    }
+                    _ => {}
+                },
+                KeyCode::Delete => match form.focus {
+                    FormField::ApiKey => delete_at_cursor(&mut form.api_key, &mut form.cursor_byte),
+                    FormField::BaseUrl => {
+                        delete_at_cursor(&mut form.base_url, &mut form.cursor_byte)
                     }
                     _ => {}
                 },
@@ -1150,6 +1408,11 @@ impl Modal for ProviderPanel {
                 KeyCode::BackTab | KeyCode::Up => form.advance_focus(false),
                 KeyCode::Left if form.focus == ModelField::Account => form.cycle_account(false),
                 KeyCode::Right if form.focus == ModelField::Account => form.cycle_account(true),
+                KeyCode::Left if form.focus == ModelField::Vision => form.cycle_vision(false),
+                KeyCode::Right if form.focus == ModelField::Vision => form.cycle_vision(true),
+                KeyCode::Char(' ') if form.focus == ModelField::Vision => {
+                    form.cycle_vision(true);
+                }
                 KeyCode::Char(' ') if form.focus == ModelField::MakeDefault => {
                     form.make_default = !form.make_default;
                 }
@@ -1323,6 +1586,13 @@ impl Modal for ProviderPanel {
                           // layout whose reserved index-2 slot is rendered as the search box.
         let mut kind = MenuKind::PluginInfo;
         let mut buf = String::new();
+        // PluginInfo rows are flush-left inside a one-column rule margin.
+        // Keep a small safety margin so the caret/ellipsis never lands in the
+        // terminal's autowrap column on narrow Windows hosts.
+        let form_cols = crossterm::terminal::size()
+            .map(|(cols, _)| cols as usize)
+            .unwrap_or(80)
+            .saturating_sub(4);
 
         match &self.mode {
             Mode::List => {
@@ -1438,7 +1708,13 @@ impl Modal for ProviderPanel {
                 } else {
                     form.name.clone()
                 };
-                items.push(field_row("名称", name, form.focus == FormField::Name));
+                items.push(editable_field_row(
+                    "名称",
+                    &name,
+                    form.focus == FormField::Name,
+                    form.cursor_byte,
+                    form_cols,
+                ));
                 items.push(field_row(
                     "协议",
                     format!(
@@ -1448,10 +1724,12 @@ impl Modal for ProviderPanel {
                     ),
                     form.focus == FormField::Preset,
                 ));
-                items.push(field_row(
+                items.push(editable_field_row(
                     &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldBaseUrl),
-                    form.base_url.clone(),
+                    &form.base_url,
                     form.focus == FormField::BaseUrl,
+                    form.cursor_byte,
+                    form_cols,
                 ));
                 if !matches!(p.auth_kind, provider_preset::AuthKind::None) {
                     let masked = "•".repeat(form.api_key.chars().count());
@@ -1464,10 +1742,19 @@ impl Modal for ProviderPanel {
                             )
                         })
                         .unwrap_or_default();
-                    items.push(field_row(
+                    let masked_cursor = "•"
+                        .repeat(
+                            form.api_key[..form.cursor_byte.min(form.api_key.len())]
+                                .chars()
+                                .count(),
+                        )
+                        .len();
+                    items.push(editable_field_row(
                         &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldApiKey),
-                        format!("{masked}{env_hint}"),
+                        &format!("{masked}{env_hint}"),
                         form.focus == FormField::ApiKey,
+                        masked_cursor,
+                        form_cols,
                     ));
                 }
                 // Account-only form — model/window/default moved to the 模型 tab.
@@ -1506,20 +1793,31 @@ impl Modal for ProviderPanel {
                         form.focus == FormField::Preset,
                     ));
                 }
-                items.push(field_row(
+                items.push(editable_field_row(
                     &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldBaseUrl),
-                    form.base_url.clone(),
+                    &form.base_url,
                     form.focus == FormField::BaseUrl,
+                    form.cursor_byte,
+                    form_cols,
                 ));
                 if !form.vendor_locked && !matches!(p.auth_kind, provider_preset::AuthKind::None) {
                     let masked = "•".repeat(form.api_key.chars().count());
-                    items.push(field_row(
+                    let masked_cursor = "•"
+                        .repeat(
+                            form.api_key[..form.cursor_byte.min(form.api_key.len())]
+                                .chars()
+                                .count(),
+                        )
+                        .len();
+                    items.push(editable_field_row(
                         &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldApiKey),
-                        format!(
+                        &format!(
                             "{masked}   ({})",
                             crate::i18n::t(crate::i18n::Msg::ProviderPanelKeepOriginal)
                         ),
                         form.focus == FormField::ApiKey,
+                        masked_cursor,
+                        form_cols,
                     ));
                 }
                 hint = if form.vendor_locked {
@@ -1576,6 +1874,11 @@ impl Modal for ProviderPanel {
                     &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldModel),
                     form.model.clone(),
                     form.focus == ModelField::Model,
+                ));
+                items.push(field_row(
+                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldVision),
+                    format!("‹ {} ›", form.vision_label()),
+                    form.focus == ModelField::Vision,
                 ));
                 let win = if form.window.is_empty() {
                     format!(
@@ -1718,6 +2021,74 @@ mod tests {
     }
 
     #[test]
+    fn text_cursor_edits_at_utf8_boundaries() {
+        let mut value = "ab前端cd".to_string();
+        let mut cursor = value.len();
+
+        cursor = previous_grapheme_boundary(&value, cursor);
+        cursor = previous_grapheme_boundary(&value, cursor);
+        insert_at_cursor(&mut value, &mut cursor, "/");
+        assert_eq!(value, "ab前端/cd");
+
+        backspace_at_cursor(&mut value, &mut cursor);
+        assert_eq!(value, "ab前端cd");
+        delete_at_cursor(&mut value, &mut cursor);
+        assert_eq!(value, "ab前端d");
+    }
+
+    #[test]
+    fn text_cursor_deletes_complete_combining_and_zwj_graphemes() {
+        let mut combining = "Ae\u{301}".to_string();
+        let mut cursor = combining.len();
+        cursor = previous_grapheme_boundary(&combining, cursor);
+        assert_eq!(cursor, 1, "cursor must jump over the complete e + accent");
+        delete_at_cursor(&mut combining, &mut cursor);
+        assert_eq!(combining, "A");
+
+        let family = "👨‍👩‍👦";
+        let mut emoji = format!("A{family}B");
+        let mut cursor = 1;
+        assert_eq!(next_grapheme_boundary(&emoji, cursor), 1 + family.len());
+        delete_at_cursor(&mut emoji, &mut cursor);
+        assert_eq!(emoji, "AB", "Delete must remove the whole ZWJ emoji");
+    }
+
+    #[test]
+    fn editable_projection_keeps_the_url_tail_visible_at_end() {
+        let url = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1";
+        let shown = editable_value_projection(url, url.len(), 28);
+        assert!(
+            shown.starts_with('…'),
+            "expected hidden-left marker: {shown}"
+        );
+        assert!(shown.ends_with('│'), "caret should remain visible: {shown}");
+        assert!(
+            shown.contains("compatible-mode/v1"),
+            "URL tail missing: {shown}"
+        );
+        assert!(crate::width::display_width(&shown) <= 28);
+    }
+
+    #[test]
+    fn editable_projection_marks_both_hidden_sides_around_middle_cursor() {
+        let url = "https://example.test/a/very/long/provider/path/v1";
+        let cursor = url.find("provider").expect("provider segment");
+        let shown = editable_value_projection(url, cursor, 20);
+        assert!(shown.starts_with('…'), "left marker missing: {shown}");
+        assert!(shown.ends_with('…'), "right marker missing: {shown}");
+        assert!(shown.contains('│'), "caret missing: {shown}");
+        assert!(crate::width::display_width(&shown) <= 20);
+    }
+
+    #[test]
+    fn editable_projection_keeps_complete_value_when_it_fits() {
+        assert_eq!(
+            editable_value_projection("https://x/v1", "https://".len(), 40),
+            "https://│x/v1"
+        );
+    }
+
+    #[test]
     fn open_edit_prefills_and_detects_legacy() {
         let cfg: Config = serde_json::from_value(serde_json::json!({
             "providers": { "leg": { "type": "openai", "base_url": "https://legacy/v1", "model": "m", "context_window": 8000 } },
@@ -1838,6 +2209,37 @@ mod tests {
     }
 
     #[test]
+    fn model_form_vision_cycles_auto_enabled_disabled_and_restores_edit_value() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "acc": { "provider": "openai-compatible" } },
+            "models": {
+                "acc/qwen": {
+                    "account": "acc",
+                    "model": "qwen3.8max",
+                    "supports_vision": true,
+                    "context_window": 131072
+                }
+            }
+        }))
+        .unwrap();
+
+        let mut add = ModelForm::new_add(&cfg, Some("acc")).unwrap();
+        assert_eq!(add.supports_vision, None);
+        add.cycle_vision(true);
+        assert_eq!(add.supports_vision, Some(true));
+        add.cycle_vision(true);
+        assert_eq!(add.supports_vision, Some(false));
+        add.cycle_vision(true);
+        assert_eq!(add.supports_vision, None);
+        add.cycle_vision(false);
+        assert_eq!(add.supports_vision, Some(false));
+
+        let edit = ModelForm::new_edit(&cfg, "acc/qwen").unwrap();
+        assert_eq!(edit.supports_vision, Some(true));
+        assert!(edit.fields().contains(&ModelField::Vision));
+    }
+
+    #[test]
     fn paste_routes_to_account_and_model_form_fields() {
         let mut panel = ProviderPanel::open();
 
@@ -1870,6 +2272,7 @@ mod tests {
             api_key: String::new(),
             base_url: String::new(),
             focus: FormField::ApiKey,
+            cursor_byte: 0,
         };
         edit.focus = FormField::ApiKey;
         panel.mode = Mode::EditAccount(edit);
@@ -1972,9 +2375,8 @@ mod tests {
         // The lowercase "atomgit" gateway preset must NOT be quick-addable as a
         // raw-key account — it has to go through the CodingPlan OAuth signer.
         assert!(!ids.contains(&"atomgit".to_string()));
-        // A preset without a default endpoint (nothing to dispatch against) is
-        // not listed either.
-        assert!(!ids.contains(&"xiaomi-mimo".to_string()));
+        // A preset with a concrete default endpoint is quick-addable.
+        assert!(ids.contains(&"xiaomi-mimo".to_string()));
         // A keyed preset vendor prompts for a key when you add its first model.
         assert!(account_needs_key(&cfg, "deepseek"));
         assert!(!account_needs_key(&cfg, "AtomGit"));

@@ -10,6 +10,7 @@ import com.atomcode.jetbrains.daemon.ConnectionErrorKind
 import com.atomcode.jetbrains.daemon.ConnectionState
 import com.atomcode.jetbrains.daemon.CreateProviderRequest
 import com.atomcode.jetbrains.daemon.DaemonAuth
+import com.atomcode.jetbrains.daemon.DaemonTokenFile
 import com.atomcode.jetbrains.daemon.ImageInput
 import com.atomcode.jetbrains.daemon.MessageInfo
 import com.atomcode.jetbrains.daemon.ModelInfo
@@ -20,7 +21,6 @@ import com.atomcode.jetbrains.daemon.SessionDetail
 import com.atomcode.jetbrains.daemon.SessionMeta
 import com.atomcode.jetbrains.daemon.SetupSnapshot
 import com.atomcode.jetbrains.files.FileChangeService
-import com.atomcode.jetbrains.security.AtomCodeTokenFactory
 import com.atomcode.jetbrains.settings.AtomCodeSettings
 import com.atomcode.jetbrains.settings.AtomCodeSettingsState
 import com.intellij.openapi.Disposable
@@ -127,7 +127,7 @@ internal class ApprovalModeRuntimeState(initialMode: ApprovalMode = ApprovalMode
 class AtomCodeProjectService(private val project: Project) : Disposable {
     private val changes = PropertyChangeSupport(this)
     private val settingsService = AtomCodeSettingsState.getInstance()
-    private val auth = DaemonAuth(AtomCodeTokenFactory.createToken())
+    private val auth = DaemonAuth(DaemonTokenFile.read(settingsService.state.port))
     private val daemonSupervisor = AtomCodeDaemonSupervisor.getInstance()
 
     @Volatile
@@ -695,7 +695,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
     }
 
     private fun newClient(settings: AtomCodeSettings): AtomCodeDaemonClient =
-        AtomCodeDaemonClient(settings.host, settings.port, settings.requestTimeoutMs, auth)
+        AtomCodeDaemonClient(settings.host, settings.port, settings.requestTimeoutMs, DaemonAuth(DaemonTokenFile.read(settings.port)))
 
     private fun getOrCreateClient(): AtomCodeDaemonClient {
         val settings = settingsService.state.copy()

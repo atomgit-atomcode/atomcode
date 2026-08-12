@@ -1,6 +1,6 @@
 use crate::checkpoint::{CompactionCheckpoint, CompactionCheckpointError};
 use crate::clock::{Clock, SystemClock};
-use crate::event::{AgentCommand, AgentEvent, StopReason, ToolBatchCall};
+use crate::event::{AgentCommand, AgentEvent, PolicyIntervention, StopReason, ToolBatchCall};
 use crate::hook::{
     Continuation, ContinuationKind, ContinuationVisibility, HookChain, LifecycleHooks, TurnCtx,
 };
@@ -1355,6 +1355,7 @@ impl RunningAgent {
                             PromptKind::User,
                             text,
                             images,
+                            None,
                         )
                         .await;
                     if shutdown {
@@ -1362,6 +1363,33 @@ impl RunningAgent {
                     }
                     // DRAIN queued mid-turn commands (FIFO) now that the turn is done
                     // and `convo` is free (see `drain_pending`).
+                    if self
+                        .drain_pending(&mut convo, &mut cmd_rx, &mut pending, &mut tool_loop_state)
+                        .await
+                    {
+                        break;
+                    }
+                }
+                AgentCommand::SendMessageWithContext {
+                    text,
+                    images,
+                    context,
+                } => {
+                    let shutdown = self
+                        .process_send_message(
+                            &mut convo,
+                            &mut cmd_rx,
+                            &mut pending,
+                            &mut tool_loop_state,
+                            PromptKind::User,
+                            text,
+                            images,
+                            Some(context),
+                        )
+                        .await;
+                    if shutdown {
+                        break;
+                    }
                     if self
                         .drain_pending(&mut convo, &mut cmd_rx, &mut pending, &mut tool_loop_state)
                         .await
@@ -1383,6 +1411,7 @@ impl RunningAgent {
                             PromptKind::Synthetic,
                             text,
                             Vec::new(),
+                            None,
                         )
                         .await;
                     if shutdown {
@@ -1400,10 +1429,9 @@ impl RunningAgent {
         self.hooks.session_end(&convo).await;
     }
 
-    /// Handle ONE `SendMessage`: run `user_prompt_submit`, the task-boundary
-    /// auto-compaction, push the user message, then drive the turn while servicing
-    /// commands. Mid-turn `Snapshot`/`SendMessage` are QUEUED into `pending` (FIFO)
-    /// instead of being dropped — the caller drains them after this returns.
+    /// Handle ONE real or synthetic prompt: run `user_prompt_submit`, the
+    /// task-boundary auto-compaction, optionally push host-owned synthetic context,
+    /// push the prompt, then drive the turn while servicing commands.
     /// Returns `true` iff a `Shutdown` (or a closed command channel) was observed
     /// mid-turn, so the caller must tear down without draining further.
     async fn process_send_message(
@@ -1415,6 +1443,7 @@ impl RunningAgent {
         kind: PromptKind,
         mut text: String,
         images: Vec<ImageContent>,
+        synthetic_context: Option<String>,
     ) -> bool {
         if let Err(reason) = self.hooks.user_prompt_submit(&mut text).await {
             self.rt.emit(AgentEvent::Error {
@@ -1451,6 +1480,9 @@ impl RunningAgent {
         // separately restores the prompt to the input box for edit-and-resend).
         // Captured AFTER the pre-turn compaction above so it indexes current history.
         let rollback_len = convo.messages.len();
+        if let Some(context) = synthetic_context.filter(|context| !context.trim().is_empty()) {
+            convo.push(Message::synthetic_user(context));
+        }
         convo.push(match kind {
             PromptKind::User => Message::user_with_images(text, images),
             PromptKind::Synthetic => Message::synthetic_user(text),
@@ -1514,6 +1546,12 @@ impl RunningAgent {
                     // buffer (a goal-mode continuation is a distinct turn, and must
                     // reach the model marked synthetic). Drained after the turn.
                     Some(c @ AgentCommand::SendSyntheticMessage { .. }) => {
+                        pending.push_back(c);
+                    }
+                    // Context-bearing real input must remain one atomic future turn;
+                    // steering only carries text/images and would silently discard its
+                    // recovery context. Queue it at the next turn boundary instead.
+                    Some(c @ AgentCommand::SendMessageWithContext { .. }) => {
                         pending.push_back(c);
                     }
                     // Route a mid-turn SendMessage into the per-turn steer buffer
@@ -1594,6 +1632,28 @@ impl RunningAgent {
                             PromptKind::User,
                             text,
                             images,
+                            None,
+                        )
+                        .await
+                    {
+                        return true;
+                    }
+                }
+                AgentCommand::SendMessageWithContext {
+                    text,
+                    images,
+                    context,
+                } => {
+                    if self
+                        .process_send_message(
+                            convo,
+                            cmd_rx,
+                            pending,
+                            tool_loop_state,
+                            PromptKind::User,
+                            text,
+                            images,
+                            Some(context),
                         )
                         .await
                     {
@@ -1610,6 +1670,7 @@ impl RunningAgent {
                             PromptKind::Synthetic,
                             text,
                             Vec::new(),
+                            None,
                         )
                         .await
                     {
@@ -1622,7 +1683,7 @@ impl RunningAgent {
                     self.run_compaction(convo, CompactTrigger::Manual { focus })
                         .await;
                 }
-                // Only Snapshot/SendMessage/SendSyntheticMessage/Compact are ever enqueued.
+                // Only snapshot, prompt, and compact commands are ever enqueued.
                 _ => {}
             }
         }
@@ -2991,6 +3052,7 @@ impl RunningAgent {
             }
             let mut plans: Vec<CallPlan> = Vec::with_capacity(pending_calls.len());
             let mut terminal_policy_denial_seen = false;
+            let mut policy_intervention: Option<PolicyIntervention> = None;
             for mut call in pending_calls {
                 // ── DUPLICATE TOOL-CALL DEDUP GATE ──
                 // Some (esp. thinking-mode / weak) models emit the SAME tool_call
@@ -3105,6 +3167,14 @@ impl RunningAgent {
                                     break;
                                 }
                                 BeforeOutcome::DenyTurn { reason } => {
+                                    blocked = Some((reason, true));
+                                    break;
+                                }
+                                BeforeOutcome::DenyTurnWithIntervention {
+                                    reason,
+                                    intervention,
+                                } => {
+                                    policy_intervention = Some(intervention);
                                     blocked = Some((reason, true));
                                     break;
                                 }
@@ -3261,12 +3331,15 @@ impl RunningAgent {
                         progress: {
                             let events = events.clone();
                             let call_id = call.id.clone();
-                            ProgressSink::new(std::sync::Arc::new(move |message| {
-                                let _ = events.send(AgentEvent::ToolProgress {
-                                    call_id: call_id.clone(),
-                                    message,
-                                });
-                            }))
+                            ProgressSink::with_source_id(
+                                call_id.clone(),
+                                std::sync::Arc::new(move |message| {
+                                    let _ = events.send(AgentEvent::ToolProgress {
+                                        call_id: call_id.clone(),
+                                        message,
+                                    });
+                                }),
+                            )
                         },
                         requester: Some(self.rt.requester()),
                     };
@@ -3448,6 +3521,13 @@ impl RunningAgent {
             // cancel-skipped Execute slots applied nothing (dangling tool_calls now
             // rolled back / backfilled by finish_cancelled). Close any batch and
             // finish the cancelled turn — exactly the old loop's checkpoint path.
+            //
+            // A concurrent cancel deliberately SUPERSEDES a policy denial reached
+            // in this same batch: any pending `policy_intervention` is dropped WITH
+            // its PolicyDenied terminal (this returns before the `policy_denied`
+            // block below), so a driver never sees a recovery contract without the
+            // matching terminal. The hard block still stands — its paired blocked
+            // ToolResult was already persisted above. See `PolicyIntervention`.
             if cancelled_during_batch || cancel.is_cancelled() {
                 if let Some((batch_id, started_at)) = &batch_start {
                     self.rt.emit(AgentEvent::ToolBatchCompleted {
@@ -3470,6 +3550,10 @@ impl RunningAgent {
                 });
             }
             if policy_denied {
+                if let Some(intervention) = policy_intervention {
+                    self.rt
+                        .emit(AgentEvent::PolicyIntervention { intervention });
+                }
                 self.finish_turn(convo, StopReason::PolicyDenied, &turn_ctx)
                     .await;
                 return;
@@ -5190,6 +5274,57 @@ mod synthetic_send_tests {
     };
     use crate::tool::{ToolCall, ToolRegistry};
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn contextual_user_prompt_is_one_turn_with_distinct_synthetic_context() {
+        let provider = Arc::new(MockProvider::new(vec![vec![
+            StreamEvent::TextDelta("ok".into()),
+            StreamEvent::Done { truncated: false },
+        ]]));
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(ToolRegistry::new().mount(&[]))
+            .build()
+            .spawn();
+
+        handle
+            .commands
+            .send(AgentCommand::SendMessageWithContext {
+                text: "continue".into(),
+                images: vec![],
+                context: "recovery facts".into(),
+            })
+            .unwrap();
+        let mut terminals = 0;
+        while let Some(event) = handle.events.recv().await {
+            if matches!(event, AgentEvent::TurnComplete { .. }) {
+                terminals += 1;
+                break;
+            }
+        }
+        handle.commands.send(AgentCommand::Snapshot).unwrap();
+        let snapshot = loop {
+            match handle.events.recv().await {
+                Some(AgentEvent::Snapshot { snapshot }) => break snapshot,
+                Some(_) => {}
+                None => panic!("agent closed before snapshot"),
+            }
+        };
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
+
+        let users = snapshot
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .collect::<Vec<_>>();
+        assert_eq!(terminals, 1, "context and prompt must share one turn");
+        assert_eq!(users.len(), 2);
+        assert!(users[0].synthetic);
+        assert_eq!(users[0].text, "recovery facts");
+        assert!(!users[1].synthetic);
+        assert_eq!(users[1].text, "continue");
+    }
 
     // (1) A synthetic prompt runs the user_prompt_submit hook (rewrite applied) and is
     //     stored as a SYNTHETIC user message.

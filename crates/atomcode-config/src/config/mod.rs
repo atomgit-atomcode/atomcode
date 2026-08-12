@@ -360,10 +360,6 @@ impl Default for PluginConfig {
     }
 }
 
-fn default_auto_copy_on_select() -> bool {
-    !cfg!(windows)
-}
-
 fn default_auto_copy_code_blocks() -> bool {
     // OFF by default. Auto-copying every rendered code block silently overwrote
     // the user's clipboard on each reply (issue #699 feedback), so it is opt-in.
@@ -395,11 +391,6 @@ pub struct UiConfig {
     /// configs see no behaviour change.
     #[serde(default)]
     pub theme: UiTheme,
-    /// Drag-select in the conversation auto-copies to the clipboard and
-    /// shows a notice. Opt-out via `/config`. Default off on Windows
-    /// (conhost QuickEdit conflict).
-    #[serde(default = "default_auto_copy_on_select")]
-    pub auto_copy_on_select: bool,
     /// Auto-copy a rendered code block's raw source to the clipboard when the
     /// AI finishes emitting it. OFF by default — it silently overwrote the
     /// user's clipboard on every code-block reply (issue #699 feedback). Env
@@ -417,16 +408,27 @@ pub struct UiConfig {
     /// shows emoji as monochrome tofu boxes.
     #[serde(default = "default_terminal_status_glyph")]
     pub terminal_status_glyph: bool,
+    /// Maximum number of already-wrapped transcript rows written to the host
+    /// terminal when a session is resumed. `None` selects a terminal-aware
+    /// default; `Some(0)` disables the cap and restores the legacy full replay.
+    /// This only limits presentation: runtime restores the full native session.
+    #[serde(default)]
+    pub history_replay_max_rows: Option<usize>,
+    /// Whether resumed history replay is bounded. Disabling this keeps the
+    /// configured row cap intact so re-enabling restores the previous limit.
+    #[serde(default = "default_true")]
+    pub truncate_resumed_history: bool,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             theme: UiTheme::default(),
-            auto_copy_on_select: default_auto_copy_on_select(),
             auto_copy_code_blocks: default_auto_copy_code_blocks(),
             ai_session_naming: default_ai_session_naming(),
             terminal_status_glyph: default_terminal_status_glyph(),
+            history_replay_max_rows: None,
+            truncate_resumed_history: true,
         }
     }
 }
@@ -481,7 +483,39 @@ impl Config {
     /// this form or they can accept images for a text-only model (or reject
     /// them for a vision model) based on stale configuration.
     pub fn image_attach_support_for_model(&self, active_model: &str) -> ImageAttachSupport {
-        if crate::util::model_name_suggests_vision(active_model) {
+        self.image_attach_support_for_selection(None, active_model)
+    }
+
+    /// Resolve image support for the exact active selection. Drivers should
+    /// prefer this over matching only the wire model name because two accounts
+    /// may expose the same model with different explicit capability overrides.
+    pub fn image_attach_support_for_selection(
+        &self,
+        active_selection: Option<&str>,
+        active_model: &str,
+    ) -> ImageAttachSupport {
+        // Prefer the active resolved selection so an explicit profile override
+        // reaches the TUI paste gate. Fall back to a unique matching wire model
+        // for runtime-local selections, then to the legacy name heuristic.
+        let selected = self
+            .resolve_model(active_selection)
+            .ok()
+            .filter(|resolved| resolved.model == active_model)
+            .map(|resolved| resolved.supports_vision);
+        let matching: Vec<_> = self
+            .logical_models()
+            .into_values()
+            .filter(|model| model.model == active_model)
+            .collect();
+        let unique = (matching.len() == 1).then(|| {
+            matching[0]
+                .supports_vision
+                .unwrap_or_else(|| crate::util::model_name_suggests_vision(active_model))
+        });
+        if selected
+            .or(unique)
+            .unwrap_or_else(|| crate::util::model_name_suggests_vision(active_model))
+        {
             return ImageAttachSupport::Supported;
         }
         match self.vision_preprocessor_provider.as_deref() {
@@ -759,6 +793,9 @@ impl Config {
             base_url,
             api_key,
             model: model.model.clone(),
+            supports_vision: model.supports_vision.unwrap_or_else(|| {
+                crate::util::model_name_suggests_vision(&model.model)
+            }),
             context_window: model.context_window,
             max_tokens: model.max_tokens,
             system_prompt: model.system_prompt.clone(),
@@ -771,7 +808,6 @@ impl Config {
             thinking_enabled: model.thinking_enabled,
             thinking_budget: model.thinking_budget,
             capable_model: model.capable_model,
-            pricing: model.pricing,
         })
     }
 
@@ -799,6 +835,18 @@ impl Config {
         self.resolve_model(Some(selection_id))
             .ok()
             .map(|r| r.to_provider_config())
+    }
+
+    /// Raw image-capability override for a persisted selection. This preserves
+    /// the distinction between Auto (`None`) and an explicit true/false value;
+    /// callers needing the effective capability should use [`Self::resolve_model`].
+    pub fn model_vision_override(&self, selection_id: &str) -> Option<bool> {
+        if let Some(model) = self.models.get(selection_id) {
+            return model.supports_vision;
+        }
+        self.providers
+            .get(selection_id)
+            .and_then(|provider| provider.supports_vision)
     }
 
     /// Whether a selection id resolves to any provider/model (legacy or new
@@ -915,6 +963,10 @@ fn legacy_provider_to_preset_id(provider_type: &str) -> &'static str {
     match provider_type {
         "claude" | "anthropic" => "anthropic",
         "ollama" => "ollama",
+        // Preserve the vendor preset for legacy OpenCode Zen entries. Falling
+        // through to the generic OpenAI preset would resolve OPENAI_API_KEY
+        // instead of OPENCODE_API_KEY even though the wire protocol is the same.
+        "opencode" => "opencode",
         _ => "openai",
     }
 }
@@ -1016,9 +1068,24 @@ mod codingplan_prefix_tests {
 
     #[test]
     fn account_ids_group_by_wire_format() {
-        assert_eq!(codingplan_group_account_id("openai"), "AtomGit");
-        assert_eq!(codingplan_group_account_id("claude"), "AtomGit-anthropic");
-        assert_eq!(codingplan_group_account_id("ollama"), "AtomGit-ollama");
+        // The rule under test is the grouping — one account per wire format,
+        // all under the configured prefix — not what that prefix happens to
+        // say, which a distribution may replace.
+        let prefix = crate::endpoints::codingplan_provider_prefix();
+        assert_eq!(codingplan_group_account_id("openai"), prefix);
+        assert_eq!(
+            codingplan_group_account_id("claude"),
+            format!("{prefix}-anthropic")
+        );
+        assert_eq!(
+            codingplan_group_account_id("ollama"),
+            format!("{prefix}-ollama")
+        );
+        // Distinct wire formats must never collapse into one account.
+        assert_ne!(
+            codingplan_group_account_id("openai"),
+            codingplan_group_account_id("claude")
+        );
     }
 
     // `codingplan_prefixes` caches the configured prefix once per process, so
@@ -1073,6 +1140,7 @@ fn project_legacy_model(account_id: &str, p: &ProviderConfig) -> ModelProfileCon
         model: p.model.clone(),
         display_name: None,
         system_prompt: p.system_prompt.clone(),
+        supports_vision: p.supports_vision,
         context_window: p.context_window,
         max_tokens: p.max_tokens,
         capable_model: p.capable_model,
@@ -1082,7 +1150,6 @@ fn project_legacy_model(account_id: &str, p: &ProviderConfig) -> ModelProfileCon
         reasoning_effort: p.reasoning_effort.clone(),
         thinking_enabled: p.thinking_enabled,
         thinking_budget: p.thinking_budget,
-        pricing: p.pricing,
     }
 }
 
@@ -1150,7 +1217,7 @@ pub struct NetworkConfig {
 /// in their config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LspConfig {
-    /// Master switch for LSP diagnostics. Off by default — opt-in only.
+    /// Master switch for read-only LSP code intelligence. Off by default — opt-in only.
     #[serde(default)]
     pub enabled: bool,
     /// Automatically detect and start language servers from the built-in
@@ -1537,6 +1604,9 @@ impl Config {
     /// for seeds and writes. Interactive startup uses the diagnostics so one
     /// malformed `[providers.<name>]` table cannot silently disappear.
     pub fn load_with_diagnostics(path: &Path) -> Result<(Self, Vec<String>)> {
+        // Pricing support was retired after v5.0.6. Clean only those known
+        // legacy tables; keep startup readable when the file is read-only.
+        let _ = crate::store::ConfigStore::new(path).remove_legacy_pricing();
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config: {}", path.display()))?;
         Self::parse_disk_content_tolerant(&content, path)
@@ -1680,16 +1750,23 @@ impl Config {
 
     /// Resolve the atomcode config dir. Pure function for testability —
     /// `config_dir()` is a thin wrapper that injects real env + real home.
-    fn resolve_config_dir(env_atomcode_home: Option<String>, home: Option<PathBuf>) -> PathBuf {
+    ///
+    /// `pub(crate)` so [`crate::distribution`] can assert that what
+    /// `bootstrap_home` materialises is byte-identical to this fallback.
+    pub(crate) fn resolve_config_dir(
+        env_atomcode_home: Option<String>,
+        home: Option<PathBuf>,
+    ) -> PathBuf {
         if let Some(p) = env_atomcode_home {
             return PathBuf::from(p);
         }
-        home.unwrap_or_else(|| PathBuf::from(".")).join(".atomcode")
+        home.unwrap_or_else(|| PathBuf::from("."))
+            .join(crate::distribution::HOME_DIR_NAME)
     }
 
     pub fn config_dir() -> PathBuf {
         Self::resolve_config_dir(
-            std::env::var("ATOMCODE_HOME")
+            std::env::var(crate::distribution::HOME_ENV)
                 .ok()
                 .filter(|s| !s.is_empty()),
             crate::util::real_home_dir(),
@@ -1921,6 +1998,43 @@ api_key = "keep-me-secret"
     }
 
     #[test]
+    fn legacy_pricing_fields_are_ignored_and_removed_on_save() {
+        let source = r#"
+default_provider = "legacy"
+
+[providers.legacy]
+type = "openai"
+model = "legacy-model"
+
+[providers.legacy.pricing]
+input_per_million = 1.0
+output_per_million = 2.0
+cached_input_per_million = 0.5
+
+[provider_accounts.account]
+provider = "openai"
+
+[models.profile]
+account = "account"
+model = "profile-model"
+
+[models.profile.pricing]
+input_per_million = 3.0
+output_per_million = 4.0
+cached_input_per_million = 1.0
+"#;
+
+        let config = Config::parse_disk_content(source, Path::new("legacy.toml")).unwrap();
+        assert_eq!(config.providers["legacy"].model, "legacy-model");
+        assert_eq!(config.models["profile"].model, "profile-model");
+
+        let rendered = config.serialize_for_disk(None).unwrap();
+        assert!(!rendered.contains("pricing"));
+        assert!(!rendered.contains("per_million"));
+        Config::parse_disk_content(&rendered, Path::new("saved.toml")).unwrap();
+    }
+
+    #[test]
     fn serialize_round_trip_survives_multiple_non_table_providers() {
         // Two providers written as inline scalars (`providers.Foo = "..."`) both
         // fail validation. Emitting them one-per-`to_string_pretty` call produced
@@ -2039,9 +2153,9 @@ model = "missing-type"
     }
 
     #[test]
-    fn auto_copy_on_select_defaults_per_platform() {
-        let ui = UiConfig::default();
-        assert_eq!(ui.auto_copy_on_select, !cfg!(windows));
+    fn legacy_auto_copy_on_select_is_ignored() {
+        let ui: UiConfig = toml::from_str("auto_copy_on_select = true").unwrap();
+        assert!(!ui.auto_copy_code_blocks);
     }
 
     #[test]
@@ -2060,6 +2174,18 @@ model = "missing-type"
         assert!(UiConfig::default().terminal_status_glyph);
         let ui: UiConfig = toml::from_str("").unwrap();
         assert!(ui.terminal_status_glyph, "missing key → default on");
+    }
+
+    #[test]
+    fn history_replay_row_cap_is_optional_and_zero_is_preserved() {
+        assert_eq!(UiConfig::default().history_replay_max_rows, None);
+        assert!(UiConfig::default().truncate_resumed_history);
+        let capped: UiConfig = toml::from_str("history_replay_max_rows = 1234").unwrap();
+        assert_eq!(capped.history_replay_max_rows, Some(1234));
+        assert!(capped.truncate_resumed_history);
+        let unlimited: UiConfig = toml::from_str("history_replay_max_rows = 0").unwrap();
+        assert_eq!(unlimited.history_replay_max_rows, Some(0));
+        assert!(unlimited.truncate_resumed_history);
     }
 
     #[test]
@@ -2409,6 +2535,7 @@ model = "missing-type"
                 model: "m".to_string(),
                 base_url: None,
                 system_prompt: None,
+                supports_vision: None,
                 user_agent: None,
                 context_window: 16000,
                 max_tokens: None,
@@ -2421,7 +2548,6 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
-                pricing: None,
             },
         );
         cfg.save(&tmp).unwrap();
@@ -2625,6 +2751,7 @@ model = "missing-type"
                 model: "m".to_string(),
                 base_url: None,
                 system_prompt: None,
+                supports_vision: None,
                 user_agent: None,
                 context_window: 16000,
                 max_tokens: None,
@@ -2637,7 +2764,6 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
-                pricing: None,
             },
         );
         cfg.save(tmp.path()).unwrap();
@@ -2705,6 +2831,7 @@ model = "missing-type"
                 model: active_model.into(),
                 base_url: Some("http://127.0.0.1/".into()),
                 system_prompt: None,
+                supports_vision: None,
                 user_agent: None,
                 context_window: 8000,
                 max_tokens: None,
@@ -2717,7 +2844,6 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
-                pricing: None,
             },
         );
         Config {
@@ -2732,6 +2858,50 @@ model = "missing-type"
         // Vision-capable main provider — preprocessor irrelevant.
         let cfg = cfg_with("claude-sonnet-4-5", None);
         assert!(cfg.can_handle_attached_images());
+    }
+
+    #[test]
+    fn explicit_vision_override_allows_unknown_custom_model() {
+        let mut cfg = cfg_with("qwen3.8max", None);
+        cfg.providers.get_mut("active").unwrap().supports_vision = Some(true);
+        assert!(cfg.can_handle_attached_images());
+        assert_eq!(
+            cfg.image_attach_support_for_model("qwen3.8max"),
+            ImageAttachSupport::Supported
+        );
+    }
+
+    #[test]
+    fn exact_selection_disambiguates_duplicate_wire_model_vision_overrides() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "account-a/qwen",
+            "provider_accounts": {
+                "account-a": { "provider": "openai", "api_key": "a" },
+                "account-b": { "provider": "openai", "api_key": "b" }
+            },
+            "models": {
+                "account-a/qwen": {
+                    "account": "account-a",
+                    "model": "qwen3.8max",
+                    "supports_vision": false
+                },
+                "account-b/qwen": {
+                    "account": "account-b",
+                    "model": "qwen3.8max",
+                    "supports_vision": true
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            cfg.image_attach_support_for_selection(Some("account-a/qwen"), "qwen3.8max"),
+            ImageAttachSupport::Unconfigured
+        );
+        assert_eq!(
+            cfg.image_attach_support_for_selection(Some("account-b/qwen"), "qwen3.8max"),
+            ImageAttachSupport::Supported
+        );
     }
 
     #[test]
@@ -2794,6 +2964,7 @@ model = "missing-type"
                 model: "Qwen/Qwen3-VL-32B-Instruct".into(),
                 base_url: Some("http://127.0.0.1/".into()),
                 system_prompt: None,
+                supports_vision: None,
                 user_agent: None,
                 context_window: 8000,
                 max_tokens: None,
@@ -2806,7 +2977,6 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
-                pricing: None,
             },
         );
         assert!(cfg.can_handle_attached_images());
@@ -3011,6 +3181,7 @@ capable_model = 5
                 model: "gpt-x".into(),
                 display_name: None,
                 system_prompt: None,
+                supports_vision: None,
                 context_window: 128_000,
                 max_tokens: None,
                 capable_model: None,
@@ -3020,7 +3191,6 @@ capable_model = 5
                 reasoning_effort: None,
                 thinking_enabled: None,
                 thinking_budget: None,
-                pricing: None,
             },
         );
         let rendered = cfg.serialize_for_disk(None).unwrap();
@@ -3059,6 +3229,7 @@ capable_model = 5
                 model: "".into(),                 // empty model → error
                 display_name: None,
                 system_prompt: None,
+                supports_vision: None,
                 context_window: 0, // zero window → error
                 max_tokens: None,
                 capable_model: None,
@@ -3068,7 +3239,6 @@ capable_model = 5
                 reasoning_effort: None,
                 thinking_enabled: None,
                 thinking_budget: None,
-                pricing: None,
             },
         );
         cfg.default_model = Some("nope".into()); // unresolvable default → error
@@ -3110,6 +3280,29 @@ capable_model = 5
 #[cfg(test)]
 mod legacy_projection_tests {
     use super::*;
+
+    struct EnvRestore {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     const LEGACY: &str = r#"
 default_provider = "MyDeepSeek"
@@ -3345,11 +3538,18 @@ context_window = 131072
             }
         }))
         .unwrap();
+        // Keys stay written under the historical prefix on purpose: this also
+        // exercises the path a config predating a prefix change takes. The
+        // account ids they fold into follow the *configured* prefix, so derive
+        // them rather than spelling a vendor name.
+        let openai_account = codingplan_group_account_id("openai");
+        let claude_account = codingplan_group_account_id("claude");
+
         let accounts = cfg.logical_accounts();
         // Two openai CodingPlan models collapse into ONE account; claude gets its
         // own; the user's manual provider is untouched.
-        assert!(accounts.contains_key("AtomGit"));
-        assert!(accounts.contains_key("AtomGit-anthropic"));
+        assert!(accounts.contains_key(openai_account));
+        assert!(accounts.contains_key(claude_account));
         assert!(accounts.contains_key("my-openai"));
         assert!(!accounts.contains_key("AtomGit-GLM-5.2"), "folded away");
         assert!(!accounts.contains_key("AtomGit-Qwen"), "folded away");
@@ -3357,23 +3557,20 @@ context_window = 131072
         let models = cfg.logical_models();
         // Model ids stay = legacy provider keys (default_provider stays resolvable),
         // only the parent account folds.
-        assert_eq!(models["AtomGit-GLM-5.2"].account, "AtomGit");
-        assert_eq!(models["AtomGit-Qwen"].account, "AtomGit");
-        assert_eq!(
-            models["AtomGit-anthropic-claude"].account,
-            "AtomGit-anthropic"
-        );
+        assert_eq!(models["AtomGit-GLM-5.2"].account, openai_account);
+        assert_eq!(models["AtomGit-Qwen"].account, openai_account);
+        assert_eq!(models["AtomGit-anthropic-claude"].account, claude_account);
         assert_eq!(models["my-openai"].account, "my-openai");
 
         // Resolving by the stable legacy id still works and keeps the gateway
         // base_url (so the OAuth request signer still fires).
         let r = cfg.resolve_model(Some("AtomGit-GLM-5.2")).unwrap();
-        assert_eq!(r.account_id, "AtomGit");
+        assert_eq!(r.account_id, openai_account);
         assert_eq!(r.model, "GLM-5.2");
         assert_eq!(r.provider_type, "openai");
         assert!(r.base_url.as_deref().unwrap().contains("atomgit"));
         let c = cfg.resolve_model(Some("AtomGit-anthropic-claude")).unwrap();
-        assert_eq!(c.account_id, "AtomGit-anthropic");
+        assert_eq!(c.account_id, claude_account);
         assert_eq!(c.provider_type, "anthropic");
     }
 
@@ -3400,6 +3597,49 @@ context_window = 131072
         assert_eq!(r.provider_type, "openai");
         // Falls back to the deepseek preset's default endpoint.
         assert_eq!(r.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
+    }
+
+    #[test]
+    fn opencode_resolves_vendor_preset_for_new_and_legacy_schema() {
+        let _env = EnvRestore::set("OPENCODE_API_KEY", "sk-opencode-test");
+        let new_schema = r#"
+default_model = "zen/model"
+
+[provider_accounts.zen]
+provider = "opencode"
+
+[models."zen/model"]
+account = "zen"
+model = "deepseek-v3.2"
+context_window = 131072
+"#;
+        let cfg: Config = toml::from_str(new_schema).unwrap();
+        let resolved = cfg.resolve_model(None).unwrap();
+        assert_eq!(resolved.provider_id, "opencode");
+        assert_eq!(resolved.provider_type, "openai");
+        assert_eq!(resolved.api_key.as_deref(), Some("sk-opencode-test"));
+        assert_eq!(
+            resolved.base_url.as_deref(),
+            Some("https://opencode.ai/zen/v1")
+        );
+
+        let legacy = r#"
+default_provider = "zen"
+
+[providers.zen]
+type = "opencode"
+model = "deepseek-v3.2"
+context_window = 131072
+"#;
+        let cfg: Config = toml::from_str(legacy).unwrap();
+        let resolved = cfg.resolve_model(None).unwrap();
+        assert_eq!(resolved.provider_id, "opencode");
+        assert_eq!(resolved.provider_type, "openai");
+        assert_eq!(resolved.api_key.as_deref(), Some("sk-opencode-test"));
+        assert_eq!(
+            resolved.base_url.as_deref(),
+            Some("https://opencode.ai/zen/v1")
+        );
     }
 
     #[test]

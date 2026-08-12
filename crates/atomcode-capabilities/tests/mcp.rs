@@ -27,6 +27,14 @@ fn test_server_config(name: &str) -> McpServerConfig {
 }
 
 fn test_server_config_with_env(name: &str, env: BTreeMap<String, String>) -> McpServerConfig {
+    test_server_config_with_env_and_timeout(name, env, 5_000)
+}
+
+fn test_server_config_with_env_and_timeout(
+    name: &str,
+    env: BTreeMap<String, String>,
+    timeout_ms: u64,
+) -> McpServerConfig {
     McpServerConfig {
         name: name.to_string(),
         source: McpConfigSource::Project,
@@ -35,7 +43,7 @@ fn test_server_config_with_env(name: &str, env: BTreeMap<String, String>) -> Mcp
             command: env!("CARGO_BIN_EXE_mcp-test-server").to_string(),
             args: vec![],
             env,
-            timeout_ms: Some(5_000),
+            timeout_ms: Some(timeout_ms),
         },
         trust: false,
         auto_approve: vec![],
@@ -144,6 +152,96 @@ async fn stdio_reconnects_once_after_server_exit_for_concurrent_calls() {
 }
 
 #[tokio::test]
+async fn stdio_timeout_uses_one_deadline_without_replaying_tool() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = temp.path().join("tool-call-count");
+    let spawns = temp.path().join("spawn-count");
+    let reconnect_delay = temp.path().join("delay-reconnect-initialize");
+    let env = BTreeMap::from([
+        ("MCP_TEST_READ_DELAY_MS".to_string(), "350".to_string()),
+        (
+            "MCP_TEST_TOOL_RESPONSE_DELAY_MS".to_string(),
+            "350".to_string(),
+        ),
+        (
+            "MCP_TEST_TOOL_CALL_COUNTER".to_string(),
+            calls.display().to_string(),
+        ),
+        (
+            "MCP_TEST_SPAWN_COUNTER".to_string(),
+            spawns.display().to_string(),
+        ),
+        (
+            "MCP_TEST_INITIALIZE_DELAY_MARKER".to_string(),
+            reconnect_delay.display().to_string(),
+        ),
+        (
+            "MCP_TEST_INITIALIZE_DELAY_MS".to_string(),
+            "300".to_string(),
+        ),
+    ]);
+    let registry = McpRegistry::new();
+    registry
+        .add_server(test_server_config_with_env_and_timeout(
+            "shared-deadline",
+            env,
+            500,
+        ))
+        .await
+        .expect("stdio MCP server should connect");
+    std::fs::write(&reconnect_delay, "delay replacement only").unwrap();
+
+    let message = "x".repeat(4 * 1024 * 1024);
+    let started = tokio::time::Instant::now();
+    let result = registry
+        .call_tool(
+            "shared-deadline",
+            "echo",
+            serde_json::json!({ "message": message }),
+        )
+        .await;
+    let elapsed = started.elapsed();
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("write and response delays must share one deadline"),
+    };
+
+    assert!(
+        error.to_string().contains("result is unknown"),
+        "timed out tool result must stay unknown: {error:#}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(700),
+        "the foreground tool call must not wait for the delayed reconnect: {elapsed:?}"
+    );
+    assert_eq!(spawn_count(&calls), 1, "the tool must run only once");
+
+    let mut recovered = false;
+    for _ in 0..100 {
+        if registry.server_statuses().await
+            == vec![("shared-deadline".to_string(), ServerStatus::Connected)]
+        {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        recovered,
+        "stdio connection should recover in the background"
+    );
+    assert_eq!(
+        registry
+            .list_tools_for_server("shared-deadline")
+            .await
+            .len(),
+        1,
+        "the recovered process must remain usable after the recovery task exits"
+    );
+    assert_eq!(spawn_count(&spawns), 2, "the client should only reconnect");
+}
+
+#[tokio::test]
 async fn stdio_marks_server_failed_when_retry_connection_also_dies() {
     let temp = tempfile::tempdir().unwrap();
     let counter = temp.path().join("spawn-count");
@@ -221,14 +319,20 @@ async fn concurrent_failures_reconnect_the_generation_that_actually_failed() {
             "sent tool calls must not be replayed: {error:#}"
         );
     }
-    assert_eq!(
-        spawn_count(&counter),
-        3,
+    let mut recovered = false;
+    for _ in 0..100 {
+        if spawn_count(&counter) == 3
+            && registry.server_statuses().await
+                == vec![("two-exits".to_string(), ServerStatus::Connected)]
+        {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        recovered,
         "each distinct failed generation should get one replacement"
-    );
-    assert_eq!(
-        registry.server_statuses().await,
-        vec![("two-exits".to_string(), ServerStatus::Connected)]
     );
 }
 

@@ -86,6 +86,7 @@ class SseParser {
             )
             "tokens" -> ChatEvent.Tokens(json.int("prompt") ?: 0, json.int("completion") ?: 0, json.int("total") ?: 0)
             "warning" -> ChatEvent.Warning(json.string("message").orEmpty())
+            "persistence_warning" -> ChatEvent.PersistenceWarning(json.string("message").orEmpty())
             "done" -> ChatEvent.Done(json.int("tokens") ?: 0, json.int("tool_calls") ?: 0, json.string("session_id"))
             "stopped" -> ChatEvent.Stopped
             "error" -> ChatEvent.Error(json.string("message").orEmpty())

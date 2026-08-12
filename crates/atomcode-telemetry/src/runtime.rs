@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
-use tokio::time::interval;
+use tokio::time::{sleep_until, Instant as TokioInstant};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -422,10 +422,10 @@ impl Telemetry {
     }
 
     /// Signal the sender task to drain mpsc→disk, force-roll the current segment,
-    /// and attempt **one** HTTP send before the process exits. The whole operation
-    /// is bounded by `timeout` (default exit budget is 500ms); if the network call
-    /// outruns the budget the future is cancelled and the segment stays on disk
-    /// for the next process to pick up.
+    /// and drain queued HTTP sends before the process exits. The whole operation
+    /// is bounded by `timeout` (default exit budget is 500ms); if a network call
+    /// outruns the budget it is cancelled and its segment is restored on disk for
+    /// a later process to retry.
     ///
     /// We intentionally do *not* close the mpsc channel: `self.tx` is shared
     /// (`Arc<Telemetry>`), and closing would race with concurrent callers.
@@ -435,8 +435,17 @@ impl Telemetry {
             let _ = tx.send(());
         }
         let handle = self.sender_task.lock().await.take();
-        if let Some(h) = handle {
-            let _ = tokio::time::timeout(timeout, h).await;
+        if let Some(mut handle) = handle {
+            if tokio::time::timeout(timeout, &mut handle).await.is_err() {
+                handle.abort();
+                let _ = handle.await;
+                if let Some(queue) = &self.queue {
+                    let queue = queue.lock().await;
+                    if let Err(error) = queue.restore_claims_for_current_process() {
+                        warn!(?error, "failed to restore cancelled telemetry claim");
+                    }
+                }
+            }
         }
         // Persist final health snapshot regardless of send outcome.
         self.persist_health();
@@ -556,28 +565,18 @@ async fn run_sender(
     queue: Arc<Mutex<Queue>>,
     shutdown: oneshot::Receiver<()>,
 ) {
-    let mut tick = interval(Duration::from_secs(60));
-    tick.tick().await; // consume the immediate first tick
     let mut shutdown = shutdown;
-    loop {
+    let mut retry_attempt = 0u32;
+    let mut next_upload = TokioInstant::now() + Duration::from_secs(60);
+    'sender: loop {
         tokio::select! {
             biased;
             _ = &mut shutdown => {
-                // Pull anything still sitting in mpsc into the active segment.
-                while let Ok(r) = rx.try_recv() {
-                    let mut q = queue.lock().await;
-                    if let Err(e) = q.append(&r) { warn!(?e, "telemetry append failed"); }
-                }
-                { let mut q = queue.lock().await; let _ = q.force_roll(); }
-                // Drain ALL pending segments (oldest first). flush_one only
-                // dispatches the oldest, so a single call would skip the just-
-                // rolled current segment whenever historical segments are
-                // present. No backoff: caller (Telemetry::shutdown) bounds
-                // total time via tokio::time::timeout on the JoinHandle.
+                persist_pending_records(&mut rx, &queue).await;
                 loop {
                     match rt.flush_one().await {
-                        Ok(None) => break,
                         Ok(Some(_)) => continue,
+                        Ok(None) => break,
                         Err(e) => {
                             warn!(?e, "telemetry shutdown flush failed; remaining segments retained");
                             break;
@@ -593,17 +592,88 @@ async fn run_sender(
                         if let Err(e) = q.append(&r) { warn!(?e, "telemetry append failed"); }
                     }
                     None => {
-                        // channel closed — drain sender once and exit
-                        rt.drain_with_backoff().await;
+                        persist_pending_records(&mut rx, &queue).await;
+                        loop {
+                            match rt.flush_one().await {
+                                Ok(Some(_)) => continue,
+                                Ok(None) => break,
+                                Err(e) => {
+                                    warn!(?e, "telemetry final flush failed; remaining segments retained");
+                                    break;
+                                }
+                            }
+                        }
                         break;
                     }
                 }
             }
-            _ = tick.tick() => {
+            _ = sleep_until(next_upload) => {
                 { let mut q = queue.lock().await; let _ = q.force_roll(); }
-                rt.drain_with_backoff().await;
+                // Keep shutdown responsive while the HTTP request is in flight.
+                // Cancelling flush_one may leave a claimed `.sending-*` file.
+                // Restore this process's claim before exiting so telemetry can
+                // retry immediately instead of waiting for stale recovery.
+                let result = tokio::select! {
+                    biased;
+                    _ = &mut shutdown => {
+                        persist_pending_records(&mut rx, &queue).await;
+                        let queue = queue.lock().await;
+                        if let Err(error) = queue.restore_claims_for_current_process() {
+                            warn!(?error, "failed to restore cancelled telemetry claim");
+                        }
+                        break 'sender;
+                    }
+                    result = rt.flush_one() => result,
+                };
+                let delay = match result {
+                    Ok(Some(_)) => {
+                        retry_attempt = 0;
+                        Duration::ZERO
+                    }
+                    Ok(None) => {
+                        retry_attempt = 0;
+                        Duration::from_secs(60)
+                    }
+                    // 400/413: flush_one already dropped the unsendable segment;
+                    // advance to the next one immediately.
+                    Err(
+                        crate::sender::http::SendError::BadRequest
+                        | crate::sender::http::SendError::PayloadTooLarge,
+                    ) => {
+                        retry_attempt = 0;
+                        Duration::ZERO
+                    }
+                    Err(crate::sender::http::SendError::Unauthorized) => {
+                        warn!("telemetry unauthorized — holding for 1h");
+                        retry_attempt = 0;
+                        Duration::from_secs(3600)
+                    }
+                    Err(crate::sender::http::SendError::RateLimited(Some(delay))) => {
+                        retry_attempt = retry_attempt.saturating_add(1);
+                        delay
+                    }
+                    Err(e) => {
+                        let delay = SenderRuntime::backoff(retry_attempt);
+                        retry_attempt = retry_attempt.saturating_add(1);
+                        warn!(?e, ?delay, "telemetry send failed; retry scheduled");
+                        delay
+                    }
+                };
+                next_upload = TokioInstant::now() + delay;
             }
         }
+    }
+}
+
+async fn persist_pending_records(rx: &mut mpsc::Receiver<Record>, queue: &Arc<Mutex<Queue>>) {
+    let mut q = queue.lock().await;
+    while let Ok(record) = rx.try_recv() {
+        if let Err(e) = q.append(&record) {
+            warn!(?e, "telemetry append failed during shutdown");
+        }
+    }
+    if let Err(e) = q.force_roll() {
+        warn!(?e, "telemetry roll failed during shutdown");
     }
 }
 

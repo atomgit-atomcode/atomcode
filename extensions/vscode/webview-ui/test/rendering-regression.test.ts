@@ -922,6 +922,107 @@ function testMissingUserImagePlaceholderHasStableThumbnailSizing() {
   assert.match(css, /\.user-message-image-placeholder\s*\{[^}]*height:\s*120px;/s);
 }
 
+const previewImages = [
+  { media_type: 'image/png', data: 'AAAA' },
+  { media_type: 'image/jpeg', data: 'BBBB' },
+];
+
+function testImagePreviewOpenSetsIndexAndImages() {
+  const state = chatReducer(initialState, {
+    type: 'OPEN_IMAGE_PREVIEW',
+    images: previewImages,
+    index: 1,
+  });
+
+  assert.deepEqual(state.imagePreview, { images: previewImages, index: 1 });
+}
+
+function testImagePreviewCloseClearsState() {
+  const opened = chatReducer(initialState, {
+    type: 'OPEN_IMAGE_PREVIEW',
+    images: previewImages,
+    index: 0,
+  });
+  const closed = chatReducer(opened, { type: 'CLOSE_IMAGE_PREVIEW' });
+
+  assert.equal(closed.imagePreview, null);
+}
+
+function testImagePreviewNextWrapsToFirst() {
+  const opened = chatReducer(initialState, {
+    type: 'OPEN_IMAGE_PREVIEW',
+    images: previewImages,
+    index: 1,
+  });
+  const next = chatReducer(opened, { type: 'IMAGE_PREVIEW_NEXT' });
+
+  assert.equal(next.imagePreview?.index, 0);
+}
+
+function testImagePreviewPrevWrapsToLast() {
+  const opened = chatReducer(initialState, {
+    type: 'OPEN_IMAGE_PREVIEW',
+    images: previewImages,
+    index: 0,
+  });
+  const prev = chatReducer(opened, { type: 'IMAGE_PREVIEW_PREV' });
+
+  assert.equal(prev.imagePreview?.index, 1);
+}
+
+function testImagePreviewNavigationIsNoopForSingleImage() {
+  const opened = chatReducer(initialState, {
+    type: 'OPEN_IMAGE_PREVIEW',
+    images: [previewImages[0]],
+    index: 0,
+  });
+  const next = chatReducer(opened, { type: 'IMAGE_PREVIEW_NEXT' });
+  const prev = chatReducer(next, { type: 'IMAGE_PREVIEW_PREV' });
+
+  assert.equal(next.imagePreview?.index, 0);
+  assert.equal(prev.imagePreview?.index, 0);
+}
+
+function testImagePreviewNavigationIsNoopWhenClosed() {
+  const next = chatReducer(initialState, { type: 'IMAGE_PREVIEW_NEXT' });
+  const prev = chatReducer(initialState, { type: 'IMAGE_PREVIEW_PREV' });
+
+  assert.equal(next.imagePreview, null);
+  assert.equal(prev.imagePreview, null);
+}
+
+function testUserMessageImageIsClickableForPreview() {
+  const messagesCss = readFileSync(join(process.cwd(), 'webview-ui/src/styles/messages.css'), 'utf8');
+  const componentsCss = readFileSync(join(process.cwd(), 'webview-ui/src/styles/components.css'), 'utf8');
+
+  assert.match(messagesCss, /\.user-message-image\s*\{[^}]*cursor:\s*zoom-in;/s);
+  assert.match(componentsCss, /\.image-lightbox\s*\{[^}]*z-index:\s*200;/s);
+  assert.match(componentsCss, /\.image-lightbox-stage\s*\{/);
+}
+
+function testUserMessageImagePreviewFiltersMissingImagesAndRecomputesIndex() {
+  // Mixed [present, missing, present] — the lightbox must only navigate over
+  // renderable entries, so NEXT/PREV never lands on the missing slot and
+  // auto-closes the preview. Verified at the source level since reducer tests
+  // can't exercise the UserMessage-side filtering.
+  const source = readFileSync(join(process.cwd(), 'webview-ui/src/components/UserMessage.tsx'), 'utf8');
+
+  // The OPEN dispatch filters to renderable images before computing the index.
+  assert.match(source, /const renderable = \(message\.images \?\? \[\]\)\.filter\(/);
+  assert.match(source, /\(i\) => !i\.missing && i\.data,/);
+  assert.match(source, /images: renderable,/);
+  assert.match(source, /index: clicked,/);
+}
+
+function testUserMessageImagePreviewUsesSharedImageDataUrlHelper() {
+  const source = readFileSync(join(process.cwd(), 'webview-ui/src/components/UserMessage.tsx'), 'utf8');
+
+  assert.match(source, /import \{ imageDataUrl \} from '\.\.\/utils\/format';/);
+  // The inline data: URL template must be gone — the shared helper is used instead.
+  assert.doesNotMatch(source, /src=\{\`data:\$\{img\.media_type\};base64,/);
+  assert.match(source, /src=\{imageDataUrl\(img\)\}/);
+}
+
 function testPermissionCardStaysVisibleWhileDecisionIsSubmitting() {
   const source = readFileSync(join(process.cwd(), 'webview-ui/src/components/AssistantMessage.tsx'), 'utf8');
 
@@ -1172,6 +1273,15 @@ testUserPlainTextCssPreservesLiteralInput();
 testInlineArtifactCodeKeepsCodeBlockBorder();
 testPreCodeDoesNotUseInlineCodePillStyling();
 testMissingUserImagePlaceholderHasStableThumbnailSizing();
+testImagePreviewOpenSetsIndexAndImages();
+testImagePreviewCloseClearsState();
+testImagePreviewNextWrapsToFirst();
+testImagePreviewPrevWrapsToLast();
+testImagePreviewNavigationIsNoopForSingleImage();
+testImagePreviewNavigationIsNoopWhenClosed();
+testUserMessageImageIsClickableForPreview();
+testUserMessageImagePreviewFiltersMissingImagesAndRecomputesIndex();
+testUserMessageImagePreviewUsesSharedImageDataUrlHelper();
 testPermissionCardStaysVisibleWhileDecisionIsSubmitting();
 testPermissionCardOffersPersistentDecisionOptions();
 testStreamingMarkdownRepairsUnclosedCodeFence();

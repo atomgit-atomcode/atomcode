@@ -17,7 +17,7 @@ atomcode-config = { path = "../atomcode-config" }
 # with web/skills/mcp/session/memory wired (the leaner features exist for other
 # embedders, not for this crate).
 atomcode-capabilities = { path = "../atomcode-capabilities", features = [
-    "provider", "tools", "web", "codeintel", "skills", "mcp", "session", "memory",
+    "provider", "tools", "web", "codeintel", "lsp", "skills", "mcp", "session", "memory",
     # CC-compatible external hooks (hooks.json): production parity with the legacy
     # core engine, which always ran them. Zero overhead when no hooks.json exists
     # (prepare skips registration — see CCExternalHooks::is_empty).

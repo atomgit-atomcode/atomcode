@@ -59,10 +59,13 @@ impl SenderRuntime {
 
         match self.http.send_segment(&seg, dropped).await {
             Ok(()) => {}
-            Err(SendError::BadRequest) => {
+            // 400 and 413 are permanent client errors: retrying the identical body
+            // will always fail, so drop the claimed segment instead of restoring it
+            // (a restored segment would block the oldest-first queue forever).
+            Err(e @ (SendError::BadRequest | SendError::PayloadTooLarge)) => {
                 let q = self.queue.lock().await;
                 q.complete_claim(&seg).map_err(|_| SendError::Other)?;
-                return Err(SendError::BadRequest);
+                return Err(e);
             }
             Err(e) => {
                 let q = self.queue.lock().await;
@@ -125,9 +128,10 @@ impl SenderRuntime {
                     sleep(Duration::from_secs(3600)).await;
                     attempt = 0;
                 }
-                Err(SendError::BadRequest) => {
-                    // Corrupt segment was already claimed and deleted by flush_one.
-                    warn!("telemetry 400 — dropped claimed segment");
+                Err(SendError::BadRequest | SendError::PayloadTooLarge) => {
+                    // Unsendable segment (400/413) was already claimed and deleted
+                    // by flush_one.
+                    warn!("telemetry 4xx — dropped unsendable claimed segment");
                     attempt = 0;
                 }
                 Err(SendError::RateLimited(Some(d))) => {

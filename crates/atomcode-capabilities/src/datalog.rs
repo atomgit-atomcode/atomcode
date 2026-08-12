@@ -588,6 +588,88 @@ mod tests {
         assert_ne!(first.file_name(), second.file_name());
     }
 
+    /// `DatalogConfig::default` materializes a literal into config.toml and
+    /// [`DatalogHook::resolve_log_dir`] special-cases that same literal back to
+    /// "unset". They are one contract, but they live in two crates with nothing
+    /// linking them except a copied string.
+    ///
+    /// Reword either side and the default silently demotes to an ordinary `~/…`
+    /// path: it stops following `$ATOMCODE_HOME` and every datalog moves to
+    /// `$HOME/.atomcode/datalog`. No error, no failing test, and config.toml
+    /// still reads exactly the same — which is why this needs pinning.
+    #[test]
+    fn the_materialized_default_resolves_the_same_as_an_unset_dir() {
+        let materialized = DatalogConfig::default().dir;
+        assert!(
+            materialized.is_some(),
+            "the default is materialized into config.toml on first save; if that \
+             stopped, this contract and its comment in `resolve_log_dir` are stale"
+        );
+
+        let working_dir = Path::new("/work/foo");
+        assert_eq!(
+            DatalogHook::resolve_log_dir(working_dir, materialized.as_deref()),
+            DatalogHook::resolve_log_dir(working_dir, None),
+            "the string written to config.toml ({:?}) is no longer the one \
+             `resolve_log_dir` treats as the default — the two crates have drifted",
+            materialized
+        );
+    }
+
+    /// The default root is `$ATOMCODE_HOME`-relative, not `$HOME`-relative.
+    /// The harness `#[ctor]` points `$ATOMCODE_HOME` at a temp dir for the whole
+    /// binary, so this asserts against a location that is provably not the
+    /// built-in `~/.atomcode` — the case the `resolve_log_dir` special-case
+    /// exists for.
+    #[test]
+    fn the_default_root_follows_atomcode_home() {
+        let configured = Config::config_dir();
+        assert!(
+            !configured.ends_with(".atomcode"),
+            "precondition: the harness must have moved the config dir off the \
+             default, else this test cannot tell the two roots apart — got {}",
+            configured.display()
+        );
+
+        let resolved = DatalogHook::resolve_log_dir(
+            Path::new("/work/foo"),
+            DatalogConfig::default().dir.as_deref(),
+        );
+        assert!(
+            resolved.starts_with(configured.join("datalog")),
+            "datalogs must land under $ATOMCODE_HOME, got {}",
+            resolved.display()
+        );
+        // The project slug is still appended, so two projects never share a bucket.
+        assert_ne!(resolved, configured.join("datalog"));
+    }
+
+    /// The special case is exact-match on purpose: any OTHER `~/…` value is a
+    /// user-authored path and must expand against the real home, not the config
+    /// dir. This is also what makes the default's spelling load-bearing — a
+    /// stray space or trailing slash falls through to this arm.
+    #[test]
+    fn other_tilde_paths_are_not_the_default() {
+        let Some(home) = atomcode_config::util::real_home_dir() else {
+            return; // no resolvable home on this box; nothing to compare against
+        };
+        let resolved = DatalogHook::resolve_log_dir(Path::new("/work/foo"), Some("~/elsewhere"));
+        assert!(
+            resolved.starts_with(home.join("elsewhere")),
+            "an explicit `~/…` must expand against $HOME, got {}",
+            resolved.display()
+        );
+
+        // Same string as the default but with a trailing space: NOT the sentinel.
+        let sloppy =
+            DatalogHook::resolve_log_dir(Path::new("/work/foo"), Some("~/.atomcode/datalog "));
+        assert!(
+            sloppy.starts_with(home.join(".atomcode")),
+            "only the exact literal is the sentinel, got {}",
+            sloppy.display()
+        );
+    }
+
     #[tokio::test]
     async fn writes_markdown_and_one_jsonl_record_per_round() {
         let root = tempdir().unwrap();

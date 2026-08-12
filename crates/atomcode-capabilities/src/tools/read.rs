@@ -10,8 +10,17 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
 
-/// Refuse a full (un-sliced) read above this size; the model must slice instead.
-const MAX_FULL_BYTES: u64 = 5 * 1024 * 1024;
+/// Hard safety ceiling for the current in-memory decoder. Default pagination
+/// controls model-visible output, but decoding still needs the complete file for
+/// UTF-8/GB18030 detection and codeintel. Refuse pathological inputs uniformly,
+/// including callers that supplied an offset/limit.
+const MAX_IN_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
+/// Default page size when the caller omits `limit`. This is large enough to give
+/// the model useful context while still encouraging deliberate continuation.
+const DEFAULT_READ_LIMIT: usize = 300;
+/// Keep the complete read result (body plus continuation) below the generic
+/// 16 KiB artifact threshold so `read_file` retains line-based pagination.
+const MAX_READ_OUTPUT_BYTES: usize = 10 * 1024;
 /// Per-line display cap (very long minified lines are truncated with a marker).
 const MAX_LINE_LEN: usize = 2000;
 /// Above this line count, an un-sliced read of a CODE file returns a symbol skeleton
@@ -32,6 +41,37 @@ pub struct ReadFileTool {
 impl ReadFileTool {
     pub fn new(vision: bool) -> Self {
         Self { vision }
+    }
+}
+
+fn continuation_footer(
+    file_path: &str,
+    start: usize,
+    end: usize,
+    total: usize,
+    page_limit: usize,
+) -> String {
+    let continuation = json!({
+        "file_path": file_path,
+        "limit": page_limit,
+        "offset": end + 1,
+    });
+    let detailed = format!(
+        "[Showing lines {start}-{end} of {total}. Continue with read_file({continuation})]"
+    );
+    // Reserve enough room for the one line we always return, even when it is a
+    // maximum-length four-byte UTF-8 line. This keeps the total budget real,
+    // rather than only bounding the body in ordinary short-path cases.
+    let detailed_footer_budget = MAX_READ_OUTPUT_BYTES
+        .saturating_sub(MAX_LINE_LEN.saturating_mul(4))
+        .saturating_sub(128);
+    if detailed.len() <= detailed_footer_budget {
+        detailed
+    } else {
+        format!(
+            "[Showing lines {start}-{end} of {total}. Continue reading the same file with offset={} and limit={page_limit}.]",
+            end + 1
+        )
     }
 }
 
@@ -132,17 +172,29 @@ impl Tool for ReadFileTool {
     }
     fn description(&self) -> &str {
         "Read a file from the filesystem. Returns the contents prefixed with 1-based \
-         line numbers (`<n>\\t<content>`). For a large file, read a slice with `offset` \
-         (1-based start line) and `limit` (max lines). If the path is a directory its \
-         entries are listed instead. Relative paths resolve against the working directory."
+         line numbers (`<n>\\t<content>`). By default returns up to 300 lines; an output \
+         budget may return fewer. When a result shows a continuation offset, continue from \
+         that offset instead of rereading line 1. Use `offset` (1-based start line) and \
+         `limit` (max lines) when a larger relevant window is needed; avoid many tiny \
+         overlapping reads. If the path is a directory its entries are listed instead. \
+         Relative paths resolve against the working directory."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
                 "file_path": { "type": "string", "description": "Path to read (absolute, or relative to the working directory)" },
-                "offset": { "type": "integer", "description": "Start line, 1-based. Omit to read from the beginning." },
-                "limit": { "type": "integer", "description": "Max number of lines to read. Omit to read to the end." }
+                "offset": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Start line, 1-based. Omit to start at line 1; after a partial result, use the next offset shown."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": DEFAULT_READ_LIMIT,
+                    "description": "Maximum lines to read. Defaults to 300; the output byte budget may return fewer."
+                }
             },
             "required": ["file_path"]
         })
@@ -162,6 +214,9 @@ impl Tool for ReadFileTool {
                 ))
             }
         };
+        if a.limit == Some(0) {
+            return err("read_file: `limit` must be at least 1.");
+        }
         let path = resolve_path(&a.file_path, &ctx.working_dir);
 
         let meta = match tokio::fs::metadata(&path).await {
@@ -193,14 +248,14 @@ impl Tool for ReadFileTool {
             ));
         }
 
-        if a.offset.is_none() && a.limit.is_none() && meta.len() > MAX_FULL_BYTES {
+        if meta.len() > MAX_IN_MEMORY_BYTES {
             return err(format!(
-                "File too large to read in full: {} bytes ({:.1} MB). Read a slice with \
-                 offset/limit (e.g. read_file({{\"file_path\":\"{}\",\"offset\":1,\"limit\":200}})), \
-                 or use bash (wc -l / sed -n).",
+                "File too large for read_file's in-memory decoder: {} bytes ({:.1} MB; \
+                 limit is {:.0} MB). Use grep/list_symbols to locate relevant content, or \
+                 bash (sed -n / rg) to read a bounded range.",
                 meta.len(),
                 meta.len() as f64 / 1_048_576.0,
-                a.file_path
+                MAX_IN_MEMORY_BYTES as f64 / 1_048_576.0,
             ));
         }
 
@@ -259,8 +314,10 @@ impl Tool for ReadFileTool {
                 }
             },
         };
-        let lines: Vec<&str> = text.lines().collect();
-        let total = lines.len();
+        // Count and page with iterators instead of collecting `Vec<&str>`: a file
+        // containing millions of tiny lines would otherwise spend far more memory
+        // on line pointers than on the bounded source bytes themselves.
+        let total = text.lines().count();
 
         // codeintel enrichment: outline a large CODE file as a symbol skeleton instead of
         // dumping it (cross-capability composition; only when codeintel is compiled in).
@@ -279,30 +336,60 @@ impl Tool for ReadFileTool {
                 "[no lines in requested range (start={start}, total={total})]"
             ));
         }
-        let end_idx = match a.limit {
-            Some(l) => start_idx.saturating_add(l).min(total),
-            None => total,
-        };
+        let page_limit = a.limit.unwrap_or(DEFAULT_READ_LIMIT);
+        let requested_end_idx = start_idx.saturating_add(page_limit).min(total);
 
         let mut out = String::new();
-        for (i, line) in lines[start_idx..end_idx].iter().enumerate() {
+        let mut end_idx = start_idx;
+        for (i, line) in text
+            .lines()
+            .skip(start_idx)
+            .take(requested_end_idx - start_idx)
+            .enumerate()
+        {
             let n = start + i;
-            if line.chars().count() > MAX_LINE_LEN {
+            let rendered = if line.chars().count() > MAX_LINE_LEN {
                 let head: String = line.chars().take(MAX_LINE_LEN).collect();
-                out.push_str(&format!(
-                    "{n}\t{head}... (line truncated to {MAX_LINE_LEN} chars)\n"
-                ));
+                format!("{n}\t{head}... (line truncated to {MAX_LINE_LEN} chars)\n")
             } else {
-                out.push_str(&format!("{n}\t{line}\n"));
+                format!("{n}\t{line}\n")
+            };
+            let candidate_end = start_idx + i + 1;
+            let footer_len = if candidate_end < total {
+                continuation_footer(&a.file_path, start, candidate_end, total, page_limit).len()
+            } else if start > 1 {
+                format!("[Showing lines {start}-{candidate_end} of {total} (end)]").len()
+            } else {
+                0
+            };
+            if !out.is_empty()
+                && out
+                    .len()
+                    .saturating_add(rendered.len())
+                    .saturating_add(footer_len)
+                    > MAX_READ_OUTPUT_BYTES
+            {
+                break;
             }
+            out.push_str(&rendered);
+            end_idx = candidate_end;
         }
-        if start > 1 || end_idx < total {
-            out.push_str(&format!("[Showing lines {start}-{end_idx} of {total}]"));
+        if end_idx < total {
+            out.push_str(&continuation_footer(
+                &a.file_path,
+                start,
+                end_idx,
+                total,
+                page_limit,
+            ));
+        } else if start > 1 {
+            out.push_str(&format!(
+                "[Showing lines {start}-{end_idx} of {total} (end)]"
+            ));
         }
         ok(out)
     }
 }
-
 
 /// Build a recovery hint for a file that couldn't be decoded as text. Lets the model
 /// pivot to an external converter (pandoc / pdftotext / unzip for .docx) on the first
@@ -539,10 +626,150 @@ mod tests {
         assert!(!r.content.contains("\tl1"), "{}", r.content);
         assert!(!r.content.contains("\tl4"), "{}", r.content);
         assert!(
-            r.content.contains("[Showing lines 2-3 of 5]"),
+            r.content.contains(
+                r#"[Showing lines 2-3 of 5. Continue with read_file({"file_path":"a.txt","limit":2,"offset":4})]"#
+            ),
             "{}",
             r.content
         );
+    }
+
+    #[tokio::test]
+    async fn omitted_limit_uses_a_bounded_page_with_an_actionable_continuation() {
+        let d = tempfile::tempdir().unwrap();
+        let text = (1..=305)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(d.path().join("notes.txt"), text).unwrap();
+
+        let r = ReadFileTool::default()
+            .execute(r#"{"file_path":"notes.txt"}"#, &ctx(d.path()))
+            .await;
+
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("300\tline 300"), "{}", r.content);
+        assert!(!r.content.contains("301\tline 301"), "{}", r.content);
+        assert!(
+            r.content.contains(
+                r#"Continue with read_file({"file_path":"notes.txt","limit":300,"offset":301})"#
+            ),
+            "{}",
+            r.content
+        );
+    }
+
+    #[tokio::test]
+    async fn read_page_stays_below_the_generic_artifact_threshold() {
+        let d = tempfile::tempdir().unwrap();
+        let text = (1..=100)
+            .map(|n| format!("line {n} {}", "x".repeat(500)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(d.path().join("wide.txt"), text).unwrap();
+
+        let r = ReadFileTool::default()
+            .execute(r#"{"file_path":"wide.txt"}"#, &ctx(d.path()))
+            .await;
+
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            r.content.len() < crate::tools::output_artifact::THRESHOLD_BYTES,
+            "read_file must emit its line continuation before generic artifact truncation: {} bytes",
+            r.content.len()
+        );
+        assert!(
+            r.content.contains("Continue with read_file("),
+            "{}",
+            r.content
+        );
+    }
+
+    #[tokio::test]
+    async fn files_above_the_legacy_five_mib_cutoff_use_default_pagination() {
+        let d = tempfile::tempdir().unwrap();
+        let line = format!("{}\n", "x".repeat(1023));
+        std::fs::write(d.path().join("large.txt"), line.repeat(5 * 1024 + 1)).unwrap();
+
+        let r = ReadFileTool::default()
+            .execute(r#"{"file_path":"large.txt"}"#, &ctx(d.path()))
+            .await;
+
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            r.content.contains("Continue with read_file("),
+            "{}",
+            r.content
+        );
+        assert!(
+            r.content.len() <= MAX_READ_OUTPUT_BYTES,
+            "{} bytes",
+            r.content.len()
+        );
+    }
+
+    #[test]
+    fn oversized_continuation_path_uses_a_compact_footer() {
+        let footer = continuation_footer(&"x".repeat(20_000), 1, 10, 100, 300);
+        assert!(!footer.contains("file_path"), "{footer}");
+        assert!(footer.contains("offset=11"), "{footer}");
+        assert!(footer.len() < MAX_READ_OUTPUT_BYTES, "{}", footer.len());
+    }
+
+    #[tokio::test]
+    async fn hard_in_memory_ceiling_applies_even_to_explicit_slices() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("huge.txt");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_IN_MEMORY_BYTES + 1).unwrap();
+
+        let r = ReadFileTool::default()
+            .execute(
+                r#"{"file_path":"huge.txt","offset":1,"limit":1}"#,
+                &ctx(d.path()),
+            )
+            .await;
+
+        assert!(r.is_error);
+        assert!(r.content.contains("in-memory decoder"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn explicit_limit_can_read_beyond_the_default_line_page() {
+        let d = tempfile::tempdir().unwrap();
+        let text = (1..=350)
+            .map(|n| format!("l{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(d.path().join("short-lines.txt"), text).unwrap();
+
+        let r = ReadFileTool::default()
+            .execute(
+                r#"{"file_path":"short-lines.txt","offset":1,"limit":350}"#,
+                &ctx(d.path()),
+            )
+            .await;
+
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("350\tl350"), "{}", r.content);
+        assert!(
+            !r.content.contains("Continue with read_file("),
+            "{}",
+            r.content
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_limit_is_rejected() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("notes.txt"), "hello").unwrap();
+
+        let r = ReadFileTool::default()
+            .execute(r#"{"file_path":"notes.txt","limit":0}"#, &ctx(d.path()))
+            .await;
+
+        assert!(r.is_error);
+        assert!(r.content.contains("must be at least 1"), "{}", r.content);
     }
 
     #[tokio::test]
@@ -743,8 +970,9 @@ mod tests {
 
     #[cfg(feature = "codeintel")]
     #[tokio::test]
-    async fn large_symbolless_code_file_reads_fully() {
-        // a >300-line .rs with NO symbols (only comments) → skeleton() None → full read.
+    async fn large_symbolless_code_file_falls_back_to_a_bounded_page() {
+        // A >300-line .rs with NO symbols (only comments) has no skeleton, so it
+        // falls back to the same bounded page as other text files.
         let d = tempfile::tempdir().unwrap();
         let mut src = String::new();
         for i in 0..400 {
@@ -756,12 +984,18 @@ mod tests {
             .await;
         assert!(!r.content.contains("File skeleton"), "{}", r.content);
         assert!(r.content.contains("comment 0"), "{}", r.content);
+        assert!(!r.content.contains("comment 300"), "{}", r.content);
+        assert!(
+            r.content.contains("Continue with read_file("),
+            "{}",
+            r.content
+        );
     }
 
     #[cfg(feature = "codeintel")]
     #[tokio::test]
-    async fn large_non_code_file_reads_fully() {
-        // .txt has no tree-sitter language → skeleton() returns None → normal full read.
+    async fn large_non_code_file_uses_a_bounded_page() {
+        // .txt has no tree-sitter language, so it uses normal bounded pagination.
         let d = tempfile::tempdir().unwrap();
         let mut src = String::new();
         for i in 0..400 {
@@ -773,6 +1007,12 @@ mod tests {
             .await;
         assert!(!r.content.contains("File skeleton"), "{}", r.content);
         assert!(r.content.contains("line 0"), "{}", r.content);
+        assert!(!r.content.contains("line 300"), "{}", r.content);
+        assert!(
+            r.content.contains("Continue with read_file("),
+            "{}",
+            r.content
+        );
     }
 
     #[tokio::test]

@@ -1017,7 +1017,7 @@ fn build_request_body(
     if let Some(t) = options.temperature {
         body.insert("temperature".into(), json!(t));
     }
-    if supports_tool_choice(model, &cfg.base_url) {
+    if supports_tool_choice(model) {
         match &options.tool_choice {
             ToolChoice::Auto => {} // omit → byte-identical to "no opinion"
             ToolChoice::Required => {
@@ -1065,15 +1065,12 @@ fn build_request_body(
     Value::Object(body)
 }
 
-/// Official DeepSeek V4 thinking endpoints reject the `tool_choice` control
-/// parameter while still accepting tools in auto mode. Keep custom OpenAI-compatible
-/// gateways untouched because they may implement the full OpenAI contract.
-fn supports_tool_choice(model: &str, base_url: &str) -> bool {
-    let model = model.trim().to_ascii_lowercase();
-    let base = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
-    let official_deepseek =
-        base == "https://api.deepseek.com" || base.starts_with("https://api.deepseek.com/");
-    !(official_deepseek && model.starts_with("deepseek-v4"))
+/// DeepSeek V4 thinking models reject the `tool_choice` control parameter while
+/// still accepting tools in auto mode. This is a model protocol constraint, not an
+/// endpoint property: compatible gateways and fallback routes enforce it too.
+fn supports_tool_choice(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase().replace(['_', ' '], "-");
+    !model.contains("deepseek-v4")
 }
 
 /// Whether a model accepts a top-level `reasoning_effort` control. Exposed so a UI
@@ -2199,13 +2196,13 @@ mod tests {
 
     #[test]
     fn specific_tool_choice_uses_openai_function_shape() {
-        let cfg = OpenAiCompatConfig::new("k", "https://x.test", "deepseek-v4-flash");
+        let cfg = OpenAiCompatConfig::new("k", "https://x.test", "glm-5.1");
         let opts = ChatOptions {
             tool_choice: ToolChoice::Specific("todowrite".into()),
             ..Default::default()
         };
         let body = build_request_body(
-            "deepseek-v4-flash",
+            "glm-5.1",
             &[Message::user("hi")],
             &[],
             &opts,
@@ -2238,6 +2235,29 @@ mod tests {
     }
 
     #[test]
+    fn proxied_deepseek_v4_omits_unsupported_tool_choice() {
+        let cfg =
+            OpenAiCompatConfig::new("k", "https://llm-api.atomgit.com/v1", "deepseek-v4-flash");
+        let opts = ChatOptions {
+            reasoning_effort: Some(ReasoningEffort::High),
+            tool_choice: ToolChoice::Specific("todowrite".into()),
+            ..Default::default()
+        };
+        let body = build_request_body(
+            "deepseek-v4-flash",
+            &[Message::user("重构运行时")],
+            &[],
+            &opts,
+            &cfg,
+            ReasoningPolicy::Include,
+        );
+        assert!(
+            body.get("tool_choice").is_none(),
+            "DeepSeek V4 thinking mode rejects forced tool_choice through proxy gateways too"
+        );
+    }
+
+    #[test]
     fn body_options_mapped() {
         let mut cfg = OpenAiCompatConfig::new("k", "https://x", "deepseek-v4-flash");
         cfg.max_tokens = Some(100);
@@ -2261,7 +2281,10 @@ mod tests {
             &cfg,
             ReasoningPolicy::Include,
         );
-        assert_eq!(body["tool_choice"], "required");
+        assert!(
+            body.get("tool_choice").is_none(),
+            "DeepSeek V4 keeps tools available but must not receive forced tool_choice"
+        );
         assert_eq!(body["temperature"], 0.5);
         assert_eq!(body["max_tokens"].as_u64(), Some(100)); // cfg fallback
         assert_eq!(body["reasoning_effort"], "high"); // v4 applicable

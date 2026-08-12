@@ -4,7 +4,7 @@
 //! clone (never stored) — mirrors PlanModeGate / StatusReminderHook.
 
 use async_trait::async_trait;
-use atomcode_capabilities::reminder::system_reminder;
+use atomcode_capabilities::reminder::synthetic_system_reminder;
 use atomcode_capabilities::tools::todo::{
     derive_current_todos, render_todos_numbered, TodoItem, TodoStatus,
 };
@@ -31,19 +31,24 @@ pub struct TodoHook;
 /// round one of a real user turn and only while no structured list exists.
 pub struct TodoEagerHook {
     eagerness: TodoEagerness,
+    /// `auto` keeps ordinary models judgment-based. For DeepSeek (a weak model
+    /// that under-uses soft reminders) a high-confidence feature/refactor request
+    /// upgrades the reminder from the soft tier to the FIRM tier — it no longer
+    /// forces the tool choice (that was unsupported by DeepSeek V4 and regressed
+    /// efficiency on small tasks; only `always` hard-forces).
+    force_complex_for_weak_model: bool,
 }
 
 impl TodoEagerHook {
     pub fn new(model: &str, provider_type: &str, configured: TodoEagerness) -> Self {
         let normalized = model.to_ascii_lowercase().replace(['_', ' '], "-");
+        let is_deepseek_v4_flash = normalized.contains("deepseek")
+            && normalized.contains("v4")
+            && normalized.contains("flash");
+        let mut force_complex_for_weak_model =
+            configured == TodoEagerness::Auto && is_deepseek_v4_flash;
         let mut eagerness = match configured {
-            TodoEagerness::Auto
-                if normalized.contains("deepseek")
-                    && normalized.contains("v4")
-                    && normalized.contains("flash") =>
-            {
-                TodoEagerness::Preferred
-            }
+            TodoEagerness::Auto if is_deepseek_v4_flash => TodoEagerness::Preferred,
             TodoEagerness::Auto => TodoEagerness::Auto,
             other => other,
         };
@@ -53,7 +58,15 @@ impl TodoEagerHook {
             );
             eagerness = TodoEagerness::Preferred;
         }
-        Self { eagerness }
+        // Ollama's adapter cannot express a forced tool choice. Keep the
+        // high-recency reminder, but never promise enforcement the provider drops.
+        if provider_type.eq_ignore_ascii_case("ollama") {
+            force_complex_for_weak_model = false;
+        }
+        Self {
+            eagerness,
+            force_complex_for_weak_model,
+        }
     }
 
     fn should_activate(&self, messages: &[Message], ctx: &TurnCtx) -> bool {
@@ -64,6 +77,131 @@ impl TodoEagerHook {
                 .iter()
                 .all(|todo| todo.status == TodoStatus::Completed)
     }
+
+    /// The explicit `always` policy is the ONLY one that hard-forces the tool
+    /// choice (`todowrite` first). The DeepSeek weak-model path deliberately does
+    /// not: its hard tool_choice was unsupported by DeepSeek V4 and dropped by the
+    /// provider, and forcing a plan on small tasks regressed turns/tokens/wall
+    /// clock for no measured quality gain — so it only firms up the text nudge.
+    fn should_hard_force(&self, messages: &[Message], ctx: &TurnCtx) -> bool {
+        self.should_activate(messages, ctx) && self.eagerness == TodoEagerness::Always
+    }
+}
+
+/// Word-boundary-aware substring test for ASCII signals; plain substring for
+/// non-ASCII ones. Word boundaries only model English morphology — an ASCII
+/// signal like `refactor` must NOT match inside `refactoring`. CJK signals like
+/// `重构` have no such morphology and no whitespace, and bilingual prompts glue
+/// them to ASCII identifiers (`重构UserService`, `迁移到PostgreSQL`), so they keep
+/// the original plain-substring behavior.
+fn contains_word(text: &str, signal: &str) -> bool {
+    if signal.is_empty() {
+        return false;
+    }
+    if !signal.is_ascii() {
+        return text.contains(signal);
+    }
+    let mut search_start = 0;
+    while let Some(offset) = text[search_start..].find(signal) {
+        let start = search_start + offset;
+        let end = start + signal.len();
+        let before_ok = text[..start]
+            .chars()
+            .next_back()
+            .map_or(true, |c| !c.is_ascii_alphanumeric());
+        let after_ok = text[end..]
+            .chars()
+            .next()
+            .map_or(true, |c| !c.is_ascii_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        search_start = end;
+    }
+    false
+}
+
+/// Deliberately narrow lexical gate for the DeepSeek `auto` policy. False
+/// negatives merely fall back to the soft reminder; false positives only upgrade
+/// the reminder to the firm text tier (no forced tool call), so keep only strong
+/// implementation/refactor signals.
+fn high_confidence_complex_engineering_request(messages: &[Message]) -> bool {
+    let Some(text) = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::User && !message.synthetic)
+        .map(|message| message.text.to_ascii_lowercase())
+    else {
+        return false;
+    };
+    let explicitly_read_only = [
+        "do not modify",
+        "don't modify",
+        "without changing",
+        "read-only",
+        "readonly",
+        "explain only",
+        "analysis only",
+        "不要修改",
+        "无需修改",
+        "禁止修改",
+        "只读",
+        "只分析",
+        "仅分析",
+        "只解释",
+        "仅解释",
+    ]
+    .iter()
+    .any(|signal| text.contains(signal));
+    let has_complex_signal = [
+        "architect",
+        "refactor",
+        "migration",
+        "migrate",
+        "redesign",
+        "implement feature",
+        "build feature",
+        "架构",
+        "重构",
+        "迁移",
+        "功能开发",
+        "新增功能",
+        "系统改造",
+    ]
+    .iter()
+    .any(|signal| contains_word(&text, signal));
+    if !has_complex_signal {
+        return false;
+    }
+
+    // A read-only clause may be scoped to only part of a mixed request, for
+    // example "不要修改文档，但请重构代码并补充测试". Do not let that clause
+    // suppress an explicit implementation imperative elsewhere in the same
+    // prompt. Keep this override deliberately narrow so "不要修改代码" does
+    // not become a positive match merely because it contains 修改/代码.
+    let explicit_change_request = [
+        "please architect",
+        "please refactor",
+        "please migrate",
+        "please redesign",
+        "please implement",
+        "please build",
+        "but refactor",
+        "then refactor",
+        "请架构",
+        "请重构",
+        "请迁移",
+        "请实现",
+        "请新增",
+        "请改造",
+        "但请重构",
+        "同时重构",
+        "并重构",
+    ]
+    .iter()
+    .any(|signal| text.contains(signal));
+
+    !explicitly_read_only || explicit_change_request
 }
 
 #[async_trait]
@@ -72,12 +210,20 @@ impl LifecycleHooks for TodoEagerHook {
         if !self.should_activate(messages, ctx) {
             return;
         }
+        // `should_activate` already passed, so branch on the raw policy — no need
+        // to re-derive the current todo list via should_hard_force / a weak-model
+        // helper. The two arms are mutually exclusive: `force_complex_for_weak_model`
+        // is only set for DeepSeek `auto` (remapped to Preferred, never `Always`).
         let lead = if self.eagerness == TodoEagerness::Always {
-            "You MUST call `todowrite` now, before any other tool or prose, to create the task list."
+            "You MUST call `todowrite` now, before any other tool or prose. Create the complete execution plan, not placeholder items: cover investigation, architecture/module design, implementation, and verification where relevant. Each item must name a concrete outcome that a later turn can execute without re-planning."
+        } else if self.force_complex_for_weak_model
+            && high_confidence_complex_engineering_request(messages)
+        {
+            "This request shows strong signals of multi-step engineering work (refactor, migration, feature build, redesign). If it genuinely spans multiple files, phases, or investigation plus changes, call `todowrite` first and lay out a concrete plan — investigation, architecture/module design, implementation, verification — with outcomes a later turn can execute without re-planning. If it is actually a single, self-contained change or purely informational, skip the list and act directly."
         } else {
-            "Before acting, decide whether this task benefits from a todo list. If it has multiple requests, phases, files, dependencies, ambiguity, or requires investigation plus changes, call `todowrite` now. Skip it only for a genuinely simple one-step or purely informational request."
+            "Before acting, decide whether this task benefits from a todo list. If it has multiple requests, phases, files, dependencies, ambiguity, or requires investigation plus changes, call `todowrite` now. A useful plan covers the complete request from investigation and architecture/module design through implementation and verification, with concrete outcomes a later turn can execute without re-planning. Skip it only for a genuinely simple one-step or purely informational request."
         };
-        messages.push(Message::user(system_reminder(lead)));
+        messages.push(synthetic_system_reminder(lead));
     }
 
     async fn pre_request_options(
@@ -86,7 +232,7 @@ impl LifecycleHooks for TodoEagerHook {
         options: &mut ChatOptions,
         ctx: &TurnCtx,
     ) {
-        if self.eagerness == TodoEagerness::Always && self.should_activate(messages, ctx) {
+        if self.should_hard_force(messages, ctx) {
             options.tool_choice = ToolChoice::Specific("todowrite".to_string());
         }
     }
@@ -185,7 +331,7 @@ impl LifecycleHooks for TodoHook {
 {}",
             render_todos_numbered(&todos, false)
         );
-        messages.push(Message::user(system_reminder(&body)));
+        messages.push(synthetic_system_reminder(&body));
     }
 
     /// The model wants to stop. If the task list still has OPEN items (pending or in_progress),
@@ -307,6 +453,7 @@ mod tests {
         assert_eq!(msgs.len(), before + 1, "one reminder appended");
         let last = &msgs[msgs.len() - 1];
         assert_eq!(last.role, Role::User);
+        assert!(last.synthetic, "runtime reminders must carry provenance");
         assert!(last.text.contains("system-reminder"), "{}", last.text);
         assert!(last.text.contains("step one"), "{}", last.text);
     }
@@ -351,6 +498,117 @@ mod tests {
             .pre_request(&mut deepseek, &ctx)
             .await;
         assert_eq!(deepseek.len(), 2, "new DeepSeek generation gets the nudge");
+    }
+
+    #[test]
+    fn contains_word_gates_english_morphology_but_keeps_cjk_substrings() {
+        // English word boundaries: `refactor` must not match inside `refactoring`,
+        // but must match a real imperative.
+        assert!(!contains_word("print the word refactoring", "refactor"));
+        assert!(contains_word("please refactor this", "refactor"));
+        // CJK has no word morphology and no whitespace; bilingual dev prompts glue
+        // a CJK signal to an ASCII identifier. Those must still match as before.
+        assert!(contains_word("请重构userservice模块", "重构"));
+        assert!(contains_word("迁移到postgresql", "迁移"));
+        assert!(contains_word("auth重构", "重构"));
+    }
+
+    #[tokio::test]
+    async fn deepseek_auto_firm_nudges_complex_work_without_forcing_tool_choice() {
+        // B: the weak-model complex path firms up the TEXT nudge but no longer
+        // hard-forces the tool choice — that force was unsupported by DeepSeek V4
+        // and dropped by the provider anyway, and forcing todos on small tasks
+        // regressed efficiency for no measured quality gain. Keep the model's
+        // judgment; only the explicit `always` policy hard-forces.
+        let hook = TodoEagerHook::new("deepseek-v4-flash", "openai", TodoEagerness::Auto);
+        let ctx = TurnCtx {
+            round: 1,
+            ..Default::default()
+        };
+        let messages = vec![Message::user("重构会话运行时并设计清晰的模块边界")];
+        let mut options = ChatOptions::default();
+        hook.pre_request_options(&messages, &mut options, &ctx)
+            .await;
+        assert_eq!(options.tool_choice, ToolChoice::Auto);
+
+        let mut reminder = messages.clone();
+        hook.pre_request(&mut reminder, &ctx).await;
+        assert_eq!(reminder.len(), 2, "a firm plan reminder is still injected");
+        assert!(reminder[1].text.contains("todowrite"));
+        assert!(
+            !reminder[1].text.contains("You MUST"),
+            "firm, not a hard mandate"
+        );
+    }
+
+    #[test]
+    fn high_confidence_gate_ignores_a_complex_word_used_only_as_data() {
+        // 021-style: the task is a simple lifetime fix that merely prints the word
+        // "refactoring". Substring matching wrongly forced a plan; word-boundary
+        // matching must not treat "refactoring" as a refactor request.
+        let messages = vec![Message::user(
+            "fix the lifetime error, then print the longest word (\"refactoring\")",
+        )];
+        assert!(!high_confidence_complex_engineering_request(&messages));
+    }
+
+    #[test]
+    fn high_confidence_gate_matches_a_real_refactor_imperative() {
+        let english = vec![Message::user("please refactor the auth module")];
+        assert!(high_confidence_complex_engineering_request(&english));
+        // Chinese has no word morphology; whole-word gating must not break it.
+        let chinese = vec![Message::user("请重构代码并补充测试")];
+        assert!(high_confidence_complex_engineering_request(&chinese));
+    }
+
+    #[tokio::test]
+    async fn deepseek_auto_keeps_simple_requests_judgment_based() {
+        let hook = TodoEagerHook::new("deepseek-v4-flash", "openai", TodoEagerness::Auto);
+        let ctx = TurnCtx {
+            round: 1,
+            ..Default::default()
+        };
+        let messages = vec![Message::user("解释这行代码")];
+        let mut options = ChatOptions::default();
+        hook.pre_request_options(&messages, &mut options, &ctx)
+            .await;
+        assert_eq!(options.tool_choice, ToolChoice::Auto);
+    }
+
+    #[tokio::test]
+    async fn deepseek_auto_respects_explicit_read_only_request() {
+        let hook = TodoEagerHook::new("deepseek-v4-flash", "openai", TodoEagerness::Auto);
+        let ctx = TurnCtx {
+            round: 1,
+            ..Default::default()
+        };
+        let messages = vec![Message::user("解释一下当前架构，不要修改代码")];
+        let mut options = ChatOptions::default();
+        hook.pre_request_options(&messages, &mut options, &ctx)
+            .await;
+        assert_eq!(options.tool_choice, ToolChoice::Auto);
+    }
+
+    #[tokio::test]
+    async fn deepseek_auto_firm_nudges_mixed_request_with_scoped_read_only_clause() {
+        // The scoped read-only clause must not suppress the complex-work detection
+        // (so the firm reminder still fires), but the weak-model path no longer
+        // hard-forces the tool choice.
+        let hook = TodoEagerHook::new("deepseek-v4-flash", "openai", TodoEagerness::Auto);
+        let ctx = TurnCtx {
+            round: 1,
+            ..Default::default()
+        };
+        let messages = vec![Message::user("不要修改文档，但请重构代码并补充测试")];
+        let mut options = ChatOptions::default();
+        hook.pre_request_options(&messages, &mut options, &ctx)
+            .await;
+        assert_eq!(options.tool_choice, ToolChoice::Auto);
+
+        let mut reminder = messages.clone();
+        hook.pre_request(&mut reminder, &ctx).await;
+        assert_eq!(reminder.len(), 2, "firm reminder fires despite read-only clause");
+        assert!(!reminder[1].text.contains("You MUST"));
     }
 
     #[tokio::test]

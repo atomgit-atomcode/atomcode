@@ -34,6 +34,7 @@ export type SSEEvent =
   | { type: 'warning'; message: string }
   | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
+  | PolicyInterventionEvent
   // Artifact events: the daemon's ArtifactDetector strips fenced code blocks from
   // TextDelta and emits them as separate artifact_start / artifact_content / artifact_end
   // events (see ArtifactDetector in crates/atomcode-daemon/src/lib.rs). Without handling
@@ -408,6 +409,8 @@ export interface ProviderInfo {
   name: string;
   type: string;
   model: string;
+  supports_vision: boolean;
+  supports_vision_override: boolean | null;
   base_url?: string;
   has_api_key: boolean;
   requires_login?: boolean;
@@ -694,6 +697,19 @@ export interface ApprovalModeResponse {
   mode: ApprovalMode;
 }
 
+export type PolicyRecoveryAction =
+  | 'complete_externally'
+  | 'skip_step'
+  | 'view_safe_instructions'
+  | 'end_task';
+
+export interface PolicyInterventionEvent {
+  type: 'policy_intervention';
+  intervention_id: number;
+  code: string;
+  actions: PolicyRecoveryAction[];
+}
+
 export type LiveWireEvent =
   | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; mode: ApprovalMode }
   | { type: 'provider'; provider: string }
@@ -714,6 +730,9 @@ export type LiveWireEvent =
   | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string }
   | { type: 'user_input_request'; request_id: number; header: string; question: string; mode: 'single' | 'multiple' | 'text'; options: { label: string; description?: string }[] }
   | { type: 'user_input_resolved'; request_id: number }
+  | PolicyInterventionEvent
+  | { type: 'policy_intervention_resolved'; intervention_id: number; action: PolicyRecoveryAction }
+  | { type: 'policy_intervention_cleared'; intervention_id: number }
   | { type: 'steered'; count: number; inputs: { text: string; images: ImageData[] }[]; client_input_ids: Array<string | null> }
   | { type: 'session_switched'; session_id: string }
   | { type: 'session_renamed'; session_id: string; name: string }
@@ -757,7 +776,13 @@ export async function postLiveMessage(
   provider?: string,
   sessionId?: string | null,
   clientInputId?: string,
-): Promise<{ disposition: 'started' | 'steered'; generation: number; turn_id: number }> {
+): Promise<{
+  disposition: 'started' | 'steered';
+  generation: number;
+  turn_id: number;
+  provider?: string;
+  providerChangeApplied?: boolean;
+}> {
   const resp = await fetch('/live/message', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
@@ -775,6 +800,8 @@ export async function postLiveMessage(
     disposition?: 'started' | 'steered';
     generation?: number;
     turn_id?: number;
+    provider?: string;
+    provider_change_applied?: boolean;
     error?: string;
   };
   if (!body.accepted) throw new Error(body.error ?? 'live runtime rejected the message');
@@ -795,6 +822,10 @@ export async function postLiveMessage(
     disposition: body.disposition,
     generation: body.generation,
     turn_id: body.turn_id,
+    ...(typeof body.provider === 'string' ? { provider: body.provider } : {}),
+    ...(typeof body.provider_change_applied === 'boolean'
+      ? { providerChangeApplied: body.provider_change_applied }
+      : {}),
   };
 }
 
@@ -996,6 +1027,23 @@ export async function postLiveUserInput(
   const result = await resp.json() as { accepted: boolean; error?: string };
   if (!result.accepted) {
     throw new Error(result.error ?? 'live runtime did not accept the user input answer');
+  }
+  return result;
+}
+
+export async function postLivePolicyInterventionResolution(
+  interventionId: number,
+  action: Exclude<PolicyRecoveryAction, 'view_safe_instructions'>,
+): Promise<{ accepted: boolean }> {
+  const resp = await fetch('/live/policy-intervention', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ intervention_id: interventionId, action }),
+  });
+  if (!resp.ok) throw new Error(`resolve live policy intervention failed: ${resp.status}`);
+  const result = await resp.json() as { accepted: boolean; error?: string };
+  if (!result.accepted) {
+    throw new Error(result.error ?? 'live runtime did not accept the policy intervention resolution');
   }
   return result;
 }

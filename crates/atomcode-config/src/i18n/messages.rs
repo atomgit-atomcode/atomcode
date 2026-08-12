@@ -337,11 +337,6 @@ pub enum Msg<'a> {
         current: usize,
     },
     ProviderContextWindowInvalid,
-    ProviderStepPricing,
-    ProviderStepPricingWithHint {
-        current: &'a str,
-    },
-    ProviderPricingInvalid,
     ProviderNameEmpty,
     ProviderBaseUrlEmpty,
     ProviderUnknownType,
@@ -390,6 +385,10 @@ pub enum Msg<'a> {
     ProviderPanelFieldBaseUrl,
     ProviderPanelFieldApiKey,
     ProviderPanelFieldModel,
+    ProviderPanelFieldVision,
+    ProviderPanelVisionAuto,
+    ProviderPanelVisionEnabled,
+    ProviderPanelVisionDisabled,
     ProviderPanelFieldWindow,
     ProviderPanelFieldMakeDefault,
     ProviderPanelSwitchHint,
@@ -454,6 +453,23 @@ pub enum Msg<'a> {
 
     // ── Tool result markers ──
     ToolDenied,
+    /// The credential-aware Bash policy rejected a tool call. Fixed text only:
+    /// never reflect the rejected command or model-controlled middleware output.
+    ToolBlockedBySecurityPolicy,
+    PolicyRecoveryHeader,
+    PolicyRecoveryQuestion,
+    PolicyRecoveryComplete,
+    PolicyRecoveryCompleteDesc,
+    PolicyRecoverySkip,
+    PolicyRecoverySkipDesc,
+    PolicyRecoveryInstructions,
+    PolicyRecoveryInstructionsDesc,
+    PolicyRecoveryEnd,
+    PolicyRecoveryEndDesc,
+    PolicyRecoverySafeInstructions,
+    PolicyRecoveryCompletedLocally,
+    PolicyRecoverySkippedLocally,
+    PolicyRecoverySubmitError,
 
     // ── Execution mode ──
     CmdSwitchedAutoMode,
@@ -735,14 +751,6 @@ pub enum Msg<'a> {
     },
 
     // ── /cost command ──
-    CostReport {
-        prompt: usize,
-        completion: usize,
-        cached: usize,
-        cache_rate: usize,
-        total: usize,
-        cost: &'a str,
-    },
     CostTokenReport {
         prompt: usize,
         completion: usize,
@@ -750,7 +758,6 @@ pub enum Msg<'a> {
         cache_rate: usize,
         total: usize,
     },
-    CostFree,
     CostUnattributed {
         tokens: u64,
     },
@@ -1266,6 +1273,7 @@ pub enum Msg<'a> {
     CmdDescProxy,
     /// Description for the `/todo` slash command — reprint the current task list.
     CmdDescTodo,
+    CmdDescTeam,
     /// Description for the `/schedule` slash command — list local scheduled tasks.
     CmdDescSchedule,
     /// Description for the `/desktop` slash command.
@@ -1425,6 +1433,18 @@ pub enum Msg<'a> {
         /// Bound to the always-visible summary because the standalone mid-turn
         /// error line can be clobbered by a real terminal's Streaming→Idle redraw.
         /// `None` on resume replay (the reason is live-only, not persisted).
+        reason: Option<&'a str>,
+    },
+
+    /// Turn-end summary for a hard local security-policy denial. This is
+    /// intentionally distinct from cancellation and provider failure: the
+    /// runtime stopped the turn deliberately and preserved a valid transcript.
+    TurnSummaryPolicyDenied {
+        turn_count: usize,
+        tool_call_count: usize,
+        duration: &'a str,
+        total_tokens: usize,
+        /// Optional driver-owned, sanitized reason folded into the terminal line.
         reason: Option<&'a str>,
     },
 

@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.5</span>
+    <span class="dhdr-ver">v5.0.6</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -107,7 +107,7 @@
           <tr><td><code>/diff</code></td><td>显示当前工作目录未提交改动的 git diff(文件列表一次最多显示 5 行,并带「更多文件」滚动提示)</td></tr>
           <tr><td><code>/review</code></td><td>对当前改动做代码审查:<code>/review</code> 审查未提交改动,<code>/review staged</code> 审查暂存区,<code>/review &lt;base&gt;</code> 对比某个基准 ref</td></tr>
           <tr><td><code>/paste</code></td><td>从剪贴板粘贴图片(Windows 下 <code>Ctrl+V</code> 被终端拦截时的备用入口)</td></tr>
-          <tr><td><code>/cost</code></td><td>当前会话的本地 token 花费 —— 适用于任意模型(含自接入模型);不支持 usage 报告的 API 会自动估算。与 <code>/usage</code> 不同,后者查询的是 CodingPlan 网关的套餐额度</td></tr>
+          <tr><td><code>/cost</code></td><td>按模型显示当前会话累计的提示、补全和缓存 Token。与 <code>/usage</code> 不同,后者查询的是 CodingPlan 网关的套餐额度</td></tr>
           <tr><td><code>/context</code></td><td>显示本轮上下文预算分解:系统提示、工具定义、冷区压缩、总消息数、context window 占用</td></tr>
           <tr><td><code>/compact</code></td><td>压缩历史消息,把早期对话压缩成摘要以腾出上下文预算</td></tr>
           <tr><td><code>/rewind</code></td><td>选择历史提示，并回退对话、代码或两者；详见 <a href="./sessions.html">会话与撤销</a></td></tr>
@@ -254,14 +254,15 @@
   ✔ Default provider set to AtomGit-GLM
 &gt; 你好</code></pre>
 
-      <h3>做完一件事前把成本看一眼</h3>
+      <h3>做完一件事前看一眼 Token 用量</h3>
       <pre><code>&gt; 重构 src/db 使用连接池
 ... (AI 执行)
 &gt; /cost
-Session token usage
-- Total output tokens: 8342
-- Current turn tokens: 2156
-- Context: 42K / 128K</code></pre>
+AtomGit · deepseek-v4-flash
+  提示 Token：       7210
+  补全 Token：       1132
+  缓存 Token：       5080（70% 命中率）
+  Token 总计：       8342</code></pre>
 
       <h3>问歪了就回退重问</h3>
       <pre><code>&gt; 给所有函数加 JSDoc

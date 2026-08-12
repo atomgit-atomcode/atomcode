@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.5</span>
+    <span class="dhdr-ver">v5.0.6</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -165,6 +165,7 @@ atomcode --dangerously-skip-permissions</code></pre>
         <li><code>Enter</code> sends the message.</li>
         <li><code>\</code> then <code>Enter</code> inserts a newline — works in every terminal (a trailing backslash makes the line a continuation).</li>
         <li><code>Shift+Enter</code> / <code>Ctrl+Enter</code> insert a newline (requires Kitty keyboard protocol: kitty / WezTerm / Alacritty / iTerm2 ≥3.5 / Windows Terminal ≥1.21; not available on Windows).</li>
+        <li>Generic web terminals use legacy key reporting by default. Set <code>ATOMCODE_KITTY=1</code> to force Kitty keyboard enhancement on, or <code>ATOMCODE_KITTY=0</code> to force it off.</li>
         <li><code>Alt+Enter</code> inserts a newline (works in most terminals, but Windows Terminal binds it to "toggle fullscreen" by default — unbind in settings).</li>
         <li>The input area grows with content.</li>
       </ul>
@@ -247,9 +248,9 @@ atomcode --dangerously-skip-permissions</code></pre>
       </ul>
       <p>Full behaviour at <a href="./sessions.html">Sessions &amp; Undo</a>.</p>
 
-      <h2>Inspecting cost and diff</h2>
+      <h2>Inspecting token usage and diff</h2>
       <ul>
-        <li><code>/cost</code> — token output for this session plus context usage (estimated when the API doesn't report usage)</li>
+        <li><code>/cost</code> — prompt, completion, and cached tokens accumulated per model in this session</li>
         <li><code>/diff</code> — git diff of uncommitted changes in the working directory</li>
         <li><code>/undo</code> — roll back every file edit from the last turn</li>
       </ul>

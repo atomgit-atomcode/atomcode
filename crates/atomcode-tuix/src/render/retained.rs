@@ -498,8 +498,9 @@ fn todo_panel_rows(
     // Overflow: show a WINDOW of `body_budget` items that ALWAYS contains the current
     // frontier (in-progress / first pending / last). Prefer recent items (window bottom
     // at the list end); pull the window back if the tail would drop the frontier. Pending
-    // hidden BELOW the window get a `+N more` row; items hidden above need no indicator
-    // (the header already reports the done/open totals).
+    // hidden BELOW the window get a `+N more` row when at least one item row remains;
+    // with a single body slot the frontier wins and the header still reports the totals.
+    // Items hidden above need no indicator.
     let n = items.len();
     let anchor = items
         .iter()
@@ -511,7 +512,8 @@ fn todo_panel_rows(
         start = anchor;
     }
     let mut end = (start + body_budget).min(n);
-    if n - end > 0 {
+    let show_more = n - end > 0 && body_budget > 1;
+    if show_more {
         end -= 1; // reserve the last row for the `+N more` marker
     }
     let hidden = n - end;
@@ -522,10 +524,42 @@ fn todo_panel_rows(
             content: content.clone(),
         });
     }
-    if hidden > 0 {
+    if show_more {
         rows.push(TodoPanelRow::More { hidden });
     }
     rows
+}
+
+/// Wrap the current task into a small, width-safe preview. The sticky footer
+/// remains bounded, so an oversized task gets at most `max_lines`; the final
+/// visible line carries an ellipsis when more content exists.
+fn wrap_todo_content(
+    content: &str,
+    width: usize,
+    max_lines: usize,
+    ellipsis: &str,
+) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+    let safe = scrub_controls(content);
+    let mut lines = wrap_prompt_text(&safe, width.max(1));
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        if let Some(last) = lines.last_mut() {
+            let suffix_width = crate::width::display_width(ellipsis);
+            let content_width = width.saturating_sub(suffix_width);
+            *last = format!(
+                "{}{}",
+                crate::width::truncate_to_width(last, content_width),
+                crate::width::truncate_to_width(ellipsis, width)
+            );
+        }
+    }
+    lines
 }
 
 /// Format a token count using k/m units. `round_clean=true` drops the
@@ -936,6 +970,10 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// level (not only on `screen`) because `reset()` rebuilds `screen` —
     /// the flag is re-applied to the fresh `screen` so suppression survives.
     in_sync_batch: bool,
+    /// `/resume` rebuilds the complete retained model while suppressing eager
+    /// terminal writes, then emits one bounded suffix at replay completion.
+    history_replay_max_rows: Option<usize>,
+    initial_history_replay_active: bool,
     /// When `Some`, the live row at body_bottom is the animated
     /// in-flight tool-call line (`<frame> Bash(cmd)`), not the generic
     /// spinner. The Spinner / StreamingBox tick handlers consult this:
@@ -972,6 +1010,15 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// no-op since the group rows are no longer at the bottom and may
     /// have scrolled out of the visible body strip).
     live_group: Option<LiveGroup>,
+    /// Agent progress block rendered in the conversation body while Todo owns
+    /// the footer. Unlike a tool batch it may remain live while ordinary body
+    /// text is appended; absolute indices stay valid until the rows enter host
+    /// scrollback, at which point updates safely stop.
+    live_agent_groups: std::collections::HashMap<String, LiveAgentGroup>,
+    /// Projection ids whose rows have entered native scrollback. Ignore their
+    /// remaining activity events until terminal so a long run cannot append
+    /// repeated snapshots every time the old block leaves the viewport.
+    frozen_agent_groups: std::collections::HashSet<String>,
     /// Modal overlay state: a floating window drawn on top of body+footer.
     /// When Some, `paint_frame` paints the overlay cells after the normal
     /// body+footer, so the diff sees the combined frame.
@@ -1032,6 +1079,12 @@ struct LiveGroup {
     /// are absolute; they remain valid as long as no rows are drained
     /// from the front of `body_lines` while the group is live.
     child_indices: std::collections::HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveAgentGroup {
+    header_idx: usize,
+    child_indices: Vec<usize>,
 }
 
 /// Wraps the real stdout writer with an optional mirror file. When
@@ -1137,10 +1190,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
             force_continuous_body_projection: false,
             pending_scroll_flush: false,
             in_sync_batch: false,
+            history_replay_max_rows: None,
+            initial_history_replay_active: false,
             inflight_tool: None,
             inflight_tool_rows: 0,
             inflight_hint: None,
             live_group: None,
+            live_agent_groups: std::collections::HashMap::new(),
+            frozen_agent_groups: std::collections::HashSet::new(),
             modal_overlay: None,
             diff_overlay_active: false,
             body_log: Vec::new(),
@@ -1177,24 +1234,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             reverse: false,
             faint: false,
             bg: None,
-        }
-    }
-
-    /// Paired foreground/background style for the user-input block.
-    ///
-    /// Both channels are explicit because Windows cannot currently answer the
-    /// automatic background probe. If `Auto` falls back to the dark palette
-    /// while the terminal is actually light, inheriting its dark default
-    /// foreground would make the prompt unreadable on `PanelBg`.
-    /// Returns `bg: None` when colours are disabled — the caller treats that as
-    /// "no block, use the plain layout".
-    fn style_panel_bg(&self) -> CellStyle {
-        CellStyle {
-            fg: role(self.caps, Role::PanelFg),
-            bg: role(self.caps, Role::PanelBg),
-            bold: false,
-            reverse: false,
-            faint: false,
         }
     }
 
@@ -1434,7 +1473,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // the row in the ordinary ToolName/Secondary palette.
         let is_subagent_fanout = matches!(
             safe_name.to_ascii_lowercase().as_str(),
-            "task" | "codereview" | "code_review"
+            "task" | "team" | "codereview" | "code_review"
         );
         let prefix = format!("{} ", icon);
         let prefix_style = if is_subagent_fanout {
@@ -2832,17 +2871,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         MAX_TODO_PANEL_ROWS.min(h.saturating_sub(4)).max(1)
     }
 
-    /// Number of rows the todo panel will occupy — mirrors `build_todo_rows`'
-    /// row count without building cells (used by the footer height math).
-    fn todo_panel_row_count(&self, todo: &crate::render::TodoProgress) -> usize {
-        todo_panel_rows(
-            &todo.items,
-            todo.completed,
-            todo.in_progress,
-            todo.total,
-            self.todo_panel_cap(),
-        )
-        .len()
+    /// Number of rows the todo panel will occupy. Use the width-aware builder
+    /// directly so wrapped current-task rows and footer height math cannot drift.
+    fn todo_panel_row_count(
+        &self,
+        todo: &crate::render::TodoProgress,
+        rule_width: usize,
+    ) -> usize {
+        self.build_todo_rows(todo, rule_width).len()
     }
 
     fn subtask_panel_cap(&self) -> usize {
@@ -2893,12 +2929,35 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .iter()
             .filter(|item| item.status == crate::render::SubtaskStatus::Failed)
             .count();
-        let pending = subtasks
+        let stopped = subtasks
+            .items
+            .iter()
+            .filter(|item| item.status == crate::render::SubtaskStatus::Stopped)
+            .count();
+        let pending_items = subtasks
             .items
             .iter()
             .filter(|item| item.status == crate::render::SubtaskStatus::Pending)
             .count();
-        let needs_summary = failed > 0 || pending > 0 || running > MAX_VISIBLE_RUNNING_SUBTASKS;
+        let terminal = subtasks
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.status,
+                    crate::render::SubtaskStatus::Completed
+                        | crate::render::SubtaskStatus::Stopped
+                        | crate::render::SubtaskStatus::Failed
+                )
+            })
+            .count();
+        let pending = if subtasks.call_id.starts_with("team:") {
+            subtasks.total.saturating_sub(terminal + running)
+        } else {
+            pending_items
+        };
+        let needs_summary =
+            failed > 0 || stopped > 0 || pending > 0 || running > MAX_VISIBLE_RUNNING_SUBTASKS;
         let spacer_rows = usize::from(cap >= 2);
         let summary_rows = usize::from(needs_summary && cap >= spacer_rows + 2);
         let visible_running = running
@@ -2941,11 +3000,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
             "*"
         };
         push_str_cells(&mut header, marker, &self.style_for(Role::Brand));
-        push_str_cells(&mut header, " Subtasks", &bold);
+        let panel_title = if subtasks.call_id.starts_with("team:") {
+            " Team"
+        } else {
+            " Subtasks"
+        };
+        push_str_cells(&mut header, panel_title, &bold);
         let failed = subtasks
             .items
             .iter()
             .filter(|item| item.status == SubtaskStatus::Failed)
+            .count();
+        let stopped = subtasks
+            .items
+            .iter()
+            .filter(|item| item.status == SubtaskStatus::Stopped)
             .count();
         let running = subtasks
             .items
@@ -2957,21 +3026,33 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .iter()
             .filter(|item| item.status == SubtaskStatus::Pending)
             .collect::<Vec<_>>();
-        let finished = subtasks.completed.saturating_add(failed);
+        let finished = subtasks
+            .completed
+            .saturating_add(failed)
+            .saturating_add(stopped);
+        let pending_count = if subtasks.call_id.starts_with("team:") {
+            subtasks
+                .total
+                .saturating_sub(finished + running.len())
+        } else {
+            pending.len()
+        };
         push_str_cells(
             &mut header,
             &format!(
                 " \u{b7} {finished}/{} finished \u{b7} {} running \u{b7} {pending} pending",
                 subtasks.total,
                 running.len(),
-                pending = pending.len()
+                pending = pending_count
             ),
             &detail,
         );
         rows.push(header);
 
-        let needs_summary =
-            failed > 0 || !pending.is_empty() || running.len() > MAX_VISIBLE_RUNNING_SUBTASKS;
+        let needs_summary = failed > 0
+            || stopped > 0
+            || pending_count > 0
+            || running.len() > MAX_VISIBLE_RUNNING_SUBTASKS;
         let summary_rows = usize::from(needs_summary && cap >= rows.len() + 1);
         let visible_running = running
             .len()
@@ -3023,7 +3104,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if needs_summary && rows.len() < cap {
             let mut parts = Vec::new();
             let hidden_running = running.len().saturating_sub(visible_running);
-            let expands_single_pending = pending.len() == 1 && hidden_running == 0 && failed == 0;
+            let expands_single_pending = pending.len() == 1
+                && pending_count == 1
+                && hidden_running == 0
+                && failed == 0;
             if hidden_running > 0 {
                 parts.push(format!("{hidden_running} running"));
             }
@@ -3040,11 +3124,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     identity.push_str(&format!(" \u{b7} {}{}", item.model, remainder));
                 }
                 parts.push(format!("{} \u{b7} pending", scrub_controls(&identity)));
-            } else if !pending.is_empty() {
-                parts.push(format!("{} pending", pending.len()));
+            } else if pending_count > 0 {
+                parts.push(format!("{pending_count} pending"));
             }
             if failed > 0 {
                 parts.push(format!("{failed} failed"));
+            }
+            if stopped > 0 {
+                parts.push(format!("{stopped} stopped"));
             }
             let mut row = Vec::new();
             push_str_cells(&mut row, "  ", &CellStyle::default());
@@ -3085,13 +3172,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
     ) -> Vec<Vec<Cell>> {
         use atomcode_capabilities::tools::todo::TodoStatus;
         let unicode = self.caps.unicode_symbols;
-        let rows = todo_panel_rows(
-            &todo.items,
-            todo.completed,
-            todo.in_progress,
-            todo.total,
-            self.todo_panel_cap(),
-        );
         // Checkbox glyphs (Tasks-panel style): ☐ open, ✔ done. Emit the ASCII form
         // directly on non-unicode terminals so the cell backstop never has to guess.
         let open_glyph = if unicode { "\u{2610}" } else { "[ ]" };
@@ -3103,6 +3183,47 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // presentation on many terminals (renders green + width-2, leaking a stray cell).
         let done_glyph = if unicode { "\u{2713}" } else { "[x]" };
         let ellipsis = if unicode { "\u{2026}" } else { "..." };
+
+        // The in-progress item owns the detailed preview. Before work starts,
+        // treat the first pending item as the frontier so a long first step is
+        // still readable. Closed lists retain the legacy single-line layout.
+        let frontier = todo
+            .items
+            .iter()
+            .position(|(status, _)| *status == TodoStatus::InProgress)
+            .or_else(|| {
+                todo.items
+                    .iter()
+                    .position(|(status, _)| *status == TodoStatus::Pending)
+            });
+        let panel_cap = self.todo_panel_cap();
+        let base_rows = if panel_cap >= 2 { 2 } else { 1 };
+        let body_rows = panel_cap.saturating_sub(base_rows);
+        let frontier_lines = frontier
+            .and_then(|index| todo.items.get(index).map(|(_, content)| (index, content)))
+            .map(|(index, content)| {
+                let status = todo.items[index].0;
+                let glyph = if status == TodoStatus::InProgress {
+                    filled_glyph
+                } else {
+                    open_glyph
+                };
+                let id = format!("#{}  ", index + 1);
+                let content_width = rule_width
+                    .saturating_sub(2 + crate::width::display_width(glyph) + 1)
+                    .saturating_sub(crate::width::display_width(&id));
+                wrap_todo_content(content, content_width, body_rows.min(3), ellipsis)
+            })
+            .unwrap_or_default();
+        let extra_frontier_rows = frontier_lines.len().saturating_sub(1);
+        let logical_cap = panel_cap.saturating_sub(extra_frontier_rows);
+        let rows = todo_panel_rows(
+            &todo.items,
+            todo.completed,
+            todo.in_progress,
+            todo.total,
+            logical_cap,
+        );
 
         // An indented item line: `  <glyph> <content>` (content width-fitted).
         let item_line = |glyph: &str,
@@ -3121,10 +3242,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             row
         };
 
-        rows.into_iter()
-            .map(|r| match r {
+        let mut rendered = Vec::new();
+        for logical in rows {
+            match logical {
                 // Blank spacer: empty cell list — paint_footer pads it to width.
-                TodoPanelRow::Spacer => Vec::new(),
+                TodoPanelRow::Spacer => rendered.push(Vec::new()),
                 TodoPanelRow::Header {
                     completed,
                     in_progress,
@@ -3150,7 +3272,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         &format!("({completed} done, {in_progress} in progress, {open} open)"),
                         &detail,
                     );
-                    row
+                    rendered.push(row);
                 }
                 TodoPanelRow::Item {
                     index,
@@ -3186,12 +3308,39 @@ impl<W: Write + Send> RetainedRenderer<W> {
                             (open_glyph, s.clone(), s)
                         }
                     };
-                    item_line(
-                        glyph,
-                        &format!("#{}  {}", index + 1, content),
-                        &glyph_style,
-                        &body_style,
-                    )
+                    if Some(index) == frontier && frontier_lines.len() > 1 {
+                        let id = format!("#{}  ", index + 1);
+                        for (line_index, line) in frontier_lines.iter().enumerate() {
+                            if line_index == 0 {
+                                rendered.push(item_line(
+                                    glyph,
+                                    &format!("{id}{line}"),
+                                    &glyph_style,
+                                    &body_style,
+                                ));
+                            } else {
+                                let mut row = Vec::new();
+                                let indent = 2
+                                    + crate::width::display_width(glyph)
+                                    + 1
+                                    + crate::width::display_width(&id);
+                                push_str_cells(
+                                    &mut row,
+                                    &" ".repeat(indent),
+                                    &CellStyle::default(),
+                                );
+                                push_str_cells(&mut row, line, &body_style);
+                                rendered.push(row);
+                            }
+                        }
+                    } else {
+                        rendered.push(item_line(
+                            glyph,
+                            &format!("#{}  {}", index + 1, content),
+                            &glyph_style,
+                            &body_style,
+                        ));
+                    }
                 }
                 TodoPanelRow::More { hidden } => {
                     // Fold indicator, not a task — no checkbox, just an indented muted+faint note.
@@ -3201,10 +3350,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     };
                     let mut row = Vec::new();
                     push_str_cells(&mut row, &format!("  +{hidden} more{ellipsis}"), &style);
-                    row
+                    rendered.push(row);
                 }
-            })
-            .collect()
+            }
+        }
+        for row in &mut rendered {
+            clamp_cell_row(row, rule_width);
+        }
+        rendered
     }
 
     /// Rows the approval panel occupies — one per option. The compact panel drops
@@ -3404,7 +3557,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         &self,
         panel: &crate::render::UserInputPanelView,
         rule_width: usize,
-        screen_width: usize,
+        _screen_width: usize,
     ) -> UserInputRows {
         use atomcode_capabilities::tools::request_user_input::UserInputMode;
         let unicode = self.caps.unicode_symbols;
@@ -3683,28 +3836,95 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 }
             }
             UserInputMode::Text => {
-                // Header CHIP + question + a `> {buffer}` input row.
+                // Header CHIP + question + a compact, theme-aware input box.
+                // Reverse video used to paint the whole terminal row white on
+                // light themes; a real border keeps the field legible without
+                // taking over the screen background.
                 push_line(&mut out, &panel.header, &self.style_bold(Role::Plan));
                 blank_row(&mut out);
                 push_line(&mut out, &panel.question, &self.style_bold(Role::Secondary));
                 blank_row(&mut out);
-                let style = CellStyle {
-                    reverse: true,
-                    ..CellStyle::default()
-                };
-                let mut row = Vec::new();
-                let budget = rule_width.saturating_sub(2);
-                let buf =
-                    crate::width::truncate_with_ellipsis(&scrub_controls(&panel.text), budget);
-                push_str_cells(&mut row, "> ", &style);
-                push_str_cells(&mut row, &buf, &style);
-                let current_width: usize = row.iter().map(|c| c.width as usize).sum();
-                let pad = screen_width.saturating_sub(current_width);
-                if pad > 0 {
-                    push_str_cells(&mut row, &" ".repeat(pad), &style);
+
+                let field_width = rule_width;
+                let placeholder = if unicode { "输入答案…" } else { "Enter answer..." };
+                let safe_text = scrub_controls(&panel.text);
+                if field_width < 5 {
+                    let mut row = Vec::new();
+                    if field_width > 0 {
+                        push_str_cells(&mut row, ">", &self.style_for(Role::Plan));
+                    }
+                    out.push(row);
+                    active = out.len().saturating_sub(1)..out.len();
+                } else {
+                    let inner_width = field_width.saturating_sub(2);
+                    let (top_left, horizontal, top_right, bottom_left, bottom_right, prompt, caret) =
+                        if unicode {
+                            ("╭", "─", "╮", "╰", "╯", "❯ ", "▏")
+                        } else {
+                            ("+", "-", "+", "+", "+", "> ", "|")
+                        };
+                    let border_style = self.style_for(Role::Plan);
+
+                    let mut top = Vec::new();
+                    push_str_cells(&mut top, top_left, &border_style);
+                    push_str_cells(
+                        &mut top,
+                        &horizontal.repeat(inner_width),
+                        &border_style,
+                    );
+                    push_str_cells(&mut top, top_right, &border_style);
+                    out.push(top);
+
+                    let mut row = Vec::new();
+                    push_str_cells(&mut row, if unicode { "│" } else { "|" }, &border_style);
+                    push_str_cells(&mut row, prompt, &self.style_bold(Role::Plan));
+                    let text_budget = inner_width
+                        .saturating_sub(crate::width::display_width(prompt))
+                        .saturating_sub(crate::width::display_width(caret));
+                    let buf = crate::width::truncate_with_ellipsis(&safe_text, text_budget);
+                    let visible_text = if buf.is_empty() {
+                        crate::width::truncate_with_ellipsis(placeholder, text_budget)
+                    } else {
+                        buf
+                    };
+                    let text_style = if panel.text.is_empty() {
+                        self.style_faint(Role::Muted)
+                    } else {
+                        self.style_for(Role::Secondary)
+                    };
+                    // An empty field's insertion point is before its placeholder;
+                    // once text exists the caret follows the typed content.
+                    if panel.text.is_empty() {
+                        push_str_cells(&mut row, caret, &border_style);
+                        push_str_cells(&mut row, &visible_text, &text_style);
+                    } else {
+                        push_str_cells(&mut row, &visible_text, &text_style);
+                        push_str_cells(&mut row, caret, &border_style);
+                    }
+                    let used = crate::width::display_width(prompt)
+                        + crate::width::display_width(&visible_text)
+                        + crate::width::display_width(caret);
+                    if inner_width > used {
+                        push_str_cells(
+                            &mut row,
+                            &" ".repeat(inner_width - used),
+                            &self.style_for(Role::Secondary),
+                        );
+                    }
+                    push_str_cells(&mut row, if unicode { "│" } else { "|" }, &border_style);
+                    out.push(row);
+                    active = out.len().saturating_sub(1)..out.len();
+
+                    let mut bottom = Vec::new();
+                    push_str_cells(&mut bottom, bottom_left, &border_style);
+                    push_str_cells(
+                        &mut bottom,
+                        &horizontal.repeat(inner_width),
+                        &border_style,
+                    );
+                    push_str_cells(&mut bottom, bottom_right, &border_style);
+                    out.push(bottom);
                 }
-                out.push(row);
-                active = out.len().saturating_sub(1)..out.len();
             }
         }
 
@@ -3774,6 +3994,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
             push_str_cells(&mut row, &body, style);
             out.push(row);
         };
+        let push_wrapped = |out: &mut Vec<Vec<Cell>>, text: &str, style: &CellStyle| {
+            let raw = crate::glyph::downgrade_glyphs(text, unicode);
+            let safe = scrub_controls(&raw);
+            for body in wrap_prompt_text(&safe, rule_width.saturating_sub(2).max(1)) {
+                let mut row = Vec::new();
+                push_str_cells(&mut row, "  ", style);
+                push_str_cells(&mut row, &body, style);
+                out.push(row);
+            }
+        };
         let hint_style = if crate::highlight::theme::is_light_for_render() {
             self.style_for(Role::Muted)
         } else {
@@ -3808,6 +4038,41 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
         if meta.on_submit {
             let answered = meta.answered.iter().filter(|a| **a).count();
+            push_line(
+                &mut out,
+                if unicode { "提交前确认" } else { "Review answers" },
+                &self.style_bold(Role::Plan),
+            );
+            out.push(Vec::new());
+            for (i, summary) in meta.summaries.iter().enumerate() {
+                push_wrapped(
+                    &mut out,
+                    &format!("{}. {}", i + 1, summary.header),
+                    &self.style_bold(Role::Secondary),
+                );
+                push_wrapped(
+                    &mut out,
+                    &summary.question,
+                    &self.style_faint(Role::Muted),
+                );
+                match summary.answer.as_deref() {
+                    Some(answer) => push_wrapped(
+                        &mut out,
+                        &if unicode {
+                            format!("回答：{answer}")
+                        } else {
+                            format!("Answer: {answer}")
+                        },
+                        &self.style_for(Role::Secondary),
+                    ),
+                    None => push_wrapped(
+                        &mut out,
+                        if unicode { "未回答" } else { "Unanswered" },
+                        &self.style_bold(Role::Warning),
+                    ),
+                }
+                out.push(Vec::new());
+            }
             let marker = if unicode {
                 "\u{276f} \u{2714} "
             } else {
@@ -3826,7 +4091,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             active = out.len().saturating_sub(1)..out.len();
             out.push(Vec::new()); // blank
                                   // Enter 提交 · Tab/Shift+Tab 切换问题 · Esc 放弃
-            let hint = "Enter \u{63d0}\u{4ea4} \u{00b7} Tab/Shift+Tab \u{5207}\u{6362}\u{95ee}\u{9898} \u{00b7} Esc \u{653e}\u{5f03}";
+            let hint = "Enter \u{63d0}\u{4ea4} \u{00b7} PgUp/PgDn \u{67e5}\u{770b} \u{00b7} Shift+Tab \u{8fd4}\u{56de} \u{00b7} Esc \u{653e}\u{5f03}";
             push_line(&mut out, hint, &hint_style);
         } else {
             // The current question's own rows. Drop its trailing hint row — the single
@@ -3844,11 +4109,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.fit_user_input_rows(
             UserInputRows { rows: out, active },
             screen_height,
-            if meta.on_submit {
-                0
-            } else {
-                view.scroll_offset
-            },
+            view.scroll_offset,
         )
     }
 
@@ -3912,10 +4173,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             scrub_controls(&self.input_buf)
         };
+        let (display, display_cursor_byte) =
+            crate::markdown::normalize_circled_list_spacing_with_cursor(
+                &safe,
+                self.input_cursor_byte,
+            );
         let (mut lines, cursor_row_in_middle, cursor_col_in_row) = if text_budget == 0 {
             (vec![String::new()], 0usize, 0usize)
         } else {
-            crate::width::wrap_with_cursor(&safe, text_budget, self.input_cursor_byte)
+            crate::width::wrap_with_cursor(&display, text_budget, display_cursor_byte)
         };
         if lines.is_empty() {
             lines.push(String::new());
@@ -4213,9 +4479,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             0
         };
-        // Modal input always wins the scarce interactive footer area. While a
-        // Task fan-out is active it owns the expanded top-panel slot and the
-        // standing TodoWrite panel collapses completely until Task finishes.
+        // Modal input always wins the scarce interactive footer area. The event
+        // loop routes Task/Team progress out of `status.subtasks` while Todo owns
+        // this slot, so only one expanded footer panel reaches the renderer.
         let approval_rows = self.modal_panel_rows();
         let subtask_rows = if approval_rows == 0 {
             self.status
@@ -4230,7 +4496,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.status
                 .todo
                 .as_ref()
-                .map(|t| self.todo_panel_row_count(t))
+                .map(|t| self.todo_panel_row_count(t, rule_width))
                 .unwrap_or(0)
         } else {
             0
@@ -4989,7 +5255,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // the same JediTerm last-column reserve so the wrapped ROW COUNT here
         // matches the actual render (else body_bottom is off by a row).
         let prefix_and_reserve = if self.caps.jediterm { 3 } else { 2 };
-        let text_budget = (self.screen.width() as usize).saturating_sub(prefix_and_reserve);
+        let screen_width = self.screen.width() as usize;
+        let text_budget = screen_width.saturating_sub(prefix_and_reserve);
+        let rule_width = screen_width.saturating_sub(PAD_COL * 2);
         let safe = if self.input_buf.is_empty() {
             self.status
                 .next_prompt_suggestion
@@ -4999,10 +5267,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             scrub_controls(&self.input_buf)
         };
+        let (display, display_cursor_byte) =
+            crate::markdown::normalize_circled_list_spacing_with_cursor(
+                &safe,
+                self.input_cursor_byte,
+            );
         let middle_rows = if text_budget == 0 {
             1
         } else {
-            crate::width::wrap_with_cursor(&safe, text_budget, self.input_cursor_byte)
+            crate::width::wrap_with_cursor(&display, text_budget, display_cursor_byte)
                 .0
                 .len()
                 .max(1)
@@ -5032,7 +5305,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.status
                 .todo
                 .as_ref()
-                .map(|t| self.todo_panel_row_count(t))
+                .map(|t| self.todo_panel_row_count(t, rule_width))
                 .unwrap_or(0)
         } else {
             0
@@ -5129,7 +5402,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.status
                 .todo
                 .as_ref()
-                .map(|todo| self.todo_panel_row_count(todo))
+                .map(|todo| self.todo_panel_row_count(todo, width))
                 .unwrap_or(0)
         } else {
             0
@@ -5646,7 +5919,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // A legacy-conhost resize first rebuilds the retained model without
         // terminal I/O. A bounded physical-row suffix is emitted once after
         // the semantic replay completes.
-        if self.replaying && self.caps.legacy_conhost {
+        if (self.replaying
+            && (self.caps.legacy_conhost || self.history_replay_max_rows.is_some()))
+            || self.initial_history_replay_active
+        {
             return;
         }
         let h = self.screen.height() as usize;
@@ -6332,37 +6608,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
-    /// Like `push_body_prefixed` but continuation rows carry `cont_prefix`
-    /// (e.g. a coloured `▎` left bar) instead of a blank pad, so a multi-line
-    /// block reads as one unit with a full-height left marker. `cont_prefix`
-    /// MUST be the same display width as `prefix` so the body stays aligned.
-    fn push_body_prefixed_cont(
-        &mut self,
-        prefix: &str,
-        prefix_style: &CellStyle,
-        cont_prefix: &str,
-        cont_style: &CellStyle,
-        body: &str,
-        body_style: &CellStyle,
-    ) {
-        let rows = self.build_prefixed_rows(
-            prefix,
-            prefix_style,
-            body,
-            body_style,
-            Some((cont_prefix, cont_style)),
-        );
-        for row in rows {
-            self.push_body_row(row);
-        }
-    }
-
     /// Symbol-anchored row builder. Wraps `body` to `screen_width − PAD_COL`,
     /// emits the leading row with `prefix`; continuation rows use `cont`'s
     /// `(prefix, style)` when given, else a blank pad of equal display width.
     /// Pure: no side effects on `body_lines` or terminal output. Used by
-    /// `push_body_prefixed` / `push_body_prefixed_cont` (which append each row
-    /// via push_body_row) and `render_inflight_tool` (which writes in-place
+    /// `push_body_prefixed` (which appends each row via `push_body_row`) and
+    /// `render_inflight_tool` (which writes in-place
     /// over previously-rendered inflight rows during spinner ticks — see that
     /// fn's doc comment for the scrollback-leak bug this split addresses).
     fn build_prefixed_rows(
@@ -6919,6 +7170,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if self.replaying {
             return;
         }
+        if let UiLine::AgentGroup { progress, .. } = line {
+            if let Some(existing) = self.body_log.iter_mut().rev().find(|existing| {
+                matches!(
+                    existing,
+                    UiLine::AgentGroup { progress: prior, finished: false }
+                        if prior.call_id == progress.call_id
+                )
+            }) {
+                *existing = line.clone();
+                return;
+            }
+        }
         match line {
             // Transient / footer / modal: never part of the permanent
             // transcript, so re-derived from live state on every frame.
@@ -6927,6 +7190,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             | UiLine::Spinner { .. }
             | UiLine::ClearTransient
             | UiLine::InputCommit
+            | UiLine::AgentGroupsFreeze
             | UiLine::DiffPanel { .. }
             | UiLine::ModalOverlayClear => return,
             _ => {}
@@ -6983,6 +7247,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.reasoning_line_buf.clear();
         self.md_state.reset();
         self.live_group = None;
+        self.live_agent_groups.clear();
+        self.frozen_agent_groups.clear();
         self.inflight_tool = None;
         self.inflight_tool_rows = 0;
         self.inflight_hint = None;
@@ -7006,11 +7272,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
     /// Rebuild a bounded suffix of the retained body into native scrollback.
     /// The complete model remains available for marks and later rendering.
-    fn replay_legacy_conhost_scrollback(&mut self) {
+    fn replay_bounded_scrollback(&mut self, max_rows: usize) {
         let full_body = std::mem::take(&mut self.body_lines);
-        let suffix_start = full_body
-            .len()
-            .saturating_sub(LEGACY_CONHOST_REFLOW_MAX_ROWS);
+        let suffix_start = full_body.len().saturating_sub(max_rows);
         let retained_rows: Vec<Vec<Cell>> = full_body[suffix_start..].to_vec();
 
         self.scrolled_off = 0;
@@ -7024,6 +7288,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let visible_rows = self.body_lines.len().saturating_sub(self.scrolled_off);
         self.body_lines = full_body;
         self.scrolled_off = self.body_lines.len().saturating_sub(visible_rows);
+    }
+
+    fn replay_legacy_conhost_scrollback(&mut self) {
+        self.replay_bounded_scrollback(LEGACY_CONHOST_REFLOW_MAX_ROWS);
     }
 
     fn reflow_welcome_prefix(&mut self) {
@@ -7054,84 +7322,26 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.mark_message(crate::render::MarkKind::User);
         self.last_mark_was_assistant = false;
         let safe = scrub_controls(text);
-
-        let bg = self.style_panel_bg();
-
-        // No panel background (NO_COLOR / colours disabled): keep the original
-        // plain layout byte-for-byte so nothing regresses.
-        if bg.bg.is_none() {
-            let accent = self.style_bold(Role::Accent);
-            let text_style = CellStyle::default();
-            self.push_body_prefixed_cont(
-                self.caps.prompt_chevron(),
-                &accent,
-                self.caps.prompt_continuation_bar(),
-                &accent,
-                &safe,
-                &text_style,
-            );
-            let muted = self.style_for(Role::Muted);
-            for n in attachments {
-                self.push_body_text(&format!("└ [Image #{}]", n), &muted);
-            }
-            self.push_body_row(Vec::new());
-            self.md_state.reset();
-            return;
-        }
-
-        let w = (self.screen.width() as usize).saturating_sub(PAD_COL);
-
-        // Marker / text / attachment styles keep their fg but gain the panel
-        // bg so the colour sits behind the whole block.
-        let mut accent = self.style_bold(Role::Accent);
-        accent.bg = bg.bg;
-        let text_style = bg.clone();
-        let mut muted = self.style_for(Role::Muted);
-        muted.bg = bg.bg;
-
-        // Content rows: `❯ ` on the first row, then a plain bg-filled indent of
-        // equal width on continuation rows. The panel background now delineates
-        // the block, so the coloured `▎` continuation bar is redundant — drop it,
-        // keeping the indent so wrapped/multi-line text stays aligned and the
-        // background has no left-edge hole.
-        let chevron = self.caps.prompt_chevron();
-        let cont_indent = " ".repeat(crate::width::display_width(chevron));
-        let mut rows = self.build_prefixed_rows(
-            chevron,
+        let display = crate::markdown::normalize_circled_list_spacing(&safe);
+        // Keep the committed echo visually continuous with the composer: the
+        // accent chevron identifies the user turn, while text and continuation
+        // rows retain the terminal background. Paste placeholders are still
+        // expanded before this point. Circled list labels receive the same
+        // display-only spacing as Markdown; neither transform alters the
+        // payload or history model.
+        let accent = self.style_bold(Role::Accent);
+        let text_style = CellStyle::default();
+        self.push_body_prefixed(
+            self.caps.prompt_chevron(),
             &accent,
-            &safe,
+            display.as_ref(),
             &text_style,
-            Some((cont_indent.as_str(), &bg)),
         );
-        for row in &mut rows {
-            Self::pad_row_to_width(row, w, bg.clone());
-        }
-        for row in rows {
-            self.push_body_row(row);
-        }
 
-        // Attachment rows live inside the block. Reuse build_prefixed_rows with
-        // a PAD_COL-wide bg indent as the "prefix" so glyph downgrade + wrap
-        // (to width − 2·PAD_COL) match the plain `push_body_text` path.
+        let muted = self.style_for(Role::Muted);
         for n in attachments {
-            let indent = " ".repeat(PAD_COL);
-            let mut arows = self.build_prefixed_rows(
-                &indent,
-                &bg,
-                &format!("└ [Image #{}]", n),
-                &muted,
-                Some((&indent, &bg)),
-            );
-            for row in &mut arows {
-                Self::pad_row_to_width(row, w, bg.clone());
-            }
-            for row in arows {
-                self.push_body_row(row);
-            }
+            self.push_body_text(&format!("└ [Image #{}]", n), &muted);
         }
-
-        // Keep the usual paragraph gap after the user message, but let the
-        // panel background hug the actual content without top/bottom padding.
         self.push_body_row(Vec::new());
         self.md_state.reset();
     }
@@ -7148,6 +7358,227 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let downgr = crate::glyph::downgrade_glyphs(text, unicode);
         let safe = scrub_controls(&downgr);
         build_one_row(&safe, muted, screen_w, unicode)
+    }
+
+    fn agent_group_rows(
+        &self,
+        progress: &crate::render::SubtaskProgress,
+        finished: bool,
+    ) -> (Vec<Cell>, Vec<Vec<Cell>>) {
+        use crate::render::SubtaskStatus;
+
+        let failed = progress
+            .items
+            .iter()
+            .filter(|item| item.status == SubtaskStatus::Failed)
+            .count();
+        let stopped = progress
+            .items
+            .iter()
+            .filter(|item| item.status == SubtaskStatus::Stopped)
+            .count();
+        let terminal = progress.completed + failed + stopped;
+        let running = progress
+            .items
+            .iter()
+            .filter(|item| item.status == SubtaskStatus::Running)
+            .count();
+        let kind = if progress.call_id.starts_with("team:") {
+            "Team agents"
+        } else {
+            "Subagents"
+        };
+        let marker = if self.caps.unicode_symbols { "●" } else { "*" };
+        let header = if finished && terminal >= progress.total {
+            format!(
+                "{marker} {kind} · {terminal}/{} finished · {failed} failed",
+                progress.total
+            )
+        } else {
+            format!("{marker} Running {running}/{} {kind}…", progress.total)
+        };
+        let header_style = self.style_bold(Role::Secondary);
+        let header_row = build_one_row(
+            &header,
+            &header_style,
+            self.screen.width(),
+            self.caps.unicode_symbols,
+        );
+        let completed_child_style = if crate::highlight::theme::is_light_for_render() {
+            self.style_for(Role::Muted)
+        } else {
+            self.style_faint(Role::Muted)
+        };
+        let active_child_style = self.style_for(Role::Secondary);
+        let stopped_child_style = self.style_for(Role::Warning);
+        let failed_child_style = self.style_for(Role::Error);
+        let child_rows = progress
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let branch = if index + 1 == progress.items.len() {
+                    "└"
+                } else {
+                    "├"
+                };
+                let state = match item.status {
+                    SubtaskStatus::Pending => "pending",
+                    SubtaskStatus::Running => {
+                        if item.activity.is_empty() {
+                            "running"
+                        } else {
+                            item.activity.as_str()
+                        }
+                    }
+                    SubtaskStatus::Completed => "done",
+                    SubtaskStatus::Stopped => "stopped",
+                    SubtaskStatus::Failed => "failed",
+                };
+                let mut text = format!("  {branch} {}", item.label);
+                if !item.description.is_empty() {
+                    text.push_str(&format!(": {}", item.description));
+                }
+                if !item.model.is_empty() {
+                    text.push_str(&format!(" · {}", item.model));
+                }
+                text.push_str(&format!(" · {state}"));
+                let text = if item.started_at.is_some() || item.output_tokens > 0 {
+                    let elapsed = item
+                        .started_at
+                        .map(|started_at| crate::render::fmt_dur(started_at.elapsed()))
+                        .unwrap_or_else(|| "0s".into());
+                    format_subtask_progress(
+                        &text,
+                        &elapsed,
+                        item.output_tokens,
+                        self.screen.width() as usize,
+                    )
+                } else {
+                    crate::width::truncate_with_ellipsis(&text, self.screen.width() as usize)
+                };
+                let child_style = match item.status {
+                    SubtaskStatus::Pending | SubtaskStatus::Running => &active_child_style,
+                    SubtaskStatus::Completed => &completed_child_style,
+                    SubtaskStatus::Stopped => &stopped_child_style,
+                    SubtaskStatus::Failed => &failed_child_style,
+                };
+                build_one_row(
+                    &text,
+                    child_style,
+                    self.screen.width(),
+                    self.caps.unicode_symbols,
+                )
+            })
+            .collect();
+        (header_row, child_rows)
+    }
+
+    fn render_agent_group(
+        &mut self,
+        progress: crate::render::SubtaskProgress,
+        finished: bool,
+    ) {
+        let projection_id = progress.call_id.clone();
+        let (header, children) = self.agent_group_rows(&progress, finished);
+        if self.frozen_agent_groups.contains(&projection_id) {
+            if finished {
+                self.frozen_agent_groups.remove(&projection_id);
+            }
+            return;
+        }
+        if let Some(group) = self.live_agent_groups.get(&projection_id).cloned() {
+            let still_rewritable = group.header_idx >= self.scrolled_off
+                && group.child_indices.len() == children.len()
+                && group
+                    .child_indices
+                    .iter()
+                    .all(|index| *index >= self.scrolled_off && *index < self.body_lines.len());
+            if still_rewritable {
+                if let Some(row) = self.body_lines.get_mut(group.header_idx) {
+                    *row = header;
+                }
+                for (index, child) in group.child_indices.iter().zip(children) {
+                    self.body_lines[*index] = child;
+                }
+                // Body rows are emitted eagerly and are not repainted by the
+                // footer diff. Rewrite every still-visible Agent row at its
+                // absolute terminal position, matching ToolGroupChildUpdate.
+                let bottom = self.body_bottom_row();
+                let body_len = self.body_lines.len();
+                if bottom > 0 {
+                    let mut indices = Vec::with_capacity(group.child_indices.len() + 1);
+                    indices.push(group.header_idx);
+                    indices.extend(group.child_indices.iter().copied());
+                    for index in indices {
+                        let offset_from_bottom = (body_len - 1).saturating_sub(index);
+                        if (bottom as usize) <= offset_from_bottom {
+                            continue;
+                        }
+                        let target_row = (bottom as usize) - offset_from_bottom;
+                        let _ = write!(self.out, "\x1b[{target_row};1H\x1b[K");
+                        if let Some(row) = self.body_lines.get(index) {
+                            let _ = self.out.write_all(&serialize_row(row));
+                        }
+                    }
+                }
+                if finished {
+                    self.live_agent_groups.remove(&projection_id);
+                }
+                self.dirty = true;
+                return;
+            }
+            self.live_agent_groups.remove(&projection_id);
+            if !finished {
+                self.frozen_agent_groups.insert(projection_id);
+            }
+            return;
+        }
+        self.clear_live_spinner_before_permanent_body();
+        self.flush_assistant_remainder();
+        self.mark_message(crate::render::MarkKind::ToolCall);
+        self.last_mark_was_assistant = false;
+        self.push_body_row(Vec::new());
+        self.push_body_row(header);
+        let header_idx = self.body_lines.len() - 1;
+        let mut child_indices = Vec::with_capacity(children.len());
+        for child in children {
+            self.push_body_row(child);
+            child_indices.push(self.body_lines.len() - 1);
+        }
+        if !finished {
+            self.live_agent_groups.insert(
+                projection_id,
+                LiveAgentGroup {
+                    header_idx,
+                    child_indices,
+                },
+            );
+        }
+    }
+
+    fn freeze_agent_groups(&mut self) {
+        let projection_ids = self
+            .live_agent_groups
+            .keys()
+            .chain(self.frozen_agent_groups.iter())
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        for projection_id in &projection_ids {
+            if let Some(UiLine::AgentGroup { finished, .. }) =
+                self.body_log.iter_mut().rev().find(|event| {
+                    matches!(
+                        event,
+                        UiLine::AgentGroup { progress, finished: false }
+                            if progress.call_id == projection_id.as_str()
+                    )
+                })
+            {
+                *finished = true;
+            }
+        }
+        self.live_agent_groups.clear();
+        self.frozen_agent_groups.clear();
     }
 }
 
@@ -7623,6 +8054,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 );
                 self.push_body_row(row);
             }
+            UiLine::AgentGroup { progress, finished } => {
+                self.render_agent_group(progress, finished);
+            }
+            UiLine::AgentGroupsFreeze => self.freeze_agent_groups(),
             UiLine::ToolCall { name, detail } => {
                 // Capture BEFORE the arm mutates `last_mark_was_assistant`.
                 // We need the entry-time value to decide whether to insert a
@@ -8237,7 +8672,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // Without this the terminal keeps sending CSI u sequences
         // (e.g. `9;5:3u`) for every keypress after we exit, and
         // the parent shell echoes them as literal gibberish.
-        if self.caps.tty {
+        if crate::should_enable_kitty_keyboard(&self.caps) {
             let _ = execute!(self.out, PopKeyboardEnhancementFlags);
         }
         // Be defensive: re-enable autowrap, release any DECSTBM, then
@@ -8365,6 +8800,24 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let _ = self.out.flush();
     }
 
+    fn begin_initial_history_replay(&mut self) {
+        self.initial_history_replay_active = self.history_replay_max_rows.is_some();
+    }
+
+    fn end_initial_history_replay(&mut self) {
+        if !std::mem::take(&mut self.initial_history_replay_active) {
+            return;
+        }
+        let Some(max_rows) = self.history_replay_max_rows else {
+            return;
+        };
+        self.replay_bounded_scrollback(max_rows);
+    }
+
+    fn set_history_replay_max_rows(&mut self, max_rows: Option<usize>) {
+        self.history_replay_max_rows = max_rows.filter(|rows| *rows > 0);
+    }
+
     fn set_suppress_auto_copy(&mut self, suppress: bool) {
         self.suppress_auto_copy = suppress;
     }
@@ -8430,7 +8883,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // that the cooked-mode child process then echoes back as
         // gibberish. `execute!` is best-effort — terminals that never
         // accepted the push silently ignore the pop.
-        if self.caps.tty {
+        if crate::should_enable_kitty_keyboard(&self.caps) {
             let _ = execute!(self.out, PopKeyboardEnhancementFlags);
         }
         if self.caps.bracketed_paste {
@@ -8836,7 +9289,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // overflow into scrollback at the new width via its append-only
         // LFs, completing the `\x1b[3J` rebuild above.
         self.reflow_body_to_current_width();
-        if self.caps.legacy_conhost {
+        if let Some(max_rows) = self.history_replay_max_rows {
+            self.replay_bounded_scrollback(max_rows);
+        } else if self.caps.legacy_conhost {
             self.replay_legacy_conhost_scrollback();
         }
 
@@ -10193,7 +10648,7 @@ mod tests {
         r.caps.unicode_symbols = true;
         let row = r.build_top_rule_with_context(
             80,
-            Some("release/v5.0.5"),
+            Some("release/v5.0.6"),
             Some(crate::render::HistoryPosition {
                 current: 999,
                 total: 1000,
@@ -10207,7 +10662,7 @@ mod tests {
             .map(|cell| cell.ch)
             .collect();
         assert!(visible.contains("History 999/1000"), "{visible:?}");
-        assert!(visible.contains("release/v5.0.5"), "{visible:?}");
+        assert!(visible.contains("release/v5.0.6"), "{visible:?}");
     }
 
     #[test]
@@ -11066,34 +11521,36 @@ mod tests {
     #[test]
     fn retained_inflight_subagent_fanout_uses_brand_activity_style() {
         let (mut r, _buf) = new_capturing(100, 24);
-        r.render_inflight_tool(
-            "⠋",
-            "Task",
-            "3 subtasks",
-            " · thinking… (57s · ↑ 715 tokens)",
-        );
-
-        let row = r
-            .body_lines
-            .iter()
-            .find(|row| {
-                row.iter()
-                    .map(|cell| cell.ch)
-                    .collect::<String>()
-                    .contains("Task")
-            })
-            .expect("live Task row");
         let brand = r.style_for(Role::Brand).fg;
         assert!(
             brand.is_some(),
             "capturing terminal should enable brand color"
         );
-        assert!(
-            row.iter()
-                .filter(|cell| !cell.ch.is_whitespace())
-                .all(|cell| cell.style.fg == brand),
-            "live Task activity, including detail and spinner metadata, must use brand color"
-        );
+        for name in ["Task", "Team"] {
+            r.render_inflight_tool(
+                "⠋",
+                name,
+                "3 subtasks",
+                " · thinking… (57s · ↑ 715 tokens)",
+            );
+
+            let row = r
+                .body_lines
+                .iter()
+                .find(|row| {
+                    row.iter()
+                        .map(|cell| cell.ch)
+                        .collect::<String>()
+                        .contains(name)
+                })
+                .unwrap_or_else(|| panic!("live {name} row"));
+            assert!(
+                row.iter()
+                    .filter(|cell| !cell.ch.is_whitespace())
+                    .all(|cell| cell.style.fg == brand),
+                "live {name} activity, including detail and spinner metadata, must use brand color"
+            );
+        }
 
         r.render_inflight_tool("⠙", "Read", "src/lib.rs", " (2s)");
         let ordinary = r
@@ -15963,6 +16420,47 @@ mod tests {
     }
 
     #[test]
+    fn team_panel_reports_stopped_separately_from_failed() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut r, buf) = new_capturing(100, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(100, 24);
+        let mut status = status_basic();
+        let item = |label: &str, state| SubtaskItem {
+            label: label.into(),
+            description: String::new(),
+            model: String::new(),
+            activity: String::new(),
+            started_at: None,
+            output_tokens: 0,
+            status: state,
+        };
+        status.subtasks = Some(SubtaskProgress {
+            call_id: "team:runtime".into(),
+            completed: 1,
+            total: 3,
+            items: vec![
+                item("done", SubtaskStatus::Completed),
+                item("stopped", SubtaskStatus::Stopped),
+                item("failed", SubtaskStatus::Failed),
+            ],
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: vec![],
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let grid = vterm.dump();
+        assert!(grid.contains("3/3 finished · 0 running · 0 pending"));
+        assert!(grid.contains("1 failed · 1 stopped"));
+    }
+
+    #[test]
     fn subtask_panel_uses_six_rows_for_three_running_and_terminal_summary() {
         use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
 
@@ -16009,7 +16507,7 @@ mod tests {
     }
 
     #[test]
-    fn subtask_panel_expands_the_only_pending_task() {
+    fn subtask_and_team_panels_expand_the_only_pending_task() {
         use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
 
         let (r, _buf) = new_capturing(120, 24);
@@ -16022,28 +16520,378 @@ mod tests {
             output_tokens: 128,
             status: state,
         };
-        let progress = SubtaskProgress {
-            call_id: "call-task".into(),
+        for call_id in ["call-task", "team:runtime"] {
+            let progress = SubtaskProgress {
+                call_id: call_id.into(),
+                completed: 0,
+                total: 4,
+                items: vec![
+                    item("explore#1", SubtaskStatus::Running),
+                    item("explore#2", SubtaskStatus::Running),
+                    item("explore#3", SubtaskStatus::Running),
+                    item("explore#4", SubtaskStatus::Pending),
+                ],
+            };
+
+            let text = r
+                .build_subtask_rows(&progress, 120)
+                .iter()
+                .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+                .collect::<Vec<_>>();
+
+            assert_eq!(text.len(), MAX_SUBTASK_PANEL_ROWS);
+            assert!(text[0].trim().is_empty());
+            assert!(text[5].contains("explore#4 · GLM-5.2 · inspect explore#4 · pending"));
+            assert!(!text[5].contains("1 pending"));
+        }
+    }
+
+    #[test]
+    fn agent_group_updates_in_body_across_foreign_output_and_freezes_final_state() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut r, buf) = new_capturing(120, 24);
+        let mut progress = SubtaskProgress {
+            call_id: "team:runtime".into(),
             completed: 0,
-            total: 4,
+            total: 2,
             items: vec![
-                item("explore#1", SubtaskStatus::Running),
-                item("explore#2", SubtaskStatus::Running),
-                item("explore#3", SubtaskStatus::Running),
-                item("explore#4", SubtaskStatus::Pending),
+                SubtaskItem {
+                    label: "explorer".into(),
+                    description: "scan kernel".into(),
+                    model: "GLM-5.2".into(),
+                    activity: "thinking".into(),
+                    started_at: Some(std::time::Instant::now()),
+                    output_tokens: 128,
+                    status: SubtaskStatus::Running,
+                },
+                SubtaskItem {
+                    label: "reviewer".into(),
+                    description: "review findings".into(),
+                    model: "GLM-5.2".into(),
+                    activity: "queued".into(),
+                    started_at: None,
+                    output_tokens: 0,
+                    status: SubtaskStatus::Pending,
+                },
             ],
         };
+        r.render(UiLine::AgentGroup {
+            progress: progress.clone(),
+            finished: false,
+        });
+        let group = r
+            .live_agent_groups
+            .get("team:runtime")
+            .cloned()
+            .expect("live agent block");
+        let active_style = r.style_for(Role::Secondary);
+        assert!(
+            r.body_lines[group.child_indices[0]]
+                .iter()
+                .filter(|cell| !cell.ch.is_whitespace())
+                .all(|cell| cell.style == active_style),
+            "running Agent rows must remain readable instead of muted"
+        );
+        let running_text = r.body_lines[group.child_indices[0]]
+            .iter()
+            .map(|cell| cell.ch)
+            .collect::<String>();
+        assert!(running_text.contains("tokens"), "token metadata must survive clipping");
+        assert!(running_text.contains('↑'), "token marker must stay visible");
+        assert!(
+            r.body_lines[group.child_indices[1]]
+                .iter()
+                .filter(|cell| !cell.ch.is_whitespace())
+                .all(|cell| cell.style == active_style),
+            "pending Agent rows are still active work and must not be muted"
+        );
 
-        let text = r
-            .build_subtask_rows(&progress, 120)
+        r.render(UiLine::CommandOutput("parent task remains visible\n".into()));
+        assert!(
+            r.live_agent_groups.contains_key("team:runtime"),
+            "foreign output must not freeze Agent block"
+        );
+
+        progress.items[1].status = SubtaskStatus::Running;
+        progress.items[1].activity = "reading files".into();
+        progress.items[1].output_tokens = 256;
+        buf.lock().unwrap().clear();
+        r.render(UiLine::AgentGroup {
+            progress: progress.clone(),
+            finished: false,
+        });
+        assert!(
+            String::from_utf8_lossy(&buf.lock().unwrap()).contains("\x1b["),
+            "Agent update must immediately rewrite visible terminal rows"
+        );
+        let child = r.body_lines[group.child_indices[1]]
+            .iter()
+            .map(|cell| cell.ch)
+            .collect::<String>();
+        assert!(child.contains("reading files"));
+        assert!(child.contains("256 tokens"));
+
+        for item in &mut progress.items {
+            item.status = SubtaskStatus::Completed;
+            item.activity = "done".into();
+        }
+        progress.completed = 2;
+        r.render(UiLine::AgentGroup {
+            progress,
+            finished: true,
+        });
+        assert!(!r.live_agent_groups.contains_key("team:runtime"));
+        let header = r.body_lines[group.header_idx]
+            .iter()
+            .map(|cell| cell.ch)
+            .collect::<String>();
+        assert!(header.contains("2/2 finished"));
+        let terminal_style = if crate::highlight::theme::is_light_for_render() {
+            r.style_for(Role::Muted)
+        } else {
+            r.style_faint(Role::Muted)
+        };
+        assert!(
+            r.body_lines[group.child_indices[0]]
+                .iter()
+                .filter(|cell| !cell.ch.is_whitespace())
+                .all(|cell| cell.style == terminal_style),
+            "completed Agent rows must be muted"
+        );
+
+        r.reflow_body_to_current_width();
+        let body = r
+            .body_lines
             .iter()
             .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("2/2 finished"), "resize replay keeps frozen Agent block");
+    }
 
-        assert_eq!(text.len(), MAX_SUBTASK_PANEL_ROWS);
-        assert!(text[0].trim().is_empty());
-        assert!(text[5].contains("explore#4 · GLM-5.2 · inspect explore#4 · pending"));
-        assert!(!text[5].contains("1 pending"));
+    #[test]
+    fn failed_and_stopped_agent_rows_remain_visually_distinct_from_completed() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (r, _buf) = new_capturing(100, 24);
+        let progress = SubtaskProgress {
+            call_id: "team:terminal-styles".into(),
+            completed: 1,
+            total: 3,
+            items: [
+                ("done", SubtaskStatus::Completed),
+                ("stopped", SubtaskStatus::Stopped),
+                ("failed", SubtaskStatus::Failed),
+            ]
+            .into_iter()
+            .map(|(label, status)| SubtaskItem {
+                label: label.into(),
+                description: String::new(),
+                model: String::new(),
+                activity: label.into(),
+                started_at: None,
+                output_tokens: 0,
+                status,
+            })
+            .collect(),
+        };
+        let (_, rows) = r.agent_group_rows(&progress, true);
+        let first_style = |row: &[Cell]| {
+            row.iter()
+                .find(|cell| !cell.ch.is_whitespace())
+                .expect("styled content")
+                .style
+                .clone()
+        };
+        assert_ne!(first_style(&rows[0]), first_style(&rows[1]));
+        assert_eq!(first_style(&rows[1]).fg, r.style_for(Role::Warning).fg);
+        assert_eq!(first_style(&rows[2]).fg, r.style_for(Role::Error).fg);
+    }
+
+    #[test]
+    fn concurrent_task_and_team_agent_groups_update_independently() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut r, _buf) = new_capturing(120, 30);
+        let progress = |call_id: &str, label: &str| SubtaskProgress {
+            call_id: call_id.into(),
+            completed: 0,
+            total: 1,
+            items: vec![SubtaskItem {
+                label: label.into(),
+                description: format!("inspect {label}"),
+                model: "GLM-5.2".into(),
+                activity: "thinking".into(),
+                started_at: Some(std::time::Instant::now()),
+                output_tokens: 0,
+                status: SubtaskStatus::Running,
+            }],
+        };
+        let mut task = progress("call-task-1", "task-agent");
+        let mut team = progress("team:run-1", "team-agent");
+        r.render(UiLine::AgentGroup {
+            progress: task.clone(),
+            finished: false,
+        });
+        r.render(UiLine::AgentGroup {
+            progress: team.clone(),
+            finished: false,
+        });
+        assert_eq!(r.live_agent_groups.len(), 2);
+
+        task.items[0].output_tokens = 128;
+        r.render(UiLine::AgentGroup {
+            progress: task,
+            finished: false,
+        });
+        team.items[0].output_tokens = 256;
+        r.render(UiLine::AgentGroup {
+            progress: team.clone(),
+            finished: false,
+        });
+        assert!(r.live_agent_groups.contains_key("call-task-1"));
+        assert!(r.live_agent_groups.contains_key("team:run-1"));
+
+        team.items[0].status = SubtaskStatus::Completed;
+        team.completed = 1;
+        r.render(UiLine::AgentGroup {
+            progress: team,
+            finished: true,
+        });
+        assert!(r.live_agent_groups.contains_key("call-task-1"));
+        assert!(!r.live_agent_groups.contains_key("team:run-1"));
+    }
+
+    #[test]
+    fn freeze_event_seals_every_live_agent_group_for_resize_replay() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut r, _buf) = new_capturing(120, 30);
+        for (call_id, label) in [("call-task-1", "task-agent"), ("team:run-1", "team-agent")]
+        {
+            r.render(UiLine::AgentGroup {
+                progress: SubtaskProgress {
+                    call_id: call_id.into(),
+                    completed: 0,
+                    total: 1,
+                    items: vec![SubtaskItem {
+                        label: label.into(),
+                        description: String::new(),
+                        model: String::new(),
+                        activity: "thinking".into(),
+                        started_at: None,
+                        output_tokens: 0,
+                        status: SubtaskStatus::Running,
+                    }],
+                },
+                finished: false,
+            });
+        }
+        assert_eq!(r.live_agent_groups.len(), 2);
+
+        r.render(UiLine::AgentGroupsFreeze);
+
+        assert!(r.live_agent_groups.is_empty());
+        assert!(r.frozen_agent_groups.is_empty());
+        let sealed = r
+            .body_log
+            .iter()
+            .filter(|event| matches!(event, UiLine::AgentGroup { finished: true, .. }))
+            .count();
+        assert_eq!(sealed, 2);
+
+        r.reflow_body_to_current_width();
+        assert!(r.live_agent_groups.is_empty(), "sealed history must not become live again");
+    }
+
+    #[test]
+    fn repeated_agent_group_id_starts_new_history_lifecycle_after_terminal() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut r, _buf) = new_capturing(100, 24);
+        let progress = SubtaskProgress {
+            call_id: "team:run-1".into(),
+            completed: 0,
+            total: 1,
+            items: vec![SubtaskItem {
+                label: "explorer".into(),
+                description: String::new(),
+                model: String::new(),
+                activity: "thinking".into(),
+                started_at: None,
+                output_tokens: 0,
+                status: SubtaskStatus::Running,
+            }],
+        };
+        r.render(UiLine::AgentGroup {
+            progress: progress.clone(),
+            finished: false,
+        });
+        r.render(UiLine::AgentGroup {
+            progress: progress.clone(),
+            finished: true,
+        });
+        r.render(UiLine::AgentGroup {
+            progress,
+            finished: false,
+        });
+
+        let lifecycle_count = r
+            .body_log
+            .iter()
+            .filter(|event| matches!(event, UiLine::AgentGroup { .. }))
+            .count();
+        assert_eq!(lifecycle_count, 2);
+    }
+
+    #[test]
+    fn scrolled_agent_group_freezes_without_appending_repeated_snapshots() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut r, _buf) = new_capturing(100, 12);
+        let mut progress = SubtaskProgress {
+            call_id: "team:run-long".into(),
+            completed: 0,
+            total: 1,
+            items: vec![SubtaskItem {
+                label: "explorer".into(),
+                description: "long audit".into(),
+                model: String::new(),
+                activity: "thinking".into(),
+                started_at: None,
+                output_tokens: 0,
+                status: SubtaskStatus::Running,
+            }],
+        };
+        r.render(UiLine::AgentGroup {
+            progress: progress.clone(),
+            finished: false,
+        });
+        let group = r.live_agent_groups["team:run-long"].clone();
+        r.scrolled_off = group.header_idx + 1;
+        progress.items[0].output_tokens = 100;
+        r.render(UiLine::AgentGroup {
+            progress: progress.clone(),
+            finished: false,
+        });
+        assert!(r.frozen_agent_groups.contains("team:run-long"));
+        let body_len = r.body_lines.len();
+
+        progress.items[0].output_tokens = 200;
+        r.render(UiLine::AgentGroup {
+            progress: progress.clone(),
+            finished: false,
+        });
+        assert_eq!(r.body_lines.len(), body_len, "frozen updates must not append");
+
+        progress.items[0].status = SubtaskStatus::Completed;
+        progress.completed = 1;
+        r.render(UiLine::AgentGroup {
+            progress,
+            finished: true,
+        });
+        assert!(!r.frozen_agent_groups.contains("team:run-long"));
     }
 
     #[test]
@@ -16475,8 +17323,38 @@ mod tests {
                 scroll_offset: 0,
                 batch: None,
             };
-            // header + blank + question + blank + input + hint = 6.
-            assert_eq!(r.build_user_input_rows(&view, 78, 80).len(), 6);
+            // header + blank + question + blank + 3-row input box + hint = 8.
+            let rows = r.build_user_input_rows(&view, 78, 80);
+            assert_eq!(rows.len(), 8);
+            assert!(
+                rows.rows
+                    .iter()
+                    .flatten()
+                    .all(|cell| !cell.style.reverse),
+                "text input must not use a full-width reverse-video strip"
+            );
+            for width in 0..5 {
+                let tiny = r.build_user_input_rows(&view, width, width);
+                let active = &tiny.rows[tiny.active.start];
+                let rendered_width: usize = active.iter().map(|cell| cell.width as usize).sum();
+                assert!(
+                    rendered_width <= width,
+                    "narrow text input exceeded its {width}-column budget: {rendered_width}"
+                );
+            }
+            let (mut ascii, _buf) = new_capturing(40, 24);
+            ascii.caps.unicode_symbols = false;
+            let mut empty = view.clone();
+            empty.text.clear();
+            let ascii_rows = ascii.build_user_input_rows(&empty, 38, 40);
+            let ascii_dump = ascii_rows
+                .rows
+                .iter()
+                .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(ascii_dump.contains("Enter answer"), "{ascii_dump}");
+            assert!(!ascii_dump.contains("输入答案"), "{ascii_dump}");
             status.user_input = Some(view);
             r.render(UiLine::InputPrompt {
                 buf: String::new(),
@@ -16493,7 +17371,8 @@ mod tests {
                 "question header\n{dump}"
             );
             assert!(
-                vterm.any_row(|r| r.contains("> atomcode")),
+                vterm
+                    .any_row(|r| r.contains("atomcode") && (r.contains("❯") || r.contains(">"))),
                 "text input row\n{dump}"
             );
         }
@@ -16546,6 +17425,51 @@ mod tests {
         assert!(
             caret < placeholder,
             "caret ▏ must render BEFORE the placeholder (输入自己的答案…)\nrow={row:?}\n{dump}"
+        );
+    }
+
+    #[test]
+    fn empty_text_answer_cursor_renders_before_the_placeholder() {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+
+        let (mut r, buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let mut status = status_basic();
+        status.user_input = Some(crate::render::UserInputPanelView {
+            header: "Repository name".into(),
+            question: "What should the new repository be called?".into(),
+            mode: UserInputMode::Text,
+            options: Vec::new(),
+            cursor: 0,
+            checked: Vec::new(),
+            text: String::new(),
+            custom_text: String::new(),
+            custom: false,
+            scroll_offset: 0,
+            batch: None,
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let dump = vterm.dump();
+        let row = (0..24)
+            .map(|y| vterm.row_text(y))
+            .find(|row| row.contains('输'))
+            .unwrap_or_else(|| panic!("text-answer row not found\n{dump}"));
+        let caret = row
+            .find('\u{258f}')
+            .unwrap_or_else(|| panic!("caret ▏ not rendered\nrow={row:?}\n{dump}"));
+        let placeholder = row.find('输').expect("placeholder present");
+        assert!(
+            caret < placeholder,
+            "caret ▏ must render before the empty text placeholder\nrow={row:?}\n{dump}"
         );
     }
 
@@ -16657,6 +17581,7 @@ mod tests {
             total: 1,
             index: 1,
             answered: vec![false],
+            summaries: vec![],
             on_submit: false,
         }));
         assert_eq!(
@@ -16670,6 +17595,7 @@ mod tests {
             total: 2,
             index: 1,
             answered: vec![false, false],
+            summaries: vec![],
             on_submit: false,
         }));
         let q_rows = r.build_user_input_panel_view(&q, 78, 80, 24);
@@ -16681,11 +17607,23 @@ mod tests {
         // nav + blank + (single rows minus its own hint) + one batch hint = single + 2.
         assert_eq!(q_rows.len(), single_rows + 2);
 
-        // Submit stop: exactly 5 rows (nav + blank + submit + blank + hint).
+        // Submit stop: review every answer before the active confirmation row.
         let sub = base(Some(UserInputBatchMeta {
             total: 2,
             index: 2,
             answered: vec![true, false],
+            summaries: vec![
+                crate::render::UserInputAnswerSummary {
+                    header: "Auth".into(),
+                    question: "Which auth?".into(),
+                    answer: Some("OAuth".into()),
+                },
+                crate::render::UserInputAnswerSummary {
+                    header: "Region".into(),
+                    question: "Which region?".into(),
+                    answer: None,
+                },
+            ],
             on_submit: true,
         }));
         let sub_rows = r.build_user_input_panel_view(&sub, 78, 80, 24);
@@ -16694,7 +17632,34 @@ mod tests {
             r.user_input_panel_view_row_count(&sub),
             "row_count invariant (submit)"
         );
-        assert_eq!(sub_rows.len(), 5);
+        let sub_dump = sub_rows
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compact_sub_dump = sub_dump.replace(' ', "");
+        assert!(
+            compact_sub_dump.contains("提交前确认"),
+            "review title:\n{sub_dump}"
+        );
+        assert!(sub_dump.contains("Which auth?"), "question shown:\n{sub_dump}");
+        assert!(sub_dump.contains("OAuth"), "answer shown:\n{sub_dump}");
+        assert!(
+            compact_sub_dump.contains("未回答"),
+            "missing answer shown:\n{sub_dump}"
+        );
+        let (mut ascii, _buf) = new_capturing(80, 24);
+        ascii.caps.unicode_symbols = false;
+        let ascii_rows = ascii.build_user_input_panel_view(&sub, 78, 80, 24);
+        let ascii_dump = ascii_rows
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(ascii_dump.contains("Answer: OAuth"), "{ascii_dump}");
+        assert!(ascii_dump.contains("Unanswered"), "{ascii_dump}");
+        assert!(!ascii_dump.contains("回答："), "{ascii_dump}");
+        assert!(!ascii_dump.contains("未回答"), "{ascii_dump}");
         let tiny_submit = r.build_user_input_panel_view(&sub, 78, 80, 3);
         let tiny_dump = tiny_submit
             .iter()
@@ -17091,49 +18056,98 @@ mod tests {
         }
     }
 
-    /// User-message text uses the foreground paired with its explicit panel
-    /// background. Inheriting the terminal default is unsafe on Windows where
-    /// `Auto` may fall back to a dark panel inside an actually-light terminal.
+    /// Committed user text keeps the terminal foreground/background used by
+    /// the composer; only the prompt marker carries the accent colour.
     #[test]
-    fn retained_user_message_text_uses_panel_foreground() {
-        let _theme = crate::highlight::theme::test_lock();
-        crate::highlight::theme::set_theme_mode(false);
-        let (mut r, _buf) = new_capturing(80, 24);
-        let expected_fg = crate::render::theme::role(r.caps, crate::render::theme::Role::PanelFg);
-        r.render(UiLine::User("hello".into()));
-
-        let mut found = false;
-        for row in &r.body_lines {
-            let text: String = row.iter().map(|c| c.ch).collect();
-            if !text.contains("hello") {
-                continue;
-            }
-            found = true;
-            // The text glyphs (the alphabetic cells; the chevron is a glyph/space)
-            // must carry the foreground selected for the panel background.
-            for cell in row {
-                if cell.ch.is_alphabetic() {
-                    assert_eq!(
-                        cell.style.fg, expected_fg,
-                        "user text cell '{}' must use panel fg {:?}, got {:?}",
-                        cell.ch, expected_fg, cell.style.fg,
-                    );
-                }
-            }
-            break;
-        }
-        assert!(found, "no row containing the user text 'hello' found");
-    }
-
-    /// A multi-line user message reads as one unit via the panel background,
-    /// not a coloured bar: the `❯` chevron sits on the first row, and every
-    /// continuation row starts with a plain bg-filled indent (no `▎` bar) so
-    /// the block is delineated by its background alone.
-    #[test]
-    fn retained_multiline_user_message_continuation_is_bg_no_bar() {
+    fn retained_user_message_keeps_composer_text_style() {
         let (mut r, _buf) = new_capturing(80, 24);
         r.caps.colors = true;
-        let expected_bg = crate::render::theme::role(r.caps, crate::render::theme::Role::PanelBg);
+        r.render(UiLine::User("hello".into()));
+
+        let row = r
+            .body_lines
+            .iter()
+            .find(|row| {
+                row.iter()
+                    .map(|c| c.ch)
+                    .collect::<String>()
+                    .contains("hello")
+            })
+            .expect("user text row present");
+        for cell in row.iter().filter(|cell| cell.ch.is_alphabetic()) {
+            assert_eq!(cell.style.fg, None, "user text must inherit terminal fg");
+            assert_eq!(cell.style.bg, None, "user text must inherit terminal bg");
+        }
+    }
+
+    /// Directly pasted circled list labels receive a display-only separator
+    /// after commit, avoiding glyph overlap in Windows Terminal fonts.
+    #[test]
+    fn retained_user_message_spaces_compact_circled_list_labels() {
+        let (mut r, _buf) = new_capturing(120, 24);
+        let source = "如果是 ①Rust、②前端：属于模型没加空格，无需修 TUI。";
+        r.render(UiLine::User(source.into()));
+
+        let visible = r
+            .body_lines
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .filter(|cell| cell.width != 0)
+                    .map(|cell| cell.ch)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            visible.contains("如果是 ① Rust、② 前端：属于模型没加空格，无需修 TUI。"),
+            "committed user echo should space compact circled labels: {visible:?}"
+        );
+        assert!(!visible.contains("①Rust"));
+        assert!(!visible.contains("②前端"));
+    }
+
+    /// History recall restores source text into the live composer rather than
+    /// emitting a committed `UiLine::User`. Its display projection must apply
+    /// the same circled-label spacing without changing the recalled buffer.
+    #[test]
+    fn retained_composer_spaces_recalled_circled_list_labels() {
+        let (mut r, buf) = new_capturing(120, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(120, 24);
+        let source = "如果是 ①Rust、②前端：属于模型没加空格，无需修 TUI。";
+        let mut status = status_basic();
+        status.history = Some(crate::render::HistoryPosition {
+            current: 119,
+            total: 119,
+        });
+
+        r.render(UiLine::InputPrompt {
+            buf: source.into(),
+            cursor_byte: source.len(),
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        assert!(
+            vterm.any_row(|row| row.contains("① Rust") && row.contains("② 前")),
+            "recalled composer should use spaced display projection:\n{}",
+            vterm.dump()
+        );
+        assert_eq!(
+            r.input_buf, source,
+            "recalled source text must stay unchanged"
+        );
+    }
+
+    /// A multi-line committed message uses the same layout as the composer:
+    /// `❯` on the first row and a plain equal-width indent on continuation rows.
+    #[test]
+    fn retained_multiline_user_message_matches_composer_indent() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = true;
         r.render(UiLine::User("first line\nsecond line".into()));
 
         let mut saw_chevron = false;
@@ -17154,16 +18168,12 @@ mod tests {
                 let head = row.first().expect("continuation row must not be empty");
                 assert_eq!(
                     head.ch, ' ',
-                    "continuation must start with a plain indent, not a ▎ bar, got {:?}",
+                    "continuation must start with the composer indent, got {:?}",
                     head.ch
                 );
                 assert_eq!(
-                    head.style.bg, expected_bg,
-                    "the continuation indent must carry the panel background"
-                );
-                assert!(
-                    row.iter().all(|c| c.ch != '\u{258e}'),
-                    "continuation row must not contain a ▎ bar"
+                    head.style.bg, None,
+                    "continuation indent must not paint a panel"
                 );
             }
         }
@@ -17174,14 +18184,9 @@ mod tests {
     }
 
     #[test]
-    fn retained_user_message_renders_panel_bg_block() {
+    fn retained_user_message_does_not_switch_to_panel_background() {
         let (mut r, _buf) = new_capturing(80, 24);
         r.caps.colors = true;
-        let expected_bg = crate::render::theme::role(r.caps, crate::render::theme::Role::PanelBg);
-        assert!(
-            expected_bg.is_some(),
-            "PanelBg must resolve to a colour when colours are on"
-        );
         r.render(UiLine::User("hello".into()));
 
         // Locate the content row (the one carrying the user's text).
@@ -17196,38 +18201,17 @@ mod tests {
             })
             .expect("user text row present");
 
-        // Every cell on the content row carries the panel background, including
-        // the ❯ marker cell and the trailing padding spaces.
         let content = &r.body_lines[idx];
         assert!(
-            content.iter().all(|c| c.style.bg == expected_bg),
-            "all content cells must carry PanelBg, got {:?}",
+            content.iter().all(|c| c.style.bg.is_none()),
+            "committed user rows must keep the composer background, got {:?}",
             content.iter().map(|c| c.style.bg).collect::<Vec<_>>()
         );
-        // Padded to screen width − PAD_COL (80 − 2 = 78) display columns.
-        let cols: usize = content.iter().map(|c| c.width as usize).sum();
-        assert_eq!(cols, 78, "content row padded to screen width − PAD_COL");
-
-        // The panel background hugs the content: no blank background padding
-        // row above or below. The normal paragraph spacer remains below.
-        assert_eq!(idx, 0, "no bg padding row may precede the content");
         let below = &r.body_lines[idx + 1];
         assert!(
             below.is_empty(),
             "the row below content must be the plain paragraph spacer"
         );
-    }
-
-    #[test]
-    fn retained_user_message_no_bg_when_colours_disabled() {
-        let (mut r, _buf) = new_capturing(80, 24);
-        r.caps.colors = false;
-        r.render(UiLine::User("hello".into()));
-        for row in &r.body_lines {
-            for c in row {
-                assert_eq!(c.style.bg, None, "no background when colours are disabled");
-            }
-        }
     }
 
     /// Submitting a recalled prompt clears the composer before its permanent
@@ -17282,31 +18266,29 @@ mod tests {
         assert!(visible.iter().any(|row| row.contains("second line")));
     }
 
-    /// No-colour terminals keep the `▎` continuation bar (there is no panel
-    /// background to delineate a multi-line block without it). On Windows /
-    /// no-unicode-font terminals that bar falls back to an ASCII `|` (2 display
-    /// cols, same as `❯`→`>`), so layout stays identical and no tofu appears.
+    /// Windows/no-unicode terminals use the ASCII prompt and the same plain
+    /// continuation indent, so submitted messages stay aligned without tofu.
     #[test]
-    fn retained_multiline_user_bar_ascii_fallback() {
+    fn retained_multiline_user_indent_ascii_fallback() {
         let (mut r, _buf) = new_capturing(80, 24);
-        r.caps.colors = false; // no panel background → bar is kept as the grouping cue
+        r.caps.colors = false;
         r.caps.unicode_symbols = false; // Windows legacy conhost / no-unicode font
         r.render(UiLine::User("first line\nsecond line".into()));
 
-        let mut saw_bar = false;
+        let mut saw_continuation = false;
         for row in &r.body_lines {
             let text: String = row.iter().map(|c| c.ch).collect();
             if text.contains("second line") {
-                saw_bar = true;
-                let bar = row.first().expect("continuation row must not be empty");
+                saw_continuation = true;
+                let indent = row.first().expect("continuation row must not be empty");
                 assert_eq!(
-                    bar.ch, '|',
-                    "ascii fallback bar must be '|', got {:?}",
-                    bar.ch
+                    indent.ch, ' ',
+                    "ascii continuation must use a plain indent, got {:?}",
+                    indent.ch
                 );
             }
         }
-        assert!(saw_bar, "expected a continuation row");
+        assert!(saw_continuation, "expected a continuation row");
     }
 
     /// Regression: when a long Bash command wraps to multiple terminal
@@ -17801,7 +18783,14 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let sink = CapturingSink(buf.clone());
         let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
+        r.caps.kitty_keyboard = true;
+        assert!(crate::should_enable_kitty_keyboard(&r.caps));
         r.suspend_for_external();
+        let suspend_bytes = buf.lock().unwrap().clone();
+        assert!(
+            String::from_utf8_lossy(&suspend_bytes).contains("\x1b[<1u"),
+            "suspend must pop the CSI-u level AtomCode pushed"
+        );
         buf.lock().unwrap().clear();
 
         r.resume_from_external();
@@ -17811,6 +18800,49 @@ mod tests {
         assert!(
             output.contains("\x1b[>1u") && !output.contains("\x1b[>3u"),
             "resume must enable disambiguation without release reports: {output:?}"
+        );
+    }
+
+    #[test]
+    fn retained_resume_keeps_generic_web_terminal_on_legacy_keys() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink(buf.clone());
+        let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
+        assert!(!r.caps.kitty_keyboard, "generic xterm must be conservative");
+        r.suspend_for_external();
+        let suspend_bytes = buf.lock().unwrap().clone();
+        let suspend_output = String::from_utf8_lossy(&suspend_bytes);
+        assert!(
+            !suspend_output.contains("\x1b[<1u"),
+            "suspend must not pop CSI-u when AtomCode never pushed it: {suspend_output:?}"
+        );
+        buf.lock().unwrap().clear();
+
+        r.resume_from_external();
+
+        let bytes = buf.lock().unwrap().clone();
+        let output = String::from_utf8_lossy(&bytes);
+        assert!(
+            !output.contains("\x1b[>1u"),
+            "resume must not arm CSI-u on a generic web terminal: {output:?}"
+        );
+    }
+
+    #[test]
+    fn retained_shutdown_does_not_pop_generic_web_terminal_keyboard_state() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink(buf.clone());
+        let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
+        assert!(!r.caps.kitty_keyboard, "generic xterm must be conservative");
+        buf.lock().unwrap().clear();
+
+        r.shutdown();
+
+        let bytes = buf.lock().unwrap().clone();
+        let output = String::from_utf8_lossy(&bytes);
+        assert!(
+            !output.contains("\x1b[<1u"),
+            "shutdown must not pop CSI-u when AtomCode never pushed it: {output:?}"
         );
     }
 
@@ -20068,6 +21100,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn initial_history_replay_emits_only_bounded_tail_but_keeps_full_model() {
+        let (mut r, buf) = new_capturing(40, 12);
+        buf.lock().unwrap().clear();
+        r.set_history_replay_max_rows(Some(3));
+
+        r.begin_initial_history_replay();
+        for i in 0..10 {
+            r.render(UiLine::CommandOutput(format!("history-row-{i}")));
+        }
+        assert!(buf.lock().unwrap().is_empty());
+        r.end_initial_history_replay();
+
+        let out = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        assert!(!out.contains("history-row-0"), "old prefix leaked: {out:?}");
+        assert!(out.contains("history-row-9"), "newest row missing: {out:?}");
+        assert!(r.body_lines.len() > 3, "retained model must stay complete");
+        let semantic_text = r.body_log.iter().filter_map(|line| match line {
+            UiLine::CommandOutput(text) => Some(text.as_str()),
+            _ => None,
+        }).collect::<String>();
+        assert!(semantic_text.contains("history-row-0"));
+        assert!(semantic_text.contains("history-row-9"));
+        assert_eq!(r.body_lines.len().saturating_sub(r.scrolled_off), 3);
+    }
+
+    #[test]
+    fn resize_reuses_history_replay_cap_instead_of_replaying_full_prefix() {
+        let (mut r, buf) = new_capturing(40, 12);
+        r.set_history_replay_max_rows(Some(3));
+        for i in 0..10 {
+            r.render(UiLine::User(format!("resize-history-{i}")));
+        }
+        r.flush_deferred();
+        buf.lock().unwrap().clear();
+
+        r.on_resize(41, 12);
+
+        let out = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        assert!(!out.contains("resize-history-0"), "old prefix leaked: {out:?}");
+        assert!(out.contains("resize-history-9"), "newest row missing: {out:?}");
+        assert_eq!(r.body_lines.len().saturating_sub(r.scrolled_off), 3);
+    }
+
     /// Windows resize footer-duplication regression: `on_resize` must call
     /// `screen.invalidate()` after rebuilding the Screen so the repaint
     /// cold-starts with a per-row CUP+EL preamble — like `reset()` and
@@ -21737,6 +22813,30 @@ mod todo_panel_rows_tests {
     }
 
     #[test]
+    fn frontier_survives_tight_overflow_budget() {
+        // One body row cannot show both the frontier and a `More` marker. The
+        // active task is the useful state, so it must win that final slot.
+        let it = items(&[
+            (TodoStatus::InProgress, "active"),
+            (TodoStatus::Pending, "later one"),
+            (TodoStatus::Pending, "later two"),
+        ]);
+        let rows = todo_panel_rows(&it, 0, 1, 3, 3);
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(
+            &rows[2],
+            TodoPanelRow::Item {
+                index: 0,
+                status: TodoStatus::InProgress,
+                content,
+            } if content == "active"
+        ));
+        assert!(!rows
+            .iter()
+            .any(|row| matches!(row, TodoPanelRow::More { .. })));
+    }
+
+    #[test]
     fn never_exceeds_max_rows() {
         let mut it = items(&[(TodoStatus::InProgress, "ip"), (TodoStatus::Completed, "c")]);
         for i in 0..20 {
@@ -21849,6 +22949,103 @@ mod todo_panel_rows_tests {
             text(ip).contains('#'),
             "item must show a #N number, got: {:?}",
             text(ip)
+        );
+    }
+
+    #[test]
+    fn build_todo_rows_wraps_frontier_within_the_fixed_panel_budget() {
+        use crate::terminal::{EnvView, TerminalCaps};
+        use atomcode_capabilities::tools::todo::TodoStatus;
+
+        let caps = TerminalCaps::from_env(EnvView {
+            is_stdout_tty: true,
+            term: Some("xterm-256color".into()),
+            colorterm: Some("truecolor".into()),
+            lang: Some("en_US.UTF-8".into()),
+            ..Default::default()
+        });
+        let r = RetainedRenderer::with_writer(Vec::<u8>::new(), caps, 40, 24);
+        let todo = crate::render::TodoProgress {
+            current: None,
+            completed: 0,
+            in_progress: 0,
+            total: 6,
+            items: vec![
+                (
+                    TodoStatus::Pending,
+                    "frontier alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu"
+                        .into(),
+                ),
+                (TodoStatus::Pending, "second task".into()),
+                (TodoStatus::Pending, "third task".into()),
+                (TodoStatus::Pending, "fourth task".into()),
+                (TodoStatus::Pending, "fifth task".into()),
+                (TodoStatus::Pending, "sixth task".into()),
+            ],
+        };
+
+        let rows = r.build_todo_rows(&todo, 32);
+        let rendered = rows
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .collect::<Vec<_>>();
+        assert!(rows.len() <= MAX_TODO_PANEL_ROWS, "{rendered:#?}");
+        assert_eq!(
+            r.todo_panel_row_count(&todo, 32),
+            rows.len(),
+            "footer measurement must include wrapped continuation rows"
+        );
+        assert!(
+            rendered
+                .iter()
+                .filter(|line| line.contains("frontier") || line.contains("delta"))
+                .count()
+                >= 2,
+            "the pending frontier should wrap onto continuation rows: {rendered:#?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("more")),
+            "tasks displaced by wrapped rows must remain explicit: {rendered:#?}"
+        );
+    }
+
+    #[test]
+    fn wrapped_frontier_uses_ascii_ellipsis_without_unicode_support() {
+        use crate::terminal::{EnvView, TerminalCaps};
+        use atomcode_capabilities::tools::todo::TodoStatus;
+
+        let caps = TerminalCaps::from_env(EnvView {
+            is_stdout_tty: true,
+            term: Some("dumb".into()),
+            lang: Some("C".into()),
+            ..Default::default()
+        });
+        assert!(!caps.unicode_symbols);
+        let r = RetainedRenderer::with_writer(Vec::<u8>::new(), caps, 40, 24);
+        let todo = crate::render::TodoProgress {
+            current: Some("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda".into()),
+            completed: 0,
+            in_progress: 1,
+            total: 1,
+            items: vec![(
+                TodoStatus::InProgress,
+                "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda".into(),
+            )],
+        };
+
+        let rendered = r
+            .build_todo_rows(&todo, 24)
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("..."),
+            "expected ASCII ellipsis: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('…'),
+            "unexpected Unicode ellipsis: {rendered:?}"
         );
     }
 }

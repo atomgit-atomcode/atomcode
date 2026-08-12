@@ -1,3 +1,4 @@
+use crate::event::PolicyIntervention;
 use crate::request::RequestCtx;
 use crate::tool::{Tool, ToolCall, ToolResult};
 use async_trait::async_trait;
@@ -83,6 +84,12 @@ pub enum BeforeOutcome {
     /// assistant tool batch has received a paired result. Reserved for hard
     /// policy boundaries where retrying through another shell spelling is unsafe.
     DenyTurn { reason: String },
+    /// Hard policy boundary with a machine-readable, non-sensitive recovery
+    /// contract for drivers. The rejected operation remains non-overridable.
+    DenyTurnWithIntervention {
+        reason: String,
+        intervention: PolicyIntervention,
+    },
 }
 
 impl BeforeOutcome {
@@ -98,19 +105,30 @@ impl BeforeOutcome {
             reason: reason.into(),
         }
     }
+    pub fn deny_turn_with_intervention(
+        reason: impl Into<String>,
+        intervention: PolicyIntervention,
+    ) -> Self {
+        BeforeOutcome::DenyTurnWithIntervention {
+            reason: reason.into(),
+            intervention,
+        }
+    }
     /// True iff this is a blocking decision.
     pub fn is_deny(&self) -> bool {
         matches!(
             self,
-            BeforeOutcome::Deny { .. } | BeforeOutcome::DenyTurn { .. }
+            BeforeOutcome::Deny { .. }
+                | BeforeOutcome::DenyTurn { .. }
+                | BeforeOutcome::DenyTurnWithIntervention { .. }
         )
     }
     /// The deny reason, if this is a [`Deny`](BeforeOutcome::Deny).
     pub fn deny_reason(&self) -> Option<&str> {
         match self {
-            BeforeOutcome::Deny { reason } | BeforeOutcome::DenyTurn { reason } => {
-                Some(reason.as_str())
-            }
+            BeforeOutcome::Deny { reason }
+            | BeforeOutcome::DenyTurn { reason }
+            | BeforeOutcome::DenyTurnWithIntervention { reason, .. } => Some(reason.as_str()),
             _ => None,
         }
     }

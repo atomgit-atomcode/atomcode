@@ -83,7 +83,10 @@ impl LifecycleHooks for StatusReminderHook {
         if ctx.round < 2 {
             return;
         }
-        messages.push(Message::user(Self::render(Local::now(), ctx)));
+        let body = Self::render(Local::now(), ctx);
+        // `render` already returns the canonical wrapper; retain that exact wire text
+        // while marking it as runtime-owned rather than human-authored.
+        messages.push(Message::synthetic_user(body));
     }
 }
 
@@ -177,6 +180,7 @@ mod tests {
         ];
         hook.pre_request(&mut r2, &ctx(2, 128_000, 1_000)).await;
         assert_eq!(r2.len(), 4, "round 2 appends exactly one tail");
+        assert!(r2[3].synthetic, "runtime reminders must carry provenance");
         assert!(
             r2[3].text.contains("<system-reminder>") && r2[3].text.contains("Current date"),
             "tail carries the wrapped status: {:?}",

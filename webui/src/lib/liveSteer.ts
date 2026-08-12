@@ -47,6 +47,78 @@ export function acknowledgeLiveSteers(
   return remaining;
 }
 
+export type SteerReceiptDisposition = 'started' | 'steered';
+export type SteerReceiptOutcome = 'clear' | 'confirm' | 'release';
+
+/**
+ * A `/live/message` response may arrive after the user has selected another
+ * provider. Only let the response undo the exact provider selection that was
+ * submitted with that request; otherwise it is stale UI state.
+ *
+ * The fallback (and its "stop the turn to switch models" notice) only makes
+ * sense when the runtime is actually on a DIFFERENT model than the user asked
+ * for. A same-name mismatch (only the provider fingerprint changed) leaves the
+ * user's selection effectively active, so it must not fire — otherwise merely
+ * sending a mid-turn steer spuriously nags the user about switching models.
+ */
+export function shouldApplySteerProviderFallback(
+  submittedProvider: string | null,
+  currentProvider: string | null,
+  providerChangeApplied: boolean | undefined,
+  effectiveProvider: string | undefined,
+): effectiveProvider is string {
+  return providerChangeApplied === false
+    && Boolean(effectiveProvider)
+    && currentProvider === submittedProvider
+    && submittedProvider !== effectiveProvider;
+}
+
+/**
+ * Reconcile a locally-submitted steer against its `/live/message` receipt.
+ *
+ * A `steered` receipt is authoritative: the runtime accepted the input into the
+ * active turn. It must NEVER be rolled back into the composer — that both breaks
+ * parity with the TUI (which folds the input or, if the turn ends first, re-runs
+ * it as the next turn — but never bounces it back) and would duplicate the
+ * prompt, because the kernel already re-runs any steer that arrived too late to
+ * fold as the next turn (see `agent.rs` leftover-steer drain).
+ *
+ * - `started`  → `clear`: a new turn began; the submit IS that turn's input.
+ * - `steered` while the client has not yet consumed the turn terminal → `confirm`:
+ *   keep it pending; the `steered` ack removes it when the fold lands, or the
+ *   turn terminal releases it if the turn ends first.
+ * - `steered` after the terminal was consumed → `release`: the fold can no longer
+ *   land, so drop the pending marker and defer to the runtime's re-run of the
+ *   leftover steer. Do NOT restore to the composer.
+ */
+export function reconcileSteerReceipt(
+  disposition: SteerReceiptDisposition,
+  lifecycle: { running: boolean; terminalConsumed: boolean },
+): SteerReceiptOutcome {
+  if (disposition === 'started') return 'clear';
+  return lifecycle.terminalConsumed ? 'release' : 'confirm';
+}
+
+/**
+ * Whether a message that was optimistically appended for a steer is still
+ * waiting to fold into the current turn — i.e. its steer was accepted
+ * (`confirmed`) but the runtime has not yet drained it at a tool boundary.
+ *
+ * The fold ack (`acknowledgeLiveSteers`) removes the entry from `pendingSteers`
+ * at the exact moment the steer enters the turn, so the badge this drives stays
+ * on the bubble until the steer truly applies. Unconfirmed submits (a new idle
+ * turn resolves to `started` and is dropped) are not badged.
+ */
+export function isSteerPending(
+  pendingSteerId: string | undefined,
+  pendingSteers: PendingLiveSteer[],
+): boolean {
+  return (
+    pendingSteerId !== undefined &&
+    pendingSteers.some((steer) => steer.id === pendingSteerId && steer.confirmed)
+  );
+}
+
 /** Restore unacknowledged steers to an editable draft without losing order. */
 export function pendingSteersToDraft(pending: PendingLiveSteer[]): {
   text: string;

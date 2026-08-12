@@ -3,7 +3,7 @@
 //! The runtime owns the replaceable kernel [`AgentHandle`] so native controls and
 //! events never need to traverse a legacy driver adapter.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -20,7 +20,9 @@ use atomcode_capabilities::session::{PresentationFile, SessionMeta, StorageOwner
 use atomcode_capabilities::tools::{ApprovalResponse, APPROVAL_KIND};
 use atomcode_kernel::agent::AgentHandle;
 use atomcode_kernel::checkpoint::CompactionCheckpointError;
-use atomcode_kernel::event::{AgentCommand, AgentEvent, RequestId, StopReason};
+use atomcode_kernel::event::{
+    AgentCommand, AgentEvent, PolicyIntervention, PolicyRecoveryAction, RequestId, StopReason,
+};
 pub use atomcode_kernel::message::CompactTrigger;
 use atomcode_kernel::message::{
     CompactionStrategy, CompactionView, Conversation, ImageContent, Message, MessageMeta,
@@ -46,6 +48,12 @@ use crate::{assemble, CodingAgentConfig, CodingProviderFactory, PluginHookSource
 pub enum CodingRuntimeEvent {
     /// A kernel observation that is not owned as a runtime terminal/request.
     Agent(AgentEvent),
+    /// Structured Team Agent lifecycle projection. Drivers consume this typed
+    /// event instead of parsing tool output or progress strings.
+    Team {
+        generation: RuntimeGeneration,
+        event: atomcode_capabilities::team::TeamEvent,
+    },
     /// Vision (VL) preprocessing recognised the turn's image(s) — the driver
     /// renders a "✓ VL recognised image, returned N chars" status line.
     VisionPreprocessSuccess {
@@ -72,6 +80,17 @@ pub enum CodingRuntimeEvent {
     Request(RuntimeRequest),
     /// Exactly one terminal for an accepted foreground turn.
     TurnFinished(TurnCompletion),
+    /// A driver acknowledged the runtime's pending security intervention.
+    /// This is control-plane state only and is never appended to conversation input.
+    PolicyInterventionResolved {
+        intervention_id: u64,
+        action: PolicyRecoveryAction,
+    },
+    /// The runtime invalidated a pending intervention because its owning
+    /// conversation was replaced. Drivers must remove only the matching UI.
+    PolicyInterventionCleared {
+        intervention_id: u64,
+    },
     ModeChanged {
         mode: RuntimeMode,
     },
@@ -412,12 +431,17 @@ pub enum DriverCommand {
         id: RequestId,
         value: serde_json::Value,
     },
+    ResolvePolicyIntervention {
+        intervention_id: u64,
+        action: PolicyRecoveryAction,
+    },
     Cancel,
     PauseGoal,
     Compact(Option<String>),
     SetMode(RuntimeMode),
     QueueLocalContext(LocalContextInput),
     ReloadProvider(CodingAgentConfig),
+    ReprepareConfig(CodingAgentConfig),
     DeactivateProvider(ProviderUnavailableReason),
     UndoToPrompt(Option<usize>),
     Rewind {
@@ -463,6 +487,8 @@ pub enum RuntimeError {
     Busy,
     SessionInUse { id: String },
     StaleRequest { id: RequestId },
+    NoPendingPolicyIntervention,
+    InvalidPolicyRecoveryAction,
     DeliveryFailed,
     Unavailable,
     ProviderUnavailable(ProviderUnavailableReason),
@@ -482,6 +508,12 @@ impl fmt::Display for RuntimeError {
                 write!(f, "session {id:?} is already in use by another runtime")
             }
             Self::StaleRequest { id } => write!(f, "runtime request {id} is stale"),
+            Self::NoPendingPolicyIntervention => {
+                f.write_str("no security policy intervention is pending")
+            }
+            Self::InvalidPolicyRecoveryAction => {
+                f.write_str("security policy recovery action is not available")
+            }
             Self::DeliveryFailed => f.write_str("kernel command delivery failed"),
             Self::Unavailable => f.write_str("coding runtime is unavailable"),
             Self::ProviderUnavailable(reason) => write!(f, "provider unavailable: {reason}"),
@@ -558,6 +590,23 @@ struct RuntimeEventEmitter {
     generation: Arc<AtomicU64>,
 }
 
+fn project_team_event(
+    current_generation: u64,
+    sequences: &mut BTreeMap<(u64, String), u64>,
+    tagged: crate::team::GenerationTeamEvent,
+) -> Option<atomcode_capabilities::team::TeamEvent> {
+    if tagged.generation != current_generation {
+        return None;
+    }
+    let key = (tagged.generation, tagged.event.run_id.to_string());
+    let previous = sequences.entry(key).or_insert(0);
+    if tagged.event.seq <= *previous {
+        return None;
+    }
+    *previous = tagged.event.seq;
+    Some(tagged.event)
+}
+
 impl RuntimeEventEmitter {
     fn send(&self, event: CodingRuntimeEvent) -> Result<(), ()> {
         let raw_sent = self.raw.send(event.clone()).is_ok();
@@ -599,9 +648,9 @@ impl RuntimeEventEmitter {
 /// compact) queue until it returns — matching the retired bridge's behavior.
 #[async_trait::async_trait]
 pub trait ImagePreprocessor: Send + Sync {
-    /// `active_model` is the runtime's resolved main-turn model name (honours
-    /// a `--provider` / `/model` selection), used to decide vision support —
-    /// authoritative, unlike re-reading a config default. `session_id` is the
+    /// `supports_vision` is the runtime's resolved main-turn capability (honours
+    /// a `--provider` / `/model` selection and explicit profile override).
+    /// `session_id` is the
     /// active conversation's id, forwarded onto any auxiliary (VL) call so a
     /// gateway pins it to the same upstream account.
     ///
@@ -613,7 +662,7 @@ pub trait ImagePreprocessor: Send + Sync {
         &self,
         text: String,
         images: Vec<ImageContent>,
-        active_model: String,
+        supports_vision: bool,
         session_id: Option<String>,
     ) -> (UserInput, Option<VisionNotice>);
 }
@@ -1043,6 +1092,18 @@ impl CodingRuntimeHandle {
                     done,
                 }
             }
+            DriverCommand::ResolvePolicyIntervention {
+                intervention_id,
+                action,
+            } => {
+                let (done, _result) = oneshot::channel();
+                CodingRuntimeControl::ResolvePolicyIntervention {
+                    generation,
+                    intervention_id,
+                    action,
+                    done,
+                }
+            }
             DriverCommand::Cancel => {
                 let (done, _result) = oneshot::channel();
                 CodingRuntimeControl::Cancel { generation, done }
@@ -1073,6 +1134,14 @@ impl CodingRuntimeHandle {
                 CodingRuntimeControl::ReassembleProvider {
                     generation,
                     next,
+                    done,
+                }
+            }
+            DriverCommand::ReprepareConfig(next) => {
+                let (done, _result) = oneshot::channel();
+                CodingRuntimeControl::Reprepare {
+                    generation,
+                    target: ReprepareTarget::ReloadConfig(next),
                     done,
                 }
             }
@@ -1160,6 +1229,24 @@ impl CodingRuntimeHandle {
                 generation: runtime_state_generation(state),
                 id,
                 value,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    pub async fn resolve_policy_intervention(
+        &self,
+        intervention_id: u64,
+        action: PolicyRecoveryAction,
+    ) -> Result<(), RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::ResolvePolicyIntervention {
+                generation: runtime_state_generation(state),
+                intervention_id,
+                action,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -1341,6 +1428,16 @@ impl CodingRuntimeHandle {
 
     pub async fn reload_capabilities(&self) -> Result<SessionChanged, RuntimeError> {
         self.reload_capabilities_with_plugin_skills(None).await
+    }
+
+    /// Rebuild every prepared capability with `next`, preserving the current
+    /// session and runtime continuity stores.
+    pub async fn reprepare_config(
+        &self,
+        next: CodingAgentConfig,
+    ) -> Result<SessionChanged, RuntimeError> {
+        self.reprepare_target(ReprepareTarget::ReloadConfig(next))
+            .await
     }
 
     /// Reload the capability graph, optionally replacing the plugin skill
@@ -1972,6 +2069,12 @@ pub enum CodingRuntimeControl {
         value: serde_json::Value,
         done: oneshot::Sender<Result<(), RuntimeError>>,
     },
+    ResolvePolicyIntervention {
+        generation: u64,
+        intervention_id: u64,
+        action: PolicyRecoveryAction,
+        done: oneshot::Sender<Result<(), RuntimeError>>,
+    },
     Snapshot {
         generation: u64,
         done: oneshot::Sender<Result<RuntimeSnapshotReceipt, RuntimeError>>,
@@ -2112,6 +2215,7 @@ pub enum ReprepareTarget {
     Reload {
         plugin_skill_dirs: Option<Vec<(std::path::PathBuf, String)>>,
     },
+    ReloadConfig(CodingAgentConfig),
     Fresh,
     Resume(String),
     ResumeWithLease {
@@ -2224,11 +2328,15 @@ fn runtime_state_available(state: u64) -> bool {
 }
 
 fn runtime_phase_accepts_command(phase: RuntimePhase, command: &DriverCommand) -> bool {
+    if matches!(command, DriverCommand::ResolvePolicyIntervention { .. }) {
+        return phase == RuntimePhase::Ready;
+    }
     match phase {
         RuntimePhase::Ready | RuntimePhase::InTurn | RuntimePhase::WaitingApproval => true,
         RuntimePhase::AwaitingProvider | RuntimePhase::Failed => matches!(
             command,
             DriverCommand::ReloadProvider(_)
+                | DriverCommand::ReprepareConfig(_)
                 | DriverCommand::DeactivateProvider(_)
                 | DriverCommand::Shutdown
         ),
@@ -2459,6 +2567,13 @@ fn spawn_runtime_owner_with_optional_agent(
     let (session_name_tx, mut session_name_rx) = mpsc::unbounded_channel::<(u64, String)>();
     let (next_prompt_tx, mut next_prompt_rx) =
         mpsc::unbounded_channel::<NextPromptSuggestionOutcome>();
+    let (team_event_tx, mut team_event_rx) = mpsc::unbounded_channel();
+    if let Some(runtime) = resources.as_ref() {
+        runtime
+            .parts
+            .team_manager
+            .set_event_sender(team_event_tx.clone());
+    }
     let mut generation = 0;
     let event_generation = Arc::new(AtomicU64::new(generation));
     let runtime_event_tx = RuntimeEventEmitter {
@@ -2476,6 +2591,10 @@ fn spawn_runtime_owner_with_optional_agent(
     );
 
     let owner_task = tokio::spawn(async move {
+        // Keep the event bus alive while the runtime can install a replacement
+        // TeamRunManager during reprepare.
+        let _team_event_guard = team_event_tx.clone();
+        let mut team_sequences = BTreeMap::new();
         // Keep the fallback receiver pending for transitional owner tests/adapters
         // that do not mount the runtime-owned schedule_wakeup tool.
         let _wakeup_guard = _closed_wakeup_tx;
@@ -2493,6 +2612,7 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut conversation_revision = 0u64;
         let mut active_turn = None;
         let mut pending_requests = BTreeSet::new();
+        let mut pending_policy_intervention: Option<PolicyIntervention> = None;
         let mut snapshot_waiters: Vec<RuntimeSnapshotWaiter> = Vec::new();
         let mut snapshot_in_flight = false;
         let mut terminal_reason = None;
@@ -2533,6 +2653,25 @@ fn spawn_runtime_owner_with_optional_agent(
         loop {
             tokio::select! {
                 biased;
+                team_event = team_event_rx.recv() => {
+                    // Team runs persist across turns, so gate their events by the TEAM
+                    // manager's own generation (advanced only at `begin_generation` — an
+                    // agent rebuild/retask), NOT the per-turn runtime `generation`. A turn
+                    // bump that does not rebuild the agent (compaction suspend, stop) would
+                    // otherwise drop every subsequent team event and wipe the team panel.
+                    let team_generation = resources
+                        .as_ref()
+                        .map(|runtime| runtime.parts.team_manager.generation())
+                        .unwrap_or(generation);
+                    if let Some(event) = team_event.and_then(|event| {
+                        project_team_event(team_generation, &mut team_sequences, event)
+                    }) {
+                        let _ = runtime_event_tx.send(CodingRuntimeEvent::Team {
+                            generation: RuntimeGeneration(team_generation),
+                            event,
+                        });
+                    }
+                }
                 management = owner_rx.recv() => match management {
                     Some(OwnerControl::SuspendCompaction { done }) => {
                         if !compaction_suspended {
@@ -2588,6 +2727,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            resources.as_ref().map(|runtime| &runtime.parts.team_manager),
                             resources
                                 .as_ref()
                                 .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
@@ -2658,6 +2798,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            resources.as_ref().map(|runtime| &runtime.parts.team_manager),
                             resources
                                 .as_ref()
                                 .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
@@ -2692,6 +2833,9 @@ fn spawn_runtime_owner_with_optional_agent(
                         agent = Some(replacement);
                         agent_available = true;
                         observed_tokens = None;
+                        if let Some(runtime) = resources.as_ref() {
+                            runtime.parts.team_manager.begin_generation(generation);
+                        }
                         if resume_after_replace {
                             compaction_suspended = false;
                             controls
@@ -2727,6 +2871,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeShutdown,
+                            resources.as_ref().map(|runtime| &runtime.parts.team_manager),
                             resources
                                 .as_ref()
                                 .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
@@ -2840,7 +2985,14 @@ fn spawn_runtime_owner_with_optional_agent(
                             if let Some(state) = goal.as_mut() {
                                 state.round = state.round.saturating_add(1);
                                 state.last_reason = Some(verdict.clone());
-                                continuation = Some(goal_continuation_message(&verdict, &state.condition));
+                                if let Some((_, _, snapshot, _)) = held_turn.as_ref() {
+                                    state.update_progress_recap(summarize_for_goal(
+                                        &snapshot.messages,
+                                        Some(&verdict),
+                                    ));
+                                }
+                                continuation =
+                                    Some(goal_continuation_message(&verdict, &state.condition));
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
                         }
@@ -3035,6 +3187,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
+                        if pending_policy_intervention.is_some() {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
                         // A persistent goal (paused at its round cap, OR already
                         // satisfied) re-engages on the next user message: resume it
                         // into Pursuing so the follow-up advances the goal and the
@@ -3053,6 +3209,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         // chit-chat (NotAGoal → don't re-engage). `decision`: None = leave
                         // the goal as-is; Some(None) = resume keeping the condition;
                         // Some(Some(text)) = resume RE-TASKED to the new message.
+                        let mut recovery_context = None;
                         let reengage_decision: Option<Option<String>> = match goal
                             .as_ref()
                             .map(|state| state.phase)
@@ -3110,8 +3267,14 @@ fn spawn_runtime_owner_with_optional_agent(
                         if let Some(new_condition) = reengage_decision {
                             if let Some(state) = goal.as_mut() {
                                 let was_user_paused = state.phase == GoalPhase::Paused;
+                                // Recovery context belongs only to continuing the same
+                                // goal. A substantive new condition is a retask and must
+                                // not inherit progress/tool output from the old goal.
+                                if new_condition.is_none() {
+                                    recovery_context = state.recovery_context();
+                                }
                                 if let Some(condition) = new_condition {
-                                    state.condition = condition;
+                                    state.retask(condition);
                                 }
                                 if was_user_paused {
                                     state.resume_paused();
@@ -3179,10 +3342,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                 // from the runtime's own resolved resources, not a
                                 // re-read config default (which would miss a
                                 // `--provider` override).
-                                let active_model = resources
+                                let supports_vision = resources
                                     .as_ref()
-                                    .map(|r| r.config.model.clone())
-                                    .unwrap_or_default();
+                                    .is_some_and(|r| r.config.supports_vision);
                                 let session_id = resources
                                     .as_ref()
                                     .and_then(|r| r.parts.session.as_ref())
@@ -3191,7 +3353,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     .preprocess(
                                         std::mem::take(&mut input.text),
                                         std::mem::take(&mut input.images),
-                                        active_model,
+                                        supports_vision,
                                         session_id,
                                     )
                                     .await;
@@ -3217,14 +3379,18 @@ fn spawn_runtime_owner_with_optional_agent(
                                 }
                             }
                         }
-                        if send_agent_command(
-                            &agent,
-                            AgentCommand::SendMessage {
+                        let command = match recovery_context {
+                            Some(context) => AgentCommand::SendMessageWithContext {
+                                text: input.text,
+                                images: input.images,
+                                context,
+                            },
+                            None => AgentCommand::SendMessage {
                                 text: input.text,
                                 images: input.images,
                             },
-                        )
-                        {
+                        };
+                        if send_agent_command(&agent, command) {
                             let _ = done.send(Ok(receipt));
                         } else {
                             agent_available = false;
@@ -3260,6 +3426,41 @@ fn spawn_runtime_owner_with_optional_agent(
                                     Ordering::Release,
                                 );
                             }
+                            let _ = done.send(Ok(()));
+                        }
+                    }
+                    Some(CodingRuntimeControl::ResolvePolicyIntervention {
+                        generation: request_generation,
+                        intervention_id,
+                        action,
+                        done,
+                    }) => {
+                        if request_generation != generation
+                            || controls.state.load(Ordering::Acquire)
+                                != runtime_phase_state(generation, RuntimePhase::Ready)
+                        {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                        } else if pending_policy_intervention.as_ref().is_none() {
+                            let _ = done.send(Err(RuntimeError::NoPendingPolicyIntervention));
+                        } else if pending_policy_intervention
+                            .as_ref()
+                            .is_some_and(|intervention| intervention.id != intervention_id)
+                        {
+                            let _ = done.send(Err(RuntimeError::NoPendingPolicyIntervention));
+                        } else if !pending_policy_intervention
+                            .as_ref()
+                            .is_some_and(|intervention| intervention.actions.contains(&action))
+                            || matches!(action, PolicyRecoveryAction::ViewSafeInstructions)
+                        {
+                            let _ = done.send(Err(RuntimeError::InvalidPolicyRecoveryAction));
+                        } else {
+                            pending_policy_intervention = None;
+                            let _ = runtime_event_tx.send(
+                                CodingRuntimeEvent::PolicyInterventionResolved {
+                                    intervention_id,
+                                    action,
+                                },
+                            );
                             let _ = done.send(Ok(()));
                         }
                     }
@@ -3517,6 +3718,14 @@ fn spawn_runtime_owner_with_optional_agent(
                         generation: request_generation,
                         done,
                     }) => {
+                        if native_protocol
+                            && request_generation == generation
+                            && agent_available
+                        {
+                            if let Some(runtime) = resources.as_ref() {
+                                runtime.parts.team_manager.stop_all().await;
+                            }
+                        }
                         if !native_protocol || request_generation != generation || !agent_available {
                             let _ = done.send(Err(RuntimeError::Unavailable));
                         } else if let Some((turn_id, _, snapshot, stats)) = held_turn.take() {
@@ -3933,6 +4142,9 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            // Preserve detached Team runs across a `/model` reassemble:
+                            // the session continues, so background team work must not die.
+                            None,
                             runtime.parts.snapshot_persistence_status(),
                         )
                         .await;
@@ -4010,6 +4222,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                 agent = Some(candidate.spawn());
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
+                                // Do NOT begin a new team generation here: a `/model`
+                                // reassemble keeps the session, so in-flight team runs
+                                // (and their events) must survive rather than be cancelled.
                                 agent_available = true;
                                 provider_unavailable_reason = None;
                                 controls.provider_unavailable_reason.store(0, Ordering::Release);
@@ -4118,6 +4333,13 @@ fn spawn_runtime_owner_with_optional_agent(
                             continue;
                         }
                         if !agent_available && provider_unavailable_reason == Some(reason) {
+                            if let Some(intervention) = pending_policy_intervention.take() {
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::PolicyInterventionCleared {
+                                        intervention_id: intervention.id,
+                                    },
+                                );
+                            }
                             let _ = done.send(Ok(RuntimeGeneration(generation)));
                             continue;
                         }
@@ -4160,6 +4382,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            resources.as_ref().map(|runtime| &runtime.parts.team_manager),
                             resources
                                 .as_ref()
                                 .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
@@ -4221,6 +4444,13 @@ fn spawn_runtime_owner_with_optional_agent(
                             runtime_phase_state(generation, RuntimePhase::AwaitingProvider),
                             Ordering::Release,
                         );
+                        if let Some(intervention) = pending_policy_intervention.take() {
+                            let _ = runtime_event_tx.send(
+                                CodingRuntimeEvent::PolicyInterventionCleared {
+                                    intervention_id: intervention.id,
+                                },
+                            );
+                        }
                         let _ = runtime_event_tx.send(CodingRuntimeEvent::ProviderUnavailable {
                             reason,
                             forced: stop_report.forced,
@@ -4240,7 +4470,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
-                        let withdraws_mcp = matches!(&target, ReprepareTarget::Reload { .. });
+                        let withdraws_mcp = matches!(
+                            &target,
+                            ReprepareTarget::Reload { .. } | ReprepareTarget::ReloadConfig(_)
+                        );
                         let resolved = match resolve_reprepare_input(&runtime, target) {
                             Ok(input) => input,
                             Err(error) => {
@@ -4431,6 +4664,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            // Reprepare REBUILDS the runtime (`runtime = candidate` below), so
+                            // the team_manager itself is replaced; terminate its in-flight runs
+                            // cleanly here before the old manager is dropped.
+                            Some(&runtime.parts.team_manager),
                             runtime.parts.snapshot_persistence_status(),
                         )
                         .await;
@@ -4483,6 +4720,11 @@ fn spawn_runtime_owner_with_optional_agent(
                         agent = Some(replacement);
                         generation = generation.wrapping_add(1);
                         event_generation.store(generation, Ordering::Release);
+                        runtime
+                            .parts
+                            .team_manager
+                            .set_event_sender(team_event_tx.clone());
+                        runtime.parts.team_manager.begin_generation(generation);
                         agent_available = true;
                         observed_tokens = None;
                         snapshot_in_flight = false;
@@ -4502,6 +4744,15 @@ fn spawn_runtime_owner_with_optional_agent(
                         );
                         let _ = runtime_event_tx
                             .send(CodingRuntimeEvent::SessionChanged(changed.clone()));
+                        if changes_session {
+                            if let Some(intervention) = pending_policy_intervention.take() {
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::PolicyInterventionCleared {
+                                        intervention_id: intervention.id,
+                                    },
+                                );
+                            }
+                        }
                         if operation == ReconfigureKind::ChangeDirectory {
                             let _ = runtime_event_tx
                                 .send(CodingRuntimeEvent::WorkingDirectoryChanged(cwd));
@@ -4596,6 +4847,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            Some(&runtime.parts.team_manager),
                             runtime.parts.snapshot_persistence_status(),
                         )
                         .await;
@@ -4626,6 +4878,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 agent = Some(replacement);
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
+                                runtime.parts.team_manager.begin_generation(generation);
                                 agent_available = true;
                                 observed_tokens = None;
                                 snapshot_in_flight = false;
@@ -4754,6 +5007,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeReconfigured,
+                            Some(&runtime.parts.team_manager),
                             runtime.parts.snapshot_persistence_status(),
                         )
                         .await;
@@ -4808,6 +5062,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 agent = Some(replacement);
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
+                                runtime.parts.team_manager.begin_generation(generation);
                                 agent_available = true;
                                 observed_tokens = None;
                                 snapshot_in_flight = false;
@@ -4820,6 +5075,13 @@ fn spawn_runtime_owner_with_optional_agent(
                                 let _ = runtime_event_tx.send(
                                     CodingRuntimeEvent::SessionChanged(changed.clone()),
                                 );
+                                if let Some(intervention) = pending_policy_intervention.take() {
+                                    let _ = runtime_event_tx.send(
+                                        CodingRuntimeEvent::PolicyInterventionCleared {
+                                            intervention_id: intervention.id,
+                                        },
+                                    );
+                                }
                                 let _ = runtime_event_tx.send(
                                     CodingRuntimeEvent::Reconfigured {
                                         operation: ReconfigureKind::RestoreSession,
@@ -5111,6 +5373,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut observed_tokens,
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeShutdown,
+                            resources.as_ref().map(|runtime| &runtime.parts.team_manager),
                             resources
                                 .as_ref()
                                 .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
@@ -5281,6 +5544,12 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         match event {
                         Some(event) if native_protocol => match event {
+                            AgentEvent::PolicyIntervention { intervention } => {
+                                pending_policy_intervention = Some(intervention.clone());
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(
+                                    AgentEvent::PolicyIntervention { intervention },
+                                ));
+                            }
                             AgentEvent::Usage(meta) => {
                                 observed_tokens = Some(meta.used_tokens as usize);
                                 turn_stats.turn_count = turn_stats.turn_count.saturating_add(1);
@@ -5565,6 +5834,14 @@ fn spawn_runtime_owner_with_optional_agent(
                                                 (meta.tokens.prompt + meta.tokens.completion) as u64,
                                             );
                                         }
+                                        // Keep one bounded runtime-owned recap. It survives
+                                        // replacement of the conversation and is attached once
+                                        // to a real recovery submit; it is deliberately not copied
+                                        // into every synthetic continuation.
+                                        state.update_progress_recap(summarize_for_goal(
+                                            &snapshot.messages,
+                                            state.last_reason.as_deref(),
+                                        ));
                                         let stop_reason = state.cap_reached();
                                         let evaluate = matches!(
                                             reason,
@@ -5687,13 +5964,18 @@ fn spawn_runtime_owner_with_optional_agent(
                                                 );
                                                 continue;
                                             } else {
-                                                state.finish(
-                                                    GoalTerminal::Failed,
-                                                    "stopped: too many failed rounds",
+                                                // The stop reason does not distinguish a full context
+                                                // from network/provider failures. Preserve the goal and
+                                                // describe both recovery paths instead of falsely
+                                                // prescribing `/compact` for every provider outage.
+                                                state.pause_for_recovery(
+                                                    "paused after repeated provider/timeout failures; check provider/network status, or run /compact if the context is full, then send a message to continue",
                                                 );
+                                                keep_goal_registered = true;
+                                                held_turn = None;
                                                 completion_reason = StopReason::ProviderError;
                                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
-                                                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning("goal stopped: too many failed rounds".into()));
+                                                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning("goal paused after repeated provider/timeout failures — check provider/network status, or run /compact if context is full, then continue".into()));
                                             }
                                         } else {
                                             state.finish(
@@ -5797,6 +6079,13 @@ fn spawn_runtime_owner_with_optional_agent(
                                 }
                             }
                             AgentEvent::TurnStarted => {
+                                if let Some(intervention) = pending_policy_intervention.take() {
+                                    let _ = runtime_event_tx.send(
+                                        CodingRuntimeEvent::PolicyInterventionCleared {
+                                            intervention_id: intervention.id,
+                                        },
+                                    );
+                                }
                                 turn_started_at = Some(std::time::Instant::now());
                                 controls.state.store(
                                     runtime_phase_state(generation, RuntimePhase::InTurn),
@@ -5905,6 +6194,9 @@ fn spawn_runtime_owner_with_optional_agent(
                 CompactionInterruption::RuntimeShutdown,
                 resources
                     .as_ref()
+                    .map(|runtime| &runtime.parts.team_manager),
+                resources
+                    .as_ref()
                     .and_then(|runtime| runtime.parts.snapshot_persistence_status()),
             )
             .await;
@@ -5988,6 +6280,7 @@ fn reject_runtime_control(
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::Respond { done, .. }
+        | CodingRuntimeControl::ResolvePolicyIntervention { done, .. }
         | CodingRuntimeControl::Cancel { done, .. }
         | CodingRuntimeControl::PauseGoal { done, .. }
         | CodingRuntimeControl::SetMode { done, .. }
@@ -6141,6 +6434,21 @@ fn resolve_reprepare_input(
             Ok(Some((
                 ReprepareInput {
                     config: runtime.config.clone(),
+                    prepare,
+                    operation: ReconfigureKind::Reprepare,
+                },
+                None,
+            )))
+        }
+        ReprepareTarget::ReloadConfig(config) => {
+            let mut prepare = runtime.prepare.clone();
+            prepare.session = match runtime.parts.session.as_ref() {
+                Some(binding) => crate::SessionMode::Resume(binding.id.clone()),
+                None => crate::SessionMode::Disabled,
+            };
+            Ok(Some((
+                ReprepareInput {
+                    config,
                     prepare,
                     operation: ReconfigureKind::Reprepare,
                 },
@@ -6775,8 +7083,18 @@ async fn stop_current_agent(
     observed_tokens: &mut Option<usize>,
     runtime_event_tx: &RuntimeEventEmitter,
     reason: CompactionInterruption,
+    team_manager: Option<&crate::team::TeamRunManager>,
     persistence_status: Option<SnapshotPersistenceStatus>,
 ) -> StopReport {
+    // Detached Team members outlive the tool call that spawned them. On a genuine
+    // teardown (shutdown, provider deactivate, undo/restore) callers pass the
+    // manager so we terminate them and no background editor is orphaned. A mere
+    // provider RECONFIGURE that KEEPS the session (`/model`, `/config` reload)
+    // passes `None`: that async work is independent of which provider the main
+    // agent uses and must survive the reconfigure.
+    if let Some(manager) = team_manager {
+        manager.stop_all().await;
+    }
     let Some(mut agent) = agent.take() else {
         compactions.interrupt_all(reason, runtime_event_tx);
         emit_terminal_persistence_warnings(persistence_status.as_ref(), runtime_event_tx);
@@ -7191,15 +7509,14 @@ async fn resolve_goal_round_cap(
         return config_default;
     }
     let call_limit = match rate_limit_source {
-        Some(source) => match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            source.fetch_windows(),
-        )
-        .await
-        {
-            Ok(Ok(windows)) => crate::rate_limit::binding_window_call_limit(&windows),
-            _ => None,
-        },
+        Some(source) => {
+            match tokio::time::timeout(std::time::Duration::from_secs(3), source.fetch_windows())
+                .await
+            {
+                Ok(Ok(windows)) => crate::rate_limit::binding_window_call_limit(&windows),
+                _ => None,
+            }
+        }
         None => None,
     };
     match call_limit {
@@ -7212,6 +7529,60 @@ async fn resolve_goal_round_cap(
 mod tests {
     use super::*;
 
+    fn team_event(
+        generation: u64,
+        run: &str,
+        seq: u64,
+        payload: atomcode_capabilities::team::TeamEventPayload,
+    ) -> crate::team::GenerationTeamEvent {
+        crate::team::GenerationTeamEvent {
+            generation,
+            event: atomcode_capabilities::team::TeamEvent::new(
+                atomcode_capabilities::team::TeamRunId::new(run),
+                seq,
+                payload,
+            ),
+        }
+    }
+
+    #[test]
+    fn team_event_projection_filters_generation_and_deduplicates_sequences() {
+        use atomcode_capabilities::team::TeamEventPayload;
+
+        let mut sequences = BTreeMap::new();
+        let first = team_event(3, "run-a", 1, TeamEventPayload::RunStarted { total: 2 });
+        assert!(project_team_event(3, &mut sequences, first.clone()).is_some());
+        assert!(project_team_event(3, &mut sequences, first).is_none());
+        assert!(project_team_event(
+            3,
+            &mut sequences,
+            team_event(3, "run-a", 0, TeamEventPayload::RunStarted { total: 2 })
+        )
+        .is_none());
+        assert!(project_team_event(
+            3,
+            &mut sequences,
+            team_event(2, "old", 99, TeamEventPayload::RunStarted { total: 1 })
+        )
+        .is_none());
+        let terminal = project_team_event(
+            3,
+            &mut sequences,
+            team_event(
+                3,
+                "run-a",
+                2,
+                TeamEventPayload::RunFinished {
+                    total: 2,
+                    completed: 2,
+                    failed: 0,
+                },
+            ),
+        )
+        .expect("ordered terminal must be delivered");
+        assert!(matches!(terminal.payload, TeamEventPayload::RunFinished { .. }));
+    }
+
     #[derive(Debug)]
     struct FakeQuotaSource {
         result: Result<Vec<crate::rate_limit::RateLimitWindow>, String>,
@@ -7222,9 +7593,7 @@ mod tests {
         fn applies_to(&self, _base_url: &str) -> bool {
             true
         }
-        async fn fetch_windows(
-            &self,
-        ) -> Result<Vec<crate::rate_limit::RateLimitWindow>, String> {
+        async fn fetch_windows(&self) -> Result<Vec<crate::rate_limit::RateLimitWindow>, String> {
             self.result.clone()
         }
     }
@@ -7246,16 +7615,14 @@ mod tests {
     #[tokio::test]
     async fn goal_round_cap_derives_from_live_plan_quota() {
         // Pro window (call_limit 1000) → 30% = 300, overriding the passed default.
-        let pro: Arc<dyn crate::rate_limit::RateLimitWindowSource> =
-            Arc::new(FakeQuotaSource {
-                result: Ok(vec![quota_window(1000)]),
-            });
+        let pro: Arc<dyn crate::rate_limit::RateLimitWindowSource> = Arc::new(FakeQuotaSource {
+            result: Ok(vec![quota_window(1000)]),
+        });
         assert_eq!(resolve_goal_round_cap(Some(&pro), 777).await, 300);
         // Lite window (800) → 240.
-        let lite: Arc<dyn crate::rate_limit::RateLimitWindowSource> =
-            Arc::new(FakeQuotaSource {
-                result: Ok(vec![quota_window(800)]),
-            });
+        let lite: Arc<dyn crate::rate_limit::RateLimitWindowSource> = Arc::new(FakeQuotaSource {
+            result: Ok(vec![quota_window(800)]),
+        });
         assert_eq!(resolve_goal_round_cap(Some(&lite), 777).await, 240);
     }
 
@@ -7264,10 +7631,9 @@ mod tests {
         // No source, a fetch error, and empty windows all fall back to the config
         // default instead of blocking /goal or inventing a number.
         assert_eq!(resolve_goal_round_cap(None, 777).await, 777);
-        let err: Arc<dyn crate::rate_limit::RateLimitWindowSource> =
-            Arc::new(FakeQuotaSource {
-                result: Err("status_v2 unavailable".into()),
-            });
+        let err: Arc<dyn crate::rate_limit::RateLimitWindowSource> = Arc::new(FakeQuotaSource {
+            result: Err("status_v2 unavailable".into()),
+        });
         assert_eq!(resolve_goal_round_cap(Some(&err), 777).await, 777);
         let empty: Arc<dyn crate::rate_limit::RateLimitWindowSource> =
             Arc::new(FakeQuotaSource { result: Ok(vec![]) });
@@ -7774,6 +8140,7 @@ mod tests {
             model: model.into(),
             base_url: Some("https://example.test/v1".into()),
             system_prompt: None,
+            supports_vision: None,
             user_agent: None,
             context_window: 64_000,
             max_tokens: None,
@@ -7786,7 +8153,6 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: Some(rank),
-            pricing: None,
         }
     }
 
@@ -7951,6 +8317,7 @@ mod tests {
                 memory: false,
                 web: false,
                 review: false,
+                subagents: crate::SubagentPolicy::Disabled,
                 rate_limit_source: None,
             },
             provider_factory: Arc::new(TestProviderFactory {
@@ -8660,8 +9027,14 @@ mod tests {
         ));
 
         handle.pause_goal().await.unwrap();
-        assert!(matches!(kernel_commands.recv().await, Some(AgentCommand::Cancel)));
-        assert!(matches!(kernel_commands.recv().await, Some(AgentCommand::Snapshot)));
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Cancel)
+        ));
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
         assert!(matches!(
             runtime_events.recv().await,
             Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
@@ -8810,6 +9183,185 @@ mod tests {
                 .is_err(),
             "an evaluator failure must not dispatch a synthetic main-agent retry"
         );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recoverable_failures_resume_with_context_even_when_compact_fails() {
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+
+        handle.start_goal("tests pass").await.unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                active: true,
+                ..
+            }))
+        ));
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+
+        // First recoverable failure: continue without repeating the recap into every
+        // synthetic prompt. The runtime stores one bounded copy for recovery compact.
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::ProviderError,
+            })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![
+                    Message::user("initial turn"),
+                    Message::assistant("edited the files", vec![]),
+                ]),
+            })
+            .unwrap();
+        let continuation =
+            tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+                .await
+                .expect("recoverable failure did not dispatch a continuation");
+        assert!(matches!(
+            continuation,
+            Some(AgentCommand::SendSyntheticMessage { text })
+                if !text.contains("Progress so far")
+        ));
+
+        // Drive the remaining recoverable failures to exhaust MAX_UNPRODUCTIVE.
+        for round in 2..=MAX_UNPRODUCTIVE {
+            kernel_events
+                .send(AgentEvent::TurnComplete {
+                    reason: StopReason::ProviderError,
+                })
+                .unwrap();
+            assert!(matches!(
+                kernel_commands.recv().await,
+                Some(AgentCommand::Snapshot)
+            ));
+            kernel_events
+                .send(AgentEvent::Snapshot {
+                    snapshot: SessionSnapshot::new(vec![
+                        Message::user("initial turn"),
+                        Message::assistant("edited the files", vec![]),
+                    ]),
+                })
+                .unwrap();
+            if round < MAX_UNPRODUCTIVE {
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+                        .await
+                        .expect("recoverable failure did not dispatch a continuation");
+            }
+        }
+
+        // The budget-exhausted terminal must PAUSE the goal (still registered,
+        // PausedAtCap) instead of clearing it — clearing would force a from-scratch
+        // re-run after the user compacts and continues.
+        let mut saw_paused_at_cap = false;
+        let mut saw_turn_finished = false;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                        active: false,
+                        phase: GoalPhase::PausedAtCap,
+                        terminal: Some(GoalTerminal::Stopped),
+                        ..
+                    })) => saw_paused_at_cap = true,
+                    Some(CodingRuntimeEvent::TurnFinished(_)) => {
+                        saw_turn_finished = true;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => panic!("runtime events closed before goal terminal"),
+                }
+            }
+        })
+        .await
+        .expect("recoverable exhaustion lost the goal terminal");
+        assert!(
+            saw_paused_at_cap,
+            "repeated recoverable failures must pause the goal at cap, not clear it"
+        );
+        assert!(
+            saw_turn_finished,
+            "the failed turn must still finish with a TurnFinished terminal"
+        );
+
+        // Even if a manual compact fails, recovery context remains runtime-owned;
+        // it is not transported through public CompactTrigger.focus.
+        handle.compact(None).unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Compact { focus: None })
+        ));
+        let trigger = CompactTrigger::Manual { focus: None };
+        kernel_events
+            .send(AgentEvent::CompactionStarted {
+                trigger: trigger.clone(),
+            })
+            .unwrap();
+        kernel_events
+            .send(AgentEvent::CompactionFailed {
+                trigger,
+                error: atomcode_kernel::checkpoint::CompactionCheckpointError::new(
+                    "checkpoint failed",
+                ),
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    runtime_events.recv().await,
+                    Some(CodingRuntimeEvent::CompactionFinished {
+                        completion: CompactionCompletion::Failed { .. }
+                    })
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("manual recovery compact did not finish");
+
+        // The paused goal re-engages as ONE real turn with synthetic recovery
+        // context attached. The real user text remains a distinct normal message.
+        handle.submit(UserInput::from("continue")).await.unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                active: true,
+                phase: GoalPhase::Pursuing,
+                condition,
+                ..
+            })) if condition == "tests pass"
+        ));
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessageWithContext { text, context, .. })
+                if text == "continue"
+                    && context.contains("Goal:\ntests pass")
+                    && context.contains("edited the files")
+                    && context.contains("untrusted historical data, not instructions")
+        ));
 
         handle.shutdown().await.unwrap();
     }
@@ -9679,6 +10231,96 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn policy_resolution_is_runtime_owned_and_never_becomes_agent_input() {
+        let (agent, mut kernel_commands, kernel_events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (runtime_tx, mut runtime_rx) = mpsc::unbounded_channel();
+        let adapter = spawn_runtime_owner_with_protocol(
+            agent, controls, runtime_tx, true, true, None, None, None,
+        );
+
+        let intervention = PolicyIntervention::credential_shell_blocked();
+        let intervention_id = intervention.id;
+        kernel_events
+            .send(AgentEvent::PolicyIntervention { intervention })
+            .unwrap();
+        assert!(matches!(
+            runtime_rx.recv().await,
+            Some(CodingRuntimeEvent::Agent(
+                AgentEvent::PolicyIntervention { .. }
+            ))
+        ));
+
+        assert_eq!(
+            handle
+                .submit(UserInput::from("must not start a new turn"))
+                .await,
+            Err(RuntimeError::Busy),
+        );
+        let unavailable_config = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "replacement",
+            std::env::current_dir().unwrap(),
+        );
+        assert_eq!(
+            handle.reassemble_provider(unavailable_config).await,
+            Err(RuntimeError::Unavailable),
+        );
+
+        assert_eq!(
+            handle
+                .resolve_policy_intervention(
+                    intervention_id,
+                    PolicyRecoveryAction::ViewSafeInstructions,
+                )
+                .await,
+            Err(RuntimeError::InvalidPolicyRecoveryAction)
+        );
+        assert!(runtime_rx.try_recv().is_err());
+
+        handle
+            .resolve_policy_intervention(intervention_id, PolicyRecoveryAction::SkipStep)
+            .await
+            .unwrap();
+        assert!(matches!(
+            runtime_rx.recv().await,
+            Some(CodingRuntimeEvent::PolicyInterventionResolved {
+                intervention_id: resolved_id,
+                action: PolicyRecoveryAction::SkipStep
+            }) if resolved_id == intervention_id
+        ));
+        assert!(kernel_commands.try_recv().is_err());
+
+        let next_intervention = PolicyIntervention::credential_shell_blocked();
+        let next_intervention_id = next_intervention.id;
+        kernel_events
+            .send(AgentEvent::PolicyIntervention {
+                intervention: next_intervention,
+            })
+            .unwrap();
+        assert!(matches!(
+            runtime_rx.recv().await,
+            Some(CodingRuntimeEvent::Agent(
+                AgentEvent::PolicyIntervention { .. }
+            ))
+        ));
+        assert_eq!(
+            handle
+                .resolve_policy_intervention(intervention_id, PolicyRecoveryAction::SkipStep)
+                .await,
+            Err(RuntimeError::NoPendingPolicyIntervention)
+        );
+        handle
+            .resolve_policy_intervention(next_intervention_id, PolicyRecoveryAction::EndTask)
+            .await
+            .unwrap();
+
+        handle.dispatch(DriverCommand::Shutdown).unwrap();
+        let _ = adapter.owner_task.await;
+    }
+
     #[test]
     fn closed_runtime_returns_typed_error() {
         let (handle, controls) = coding_runtime_control_channel();
@@ -9908,6 +10550,7 @@ mod tests {
             &emitter,
             CompactionInterruption::RuntimeReconfigured,
             None,
+            None,
         )
         .await;
 
@@ -9929,6 +10572,130 @@ mod tests {
             &emitter,
         );
         assert_eq!(conversation_revision, 8);
+    }
+
+    #[tokio::test]
+    async fn stopping_runtime_agent_terminates_detached_team_members() {
+        use atomcode_capabilities::team::{
+            TeamDifficulty, TeamPermission, TeamRoleId, TeamTaskSpec,
+        };
+
+        let manager = crate::team::TeamRunManager::new(crate::team::TeamRuntimeConfig {
+            cancel_grace: std::time::Duration::from_millis(1),
+            ..Default::default()
+        });
+        manager.begin_generation(4);
+        let factory: crate::team::TeamJobFactory =
+            Arc::new(|_, _, _| Box::pin(std::future::pending::<crate::team::TeamMemberOutcome>()));
+        let run = manager
+            .delegate(
+                vec![TeamTaskSpec {
+                    description: "inspect".into(),
+                    prompt: "inspect".into(),
+                    role: TeamRoleId::Explorer,
+                    permission: TeamPermission::Explore,
+                    difficulty: TeamDifficulty::Simple,
+                    scope: Vec::new(),
+                }],
+                factory,
+                Arc::new(|_| "test-model".to_string()),
+            )
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        let mut agent = None;
+        let mut compactions = CompactionTracker::default();
+        let mut observed_tokens = None;
+        let (raw, _events) = mpsc::unbounded_channel();
+        let emitter = RuntimeEventEmitter {
+            raw,
+            tagged: None,
+            generation: Arc::new(AtomicU64::new(4)),
+        };
+        stop_current_agent(
+            &mut agent,
+            &mut compactions,
+            &mut observed_tokens,
+            &emitter,
+            CompactionInterruption::RuntimeShutdown,
+            Some(&manager),
+            None,
+        )
+        .await;
+
+        assert!(
+            manager
+                .wait(&run, std::time::Duration::from_millis(20))
+                .await
+                .unwrap()
+                .terminal
+        );
+        assert_eq!(manager.snapshot(Some(&run)).unwrap().runs[0].stopped, 1);
+    }
+
+    #[tokio::test]
+    async fn reassembling_provider_preserves_detached_team_members() {
+        use atomcode_capabilities::team::{
+            TeamDifficulty, TeamPermission, TeamRoleId, TeamTaskSpec,
+        };
+
+        let manager = crate::team::TeamRunManager::new(crate::team::TeamRuntimeConfig {
+            cancel_grace: std::time::Duration::from_millis(1),
+            ..Default::default()
+        });
+        manager.begin_generation(4);
+        let factory: crate::team::TeamJobFactory =
+            Arc::new(|_, _, _| Box::pin(std::future::pending::<crate::team::TeamMemberOutcome>()));
+        let run = manager
+            .delegate(
+                vec![TeamTaskSpec {
+                    description: "inspect".into(),
+                    prompt: "inspect".into(),
+                    role: TeamRoleId::Explorer,
+                    permission: TeamPermission::Explore,
+                    difficulty: TeamDifficulty::Simple,
+                    scope: Vec::new(),
+                }],
+                factory,
+                Arc::new(|_| "test-model".to_string()),
+            )
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        let mut agent = None;
+        let mut compactions = CompactionTracker::default();
+        let mut observed_tokens = None;
+        let (raw, _events) = mpsc::unbounded_channel();
+        let emitter = RuntimeEventEmitter {
+            raw,
+            tagged: None,
+            generation: Arc::new(AtomicU64::new(4)),
+        };
+        // A `/model` reassemble passes `None` for the manager: the session
+        // continues, so the detached member must NOT be terminated.
+        stop_current_agent(
+            &mut agent,
+            &mut compactions,
+            &mut observed_tokens,
+            &emitter,
+            CompactionInterruption::RuntimeReconfigured,
+            None,
+            None,
+        )
+        .await;
+
+        // The member is still pending (std::future::pending), so the run is NOT terminal.
+        assert!(
+            !manager
+                .wait(&run, std::time::Duration::from_millis(20))
+                .await
+                .unwrap()
+                .terminal,
+            "reassemble must preserve in-flight team members"
+        );
+        assert_eq!(manager.snapshot(Some(&run)).unwrap().runs[0].stopped, 0);
     }
 
     #[tokio::test]
@@ -10599,7 +11366,7 @@ mod tests {
             &self,
             text: String,
             _images: Vec<ImageContent>,
-            _active_model: String,
+            _supports_vision: bool,
             _session_id: Option<String>,
         ) -> (UserInput, Option<VisionNotice>) {
             (
@@ -10625,7 +11392,7 @@ mod tests {
             &self,
             text: String,
             _images: Vec<ImageContent>,
-            _active_model: String,
+            _supports_vision: bool,
             _session_id: Option<String>,
         ) -> (UserInput, Option<VisionNotice>) {
             self.called.store(true, Ordering::Release);
@@ -11996,6 +12763,42 @@ mod tests {
 
         let second = CodingRuntime::start(start()).await.unwrap();
         second.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn config_reprepare_advances_generation_and_keeps_the_current_session() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let session_id = "config-reprepare-session";
+        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
+        persist_native_session(
+            &manager,
+            session_id,
+            project.path(),
+            &SessionSnapshot::new(vec![Message::user("persisted before reprepare")]),
+        );
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume(session_id.into());
+        let mut next_config = start.agent.clone();
+        next_config.todo.enabled = !next_config.todo.enabled;
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        let before = runtime.handle.status();
+
+        let changed = runtime.handle.reprepare_config(next_config).await.unwrap();
+
+        assert!(changed.generation.0 > before.generation);
+        assert_eq!(changed.session_id.as_deref(), Some(session_id));
+        assert_eq!(changed.working_dir, project.path());
+        assert_eq!(runtime.handle.status().generation, changed.generation.0);
+        let snapshot = runtime.handle.snapshot().await.unwrap();
+        assert!(snapshot
+            .messages
+            .iter()
+            .any(|message| message.text == "persisted before reprepare"));
+        runtime.handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -13426,12 +14229,9 @@ mod tests {
             if attempt == 0 {
                 // First round: evaluator says NotMet → continuation dispatched.
                 assert!(matches!(
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        kernel_commands.recv()
-                    )
-                    .await
-                    .expect("first goal continuation was not dispatched"),
+                    tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+                        .await
+                        .expect("first goal continuation was not dispatched"),
                     Some(AgentCommand::SendSyntheticMessage { .. })
                 ));
             }
@@ -13460,8 +14260,8 @@ mod tests {
             }
         ));
 
-        let progress = last_goal_progress
-            .expect("no GoalChanged event was emitted after round cap");
+        let progress =
+            last_goal_progress.expect("no GoalChanged event was emitted after round cap");
         assert_eq!(
             progress.phase,
             GoalPhase::PausedAtCap,
@@ -13526,12 +14326,9 @@ mod tests {
             if attempt == 0 {
                 // First round: evaluator says NotMet → continuation dispatched.
                 assert!(matches!(
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        kernel_commands.recv()
-                    )
-                    .await
-                    .expect("first goal continuation was not dispatched"),
+                    tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+                        .await
+                        .expect("first goal continuation was not dispatched"),
                     Some(AgentCommand::SendSyntheticMessage { .. })
                 ));
             }
@@ -13552,10 +14349,7 @@ mod tests {
 
         // --- Goal is now PausedAtCap; submit new message ---
         let submit_text = "please continue";
-        handle
-            .submit(UserInput::from(submit_text))
-            .await
-            .unwrap();
+        handle.submit(UserInput::from(submit_text)).await.unwrap();
 
         // Collect events until we see SendMessage or timeout.
         let mut saw_goal_changed_pursuing = false;
@@ -13663,10 +14457,7 @@ mod tests {
 
         // --- Goal is now Satisfied; submit new message ---
         let submit_text = "follow-up question";
-        handle
-            .submit(UserInput::from(submit_text))
-            .await
-            .unwrap();
+        handle.submit(UserInput::from(submit_text)).await.unwrap();
 
         // Collect until SendMessage; assert no GoalChanged(Pursuing) seen.
         let mut saw_goal_changed_pursuing = false;
@@ -13728,13 +14519,18 @@ mod tests {
         // --- Drive the goal to Satisfied ---
         handle.start_goal("tests pass").await.unwrap();
         let _ = runtime_events.recv().await; // GoalChanged(active=true)
-        handle.submit(UserInput::from("initial turn")).await.unwrap();
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
         ));
         kernel_events
-            .send(AgentEvent::TurnComplete { reason: StopReason::Stopped })
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            })
             .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
@@ -13811,13 +14607,18 @@ mod tests {
         // --- Drive the goal to Satisfied ---
         handle.start_goal("tests pass").await.unwrap();
         let _ = runtime_events.recv().await; // GoalChanged(active=true)
-        handle.submit(UserInput::from("initial turn")).await.unwrap();
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
         ));
         kernel_events
-            .send(AgentEvent::TurnComplete { reason: StopReason::Stopped })
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            })
             .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
@@ -13889,13 +14690,18 @@ mod tests {
         // --- Drive the goal to Satisfied ---
         handle.start_goal("tests pass").await.unwrap();
         let _ = runtime_events.recv().await; // GoalChanged(active=true)
-        handle.submit(UserInput::from("initial turn")).await.unwrap();
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
         ));
         kernel_events
-            .send(AgentEvent::TurnComplete { reason: StopReason::Stopped })
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            })
             .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
@@ -13948,7 +14754,10 @@ mod tests {
         .await
         .expect("empty submit did not deliver within timeout");
 
-        assert!(saw_send_message, "the (empty) message still runs as an ordinary turn");
+        assert!(
+            saw_send_message,
+            "the (empty) message still runs as an ordinary turn"
+        );
         assert!(
             !saw_goal_changed_pursuing,
             "empty input must NOT re-engage the goal (classifier skipped)"

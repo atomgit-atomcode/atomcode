@@ -23,8 +23,8 @@ pub enum PreprocessOutcome {
 }
 
 /// Pure short-circuit: no images, or the main model already accepts images.
-pub fn should_skip(active_model: &str, has_images: bool) -> bool {
-    !has_images || atomcode_capabilities::provider::model_suggests_vision(active_model)
+pub fn should_skip(supports_vision: bool, has_images: bool) -> bool {
+    !has_images || supports_vision
 }
 
 /// Display name for a VL model: strip a `vendor/` prefix (e.g.
@@ -180,12 +180,9 @@ mod tests {
 
     #[test]
     fn should_skip_when_no_images_or_vision_model() {
-        assert!(should_skip("glm-4-flash", false), "no images → skip");
-        assert!(should_skip("qwen-vl-max", true), "vision model → skip");
-        assert!(
-            !should_skip("glm-4-flash", true),
-            "text model + images → run"
-        );
+        assert!(should_skip(false, false), "no images → skip");
+        assert!(should_skip(true, true), "vision model → skip");
+        assert!(!should_skip(false, true), "text model + images → run");
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.5</span>
+    <span class="dhdr-ver">v5.0.6</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -166,7 +166,7 @@
       <h2>Recovery after an interrupted exit</h2>
       <p>AtomCode saves temporary progress while a turn is running. After a terminal crash or network interruption, <code>/resume</code> attempts to restore the last user prompt, generated response, and tool-call progress instead of falling back to the previous completed turn. Pending permissions and questions are never auto-approved.</p>
 
-      <h2>Inspecting and trimming cost</h2>
+      <h2>Inspecting and managing token usage</h2>
       <pre><code>/cost</code></pre>
       <p>Shows cumulative input / output tokens for the current session. When the number approaches the provider's <code>context_window</code>:</p>
       <ul>

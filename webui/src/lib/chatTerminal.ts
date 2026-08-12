@@ -3,6 +3,28 @@ export interface ChatDoneTerminal {
   message?: string;
 }
 
+export type ActiveTurnSubmissionDisposition = 'blocked' | 'send' | 'queue' | 'steer';
+
+/**
+ * Decide composer behavior from the synchronous runtime projection.
+ * `/chat` cannot steer an active turn, so it owns a next-turn queue; `/live`
+ * submits into the shared runtime as an in-turn steer.
+ */
+export function activeTurnSubmissionDisposition(
+  running: boolean,
+  sync: boolean,
+  pendingMode = false,
+  compacting = false,
+): ActiveTurnSubmissionDisposition {
+  // An active turn owns the transport, so newly composed input must first be
+  // accepted as either a next-turn queue item or an in-turn live steer. Mode
+  // switches and compaction only gate starting a new idle turn; letting those
+  // transient states win here makes Enter/click silently do nothing.
+  if (running) return sync ? 'steer' : 'queue';
+  if (pendingMode || compacting) return 'blocked';
+  return 'send';
+}
+
 export type ChatDoneDisposition =
   | { kind: 'completed'; discardQueued: false }
   | { kind: 'incomplete'; discardQueued: true; detail: string };

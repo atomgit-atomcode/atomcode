@@ -41,6 +41,13 @@ pub fn status(atomcode_dir: &std::path::Path, cfg: &TelemetryConfig) -> Result<(
             s.segment_count,
             s.total_bytes as f64 / 1024.0
         );
+        if s.stranded_partial_count > 0 {
+            println!(
+                "Partial:   {} segment(s) not ready ({:.1} KB)",
+                s.stranded_partial_count,
+                s.stranded_partial_bytes as f64 / 1024.0
+            );
+        }
     } else {
         println!("Queue:     (empty)");
     }
@@ -156,13 +163,28 @@ pub fn clear(atomcode_dir: &std::path::Path) -> Result<()> {
         println!("(already empty)");
         return Ok(());
     }
-    for e in std::fs::read_dir(&qdir)? {
-        let p = e?.path();
-        if p.extension().and_then(|s| s.to_str()) == Some("ndjson") {
-            std::fs::remove_file(&p)?;
-        }
+    let queue = Queue::open(qdir)?;
+    let stats = queue.clear_inactive()?;
+    if stats.skipped > 0 {
+        println!(
+            "Queue cleared ({} file(s) removed, {} active file(s) skipped).",
+            stats.removed, stats.skipped
+        );
+    } else {
+        println!("Queue cleared ({} file(s) removed).", stats.removed);
     }
-    println!("Queue cleared.");
+    Ok(())
+}
+
+pub fn recover(atomcode_dir: &std::path::Path) -> Result<()> {
+    let qdir = atomcode_dir.join("telemetry/queue");
+    if !qdir.exists() {
+        println!("(no legacy telemetry segments)");
+        return Ok(());
+    }
+    let queue = Queue::open(qdir)?;
+    let recovered = queue.recover_legacy_partials()?;
+    println!("Recovered {recovered} legacy telemetry segment(s).");
     Ok(())
 }
 
