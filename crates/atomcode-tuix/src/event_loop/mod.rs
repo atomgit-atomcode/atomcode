@@ -18017,6 +18017,65 @@ fn todo_panel_is_active(state: &crate::state::UiState) -> bool {
     effective_todo_progress(state).is_some_and(|todo| todo.total > 0 && todo.completed < todo.total)
 }
 
+fn team_action(args: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(args)
+        .ok()?
+        .get("action")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn projected_team_action(tool_name: &str, args: &str, plain: bool) -> Option<String> {
+    (!plain && tool_name == "team").then(|| team_action(args)).flatten()
+}
+
+/// Interactive TUI already projects successful Team state through the dedicated
+/// agent panel. Keep only lifecycle actions that benefit from a permanent,
+/// compact acknowledgement; polling/result calls are panel-only. The complete
+/// JSON remains in the kernel conversation and in plain/headless renderers.
+fn team_success_notice(action: &str, output: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(output).ok()?;
+    let run_id = value.get("run_id")?.as_str()?;
+    match action {
+        "delegate" => Some(format!("  ○ Team dispatched · {run_id}\n")),
+        "stop" => Some(format!("  ○ Team stopped · {run_id}\n")),
+        "result" => {
+            let members = value.get("members")?.as_array()?;
+            let mut lines = vec![format!("  Team results · {run_id}")];
+            for member in members {
+                let id = member.get("id").and_then(|value| value.as_str()).unwrap_or("agent");
+                let status = member
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                let result = member.get("result").and_then(|value| value.as_str());
+                let result = result
+                    .map(|text| crate::width::truncate_with_ellipsis(&summarise(text), 500))
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or_else(|| "no report".into());
+                lines.push(format!("  └ {id} · {status} · {result}"));
+            }
+            lines.push(String::new());
+            Some(lines.join("\n"))
+        }
+        "status" | "wait" => None,
+        _ => None,
+    }
+}
+
+fn team_batch_result_suffix(action: &str, output: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(output).ok()?;
+    match action {
+        "delegate" => Some(format!(
+            "dispatched · {}",
+            value.get("run_id")?.as_str()?
+        )),
+        "stop" => Some(format!("stopped · {}", value.get("run_id")?.as_str()?)),
+        "status" | "wait" | "result" => Some("updated".into()),
+        _ => None,
+    }
+}
+
 fn effective_todo_progress(state: &crate::state::UiState) -> Option<&crate::render::TodoProgress> {
     state
         .pending_todo_preview
@@ -18253,7 +18312,8 @@ fn completed_task_detail(
 mod subtask_progress_projection_tests {
     use super::{
         completed_task_detail, correlate_task_team_progress, should_defer_task_approval_row,
-        subtask_progress_from_args, task_call_id_from_team_run, update_subtask_progress,
+        projected_team_action, subtask_progress_from_args, task_call_id_from_team_run,
+        team_action, team_batch_result_suffix, team_success_notice, update_subtask_progress,
     };
     use crate::render::SubtaskStatus;
 
@@ -18458,6 +18518,61 @@ mod subtask_progress_projection_tests {
         assert_eq!(
             state.active_subtasks.as_ref().map(|p| p.call_id.as_str()),
             Some("call-task-10")
+        );
+    }
+
+    #[test]
+    fn team_tool_success_is_compact_for_interactive_projection() {
+        assert_eq!(
+            team_action(r#"{"action":"delegate","tasks":[]}"#),
+            Some("delegate".into())
+        );
+        assert_eq!(
+            team_success_notice(
+                "delegate",
+                r#"{"run_id":"team-2-2","status":"running"}"#
+            ),
+            Some("  ○ Team dispatched · team-2-2\n".into())
+        );
+        assert_eq!(
+            team_success_notice("stop", r#"{"run_id":"team-2-2","status":"stopped"}"#),
+            Some("  ○ Team stopped · team-2-2\n".into())
+        );
+        assert_eq!(
+            team_success_notice("wait", r#"{"run_id":"team-2-2","terminal":false}"#),
+            None
+        );
+        let result = team_success_notice(
+            "result",
+            r#"{"run_id":"team-2-2","members":[{"id":"reviewer#1","status":"completed","result":"Found one race"},{"id":"tester#2","status":"failed","result":null}]}"#,
+        )
+        .unwrap();
+        assert!(result.contains("Team results · team-2-2"), "{result}");
+        assert!(result.contains("reviewer#1 · completed · Found one race"), "{result}");
+        assert!(result.contains("tester#2 · failed · no report"), "{result}");
+        assert_eq!(team_success_notice("delegate", "not json"), None);
+        assert_eq!(
+            projected_team_action("team", r#"{"action":"wait"}"#, false),
+            Some("wait".into())
+        );
+        assert_eq!(
+            projected_team_action("team", r#"{"action":"wait"}"#, true),
+            None
+        );
+        assert_eq!(
+            projected_team_action("bash", r#"{"action":"wait"}"#, false),
+            None
+        );
+        assert_eq!(
+            team_batch_result_suffix(
+                "delegate",
+                r#"{"run_id":"team-2-2","status":"running"}"#
+            ),
+            Some("dispatched · team-2-2".into())
+        );
+        assert_eq!(
+            team_batch_result_suffix("result", r#"{"run_id":"team-2-2"}"#),
+            Some("updated".into())
         );
     }
 
@@ -21361,6 +21476,7 @@ fn handle_agent_event(
             let detail = format_tool_detail(&name, &arguments);
             let detail = enrich_todo_detail(&name, &arguments, &detail, &state.todo_titles);
             let display = display_tool_name(&name);
+            let projected_team = projected_team_action(&name, &arguments, ctx.is_plain_renderer);
 
             // The merged `todowrite` carries EITHER the full-list PLAN shape (`{todos:[…]}`) or
             // the incremental `{action}` shape; a resumed session may also carry legacy `todo`
@@ -21409,9 +21525,12 @@ fn handle_agent_event(
             // carries the disambiguated detail — don't overwrite with
             // the raw basename (issue #439).
             if state.call_id_to_batch.contains_key(&id) {
-                pending_tools
+                let entry = pending_tools
                     .entry(id)
                     .or_insert((display.clone(), detail, true));
+                if let Some(action) = projected_team {
+                    entry.1 = action;
+                }
                 state.on_tool_call_started(&display);
                 return;
             }
@@ -21423,7 +21542,7 @@ fn handle_agent_event(
             // ToolCallInFlight row would duplicate the tool line.
             if let Some((stored_display, stored_detail, true)) = pending_tools.get_mut(&id) {
                 *stored_display = display.clone();
-                *stored_detail = detail.clone();
+                *stored_detail = projected_team.unwrap_or_else(|| detail.clone());
                 state.on_tool_call_started(&display);
                 return;
             }
@@ -21435,6 +21554,16 @@ fn handle_agent_event(
             if todo_plan.is_some() {
                 // call_rendered=true ⇒ ToolCallResult suppresses the result row.
                 pending_tools.insert(id, (display.clone(), detail, true));
+                state.on_tool_call_started(&display);
+                return;
+            }
+
+            // Team has its own structured live projection. In the interactive
+            // renderer, keep the action only as correlation metadata and avoid
+            // painting a generic `Team` tool row whose JSON result would repeat
+            // the dedicated panel. Plain/headless output remains unchanged.
+            if let Some(action) = projected_team {
+                pending_tools.insert(id, (display.clone(), action, false));
                 state.on_tool_call_started(&display);
                 return;
             }
@@ -21634,8 +21763,16 @@ fn handle_agent_event(
                 let web_sources = (name == "web_search" && success)
                     .then(|| web_search_result_suffix(&output))
                     .flatten();
+                let team_action = (name == "team" && !ctx.is_plain_renderer)
+                    .then(|| pending_tools.get(&call_id).map(|(_, detail, _)| detail.clone()))
+                    .flatten();
                 let suffix = if !success {
                     format!(" {} \u{2717}", arrow)
+                } else if let Some(team) = team_action
+                    .as_deref()
+                    .and_then(|action| team_batch_result_suffix(action, &output))
+                {
+                    format!(" {} {}", arrow, team)
                 } else if let Some(srcs) = web_sources {
                     format!(" {} {}", arrow, srcs)
                 } else {
@@ -21668,6 +21805,32 @@ fn handle_agent_event(
                 // a blank-looking termination with no actionable explanation.
                 if credential_policy_block {
                     render_credential_policy_error(state, renderer);
+                } else if name == "team" && !success {
+                    // The compact batch child still needs an actionable error;
+                    // unlike successful JSON, failures have no structured panel
+                    // equivalent and must remain visible.
+                    renderer.render(UiLine::Error(summarise(&output)));
+                } else if team_action.as_deref() == Some("result") && success {
+                    if let Some(report) = team_success_notice("result", &output) {
+                        renderer.render(UiLine::CommandOutput(report));
+                    }
+                }
+                renderer.flush();
+                return;
+            }
+
+            // Successful Team calls are already represented by the structured
+            // Team projection. Replace raw JSON with at most one short lifecycle
+            // acknowledgement. Failures deliberately fall through to the normal
+            // red error path, and plain/headless renderers keep the full payload.
+            if name == "team" && success && !ctx.is_plain_renderer {
+                let action = pending_tools
+                    .remove(&call_id)
+                    .map(|(_, detail, _)| detail)
+                    .unwrap_or_default();
+                if let Some(notice) = team_success_notice(&action, &output) {
+                    renderer.render(UiLine::AssistantLineBreak);
+                    renderer.render(UiLine::CommandOutput(notice));
                 }
                 renderer.flush();
                 return;
@@ -21878,11 +22041,19 @@ fn handle_agent_event(
                 &call.arguments,
                 ctx.is_plain_renderer,
             );
+            let projected_team =
+                projected_team_action(&tool_name, &call.arguments, ctx.is_plain_renderer);
 
             // Check if ToolCallStarted already rendered this tool call as a
             // dynamic ToolCallInFlight spinner. If so, we need to freeze it
             // to a static `▸` row before showing the approval prompt.
-            if defer_task_row {
+            if let Some(action) = projected_team {
+                // The approval panel itself names the risky Team delegation.
+                // Defer its transcript row exactly like Task: once approved,
+                // structured Team events own the visual lifecycle; if denied,
+                // the normal failed ToolResult still renders the reason.
+                pending_tools.insert(call.id.clone(), (display.clone(), action, false));
+            } else if defer_task_row {
                 // The approval panel already names the Task being approved.
                 // Keep its transcript row deferred so ToolCallResult can append
                 // exactly one permanent `Task(... completed · duration)` row.
