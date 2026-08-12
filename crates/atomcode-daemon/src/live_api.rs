@@ -899,6 +899,19 @@ impl NativeLiveWireProjector {
                 },
                 Kernel::Error { message, .. } => LiveWireEvent::Error { message },
                 Kernel::Warning(message) => LiveWireEvent::Warning { message },
+                Kernel::StreamRecovery {
+                    attempt,
+                    max_attempts,
+                    recovered,
+                } => LiveWireEvent::Warning {
+                    message: if recovered {
+                        "recovered from the interrupted stream".to_string()
+                    } else {
+                        format!(
+                            "stream timed out; safely continuing from saved progress ({attempt}/{max_attempts})"
+                        )
+                    },
+                },
                 Kernel::RateLimited {
                     reset_at_display,
                     reset_label,
