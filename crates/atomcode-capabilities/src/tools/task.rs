@@ -571,16 +571,18 @@ parallel workers NON-OVERLAPPING scopes."
     }
 
     fn take_policy_intervention(&self, result: &mut ToolResult) -> Option<PolicyIntervention> {
-        if !result.content.starts_with(CHILD_POLICY_INTERVENTION_MARKER) {
+        let Some(rest) = result
+            .content
+            .strip_prefix(CHILD_POLICY_INTERVENTION_MARKER)
+        else {
             return None;
-        }
-        // Never expose the internal marker, child transcript, or rejected shell
-        // bytes to the parent model/driver. Reuse the stable policy-authored
-        // reason so every driver follows its existing recovery presentation.
-        result.content = format!(
-            "blocked: {}",
-            super::credential_bash_gate::CREDENTIAL_BASH_DENIAL_REASON
-        );
+        };
+        // The blocked child's block was already sanitized at render time (fixed
+        // notice, no child-derived data), so just strip the internal signal marker
+        // — never expose it — and KEEP the surviving siblings' output. Lift the
+        // structured recovery contract so every driver follows its existing
+        // policy-recovery presentation.
+        result.content = rest.to_string();
         result.is_error = true;
         Some(PolicyIntervention::credential_shell_blocked())
     }
@@ -884,63 +886,7 @@ parallel workers NON-OVERLAPPING scopes."
                 failed,
             });
         }
-        // Sort by label for deterministic output regardless of scheduling order.
-        collected.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let n_total = collected.len();
-        let child_policy_blocked = collected
-            .iter()
-            .any(|(_, _, _, outcome)| outcome.policy_intervention.is_some());
-        let mut n_error = 0usize;
-        let mut blocks: Vec<String> = Vec::new();
-        for (label, desc, model, outcome) in collected {
-            let is_err = outcome.stop != StopReason::Stopped;
-            if is_err {
-                n_error += 1;
-            }
-            // Collect any output the child produced (assistant text, else tool results).
-            let produced = if !outcome.text.is_empty() {
-                outcome.text
-            } else {
-                outcome
-                    .tool_results
-                    .iter()
-                    .map(|r| r.content.clone())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            let (state, tag, body) = if is_err {
-                // Preserve partial output on a bounded/failed stop (MaxRounds,
-                // ProviderError, Cancelled, …) —
-                // a worker that did real work before hitting a limit is not a total loss (#2).
-                let mut b = format!("subagent stopped early ({:?})", outcome.stop);
-                if let Some(e) = &outcome.error {
-                    b.push_str(&format!(": {e}"));
-                }
-                if !produced.is_empty() {
-                    b.push_str(&format!("\n--- partial output ---\n{produced}"));
-                }
-                ("error", "task_error", b)
-            } else {
-                ("completed", "task_result", produced)
-            };
-            blocks.push(render_task_block(&label, &desc, &model, state, tag, &body));
-        }
-
-        let mut content = blocks.join("\n");
-        if child_policy_blocked {
-            content.insert_str(0, CHILD_POLICY_INTERVENTION_MARKER);
-        }
-
-        ToolResult {
-            call_id: String::new(),
-            content,
-            // Fail the whole tool call only when EVERY subtask failed. A partial failure is
-            // conveyed per-block (<task_error>/<task_result>), so the parent can act on the
-            // survivors instead of re-dispatching — and double-applying — the whole batch (#5).
-            is_error: n_total > 0 && n_error == n_total,
-            images: vec![],
-        }
+        aggregate_task_result(collected)
     }
 }
 
@@ -1418,6 +1364,90 @@ fn subtask_progress_line(head: &str, model: &str, desc: &str) -> String {
     }
 }
 
+/// Fixed body shown for a child that hit a HARD policy terminal. Carries no
+/// child-derived data (transcript, rejected op, partial output), so nothing the
+/// blocked subagent produced can reach the parent model.
+const SANITIZED_POLICY_BLOCK_BODY: &str = "blocked by a hard security policy; the subagent's output was withheld. Choose a recovery option or take a different, policy-safe approach.";
+
+/// Assemble the per-subtask blocks into the tool result.
+///
+/// A hard policy terminal (`StopReason::PolicyDenied` — credential-shell AND
+/// sensitive-path both end here; the latter denies with a plain `deny_turn` and
+/// carries NO structured intervention) has its block replaced with a fixed
+/// sanitized notice so the child's transcript / rejected op / partial output
+/// never reaches the parent model, and prepends an internal marker so the kernel
+/// lifts the structured recovery contract. Only the blocked child's block is
+/// sanitized — successful siblings are preserved (not wiped).
+fn aggregate_task_result(mut collected: Vec<(String, String, String, Outcome)>) -> ToolResult {
+    // Sort by label for deterministic output regardless of scheduling order.
+    collected.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let n_total = collected.len();
+    let mut n_error = 0usize;
+    let mut any_policy_blocked = false;
+    let mut blocks: Vec<String> = Vec::new();
+    for (label, desc, model, outcome) in collected {
+        let is_err = outcome.stop != StopReason::Stopped;
+        if is_err {
+            n_error += 1;
+        }
+        if outcome.stop == StopReason::PolicyDenied {
+            any_policy_blocked = true;
+            blocks.push(render_task_block(
+                &label,
+                &desc,
+                &model,
+                "blocked",
+                "task_error",
+                SANITIZED_POLICY_BLOCK_BODY,
+            ));
+            continue;
+        }
+        // Collect any output the child produced (assistant text, else tool results).
+        let produced = if !outcome.text.is_empty() {
+            outcome.text
+        } else {
+            outcome
+                .tool_results
+                .iter()
+                .map(|r| r.content.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let (state, tag, body) = if is_err {
+            // Preserve partial output on a bounded/failed stop (MaxRounds,
+            // ProviderError, Cancelled, …) — a worker that did real work before
+            // hitting a limit is not a total loss (#2).
+            let mut b = format!("subagent stopped early ({:?})", outcome.stop);
+            if let Some(e) = &outcome.error {
+                b.push_str(&format!(": {e}"));
+            }
+            if !produced.is_empty() {
+                b.push_str(&format!("\n--- partial output ---\n{produced}"));
+            }
+            ("error", "task_error", b)
+        } else {
+            ("completed", "task_result", produced)
+        };
+        blocks.push(render_task_block(&label, &desc, &model, state, tag, &body));
+    }
+
+    let mut content = blocks.join("\n");
+    if any_policy_blocked {
+        content.insert_str(0, CHILD_POLICY_INTERVENTION_MARKER);
+    }
+
+    ToolResult {
+        call_id: String::new(),
+        content,
+        // Fail the whole tool call only when EVERY subtask failed. A partial failure is
+        // conveyed per-block (<task_error>/<task_result>), so the parent can act on the
+        // survivors instead of re-dispatching — and double-applying — the whole batch (#5).
+        is_error: n_total > 0 && n_error == n_total,
+        images: vec![],
+    }
+}
+
 /// Wrap a child-agent result in an opencode-style `<task>` block. `model` is the
 /// model the subagent actually ran on (surfaced so the user can see which tier/model
 /// executed — the strong/weak routing proof).
@@ -1529,11 +1559,14 @@ mod tests {
     }
 
     #[test]
-    fn task_lifts_and_sanitizes_child_policy_intervention() {
+    fn take_policy_intervention_strips_marker_and_preserves_siblings() {
+        // Sanitization happens at render time (the blocked child's block carries
+        // no transcript). take_policy_intervention only strips the internal signal
+        // marker and lifts the recovery contract — surviving siblings are kept.
         let tool = dummy();
         let mut result = ToolResult {
             content: format!(
-                "{}child transcript must not escape",
+                "{}<task id=\"a\">SIBLING FINDINGS</task>\n<task id=\"b\">blocked</task>",
                 CHILD_POLICY_INTERVENTION_MARKER
             ),
             ..Default::default()
@@ -1543,19 +1576,61 @@ mod tests {
             .take_policy_intervention(&mut result)
             .expect("child policy marker must be lifted");
 
-        assert_eq!(
-            intervention.code,
-            atomcode_kernel::event::PolicyInterventionCode::CredentialShellBlocked
-        );
+        assert_eq!(intervention.code, PolicyInterventionCode::CredentialShellBlocked);
         assert!(result.is_error);
-        assert_eq!(
-            result.content,
-            format!(
-                "blocked: {}",
-                super::super::credential_bash_gate::CREDENTIAL_BASH_DENIAL_REASON
-            )
+        assert!(
+            !result.content.contains(CHILD_POLICY_INTERVENTION_MARKER),
+            "the internal marker must never be exposed"
         );
-        assert!(!result.content.contains("child transcript"));
+        assert!(
+            result.content.contains("SIBLING FINDINGS"),
+            "a successful sibling's output must survive a policy block"
+        );
+    }
+
+    #[test]
+    fn take_policy_intervention_ignores_unmarked_result() {
+        assert!(dummy()
+            .take_policy_intervention(&mut ToolResult {
+                content: "ordinary result".into(),
+                ..Default::default()
+            })
+            .is_none());
+    }
+
+    #[test]
+    fn aggregate_withholds_blocked_child_transcript_and_keeps_siblings() {
+        // A sensitive-path block ends PolicyDenied with NO structured intervention
+        // (plain deny_turn). It must STILL be detected (marker prepended so the
+        // kernel lifts it), its transcript withheld, while a successful sibling's
+        // output survives.
+        let blocked = Outcome {
+            stop: StopReason::PolicyDenied,
+            text: "SECRET id_rsa bytes the child tried to exfiltrate".into(),
+            ..Default::default()
+        };
+        let ok = Outcome {
+            stop: StopReason::Stopped,
+            text: "SIBLING FINDINGS".into(),
+            ..Default::default()
+        };
+        let result = aggregate_task_result(vec![
+            ("a-blocked".into(), "d".into(), "m".into(), blocked),
+            ("b-ok".into(), "d".into(), "m".into(), ok),
+        ]);
+
+        assert!(
+            result.content.starts_with(CHILD_POLICY_INTERVENTION_MARKER),
+            "a PolicyDenied child must be signalled even without a structured intervention"
+        );
+        assert!(
+            !result.content.contains("SECRET"),
+            "the blocked child's transcript must never reach the parent"
+        );
+        assert!(
+            result.content.contains("SIBLING FINDINGS"),
+            "the successful sibling's output must be preserved, not wiped"
+        );
     }
 
     #[tokio::test]
