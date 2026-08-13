@@ -1011,8 +1011,7 @@ mod tests {
         assert_eq!(h2.timeout_ms, 10_000);
 
         // Stop / StopFailure are supported plugin hook events (both spellings).
-        let h3 = HookConfig::from_plugin_spec("Stop", None, "x".into(), None, "/p".into())
-            .unwrap();
+        let h3 = HookConfig::from_plugin_spec("Stop", None, "x".into(), None, "/p".into()).unwrap();
         assert_eq!(h3.event, HookEvent::Stop);
         let h4 = HookConfig::from_plugin_spec("stop_failure", None, "x".into(), None, "/p".into())
             .unwrap();
@@ -1089,10 +1088,7 @@ mod tests {
 
         // Normal terminal → ONLY the Stop hook fires.
         cc.turn_complete(&convo, &StopReason::Stopped, &ctx).await;
-        assert!(
-            stop_marker.exists(),
-            "Stop hook must fire on a normal stop"
-        );
+        assert!(stop_marker.exists(), "Stop hook must fire on a normal stop");
         assert!(
             !failure_marker.exists(),
             "StopFailure must NOT fire on a normal stop"
@@ -1175,8 +1171,14 @@ mod tests {
         CCExternalHooks::new(vec![hook(&m_a_s), hook(&m_b_s)], "/tmp")
             .turn_complete(&convo, &StopReason::Stopped, &ctx)
             .await;
-        assert!(m_a.exists(), "first of two hooks must see stop_hook_active:true");
-        assert!(m_b.exists(), "second of two hooks must see stop_hook_active:true");
+        assert!(
+            m_a.exists(),
+            "first of two hooks must see stop_hook_active:true"
+        );
+        assert!(
+            m_b.exists(),
+            "second of two hooks must see stop_hook_active:true"
+        );
     }
 
     #[test]
