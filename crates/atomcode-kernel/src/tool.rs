@@ -36,6 +36,7 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+use crate::event::PolicyIntervention;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -247,6 +248,14 @@ pub trait Tool: Send + Sync {
     /// itself never gates.
     fn always_grant_scope(&self, args: &str) -> String {
         args.to_string()
+    }
+    /// Lift a policy intervention discovered behind this tool's execution
+    /// boundary (for example, a task tool whose child agent hit a hard policy
+    /// gate). Implementations may sanitize `result` before it is observed by
+    /// middleware, the driver, history, or the model. The conservative default
+    /// is no intervention.
+    fn take_policy_intervention(&self, _result: &mut ToolResult) -> Option<PolicyIntervention> {
+        None
     }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult;
 }

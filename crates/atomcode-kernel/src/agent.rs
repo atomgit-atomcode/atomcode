@@ -533,6 +533,7 @@ enum CallPlan {
 struct ExecutedCallResult {
     result: ToolResult,
     effective_cwd: Option<std::path::PathBuf>,
+    policy_intervention: Option<PolicyIntervention>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -748,6 +749,10 @@ pub struct Outcome {
     /// on the code instead of string-matching `error`.
     pub http_status: Option<u16>,
     pub error_code: Option<String>,
+    /// A hard policy boundary raised during this run. One-shot child drivers
+    /// preserve it so their parent tool can lift the same structured recovery
+    /// contract instead of reducing it to an ordinary string failure.
+    pub policy_intervention: Option<PolicyIntervention>,
 }
 
 /// Auto-response policy for the one-shot adapter (no human in the loop).
@@ -980,6 +985,9 @@ impl Agent {
                     outcome.error = Some(message);
                     outcome.http_status = http_status;
                     outcome.error_code = code;
+                }
+                AgentEvent::PolicyIntervention { intervention } => {
+                    outcome.policy_intervention = Some(intervention);
                 }
                 AgentEvent::TurnComplete { reason } => {
                     outcome.stop = reason;
@@ -3322,11 +3330,16 @@ impl RunningAgent {
                     results[i] = Some(ExecutedCallResult {
                         result: r.clone(),
                         effective_cwd: None,
+                        policy_intervention: None,
                     });
                 }
             }
 
             let mut ordered: FuturesOrdered<_> = FuturesOrdered::new();
+            // Independent from user cancellation: a hard policy result stops
+            // Execute plans that have not crossed their execution lock yet,
+            // without changing the authoritative terminal to Cancelled.
+            let policy_stop = tokio_util::sync::CancellationToken::new();
             for (idx, plan) in plans.iter().enumerate() {
                 let CallPlan::Execute {
                     tool,
@@ -3342,6 +3355,7 @@ impl RunningAgent {
                 let gate = gate.clone();
                 let sem = sem.clone();
                 let cancel = cancel.clone();
+                let policy_stop = policy_stop.clone();
                 // SEAM 1/1b: a per-agent working dir (when set) PINS the tool
                 // context's dir instead of the process-global `current_dir()`.
                 let cwd = self.cwd.clone();
@@ -3371,6 +3385,22 @@ impl RunningAgent {
                     // serial loop's skip-the-rest behavior.
                     if cancel.is_cancelled() {
                         return (idx, None);
+                    }
+                    if policy_stop.is_cancelled() {
+                        return (
+                            idx,
+                            Some(ExecutedCallResult {
+                                result: ToolResult {
+                                    call_id: call.id.clone(),
+                                    content: "blocked: another call in this batch terminated the turn by policy"
+                                        .into(),
+                                    is_error: true,
+                                    images: vec![],
+                                },
+                                effective_cwd: None,
+                                policy_intervention: None,
+                            }),
+                        );
                     }
                     // SNAPSHOT cwd AFTER acquiring the lock so a prior write-locked
                     // `change_dir` (which held the exclusive barrier) is visible here.
@@ -3422,11 +3452,21 @@ impl RunningAgent {
                         },
                     };
                     r.call_id = call.id.clone();
+                    // Composed tools may own a child agent. Lift and sanitize a
+                    // child policy terminal at the execution boundary, before
+                    // middleware/history/model observation. Signal sibling
+                    // futures immediately; those still waiting on the execution
+                    // lock produce paired blocked results without running.
+                    let policy_intervention = tool.take_policy_intervention(&mut r);
+                    if policy_intervention.is_some() {
+                        policy_stop.cancel();
+                    }
                     (
                         idx,
                         Some(ExecutedCallResult {
                             result: r,
                             effective_cwd: Some(effective_cwd),
+                            policy_intervention,
                         }),
                     )
                 });
@@ -3474,10 +3514,15 @@ impl RunningAgent {
                 let Some(ExecutedCallResult {
                     mut result,
                     effective_cwd,
+                    policy_intervention: result_policy_intervention,
                 }) = result_slot.take()
                 else {
                     continue; // Skip plan (no result to apply)
                 };
+                if let Some(intervention) = result_policy_intervention {
+                    policy_intervention.get_or_insert(intervention);
+                    policy_denied = true;
+                }
                 // ToolMiddleware after-chain: transform / observe the result and
                 // collect any CONTINUATION decision. Middleware sees the RAW
                 // (uncapped) result. The first `Block` reason wins.

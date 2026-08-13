@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use atomcode_kernel::agent::{Agent, AutoRespond, Outcome, ToolLoopPolicy};
-use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
+use atomcode_kernel::event::{AgentCommand, AgentEvent, PolicyIntervention, StopReason};
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::Message;
 use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const DEFAULT_MAX_CONCURRENT: usize = 3;
+const CHILD_POLICY_INTERVENTION_MARKER: &str = "\u{1e}atomcode:child-policy-intervention\u{1e}";
 static TASK_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn task_run_id(progress: &ProgressSink) -> crate::team::TeamRunId {
@@ -569,6 +570,21 @@ MUST declare a `scope` (working-dir-relative globs) listing the files it may wri
 parallel workers NON-OVERLAPPING scopes."
     }
 
+    fn take_policy_intervention(&self, result: &mut ToolResult) -> Option<PolicyIntervention> {
+        if !result.content.starts_with(CHILD_POLICY_INTERVENTION_MARKER) {
+            return None;
+        }
+        // Never expose the internal marker, child transcript, or rejected shell
+        // bytes to the parent model/driver. Reuse the stable policy-authored
+        // reason so every driver follows its existing recovery presentation.
+        result.content = format!(
+            "blocked: {}",
+            super::credential_bash_gate::CREDENTIAL_BASH_DENIAL_REASON
+        );
+        result.is_error = true;
+        Some(PolicyIntervention::credential_shell_blocked())
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
@@ -872,6 +888,9 @@ parallel workers NON-OVERLAPPING scopes."
         collected.sort_by(|a, b| a.0.cmp(&b.0));
 
         let n_total = collected.len();
+        let child_policy_blocked = collected
+            .iter()
+            .any(|(_, _, _, outcome)| outcome.policy_intervention.is_some());
         let mut n_error = 0usize;
         let mut blocks: Vec<String> = Vec::new();
         for (label, desc, model, outcome) in collected {
@@ -908,9 +927,14 @@ parallel workers NON-OVERLAPPING scopes."
             blocks.push(render_task_block(&label, &desc, &model, state, tag, &body));
         }
 
+        let mut content = blocks.join("\n");
+        if child_policy_blocked {
+            content.insert_str(0, CHILD_POLICY_INTERVENTION_MARKER);
+        }
+
         ToolResult {
             call_id: String::new(),
-            content: blocks.join("\n"),
+            content,
             // Fail the whole tool call only when EVERY subtask failed. A partial failure is
             // conveyed per-block (<task_error>/<task_result>), so the parent can act on the
             // survivors instead of re-dispatching — and double-applying — the whole batch (#5).
@@ -1365,6 +1389,9 @@ async fn run_child_to_completion(
                 outcome.http_status = http_status;
                 outcome.error_code = code;
             }
+            AgentEvent::PolicyIntervention { intervention } => {
+                outcome.policy_intervention = Some(intervention);
+            }
             AgentEvent::TurnComplete { reason } => {
                 outcome.stop = reason;
                 let _ = handle.commands.send(AgentCommand::Shutdown);
@@ -1410,9 +1437,12 @@ fn render_task_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atomcode_kernel::event::PolicyInterventionCode;
     use atomcode_kernel::message::Message;
+    use atomcode_kernel::middleware::BeforeOutcome;
     use atomcode_kernel::provider::ChatOptions;
     use atomcode_kernel::stream::{ProviderError, StreamEvent};
+    use atomcode_kernel::testkit::{EchoTool, ScriptedProvider};
     use atomcode_kernel::tool::{ProgressSink, ToolDef, ToolRegistry};
     use futures::stream::{self, BoxStream};
     use futures::StreamExt;
@@ -1476,9 +1506,99 @@ mod tests {
         )
     }
 
+    struct ChildPolicyGate;
+
+    #[async_trait]
+    impl ToolMiddleware for ChildPolicyGate {
+        async fn before(
+            &self,
+            _call: &mut ToolCall,
+            _tool: &Arc<dyn Tool>,
+            _ctx: &atomcode_kernel::request::RequestCtx,
+        ) -> BeforeOutcome {
+            BeforeOutcome::deny_turn_with_intervention(
+                super::super::credential_bash_gate::CREDENTIAL_BASH_DENIAL_REASON,
+                PolicyIntervention::credential_shell_blocked(),
+            )
+        }
+    }
+
     #[test]
     fn name_is_task() {
         assert_eq!(dummy().name(), "task");
+    }
+
+    #[test]
+    fn task_lifts_and_sanitizes_child_policy_intervention() {
+        let tool = dummy();
+        let mut result = ToolResult {
+            content: format!(
+                "{}child transcript must not escape",
+                CHILD_POLICY_INTERVENTION_MARKER
+            ),
+            ..Default::default()
+        };
+
+        let intervention = tool
+            .take_policy_intervention(&mut result)
+            .expect("child policy marker must be lifted");
+
+        assert_eq!(
+            intervention.code,
+            atomcode_kernel::event::PolicyInterventionCode::CredentialShellBlocked
+        );
+        assert!(result.is_error);
+        assert_eq!(
+            result.content,
+            format!(
+                "blocked: {}",
+                super::super::credential_bash_gate::CREDENTIAL_BASH_DENIAL_REASON
+            )
+        );
+        assert!(!result.content.contains("child transcript"));
+    }
+
+    #[tokio::test]
+    async fn child_runner_preserves_structured_policy_intervention() {
+        let provider = Arc::new(ScriptedProvider::events(vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: "child-call".into(),
+                name: "echo".into(),
+                arguments: r#"{"text":"secret"}"#.into(),
+            }),
+            StreamEvent::Done { truncated: false },
+        ]));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        let cancel = CancellationToken::new();
+        let progress = Arc::new(SubtaskProgressHook::new(
+            ProgressSink::noop(),
+            "worker#1".into(),
+            false,
+            cancel.clone(),
+            None,
+            crate::team::TeamMemberId::new("worker#1"),
+        ));
+        let child = Agent::builder()
+            .provider(provider)
+            .tools(registry.mount(&["echo"]))
+            .cancel_token(cancel)
+            .middleware(Arc::new(ChildPolicyGate))
+            .build();
+
+        let outcome = run_child_to_completion(
+            child,
+            "go".into(),
+            AutoRespond::AllowAll,
+            progress,
+        )
+        .await;
+
+        assert_eq!(outcome.stop, StopReason::PolicyDenied);
+        assert_eq!(
+            outcome.policy_intervention.map(|value| value.code),
+            Some(PolicyInterventionCode::CredentialShellBlocked)
+        );
     }
 
     #[test]
