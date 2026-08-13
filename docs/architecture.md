@@ -1,144 +1,205 @@
-# AtomCode Architecture — Module Map
+# AtomCode Architecture
 
-## Crate Overview
+本文描述当前生产架构及其依赖边界。历史迁移方案和已经完成的 bridge/core
+退役过程不属于当前架构；如需了解迁移背景，应查阅相关 Git 历史和归档文档。
 
-| Crate | Role |
-|-------|------|
-| **atomcode-core** | Agent 引擎 — 工具、上下文、语义分析、LLM 通信 |
-| **atomcode-tuix** | 终端 UI — retained-mode 渲染、input、modal 选择器、命令分发 |
-| **atomcode-cli** | CLI 入口 — 参数解析、OAuth 登录 |
-| **atomcode-daemon** | 后台服务 — HTTP API 服务（独立部署） |
+## 总体调用链
 
----
+coding agent 的统一生产调用链为：
 
-## atomcode-core 模块
-
-### Agent 层 — 决策与编排
-
-| 模块 | 行数 | 职责 |
-|------|:----:|------|
-| `agent/mod.rs` | 2549 | **核心主循环** — start_turn、run_turn_loop、auto_compile、auto_diagnose、system prompt 构建、纪律检查、步数限制。（待拆分） |
-| `agent/task_classifier.rs` | 197 | **意图分类** — 用户消息分类为 BugFix/FollowUp/FeatureDev/Question/Command/SingleFileEdit，驱动 read-only 限制和 Analyze 前缀 |
-| `agent/knowledge.rs` | 179 | **跨 session 知识持久化** — 从 tool result 自动提取端口/密码，"记住这个"手动记录，存入 .atomcode/knowledge.md |
-| `agent/git_checkpoint.rs` | 71 | **Git 检查点** — git stash create 创建轻量备份，/undo 恢复 |
-| `agent/subtask_driver.rs` | ~100 | **子任务驱动** — 将计划拆为文件级子任务，auto_compile 通过后推进下一步 |
-
-### 工具层 — 执行与安全
-
-| 模块 | 行数 | 职责 |
-|------|:----:|------|
-| `tool/mod.rs` | 372 | **工具注册表** — Tool trait、ToolContext、ToolRegistry、权限系统（RequireApproval 不可被 session grant 绕过） |
-| `tool/edit.rs` | 952 | **编辑文件** — text-match / line-number / symbol-scoped / fuzzy 四种模式，edit 后附 surrounding context（recency bias），空 old_string 拒绝 |
-| `tool/bash.rs` | 380 | **执行命令** — 超时管理、nohup 包装（devserver 自动检测）、破坏性命令拦截（18 种模式）、30s idle 检测、输出附 [cwd:] |
-| `tool/read.rs` | ~150 | **读文件** — 大文件截断 1500 行 + tree-sitter skeleton |
-| `tool/write.rs` | ~150 | **写文件** — 新文件创建、file_history 备份 |
-| `tool/grep.rs` | ~230 | **搜索内容** — regex + smart-case + 自动 literal 降级 + tree-sitter 函数标注 + 3 行默认上下文 |
-| `tool/glob.rs` | ~90 | **搜索文件名** — 通配符匹配 |
-| `tool/search_replace.rs` | ~170 | **跨文件替换** — 正则批量替换 + file_history 备份 |
-| `tool/find_references.rs` | 155 | **查找引用** — ripgrep + tree-sitter 分类（定义 vs 调用） |
-| `tool/list_symbols.rs` | ~60 | **列出符号** — tree-sitter 提取函数/类签名 |
-| `tool/read_symbol.rs` | ~60 | **读取符号** — 按函数名提取完整代码 |
-| `tool/file_history.rs` | ~200 | **文件快照** — edit/write 前自动 copyFile 备份，按 session 隔离，每文件最多 50 版本 |
-| `tool/result_store.rs` | ~100 | **结果外部化** — >512B 的 tool result 写磁盘，ToolResultRef 只保留摘要+hash |
-| `tool/web_search.rs` | 308 | **Web 搜索** — DuckDuckGo HTML 解析 |
-| `tool/web_fetch.rs` | ~80 | **抓取网页** — HTML → 文本提取 |
-| `tool/use_skill.rs` | ~80 | **技能调用** — 加载 .atomcode/skills/ 下的 markdown 技能 |
-| `tool/cd.rs` | ~50 | **切换目录** |
-| `tool/list_dir.rs` | ~50 | **列出目录** |
-| `tool/devserver/` | ~600 | **Dev Server 检测** — java/javascript/python/rust 四个语言模块，检测服务命令 + nohup 包装 + 端口探测 + 编译错误增强 |
-
-### 上下文层 — 对话与预算
-
-| 模块 | 行数 | 职责 |
-|------|:----:|------|
-| `conversation/mod.rs` | 986 | **上下文管理** — hot/cold 分区（30/70）、batch summary、ToolResult 浓缩、消息清理（孤儿 result 删除） |
-| `conversation/message.rs` | ~110 | **消息结构** — Text/AssistantWithToolCalls/ToolResult/ToolResultRef，token 估算（byte_size 真实估算） |
-| `conversation/turn.rs` | ~80 | **Turn 跟踪** — 轮次边界检测、完成计数 |
-
-### Turn 层 — LLM 通信
-
-| 模块 | 行数 | 职责 |
-|------|:----:|------|
-| `turn/runner.rs` | 368 | **TurnRunner** — 构建 messages + inflate refs + 调 LLM + 执行 tool + 权限检查，context stats post-inflate 记录 |
-| `ctx/truncate.rs` | 521 | **输出截断** — 按工具类型截断（bash 保错误行、read 出 skeleton）、>512B 外部化到 result_store (2026-04 从 turn/truncation.rs 迁入 ctx 模块) |
-| `turn/permission.rs` | ~100 | **权限决策** — InteractivePermissionDecider（弹确认框）、AutoBypass/AutoDeny |
-| `turn/json_repair.rs` | 439 | **JSON 修复** — 自动修复 JSON 语法错误（缺逗号、单引号、未闭合） |
-| `turn/log.rs` | ~160 | **LLM 请求日志** — 每次 LLM 调用写 JSON 到 ~/.atomcode/logs/ |
-
-### 语义层 — 代码理解
-
-| 模块 | 行数 | 职责 |
-|------|:----:|------|
-| `semantic/mod.rs` | 793 | **语义分析** — list_symbols / extract_symbol / skeleton / find_similar_calls / count_syntax_errors，支持 9 种语言 |
-| `semantic/language.rs` | ~70 | **语言注册** — Lang 枚举 + grammar + symbols_query(.scm 文件) |
-| `semantic/cache.rs` | ~80 | **AST 缓存** — 按 mtime 缓存 tree-sitter 解析树 |
-
-### 基础设施
-
-| 模块 | 行数 | 职责 |
-|------|:----:|------|
-| `config/mod.rs` | 286 | **配置** — Config/ProviderConfig 加载、DEFAULT_SYSTEM_PROMPT（124 行规则） |
-| `config/prompt_sections.rs` | ~60 | **动态 prompt** — UNIFIED_PROMPT 构建 |
-| `config/provider.rs` | 40 | **Provider 配置** — type/api_key/model/base_url/context_window |
-| `project_context.rs` | 487 | **项目上下文** — 目录树扫描（3 层）+ tree-sitter 符号标注 + tech stack 探测 + 配置文件摘要 |
-| `provider/openai.rs` | 401 | **OpenAI 兼容 Provider** — OpenRouter/硅基流动/本地 API 通信 |
-| `provider/claude.rs` | 325 | **Anthropic Provider** — Claude API 通信 |
-| `provider/ollama.rs` | ~150 | **Ollama Provider** — 本地模型通信 |
-| `session.rs` | 280 | **会话管理** — 保存/加载/恢复对话历史 |
-| `skill.rs` | 599 | **技能系统** — Markdown 技能文件加载、参数展开 |
-| `stream/mod.rs` | ~80 | **SSE 流解析** — LLM 响应流处理 |
-
----
-
-## atomcode-tuix 模块
-
-> CC 风格的 normal-mode TUI（不进 alternate screen），retained-mode 渲染器（cell-level diff + 16ms tick）。详细设计见 `docs/superpowers/plans/2026-04-19-tuix-retained-mode-rewrite.md`。
-
-| 模块 | 职责 |
-|------|------|
-| `lib.rs` | TUI 入口 — `run()` 启动事件循环、初始化 renderer |
-| `event_loop/` | 主循环 — 事件分发、命令处理、buffer 管理、Modal 调度 |
-| `render/` | 渲染层 — Cell/Screen buffer、diff、retained-mode 帧循环、theme |
-| `modals/` | Modal 选择器 — dir/model/session/provider/issue/welcome 向导 |
-| `input/` | 输入处理 — key action 映射、history、reader |
-| `markdown.rs` | Markdown 渲染 — pulldown-cmark + syntect + CJK 间距 |
-| `commands.rs` | 斜杠命令注册与分发 |
-| `think.rs` | reasoning_content 流式渲染 |
-| `state.rs` | UiState — 全局 UI 状态机 |
-| `trace.rs` | datalog 记录 — 每轮对话写 Markdown |
-
----
-
-## 数据流
-
+```text
+CLI / TUI / daemon / background / ACP / clix code
+                    │
+                    ▼
+       CodingRuntimeHandle / DriverCommand
+                    │
+                    ▼
+               CodingRuntime
+                    │
+                    ▼
+          atomcode-kernel Agent
 ```
-用户输入
-    ↓
-task_classifier → 分类（BugFix/FeatureDev/...）
-    ↓
-"Analyze first" 前缀注入
-    ↓
-auto_diagnose → 扫描日志、提取异常、tree-sitter 代码定位
-    ↓
-conversation.to_provider_messages_budgeted() → hot/cold 分区
-    ↓
-inflate ToolResultRef → 恢复最近 20 个大 tool result
-    ↓
-TurnRunner.run() → 发给 LLM
-    ↓
-LLM 返回 tool_use → 执行工具
-    ↓
-file_history.backup() → edit/write 前备份
-    ↓
-tool 执行 → surrounding_context 附在结果末尾
-    ↓
-post_process → 截断 + 外部化到 result_store
-    ↓
-auto_compile_verify → 编译检查
-    ↓
-syntax_check_edited_files → tree-sitter 语法检查
-    ↓
-apply_post_turn_discipline → 步数提醒、重读检测
-    ↓
-继续下一轮 or finish_turn
+
+- driver 负责输入、展示、传输以及明确的本地操作；
+- `CodingRuntime` 是 coding agent 的唯一运行时所有者；
+- `atomcode-kernel` 只负责中立的 agent 循环；
+- `atomcode-capabilities` 提供 provider、工具、MCP、session 等可复用能力；
+- provider、session、working directory、goal、loop、审批和 generation 等 coding
+  生命周期状态不得由 driver 或 kernel 另建第二份所有权。
+
+## 分层与依赖方向
+
+```text
+L3  drivers / services
+    atomcode-cli  atomcode-tuix  atomcode-daemon  atomcode-clix  ACP
+                              │
+                              ▼
+L2                     atomcode-coding
+                  runtime owner + coding assembly
+                       │                 │
+                       ▼                 ▼
+L1            atomcode-capabilities   atomcode-config/auth/...
+              providers/tools/session
+                       │
+                       ▼
+L0                     atomcode-kernel
+                  neutral agent contracts
 ```
+
+依赖只能从上层指向下层：
+
+- `atomcode-kernel` 不得依赖 coding 产品语义、具体 provider、具体工具或 UI；
+- `atomcode-capabilities` 可以依赖 kernel，但不得反向依赖 `atomcode-coding`、
+  driver 或已退役的 core；
+- `atomcode-coding` 组装 kernel 与 capabilities，并拥有 coding 生命周期；
+- driver 通过 `CodingRuntimeHandle` 和 `DriverCommand` 驱动运行时，不得重建 live
+  agent 生命周期；
+- 独立业务 agent（例如 review）可以直接组装其所需的 kernel/capabilities，
+  但不得复制 coding runtime 的状态所有权。
+
+## 主要 crate
+
+| Crate | 层级 | 职责 |
+|---|---:|---|
+| `atomcode-kernel` | L0 | 中立 Agent、`AgentCommand`/`AgentEvent`、message、provider/tool trait、middleware、hook 与 request 边界 |
+| `atomcode-capabilities` | L1 | 具体 provider、文件与 shell 工具、MCP、skills、plugin、memory、session persistence、compaction 等可复用能力 |
+| `atomcode-coding` | L2 | coding persona、能力装配、`CodingRuntime`、provider/session/controller、goal/loop、team/subagent 与产品执行策略 |
+| `atomcode-config` | leaf | 配置模型、加载与产品配置策略 |
+| `atomcode-auth` | leaf | 登录、OAuth 与凭据生命周期 |
+| `atomcode-cli` | L3 | 可执行程序入口、参数解析、headless/TUI/ACP 等入口协调 |
+| `atomcode-tuix` | L3 | retained-mode 终端 UI、事件循环、modal、命令与 runtime 事件投影 |
+| `atomcode-daemon` | L3 | HTTP/WebUI/live hub、headless runtime 接入及历史 session 单向导入 |
+| `atomcode-clix` | L3 | 独立 coding CLI driver |
+| `atomcode-review` | L2/L3 | 基于 kernel + capabilities 的独立代码审查 agent |
+| `atomcode-telemetry` | service | 遥测事件、配置和上报 |
+| `atomcode-updater` | service | 安装包与版本更新能力 |
+| `atomcode-codingplan` | capability | coding plan 相关能力；可选 crypto overlay 由发布构建注入 |
+
+## atomcode-kernel：中立执行边界
+
+kernel 定义可复用的 agent 执行协议，而不是 AtomCode 产品运行时：
+
+- `Agent` 执行模型循环；
+- `AgentCommand` / `AgentEvent` 构成中立命令与事件边界；
+- `LlmProvider`、`Tool`、`ToolMiddleware`、hooks 和 request 是扩展 seam；
+- message、stream、checkpoint 等类型不包含 UI 或 coding 产品所有权；
+- kernel 不负责 provider 选择、session 切换、cwd、goal、loop 或持久化目标。
+
+新增产品行为前应先判断它是否真是所有 agent 都需要的中立机制。coding 专属行为应
+留在 `atomcode-coding`，具体实现应优先放在 `atomcode-capabilities`。
+
+## atomcode-capabilities：可复用能力
+
+capabilities 将具体能力实现挂载到 kernel seam，包括：
+
+- OpenAI-compatible、Anthropic、Ollama 等 provider；
+- read/write/edit/bash/grep/glob、code intelligence 与 Web 工具；
+- MCP transport、registry、OAuth 和工具适配；
+- skills、plugin、memory、通知和外部 hooks；
+- compaction 策略；
+- native session snapshot、append-only transcript、catalog、lease 与 recall。
+
+能力通过 Cargo feature 按需启用。该 crate 必须保持 core-free，也不得依赖 L2/L3。
+
+## atomcode-coding：运行时所有者
+
+`atomcode-coding` 将中立 kernel 和具体 capabilities 组装为完整 coding agent：
+
+- `prepare` / `assemble` 构建 provider、工具、MCP、skills、session hooks 等 parts；
+- `CodingRuntime` 持有 live `AgentHandle`、配置、parts、provider、session binding、
+  generation、controller、pending request 和 snapshot broker；
+- `CodingRuntimeHandle` 是 driver 的控制句柄；
+- `DriverCommand` 表达 submit、steer、cancel、approval、compact、provider reload、
+  session/working-directory 变更、goal/loop 等操作；
+- `CodingRuntimeEvent` 和明确终态将运行结果投影给各 driver。
+
+runtime 重建或切换时必须保持 session、cwd、provider、审批、gateway affinity 和持久化
+目标的一致性。旧 generation 的迟到事件不得污染 replacement runtime；失败不得静默
+降级为 fresh session、空 snapshot、noop handle 或假成功。
+
+## Driver 与服务边界
+
+### CLI / TUI
+
+`atomcode-cli` 负责进程入口和模式选择；`atomcode-tuix` 负责终端交互与展示。TUI
+消费 runtime event 并产生 driver command，不拥有第二套 agent、provider 或 session
+状态机。
+
+### daemon / WebUI
+
+`atomcode-daemon` 通过 `CodingRuntime` 提供 headless chat，并通过 live hub 复用 TUI
+附加的运行时。WebUI/HTTP DTO 是传输和展示投影，不是运行时状态的权威来源。
+
+### ACP / clix / background
+
+这些入口同样应通过 coding runtime 驱动 coding agent。它们可以适配各自协议和 I/O，
+但不能重新实现 provider/session/cancel/reload 生命周期。
+
+## Session 持久化
+
+native session 模型是唯一可写持久化模型：
+
+- `SessionManager`、native `SessionMeta`、`SessionSnapshot` 和 `PresentationFile`
+  定义持久化边界；
+- snapshot 用于恢复运行上下文；append-only transcript 用于完整历史与 recall；
+- catalog 负责发现会话，lease 负责跨进程互斥；
+- session binding 和 lease 必须随 runtime 生命周期转移，不得由 UI 根据 session id
+  猜测磁盘位置；
+- 写入只能走 native store，不存在 core writer 或双向格式投影。
+
+### 历史 core JSON importer
+
+daemon 仍保留私有、冻结 DTO，用于读取历史 `core-session-json` 并单向收敛为 native
+session。这是兼容输入，不是当前 runtime 或持久化模型：
+
+```text
+historical core JSON
+          │  daemon private reader DTO
+          ▼
+native SessionManager / snapshot / transcript
+```
+
+禁止从 native 数据反向写回 core JSON，也禁止让 importer DTO 进入 kernel、coding runtime
+或公共 session API。只有历史格式消费者归零后，才能删除该 importer。
+
+## `atomcode-core` 状态
+
+`atomcode-core` 已从 workspace 和生产依赖中退役，当前不存在现役的
+`crates/atomcode-core`：
+
+- core legacy `AgentClient/AgentCommand/AgentEvent` 和 v1 engine 已退役；
+- `atomcode-bridge`、双 endpoint、v1/v2 选择开关和 core driver fallback 已退役；
+- 生产代码不得重新创建 `atomcode-core` facade、兼容 crate 或第二 runtime owner；
+- 源码注释中出现“ported from core”“retired core”表示历史来源，不表示运行时依赖；
+- daemon 的历史 JSON importer 是当前唯一允许保留的 core 格式兼容面。
+
+如果新需求似乎需要恢复 core 类型，应先定位当前状态 owner，并将能力放入 kernel、
+capabilities、coding 或 driver 的正确层，而不是重建 core。
+
+## 运行时生命周期不变量
+
+涉及 submit、steer、cancel、approval、request、compact、provider/model reload、
+session/resume、fresh、undo、cd、goal、loop 或 shutdown 时，必须保证：
+
+1. live agent 和 coding 状态只有一个 runtime owner；
+2. accepted operation 对 success、error、cancel、replace、shutdown 都有终态；
+3. cancel/reload/session switch/shutdown 时 pending approval/request fail-closed；
+4. generation 隔离迟到事件；
+5. build/prepare/assemble/restore 失败显式返回或回滚；
+6. turn completion 复用既有 `LifecycleHooks::turn_complete` 和 kernel 终止路径；
+7. compaction 复用 capabilities 的现有实现，不创建第二压缩状态机；
+8. 历史数据只作为 importer 输入，runtime snapshot 具有明确权威来源。
+
+## 架构变更检查清单
+
+修改公共协议、runtime、session、安全边界或跨 crate 依赖前，应至少检查：
+
+- 状态的唯一 owner 和所有生产/消费入口；
+- CLI、TUI、daemon、headless、background、ACP、clix 的实际影响；
+- 命令、事件、持久化格式和转换边界；
+- failure、cancel、replace、resume 与降级语义；
+- 是否引入反向依赖、第二生命周期、静默 fallback 或新的 legacy writer；
+- 相关 crate 测试以及必要的跨 crate 编译验证。
+
+当前架构以“单一状态所有权、单向依赖、显式终态、单向历史导入”为原则。文档与代码
+冲突时，应先以当前代码核实事实，再同步修正文档，不能把历史结构当作实现前提。
