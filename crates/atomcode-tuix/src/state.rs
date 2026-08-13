@@ -157,6 +157,8 @@ pub struct UserInputPanel {
     pub custom_text: String,
     /// UTF-8 byte cursor for `custom_text`, always kept on a grapheme boundary.
     pub custom_text_cursor_byte: usize,
+    /// Images attached while answering this question.
+    pub images: Vec<atomcode_kernel::message::ImageContent>,
     /// Whether the "Other" free-text row is offered. Human-authored choice
     /// questions always set this; internal fixed checkpoints may disable it.
     pub custom: bool,
@@ -198,6 +200,7 @@ impl UserInputPanel {
             text_cursor_byte: 0,
             custom_text: String::new(),
             custom_text_cursor_byte: 0,
+            images: Vec::new(),
             custom,
             scroll_offset: 0,
         }
@@ -441,15 +444,16 @@ impl UserInputPanel {
                     vec![self.options[self.cursor].0.clone()]
                 } else {
                     let custom = self.custom_text.trim();
-                    if custom.is_empty() {
+                    if custom.is_empty() && self.images.is_empty() {
                         return None; // cursor on "Other" with no text → no-op
                     }
-                    vec![custom.to_string()]
+                    (!custom.is_empty()).then(|| custom.to_string()).into_iter().collect()
                 };
                 Some(UserInputResponse {
                     declined: false,
                     selected,
                     text: None,
+                    images: self.images.clone(),
                 })
             }
             Multiple => {
@@ -461,19 +465,21 @@ impl UserInputPanel {
                 if !custom.is_empty() {
                     selected.push(custom.to_string());
                 }
-                if selected.is_empty() {
+                if selected.is_empty() && self.images.is_empty() {
                     return None; // nothing chosen → Submit is a no-op
                 }
                 Some(UserInputResponse {
                     declined: false,
                     selected,
                     text: None,
+                    images: self.images.clone(),
                 })
             }
             Text => Some(UserInputResponse {
                 declined: false,
                 selected: vec![],
                 text: Some(self.text.clone()),
+                images: self.images.clone(),
             }),
         }
     }

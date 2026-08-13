@@ -4,6 +4,7 @@
 //! round-trip via `ToolContext::request`. Types are defined here for drivers to import.
 
 use async_trait::async_trait;
+use atomcode_kernel::message::ImageContent;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
 
 /// The `kind` string for the generic driver round-trip carrying a user-input request.
@@ -49,6 +50,8 @@ pub struct UserInputResponse {
     pub selected: Vec<String>, // single: len<=1; multiple: 0..N (labels)
     #[serde(default)]
     pub text: Option<String>, // text mode
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageContent>,
 }
 
 impl UserInputResponse {
@@ -129,7 +132,7 @@ fn answer_summary(resp: &UserInputResponse) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     });
-    match (selected, text) {
+    let mut summary = match (selected, text) {
         (Some(sel), Some(t)) => format!("User selected: {sel}, and User answered: {t:?}"),
         (Some(sel), None) => format!("User selected: {sel}"),
         (None, Some(t)) => format!("User answered: {t:?}"),
@@ -139,7 +142,12 @@ fn answer_summary(resp: &UserInputResponse) -> String {
             Some(t) => format!("User answered: {t:?}"),
             None => "User selected nothing.".to_string(),
         },
+    };
+    if !resp.images.is_empty() {
+        let noun = if resp.images.len() == 1 { "image" } else { "images" };
+        summary.push_str(&format!(", and User attached {} {noun}", resp.images.len()));
     }
+    summary
 }
 
 /// Map one question's response to its answer clause (shared by single + batch).
@@ -170,7 +178,12 @@ pub fn format_batch_result(reqs: &[UserInputRequest], resps: &[UserInputResponse
             format!("Q{} ({}): {}", i + 1, req.header, clause)
         })
         .collect();
-    ok_result(lines.join("\n"))
+    ToolResult {
+        call_id: String::new(),
+        content: lines.join("\n"),
+        is_error: false,
+        images: resps.iter().flat_map(|r| r.images.iter().cloned()).collect(),
+    }
 }
 
 fn err_result(msg: impl Into<String>) -> ToolResult {
@@ -199,7 +212,12 @@ pub fn format_result(resp: &UserInputResponse) -> ToolResult {
              are truly blocked.",
         );
     }
-    ok_result(answer_summary(resp))
+    ToolResult {
+        call_id: String::new(),
+        content: answer_summary(resp),
+        is_error: false,
+        images: resp.images.clone(),
+    }
 }
 
 /// Result when no driver can present the question (Null round-trip / missing requester).
@@ -337,6 +355,7 @@ mod tests {
             declined: false,
             selected: vec!["OAuth".into()],
             text: None,
+            images: vec![],
         });
         assert_eq!(r.content, r#"User selected: "OAuth""#);
         assert!(!r.is_error);
@@ -349,6 +368,7 @@ mod tests {
                 declined: false,
                 selected: vec!["A".into(), "B".into()],
                 text: None,
+                images: vec![],
             })
             .content,
             r#"User selected: "A", "B""#
@@ -358,6 +378,7 @@ mod tests {
                 declined: false,
                 selected: vec![],
                 text: None,
+                images: vec![],
             })
             .content,
             "User selected nothing."
@@ -371,6 +392,7 @@ mod tests {
                 declined: false,
                 selected: vec![],
                 text: Some("hi".into()),
+                images: vec![],
             })
             .content,
             r#"User answered: "hi""#
@@ -454,6 +476,7 @@ mod tests {
                 declined: false,
                 selected: vec!["OAuth".into()],
                 text: None,
+                images: vec![],
             },
             UserInputResponse::declined(),
         ];
@@ -527,6 +550,7 @@ mod tests {
             declined: false,
             selected: vec!["Python".into()],
             text: Some("plus Rust".into()),
+            images: vec![],
         });
         assert_eq!(
             r.content,
@@ -557,6 +581,7 @@ mod tests {
             declined: false,
             selected: vec!["Python".into(), "Rust".into()],
             text: Some("plus Go".into()),
+            images: vec![],
         }];
         let r = format_batch_result(&reqs, &resps);
         assert_eq!(
@@ -572,7 +597,33 @@ mod tests {
             declined: false,
             selected: vec!["Python".into()],
             text: Some("   ".into()),
+            images: vec![],
         });
         assert_eq!(r.content, r#"User selected: "Python""#);
+    }
+
+    #[test]
+    fn attached_image_is_forwarded_in_tool_result() {
+        let image = ImageContent {
+            media_type: "image/png".into(),
+            data: "aW1hZ2U=".into(),
+        };
+        let r = format_result(&UserInputResponse {
+            declined: false,
+            selected: vec![],
+            text: Some("reference".into()),
+            images: vec![image.clone()],
+        });
+        assert_eq!(r.images, vec![image]);
+        assert!(r.content.contains("User attached 1 image"));
+    }
+
+    #[test]
+    fn old_response_without_images_remains_compatible() {
+        let r: UserInputResponse = serde_json::from_str(
+            r#"{"declined":false,"selected":["A"],"text":null}"#,
+        )
+        .unwrap();
+        assert!(r.images.is_empty());
     }
 }

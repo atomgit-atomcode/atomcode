@@ -11085,6 +11085,102 @@ fn attach_image_to_input(
     Ok(true)
 }
 
+fn attach_image_to_user_input(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    image: Option<(ImageContent, u64)>,
+) -> Result<bool> {
+    let Some((image, _)) = image else {
+        return Ok(false);
+    };
+    if let Some(reject) =
+        image_attach_reject_line(&ctx.config, &ctx.provider_selection, &ctx.model_name)
+    {
+        renderer.render(UiLine::Error(reject));
+        renderer.flush();
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(true);
+    }
+    if app.state.user_input_panel.is_none()
+        && app
+            .state
+            .user_input_batch
+            .as_ref()
+            .map_or(true, |batch| batch.on_submit_stop())
+    {
+        return Ok(true);
+    }
+    app.state.session_image_count += 1;
+    let marker = format!("[Image #{}]", app.state.session_image_count);
+    let panel = if let Some(batch) = app.state.user_input_batch.as_mut() {
+        &mut batch.questions[batch.current]
+    } else if let Some(panel) = app.state.user_input_panel.as_mut() {
+        panel
+    } else {
+        return Ok(true);
+    };
+    clear_panel_paste_command(panel);
+    if !matches!(
+        panel.mode,
+        atomcode_capabilities::tools::request_user_input::UserInputMode::Text
+    ) {
+        panel.cursor = panel.other_index();
+    }
+    panel.images.push(image);
+    panel.insert_paste(&marker);
+    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    Ok(true)
+}
+
+fn clear_panel_paste_command(panel: &mut crate::state::UserInputPanel) {
+    use atomcode_capabilities::tools::request_user_input::UserInputMode::*;
+    match panel.mode {
+        Text
+            if panel.text.trim() == "/paste"
+                || paste_command_image_path(&panel.text).is_some() =>
+        {
+            panel.text.clear();
+            panel.text_cursor_byte = 0;
+        }
+        Single | Multiple
+            if panel.is_other_row()
+                && (panel.custom_text.trim() == "/paste"
+                    || paste_command_image_path(&panel.custom_text).is_some()) =>
+        {
+            panel.custom_text.clear();
+            panel.custom_text_cursor_byte = 0;
+        }
+        _ => {}
+    }
+}
+
+fn paste_command_image_path(text: &str) -> Option<&str> {
+    let rest = text.trim().strip_prefix("/paste")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let path = rest.trim();
+    (!path.is_empty()).then_some(path)
+}
+
+fn user_input_text(state: &crate::state::UiState) -> Option<&str> {
+    let panel = if let Some(batch) = state.user_input_batch.as_ref() {
+        if batch.on_submit_stop() {
+            return None;
+        }
+        &batch.questions[batch.current]
+    } else {
+        state.user_input_panel.as_ref()?
+    };
+    use atomcode_capabilities::tools::request_user_input::UserInputMode::*;
+    match panel.mode {
+        Text => Some(&panel.text),
+        Single | Multiple if panel.is_other_row() => Some(&panel.custom_text),
+        _ => None,
+    }
+}
+
 /// Submit-time image-path recognition.
 ///
 /// `try_attach_image_from_path` only runs on `InputEvent::Paste`. Paths that
@@ -11367,6 +11463,13 @@ fn handle_input(
             // Paste event — without this branch it fell through every arm and
             // was silently dropped, so the user could only type answers.
             if matches!(app.state.phase, UiPhase::UserInput) {
+                let image = paste_command_image_path(&text)
+                    .and_then(try_attach_image_from_path)
+                    .or_else(|| try_attach_image_from_path(&text))
+                    .or_else(|| text.trim().is_empty().then(try_paste_clipboard_image).flatten());
+                if attach_image_to_user_input(app, ctx, renderer, image)? {
+                    return Ok(());
+                }
                 app.state.insert_user_input_paste(&text);
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
@@ -11620,6 +11723,18 @@ fn handle_input(
             // Ctrl+Alt+V (the Windows-Terminal alternate) both trigger; only
             // Ctrl+Shift+V is excluded so a terminal's "paste as plain text"
             // chord still passes through.
+            if matches!(app.state.phase, UiPhase::UserInput)
+                && is_paste_image_chord(code, modifiers)
+            {
+                if attach_image_to_user_input(app, ctx, renderer, try_paste_clipboard_image())? {
+                    return Ok(());
+                }
+                if let Some(text) = try_paste_clipboard_text() {
+                    app.state.insert_user_input_paste(&text);
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                }
+                return Ok(());
+            }
             if matches!(app.state.phase, UiPhase::Idle | UiPhase::Streaming)
                 && is_paste_image_chord(code, modifiers)
             {
@@ -15610,7 +15725,7 @@ mod bypass_approval_tests {
 
 #[cfg(test)]
 mod user_input_key_tests {
-    use super::user_input_response_for;
+    use super::{clear_panel_paste_command, paste_command_image_path, user_input_response_for};
     use crate::state::UserInputPanel;
     use atomcode_capabilities::tools::request_user_input::{
         UserInputMode, UserInputOption, UserInputRequest,
@@ -15824,6 +15939,40 @@ mod user_input_key_tests {
         assert!(!resp.declined);
         assert!(resp.selected.is_empty());
         assert_eq!(resp.text.as_deref(), Some("hi there"));
+    }
+
+    #[test]
+    fn successful_image_attach_replaces_paste_command_with_marker() {
+        let mut p = panel(UserInputMode::Text);
+        p.text = "/paste".into();
+        p.text_cursor_byte = p.text.len();
+        clear_panel_paste_command(&mut p);
+        p.insert_paste("[Image #1]");
+        p.images.push(atomcode_kernel::message::ImageContent {
+            media_type: "image/png".into(),
+            data: "aW1hZ2U=".into(),
+        });
+        assert_eq!(p.text, "[Image #1]");
+        let response = user_input_response_for(&p, KeyCode::Enter).unwrap();
+        assert_eq!(response.images.len(), 1);
+    }
+
+    #[test]
+    fn failed_image_attach_keeps_paste_command_available_for_retry() {
+        let mut p = panel(UserInputMode::Text);
+        p.text = "/paste".into();
+        p.text_cursor_byte = p.text.len();
+        assert_eq!(p.text, "/paste");
+        assert!(p.images.is_empty());
+    }
+
+    #[test]
+    fn explicit_windows_image_path_is_parsed_as_paste_command() {
+        assert_eq!(
+            paste_command_image_path(r#"/paste C:\Users\linux\Videos\image.jpg"#),
+            Some(r#"C:\Users\linux\Videos\image.jpg"#)
+        );
+        assert_eq!(paste_command_image_path("/pasteboard x.png"), None);
     }
 
     // Navigation / typing keys do NOT resolve (return None so the caller mutates
@@ -16177,13 +16326,14 @@ pub(crate) fn user_input_response_for(
     match (&panel.mode, code) {
         (_, KeyCode::Esc) => Some(UserInputResponse::declined()),
         (UserInputMode::Text, KeyCode::Enter) => {
-            if panel.text.trim().is_empty() {
+            if panel.text.trim().is_empty() && panel.images.is_empty() {
                 None // empty buffer → no-op, keep panel open
             } else {
                 Some(UserInputResponse {
                     declined: false,
                     selected: vec![],
                     text: Some(panel.text.clone()),
+                    images: panel.images.clone(),
                 })
             }
         }
@@ -16294,6 +16444,23 @@ fn handle_user_input_key(
     // single-question path below untouched → N==1 behavior is literally unchanged).
     if app.state.user_input_batch.is_some() {
         return handle_user_input_batch_key(app, ctx, renderer, code, modifiers);
+    }
+    if code == KeyCode::Enter {
+        if let Some(command) = user_input_text(&app.state).map(str::trim) {
+            if command == "/paste" || paste_command_image_path(command).is_some() {
+                let image = paste_command_image_path(command)
+                    .and_then(try_attach_image_from_path)
+                    .or_else(|| (command == "/paste").then(try_paste_clipboard_image).flatten());
+                if !attach_image_to_user_input(app, ctx, renderer, image)? {
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::CmdPasteNoImage).into_owned(),
+                    ));
+                    renderer.flush();
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                }
+                return Ok(());
+            }
+        }
     }
     let Some(panel) = app.state.user_input_panel.as_ref() else {
         return Ok(());
@@ -16712,6 +16879,23 @@ fn handle_user_input_batch_key(
 ) -> Result<()> {
     use atomcode_capabilities::tools::request_user_input::{UserInputMode, UserInputResponse};
     use crossterm::event::KeyModifiers;
+    if code == KeyCode::Enter {
+        if let Some(command) = user_input_text(&app.state).map(str::trim) {
+            if command == "/paste" || paste_command_image_path(command).is_some() {
+                let image = paste_command_image_path(command)
+                    .and_then(try_attach_image_from_path)
+                    .or_else(|| (command == "/paste").then(try_paste_clipboard_image).flatten());
+                if !attach_image_to_user_input(app, ctx, renderer, image)? {
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::CmdPasteNoImage).into_owned(),
+                    ));
+                    renderer.flush();
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                }
+                return Ok(());
+            }
+        }
+    }
     let Some(batch) = app.state.user_input_batch.as_ref() else {
         return Ok(());
     };
