@@ -47,7 +47,7 @@ use crate::commands::{parse_bash_command, parse_slash_line, CommandRegistry};
 use crate::custom_commands::ArgsRequirement;
 use crate::input::history::History;
 use crate::input::key_action::{classify, Action};
-use crate::input::InputEvent;
+use crate::input::{InputEvent, PointerEvent, PointerKind};
 use crate::render::{Renderer, UiLine};
 use crate::state::{UiPhase, UiState};
 use crate::think::ThinkStripper;
@@ -11201,6 +11201,32 @@ fn handle_paste_command(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerRoute {
+    ScrollBody(i32),
+    Ignored,
+}
+
+fn route_pointer(event: PointerEvent) -> PointerRoute {
+    if event.shift && matches!(event.kind, PointerKind::Drag) {
+        return PointerRoute::Ignored;
+    }
+
+    match event.kind {
+        PointerKind::Scroll(delta) => PointerRoute::ScrollBody(i32::from(delta)),
+        PointerKind::Down | PointerKind::Up | PointerKind::Drag | PointerKind::Move => {
+            PointerRoute::Ignored
+        }
+    }
+}
+
+fn apply_pointer_event(event: PointerEvent, renderer: &mut dyn Renderer) {
+    match route_pointer(event) {
+        PointerRoute::ScrollBody(delta) => renderer.scroll_body(delta),
+        PointerRoute::Ignored => {}
+    }
+}
+
 fn handle_input(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -11249,20 +11275,12 @@ fn handle_input(
             InputEvent::Eof => "eof".into(),
             InputEvent::Key(k) => format!("key({:?},{:?})", k.kind, k.code),
             InputEvent::Resize(w, h) => format!("resize({}x{})", w, h),
-            InputEvent::MouseScroll(d) => format!("mouse_scroll({})", d),
+            InputEvent::Pointer(pointer) => format!("pointer({:?})", pointer),
         }
     );
 
     match ev {
-        InputEvent::MouseScroll(delta) => {
-            // Mouse wheel is a no-op: SGR mouse capture (`?1002h` /
-            // `?1006h`) is intentionally NOT enabled, so wheel ticks
-            // resolve at the terminal level (native scrollback) before
-            // reaching us. This arm survives only as a defensive
-            // catch-all for terminals that forward wheel events
-            // outside the SGR mouse protocol.
-            renderer.scroll_body(delta);
-        }
+        InputEvent::Pointer(pointer) => apply_pointer_event(pointer, renderer),
         InputEvent::Resize(mut cols, mut rows) => {
             // Coalesce burst-fired SIGWINCH events. gnome-terminal /
             // alacritty / iTerm2 send a Resize per pixel during a
@@ -11682,6 +11700,96 @@ fn provider_transition_allows_idle_commit(line: &str) -> bool {
             "reload" | "context" | "status" | "keys" | "quit" | "exit"
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_pointer_event, route_pointer, PointerRoute};
+    use crate::input::{PointerButton, PointerEvent, PointerKind};
+    use crate::render::{Renderer, UiLine};
+
+    #[derive(Default)]
+    struct ScrollCapture {
+        deltas: Vec<i32>,
+    }
+
+    impl Renderer for ScrollCapture {
+        fn render(&mut self, _line: UiLine) {}
+        fn flush(&mut self) {}
+        fn shutdown(&mut self) {}
+        fn reset(&mut self) {}
+        fn clear_screen(&mut self) {}
+        fn suspend_for_external(&mut self) {}
+        fn resume_from_external(&mut self) {}
+        fn flush_deferred(&mut self) {}
+
+        fn scroll_body(&mut self, delta: i32) {
+            self.deltas.push(delta);
+        }
+    }
+
+    fn pointer(kind: PointerKind, button: Option<PointerButton>, shift: bool) -> PointerEvent {
+        PointerEvent {
+            kind,
+            button,
+            row: 12,
+            col: 34,
+            shift,
+            control: false,
+            alt: false,
+        }
+    }
+
+    #[test]
+    fn pointer_shift_drag_uses_terminal_selection_escape_hatch() {
+        assert_eq!(
+            route_pointer(pointer(
+                PointerKind::Drag,
+                Some(PointerButton::Primary),
+                true,
+            )),
+            PointerRoute::Ignored
+        );
+    }
+
+    #[test]
+    fn pointer_vertical_scroll_preserves_existing_body_scroll_amount() {
+        assert_eq!(
+            route_pointer(pointer(PointerKind::Scroll(-3), None, false)),
+            PointerRoute::ScrollBody(-3)
+        );
+        assert_eq!(
+            route_pointer(pointer(PointerKind::Scroll(3), None, false)),
+            PointerRoute::ScrollBody(3)
+        );
+    }
+
+    #[test]
+    fn pointer_scroll_is_forwarded_once_to_existing_renderer_scroll_body() {
+        let mut renderer = ScrollCapture::default();
+
+        apply_pointer_event(pointer(PointerKind::Scroll(-3), None, false), &mut renderer);
+        apply_pointer_event(pointer(PointerKind::Scroll(3), None, false), &mut renderer);
+
+        assert_eq!(renderer.deltas, vec![-3, 3]);
+    }
+
+    #[test]
+    fn pointer_buttons_and_motion_are_ignored_until_hit_routing_exists() {
+        for (kind, button) in [
+            (PointerKind::Down, Some(PointerButton::Primary)),
+            (PointerKind::Up, Some(PointerButton::Primary)),
+            (PointerKind::Drag, Some(PointerButton::Primary)),
+            (PointerKind::Move, None),
+            (PointerKind::Down, Some(PointerButton::Secondary)),
+            (PointerKind::Down, Some(PointerButton::Middle)),
+        ] {
+            assert_eq!(
+                route_pointer(pointer(kind, button, false)),
+                PointerRoute::Ignored
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@ use crossterm::event::{DisableFocusChange, EnableFocusChange};
 use crossterm::execute;
 use tokio::sync::mpsc;
 
-use super::InputEvent;
+use super::{InputEvent, PointerButton, PointerEvent, PointerKind};
 
 /// Burst-aggregation timeouts — how long the burst detector waits for the
 /// next event before deciding the burst is over. A two-stage state machine
@@ -593,16 +593,36 @@ fn mouse_input_event(m: crossterm::event::MouseEvent) -> Option<InputEvent> {
         m.column,
         m.row
     );
-    match m.kind {
-        crossterm::event::MouseEventKind::ScrollUp => {
-            crate::tuix_trace!("RD", "mouse scroll up");
-            Some(InputEvent::MouseScroll(-3))
-        }
-        crossterm::event::MouseEventKind::ScrollDown => {
-            crate::tuix_trace!("RD", "mouse scroll down");
-            Some(InputEvent::MouseScroll(3))
-        }
-        _ => None,
+    use crossterm::event::MouseEventKind;
+
+    let (kind, button) = match m.kind {
+        MouseEventKind::Down(button) => (PointerKind::Down, Some(pointer_button(button))),
+        MouseEventKind::Up(button) => (PointerKind::Up, Some(pointer_button(button))),
+        MouseEventKind::Drag(button) => (PointerKind::Drag, Some(pointer_button(button))),
+        MouseEventKind::Moved => (PointerKind::Move, None),
+        MouseEventKind::ScrollUp => (PointerKind::Scroll(-3), None),
+        MouseEventKind::ScrollDown => (PointerKind::Scroll(3), None),
+        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => return None,
+    };
+
+    Some(InputEvent::Pointer(PointerEvent {
+        kind,
+        button,
+        row: m.row,
+        col: m.column,
+        shift: m.modifiers.contains(crossterm::event::KeyModifiers::SHIFT),
+        control: m
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL),
+        alt: m.modifiers.contains(crossterm::event::KeyModifiers::ALT),
+    }))
+}
+
+fn pointer_button(button: crossterm::event::MouseButton) -> PointerButton {
+    match button {
+        crossterm::event::MouseButton::Left => PointerButton::Primary,
+        crossterm::event::MouseButton::Right => PointerButton::Secondary,
+        crossterm::event::MouseButton::Middle => PointerButton::Middle,
     }
 }
 
@@ -664,6 +684,121 @@ fn coalesce_paste(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::{PointerButton, PointerEvent, PointerKind};
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16, modifiers: KeyModifiers) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn mouse_primary_button_lifecycle_preserves_zero_based_coordinates() {
+        let cases = [
+            (MouseEventKind::Down(MouseButton::Left), PointerKind::Down),
+            (MouseEventKind::Up(MouseButton::Left), PointerKind::Up),
+            (MouseEventKind::Drag(MouseButton::Left), PointerKind::Drag),
+        ];
+
+        for (mouse_kind, pointer_kind) in cases {
+            assert_eq!(
+                mouse_input_event(mouse(mouse_kind, 0, 0, KeyModifiers::NONE)),
+                Some(InputEvent::Pointer(PointerEvent {
+                    kind: pointer_kind,
+                    button: Some(PointerButton::Primary),
+                    row: 0,
+                    col: 0,
+                    shift: false,
+                    control: false,
+                    alt: false,
+                }))
+            );
+        }
+    }
+
+    #[test]
+    fn mouse_move_preserves_coordinates_and_modifiers() {
+        assert_eq!(
+            mouse_input_event(mouse(
+                MouseEventKind::Moved,
+                41,
+                17,
+                KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
+            )),
+            Some(InputEvent::Pointer(PointerEvent {
+                kind: PointerKind::Move,
+                button: None,
+                row: 17,
+                col: 41,
+                shift: true,
+                control: true,
+                alt: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn mouse_vertical_scroll_preserves_direction_amount_and_position() {
+        for (mouse_kind, delta) in [
+            (MouseEventKind::ScrollUp, -3),
+            (MouseEventKind::ScrollDown, 3),
+        ] {
+            assert_eq!(
+                mouse_input_event(mouse(mouse_kind, 7, 11, KeyModifiers::ALT)),
+                Some(InputEvent::Pointer(PointerEvent {
+                    kind: PointerKind::Scroll(delta),
+                    button: None,
+                    row: 11,
+                    col: 7,
+                    shift: false,
+                    control: false,
+                    alt: true,
+                }))
+            );
+        }
+    }
+
+    #[test]
+    fn mouse_non_primary_buttons_are_retained_without_becoming_primary() {
+        for (button, expected) in [
+            (MouseButton::Right, PointerButton::Secondary),
+            (MouseButton::Middle, PointerButton::Middle),
+        ] {
+            assert_eq!(
+                mouse_input_event(mouse(
+                    MouseEventKind::Down(button),
+                    9,
+                    5,
+                    KeyModifiers::NONE,
+                )),
+                Some(InputEvent::Pointer(PointerEvent {
+                    kind: PointerKind::Down,
+                    button: Some(expected),
+                    row: 5,
+                    col: 9,
+                    shift: false,
+                    control: false,
+                    alt: false,
+                }))
+            );
+        }
+    }
+
+    #[test]
+    fn mouse_horizontal_scroll_fails_closed() {
+        assert_eq!(
+            mouse_input_event(mouse(MouseEventKind::ScrollLeft, 2, 3, KeyModifiers::NONE,)),
+            None
+        );
+        assert_eq!(
+            mouse_input_event(mouse(MouseEventKind::ScrollRight, 2, 3, KeyModifiers::NONE,)),
+            None
+        );
+    }
 
     /// A long bracketed paste arriving as several `Event::Paste` chunks (the
     /// Windows Terminal / conhost behaviour) collapses into ONE payload — so
