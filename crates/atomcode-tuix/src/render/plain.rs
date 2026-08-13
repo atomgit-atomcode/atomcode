@@ -698,6 +698,9 @@ mod tests {
             jediterm: false,
             modern_emulator: false,
             kitty_keyboard: false,
+            mouse_sgr: false,
+            osc52_clipboard: false,
+            tmux_passthrough: false,
         }
     }
 
@@ -718,6 +721,9 @@ mod tests {
             jediterm: true,
             modern_emulator: false,
             kitty_keyboard: false,
+            mouse_sgr: false,
+            osc52_clipboard: false,
+            tmux_passthrough: false,
         }
     }
 

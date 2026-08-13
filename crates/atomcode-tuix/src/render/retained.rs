@@ -805,6 +805,7 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
 pub struct RetainedRenderer<W: Write + Send> {
     out: W,
     caps: TerminalCaps,
+    mouse_capture_enabled: bool,
     screen: Screen,
     // ── widget state ──
     input_buf: String,
@@ -1137,21 +1138,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // the atomcode session transcript. `\x1b[3J` only affects scrollback;
         // it does not touch the visible screen rows.
         //
-        // Mouse capture (`\x1b[?1002h` button-event + `\x1b[?1006h` SGR
-        // coords) is intentionally NOT enabled here. We defer mouse wheel,
-        // cmd+drag selection, and cmd+C copy to the terminal's native
-        // handling — matches Claude Code's UX model. Trade-off: atomcode's
-        // reverse-video drag selection and arboard/OSC52 clipboard write
-        // path are no longer reachable from interactive events. The
-        // disable-on-shutdown (`?1002l`/`?1006l`) sequences below are
-        // preserved as defensive hygiene against any other actor (a child
-        // process that exited weirdly, a prior atomcode run that
-        // panicked before Drop) having left capture on.
         let _ = out.write_all(b"\x1b[3J");
+        let mouse_capture_enabled = caps.mouse_sgr;
+        if mouse_capture_enabled {
+            let _ = out.write_all(b"\x1b[?1002h\x1b[?1006h");
+        }
         let _ = out.flush();
         Self {
             out,
             caps,
+            mouse_capture_enabled,
             screen: Screen::new(w, h).with_jediterm(caps.jediterm),
             input_buf: String::new(),
             input_cursor_byte: 0,
@@ -7532,6 +7528,29 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.live_agent_groups.clear();
         self.frozen_agent_groups.clear();
     }
+
+    fn disable_mouse_capture(&mut self) {
+        if self.caps.mouse_sgr {
+            if self.mouse_capture_enabled {
+                let _ = self.out.write_all(b"\x1b[?1002l\x1b[?1006l");
+                self.mouse_capture_enabled = false;
+            }
+        } else {
+            // Keep the pre-capability defensive reset byte-for-byte for all
+            // unsupported terminals and Gate 0 fixtures.
+            let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l");
+        }
+    }
+
+    fn enable_mouse_capture(&mut self) {
+        if self.caps.mouse_sgr && !self.mouse_capture_enabled {
+            // Mark ownership even if the best-effort write fails: a partial
+            // write may already have armed button-event tracking, so Drop
+            // must still emit the matching defensive disable sequence.
+            self.mouse_capture_enabled = true;
+            let _ = self.out.write_all(b"\x1b[?1002h\x1b[?1006h");
+        }
+    }
 }
 
 impl<W: Write + Send> Renderer for RetainedRenderer<W> {
@@ -8606,9 +8625,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn shutdown(&mut self) {
-        // Disable mouse capture (button-event + SGR coordinates) so the
-        // terminal returns to default mouse behavior when atomcode exits.
-        let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l");
+        self.disable_mouse_capture();
         let _ = self.out.flush();
         // Drain any pending frame before exit so the user sees the
         // latest widget state (typically a final prompt or an error
@@ -8799,11 +8816,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
     fn suspend_for_external(&mut self) {
         // Disable mouse capture so the external child process (OAuth browser,
-        // shell prompt, etc.) runs with a clean terminal state. Disable order:
-        // SGR first, then button-event. Mouse mode must be off before
-        // raw_mode is disabled, so the child process sees the terminal with
-        // mouse disabled.
-        let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l"); // Position cursor at the top of where the footer (input box +
+        // shell prompt, etc.) runs with a clean terminal state. Mouse mode
+        // must be off before raw_mode is disabled, so the child process sees
+        // the terminal with mouse disabled.
+        self.disable_mouse_capture(); // Position cursor at the top of where the footer (input box +
         // status + menu) used to be, then clear from there to end of
         // screen. Without this, cursor stays wherever the last paint
         // left it — usually inside the footer area — and the child's
@@ -8918,14 +8934,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
         }
         let _ = self.out.flush();
-        // Mouse capture intentionally NOT re-enabled on resume. We deferred
-        // mouse wheel / cmd+drag selection / cmd+C copy to the terminal's
-        // native handling at startup (see with_writer comment), so resume
-        // must keep that contract — re-enabling here would suddenly steal
-        // wheel events back from the terminal after the user returned from
-        // an external subprocess. The matching disable in
-        // suspend_for_external is still emitted so any subprocess that
-        // somehow turned capture on during its run gets cleaned up here.
+        self.enable_mouse_capture();
         let _ = self.out.flush();
     }
 
@@ -9295,9 +9304,16 @@ impl<W: Write + Send> Drop for RetainedRenderer<W> {
         // (DevEco/IDEA) that armed state turns every mouse move into input-box
         // gibberish, so a panic here must never push. Popping a level we never
         // pushed is a harmless no-op (empty kitty stack).
-        let _ = self
-            .out
-            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r");
+        if self.caps.mouse_sgr {
+            self.disable_mouse_capture();
+            let _ = self
+                .out
+                .write_all(b"\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r");
+        } else {
+            let _ = self
+                .out
+                .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r");
+        }
         let _ = self.out.flush();
     }
 }

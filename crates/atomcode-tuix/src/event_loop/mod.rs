@@ -26323,6 +26323,9 @@ mod install_password_modal_tests {
             jediterm: false,
             modern_emulator: false,
             kitty_keyboard: false,
+            mouse_sgr: false,
+            osc52_clipboard: false,
+            tmux_passthrough: false,
         }
     }
 

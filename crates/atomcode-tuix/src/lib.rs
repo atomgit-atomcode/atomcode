@@ -246,6 +246,53 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Exercise the production TerminalGuard against the child process's real PTY.
+/// The caller is responsible for process isolation; this adapter exists only so
+/// contract tests can observe the private guard without copying its sequences.
+#[cfg(all(test, unix))]
+pub(crate) fn exercise_terminal_guard_for_contract(
+    active: impl FnOnce(TerminalCaps) -> Result<()>,
+) -> Result<()> {
+    let caps = TerminalCaps::from_env(crate::terminal::EnvView {
+        is_stdout_tty: true,
+        term: Some("xterm-256color".into()),
+        colorterm: Some("truecolor".into()),
+        lang: Some("en_US.UTF-8".into()),
+        term_program: Some("iTerm.app".into()),
+        force_kitty_keyboard: Some(true),
+        force_mouse_sgr: Some(false),
+        ..Default::default()
+    });
+    write_raw_contract_marker("BEGIN")?;
+    let (guard, _) = TerminalGuard::activate(caps)?;
+    assert!(
+        crossterm::terminal::is_raw_mode_enabled()?,
+        "TerminalGuard must enable the real PTY raw backend"
+    );
+    write_raw_contract_marker("ACTIVE")?;
+    active(caps)?;
+    drop(guard);
+    assert!(
+        !crossterm::terminal::is_raw_mode_enabled()?,
+        "TerminalGuard must restore the real PTY raw backend"
+    );
+    write_raw_contract_marker("END")?;
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+fn write_raw_contract_marker(name: &str) -> Result<()> {
+    use std::io::Write as _;
+
+    let raw = u8::from(crossterm::terminal::is_raw_mode_enabled()?);
+    write!(
+        io::stdout(),
+        "\x1b]777;ATOMCODE-LIFECYCLE-{name};raw={raw}\x07"
+    )?;
+    io::stdout().flush()?;
+    Ok(())
+}
+
 /// Byte sequence that fully restores the terminal the TUI armed. Pure
 /// (returns the bytes; no I/O) so the restore *contract* is unit
 /// testable without a real stdout.
@@ -963,6 +1010,9 @@ mod panic_restore_tests {
             jediterm: false,
             modern_emulator: true,
             kitty_keyboard: true,
+            mouse_sgr: true,
+            osc52_clipboard: true,
+            tmux_passthrough: false,
         }
     }
 
