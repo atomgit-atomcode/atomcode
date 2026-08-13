@@ -449,7 +449,12 @@ pub async fn run(
         atomcode_config::config::UiTheme::Light => true,
         atomcode_config::config::UiTheme::Dark => false,
         atomcode_config::config::UiTheme::Auto => {
-            if caps.colors && !force_plain {
+            if caps.colors
+                && !force_plain
+                && crate::terminal_bg::should_query_background(
+                    std::env::var("TERM_PROGRAM").ok().as_deref(),
+                )
+            {
                 crate::terminal_bg::detect_light(std::time::Duration::from_millis(60))
                     .unwrap_or(false)
             } else {
