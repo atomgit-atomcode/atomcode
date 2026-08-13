@@ -7532,8 +7532,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
     fn disable_mouse_capture(&mut self) {
         if self.caps.mouse_sgr {
             if self.mouse_capture_enabled {
-                let _ = self.out.write_all(b"\x1b[?1002l\x1b[?1006l");
-                self.mouse_capture_enabled = false;
+                if self
+                    .out
+                    .write_all(b"\x1b[?1002l\x1b[?1006l")
+                    .is_ok()
+                {
+                    self.mouse_capture_enabled = false;
+                }
             }
         } else {
             // Keep the pre-capability defensive reset byte-for-byte for all
