@@ -806,6 +806,8 @@ pub struct RetainedRenderer<W: Write + Send> {
     out: W,
     caps: TerminalCaps,
     mouse_capture_enabled: bool,
+    interaction_publisher: crate::render::interaction::InteractionPublisher,
+    pending_interactions: Vec<crate::render::interaction::HitRegion>,
     screen: Screen,
     // ── widget state ──
     input_buf: String,
@@ -1108,6 +1110,13 @@ impl Write for StdoutTap {
 
 impl RetainedRenderer<StdoutTap> {
     pub fn new(caps: TerminalCaps) -> Self {
+        Self::new_with_interactions(caps, Default::default())
+    }
+
+    pub fn new_with_interactions(
+        caps: TerminalCaps,
+        interactions: crate::render::interaction::InteractionPublisher,
+    ) -> Self {
         let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
         let mirror = std::env::var("ATOMCODE_RENDER_DUMP")
             .ok()
@@ -1127,12 +1136,22 @@ impl RetainedRenderer<StdoutTap> {
         // cleared). So we never touch the console mode. (conhost's click-pause is its
         // standard, recoverable behavior — Esc cancels, Enter copies; far better than
         // losing the whole mouse.) See the deleted `render::conhost` module's history.
-        Self::with_writer(tap, caps, w, h)
+        Self::with_writer_and_interactions(tap, caps, w, h, interactions)
     }
 }
 
 impl<W: Write + Send> RetainedRenderer<W> {
-    pub fn with_writer(mut out: W, caps: TerminalCaps, w: u16, h: u16) -> Self {
+    pub fn with_writer(out: W, caps: TerminalCaps, w: u16, h: u16) -> Self {
+        Self::with_writer_and_interactions(out, caps, w, h, Default::default())
+    }
+
+    pub fn with_writer_and_interactions(
+        mut out: W,
+        caps: TerminalCaps,
+        w: u16,
+        h: u16,
+        interaction_publisher: crate::render::interaction::InteractionPublisher,
+    ) -> Self {
         // Clear scrollback buffer so previous terminal content (e.g. git log)
         // doesn't remain visible above the atomcode viewport and mix with
         // the atomcode session transcript. `\x1b[3J` only affects scrollback;
@@ -1148,6 +1167,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             out,
             caps,
             mouse_capture_enabled,
+            interaction_publisher,
+            pending_interactions: Vec::new(),
             screen: Screen::new(w, h).with_jediterm(caps.jediterm),
             input_buf: String::new(),
             input_cursor_byte: 0,
@@ -4598,6 +4619,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             super::MenuKind::Plugin | super::MenuKind::SessionList | super::MenuKind::DirectoryList
         );
         let mut menu_cells: Vec<Vec<Cell>> = Vec::new();
+        let mut menu_hit_rows: Vec<(usize, usize, crate::render::interaction::HitTarget)> =
+            Vec::new();
         let final_len = self.menu.as_ref().map(|m| m.items.len()).unwrap_or(0);
         let is_sticky = matches!(
             menu_kind,
@@ -4629,6 +4652,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     menu_cells.push(Vec::new());
                 }
             }
+            let cells_before_item = menu_cells.len();
 
             if menu_kind == super::MenuKind::Marketplace
                 && !is_add_url
@@ -4891,6 +4915,45 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     menu_cells.push(row);
                 }
             }
+            let item_end = menu_cells.len();
+            let item_start = if menu_kind == super::MenuKind::SessionList
+                && orig_idx > crate::modals::session_picker::HEADER_ROWS
+            {
+                cells_before_item.saturating_add(1)
+            } else {
+                cells_before_item
+            };
+            let target = match menu_kind {
+                super::MenuKind::SlashCommand
+                    if self.input_buf.starts_with('/')
+                        && !self.input_buf[1..].contains(char::is_whitespace) =>
+                {
+                    Some(crate::render::interaction::HitTarget::MenuItem { index: orig_idx })
+                }
+                super::MenuKind::DirectoryList
+                    if orig_idx >= crate::modals::dir_picker::DIR_HEADER_ROWS
+                        && orig_idx < final_len.saturating_sub(1) =>
+                {
+                    Some(crate::render::interaction::HitTarget::ModalItem {
+                        index: orig_idx - crate::modals::dir_picker::DIR_HEADER_ROWS,
+                    })
+                }
+                super::MenuKind::SessionList
+                    if orig_idx >= crate::modals::session_picker::HEADER_ROWS
+                        && orig_idx < final_len.saturating_sub(1) =>
+                {
+                    Some(crate::render::interaction::HitTarget::ModalItem {
+                        index: orig_idx - crate::modals::session_picker::HEADER_ROWS,
+                    })
+                }
+                _ => None,
+            };
+            if let Some(target) = target {
+                let height = item_end.saturating_sub(item_start);
+                if height > 0 {
+                    menu_hit_rows.push((item_start, height, target));
+                }
+            }
         }
         // Attachment rows: `  └ [Image #N]` in muted gray, identical
         // visual treatment to the post-submit `UiLine::ImageAttachment`
@@ -5020,6 +5083,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         let menu_top = attach_top + attachment_rows;
+        self.pending_interactions
+            .extend(
+                menu_hit_rows
+                    .into_iter()
+                    .map(
+                        |(relative_row, height, target)| crate::render::interaction::HitRegion {
+                            rect: crate::render::interaction::CellRect {
+                                row: (menu_top + relative_row).min(u16::MAX as usize) as u16,
+                                col: 0,
+                                height: height.min(u16::MAX as usize) as u16,
+                                width: w.min(u16::MAX as usize) as u16,
+                            },
+                            target,
+                        },
+                    ),
+            );
         let is_search_box_focused = matches!(
             menu_kind,
             super::MenuKind::Plugin | super::MenuKind::SessionList | super::MenuKind::DirectoryList
@@ -5502,6 +5581,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// rows where prior footer cells lived — wiping the body row
     /// we just wrote there.
     fn paint_frame(&mut self) {
+        self.pending_interactions.clear();
         self.paint_body_into_cells();
         self.paint_footer();
         // Overlay modal drawn on top of body+footer so the diff sees
@@ -8968,9 +9048,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             // patch against them → ghost text on screen). Letting
             // the real prev→current diff run produces the correct
             // erase patches naturally.
-            if footer_rows != self.last_painted_footer_rows {
-                self.last_painted_footer_rows = footer_rows;
-            }
             let has_status = !self.status.model.is_empty()
                 || !self.status.cwd.is_empty()
                 || self.status.hint.is_some();
@@ -9006,17 +9083,40 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             // (~1-2KB) incur 2-4 chunks. Still single-digit ms.
             const CHUNK: usize = 512;
             let mut offset = 0;
+            let mut frame_written = true;
             while offset < bytes.len() {
                 let end = (offset + CHUNK).min(bytes.len());
-                let _ = self.out.write_all(&bytes[offset..end]);
+                if self.out.write_all(&bytes[offset..end]).is_err() {
+                    frame_written = false;
+                    break;
+                }
                 if end < bytes.len() {
                     // Inter-chunk flush; the final-chunk flush is at
                     // the end of this method.
-                    let _ = self.out.flush();
+                    if self.out.flush().is_err() {
+                        frame_written = false;
+                        break;
+                    }
                 }
                 offset = end;
             }
-            self.dirty = false;
+            if frame_written {
+                frame_written = self.out.flush().is_ok();
+            }
+            if frame_written {
+                self.last_painted_footer_rows = footer_rows;
+                self.interaction_publisher
+                    .publish(self.pending_interactions.clone());
+                self.dirty = false;
+            } else {
+                // `render_diff` already advanced its cell cache. Force the next
+                // successful retry to repaint the whole frame before publishing
+                // its hit map, because the terminal may have received no bytes
+                // or only a partial chunk.
+                self.screen.invalidate();
+                self.interaction_publisher.fail_closed();
+                self.dirty = true;
+            }
             // Diagnostic: count how many cells on the bot_rule row
             // (screen_h - 2, 0-indexed) actually hold '─'. bot_rule
             // sits at a constant absolute row regardless of middle
@@ -9047,7 +9147,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 t0.elapsed().as_micros()
             );
         }
-        let _ = self.out.flush();
+        if !self.dirty {
+            let _ = self.out.flush();
+        }
     }
 
     fn scroll_body(&mut self, _delta: i32) {
@@ -9754,6 +9856,209 @@ mod tests {
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    struct SwitchableFailSink(Arc<std::sync::atomic::AtomicBool>);
+    impl Write for SwitchableFailSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.0.load(Ordering::Relaxed) {
+                Err(std::io::Error::other("frame write rejected"))
+            } else {
+                Ok(bytes.len())
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.0.load(Ordering::Relaxed) {
+                Err(std::io::Error::other("frame flush rejected"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn interaction_generation_waits_for_a_successful_frame_write() {
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            SwitchableFailSink(fail.clone()),
+            caps_with_color(),
+            80,
+            24,
+            interactions.clone(),
+        );
+        renderer.render(UiLine::InputPrompt {
+            buf: "/h".into(),
+            cursor_byte: 2,
+            menu: Some(MenuPayload {
+                items: vec![("help".into(), "Show help".into())],
+                selected: 0,
+                kind: crate::render::MenuKind::SlashCommand,
+            }),
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+
+        renderer.flush_deferred();
+        let old_frame = interactions.snapshot();
+        assert_eq!(old_frame.generation, 1);
+
+        renderer.render(UiLine::InputPrompt {
+            buf: "/".into(),
+            cursor_byte: 1,
+            menu: Some(MenuPayload {
+                items: vec![
+                    ("help".into(), "Show help".into()),
+                    ("status".into(), "Show status".into()),
+                ],
+                selected: 1,
+                kind: crate::render::MenuKind::SlashCommand,
+            }),
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+
+        fail.store(true, Ordering::Relaxed);
+        renderer.flush_deferred();
+        let failed_frame = interactions.snapshot();
+        assert_eq!(failed_frame.generation, old_frame.generation);
+        assert_eq!(failed_frame.regions, old_frame.regions);
+        assert!(
+            interactions.snapshot_actionable().is_none(),
+            "a failed terminal write must fail pointer actions closed"
+        );
+
+        fail.store(false, Ordering::Relaxed);
+        renderer.flush_deferred();
+        let frame = interactions.snapshot();
+        assert_eq!(frame.generation, old_frame.generation + 1);
+        assert!(interactions.snapshot_actionable().is_some());
+        let status_region = frame
+            .regions
+            .iter()
+            .find(|region| {
+                region.target == crate::render::interaction::HitTarget::MenuItem { index: 1 }
+            })
+            .expect("second slash row has a hit region");
+        assert_eq!(
+            frame.hit(status_region.rect.row, status_region.rect.col),
+            Some(crate::render::interaction::HitTarget::MenuItem { index: 1 })
+        );
+    }
+
+    #[test]
+    fn interaction_rows_match_slash_and_session_card_painted_bounds() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            80,
+            30,
+            interactions.clone(),
+        );
+        renderer.render(UiLine::InputPrompt {
+            buf: "/".into(),
+            cursor_byte: 1,
+            menu: Some(MenuPayload {
+                items: vec![
+                    ("help".into(), String::new()),
+                    ("status".into(), String::new()),
+                ],
+                selected: 0,
+                kind: crate::render::MenuKind::SlashCommand,
+            }),
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+        let slash = interactions.snapshot();
+        let slash_regions: Vec<_> = slash
+            .regions
+            .iter()
+            .filter(|region| {
+                matches!(
+                    region.target,
+                    crate::render::interaction::HitTarget::MenuItem { .. }
+                )
+            })
+            .collect();
+        assert_eq!(slash_regions.len(), 2);
+        assert_eq!(slash_regions[0].rect.height, 1);
+        assert_eq!(slash_regions[1].rect.row, slash_regions[0].rect.row + 1);
+
+        renderer.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: Some(MenuPayload {
+                items: vec![
+                    ("Resume".into(), String::new()),
+                    (String::new(), String::new()),
+                    (String::new(), String::new()),
+                    (String::new(), String::new()),
+                    ("first".into(), "meta one".into()),
+                    ("second".into(), "meta two".into()),
+                    ("— hint —".into(), String::new()),
+                ],
+                selected: 4,
+                kind: crate::render::MenuKind::SessionList,
+            }),
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+        let session = interactions.snapshot();
+        let session_regions: Vec<_> = session
+            .regions
+            .iter()
+            .filter(|region| {
+                matches!(
+                    region.target,
+                    crate::render::interaction::HitTarget::ModalItem { .. }
+                )
+            })
+            .collect();
+        assert_eq!(session_regions.len(), 2);
+        assert_eq!(session_regions[0].rect.height, 2);
+        assert_eq!(session_regions[1].rect.height, 2);
+        assert_eq!(session_regions[1].rect.row, session_regions[0].rect.row + 3);
+    }
+
+    #[test]
+    fn interaction_does_not_publish_reduced_semantics_for_slash_submenus() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            80,
+            24,
+            interactions.clone(),
+        );
+        for buffer in ["/skills ", "/effort "] {
+            renderer.render(UiLine::InputPrompt {
+                buf: buffer.into(),
+                cursor_byte: buffer.len(),
+                menu: Some(MenuPayload {
+                    items: vec![("choice".into(), "submenu item".into())],
+                    selected: 0,
+                    kind: crate::render::MenuKind::SlashCommand,
+                }),
+                status: StatusLine::default(),
+                attachments: Vec::new(),
+            });
+            renderer.flush_deferred();
+            assert!(
+                interactions
+                    .snapshot()
+                    .regions
+                    .iter()
+                    .all(|region| !matches!(
+                        region.target,
+                        crate::render::interaction::HitTarget::MenuItem { .. }
+                    )),
+                "submenu {buffer:?} must not expose the top-level-only click semantic"
+            );
         }
     }
 

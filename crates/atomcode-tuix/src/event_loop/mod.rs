@@ -3805,6 +3805,7 @@ impl AuthObservation {
 }
 
 pub struct LoopCtx {
+    pub(crate) interaction_publisher: crate::render::interaction::InteractionPublisher,
     pub config: Config,
     /// Exact active model selection id. Unlike `model_name`, this remains
     /// unambiguous when two accounts expose the same wire model.
@@ -11227,29 +11228,105 @@ fn apply_pointer_event(event: PointerEvent, renderer: &mut dyn Renderer) {
     }
 }
 
+fn handle_pointer_hit(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    event: PointerEvent,
+    frame: &crate::render::interaction::InteractionFrame,
+) -> Result<()> {
+    let Some(target) = frame.hit(event.row, event.col) else {
+        app.menu.pointer_cancel();
+        return Ok(());
+    };
+    let click = match event.kind {
+        PointerKind::Down => app.menu.pointer_press(target),
+        PointerKind::Up => app.menu.pointer_release(target),
+        PointerKind::Drag | PointerKind::Move | PointerKind::Scroll(_) => {
+            return Ok(());
+        }
+    };
+    let pointer_action = match click {
+        PointerClickAction::Select(crate::render::interaction::HitTarget::ModalItem { index }) => {
+            Some(crate::modals::ModalPointerAction::Select(index))
+        }
+        PointerClickAction::Confirm(crate::render::interaction::HitTarget::ModalItem { index }) => {
+            Some(crate::modals::ModalPointerAction::Confirm(index))
+        }
+        PointerClickAction::Select(crate::render::interaction::HitTarget::ModalCancel)
+        | PointerClickAction::Confirm(crate::render::interaction::HitTarget::ModalCancel) => {
+            Some(crate::modals::ModalPointerAction::Cancel)
+        }
+        _ => None,
+    };
+    if let Some(action) = pointer_action {
+        if matches!(app.state.phase, UiPhase::Idle) {
+            if let Some(modal) = app.active_modal.as_mut() {
+                let outcome =
+                    modal.handle_pointer(action, &mut app.buf, &mut app.state, ctx, renderer)?;
+                if outcome == crate::modals::ModalAction::Close {
+                    app.active_modal = None;
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                }
+            }
+        }
+        return Ok(());
+    }
+    match click {
+        PointerClickAction::Select(crate::render::interaction::HitTarget::MenuItem { index }) => {
+            let Some(items) = menu_for_display(&app.buf, ctx) else {
+                return Ok(());
+            };
+            app.menu.select_index(index, items.len());
+            redraw_with_menu(
+                &app.buf,
+                &items,
+                app.menu.selected,
+                &app.state,
+                ctx,
+                renderer,
+            );
+        }
+        PointerClickAction::Confirm(crate::render::interaction::HitTarget::MenuItem { index }) => {
+            let Some(items) = menu_for_display(&app.buf, ctx) else {
+                return Ok(());
+            };
+            app.menu.select_index(index, items.len());
+            confirm_idle_menu_selected(app, ctx, renderer, &items)?;
+        }
+        PointerClickAction::None
+        | PointerClickAction::Select(_)
+        | PointerClickAction::Confirm(_) => {}
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PointerPreflightRoute {
     ScrollContinue,
+    PointerContinue,
     ReturnIgnored,
     NotPointer,
 }
 
-fn pointer_preflight_route(event: &InputEvent) -> PointerPreflightRoute {
+fn pointer_preflight_route(event: &InputEvent, pointer_actionable: bool) -> PointerPreflightRoute {
     match event {
         InputEvent::Pointer(PointerEvent {
             kind: PointerKind::Scroll(_),
             ..
         }) => PointerPreflightRoute::ScrollContinue,
+        InputEvent::Pointer(_) if pointer_actionable => PointerPreflightRoute::PointerContinue,
         InputEvent::Pointer(_) => PointerPreflightRoute::ReturnIgnored,
         _ => PointerPreflightRoute::NotPointer,
     }
 }
 
-fn handle_input_preflight(
+fn handle_input_preflight_with_pointer(
     event: &InputEvent,
+    pointer_actionable: bool,
     run_general_prelude: impl FnOnce(),
 ) -> PointerPreflightRoute {
-    let route = pointer_preflight_route(event);
+    let route = pointer_preflight_route(event, pointer_actionable);
     if route != PointerPreflightRoute::ReturnIgnored {
         run_general_prelude();
     }
@@ -11264,7 +11341,21 @@ fn handle_input(
 ) -> Result<()> {
     use crate::modals::ModalAction;
 
-    let preflight = handle_input_preflight(&ev, || {
+    let interaction = ctx.interaction_publisher.snapshot_actionable();
+    let pointer_actionable = match &ev {
+        InputEvent::Pointer(pointer)
+            if !pointer.shift
+                && pointer.button == Some(crate::input::PointerButton::Primary)
+                && matches!(pointer.kind, PointerKind::Down | PointerKind::Up) =>
+        {
+            interaction.as_ref().is_some_and(|interaction| {
+                interaction.hit(pointer.row, pointer.col).is_some()
+                    || (pointer.kind == PointerKind::Up && app.menu.has_pointer_press())
+            })
+        }
+        _ => false,
+    };
+    let preflight = handle_input_preflight_with_pointer(&ev, pointer_actionable, || {
         let has_non_capturing_modal = app
             .active_modal
             .as_ref()
@@ -11315,7 +11406,16 @@ fn handle_input(
     }
 
     match ev {
-        InputEvent::Pointer(pointer) => apply_pointer_event(pointer, renderer),
+        InputEvent::Pointer(pointer) => {
+            if preflight == PointerPreflightRoute::ScrollContinue {
+                apply_pointer_event(pointer, renderer);
+            } else {
+                let interaction = interaction
+                    .as_deref()
+                    .expect("actionable pointer preflight requires a published frame");
+                handle_pointer_hit(app, ctx, renderer, pointer, interaction)?;
+            }
+        }
         InputEvent::Resize(mut cols, mut rows) => {
             // Coalesce burst-fired SIGWINCH events. gnome-terminal /
             // alacritty / iTerm2 send a Resize per pixel during a
@@ -11740,10 +11840,11 @@ fn provider_transition_allows_idle_commit(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_pointer_event, handle_input_preflight, route_pointer, PointerPreflightRoute,
-        PointerRoute,
+        apply_pointer_event, handle_input_preflight_with_pointer, route_pointer,
+        PointerPreflightRoute, PointerRoute,
     };
     use crate::input::{PointerButton, PointerEvent, PointerKind};
+    use crate::render::interaction::HitTarget;
     use crate::render::{Renderer, UiLine};
 
     #[derive(Default)]
@@ -11779,6 +11880,59 @@ mod tests {
     }
 
     #[test]
+    fn pointer_click_selects_first_and_only_a_second_same_target_click_confirms() {
+        let target = HitTarget::MenuItem { index: 2 };
+        let other = HitTarget::MenuItem { index: 3 };
+        let mut menu = super::MenuState::new();
+
+        assert_eq!(
+            menu.pointer_press(target),
+            super::PointerClickAction::Select(target)
+        );
+        assert_eq!(
+            menu.pointer_release(target),
+            super::PointerClickAction::None
+        );
+        assert_eq!(
+            menu.pointer_press(other),
+            super::PointerClickAction::Select(other)
+        );
+        assert_eq!(menu.pointer_release(other), super::PointerClickAction::None);
+        assert_eq!(
+            menu.pointer_press(other),
+            super::PointerClickAction::Select(other)
+        );
+        assert_eq!(
+            menu.pointer_release(other),
+            super::PointerClickAction::Confirm(other)
+        );
+    }
+
+    #[test]
+    fn pointer_release_outside_the_pressed_target_cancels_confirmation() {
+        let target = HitTarget::MenuItem { index: 2 };
+        let outside = HitTarget::MenuItem { index: 4 };
+        let mut menu = super::MenuState::new();
+
+        assert_eq!(
+            menu.pointer_press(target),
+            super::PointerClickAction::Select(target)
+        );
+        assert_eq!(
+            menu.pointer_release(outside),
+            super::PointerClickAction::None
+        );
+        assert_eq!(
+            menu.pointer_press(target),
+            super::PointerClickAction::Select(target)
+        );
+        assert_eq!(
+            menu.pointer_release(outside),
+            super::PointerClickAction::None
+        );
+    }
+
+    #[test]
     fn pointer_shift_drag_uses_terminal_selection_escape_hatch() {
         assert_eq!(
             route_pointer(pointer(
@@ -11802,7 +11956,7 @@ mod tests {
             let mut prelude_runs = 0;
             let renderer = ScrollCapture::default();
 
-            let route = handle_input_preflight(&input, || prelude_runs += 1);
+            let route = handle_input_preflight_with_pointer(&input, false, || prelude_runs += 1);
 
             assert_eq!(route, PointerPreflightRoute::ReturnIgnored);
             assert_eq!(prelude_runs, 0);
@@ -11818,7 +11972,7 @@ mod tests {
             let mut prelude_runs = 0;
             let mut renderer = ScrollCapture::default();
 
-            let route = handle_input_preflight(&input, || prelude_runs += 1);
+            let route = handle_input_preflight_with_pointer(&input, false, || prelude_runs += 1);
             if let PointerPreflightRoute::ScrollContinue = route {
                 apply_pointer_event(event, &mut renderer);
             }
@@ -11827,6 +11981,21 @@ mod tests {
             assert_eq!(prelude_runs, 1);
             assert_eq!(renderer.deltas, vec![i32::from(delta)]);
         }
+    }
+
+    #[test]
+    fn pointer_hit_continues_through_the_same_production_prelude_gate() {
+        let input = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Down,
+            Some(PointerButton::Primary),
+            false,
+        ));
+        let mut prelude_runs = 0;
+
+        let route = handle_input_preflight_with_pointer(&input, true, || prelude_runs += 1);
+
+        assert_eq!(route, PointerPreflightRoute::PointerContinue);
+        assert_eq!(prelude_runs, 1);
     }
 
     #[test]
@@ -11979,12 +12148,68 @@ fn handle_scroll_key(
 /// Slash-command palette state. Active whenever buf starts with '/'.
 pub struct MenuState {
     pub selected: usize,
+    pointer_selected: Option<crate::render::interaction::HitTarget>,
+    pointer_pressed: Option<crate::render::interaction::HitTarget>,
+    pointer_confirm_on_release: bool,
 }
 
 impl MenuState {
     pub fn new() -> Self {
-        Self { selected: 0 }
+        Self {
+            selected: 0,
+            pointer_selected: None,
+            pointer_pressed: None,
+            pointer_confirm_on_release: false,
+        }
     }
+
+    fn pointer_press(
+        &mut self,
+        target: crate::render::interaction::HitTarget,
+    ) -> PointerClickAction {
+        self.pointer_confirm_on_release = self.pointer_selected == Some(target);
+        self.pointer_selected = Some(target);
+        self.pointer_pressed = Some(target);
+        PointerClickAction::Select(target)
+    }
+
+    fn pointer_release(
+        &mut self,
+        target: crate::render::interaction::HitTarget,
+    ) -> PointerClickAction {
+        let confirm = self.pointer_pressed == Some(target) && self.pointer_confirm_on_release;
+        self.pointer_pressed = None;
+        self.pointer_confirm_on_release = false;
+        if confirm {
+            PointerClickAction::Confirm(target)
+        } else {
+            PointerClickAction::None
+        }
+    }
+
+    fn pointer_cancel(&mut self) {
+        self.pointer_pressed = None;
+        self.pointer_confirm_on_release = false;
+    }
+
+    fn has_pointer_press(&self) -> bool {
+        self.pointer_pressed.is_some()
+    }
+
+    fn select_index(&mut self, index: usize, len: usize) {
+        self.selected = if len == 0 { 0 } else { index.min(len - 1) };
+    }
+
+    fn confirm_selected(&self, len: usize) -> Option<usize> {
+        (len > 0).then(|| self.selected.min(len - 1))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerClickAction {
+    Select(crate::render::interaction::HitTarget),
+    Confirm(crate::render::interaction::HitTarget),
+    None,
 }
 
 // `ModelPicker` moved to `crate::modals::model_picker`; re-exported at
@@ -12275,6 +12500,120 @@ fn streaming_top_level_slash_selection(
     ))
 }
 
+fn confirm_idle_menu_selected(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    items: &[(String, String)],
+) -> Result<()> {
+    let Some(selected) = app.menu.confirm_selected(items.len()) else {
+        return Ok(());
+    };
+    let name = items[selected].0.clone();
+    let needs_args = ctx
+        .commands
+        .find(&name)
+        .map(|command| command.needs_args)
+        .or_else(|| {
+            ctx.custom_commands
+                .resolve(&name)
+                .map(|command| command.args_requirement != ArgsRequirement::None)
+        })
+        .unwrap_or(false);
+    app.menu.selected = 0;
+    if needs_args {
+        app.buf.text = format!("/{name} ");
+        app.buf.cursor = app.buf.text.len();
+        if matches!(name.as_str(), "skills" | "effort") {
+            if let Some(next_items) = build_menu_items(
+                &app.buf.text,
+                app.buf.cursor,
+                &ctx.commands,
+                &ctx.custom_commands,
+                Some(&ctx.skill_registry),
+                Some(&ctx.file_index),
+            ) {
+                redraw_with_menu(&app.buf, &next_items, 0, &app.state, ctx, renderer);
+                return Ok(());
+            }
+            if name == "skills" {
+                renderer.render(UiLine::CommandOutput(
+                    "  ⓘ No user-invocable skills installed yet.\n    \
+                    • Drop SKILL.md into ~/.atomcode/skills/<name>/ \n      \
+                      (Windows: %USERPROFILE%\\.atomcode\\skills\\<name>\\)\n    \
+                    • Or install a plugin that ships skills via /plugin install <git-url>\n\n"
+                        .into(),
+                ));
+            }
+        }
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
+    let committed = format!("/{name}");
+    renderer.render(UiLine::ClearTransient);
+    renderer.render(UiLine::User(committed.clone()));
+    app.buf.text.clear();
+    app.buf.cursor = 0;
+    ctx.history.push(crate::input::history::HistoryEntry {
+        text: committed.clone(),
+        images: Vec::new(),
+        pastes: Vec::new(),
+    });
+    if let Some((command, arg)) = parse_slash_line(&committed) {
+        if command.eq_ignore_ascii_case("paste") {
+            handle_paste_command(app, ctx, renderer)?;
+        } else {
+            execute_slash_command(
+                command,
+                arg,
+                &mut app.state,
+                ctx,
+                renderer,
+                &mut app.active_modal,
+                &mut app.setup_pending,
+            )?;
+        }
+        if matches!(app.state.phase, UiPhase::Idle) {
+            redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn command_action_contract_fixtures_for_test(
+) -> Vec<crate::modals::ModalActionContractFixture> {
+    let registry = CommandRegistry::builtin();
+    let custom = crate::custom_commands::CustomCommandRegistry::empty();
+    let items = build_menu_items("/he", 3, &registry, &custom, None, None)
+        .expect("real slash command menu");
+    let selected = items
+        .iter()
+        .position(|(name, _)| name == "help")
+        .expect("help command in real menu");
+    let (completed, submit) = streaming_top_level_slash_selection(
+        "/he",
+        &items[selected].0,
+        registry
+            .find(&items[selected].0)
+            .expect("real command")
+            .needs_args,
+        KeyCode::Tab,
+    )
+    .expect("real slash selection semantic");
+    vec![crate::modals::ModalActionContractFixture {
+        name: "command_menu_tab_completion".into(),
+        before: serde_json::json!({ "buffer": "/he", "selected": selected }).to_string(),
+        input: "Tab".into(),
+        outcome: format!("Complete(submit={submit})"),
+        after: serde_json::json!({ "buffer": completed, "selected": selected }).to_string(),
+        focus: "command_menu.items".into(),
+        selected: Some(selected),
+        stack: vec!["CommandMenu".into()],
+    }]
+}
+
 fn handle_idle_key(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -12393,6 +12732,12 @@ fn handle_idle_key(
             (selection_key @ (KeyCode::Enter | KeyCode::Tab), m)
                 if menu_handles_selection_key(selection_key, m, idle_commit_gate_pending(ctx)) =>
             {
+                if selection_key == KeyCode::Enter
+                    && app.buf.text.starts_with('/')
+                    && !app.buf.text[1..].contains(char::is_whitespace)
+                {
+                    return confirm_idle_menu_selected(app, ctx, renderer, items);
+                }
                 // Tab and Enter both pick the highlighted entry, but
                 // they diverge on no-arg top-level commands:
                 //   * Enter   → execute immediately (legacy behavior).

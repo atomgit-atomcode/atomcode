@@ -17,7 +17,7 @@ use crate::session::{Session, SessionMeta, TurnStat};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use super::{Modal, ModalAction};
+use super::{Modal, ModalAction, ModalPointerAction};
 use crate::event_loop::{
     build_status, format_tool_detail, provider_transition_pending, summarise, Buffer, LoopCtx,
 };
@@ -111,7 +111,25 @@ impl SessionPicker {
         }
         let max = self.filtered.len().saturating_sub(1);
         if self.selected < max {
-            self.selected += 1;
+            self.select_index(self.selected + 1);
+        }
+    }
+
+    fn select_index(&mut self, index: usize) {
+        if self.filtered.is_empty() {
+            self.selected = 0;
+            self.search_focused = false;
+        } else {
+            self.selected = index.min(self.filtered.len() - 1);
+            self.search_focused = false;
+        }
+        self.confirm_delete = None;
+        self.delete_status = None;
+    }
+
+    fn apply_pointer_semantic(&mut self, action: ModalPointerAction) {
+        if let ModalPointerAction::Select(index) = action {
+            self.select_index(index);
         }
     }
 
@@ -144,6 +162,101 @@ impl SessionPicker {
         // the runtime to reacquire the lease or publishing a session switch.
         replay_session(renderer, state, current_session, true);
         true
+    }
+
+    fn confirm_selected(
+        &mut self,
+        state: &mut UiState,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<ModalAction> {
+        let Some(selected) = self.chosen_session().cloned() else {
+            return Ok(ModalAction::Continue);
+        };
+        let expected_bucket = ctx
+            .current_session_project_bucket
+            .clone()
+            .unwrap_or_else(|| {
+                atomcode_capabilities::session::SessionManager::project_hash(&ctx.working_dir)
+            });
+        if self.replay_selected_current_session(
+            &ctx.current_session,
+            &expected_bucket,
+            state,
+            renderer,
+        ) {
+            return Ok(ModalAction::Close);
+        }
+        if provider_transition_pending(ctx) {
+            renderer.render(UiLine::Error(
+                crate::i18n::t(crate::i18n::Msg::CmdProviderReloading).into_owned(),
+            ));
+            renderer.flush();
+            return Ok(ModalAction::Continue);
+        }
+        if ctx.pending_session_resume.is_some() || ctx.pending_session_resume_preparation.is_some()
+        {
+            renderer.render(UiLine::Error(
+                crate::i18n::t(crate::i18n::Msg::SessionLoadFailed {
+                    error: "another session resume is still in progress",
+                })
+                .into_owned(),
+            ));
+            renderer.flush();
+            return Ok(ModalAction::Close);
+        }
+
+        let operation_id = ctx.next_session_resume_operation_id;
+        ctx.next_session_resume_operation_id =
+            ctx.next_session_resume_operation_id.wrapping_add(1).max(1);
+        let pending = crate::event_loop::PendingSessionResumePreparation {
+            operation_id,
+            project_bucket: selected.project_bucket.clone(),
+            session_id: selected.id.clone(),
+            working_dir: ctx.working_dir.clone(),
+        };
+        ctx.pending_session_resume_preparation = Some(pending.clone());
+        let event_tx = ctx.runtime_event_tx.clone();
+        let runtime_id = ctx.foreground_runtime_id;
+        let preparation = pending.clone();
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                tokio::task::spawn_blocking(move || {
+                    atomcode_daemon::legacy_convert::prepare_catalog_session_resume_in_project(
+                        &preparation.project_bucket,
+                        &preparation.session_id,
+                    )
+                    .map_err(|error| error.to_string())
+                    .and_then(|prepared| {
+                        prepared
+                            .ok_or_else(|| format!("session {} not found", preparation.session_id))
+                    })
+                }),
+            )
+            .await;
+            let result = match result {
+                Ok(joined) => flatten_session_preparation(joined),
+                Err(_) => Err("session preparation timed out after 15 seconds; the session may be in use by another process".into()),
+            };
+            let _ = event_tx.send(crate::event_loop::bg_runtime::RuntimeEvent {
+                runtime_id,
+                event: crate::event_loop::bg_runtime::RuntimeEventPayload::Driver(
+                    crate::event_loop::bg_runtime::DriverEvent::SessionResumePrepared {
+                        operation_id,
+                        project_bucket: pending.project_bucket,
+                        session_id: pending.session_id,
+                        working_dir: pending.working_dir,
+                        result,
+                    },
+                ),
+            });
+        });
+        renderer.render(UiLine::CommandOutput(
+            crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned(),
+        ));
+        renderer.flush();
+        Ok(ModalAction::Close)
     }
 
     /// The static key-legend hint advertising the picker's actions
@@ -274,100 +387,7 @@ impl Modal for SessionPicker {
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
-            KeyCode::Enter => {
-                let Some(selected) = self.chosen_session().cloned() else {
-                    // Filter matched nothing — ignore Enter, stay open.
-                    return Ok(ModalAction::Continue);
-                };
-                let expected_bucket =
-                    ctx.current_session_project_bucket
-                        .clone()
-                        .unwrap_or_else(|| {
-                            atomcode_capabilities::session::SessionManager::project_hash(
-                                &ctx.working_dir,
-                            )
-                        });
-                if self.replay_selected_current_session(
-                    &ctx.current_session,
-                    &expected_bucket,
-                    state,
-                    renderer,
-                ) {
-                    return Ok(ModalAction::Close);
-                }
-                if provider_transition_pending(ctx) {
-                    renderer.render(UiLine::Error(
-                        crate::i18n::t(crate::i18n::Msg::CmdProviderReloading).into_owned(),
-                    ));
-                    renderer.flush();
-                    return Ok(ModalAction::Continue);
-                }
-                if ctx.pending_session_resume.is_some()
-                    || ctx.pending_session_resume_preparation.is_some()
-                {
-                    renderer.render(UiLine::Error(
-                        crate::i18n::t(crate::i18n::Msg::SessionLoadFailed {
-                            error: "another session resume is still in progress",
-                        })
-                        .into_owned(),
-                    ));
-                    renderer.flush();
-                    return Ok(ModalAction::Close);
-                }
-
-                let operation_id = ctx.next_session_resume_operation_id;
-                ctx.next_session_resume_operation_id =
-                    ctx.next_session_resume_operation_id.wrapping_add(1).max(1);
-                let pending = crate::event_loop::PendingSessionResumePreparation {
-                    operation_id,
-                    project_bucket: selected.project_bucket.clone(),
-                    session_id: selected.id.clone(),
-                    working_dir: ctx.working_dir.clone(),
-                };
-                ctx.pending_session_resume_preparation = Some(pending.clone());
-                let event_tx = ctx.runtime_event_tx.clone();
-                let runtime_id = ctx.foreground_runtime_id;
-                let preparation = pending.clone();
-                tokio::spawn(async move {
-                    let result = tokio::time::timeout(
-                        std::time::Duration::from_secs(15),
-                        tokio::task::spawn_blocking(move || {
-                        atomcode_daemon::legacy_convert::prepare_catalog_session_resume_in_project(
-                            &preparation.project_bucket,
-                            &preparation.session_id,
-                        )
-                        .map_err(|error| error.to_string())
-                        .and_then(|prepared| {
-                            prepared.ok_or_else(|| {
-                                format!("session {} not found", preparation.session_id)
-                            })
-                        })
-                        }),
-                    )
-                    .await;
-                    let result = match result {
-                        Ok(joined) => flatten_session_preparation(joined),
-                        Err(_) => Err("session preparation timed out after 15 seconds; the session may be in use by another process".into()),
-                    };
-                    let _ = event_tx.send(crate::event_loop::bg_runtime::RuntimeEvent {
-                        runtime_id,
-                        event: crate::event_loop::bg_runtime::RuntimeEventPayload::Driver(
-                            crate::event_loop::bg_runtime::DriverEvent::SessionResumePrepared {
-                                operation_id,
-                                project_bucket: pending.project_bucket,
-                                session_id: pending.session_id,
-                                working_dir: pending.working_dir,
-                                result,
-                            },
-                        ),
-                    });
-                });
-                renderer.render(UiLine::CommandOutput(
-                    crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned(),
-                ));
-                renderer.flush();
-                Ok(ModalAction::Close)
-            }
+            KeyCode::Enter => self.confirm_selected(state, ctx, renderer),
             KeyCode::Esc => {
                 if self.confirm_delete.is_some() {
                     // Cancel the pending delete. Clear the confirm prompt too,
@@ -407,6 +427,28 @@ impl Modal for SessionPicker {
         self.selected = 0;
         self.draw(buf, state, ctx, renderer);
         Ok(ModalAction::Continue)
+    }
+
+    fn handle_pointer(
+        &mut self,
+        action: ModalPointerAction,
+        buf: &mut Buffer,
+        state: &mut UiState,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<ModalAction> {
+        match action {
+            ModalPointerAction::Select(index) => {
+                self.apply_pointer_semantic(ModalPointerAction::Select(index));
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            ModalPointerAction::Confirm(index) => {
+                self.select_index(index);
+                self.confirm_selected(state, ctx, renderer)
+            }
+            ModalPointerAction::Cancel => Ok(ModalAction::Close),
+        }
     }
 
     fn draw(&self, _buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
@@ -889,6 +931,7 @@ pub(crate) fn replay_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modals::ModalPointerAction;
     use std::path::PathBuf;
 
     fn meta(name: &str, msgs: usize) -> SessionMeta {
@@ -902,6 +945,20 @@ mod tests {
             message_count: msgs,
             file_size: 0,
         }
+    }
+
+    #[test]
+    fn pointer_selection_uses_the_same_session_index_semantic_as_keyboard() {
+        let sessions = vec![meta("one", 1), meta("two", 2), meta("three", 3)];
+        let mut keyboard = SessionPicker::open(sessions.clone());
+        let mut pointer = SessionPicker::open(sessions);
+
+        keyboard.down();
+        pointer.apply_pointer_semantic(ModalPointerAction::Select(1));
+
+        assert_eq!(keyboard.selected, pointer.selected);
+        assert_eq!(keyboard.search_focused, pointer.search_focused);
+        assert_eq!(keyboard.chosen_id(), pointer.chosen_id());
     }
 
     #[test]

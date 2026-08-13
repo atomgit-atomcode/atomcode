@@ -544,8 +544,12 @@ pub async fn run(
     // auto-trigger; the modal would otherwise try to draw a
     // Cyan-bordered box into a stdout that no human is watching.
     let is_plain_renderer = !caps.tty;
+    let interaction_publisher = crate::render::interaction::InteractionPublisher::default();
     let mut inner: Box<dyn Renderer> = if caps.tty {
-        Box::new(RetainedRenderer::new(caps))
+        Box::new(RetainedRenderer::new_with_interactions(
+            caps,
+            interaction_publisher.clone(),
+        ))
     } else {
         // Pass caps + the ORIGINAL tty value so PlainRenderer can:
         // (a) gate colours / unicode / spinner on caps.{colors,
@@ -834,6 +838,7 @@ pub async fn run(
 
     let file_index_root = working_dir.clone();
     let ctx = LoopCtx {
+        interaction_publisher,
         config,
         provider_selection,
         model_name,

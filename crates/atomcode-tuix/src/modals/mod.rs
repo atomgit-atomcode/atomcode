@@ -108,6 +108,13 @@ pub enum ModalAction {
     Close,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalPointerAction {
+    Select(usize),
+    Confirm(usize),
+    Cancel,
+}
+
 /// A modal overlay: takes over key handling until it returns
 /// `ModalAction::Close`. The implementation owns its own state (the
 /// selected index, the wizard step, the filter query, etc.) and is
@@ -132,6 +139,17 @@ pub trait Modal: Send {
     /// when the modal is installed into `active_modal`; `handle_key`
     /// is expected to handle subsequent repaints after each key.
     fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer);
+
+    fn handle_pointer(
+        &mut self,
+        _action: ModalPointerAction,
+        _buf: &mut Buffer,
+        _state: &mut UiState,
+        _ctx: &mut LoopCtx,
+        _renderer: &mut dyn Renderer,
+    ) -> Result<ModalAction> {
+        Ok(ModalAction::Continue)
+    }
 
     /// Handle a bracketed-paste payload while the modal is active.
     /// Default: append the text to `buf` (so text-input wizard steps

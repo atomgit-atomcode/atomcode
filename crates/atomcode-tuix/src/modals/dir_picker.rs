@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use super::{Modal, ModalAction};
+use super::{Modal, ModalAction, ModalPointerAction};
 use crate::event_loop::commands::apply_cd;
 use crate::event_loop::{build_status, Buffer, LoopCtx};
 use crate::render::{MenuPayload, Renderer, UiLine};
@@ -30,6 +30,12 @@ pub struct DirPicker {
     pub query: String,
     tab_matches: Vec<String>,
     tab_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DirConfirmFailure {
+    Redraw(String),
+    FlushOnly(String),
 }
 
 impl DirPicker {
@@ -89,8 +95,116 @@ impl DirPicker {
             self.selected = 0;
             return;
         }
-        if self.selected + 1 < n {
-            self.selected += 1;
+        self.select_index(self.selected.saturating_add(1));
+    }
+
+    fn select_index(&mut self, index: usize) {
+        let len = self.filtered().len();
+        if len == 0 {
+            self.selected = 0;
+        } else {
+            self.selected = index.min(len - 1);
+        }
+    }
+
+    #[cfg(test)]
+    fn selected_path(&self) -> Option<PathBuf> {
+        self.filtered().get(self.selected).cloned()
+    }
+
+    fn confirm_selected_with(
+        &self,
+        cwd: &std::path::Path,
+        previous_dir: Option<&std::path::Path>,
+        mut apply: impl FnMut(&std::path::Path) -> Result<(), String>,
+    ) -> Result<ModalAction, DirConfirmFailure> {
+        let filtered = self.filtered();
+        let Some(path) =
+            resolve_enter_target(&filtered, self.selected, &self.query, cwd, previous_dir)
+                .map_err(DirConfirmFailure::Redraw)?
+        else {
+            return Ok(ModalAction::Continue);
+        };
+        if crate::event_loop::commands::paths_same(&path, cwd) {
+            return Ok(ModalAction::Close);
+        }
+        if !path.is_dir() {
+            let display = path.display().to_string();
+            return Err(DirConfirmFailure::FlushOnly(
+                crate::i18n::t(crate::i18n::Msg::DirNotExists { path: &display }).into_owned(),
+            ));
+        }
+        apply(&path).map_err(DirConfirmFailure::Redraw)?;
+        Ok(ModalAction::Close)
+    }
+
+    fn confirm_selected(
+        &mut self,
+        buf: &mut Buffer,
+        state: &mut UiState,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<ModalAction> {
+        let cwd = ctx.working_dir.clone();
+        let previous_dir = ctx.previous_dir.clone();
+        let mut applied = false;
+        let result = self.confirm_selected_with(&cwd, previous_dir.as_deref(), |path| {
+            apply_cd(ctx, path.to_path_buf()).map(|_| {
+                applied = true;
+            })
+        });
+        self.finish_confirmation(result, applied, buf, state, ctx, renderer)
+    }
+
+    fn finish_confirmation(
+        &self,
+        result: Result<ModalAction, DirConfirmFailure>,
+        applied: bool,
+        buf: &Buffer,
+        state: &UiState,
+        ctx: &LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<ModalAction> {
+        match result {
+            Ok(action) => {
+                if applied {
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned(),
+                    ));
+                    renderer.flush();
+                }
+                Ok(action)
+            }
+            Err(DirConfirmFailure::Redraw(error)) => {
+                renderer.render(UiLine::Error(error));
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            Err(DirConfirmFailure::FlushOnly(error)) => {
+                renderer.render(UiLine::Error(error));
+                renderer.flush();
+                Ok(ModalAction::Continue)
+            }
+        }
+    }
+
+    fn apply_pointer_semantic_with(
+        &mut self,
+        action: ModalPointerAction,
+        cwd: &std::path::Path,
+        previous_dir: Option<&std::path::Path>,
+        apply: impl FnMut(&std::path::Path) -> Result<(), String>,
+    ) -> Result<ModalAction, DirConfirmFailure> {
+        match action {
+            ModalPointerAction::Select(index) => {
+                self.select_index(index);
+                Ok(ModalAction::Continue)
+            }
+            ModalPointerAction::Confirm(index) => {
+                self.select_index(index);
+                self.confirm_selected_with(cwd, previous_dir, apply)
+            }
+            ModalPointerAction::Cancel => Ok(ModalAction::Close),
         }
     }
 
@@ -174,48 +288,7 @@ impl Modal for DirPicker {
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
-            KeyCode::Enter => {
-                let filt = self.filtered();
-                let path = match resolve_enter_target(
-                    &filt,
-                    self.selected,
-                    &self.query,
-                    &ctx.working_dir,
-                    ctx.previous_dir.as_deref(),
-                ) {
-                    Ok(Some(path)) => path,
-                    Ok(None) => return Ok(ModalAction::Continue),
-                    Err(error) => {
-                        // Invalid ad-hoc paths stay editable in the modal.
-                        renderer.render(UiLine::Error(error));
-                        self.draw(buf, state, ctx, renderer);
-                        return Ok(ModalAction::Continue);
-                    }
-                };
-                if crate::event_loop::commands::paths_same(&path, &ctx.working_dir) {
-                    return Ok(ModalAction::Close);
-                }
-                if !path.is_dir() {
-                    let p = path.display().to_string();
-                    renderer.render(UiLine::Error(
-                        crate::i18n::t(crate::i18n::Msg::DirNotExists { path: &p }).into_owned(),
-                    ));
-                    renderer.flush();
-                    return Ok(ModalAction::Continue);
-                }
-                match apply_cd(ctx, path) {
-                    Ok(_) => renderer.render(UiLine::CommandOutput(
-                        crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned(),
-                    )),
-                    Err(error) => {
-                        renderer.render(UiLine::Error(error));
-                        self.draw(buf, state, ctx, renderer);
-                        return Ok(ModalAction::Continue);
-                    }
-                }
-                renderer.flush();
-                Ok(ModalAction::Close)
-            }
+            KeyCode::Enter => self.confirm_selected(buf, state, ctx, renderer),
             KeyCode::Esc => Ok(ModalAction::Close),
             _ => Ok(ModalAction::Continue),
         }
@@ -240,6 +313,51 @@ impl Modal for DirPicker {
         self.reset_tab_completion();
         self.draw(buf, state, ctx, renderer);
         Ok(ModalAction::Continue)
+    }
+
+    fn handle_pointer(
+        &mut self,
+        action: ModalPointerAction,
+        buf: &mut Buffer,
+        state: &mut UiState,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<ModalAction> {
+        match action {
+            ModalPointerAction::Select(_) => {
+                let result =
+                    self.apply_pointer_semantic_with(action, &ctx.working_dir, None, |_| Ok(()));
+                if let Err(failure) = result {
+                    return self.finish_confirmation(
+                        Err(failure),
+                        false,
+                        buf,
+                        state,
+                        ctx,
+                        renderer,
+                    );
+                }
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            ModalPointerAction::Confirm(index) => {
+                let cwd = ctx.working_dir.clone();
+                let previous_dir = ctx.previous_dir.clone();
+                let mut applied = false;
+                let result = self.apply_pointer_semantic_with(
+                    ModalPointerAction::Confirm(index),
+                    &cwd,
+                    previous_dir.as_deref(),
+                    |path| {
+                        apply_cd(ctx, path.to_path_buf()).map(|_| {
+                            applied = true;
+                        })
+                    },
+                );
+                self.finish_confirmation(result, applied, buf, state, ctx, renderer)
+            }
+            ModalPointerAction::Cancel => Ok(ModalAction::Close),
+        }
     }
 
     fn draw(&self, _buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
@@ -446,9 +564,103 @@ fn best_completion(query: &str, matches: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modals::ModalPointerAction;
 
     fn pb(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    #[test]
+    fn keyboard_and_pointer_share_directory_selection_and_confirmation_semantics() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("current");
+        let target = root.path().join("target");
+        std::fs::create_dir(&current).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let dirs = vec![current.clone(), target.clone()];
+        let mut keyboard = DirPicker::open(dirs.clone(), current.clone());
+        let mut pointer = DirPicker::open(dirs, current.clone());
+
+        keyboard.down();
+        pointer
+            .apply_pointer_semantic_with(ModalPointerAction::Select(1), &current, None, |_| {
+                unreachable!("selection must not dispatch a runtime command")
+            })
+            .unwrap();
+
+        let mut keyboard_runtime_command = None;
+        let keyboard_result = keyboard.confirm_selected_with(&current, None, |path| {
+            keyboard_runtime_command = Some(path.to_path_buf());
+            Ok(())
+        });
+        let mut pointer_runtime_command = None;
+        let pointer_result = pointer.apply_pointer_semantic_with(
+            ModalPointerAction::Confirm(1),
+            &current,
+            None,
+            |path| {
+                pointer_runtime_command = Some(path.to_path_buf());
+                Ok(())
+            },
+        );
+
+        assert_eq!(keyboard.selected, pointer.selected);
+        assert_eq!(keyboard.selected_path(), pointer.selected_path());
+        assert_eq!(keyboard_runtime_command, pointer_runtime_command);
+        assert_eq!(keyboard_result, pointer_result);
+
+        let mut keyboard_failed =
+            DirPicker::open(vec![current.clone(), target.clone()], current.clone());
+        let mut pointer_failed = DirPicker::open(vec![current.clone(), target], current.clone());
+        keyboard_failed.down();
+        pointer_failed
+            .apply_pointer_semantic_with(ModalPointerAction::Select(1), &current, None, |_| {
+                unreachable!("selection must not dispatch a runtime command")
+            })
+            .unwrap();
+        let keyboard_failure = keyboard_failed
+            .confirm_selected_with(&current, None, |_| Err("runtime rejected cd".to_string()));
+        let pointer_failure = pointer_failed.apply_pointer_semantic_with(
+            ModalPointerAction::Confirm(1),
+            &current,
+            None,
+            |_| Err("runtime rejected cd".to_string()),
+        );
+
+        assert_eq!(keyboard_failure, pointer_failure);
+        assert!(matches!(
+            pointer_failure,
+            Err(DirConfirmFailure::Redraw(ref error)) if error == "runtime rejected cd"
+        ));
+        assert_eq!(keyboard_failed.selected, pointer_failed.selected);
+        assert_eq!(
+            keyboard_failed.selected_path(),
+            pointer_failed.selected_path()
+        );
+    }
+
+    #[test]
+    fn confirmation_preserves_redraw_vs_flush_only_failure_semantics() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("current");
+        std::fs::create_dir(&current).unwrap();
+        let file = root.path().join("not-a-directory");
+        std::fs::write(&file, "x").unwrap();
+
+        let invalid = DirPicker {
+            query: "./missing".into(),
+            ..DirPicker::open(Vec::new(), current.clone())
+        };
+        assert!(matches!(
+            invalid.confirm_selected_with(&current, None, |_| Ok(())),
+            Err(DirConfirmFailure::Redraw(_))
+        ));
+
+        let not_directory = DirPicker::open(vec![file], current.clone());
+        assert!(matches!(
+            not_directory.confirm_selected_with(&current, None, |_| Ok(())),
+            Err(DirConfirmFailure::FlushOnly(_))
+        ));
     }
 
     #[test]
