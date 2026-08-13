@@ -42,6 +42,7 @@ pub enum DriverEvent {
         result: Result<atomcode_coding::SessionChanged, atomcode_coding::RuntimeError>,
     },
     SessionResumePrepared {
+        operation_id: u64,
         project_bucket: String,
         session_id: String,
         working_dir: PathBuf,

@@ -748,8 +748,7 @@ impl DetachedUsageRecorder {
 
 fn merge_model_usage(records: &mut Vec<ModelUsageStat>, usage: ModelUsageStat) {
     if let Some(existing) = records.iter_mut().find(|existing| {
-        existing.provider_id == usage.provider_id
-            && existing.model_id == usage.model_id
+        existing.provider_id == usage.provider_id && existing.model_id == usage.model_id
     }) {
         existing.tokens.add_assign(usage.tokens);
     } else {
@@ -759,8 +758,7 @@ fn merge_model_usage(records: &mut Vec<ModelUsageStat>, usage: ModelUsageStat) {
 
 fn subtract_model_usage(records: &mut Vec<ModelUsageStat>, usage: &ModelUsageStat) {
     if let Some(existing) = records.iter_mut().find(|existing| {
-        existing.provider_id == usage.provider_id
-            && existing.model_id == usage.model_id
+        existing.provider_id == usage.provider_id && existing.model_id == usage.model_id
     }) {
         existing.tokens.sub_assign(usage.tokens);
     }
@@ -1309,7 +1307,7 @@ impl SessionManager {
         fs::create_dir_all(&self.root).map_err(|error| io_at(&self.root, error))?;
         let path = self.lease_path(id)?;
         reject_existing_non_regular(&path)?;
-        let file = open_lock_file(&path)?;
+        let file = open_session_lock_file(id, &path)?;
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => Ok(SessionLease {
                 inner: Arc::new(SessionLeaseInner {
@@ -1318,7 +1316,7 @@ impl SessionManager {
                     file,
                 }),
             }),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(error) if is_file_lock_contention(&error) => {
                 Err(SessionStoreError::SessionInUse {
                     id: id.to_string(),
                     path,
@@ -1443,8 +1441,17 @@ impl SessionManager {
         fs::create_dir_all(&self.root).map_err(|e| io_at(&self.root, e))?;
         let lock_path = self.meta_lock_path(id)?;
         reject_existing_non_regular(&lock_path)?;
-        let lock = open_lock_file(&lock_path)?;
-        fs2::FileExt::lock_exclusive(&lock).map_err(|e| io_at(&lock_path, e))?;
+        let lock = open_session_lock_file(id, &lock_path)?;
+        acquire_file_lock_until(&lock, META_LOCK_WAIT_TIMEOUT).map_err(|error| {
+            if is_file_lock_contention(&error) {
+                SessionStoreError::SessionInUse {
+                    id: id.to_string(),
+                    path: lock_path.clone(),
+                }
+            } else {
+                io_at(&lock_path, error)
+            }
+        })?;
         operation()
     }
 
@@ -3753,6 +3760,35 @@ fn open_append_file(path: &Path) -> SessionResult<File> {
 }
 
 const TRANSIENT_FILE_ACCESS_RETRY_DELAYS_MS: [u64; 3] = [10, 30, 60];
+const META_LOCK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const META_LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+fn is_file_lock_contention(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock
+        // Windows reports sharing/lock violations as raw OS errors instead of
+        // consistently mapping them to WouldBlock (ERROR_SHARING_VIOLATION=32,
+        // ERROR_LOCK_VIOLATION=33).
+        || cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))
+}
+
+fn acquire_file_lock_until(file: &File, timeout: std::time::Duration) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(file) {
+            Ok(()) => return Ok(()),
+            Err(error) if is_file_lock_contention(&error) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(error);
+                }
+                std::thread::sleep(
+                    META_LOCK_RETRY_DELAY.min(deadline.saturating_duration_since(now)),
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 fn retry_transient_file_access<T>(
     mut operation: impl FnMut() -> SessionResult<T>,
@@ -3785,6 +3821,18 @@ fn open_lock_file(path: &Path) -> SessionResult<File> {
     ensure_opened_regular(path, &file)?;
     ensure_private_file_permissions(path, &file)?;
     Ok(file)
+}
+
+fn open_session_lock_file(id: &str, path: &Path) -> SessionResult<File> {
+    open_lock_file(path).map_err(|error| match error {
+        SessionStoreError::Io { source, .. } if is_file_lock_contention(&source) => {
+            SessionStoreError::SessionInUse {
+                id: id.to_string(),
+                path: path.to_path_buf(),
+            }
+        }
+        error => error,
+    })
 }
 
 fn set_private_create_mode(options: &mut OpenOptions) {
@@ -4009,7 +4057,9 @@ mod tests {
         let mut meta = SessionMeta::new("reminder-session", "/project", 1);
 
         meta.auto_name_from_messages(&[
-            Message::user(crate::reminder::system_reminder("我就在任务1上！继续任务2！")),
+            Message::user(crate::reminder::system_reminder(
+                "我就在任务1上！继续任务2！",
+            )),
             Message::user("修复登录错误"),
         ]);
 
@@ -5956,6 +6006,23 @@ mod tests {
         load_done_rx.recv().unwrap().unwrap();
         save_thread.join().unwrap();
         load_thread.join().unwrap();
+    }
+
+    #[test]
+    fn bounded_meta_lock_wait_returns_contention() {
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s1.meta.lock");
+        let held = super::open_lock_file(&path).unwrap();
+        fs2::FileExt::try_lock_exclusive(&held).unwrap();
+        let contender = super::open_lock_file(&path).unwrap();
+
+        let started = Instant::now();
+        let error = super::acquire_file_lock_until(&contender, Duration::from_millis(40))
+            .expect_err("contended lock must stop at its deadline");
+        assert!(super::is_file_lock_contention(&error));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

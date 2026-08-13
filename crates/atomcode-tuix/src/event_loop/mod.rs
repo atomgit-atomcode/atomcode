@@ -23,8 +23,8 @@ pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
 pub(crate) mod ui_event;
 pub(crate) mod usage_monitor;
-pub use commands::{MAX_SESSION_NAME_LEN, perform_session_rename, validate_session_name};
 use commands::{execute_slash_command, format_rate_limited_line};
+pub use commands::{perform_session_rename, validate_session_name, MAX_SESSION_NAME_LEN};
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -32,8 +32,8 @@ use std::time::Duration;
 
 use crate::session::{Session, SessionId};
 use anyhow::Result;
-use atomcode_coding::CodingRuntimeHandle;
 use atomcode_coding::runtime::{CodingRuntimeEvent, CompactTrigger, CompactionCompletion};
+use atomcode_coding::CodingRuntimeHandle;
 use atomcode_config::config::Config;
 use atomcode_config::{ConfigCommit, ConfigRevision, ConfigSnapshot, ConfigStore};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
@@ -43,11 +43,11 @@ use ui_event::{UiAgentPhase as AgentPhase, UiEvent as AgentEvent};
 use atomcode_kernel::message::ImageContent;
 use base64::Engine;
 
-use crate::commands::{CommandRegistry, parse_bash_command, parse_slash_line};
+use crate::commands::{parse_bash_command, parse_slash_line, CommandRegistry};
 use crate::custom_commands::ArgsRequirement;
-use crate::input::InputEvent;
 use crate::input::history::History;
-use crate::input::key_action::{Action, classify};
+use crate::input::key_action::{classify, Action};
+use crate::input::InputEvent;
 use crate::render::{Renderer, UiLine};
 use crate::state::{UiPhase, UiState};
 use crate::think::ThinkStripper;
@@ -1284,10 +1284,13 @@ pub(crate) struct PendingSessionResume {
     pub session: Session,
     pub working_dir: PathBuf,
     pub committed: Option<atomcode_coding::SessionChanged>,
+    pub cancel: tokio_util::sync::CancellationToken,
+    pub cancel_requested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingSessionResumePreparation {
+    pub operation_id: u64,
     pub project_bucket: String,
     pub session_id: String,
     pub working_dir: PathBuf,
@@ -1367,8 +1370,8 @@ fn session_transition_matches(
 #[cfg(test)]
 mod session_resume_tests {
     use super::{
-        PendingSessionResume, SessionTransitionEffect, commit_pending_projection,
-        session_resume_matches,
+        commit_pending_projection, session_resume_matches, PendingSessionResume,
+        SessionTransitionEffect,
     };
     use crate::session::Session;
     use std::path::PathBuf;
@@ -1383,6 +1386,8 @@ mod session_resume_tests {
             session,
             working_dir: working_dir.clone(),
             committed: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            cancel_requested: false,
         };
         let exact = atomcode_coding::SessionChanged {
             generation: atomcode_coding::RuntimeGeneration(1),
@@ -2405,6 +2410,7 @@ enum ReadyRuntimeRequest {
         id: String,
         working_dir: PathBuf,
         lease: atomcode_capabilities::session::SessionLease,
+        cancel: tokio_util::sync::CancellationToken,
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     },
@@ -2655,12 +2661,13 @@ impl ReadyRuntimeControl {
                     id,
                     working_dir,
                     lease,
+                    cancel,
                     runtime_id,
                     event_tx,
                 } => {
                     let result = self
                         .handle
-                        .resume_session_with_lease(id, working_dir, lease)
+                        .resume_session_with_lease_cancelable(id, working_dir, lease, cancel)
                         .await;
                     RuntimeControl::send_native_result(
                         &event_tx,
@@ -3162,6 +3169,7 @@ impl RuntimeControl {
         id: String,
         working_dir: PathBuf,
         lease: atomcode_capabilities::session::SessionLease,
+        cancel: tokio_util::sync::CancellationToken,
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
@@ -3170,6 +3178,7 @@ impl RuntimeControl {
                 id,
                 working_dir,
                 lease,
+                cancel,
                 runtime_id,
                 event_tx,
             }),
@@ -3183,7 +3192,7 @@ impl RuntimeControl {
                 };
                 tokio::spawn(async move {
                     let result = handle
-                        .resume_session_with_lease(id, working_dir, lease)
+                        .resume_session_with_lease_cancelable(id, working_dir, lease, cancel)
                         .await;
                     RuntimeControl::send_native_result(
                         &event_tx,
@@ -3435,12 +3444,12 @@ pub type RuntimeSpawnOverride =
 #[cfg(test)]
 mod local_restore_scope_tests {
     use super::{
-        RuntimeControl, RuntimeUiAvailability, bg_runtime, bg_runtime::RuntimeId,
-        complete_mcp_reload_notice, request_context_stats_render,
+        bg_runtime, bg_runtime::RuntimeId, complete_mcp_reload_notice,
+        request_context_stats_render, RuntimeControl, RuntimeUiAvailability,
     };
     use atomcode_coding::runtime::{
-        CodingRuntimeControl, coding_runtime_control_channel, noop_agent_handle,
-        spawn_runtime_owner,
+        coding_runtime_control_channel, noop_agent_handle, spawn_runtime_owner,
+        CodingRuntimeControl,
     };
     use atomcode_coding::{
         CodingAgentConfig, DeferredRuntimeState, DriverCommand, ProviderUnavailableReason,
@@ -3992,6 +4001,9 @@ pub struct LoopCtx {
     /// Exact picker selection whose catalog convergence and lease acquisition run
     /// off the input thread before the runtime resume is accepted.
     pub(crate) pending_session_resume_preparation: Option<PendingSessionResumePreparation>,
+    /// Monotonic identity for `/resume` preparation. Cancellation clears the
+    /// pending operation; any result carrying an older identity is ignored.
+    pub(crate) next_session_resume_operation_id: u64,
     /// `/resume` catalog scan result loaded off the UI thread, waiting to be
     /// installed into the session picker by the main loop (which owns `app`).
     /// Carries the dir the scan was for so install can drop a result the user has
@@ -12085,6 +12097,34 @@ fn handle_idle_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
+    let cancel_resume = code == KeyCode::Esc && modifiers.is_empty()
+        || code == KeyCode::Char('c')
+            && modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+    if cancel_resume && ctx.pending_session_resume_preparation.take().is_some() {
+        renderer.render(UiLine::Warning(match crate::i18n::current_locale() {
+            crate::i18n::Locale::ZhCn => "已取消加载会话".into(),
+            crate::i18n::Locale::En => "Session loading cancelled".into(),
+        }));
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        commands::request_session_catalog(ctx, renderer);
+        return Ok(());
+    }
+    if cancel_resume {
+        if let Some(pending) = ctx
+            .pending_session_resume
+            .as_mut()
+            .filter(|pending| pending.committed.is_none() && !pending.cancel_requested)
+        {
+            pending.cancel_requested = true;
+            pending.cancel.cancel();
+            renderer.render(UiLine::Warning(match crate::i18n::current_locale() {
+                crate::i18n::Locale::ZhCn => "正在取消加载会话…".into(),
+                crate::i18n::Locale::En => "Cancelling session loading…".into(),
+            }));
+            renderer.flush();
+            return Ok(());
+        }
+    }
     // GOAL ESCAPE HATCH (Idle). A `/goal` continuation is driven SERVER-SIDE,
     // so the TUI can legitimately sit in Idle while the agent keeps looping
     // rounds. From Idle, Esc/Ctrl+C otherwise just clear the input / arm exit —
@@ -13354,7 +13394,7 @@ fn midturn_submit_route(streaming: bool) -> SubmitRoute {
 
 #[cfg(test)]
 mod midturn_submit_route_tests {
-    use super::{SubmitRoute, midturn_submit_route, phase_has_active_turn};
+    use super::{midturn_submit_route, phase_has_active_turn, SubmitRoute};
 
     #[test]
     fn midturn_submit_steers_native_runtime() {
@@ -15456,7 +15496,7 @@ fn bypass_approval_choice() -> ApprovalChoice {
 #[cfg(test)]
 mod bypass_approval_tests {
     use super::{
-        ApprovalChoice, apply_startup_bypass, approval_choice_to_decision, bypass_approval_choice,
+        apply_startup_bypass, approval_choice_to_decision, bypass_approval_choice, ApprovalChoice,
     };
     use atomcode_capabilities::tools::approval::PermissionDecision;
 
@@ -18026,7 +18066,9 @@ fn team_action(args: &str) -> Option<String> {
 }
 
 fn projected_team_action(tool_name: &str, args: &str, plain: bool) -> Option<String> {
-    (!plain && tool_name == "team").then(|| team_action(args)).flatten()
+    (!plain && tool_name == "team")
+        .then(|| team_action(args))
+        .flatten()
 }
 
 /// Interactive TUI already projects successful Team state through the dedicated
@@ -18043,7 +18085,10 @@ fn team_success_notice(action: &str, output: &str) -> Option<String> {
             let members = value.get("members")?.as_array()?;
             let mut lines = vec![format!("  Team results · {run_id}")];
             for member in members {
-                let id = member.get("id").and_then(|value| value.as_str()).unwrap_or("agent");
+                let id = member
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("agent");
                 let status = member
                     .get("status")
                     .and_then(|value| value.as_str())
@@ -18066,10 +18111,7 @@ fn team_success_notice(action: &str, output: &str) -> Option<String> {
 fn team_batch_result_suffix(action: &str, output: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(output).ok()?;
     match action {
-        "delegate" => Some(format!(
-            "dispatched · {}",
-            value.get("run_id")?.as_str()?
-        )),
+        "delegate" => Some(format!("dispatched · {}", value.get("run_id")?.as_str()?)),
         "stop" => Some(format!("stopped · {}", value.get("run_id")?.as_str()?)),
         "status" | "wait" | "result" => Some("updated".into()),
         _ => None,
@@ -18311,8 +18353,8 @@ fn completed_task_detail(
 #[cfg(test)]
 mod subtask_progress_projection_tests {
     use super::{
-        completed_task_detail, correlate_task_team_progress, should_defer_task_approval_row,
-        projected_team_action, subtask_progress_from_args, task_call_id_from_team_run,
+        completed_task_detail, correlate_task_team_progress, projected_team_action,
+        should_defer_task_approval_row, subtask_progress_from_args, task_call_id_from_team_run,
         team_action, team_batch_result_suffix, team_success_notice, update_subtask_progress,
     };
     use crate::render::SubtaskStatus;
@@ -18528,10 +18570,7 @@ mod subtask_progress_projection_tests {
             Some("delegate".into())
         );
         assert_eq!(
-            team_success_notice(
-                "delegate",
-                r#"{"run_id":"team-2-2","status":"running"}"#
-            ),
+            team_success_notice("delegate", r#"{"run_id":"team-2-2","status":"running"}"#),
             Some("  ○ Team dispatched · team-2-2\n".into())
         );
         assert_eq!(
@@ -18548,7 +18587,10 @@ mod subtask_progress_projection_tests {
         )
         .unwrap();
         assert!(result.contains("Team results · team-2-2"), "{result}");
-        assert!(result.contains("reviewer#1 · completed · Found one race"), "{result}");
+        assert!(
+            result.contains("reviewer#1 · completed · Found one race"),
+            "{result}"
+        );
         assert!(result.contains("tester#2 · failed · no report"), "{result}");
         assert_eq!(team_success_notice("delegate", "not json"), None);
         assert_eq!(
@@ -18564,10 +18606,7 @@ mod subtask_progress_projection_tests {
             None
         );
         assert_eq!(
-            team_batch_result_suffix(
-                "delegate",
-                r#"{"run_id":"team-2-2","status":"running"}"#
-            ),
+            team_batch_result_suffix("delegate", r#"{"run_id":"team-2-2","status":"running"}"#),
             Some("dispatched · team-2-2".into())
         );
         assert_eq!(
@@ -18633,7 +18672,7 @@ fn is_incomplete_review_result(name: &str, output: &str, success: bool) -> bool 
 
 #[cfg(test)]
 mod tool_output_stream_gate_tests {
-    use super::{DISPATCH_TOOL_RAW_NAME, display_tool_name, streams_tool_output_by_default};
+    use super::{display_tool_name, streams_tool_output_by_default, DISPATCH_TOOL_RAW_NAME};
 
     #[test]
     fn dispatch_tool_streams_without_verbose() {
@@ -18803,7 +18842,7 @@ fn project_token_usage(meta: atomcode_kernel::message::MessageMeta) -> AgentEven
 
 #[cfg(test)]
 mod token_usage_projection_tests {
-    use super::{AgentEvent, project_token_usage};
+    use super::{project_token_usage, AgentEvent};
     use atomcode_kernel::message::MessageMeta;
     use atomcode_kernel::stream::TokenUsage;
 
@@ -19386,8 +19425,8 @@ fn handle_runtime_event(
                 }
                 CodingRuntimeEvent::Request(request) => {
                     use atomcode_capabilities::tools::{
-                        APPROVAL_KIND, ApprovalRequest,
-                        request_user_input::{REQUEST_USER_INPUT_KIND, UserInputResponse},
+                        request_user_input::{UserInputResponse, REQUEST_USER_INPUT_KIND},
+                        ApprovalRequest, APPROVAL_KIND,
                     };
                     if request.kind == REQUEST_USER_INPUT_KIND {
                         match classify_tui_user_input(request.payload) {
@@ -19870,6 +19909,10 @@ fn handle_runtime_event(
                 CodingRuntimeEvent::SnapshotRestoreFinished { .. } => return,
                 CodingRuntimeEvent::SessionResumeFinished(result) => {
                     match result {
+                        Err(atomcode_coding::RuntimeError::Cancelled) => {
+                            ctx.pending_session_resume = None;
+                            commands::request_session_catalog(ctx, renderer);
+                        }
                         Err(error) => {
                             ctx.pending_session_resume = None;
                             let message = error.to_string();
@@ -20196,6 +20239,7 @@ fn handle_runtime_event(
         }
         bg_runtime::RuntimeEventPayload::Driver(
             bg_runtime::DriverEvent::SessionResumePrepared {
+                operation_id,
                 project_bucket,
                 session_id,
                 working_dir,
@@ -20203,6 +20247,7 @@ fn handle_runtime_event(
             },
         ) => {
             let expected = PendingSessionResumePreparation {
+                operation_id,
                 project_bucket,
                 session_id,
                 working_dir,
@@ -20251,10 +20296,12 @@ fn handle_runtime_event(
                     return;
                 }
             };
+            let cancel = tokio_util::sync::CancellationToken::new();
             if let Err(error) = ctx.runtime.resume_session(
                 session.id.clone(),
                 expected.working_dir.clone(),
                 prepared.lease,
+                cancel.clone(),
                 ctx.foreground_runtime_id,
                 ctx.runtime_event_tx.clone(),
             ) {
@@ -20271,6 +20318,8 @@ fn handle_runtime_event(
                 session,
                 working_dir: expected.working_dir,
                 committed: None,
+                cancel,
+                cancel_requested: false,
             });
         }
         bg_runtime::RuntimeEventPayload::Driver(
@@ -21764,7 +21813,11 @@ fn handle_agent_event(
                     .then(|| web_search_result_suffix(&output))
                     .flatten();
                 let team_action = (name == "team" && !ctx.is_plain_renderer)
-                    .then(|| pending_tools.get(&call_id).map(|(_, detail, _)| detail.clone()))
+                    .then(|| {
+                        pending_tools
+                            .get(&call_id)
+                            .map(|(_, detail, _)| detail.clone())
+                    })
                     .flatten();
                 let suffix = if !success {
                     format!(" {} \u{2717}", arrow)
@@ -23663,8 +23716,8 @@ fn clipboard_image_hint_changed(
 #[cfg(test)]
 mod clipboard_hint_tests {
     use super::{
-        ClipboardCheckState, active_clipboard_hint, apply_clipboard_observation,
-        observe_clipboard_image, publish_clipboard_hint, rgba_fingerprint,
+        active_clipboard_hint, apply_clipboard_observation, observe_clipboard_image,
+        publish_clipboard_hint, rgba_fingerprint, ClipboardCheckState,
     };
     use std::time::{Duration, Instant};
 
@@ -24365,7 +24418,7 @@ fn input_history_position(buf: &Buffer, total: usize) -> Option<crate::render::H
 
 #[cfg(test)]
 mod input_history_position_tests {
-    use super::{Buffer, input_history_position};
+    use super::{input_history_position, Buffer};
 
     #[test]
     fn visible_only_while_recalling_history() {
@@ -25765,7 +25818,7 @@ pub(crate) fn install_password_modal(
 pub(crate) fn todo_progress_from_items(
     todos: &[atomcode_capabilities::tools::todo::TodoItem],
 ) -> crate::render::TodoProgress {
-    use atomcode_capabilities::tools::todo::{TodoStatus, todo_counts};
+    use atomcode_capabilities::tools::todo::{todo_counts, TodoStatus};
     let (completed, in_progress, total) = todo_counts(todos);
     let current = todos
         .iter()
@@ -26484,7 +26537,7 @@ mod format_shell_command_tests {
 
 #[cfg(test)]
 mod user_input_mode_tests {
-    use super::{TuiUserInputPresentation, classify_tui_user_input, round_cap_should_auto_stop};
+    use super::{classify_tui_user_input, round_cap_should_auto_stop, TuiUserInputPresentation};
     use crate::state::AgentMode;
 
     #[test]

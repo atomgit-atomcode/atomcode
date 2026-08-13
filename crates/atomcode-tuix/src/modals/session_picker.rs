@@ -315,7 +315,11 @@ impl Modal for SessionPicker {
                     return Ok(ModalAction::Close);
                 }
 
+                let operation_id = ctx.next_session_resume_operation_id;
+                ctx.next_session_resume_operation_id =
+                    ctx.next_session_resume_operation_id.wrapping_add(1).max(1);
                 let pending = crate::event_loop::PendingSessionResumePreparation {
+                    operation_id,
                     project_bucket: selected.project_bucket.clone(),
                     session_id: selected.id.clone(),
                     working_dir: ctx.working_dir.clone(),
@@ -325,7 +329,9 @@ impl Modal for SessionPicker {
                 let runtime_id = ctx.foreground_runtime_id;
                 let preparation = pending.clone();
                 tokio::spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || {
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        tokio::task::spawn_blocking(move || {
                         atomcode_daemon::legacy_convert::prepare_catalog_session_resume_in_project(
                             &preparation.project_bucket,
                             &preparation.session_id,
@@ -336,13 +342,18 @@ impl Modal for SessionPicker {
                                 format!("session {} not found", preparation.session_id)
                             })
                         })
-                    })
+                        }),
+                    )
                     .await;
-                    let result = flatten_session_preparation(result);
+                    let result = match result {
+                        Ok(joined) => flatten_session_preparation(joined),
+                        Err(_) => Err("session preparation timed out after 15 seconds; the session may be in use by another process".into()),
+                    };
                     let _ = event_tx.send(crate::event_loop::bg_runtime::RuntimeEvent {
                         runtime_id,
                         event: crate::event_loop::bg_runtime::RuntimeEventPayload::Driver(
                             crate::event_loop::bg_runtime::DriverEvent::SessionResumePrepared {
+                                operation_id,
                                 project_bucket: pending.project_bucket,
                                 session_id: pending.session_id,
                                 working_dir: pending.working_dir,

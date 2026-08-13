@@ -485,6 +485,7 @@ pub enum SubmitReceipt {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeError {
     Busy,
+    Cancelled,
     SessionInUse { id: String },
     StaleRequest { id: RequestId },
     NoPendingPolicyIntervention,
@@ -504,6 +505,7 @@ impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Busy => f.write_str("coding runtime is busy"),
+            Self::Cancelled => f.write_str("coding runtime operation was cancelled"),
             Self::SessionInUse { id } => {
                 write!(f, "session {id:?} is already in use by another runtime")
             }
@@ -1475,6 +1477,26 @@ impl CodingRuntimeHandle {
             id: id.into(),
             working_dir,
             lease,
+            cancel: None,
+        })
+        .await
+    }
+
+    /// Resume with a driver-owned cancellation signal. Cancellation is honored
+    /// only while the replacement is still in preflight; after the persistence
+    /// commit point the runtime transition remains authoritative.
+    pub async fn resume_session_with_lease_cancelable(
+        &self,
+        id: impl Into<String>,
+        working_dir: std::path::PathBuf,
+        lease: SessionLease,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<SessionChanged, RuntimeError> {
+        self.reprepare_target(ReprepareTarget::ResumeWithLease {
+            id: id.into(),
+            working_dir,
+            lease,
+            cancel: Some(cancel),
         })
         .await
     }
@@ -2222,6 +2244,7 @@ pub enum ReprepareTarget {
         id: String,
         working_dir: std::path::PathBuf,
         lease: SessionLease,
+        cancel: Option<tokio_util::sync::CancellationToken>,
     },
     ChangeDirectory(std::path::PathBuf),
 }
@@ -4485,7 +4508,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         // A same-directory ChangeDirectory resolves to no input: the current
                         // runtime remains authoritative, with no candidate session, generation
                         // advance, or reconfiguration events.
-                        let Some((input, prepared_lease)) = resolved else {
+                        let Some((input, prepared_lease, reprepare_cancel)) = resolved else {
                             let unchanged = session_changed(generation, &runtime);
                             resources = Some(runtime);
                             let _ = done.send(Ok(unchanged));
@@ -4539,14 +4562,32 @@ fn spawn_runtime_owner_with_optional_agent(
                         let reuse_lease = prepared_lease.or_else(|| {
                             matching_session_lease(&runtime.parts, &input.prepare.session)
                         });
-                        let candidate_parts = prepare_with_plugin_hook_source_reusing_lease(
+                        let prepare_candidate = prepare_with_plugin_hook_source_reusing_lease(
                             &input.config,
                             input.prepare.clone(),
                             runtime.plugin_hooks.as_ref(),
                             reuse_lease,
                             true,
-                        )
-                        .await;
+                        );
+                        let candidate_parts = match reprepare_cancel.as_ref() {
+                            Some(cancel) => {
+                                tokio::select! {
+                                    biased;
+                                    _ = cancel.cancelled() => Err(RuntimeError::Cancelled),
+                                    result = tokio::time::timeout(
+                                        std::time::Duration::from_secs(30),
+                                        prepare_candidate,
+                                    ) => match result {
+                                        Ok(result) => result.map_err(runtime_prepare_error),
+                                        Err(_) => Err(RuntimeError::ReconfigureFailed(
+                                            "session resume preflight timed out after 30 seconds"
+                                                .to_string(),
+                                        )),
+                                    },
+                                }
+                            }
+                            None => prepare_candidate.await.map_err(runtime_prepare_error),
+                        };
                         let mut candidate = match candidate_parts {
                             Ok(parts) => RuntimeResources {
                                 config: input.config,
@@ -4561,7 +4602,6 @@ fn spawn_runtime_owner_with_optional_agent(
                                 image_preprocessor: runtime.image_preprocessor.clone(),
                             },
                             Err(error) => {
-                                let error = runtime_prepare_error(error);
                                 controls.state.store(
                                     runtime_phase_state(generation, previous_phase),
                                     Ordering::Release,
@@ -6419,9 +6459,16 @@ async fn receive_agent_event(agent: &mut Option<AgentHandle>) -> Option<AgentEve
 fn resolve_reprepare_input(
     runtime: &RuntimeResources,
     target: ReprepareTarget,
-) -> Result<Option<(ReprepareInput, Option<SessionLease>)>, RuntimeError> {
+) -> Result<
+    Option<(
+        ReprepareInput,
+        Option<SessionLease>,
+        Option<tokio_util::sync::CancellationToken>,
+    )>,
+    RuntimeError,
+> {
     match target {
-        ReprepareTarget::Exact(input) => Ok(Some((input, None))),
+        ReprepareTarget::Exact(input) => Ok(Some((input, None, None))),
         ReprepareTarget::Reload { plugin_skill_dirs } => {
             let mut prepare = runtime.prepare.clone();
             if let Some(plugin_skill_dirs) = plugin_skill_dirs {
@@ -6438,6 +6485,7 @@ fn resolve_reprepare_input(
                     operation: ReconfigureKind::Reprepare,
                 },
                 None,
+                None,
             )))
         }
         ReprepareTarget::ReloadConfig(config) => {
@@ -6453,6 +6501,7 @@ fn resolve_reprepare_input(
                     operation: ReconfigureKind::Reprepare,
                 },
                 None,
+                None,
             )))
         }
         ReprepareTarget::Fresh => {
@@ -6464,6 +6513,7 @@ fn resolve_reprepare_input(
                     prepare,
                     operation: ReconfigureKind::FreshSession,
                 },
+                None,
                 None,
             )))
         }
@@ -6477,12 +6527,14 @@ fn resolve_reprepare_input(
                     operation: ReconfigureKind::ResumeSession,
                 },
                 None,
+                None,
             )))
         }
         ReprepareTarget::ResumeWithLease {
             id,
             working_dir,
             lease,
+            cancel,
         } => {
             if lease.id() != id {
                 return Err(RuntimeError::ReconfigureFailed(format!(
@@ -6517,6 +6569,7 @@ fn resolve_reprepare_input(
                     operation: ReconfigureKind::ResumeSession,
                 },
                 Some(lease),
+                cancel,
             )))
         }
         ReprepareTarget::ChangeDirectory(directory) => {
@@ -6556,6 +6609,7 @@ fn resolve_reprepare_input(
                     prepare,
                     operation: ReconfigureKind::ChangeDirectory,
                 },
+                None,
                 None,
             )))
         }
@@ -7580,7 +7634,10 @@ mod tests {
             ),
         )
         .expect("ordered terminal must be delivered");
-        assert!(matches!(terminal.payload, TeamEventPayload::RunFinished { .. }));
+        assert!(matches!(
+            terminal.payload,
+            TeamEventPayload::RunFinished { .. }
+        ));
     }
 
     #[derive(Debug)]
@@ -12879,6 +12936,54 @@ mod tests {
             manager.acquire_lease(target_id),
             Err(SessionStoreError::SessionInUse { .. })
         ));
+
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn cancelled_preflight_keeps_the_current_runtime_authoritative() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
+        let target_id = "cancelled-target";
+        persist_native_session(
+            &manager,
+            target_id,
+            project.path(),
+            &SessionSnapshot::new(vec![Message::user("target history")]),
+        );
+        let target_lease = manager.acquire_lease(target_id).unwrap();
+
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Fresh;
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        let old_id = runtime.session.as_ref().unwrap().id.clone();
+        let old_snapshot = runtime.handle.snapshot().await.unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        let result = runtime
+            .handle
+            .resume_session_with_lease_cancelable(
+                target_id,
+                project.path().to_path_buf(),
+                target_lease,
+                cancel,
+            )
+            .await;
+
+        assert_eq!(result, Err(RuntimeError::Cancelled));
+        assert_eq!(runtime.handle.status().generation, 0);
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        assert_eq!(runtime.handle.snapshot().await.unwrap(), old_snapshot);
+        assert!(matches!(
+            manager.acquire_lease(&old_id),
+            Err(SessionStoreError::SessionInUse { .. })
+        ));
+        assert!(manager.acquire_lease(target_id).is_ok());
 
         runtime.handle.shutdown().await.unwrap();
     }

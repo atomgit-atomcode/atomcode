@@ -3842,6 +3842,45 @@ fn execute_slash_command_impl(
     Ok(())
 }
 
+/// Reload the current-project session picker after a cancelled resume without
+/// blocking the TUI event loop.
+pub(crate) fn request_session_catalog(ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    renderer.render(UiLine::CommandOutput(
+        t(Msg::CmdSessionListLoading).into_owned(),
+    ));
+    renderer.flush();
+    let working_dir = ctx.working_dir.clone();
+    let event_working_dir = working_dir.clone();
+    let event_tx = ctx.runtime_event_tx.clone();
+    let runtime_id = ctx.foreground_runtime_id;
+    tokio::spawn(async move {
+        let scanned = tokio::task::spawn_blocking(move || {
+            atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)
+                .map(|all| {
+                    all.into_iter()
+                        .filter(|entry| entry.message_count > 0)
+                        .map(crate::session::SessionMeta::from)
+                        .collect::<Vec<_>>()
+                })
+                .map_err(|error| error.to_string())
+        })
+        .await;
+        let result = match scanned {
+            Ok(inner) => inner,
+            Err(join) => Err(join.to_string()),
+        };
+        let _ = event_tx.send(crate::event_loop::bg_runtime::RuntimeEvent {
+            runtime_id,
+            event: crate::event_loop::bg_runtime::RuntimeEventPayload::Driver(
+                crate::event_loop::bg_runtime::DriverEvent::SessionCatalogLoaded {
+                    working_dir: event_working_dir,
+                    result,
+                },
+            ),
+        });
+    });
+}
+
 /// 贪婪切分 `/skills` 参数：从左到右扫 whitespace 分词，`resolve(token)` 返回该
 /// token 对应 skill 的**规范身份**（`Some(canonical)`）时收入列表，否则停止。去重
 /// 按规范身份而非原始拼写——两个拼写不同但解析到同一 skill 的 token（大小写、后缀
