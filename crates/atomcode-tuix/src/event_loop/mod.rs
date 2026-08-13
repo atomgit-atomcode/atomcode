@@ -11227,6 +11227,24 @@ fn apply_pointer_event(event: PointerEvent, renderer: &mut dyn Renderer) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerPreflightRoute {
+    ScrollContinue,
+    ReturnIgnored,
+    NotPointer,
+}
+
+fn pointer_preflight_route(event: &InputEvent) -> PointerPreflightRoute {
+    match event {
+        InputEvent::Pointer(PointerEvent {
+            kind: PointerKind::Scroll(_),
+            ..
+        }) => PointerPreflightRoute::ScrollContinue,
+        InputEvent::Pointer(_) => PointerPreflightRoute::ReturnIgnored,
+        _ => PointerPreflightRoute::NotPointer,
+    }
+}
+
 fn handle_input(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -11234,6 +11252,10 @@ fn handle_input(
     ev: InputEvent,
 ) -> Result<()> {
     use crate::modals::ModalAction;
+
+    if pointer_preflight_route(&ev) == PointerPreflightRoute::ReturnIgnored {
+        return Ok(());
+    }
 
     let has_non_capturing_modal = app
         .active_modal
@@ -11704,9 +11726,13 @@ fn provider_transition_allows_idle_commit(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_pointer_event, route_pointer, PointerRoute};
+    use super::{
+        apply_pointer_event, pointer_preflight_route, route_pointer, PointerPreflightRoute,
+        PointerRoute,
+    };
     use crate::input::{PointerButton, PointerEvent, PointerKind};
     use crate::render::{Renderer, UiLine};
+    use crate::state::UiPhase;
 
     #[derive(Default)]
     struct ScrollCapture {
@@ -11750,6 +11776,56 @@ mod tests {
             )),
             PointerRoute::Ignored
         );
+    }
+
+    #[test]
+    fn pointer_non_scroll_fails_closed_before_general_input_prelude() {
+        for event in [
+            pointer(PointerKind::Drag, Some(PointerButton::Primary), true),
+            pointer(PointerKind::Move, None, false),
+            pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+            pointer(PointerKind::Up, Some(PointerButton::Primary), false),
+        ] {
+            let input = crate::input::InputEvent::Pointer(event);
+            let mut phase = UiPhase::Streaming;
+            let mut interrupt_drain_pending = true;
+            let mut prelude_runs = 0;
+            let mut renderer = ScrollCapture::default();
+
+            let route = pointer_preflight_route(&input);
+            if route == PointerPreflightRoute::ScrollContinue {
+                prelude_runs += 1;
+                phase = UiPhase::Idle;
+                interrupt_drain_pending = false;
+                apply_pointer_event(event, &mut renderer);
+            }
+
+            assert_eq!(route, PointerPreflightRoute::ReturnIgnored);
+            assert_eq!(prelude_runs, 0);
+            assert_eq!(phase, UiPhase::Streaming);
+            assert!(interrupt_drain_pending);
+            assert!(renderer.deltas.is_empty());
+        }
+    }
+
+    #[test]
+    fn pointer_scroll_continues_through_general_input_prelude() {
+        for delta in [-3, 3] {
+            let event = pointer(PointerKind::Scroll(delta), None, false);
+            let input = crate::input::InputEvent::Pointer(event);
+            let mut prelude_runs = 0;
+            let mut renderer = ScrollCapture::default();
+
+            let route = pointer_preflight_route(&input);
+            if route == PointerPreflightRoute::ScrollContinue {
+                prelude_runs += 1;
+                apply_pointer_event(event, &mut renderer);
+            }
+
+            assert_eq!(route, PointerPreflightRoute::ScrollContinue);
+            assert_eq!(prelude_runs, 1);
+            assert_eq!(renderer.deltas, vec![i32::from(delta)]);
+        }
     }
 
     #[test]
