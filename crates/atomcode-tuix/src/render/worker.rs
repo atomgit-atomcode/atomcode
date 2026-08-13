@@ -110,6 +110,7 @@ enum AckOp {
 /// protocol is the same `UiLine` enum.
 pub struct TaskRenderer {
     cmd_tx: mpsc::Sender<RenderCmd>,
+    interaction_publisher: Option<crate::render::interaction::InteractionPublisher>,
     /// Coalesces the 5ms `FlushDeferred` heartbeat: `true` means one is already
     /// queued and undrained, so we skip enqueuing another. Without this, when the
     /// worker's terminal write blocks — classically the Windows console pausing
@@ -129,6 +130,20 @@ impl TaskRenderer {
     /// renderer. After this returns the caller interacts with the inner
     /// renderer only via the returned facade.
     pub fn new(inner: Box<dyn Renderer>) -> Self {
+        Self::new_inner(inner, None)
+    }
+
+    pub fn new_with_interactions(
+        inner: Box<dyn Renderer>,
+        interactions: crate::render::interaction::InteractionPublisher,
+    ) -> Self {
+        Self::new_inner(inner, Some(interactions))
+    }
+
+    fn new_inner(
+        inner: Box<dyn Renderer>,
+        interaction_publisher: Option<crate::render::interaction::InteractionPublisher>,
+    ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<RenderCmd>();
         let flush_pending = Arc::new(AtomicBool::new(false));
         let worker_flag = Arc::clone(&flush_pending);
@@ -138,6 +153,7 @@ impl TaskRenderer {
             .expect("spawn render worker thread");
         Self {
             cmd_tx,
+            interaction_publisher,
             flush_pending,
             worker: Some(worker),
         }
@@ -156,6 +172,7 @@ impl TaskRenderer {
     /// thread fast enough. CC-style TUI harnesses use ~10s for the
     /// same reason.
     fn ack(&self, op: AckOp) {
+        self.fail_interactions_closed();
         let (ack_tx, ack_rx) = mpsc::channel();
         if self
             .cmd_tx
@@ -166,11 +183,19 @@ impl TaskRenderer {
             return;
         }
         let _ = ack_rx.recv_timeout(Duration::from_secs(10));
+        self.fail_interactions_closed();
+    }
+
+    fn fail_interactions_closed(&self) {
+        if let Some(interactions) = &self.interaction_publisher {
+            interactions.fail_closed();
+        }
     }
 }
 
 impl Renderer for TaskRenderer {
     fn render(&mut self, line: UiLine) {
+        self.fail_interactions_closed();
         let _ = self.cmd_tx.send(RenderCmd::Line(line));
     }
 
@@ -238,6 +263,7 @@ impl Renderer for TaskRenderer {
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16) {
+        self.fail_interactions_closed();
         let _ = self.cmd_tx.send(RenderCmd::Resize(cols, rows));
     }
 
@@ -505,8 +531,9 @@ fn ui_line_tag(l: &UiLine) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::interaction::{CellRect, HitRegion, HitTarget, InteractionPublisher};
     use crate::render::Renderer;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
 
     /// Counting test renderer — records every call so tests can assert
     /// the worker forwards correctly.
@@ -586,6 +613,95 @@ mod tests {
         (TaskRenderer::new(inner), counts)
     }
 
+    struct BlockingInteractionRenderer {
+        interactions: InteractionPublisher,
+        entered: mpsc::Sender<()>,
+        published: mpsc::Sender<()>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl Renderer for BlockingInteractionRenderer {
+        fn render(&mut self, _line: UiLine) {
+            let _ = self.entered.send(());
+            let (released, wake) = &*self.gate;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+        }
+
+        fn flush_deferred(&mut self) {
+            self.interactions.publish(
+                2,
+                vec![HitRegion {
+                    rect: CellRect {
+                        row: 7,
+                        col: 0,
+                        height: 1,
+                        width: 12,
+                    },
+                    target: HitTarget::MenuItem { index: 1 },
+                }],
+            );
+            let _ = self.published.send(());
+        }
+
+        fn flush(&mut self) {}
+        fn shutdown(&mut self) {}
+        fn reset(&mut self) {}
+        fn clear_screen(&mut self) {}
+        fn suspend_for_external(&mut self) {}
+        fn resume_from_external(&mut self) {}
+    }
+
+    #[test]
+    fn queued_logical_frame_immediately_closes_stale_interactions() {
+        let interactions = InteractionPublisher::default();
+        interactions.publish(
+            1,
+            vec![HitRegion {
+                rect: CellRect {
+                    row: 3,
+                    col: 0,
+                    height: 1,
+                    width: 12,
+                },
+                target: HitTarget::MenuItem { index: 0 },
+            }],
+        );
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (published_tx, published_rx) = mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let inner = Box::new(BlockingInteractionRenderer {
+            interactions: interactions.clone(),
+            entered: entered_tx,
+            published: published_tx,
+            gate: gate.clone(),
+        });
+        let mut renderer = TaskRenderer::new_with_interactions(inner, interactions.clone());
+
+        renderer.render(UiLine::User("new logical frame".into()));
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        renderer.flush_deferred();
+        assert!(
+            interactions.snapshot_actionable().is_none(),
+            "the queued frame must invalidate stale coordinates before the worker unblocks"
+        );
+
+        let (released, wake) = &*gate;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+        published_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let frame = interactions
+            .snapshot_actionable()
+            .expect("successful worker publication reopens interactions");
+        assert_eq!(frame.generation, 2);
+        assert_eq!(frame.surface_session, 2);
+        assert_eq!(frame.hit(7, 1), Some(HitTarget::MenuItem { index: 1 }));
+        renderer.shutdown();
+    }
+
     #[test]
     fn render_and_flush_forward_to_inner() {
         let (mut r, counts) = setup();
@@ -643,6 +759,33 @@ mod tests {
         assert_eq!(counts.lock().unwrap().suspends, 1);
         r.resume_from_external();
         assert_eq!(counts.lock().unwrap().resumes, 1);
+    }
+
+    #[test]
+    fn every_lifecycle_ack_closes_interactions_before_waiting() {
+        let interactions = InteractionPublisher::default();
+        let counts = Arc::new(Mutex::new(Counts::default()));
+        let inner = Box::new(TestRenderer {
+            counts: counts.clone(),
+        });
+        let mut renderer = TaskRenderer::new_with_interactions(inner, interactions.clone());
+        let publish = || interactions.publish(1, Vec::new());
+
+        publish();
+        renderer.reset();
+        assert!(interactions.snapshot_actionable().is_none());
+        publish();
+        renderer.clear_screen();
+        assert!(interactions.snapshot_actionable().is_none());
+        publish();
+        renderer.suspend_for_external();
+        assert!(interactions.snapshot_actionable().is_none());
+        publish();
+        renderer.resume_from_external();
+        assert!(interactions.snapshot_actionable().is_none());
+        publish();
+        renderer.shutdown();
+        assert!(interactions.snapshot_actionable().is_none());
     }
 
     #[test]

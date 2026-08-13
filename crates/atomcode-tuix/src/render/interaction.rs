@@ -34,6 +34,7 @@ pub struct HitRegion {
 #[derive(Debug, Default)]
 pub struct InteractionFrame {
     pub generation: u64,
+    pub surface_session: u64,
     pub regions: Vec<HitRegion>,
 }
 
@@ -59,10 +60,10 @@ impl InteractionPublisher {
     }
 
     pub fn snapshot_actionable(&self) -> Option<Arc<InteractionFrame>> {
-        // Retained frame flushing and input dispatch are serialized by the
-        // current TUI event loop. The second load only closes the small clone
-        // window if a writer failed concurrently; this is not intended as a
-        // cross-thread transaction boundary for event execution.
+        // The render worker publishes while the event-loop thread invalidates
+        // before enqueueing a logical frame. The second load closes the clone
+        // window when invalidation races this snapshot; it is intentionally a
+        // visibility gate, not a transaction spanning later event execution.
         if !self.actionable.load(Ordering::Acquire) {
             return None;
         }
@@ -70,11 +71,12 @@ impl InteractionPublisher {
         self.actionable.load(Ordering::Acquire).then_some(frame)
     }
 
-    pub fn publish(&self, regions: Vec<HitRegion>) {
+    pub fn publish(&self, surface_session: u64, regions: Vec<HitRegion>) {
         let mut slot = write_recover(&self.inner);
         let generation = slot.generation.saturating_add(1);
         *slot = Arc::new(InteractionFrame {
             generation,
+            surface_session,
             regions,
         });
         self.actionable.store(true, Ordering::Release);
@@ -114,7 +116,7 @@ mod tests {
         assert!(initial.regions.is_empty());
         assert!(publisher.snapshot_actionable().is_none());
 
-        publisher.publish(vec![HitRegion {
+        publisher.publish(1, vec![HitRegion {
             rect: CellRect {
                 row: 3,
                 col: 2,
@@ -139,7 +141,7 @@ mod tests {
         let poison = publisher.clone();
         let _ = std::thread::spawn(move || poison.poison_for_test()).join();
 
-        publisher.publish(vec![HitRegion {
+        publisher.publish(1, vec![HitRegion {
             rect: CellRect {
                 row: 1,
                 col: 1,
@@ -156,6 +158,7 @@ mod tests {
     fn later_overlay_region_wins_hit_precedence() {
         let frame = InteractionFrame {
             generation: 1,
+            surface_session: 1,
             regions: vec![
                 HitRegion {
                     rect: CellRect {

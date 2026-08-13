@@ -11240,8 +11240,8 @@ fn handle_pointer_hit(
         return Ok(());
     };
     let click = match event.kind {
-        PointerKind::Down => app.menu.pointer_press(target),
-        PointerKind::Up => app.menu.pointer_release(target),
+        PointerKind::Down => app.menu.pointer_press(target, frame.surface_session),
+        PointerKind::Up => app.menu.pointer_release(target, frame.surface_session),
         PointerKind::Drag | PointerKind::Move | PointerKind::Scroll(_) => {
             return Ok(());
         }
@@ -11265,6 +11265,7 @@ fn handle_pointer_hit(
                 let outcome =
                     modal.handle_pointer(action, &mut app.buf, &mut app.state, ctx, renderer)?;
                 if outcome == crate::modals::ModalAction::Close {
+                    app.menu.pointer_cancel();
                     app.active_modal = None;
                     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 }
@@ -11292,6 +11293,12 @@ fn handle_pointer_hit(
                 return Ok(());
             };
             app.menu.select_index(index, items.len());
+            if !app
+                .menu
+                .pointer_confirmation_allowed(idle_commit_gate_pending(ctx))
+            {
+                return Ok(());
+            }
             confirm_idle_menu_selected(app, ctx, renderer, &items)?;
         }
         PointerClickAction::None
@@ -11403,6 +11410,9 @@ fn handle_input(
     });
     if preflight == PointerPreflightRoute::ReturnIgnored {
         return Ok(());
+    }
+    if !matches!(ev, InputEvent::Pointer(_)) {
+        app.menu.pointer_cancel();
     }
 
     match ev {
@@ -11884,27 +11894,65 @@ mod tests {
         let target = HitTarget::MenuItem { index: 2 };
         let other = HitTarget::MenuItem { index: 3 };
         let mut menu = super::MenuState::new();
+        let session = 7;
 
         assert_eq!(
-            menu.pointer_press(target),
+            menu.pointer_press(target, session),
             super::PointerClickAction::Select(target)
         );
         assert_eq!(
-            menu.pointer_release(target),
+            menu.pointer_release(target, session),
             super::PointerClickAction::None
         );
         assert_eq!(
-            menu.pointer_press(other),
-            super::PointerClickAction::Select(other)
-        );
-        assert_eq!(menu.pointer_release(other), super::PointerClickAction::None);
-        assert_eq!(
-            menu.pointer_press(other),
+            menu.pointer_press(other, session),
             super::PointerClickAction::Select(other)
         );
         assert_eq!(
-            menu.pointer_release(other),
+            menu.pointer_release(other, session),
+            super::PointerClickAction::None
+        );
+        assert_eq!(
+            menu.pointer_press(other, session),
+            super::PointerClickAction::Select(other)
+        );
+        assert_eq!(
+            menu.pointer_release(other, session),
             super::PointerClickAction::Confirm(other)
+        );
+    }
+
+    #[test]
+    fn pointer_confirmation_arm_does_not_cross_modal_or_content_sessions() {
+        let target = HitTarget::ModalItem { index: 0 };
+        let mut menu = super::MenuState::new();
+
+        assert_eq!(
+            menu.pointer_press(target, 11),
+            super::PointerClickAction::Select(target)
+        );
+        assert_eq!(
+            menu.pointer_release(target, 11),
+            super::PointerClickAction::None
+        );
+
+        // The same target index in a newly painted modal/content session is a
+        // fresh selection, not confirmation inherited from the prior picker.
+        assert_eq!(
+            menu.pointer_press(target, 12),
+            super::PointerClickAction::Select(target)
+        );
+        assert_eq!(
+            menu.pointer_release(target, 12),
+            super::PointerClickAction::None
+        );
+        assert_eq!(
+            menu.pointer_press(target, 12),
+            super::PointerClickAction::Select(target)
+        );
+        assert_eq!(
+            menu.pointer_release(target, 12),
+            super::PointerClickAction::Confirm(target)
         );
     }
 
@@ -11913,21 +11961,22 @@ mod tests {
         let target = HitTarget::MenuItem { index: 2 };
         let outside = HitTarget::MenuItem { index: 4 };
         let mut menu = super::MenuState::new();
+        let session = 3;
 
         assert_eq!(
-            menu.pointer_press(target),
+            menu.pointer_press(target, session),
             super::PointerClickAction::Select(target)
         );
         assert_eq!(
-            menu.pointer_release(outside),
+            menu.pointer_release(outside, session),
             super::PointerClickAction::None
         );
         assert_eq!(
-            menu.pointer_press(target),
+            menu.pointer_press(target, session),
             super::PointerClickAction::Select(target)
         );
         assert_eq!(
-            menu.pointer_release(outside),
+            menu.pointer_release(outside, session),
             super::PointerClickAction::None
         );
     }
@@ -11996,6 +12045,44 @@ mod tests {
 
         assert_eq!(route, PointerPreflightRoute::PointerContinue);
         assert_eq!(prelude_runs, 1);
+    }
+
+    #[test]
+    fn pointer_and_keyboard_confirmation_share_the_idle_commit_gate() {
+        for pending in [false, true] {
+            assert_eq!(
+                super::idle_menu_confirmation_allowed(pending),
+                super::menu_handles_selection_key(
+                    crossterm::event::KeyCode::Enter,
+                    crossterm::event::KeyModifiers::NONE,
+                    pending,
+                ),
+                "pointer and Enter must agree when commit_gate_pending={pending}"
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_pointer_confirmation_rearms_as_a_fresh_selection() {
+        let target = HitTarget::MenuItem { index: 1 };
+        let mut menu = super::MenuState::new();
+        let session = 9;
+        let _ = menu.pointer_press(target, session);
+        let _ = menu.pointer_release(target, session);
+        let _ = menu.pointer_press(target, session);
+        assert_eq!(
+            menu.pointer_release(target, session),
+            super::PointerClickAction::Confirm(target)
+        );
+
+        assert!(!menu.pointer_confirmation_allowed(true));
+        let _ = menu.pointer_press(target, session);
+        assert_eq!(
+            menu.pointer_release(target, session),
+            super::PointerClickAction::None,
+            "after a blocked commit, the next click must select again"
+        );
+        assert!(menu.pointer_confirmation_allowed(false));
     }
 
     #[test]
@@ -12148,8 +12235,8 @@ fn handle_scroll_key(
 /// Slash-command palette state. Active whenever buf starts with '/'.
 pub struct MenuState {
     pub selected: usize,
-    pointer_selected: Option<crate::render::interaction::HitTarget>,
-    pointer_pressed: Option<crate::render::interaction::HitTarget>,
+    pointer_selected: Option<(u64, crate::render::interaction::HitTarget)>,
+    pointer_pressed: Option<(u64, crate::render::interaction::HitTarget)>,
     pointer_confirm_on_release: bool,
 }
 
@@ -12166,20 +12253,27 @@ impl MenuState {
     fn pointer_press(
         &mut self,
         target: crate::render::interaction::HitTarget,
+        surface_session: u64,
     ) -> PointerClickAction {
-        self.pointer_confirm_on_release = self.pointer_selected == Some(target);
-        self.pointer_selected = Some(target);
-        self.pointer_pressed = Some(target);
+        let identity = (surface_session, target);
+        self.pointer_confirm_on_release = self.pointer_selected == Some(identity);
+        self.pointer_selected = Some(identity);
+        self.pointer_pressed = Some(identity);
         PointerClickAction::Select(target)
     }
 
     fn pointer_release(
         &mut self,
         target: crate::render::interaction::HitTarget,
+        surface_session: u64,
     ) -> PointerClickAction {
-        let confirm = self.pointer_pressed == Some(target) && self.pointer_confirm_on_release;
+        let identity = (surface_session, target);
+        let confirm = self.pointer_pressed == Some(identity) && self.pointer_confirm_on_release;
         self.pointer_pressed = None;
         self.pointer_confirm_on_release = false;
+        if self.pointer_selected != Some(identity) {
+            self.pointer_selected = None;
+        }
         if confirm {
             PointerClickAction::Confirm(target)
         } else {
@@ -12188,12 +12282,21 @@ impl MenuState {
     }
 
     fn pointer_cancel(&mut self) {
+        self.pointer_selected = None;
         self.pointer_pressed = None;
         self.pointer_confirm_on_release = false;
     }
 
     fn has_pointer_press(&self) -> bool {
         self.pointer_pressed.is_some()
+    }
+
+    fn pointer_confirmation_allowed(&mut self, commit_gate_pending: bool) -> bool {
+        let allowed = idle_menu_confirmation_allowed(commit_gate_pending);
+        if !allowed {
+            self.pointer_cancel();
+        }
+        allowed
     }
 
     fn select_index(&mut self, index: usize, len: usize) {
@@ -12480,7 +12583,11 @@ fn menu_handles_selection_key(
 ) -> bool {
     matches!(code, KeyCode::Enter | KeyCode::Tab)
         && !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
-        && !(code == KeyCode::Enter && commit_gate_pending)
+        && (code != KeyCode::Enter || idle_menu_confirmation_allowed(commit_gate_pending))
+}
+
+fn idle_menu_confirmation_allowed(commit_gate_pending: bool) -> bool {
+    !commit_gate_pending
 }
 
 fn streaming_top_level_slash_selection(

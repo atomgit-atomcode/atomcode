@@ -577,7 +577,14 @@ pub async fn run(
     inner.set_auto_copy_enabled(auto_copy);
     let history_replay_max_rows = resolve_history_replay_max_rows(&config, &caps);
     inner.set_history_replay_max_rows(history_replay_max_rows);
-    let mut renderer: Box<dyn Renderer> = Box::new(TaskRenderer::new(inner));
+    let mut renderer: Box<dyn Renderer> = if caps.tty {
+        Box::new(TaskRenderer::new_with_interactions(
+            inner,
+            interaction_publisher.clone(),
+        ))
+    } else {
+        Box::new(TaskRenderer::new(inner))
+    };
 
     // Input thread (only spawn when raw-mode/TTY available; pipe mode
     // reads stdin directly). `reader_handle` exposes Pause / Resume so

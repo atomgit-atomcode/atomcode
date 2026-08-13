@@ -808,6 +808,8 @@ pub struct RetainedRenderer<W: Write + Send> {
     mouse_capture_enabled: bool,
     interaction_publisher: crate::render::interaction::InteractionPublisher,
     pending_interactions: Vec<crate::render::interaction::HitRegion>,
+    interaction_surface: Option<(String, super::MenuKind, Vec<(String, String)>)>,
+    interaction_surface_session: u64,
     screen: Screen,
     // ── widget state ──
     input_buf: String,
@@ -1141,6 +1143,15 @@ impl RetainedRenderer<StdoutTap> {
 }
 
 impl<W: Write + Send> RetainedRenderer<W> {
+    fn update_interaction_surface(&mut self, input: &str, menu: Option<&MenuPayload>) {
+        let next = menu.map(|menu| (input.to_owned(), menu.kind, menu.items.clone()));
+        if self.interaction_surface != next {
+            self.interaction_surface = next;
+            self.interaction_surface_session =
+                self.interaction_surface_session.saturating_add(1);
+        }
+    }
+
     pub fn with_writer(out: W, caps: TerminalCaps, w: u16, h: u16) -> Self {
         Self::with_writer_and_interactions(out, caps, w, h, Default::default())
     }
@@ -1169,6 +1180,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             mouse_capture_enabled,
             interaction_publisher,
             pending_interactions: Vec::new(),
+            interaction_surface: None,
+            interaction_surface_session: 0,
             screen: Screen::new(w, h).with_jediterm(caps.jediterm),
             input_buf: String::new(),
             input_cursor_byte: 0,
@@ -7676,6 +7689,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // served its purpose — clear it so the user sees a clean input
                 // prompt, not a stale `⠋ Pondering…` row above the input box.
                 self.clear_live_spinner();
+                self.update_interaction_surface(&buf, menu.as_ref());
                 self.input_buf = buf;
                 self.input_cursor_byte = cursor_byte;
                 self.menu = menu;
@@ -7692,6 +7706,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 attachments,
             } => {
                 // Input box / status / menu still belong in the footer.
+                self.update_interaction_surface(&buf, menu.as_ref());
                 self.input_buf = buf;
                 self.input_cursor_byte = cursor_byte;
                 self.menu = menu;
@@ -7746,6 +7761,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // after this event, so mirror that state synchronously.
                 self.input_buf.clear();
                 self.input_cursor_byte = 0;
+                self.update_interaction_surface("", None);
                 self.menu = None;
                 self.input_attachments.clear();
                 self.dirty = true;
@@ -9106,7 +9122,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             if frame_written {
                 self.last_painted_footer_rows = footer_rows;
                 self.interaction_publisher
-                    .publish(self.pending_interactions.clone());
+                    .publish(
+                        self.interaction_surface_session,
+                        self.pending_interactions.clone(),
+                    );
                 self.dirty = false;
             } else {
                 // `render_diff` already advanced its cell cache. Force the next
@@ -10060,6 +10079,53 @@ mod tests {
                 "submenu {buffer:?} must not expose the top-level-only click semantic"
             );
         }
+    }
+
+    #[test]
+    fn interaction_surface_session_survives_selection_redraw_but_not_close_reopen() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            80,
+            24,
+            interactions.clone(),
+        );
+        let menu = |selected| MenuPayload {
+            items: vec![
+                ("help".into(), "Show help".into()),
+                ("status".into(), "Show status".into()),
+            ],
+            selected,
+            kind: crate::render::MenuKind::SlashCommand,
+        };
+        let prompt = |menu| UiLine::InputPrompt {
+            buf: "/".into(),
+            cursor_byte: 1,
+            menu,
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        };
+
+        renderer.render(prompt(Some(menu(0))));
+        renderer.flush_deferred();
+        let first = interactions.snapshot().surface_session;
+
+        renderer.render(prompt(Some(menu(1))));
+        renderer.flush_deferred();
+        assert_eq!(
+            interactions.snapshot().surface_session,
+            first,
+            "selection-only redraw keeps the click-confirm session"
+        );
+
+        renderer.render(prompt(None));
+        renderer.render(prompt(Some(menu(0))));
+        renderer.flush_deferred();
+        assert!(
+            interactions.snapshot().surface_session > first,
+            "close/reopen must create a fresh session even when coalesced before paint"
+        );
     }
 
     /// Writer that tracks every individual `write` call — for tests
