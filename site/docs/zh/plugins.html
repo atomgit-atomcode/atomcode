@@ -182,8 +182,8 @@ atomcode plugin marketplace remove|update|list</code></pre>
           <tr><td><code>PostToolUse</code></td><td>工具调用后</td><td>审计、副作用</td></tr>
           <tr><td><code>SessionStart</code></td><td>session 启动</td><td>预热、记录</td></tr>
           <tr><td><code>SessionEnd</code></td><td>session 结束</td><td>清理、归档</td></tr>
-          <tr><td><code>Stop</code></td><td>回合结束——正常停止、安全熔断、用户取消或限流暂停</td><td>指示灯:回合完成(绿/呼吸)</td></tr>
-          <tr><td><code>StopFailure</code></td><td>回合因 API/provider 错误(流失败/超时)而结束</td><td>指示灯:API 出错告警(红)</td></tr>
+          <tr><td><code>Stop</code></td><td>回合结束——正常停止、安全熔断、用户取消或限流暂停</td><td>通知插件回合已结束;触发后续动作</td></tr>
+          <tr><td><code>StopFailure</code></td><td>回合因 API/provider 错误(流失败/超时)而结束</td><td>通知插件回合失败;告警 / 记录</td></tr>
           <tr><td><code>Notification</code></td><td>系统通知</td><td>转发外部告警通道</td></tr>
         </tbody>
       </table>

@@ -182,8 +182,8 @@ atomcode plugin marketplace remove|update|list</code></pre>
           <tr><td><code>PostToolUse</code></td><td>After a tool call</td><td>Audit, side effects</td></tr>
           <tr><td><code>SessionStart</code></td><td>Session startup</td><td>Warm-up, logging</td></tr>
           <tr><td><code>SessionEnd</code></td><td>Session end</td><td>Cleanup, archiving</td></tr>
-          <tr><td><code>Stop</code></td><td>Turn ended — normal stop, safety fuse, user cancel, or rate-limit pause</td><td>Indicator: turn finished (green / breathe)</td></tr>
-          <tr><td><code>StopFailure</code></td><td>Turn ended because of an API/provider error (stream failure / timeout)</td><td>Indicator: API error alert (red)</td></tr>
+          <tr><td><code>Stop</code></td><td>Turn ended — normal stop, safety fuse, user cancel, or rate-limit pause</td><td>Notify the plugin the turn has ended; trigger follow-up actions</td></tr>
+          <tr><td><code>StopFailure</code></td><td>Turn ended because of an API/provider error (stream failure / timeout)</td><td>Notify the plugin the turn failed; alert / log</td></tr>
           <tr><td><code>Notification</code></td><td>System notification</td><td>Forward to external alert channels</td></tr>
         </tbody>
       </table>
