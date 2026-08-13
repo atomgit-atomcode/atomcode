@@ -11245,6 +11245,17 @@ fn pointer_preflight_route(event: &InputEvent) -> PointerPreflightRoute {
     }
 }
 
+fn handle_input_preflight(
+    event: &InputEvent,
+    run_general_prelude: impl FnOnce(),
+) -> PointerPreflightRoute {
+    let route = pointer_preflight_route(event);
+    if route != PointerPreflightRoute::ReturnIgnored {
+        run_general_prelude();
+    }
+    route
+}
+
 fn handle_input(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -11253,53 +11264,55 @@ fn handle_input(
 ) -> Result<()> {
     use crate::modals::ModalAction;
 
-    if pointer_preflight_route(&ev) == PointerPreflightRoute::ReturnIgnored {
+    let preflight = handle_input_preflight(&ev, || {
+        let has_non_capturing_modal = app
+            .active_modal
+            .as_ref()
+            .is_some_and(|modal| !modal.captures_all_keys());
+        let has_replay_payload =
+            !app.message_queue.is_empty() || !app.state.pending_steers.is_empty();
+        if should_release_stale_modal_interrupt_wait(
+            app.state.phase,
+            app.interrupt_drain_pending,
+            has_non_capturing_modal,
+            ctx.runtime.has_active_turn(),
+            has_replay_payload,
+        ) {
+            crate::tuix_trace!(
+                "KEY",
+                "release stale interrupt wait before routing visible modal"
+            );
+            app.interrupt_drain_pending = false;
+            app.state.phase = UiPhase::Idle;
+        }
+
+        if matches!(app.state.phase, UiPhase::Idle)
+            && app.active_modal.is_none()
+            && poll_shared_state(ctx, renderer)
+        {
+            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        }
+        // `/codingplan` has extra warning/quota caches beyond the generic config.
+        refresh_after_cross_process_codingplan_sync(ctx);
+
+        crate::tuix_trace!(
+            "IN",
+            "phase={:?} modal={} qlen={} ev={}",
+            app.state.phase,
+            app.active_modal.is_some(),
+            app.message_queue.len(),
+            match &ev {
+                InputEvent::Paste(t) => format!("paste({})", t.len()),
+                InputEvent::Eof => "eof".into(),
+                InputEvent::Key(k) => format!("key({:?},{:?})", k.kind, k.code),
+                InputEvent::Resize(w, h) => format!("resize({}x{})", w, h),
+                InputEvent::Pointer(pointer) => format!("pointer({:?})", pointer),
+            }
+        );
+    });
+    if preflight == PointerPreflightRoute::ReturnIgnored {
         return Ok(());
     }
-
-    let has_non_capturing_modal = app
-        .active_modal
-        .as_ref()
-        .is_some_and(|modal| !modal.captures_all_keys());
-    let has_replay_payload = !app.message_queue.is_empty() || !app.state.pending_steers.is_empty();
-    if should_release_stale_modal_interrupt_wait(
-        app.state.phase,
-        app.interrupt_drain_pending,
-        has_non_capturing_modal,
-        ctx.runtime.has_active_turn(),
-        has_replay_payload,
-    ) {
-        crate::tuix_trace!(
-            "KEY",
-            "release stale interrupt wait before routing visible modal"
-        );
-        app.interrupt_drain_pending = false;
-        app.state.phase = UiPhase::Idle;
-    }
-
-    if matches!(app.state.phase, UiPhase::Idle)
-        && app.active_modal.is_none()
-        && poll_shared_state(ctx, renderer)
-    {
-        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
-    }
-    // `/codingplan` has extra warning/quota caches beyond the generic config.
-    refresh_after_cross_process_codingplan_sync(ctx);
-
-    crate::tuix_trace!(
-        "IN",
-        "phase={:?} modal={} qlen={} ev={}",
-        app.state.phase,
-        app.active_modal.is_some(),
-        app.message_queue.len(),
-        match &ev {
-            InputEvent::Paste(t) => format!("paste({})", t.len()),
-            InputEvent::Eof => "eof".into(),
-            InputEvent::Key(k) => format!("key({:?},{:?})", k.kind, k.code),
-            InputEvent::Resize(w, h) => format!("resize({}x{})", w, h),
-            InputEvent::Pointer(pointer) => format!("pointer({:?})", pointer),
-        }
-    );
 
     match ev {
         InputEvent::Pointer(pointer) => apply_pointer_event(pointer, renderer),
@@ -11727,12 +11740,11 @@ fn provider_transition_allows_idle_commit(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_pointer_event, pointer_preflight_route, route_pointer, PointerPreflightRoute,
+        apply_pointer_event, handle_input_preflight, route_pointer, PointerPreflightRoute,
         PointerRoute,
     };
     use crate::input::{PointerButton, PointerEvent, PointerKind};
     use crate::render::{Renderer, UiLine};
-    use crate::state::UiPhase;
 
     #[derive(Default)]
     struct ScrollCapture {
@@ -11787,23 +11799,13 @@ mod tests {
             pointer(PointerKind::Up, Some(PointerButton::Primary), false),
         ] {
             let input = crate::input::InputEvent::Pointer(event);
-            let mut phase = UiPhase::Streaming;
-            let mut interrupt_drain_pending = true;
             let mut prelude_runs = 0;
-            let mut renderer = ScrollCapture::default();
+            let renderer = ScrollCapture::default();
 
-            let route = pointer_preflight_route(&input);
-            if route == PointerPreflightRoute::ScrollContinue {
-                prelude_runs += 1;
-                phase = UiPhase::Idle;
-                interrupt_drain_pending = false;
-                apply_pointer_event(event, &mut renderer);
-            }
+            let route = handle_input_preflight(&input, || prelude_runs += 1);
 
             assert_eq!(route, PointerPreflightRoute::ReturnIgnored);
             assert_eq!(prelude_runs, 0);
-            assert_eq!(phase, UiPhase::Streaming);
-            assert!(interrupt_drain_pending);
             assert!(renderer.deltas.is_empty());
         }
     }
@@ -11816,9 +11818,8 @@ mod tests {
             let mut prelude_runs = 0;
             let mut renderer = ScrollCapture::default();
 
-            let route = pointer_preflight_route(&input);
-            if route == PointerPreflightRoute::ScrollContinue {
-                prelude_runs += 1;
+            let route = handle_input_preflight(&input, || prelude_runs += 1);
+            if let PointerPreflightRoute::ScrollContinue = route {
                 apply_pointer_event(event, &mut renderer);
             }
 
