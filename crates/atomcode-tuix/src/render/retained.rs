@@ -9052,6 +9052,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // paint here.
         if self.dirty {
             let t0 = std::time::Instant::now();
+            let interaction_authority = self.interaction_publisher.worker_authority().unwrap_or((
+                self.interaction_publisher.current_epoch(),
+                self.interaction_surface_session,
+            ));
             let footer_rows = self.current_footer_rows();
             // Track footer_rows for diagnostic / resize code paths.
             // We DON'T call `screen.invalidate()` here — invalidate
@@ -9121,11 +9125,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
             if frame_written {
                 self.last_painted_footer_rows = footer_rows;
-                self.interaction_publisher
-                    .publish(
-                        self.interaction_surface_session,
-                        self.pending_interactions.clone(),
-                    );
+                let _ = self.interaction_publisher.publish_if_current(
+                    interaction_authority.0,
+                    interaction_authority.1,
+                    self.pending_interactions.clone(),
+                );
                 self.dirty = false;
             } else {
                 // `render_diff` already advanced its cell cache. Force the next

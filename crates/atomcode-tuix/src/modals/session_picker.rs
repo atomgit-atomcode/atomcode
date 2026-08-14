@@ -962,6 +962,32 @@ mod tests {
     }
 
     #[test]
+    fn real_session_payload_keeps_surface_identity_across_selection_chrome() {
+        let mut picker = SessionPicker::open(vec![meta("one", 1), meta("two", 2)]);
+        let before = UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: Some(build_menu_payload(&picker, "atomcode", None)),
+            status: Default::default(),
+            attachments: Vec::new(),
+        };
+        picker.down();
+        let after = UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: Some(build_menu_payload(&picker, "atomcode", None)),
+            status: Default::default(),
+            attachments: Vec::new(),
+        };
+
+        assert_eq!(
+            crate::render::worker::interaction_surface_for_line(&before),
+            crate::render::worker::interaction_surface_for_line(&after),
+            "title position and selected chrome are not selectable identity"
+        );
+    }
+
+    #[test]
     fn turn_divider_label_renders_stats_or_plain_rule() {
         let s = TurnStat {
             after_message: 4,

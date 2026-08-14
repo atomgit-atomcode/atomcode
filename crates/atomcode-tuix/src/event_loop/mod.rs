@@ -11293,13 +11293,16 @@ fn handle_pointer_hit(
                 return Ok(());
             };
             app.menu.select_index(index, items.len());
-            if !app
-                .menu
-                .pointer_confirmation_allowed(idle_commit_gate_pending(ctx))
-            {
-                return Ok(());
+            let commit_gate_pending = idle_commit_gate_pending(ctx);
+            if let Some(result) = handle_pointer_menu_confirmation(
+                app,
+                |app| &mut app.menu,
+                commit_gate_pending,
+                items.len(),
+                |app, selected| confirm_idle_menu_selected(app, ctx, renderer, &items, selected),
+            ) {
+                result?;
             }
-            confirm_idle_menu_selected(app, ctx, renderer, &items)?;
         }
         PointerClickAction::None
         | PointerClickAction::Select(_)
@@ -11308,12 +11311,53 @@ fn handle_pointer_hit(
     Ok(())
 }
 
+fn handle_pointer_menu_confirmation<S, R>(
+    state: &mut S,
+    menu_for_state: impl for<'a> Fn(&'a mut S) -> &'a mut MenuState,
+    commit_gate_pending: bool,
+    item_count: usize,
+    execute: impl FnOnce(&mut S, usize) -> R,
+) -> Option<R> {
+    let selected = {
+        let menu = menu_for_state(state);
+        if !menu.pointer_confirmation_allowed(commit_gate_pending) {
+            return None;
+        }
+        menu.confirm_selected(item_count)?
+    };
+    Some(execute(state, selected))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PointerPreflightRoute {
     ScrollContinue,
     PointerContinue,
     ReturnIgnored,
     NotPointer,
+}
+
+fn pointer_input_route(
+    event: &InputEvent,
+    interaction: Option<&crate::render::interaction::InteractionFrame>,
+    menu: &mut MenuState,
+) -> PointerPreflightRoute {
+    let pointer_actionable = match event {
+        InputEvent::Pointer(pointer)
+            if !pointer.shift
+                && pointer.button == Some(crate::input::PointerButton::Primary)
+                && matches!(pointer.kind, PointerKind::Down | PointerKind::Up) =>
+        {
+            interaction.is_some_and(|interaction| {
+                interaction.hit(pointer.row, pointer.col).is_some()
+                    || (pointer.kind == PointerKind::Up && menu.has_pointer_press())
+            })
+        }
+        _ => false,
+    };
+    if cancel_unactionable_pointer_release(event, pointer_actionable, menu) {
+        return PointerPreflightRoute::ReturnIgnored;
+    }
+    pointer_preflight_route(event, pointer_actionable)
 }
 
 fn pointer_preflight_route(event: &InputEvent, pointer_actionable: bool) -> PointerPreflightRoute {
@@ -11328,16 +11372,38 @@ fn pointer_preflight_route(event: &InputEvent, pointer_actionable: bool) -> Poin
     }
 }
 
-fn handle_input_preflight_with_pointer(
+fn handle_input_preflight(
     event: &InputEvent,
-    pointer_actionable: bool,
+    interaction: Option<&crate::render::interaction::InteractionFrame>,
+    menu: &mut MenuState,
     run_general_prelude: impl FnOnce(),
 ) -> PointerPreflightRoute {
-    let route = pointer_preflight_route(event, pointer_actionable);
+    let route = pointer_input_route(event, interaction, menu);
     if route != PointerPreflightRoute::ReturnIgnored {
         run_general_prelude();
     }
     route
+}
+
+fn cancel_unactionable_pointer_release(
+    event: &InputEvent,
+    pointer_actionable: bool,
+    menu: &mut MenuState,
+) -> bool {
+    let cancel = !pointer_actionable
+        && matches!(
+            event,
+            InputEvent::Pointer(PointerEvent {
+                kind: PointerKind::Up,
+                button: Some(crate::input::PointerButton::Primary),
+                ..
+            })
+        )
+        && menu.has_pointer_press();
+    if cancel {
+        menu.pointer_cancel();
+    }
+    cancel
 }
 
 fn handle_input(
@@ -11349,20 +11415,7 @@ fn handle_input(
     use crate::modals::ModalAction;
 
     let interaction = ctx.interaction_publisher.snapshot_actionable();
-    let pointer_actionable = match &ev {
-        InputEvent::Pointer(pointer)
-            if !pointer.shift
-                && pointer.button == Some(crate::input::PointerButton::Primary)
-                && matches!(pointer.kind, PointerKind::Down | PointerKind::Up) =>
-        {
-            interaction.as_ref().is_some_and(|interaction| {
-                interaction.hit(pointer.row, pointer.col).is_some()
-                    || (pointer.kind == PointerKind::Up && app.menu.has_pointer_press())
-            })
-        }
-        _ => false,
-    };
-    let preflight = handle_input_preflight_with_pointer(&ev, pointer_actionable, || {
+    let preflight = handle_input_preflight(&ev, interaction.as_deref(), &mut app.menu, || {
         let has_non_capturing_modal = app
             .active_modal
             .as_ref()
@@ -11850,11 +11903,11 @@ fn provider_transition_allows_idle_commit(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_pointer_event, handle_input_preflight_with_pointer, route_pointer,
-        PointerPreflightRoute, PointerRoute,
+        apply_pointer_event, handle_input_preflight, route_pointer, PointerPreflightRoute,
+        PointerRoute,
     };
     use crate::input::{PointerButton, PointerEvent, PointerKind};
-    use crate::render::interaction::HitTarget;
+    use crate::render::interaction::{CellRect, HitRegion, HitTarget, InteractionFrame};
     use crate::render::{Renderer, UiLine};
 
     #[derive(Default)]
@@ -11886,6 +11939,22 @@ mod tests {
             shift,
             control: false,
             alt: false,
+        }
+    }
+
+    fn pointer_interaction() -> InteractionFrame {
+        InteractionFrame {
+            generation: 1,
+            surface_session: 1,
+            regions: vec![HitRegion {
+                rect: CellRect {
+                    row: 12,
+                    col: 34,
+                    height: 1,
+                    width: 1,
+                },
+                target: HitTarget::MenuItem { index: 0 },
+            }],
         }
     }
 
@@ -12004,8 +12073,9 @@ mod tests {
             let input = crate::input::InputEvent::Pointer(event);
             let mut prelude_runs = 0;
             let renderer = ScrollCapture::default();
+            let mut menu = super::MenuState::new();
 
-            let route = handle_input_preflight_with_pointer(&input, false, || prelude_runs += 1);
+            let route = handle_input_preflight(&input, None, &mut menu, || prelude_runs += 1);
 
             assert_eq!(route, PointerPreflightRoute::ReturnIgnored);
             assert_eq!(prelude_runs, 0);
@@ -12020,8 +12090,9 @@ mod tests {
             let input = crate::input::InputEvent::Pointer(event);
             let mut prelude_runs = 0;
             let mut renderer = ScrollCapture::default();
+            let mut menu = super::MenuState::new();
 
-            let route = handle_input_preflight_with_pointer(&input, false, || prelude_runs += 1);
+            let route = handle_input_preflight(&input, None, &mut menu, || prelude_runs += 1);
             if let PointerPreflightRoute::ScrollContinue = route {
                 apply_pointer_event(event, &mut renderer);
             }
@@ -12040,49 +12111,106 @@ mod tests {
             false,
         ));
         let mut prelude_runs = 0;
+        let mut menu = super::MenuState::new();
+        let interaction = pointer_interaction();
 
-        let route = handle_input_preflight_with_pointer(&input, true, || prelude_runs += 1);
+        let route = handle_input_preflight(&input, Some(&interaction), &mut menu, || {
+            prelude_runs += 1
+        });
 
         assert_eq!(route, PointerPreflightRoute::PointerContinue);
         assert_eq!(prelude_runs, 1);
     }
 
     #[test]
-    fn pointer_and_keyboard_confirmation_share_the_idle_commit_gate() {
-        for pending in [false, true] {
-            assert_eq!(
-                super::idle_menu_confirmation_allowed(pending),
-                super::menu_handles_selection_key(
-                    crossterm::event::KeyCode::Enter,
-                    crossterm::event::KeyModifiers::NONE,
-                    pending,
-                ),
-                "pointer and Enter must agree when commit_gate_pending={pending}"
-            );
-        }
+    fn unactionable_primary_up_cancels_a_slow_click_before_the_general_prelude() {
+        let target = HitTarget::MenuItem { index: 0 };
+        let mut menu = super::MenuState::new();
+        let _ = menu.pointer_press(target, 1);
+        let mut prelude_runs = 0;
+        let up = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Up,
+            Some(PointerButton::Primary),
+            false,
+        ));
+
+        assert_eq!(
+            super::handle_input_preflight(&up, None, &mut menu, || prelude_runs += 1),
+            super::PointerPreflightRoute::ReturnIgnored
+        );
+        assert_eq!(prelude_runs, 0);
+        assert!(!menu.has_pointer_press());
+        let _ = menu.pointer_press(target, 2);
+        assert_eq!(
+            menu.pointer_release(target, 2),
+            super::PointerClickAction::None,
+            "a new frame needs two complete clicks after the slow release"
+        );
+        let _ = menu.pointer_press(target, 2);
+        assert_eq!(
+            menu.pointer_release(target, 2),
+            super::PointerClickAction::Confirm(target)
+        );
     }
 
     #[test]
     fn blocked_pointer_confirmation_rearms_as_a_fresh_selection() {
+        struct ConfirmationHarness {
+            menu: super::MenuState,
+            callbacks: usize,
+        }
+
         let target = HitTarget::MenuItem { index: 1 };
-        let mut menu = super::MenuState::new();
+        let mut harness = ConfirmationHarness {
+            menu: super::MenuState::new(),
+            callbacks: 0,
+        };
+        harness.menu.select_index(1, 2);
         let session = 9;
-        let _ = menu.pointer_press(target, session);
-        let _ = menu.pointer_release(target, session);
-        let _ = menu.pointer_press(target, session);
+        let _ = harness.menu.pointer_press(target, session);
+        let _ = harness.menu.pointer_release(target, session);
+        let _ = harness.menu.pointer_press(target, session);
         assert_eq!(
-            menu.pointer_release(target, session),
+            harness.menu.pointer_release(target, session),
             super::PointerClickAction::Confirm(target)
         );
 
-        assert!(!menu.pointer_confirmation_allowed(true));
-        let _ = menu.pointer_press(target, session);
         assert_eq!(
-            menu.pointer_release(target, session),
+            super::handle_pointer_menu_confirmation(
+                &mut harness,
+                |harness| &mut harness.menu,
+                true,
+                2,
+                |harness, _selected| harness.callbacks += 1,
+            ),
+            None
+        );
+        assert_eq!(harness.callbacks, 0);
+        let _ = harness.menu.pointer_press(target, session);
+        assert_eq!(
+            harness.menu.pointer_release(target, session),
             super::PointerClickAction::None,
             "after a blocked commit, the next click must select again"
         );
-        assert!(menu.pointer_confirmation_allowed(false));
+        let _ = harness.menu.pointer_press(target, session);
+        assert_eq!(
+            harness.menu.pointer_release(target, session),
+            super::PointerClickAction::Confirm(target)
+        );
+        assert_eq!(
+            super::handle_pointer_menu_confirmation(
+                &mut harness,
+                |harness| &mut harness.menu,
+                false,
+                2,
+                |harness, selected| {
+                    assert_eq!(selected, 1);
+                    harness.callbacks += 1;
+                },
+            ),
+            Some(())
+        );
+        assert_eq!(harness.callbacks, 1);
     }
 
     #[test]
@@ -12612,10 +12740,8 @@ fn confirm_idle_menu_selected(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     items: &[(String, String)],
+    selected: usize,
 ) -> Result<()> {
-    let Some(selected) = app.menu.confirm_selected(items.len()) else {
-        return Ok(());
-    };
     let name = items[selected].0.clone();
     let needs_args = ctx
         .commands
@@ -12843,7 +12969,10 @@ fn handle_idle_key(
                     && app.buf.text.starts_with('/')
                     && !app.buf.text[1..].contains(char::is_whitespace)
                 {
-                    return confirm_idle_menu_selected(app, ctx, renderer, items);
+                    let Some(selected) = app.menu.confirm_selected(items.len()) else {
+                        return Ok(());
+                    };
+                    return confirm_idle_menu_selected(app, ctx, renderer, items, selected);
                 }
                 // Tab and Enter both pick the highlighted entry, but
                 // they diverge on no-arg top-level commands:

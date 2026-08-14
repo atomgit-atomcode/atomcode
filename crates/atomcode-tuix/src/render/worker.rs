@@ -48,14 +48,74 @@ use std::time::Duration;
 
 use super::{Renderer, UiLine};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InteractionSurface {
+    mode: InteractionSurfaceMode,
+    kind: super::MenuKind,
+    input: String,
+    candidates: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractionSurfaceMode {
+    Input,
+    Streaming,
+}
+
+pub(crate) fn interaction_surface_for_line(line: &UiLine) -> Option<InteractionSurface> {
+    let (mode, input, menu) = match line {
+        UiLine::InputPrompt { buf, menu, .. } => {
+            (InteractionSurfaceMode::Input, buf, menu.as_ref())
+        }
+        UiLine::StreamingBox { buf, menu, .. } => {
+            (InteractionSurfaceMode::Streaming, buf, menu.as_ref())
+        }
+        _ => return None,
+    };
+    let menu = menu?;
+    let candidates = match menu.kind {
+        super::MenuKind::SlashCommand
+            if input.starts_with('/') && !input[1..].contains(char::is_whitespace) =>
+        {
+            menu.items.clone()
+        }
+        super::MenuKind::DirectoryList => menu
+            .items
+            .get(crate::modals::dir_picker::DIR_HEADER_ROWS..menu.items.len().saturating_sub(1))
+            .unwrap_or_default()
+            .to_vec(),
+        super::MenuKind::SessionList => menu
+            .items
+            .get(crate::modals::session_picker::HEADER_ROWS..menu.items.len().saturating_sub(1))
+            .unwrap_or_default()
+            .to_vec(),
+        _ => return None,
+    };
+    Some(InteractionSurface {
+        mode,
+        kind: menu.kind,
+        input: input.clone(),
+        candidates,
+    })
+}
+
 /// Commands sent to the render worker thread.
 enum RenderCmd {
-    Line(UiLine),
+    Line {
+        line: UiLine,
+        epoch: u64,
+        surface_session: u64,
+    },
     Flush,
     FlushDeferred,
     /// Terminal resize — fire-and-forget, the worker updates its
     /// internal DECSTBM region and repaints the footer.
-    Resize(u16, u16),
+    Resize {
+        cols: u16,
+        rows: u16,
+        epoch: u64,
+        surface_session: u64,
+    },
     /// Scroll the body viewport by `delta` rows. Negative = up,
     /// positive = down. RetainedRenderer's append-only path leaves
     /// scrollback to the host terminal, so this is effectively a
@@ -92,6 +152,8 @@ enum RenderCmd {
     Ack {
         op: AckOp,
         ack: mpsc::Sender<()>,
+        epoch: u64,
+        surface_session: u64,
     },
 }
 
@@ -111,6 +173,8 @@ enum AckOp {
 pub struct TaskRenderer {
     cmd_tx: mpsc::Sender<RenderCmd>,
     interaction_publisher: Option<crate::render::interaction::InteractionPublisher>,
+    interaction_surface: Option<InteractionSurface>,
+    interaction_surface_session: u64,
     /// Coalesces the 5ms `FlushDeferred` heartbeat: `true` means one is already
     /// queued and undrained, so we skip enqueuing another. Without this, when the
     /// worker's terminal write blocks — classically the Windows console pausing
@@ -147,13 +211,16 @@ impl TaskRenderer {
         let (cmd_tx, cmd_rx) = mpsc::channel::<RenderCmd>();
         let flush_pending = Arc::new(AtomicBool::new(false));
         let worker_flag = Arc::clone(&flush_pending);
+        let worker_interactions = interaction_publisher.clone();
         let worker = thread::Builder::new()
             .name("tuix-render".to_string())
-            .spawn(move || run_worker(inner, cmd_rx, worker_flag))
+            .spawn(move || run_worker(inner, cmd_rx, worker_flag, worker_interactions))
             .expect("spawn render worker thread");
         Self {
             cmd_tx,
             interaction_publisher,
+            interaction_surface: None,
+            interaction_surface_session: 0,
             flush_pending,
             worker: Some(worker),
         }
@@ -172,11 +239,16 @@ impl TaskRenderer {
     /// thread fast enough. CC-style TUI harnesses use ~10s for the
     /// same reason.
     fn ack(&self, op: AckOp) {
-        self.fail_interactions_closed();
+        let epoch = self.invalidate_interactions();
         let (ack_tx, ack_rx) = mpsc::channel();
         if self
             .cmd_tx
-            .send(RenderCmd::Ack { op, ack: ack_tx })
+            .send(RenderCmd::Ack {
+                op,
+                ack: ack_tx,
+                epoch,
+                surface_session: self.interaction_surface_session,
+            })
             .is_err()
         {
             // Worker is gone (already shut down) — nothing to do.
@@ -191,12 +263,28 @@ impl TaskRenderer {
             interactions.fail_closed();
         }
     }
+
+    fn invalidate_interactions(&self) -> u64 {
+        self.interaction_publisher.as_ref().map_or(
+            0,
+            crate::render::interaction::InteractionPublisher::invalidate,
+        )
+    }
 }
 
 impl Renderer for TaskRenderer {
     fn render(&mut self, line: UiLine) {
-        self.fail_interactions_closed();
-        let _ = self.cmd_tx.send(RenderCmd::Line(line));
+        let surface = interaction_surface_for_line(&line);
+        if self.interaction_surface != surface {
+            self.interaction_surface = surface;
+            self.interaction_surface_session = self.interaction_surface_session.saturating_add(1);
+        }
+        let epoch = self.invalidate_interactions();
+        let _ = self.cmd_tx.send(RenderCmd::Line {
+            line,
+            epoch,
+            surface_session: self.interaction_surface_session,
+        });
     }
 
     fn flush(&mut self) {
@@ -263,8 +351,13 @@ impl Renderer for TaskRenderer {
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16) {
-        self.fail_interactions_closed();
-        let _ = self.cmd_tx.send(RenderCmd::Resize(cols, rows));
+        let epoch = self.invalidate_interactions();
+        let _ = self.cmd_tx.send(RenderCmd::Resize {
+            cols,
+            rows,
+            epoch,
+            surface_session: self.interaction_surface_session,
+        });
     }
 
     fn scroll_body(&mut self, delta: i32) {
@@ -312,6 +405,7 @@ fn run_worker(
     mut inner: Box<dyn Renderer>,
     cmd_rx: mpsc::Receiver<RenderCmd>,
     flush_pending: Arc<AtomicBool>,
+    interaction_publisher: Option<crate::render::interaction::InteractionPublisher>,
 ) {
     use std::time::Instant;
     const RESIZE_REFLOW_DEBOUNCE: Duration = Duration::from_millis(75);
@@ -330,7 +424,14 @@ fn run_worker(
         // terminal emulator; big `render` durations = our own bytes taking
         // forever to serialize or intermediate `write_all` blocking.
         match cmd {
-            RenderCmd::Line(line) => {
+            RenderCmd::Line {
+                line,
+                epoch,
+                surface_session,
+            } => {
+                if let Some(interactions) = &interaction_publisher {
+                    let _ = interactions.set_worker_authority(epoch, surface_session);
+                }
                 let tag = ui_line_tag(&line);
                 let t0 = Instant::now();
                 inner.render(line);
@@ -356,7 +457,12 @@ fn run_worker(
                     crate::tuix_trace!("REN", "FlushDeferred deferred={}µs", d.as_micros());
                 }
             }
-            RenderCmd::Resize(mut cols, mut rows) => {
+            RenderCmd::Resize {
+                mut cols,
+                mut rows,
+                mut epoch,
+                mut surface_session,
+            } => {
                 // Rebuild only after the terminal has stopped reporting
                 // intermediate geometries. Besides avoiding redundant work,
                 // this keeps large ANSI reflow writes out of conhost's
@@ -368,9 +474,16 @@ fn run_worker(
                         break;
                     }
                     match cmd_rx.recv_timeout(remaining) {
-                        Ok(RenderCmd::Resize(next_cols, next_rows)) => {
+                        Ok(RenderCmd::Resize {
+                            cols: next_cols,
+                            rows: next_rows,
+                            epoch: next_epoch,
+                            surface_session: next_surface_session,
+                        }) => {
                             cols = next_cols;
                             rows = next_rows;
+                            epoch = next_epoch;
+                            surface_session = next_surface_session;
                             deadline = Instant::now() + RESIZE_REFLOW_DEBOUNCE;
                         }
                         Ok(cmd @ RenderCmd::Ack { .. }) => {
@@ -388,6 +501,9 @@ fn run_worker(
                         Err(mpsc::RecvTimeoutError::Timeout)
                         | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
+                }
+                if let Some(interactions) = &interaction_publisher {
+                    let _ = interactions.set_worker_authority(epoch, surface_session);
                 }
                 let t0 = Instant::now();
                 inner.on_resize(cols, rows);
@@ -441,7 +557,15 @@ fn run_worker(
             RenderCmd::SetTitle(title) => {
                 inner.set_title(title);
             }
-            RenderCmd::Ack { op, ack } => {
+            RenderCmd::Ack {
+                op,
+                ack,
+                epoch,
+                surface_session,
+            } => {
+                if let Some(interactions) = &interaction_publisher {
+                    let _ = interactions.set_worker_authority(epoch, surface_session);
+                }
                 let t0 = Instant::now();
                 match op {
                     AckOp::Reset => inner.reset(),
@@ -613,26 +737,71 @@ mod tests {
         (TaskRenderer::new(inner), counts)
     }
 
+    fn slash_prompt(input: &str, items: &[&str], selected: usize) -> UiLine {
+        UiLine::InputPrompt {
+            buf: input.into(),
+            cursor_byte: input.len(),
+            menu: Some(crate::render::MenuPayload {
+                items: items
+                    .iter()
+                    .map(|item| ((*item).into(), String::new()))
+                    .collect(),
+                selected,
+                kind: crate::render::MenuKind::SlashCommand,
+            }),
+            status: Default::default(),
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn logical_surface_session_ignores_selection_but_tracks_close_and_candidates() {
+        let (mut renderer, _) = setup();
+        renderer.render(slash_prompt("/", &["help", "status"], 0));
+        let first = renderer.interaction_surface_session;
+
+        renderer.render(slash_prompt("/", &["help", "status"], 1));
+        assert_eq!(renderer.interaction_surface_session, first);
+
+        renderer.render(UiLine::InputPrompt {
+            buf: "/".into(),
+            cursor_byte: 1,
+            menu: None,
+            status: Default::default(),
+            attachments: Vec::new(),
+        });
+        renderer.render(slash_prompt("/", &["help", "status"], 0));
+        assert!(renderer.interaction_surface_session >= first + 2);
+        let reopened = renderer.interaction_surface_session;
+
+        renderer.render(slash_prompt("/h", &["help"], 0));
+        assert!(renderer.interaction_surface_session > reopened);
+    }
+
     struct BlockingInteractionRenderer {
         interactions: InteractionPublisher,
-        entered: mpsc::Sender<()>,
-        published: mpsc::Sender<()>,
-        gate: Arc<(Mutex<bool>, Condvar)>,
+        entered: mpsc::Sender<usize>,
+        published: mpsc::Sender<bool>,
+        gate: Arc<(Mutex<(usize, usize)>, Condvar)>,
     }
 
     impl Renderer for BlockingInteractionRenderer {
         fn render(&mut self, _line: UiLine) {
-            let _ = self.entered.send(());
-            let (released, wake) = &*self.gate;
-            let mut released = released.lock().unwrap();
-            while !*released {
-                released = wake.wait(released).unwrap();
+            let (state, wake) = &*self.gate;
+            let mut state = state.lock().unwrap();
+            state.0 += 1;
+            let id = state.0;
+            let _ = self.entered.send(id);
+            while state.1 < id {
+                state = wake.wait(state).unwrap();
             }
         }
 
         fn flush_deferred(&mut self) {
-            self.interactions.publish(
-                2,
+            let (epoch, surface_session) = self.interactions.worker_authority().unwrap();
+            let published = self.interactions.publish_if_current(
+                epoch,
+                surface_session,
                 vec![HitRegion {
                     rect: CellRect {
                         row: 7,
@@ -643,7 +812,7 @@ mod tests {
                     target: HitTarget::MenuItem { index: 1 },
                 }],
             );
-            let _ = self.published.send(());
+            let _ = self.published.send(published);
         }
 
         fn flush(&mut self) {}
@@ -671,7 +840,7 @@ mod tests {
         );
         let (entered_tx, entered_rx) = mpsc::channel();
         let (published_tx, published_rx) = mpsc::channel();
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let gate = Arc::new((Mutex::new((0, 0)), Condvar::new()));
         let inner = Box::new(BlockingInteractionRenderer {
             interactions: interactions.clone(),
             entered: entered_tx,
@@ -679,19 +848,38 @@ mod tests {
             gate: gate.clone(),
         });
         let mut renderer = TaskRenderer::new_with_interactions(inner, interactions.clone());
+        let prompt = |name: &str| UiLine::InputPrompt {
+            buf: "/".into(),
+            cursor_byte: 1,
+            menu: Some(super::super::MenuPayload {
+                items: vec![(name.into(), String::new())],
+                selected: 0,
+                kind: super::super::MenuKind::SlashCommand,
+            }),
+            status: Default::default(),
+            attachments: Vec::new(),
+        };
 
-        renderer.render(UiLine::User("new logical frame".into()));
-        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        renderer.render(prompt("old"));
         renderer.flush_deferred();
+        assert_eq!(entered_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        renderer.render(prompt("new"));
         assert!(
             interactions.snapshot_actionable().is_none(),
             "the queued frame must invalidate stale coordinates before the worker unblocks"
         );
 
-        let (released, wake) = &*gate;
-        *released.lock().unwrap() = true;
+        let (state, wake) = &*gate;
+        state.lock().unwrap().1 = 1;
         wake.notify_all();
-        published_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!published_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert!(interactions.snapshot_actionable().is_none());
+        assert_eq!(entered_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
+        renderer.flush_deferred();
+
+        state.lock().unwrap().1 = 2;
+        wake.notify_all();
+        assert!(published_rx.recv_timeout(Duration::from_secs(1)).unwrap());
 
         let frame = interactions
             .snapshot_actionable()

@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,40 +49,78 @@ impl InteractionFrame {
 
 #[derive(Debug, Clone, Default)]
 pub struct InteractionPublisher {
-    inner: Arc<RwLock<Arc<InteractionFrame>>>,
-    actionable: Arc<AtomicBool>,
+    inner: Arc<RwLock<PublisherState>>,
+}
+
+#[derive(Debug, Default)]
+struct PublisherState {
+    frame: Arc<InteractionFrame>,
+    epoch: u64,
+    actionable: bool,
+    worker_authority: Option<(u64, u64)>,
 }
 
 impl InteractionPublisher {
     pub fn snapshot(&self) -> Arc<InteractionFrame> {
-        read_recover(&self.inner).clone()
+        read_recover(&self.inner).frame.clone()
     }
 
     pub fn snapshot_actionable(&self) -> Option<Arc<InteractionFrame>> {
-        // The render worker publishes while the event-loop thread invalidates
-        // before enqueueing a logical frame. The second load closes the clone
-        // window when invalidation races this snapshot; it is intentionally a
-        // visibility gate, not a transaction spanning later event execution.
-        if !self.actionable.load(Ordering::Acquire) {
-            return None;
-        }
-        let frame = self.snapshot();
-        self.actionable.load(Ordering::Acquire).then_some(frame)
+        let state = read_recover(&self.inner);
+        state.actionable.then(|| state.frame.clone())
     }
 
     pub fn publish(&self, surface_session: u64, regions: Vec<HitRegion>) {
-        let mut slot = write_recover(&self.inner);
-        let generation = slot.generation.saturating_add(1);
-        *slot = Arc::new(InteractionFrame {
+        let epoch = read_recover(&self.inner).epoch;
+        let _ = self.publish_if_current(epoch, surface_session, regions);
+    }
+
+    pub fn publish_if_current(
+        &self,
+        expected_epoch: u64,
+        surface_session: u64,
+        regions: Vec<HitRegion>,
+    ) -> bool {
+        let mut state = write_recover(&self.inner);
+        if state.epoch != expected_epoch {
+            return false;
+        }
+        let generation = state.frame.generation.saturating_add(1);
+        state.frame = Arc::new(InteractionFrame {
             generation,
             surface_session,
             regions,
         });
-        self.actionable.store(true, Ordering::Release);
+        state.actionable = true;
+        true
+    }
+
+    pub fn invalidate(&self) -> u64 {
+        let mut state = write_recover(&self.inner);
+        state.epoch = state.epoch.saturating_add(1);
+        state.actionable = false;
+        state.epoch
     }
 
     pub fn fail_closed(&self) {
-        self.actionable.store(false, Ordering::Release);
+        let _ = self.invalidate();
+    }
+
+    pub fn set_worker_authority(&self, epoch: u64, surface_session: u64) -> bool {
+        let mut state = write_recover(&self.inner);
+        if state.epoch != epoch {
+            return false;
+        }
+        state.worker_authority = Some((epoch, surface_session));
+        true
+    }
+
+    pub fn worker_authority(&self) -> Option<(u64, u64)> {
+        read_recover(&self.inner).worker_authority
+    }
+
+    pub fn current_epoch(&self) -> u64 {
+        read_recover(&self.inner).epoch
     }
 
     #[cfg(test)]
@@ -183,5 +220,37 @@ mod tests {
 
         assert_eq!(frame.hit(5, 4), Some(HitTarget::ModalItem { index: 0 }));
         assert_eq!(frame.hit(4, 4), Some(HitTarget::MenuItem { index: 2 }));
+    }
+
+    #[test]
+    fn stale_worker_publish_cannot_reopen_after_a_newer_invalidation() {
+        let publisher = InteractionPublisher::default();
+        let initial_epoch = publisher.invalidate();
+        assert!(publisher.publish_if_current(initial_epoch, 1, Vec::new()));
+        assert_eq!(publisher.snapshot().generation, 1);
+
+        let stale_epoch = publisher.invalidate();
+        let current_epoch = publisher.invalidate();
+        assert!(!publisher.publish_if_current(stale_epoch, 1, Vec::new()));
+        assert!(publisher.snapshot_actionable().is_none());
+        assert_eq!(publisher.snapshot().generation, 1);
+
+        assert!(publisher.publish_if_current(current_epoch, 2, Vec::new()));
+        let frame = publisher.snapshot_actionable().unwrap();
+        assert_eq!(frame.generation, 2);
+        assert_eq!(frame.surface_session, 2);
+    }
+
+    #[test]
+    fn stale_worker_authority_cannot_replace_the_current_epoch() {
+        let publisher = InteractionPublisher::default();
+        let stale_epoch = publisher.invalidate();
+        assert!(publisher.set_worker_authority(stale_epoch, 1));
+        let current_epoch = publisher.invalidate();
+        assert!(publisher.set_worker_authority(current_epoch, 2));
+
+        assert!(!publisher.set_worker_authority(stale_epoch, 1));
+
+        assert_eq!(publisher.worker_authority(), Some((current_epoch, 2)));
     }
 }

@@ -640,6 +640,35 @@ mod tests {
     }
 
     #[test]
+    fn real_directory_payload_keeps_surface_identity_across_selection_chrome() {
+        let mut picker = DirPicker::open(
+            vec![pb("/workspace/alpha"), pb("/workspace/beta")],
+            pb("/workspace/alpha"),
+        );
+        let before = UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: Some(build_menu_payload(&picker)),
+            status: Default::default(),
+            attachments: Vec::new(),
+        };
+        picker.down();
+        let after = UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: Some(build_menu_payload(&picker)),
+            status: Default::default(),
+            attachments: Vec::new(),
+        };
+
+        assert_eq!(
+            crate::render::worker::interaction_surface_for_line(&before),
+            crate::render::worker::interaction_surface_for_line(&after),
+            "title position and selected chrome are not selectable identity"
+        );
+    }
+
+    #[test]
     fn confirmation_preserves_redraw_vs_flush_only_failure_semantics() {
         let root = tempfile::tempdir().unwrap();
         let current = root.path().join("current");
