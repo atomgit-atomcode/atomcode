@@ -18798,17 +18798,29 @@ mod tests {
         );
         let visible = lines.join("\n");
         let compact_visible = visible.replace(' ', "");
-        let separators: Vec<&str> = lines
+        let rules: Vec<&str> = lines
             .iter()
             .map(|line| line.trim())
-            .filter(|line| line.len() >= 3 && line.bytes().all(|byte| byte == b'-'))
+            .filter(|line| {
+                line.len() >= 3
+                    && line
+                        .chars()
+                        .all(|ch| matches!(ch, '━' | '─' | '=' | '-' | ' '))
+            })
             .collect();
-        assert!(!separators.is_empty(), "table separator missing: {lines:#?}");
         assert!(
-            separators
+            rules.iter().any(|line| line.contains("  ")),
+            "segmented table rule missing: {lines:#?}"
+        );
+        assert!(
+            rules.iter().any(|line| !line.contains(' ')),
+            "top or bottom table boundary missing: {lines:#?}"
+        );
+        assert!(
+            rules
                 .iter()
-                .all(|line| line.len() < usize::from(width)),
-            "table separator consumed the right-side guard: {separators:?}"
+                .all(|line| crate::width::display_width(line) < usize::from(width)),
+            "table rules consumed the right-side guard: {rules:?}"
         );
         assert!(compact_visible.contains("汇总结果如下"));
         assert!(visible.contains("Agora CLI"));

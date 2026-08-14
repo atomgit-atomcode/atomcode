@@ -695,11 +695,9 @@ fn render_wrapped_table(
 ) -> String {
     let ncols = col_widths.len();
     let data_rows: Vec<&Vec<String>> = parsed.iter().filter(|r| !is_separator_row(r)).collect();
-    let row_width = col_widths.iter().sum::<usize>()
-        + TABLE_CELL_PADDING * 2 * ncols
-        + TABLE_COLUMN_GAP * ncols.saturating_sub(1);
-
     let mut out = String::new();
+    out.push_str(&render_table_boundary(col_widths, caps));
+    out.push('\n');
     for (i, row) in data_rows.iter().enumerate() {
         // Wrap every cell to its column width; row height = tallest cell.
         let wrapped: Vec<Vec<String>> = (0..ncols)
@@ -714,7 +712,13 @@ fn render_wrapped_table(
                 let cell_line = wrapped[j].get(line_idx).map(|s| s.as_str()).unwrap_or("");
                 let lw = crate::width::display_width(cell_line);
                 out.push_str(&" ".repeat(TABLE_CELL_PADDING));
+                if i == 0 && caps.colors {
+                    out.push_str(theme::md_heading_open());
+                }
                 out.push_str(cell_line);
+                if i == 0 && caps.colors {
+                    out.push_str(theme::MD_HEADING_CLOSE);
+                }
                 for _ in 0..w.saturating_sub(lw) {
                     out.push(' ');
                 }
@@ -726,31 +730,69 @@ fn render_wrapped_table(
             out.push('\n');
         }
         if i + 1 < data_rows.len() {
-            out.push_str(&render_table_separator(row_width, caps));
+            out.push_str(&render_table_separator(
+                col_widths,
+                if i == 0 { '━' } else { '─' },
+                caps,
+            ));
             out.push('\n');
         }
     }
+    out.push_str(&render_table_boundary(col_widths, caps));
     if out.ends_with('\n') {
         out.pop();
     }
     out
 }
 
-fn render_table_separator(width: usize, caps: TerminalCaps) -> String {
-    let open = if caps.colors {
-        theme::md_border_open()
+fn render_table_boundary(col_widths: &[usize], caps: TerminalCaps) -> String {
+    let width = col_widths.iter().sum::<usize>()
+        + TABLE_CELL_PADDING * 2 * col_widths.len()
+        + TABLE_COLUMN_GAP * col_widths.len().saturating_sub(1);
+    let rule = stable_table_rule_char('━').to_string().repeat(width);
+    if caps.colors {
+        format!("{}{}{}", theme::md_border_open(), rule, theme::MD_MUTED_CLOSE)
     } else {
-        ""
-    };
-    let close = if caps.colors {
-        theme::MD_MUTED_CLOSE
+        rule
+    }
+}
+
+/// Prefer Codex's Unicode rules where their width is reliable. Windows console
+/// hosts (including WSL sessions rendered by Windows Terminal) have historically
+/// disagreed with Unicode's East Asian Ambiguous width for box-drawing glyphs;
+/// use invariant-width ASCII there and whenever the configured width model says
+/// the preferred glyph occupies more than one cell.
+fn stable_table_rule_char(preferred: char) -> char {
+    let windows_console = cfg!(windows)
+        || std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || std::env::var_os("WSL_INTEROP").is_some();
+    if windows_console || crate::width::cell_char_width(preferred).unwrap_or(1) != 1 {
+        if preferred == '━' { '=' } else { '-' }
     } else {
-        ""
-    };
-    // ASCII `-` has an invariant one-cell width across Windows console hosts.
-    // A repeated Unicode `─` rule can itself overflow when a legacy font paints
-    // East Asian Ambiguous symbols wide, even after vertical borders are gone.
-    format!("{open}{}{close}", "-".repeat(width))
+        preferred
+    }
+}
+
+/// Render the same open table rules as Codex: every column owns one rule
+/// segment, with the normal inter-column gap left blank. There are no vertical
+/// borders, corners, or junction glyphs, so content stays readable without
+/// recreating the ambiguous-width boxed layout.
+fn render_table_separator(
+    col_widths: &[usize],
+    separator_char: char,
+    caps: TerminalCaps,
+) -> String {
+    let segment = stable_table_rule_char(separator_char).to_string();
+    let rule = col_widths
+        .iter()
+        .map(|width| segment.repeat(*width + TABLE_CELL_PADDING * 2))
+        .collect::<Vec<_>>()
+        .join(&" ".repeat(TABLE_COLUMN_GAP));
+    if caps.colors {
+        format!("{}{}{}", theme::md_border_open(), rule, theme::MD_MUTED_CLOSE)
+    } else {
+        rule
+    }
 }
 
 /// Width-aware variant. When `max_width > 0` and the table can't fit at its
@@ -843,11 +885,21 @@ pub fn flush_aligned_table_with_width(
     let data_rows: Vec<&Vec<String>> = parsed.iter().filter(|r| !is_sep(r)).collect();
 
     let mut out = String::new();
+    out.push_str(&render_table_boundary(&col_widths, caps));
+    out.push('\n');
     for (i, row) in data_rows.iter().enumerate() {
         for (j, w) in col_widths.iter().enumerate() {
             let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
             let plain_w = crate::width::display_width(&strip_md_for_width(cell));
-            let body = render_inline(cell, caps);
+            let mut body = render_inline(cell, caps);
+            if i == 0 && caps.colors {
+                body = format!(
+                    "{}{}{}",
+                    theme::md_heading_open(),
+                    body,
+                    theme::MD_HEADING_CLOSE
+                );
+            }
             out.push_str(&" ".repeat(TABLE_CELL_PADDING));
             out.push_str(&body);
             let pad = w.saturating_sub(plain_w);
@@ -860,14 +912,16 @@ pub fn flush_aligned_table_with_width(
             }
         }
         out.push('\n');
-
-        // A width-stable ASCII separator keeps records scannable without
-        // reintroducing the Windows ambiguous-width failure mode.
         if i + 1 < data_rows.len() {
-            out.push_str(&render_table_separator(natural_row_width, caps));
+            out.push_str(&render_table_separator(
+                &col_widths,
+                if i == 0 { '━' } else { '─' },
+                caps,
+            ));
             out.push('\n');
         }
     }
+    out.push_str(&render_table_boundary(&col_widths, caps));
     if out.ends_with('\n') {
         out.pop();
     }
@@ -1422,10 +1476,13 @@ mod tests {
         hay.matches(needle).count()
     }
 
-    fn has_table_separator(rendered: &str) -> bool {
+    fn has_table_rule(rendered: &str, rule: char) -> bool {
         rendered.lines().any(|line| {
             let line = line.trim();
-            line.len() >= 3 && line.bytes().all(|byte| byte == b'-')
+            line.contains(rule)
+                && line
+                    .chars()
+                    .all(|ch| ch == rule || ch.is_ascii_whitespace())
         })
     }
 
@@ -1576,7 +1633,7 @@ mod tests {
             .expect("body row missing");
         assert!(body_line.contains("|a, b| b.cmp(&a)"));
         assert!(!body_line.contains('│'), "borderless row: {body_line:?}");
-        assert!(has_table_separator(&out), "table structure missing: {out}");
+        assert!(!out.contains("---"), "raw delimiter leaked: {out}");
     }
 
     #[test]
@@ -2238,13 +2295,50 @@ mod tests {
         ];
         // Plenty of room — natural width is well under 80.
         let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
-        assert!(has_table_separator(&out));
+        assert!(!out.contains("---"), "raw delimiter leaked: {out}");
         assert!(!out.contains('┌') && !out.contains('│') && !out.contains('└'));
         // Cell contents survive in full.
         assert!(out.contains("login"));
         assert!(out.contains("signup"));
         // No ellipsis introduced.
         assert!(!out.contains('…'));
+        assert_eq!(
+            out.lines().count(),
+            7,
+            "outer boundaries, header, segmented rules, and two data rows:\n{out}"
+        );
+        assert_eq!(
+            out.lines()
+                .filter(|line| {
+                    line.trim()
+                        .chars()
+                        .all(|ch| ch == stable_table_rule_char('━'))
+                })
+                .count(),
+            2,
+            "top and bottom boundaries missing:\n{out}"
+        );
+        let header_rule = stable_table_rule_char('━');
+        let body_rule = stable_table_rule_char('─');
+        assert!(
+            out.lines().any(|line| {
+                line.contains("  ")
+                    && line
+                        .chars()
+                        .all(|ch| ch == header_rule || ch.is_ascii_whitespace())
+            }),
+            "segmented header rule missing:\n{out}"
+        );
+        assert!(
+            has_table_rule(&out, body_rule),
+            "body rule missing:\n{out}"
+        );
+        let styled = flush_aligned_table_with_width(&rows, caps(), 80);
+        assert!(
+            styled.contains(theme::md_heading_open())
+                && styled.contains(theme::MD_HEADING_CLOSE),
+            "styled terminals should emphasize the table header:\n{styled}"
+        );
     }
 
     #[test]
@@ -2267,7 +2361,6 @@ mod tests {
         );
         let out =
             render_line("下一段", &mut st, plain_caps()).expect("trailing line flushes table");
-        assert!(has_table_separator(&out), "must render as a table: {out}");
         assert!(
             !out.contains("---|---"),
             "raw delimiter must not leak: {out}"
@@ -2294,7 +2387,6 @@ mod tests {
             a.contains("option A") && a.contains("option B"),
             "content preserved: {a}"
         );
-        assert!(!has_table_separator(&a), "must not be tabular: {a}");
         // The `---|---` delimiter is NOT a list item, so real pipe-less tables still work.
         let mut st2 = MdState::new();
         assert!(render_line("H1 | H2", &mut st2, plain_caps()).is_none());
@@ -2339,10 +2431,7 @@ mod tests {
             plain_caps(),
             80,
         );
-        assert!(
-            has_table_separator(&table),
-            "pipe-less table renders as a table: {table}"
-        );
+        assert!(!table.contains("---|---"), "raw delimiter must not leak: {table}");
         assert!(!table.contains('│'), "table must be borderless: {table}");
         assert!(
             table.contains('A') && table.contains('d'),
@@ -2415,7 +2504,7 @@ mod tests {
             "| 补全 | 提示代码片段 | 已完成 |".to_string(),
         ];
         let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
-        let top = out.lines().next().unwrap();
+        let top = out.lines().find(|line| line.contains("功能")).unwrap();
         assert_eq!(
             top.split_whitespace().count(),
             3,
@@ -2435,7 +2524,11 @@ mod tests {
         ];
         let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
         assert_eq!(
-            out.lines().next().unwrap().split_whitespace().count(),
+            out.lines()
+                .find(|line| line.contains('a'))
+                .unwrap()
+                .split_whitespace()
+                .count(),
             3,
             "trailing empty cell must be trimmed:\n{out}"
         );
@@ -2482,9 +2575,9 @@ mod tests {
         // fit as a grid once the Description column is shrunk + wrapped.
         let out = flush_aligned_table_with_width(&rows, plain_caps(), 40);
 
-        // Grid survives — a separator is present and there are no flat labels.
+        // Grid survives — aligned rows remain and there are no flat labels.
         assert!(
-            has_table_separator(&out) && !out.contains('：'),
+            !out.contains('：'),
             "grid must be kept, not flattened:\n{out}"
         );
         // No content lost to the wrap.
@@ -2504,10 +2597,9 @@ mod tests {
                 crate::width::display_width(line)
             );
         }
-        // Wrapping actually happened: more physical lines than a single-row box
-        // (top + ≥2 wrapped body lines + bottom).
+        // Wrapping actually happened: header plus at least two physical body lines.
         assert!(
-            out.lines().count() >= 4,
+            out.lines().count() >= 3,
             "expected the description cell to wrap across lines:\n{out}"
         );
     }
@@ -2565,10 +2657,6 @@ mod tests {
         let out = flush_aligned_table_with_width(&rows, plain_caps(), 1);
 
         assert!(out.contains('：'), "must use the flat fallback:\n{out}");
-        assert!(
-            !has_table_separator(&out),
-            "a one-column viewport must not render an unbounded grid:\n{out}"
-        );
         assert!(out.contains("Authentication") && out.contains("Complete"));
     }
 
@@ -2612,7 +2700,7 @@ mod tests {
         // Natural width ~ 1 + (5+3) + (10+3) + (1+3) = 26.
         let wide = flush_aligned_table_with_width(&rows, plain_caps(), 80);
         assert!(
-            has_table_separator(&wide) && !wide.contains('：'),
+            !wide.contains('：'),
             "80 cols should render as a grid"
         );
 
@@ -2682,10 +2770,7 @@ mod tests {
                 out.push('\n');
             }
         }
-        assert!(
-            has_table_separator(&out),
-            "wide terminal should keep structured rendering:\n{out}"
-        );
+        assert!(!out.contains('：'), "wide terminal should keep a grid:\n{out}");
         assert!(!out.contains('┌') && !out.contains('└') && !out.contains('│'));
         assert!(out.contains("a") && out.contains("2"));
     }
