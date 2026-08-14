@@ -3534,7 +3534,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     ///     each with an optional faint description line, and a final inline
     ///     custom-answer row (faint placeholder when empty, typed text + cursor
     ///     indicator when non-empty / active). The cursor row is marked `❯`;
-    ///     multiple adds `[x]`/`[ ]` checkboxes; the cursor label is emphasized
+    ///     multiple adds `[✓]`/`[ ]` checkboxes; the cursor label is emphasized
     ///     in the orange highlight colour.
     ///   - Text: a single `> {buffer}` input row.
     /// The caller measures returned rows directly because wrapping makes height
@@ -3597,9 +3597,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     } else {
                         "  "
                     };
-                    // Multiple mode prepends a checkbox.
+                    // Multiple mode prepends a checkbox. The checked glyph is a
+                    // light check ✓ (matching Claude Code's selection style), with
+                    // the ASCII `[x]` fallback on non-unicode terminals.
                     let checkbox = if multiple {
-                        if checked { "[x] " } else { "[ ] " }
+                        if checked {
+                            if unicode { "[\u{2713}] " } else { "[x] " }
+                        } else {
+                            "[ ] "
+                        }
                     } else {
                         ""
                     };
@@ -3685,7 +3691,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         "  "
                     };
                     let checkbox = if multiple {
-                        if other_has_text { "[x] " } else { "[ ] " }
+                        if other_has_text {
+                            if unicode { "[\u{2713}] " } else { "[x] " }
+                        } else {
+                            "[ ] "
+                        }
                     } else {
                         ""
                     };
@@ -17285,7 +17295,7 @@ mod tests {
             drain_into_vterm(&buf, &mut vterm);
             let dump = vterm.dump();
             assert!(
-                vterm.any_row(|r| r.contains("[x] 1. Streaming")),
+                vterm.any_row(|r| r.contains("[\u{2713}] 1. Streaming")),
                 "Streaming checked\n{dump}"
             );
             assert!(
@@ -17297,7 +17307,7 @@ mod tests {
                 "Tool use unchecked\n{dump}"
             );
             assert!(
-                vterm.any_row(|r| r.contains("[x] 3. Zig")),
+                vterm.any_row(|r| r.contains("[\u{2713}] 3. Zig")),
                 "custom-answer row: checkbox + number + typed text (no 'Other' word)\n{dump}"
             );
             assert!(
