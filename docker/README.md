@@ -143,3 +143,75 @@ docker restart atomcode-daemon   # 重启
 docker rm -f atomcode-daemon     # 删除
 docker logs -f atomcode-daemon   # 查看日志
 ```
+
+---
+
+## NAS 部署(群晖 / 威联通等)
+
+使用仓库自带的 `docker-compose.yml` 可在 NAS 上实现一键常驻部署,配合 WebUI 通过手机随时修改代码、发起调试任务。
+
+### 准备工作
+
+1. 先构建 Daemon 镜像(与前面章节相同,产物路径为 `dist/v*/atomcode-daemon-*-linux-x64`):
+
+   ```bash
+   ./scripts/release.sh
+   docker build -t atomcode-daemon:local -f docker/Dockerfile-Daemon .
+   ```
+
+2. 在 NAS 上创建一个部署目录(例如 `docker/atomcode/`),将 `docker/docker-compose.yml` 与 `docker/config-example.toml` 复制进去,并把 `config-example.toml` 重命名为 `config.toml`、填入你的 Provider 与 API Key:
+
+   ```toml
+   default_provider = "openrouter"
+
+   [providers.openrouter]
+   type = "openai"
+   api_key = "your-api-key"
+   model = "xxx"
+   base_url = "https://openrouter.ai/api/v1"
+   context_window = 16000
+   ```
+
+3. 创建项目目录 `projects/`(将挂载为容器内 `/workspace`)。
+
+### 启动
+
+```bash
+cd docker/atomcode
+docker compose up -d
+```
+
+- 使用 `restart: unless-stopped`,NAS 重启后容器会自动拉起,崩溃也会自愈。
+- 端口映射为 `13456:13456`,如与本机其他服务冲突可修改左侧宿主机端口(例如 `23456:13456`)。
+
+### 群晖 Container Manager 操作步骤
+
+1. 打开「Container Manager」→「项目」→「新增」。
+2. 项目名称填写 `atomcode`,路径选择包含 `docker-compose.yml` 的部署目录。
+3. 来源选择「使用 docker-compose.yml」,点击「下一步」后 Container Manager 会自动拉取/构建并启动。
+4. 在「容器」页确认 `atomcode-daemon` 状态为「运行中」,启动策略为「如果异常则自动重启」。
+
+### 威联通 Container Station 操作步骤
+
+1. 打开「Container Station」→「应用程序」→「创建」→「创建应用程序」。
+2. 将 `docker-compose.yml` 内容粘贴到编辑器中,点击「验证」通过后「创建」。
+3. 首次使用需先在「映像」页构建/导入 `atomcode-daemon:local` 镜像。
+
+### 验证与手机访问
+
+```bash
+# 在 NAS 本机或局域网内验证
+curl http://<NAS-IP>:13456/
+```
+
+- 局域网内手机访问:打开浏览器输入 `http://<NAS-IP>:13456` 即可进入 WebUI(需配合 WebUI 远程访问面板)。
+- **注意**:Daemon 默认绑定 `127.0.0.1` 且无内置鉴权,仅适合内网信任环境。如需公网访问,务必使用反向代理 + HTTPS + token 鉴权(如 Caddy / Nginx + 自签证书),或内网穿透方案(如 Tailscale / 蒲公英),切勿直接暴露端口到公网。
+
+### ARM64 架构说明
+
+`Dockerfile-Daemon` 目前通过 `COPY dist/v*/atomcode-daemon-*-linux-x64` 内置 **x64** 二进制,适用于绝大多数 x86 群晖/威联通机型。若你的 NAS 为 **ARM64**(部分群晖机型、树莓派类设备),需要:
+
+1. 在 ARM64 主机或交叉编译环境执行 `./scripts/release.sh` 产出 `linux-aarch64` 产物;
+2. 相应修改 Dockerfile 中的 `COPY` 路径为 `dist/v*/atomcode-daemon-*-linux-aarch64` 后重新构建。
+
+(官方多架构镜像与自动化构建正在推进中,详见 issue #1421 / #1431。)

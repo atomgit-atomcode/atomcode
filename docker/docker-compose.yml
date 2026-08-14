@@ -1,0 +1,39 @@
+# AtomCode Daemon 的 docker-compose 一键部署示例
+# 适用于 NAS(群晖 / 威联通等)常驻运行:restart: unless-stopped 保证开机自启与崩溃自愈。
+#
+# 快速开始:
+#   1. 先按 docker/README.md 构建镜像: docker build -t atomcode-daemon:local -f docker/Dockerfile-Daemon .
+#   2. 复制本文件到部署目录(如 NAS 上的 docker/atomcode/),编辑下方挂载路径
+#   3. docker compose up -d
+#
+# 目录约定(可自行调整):
+#   ./config.toml       -> /root/.atomcode/config.toml   (AtomCode 配置,参考 docker/config-example.toml)
+#   ./projects          -> /workspace                    (项目代码目录,通过 WebUI 远程修改)
+#   ./sessions          -> /root/.atomcode/sessions      (会话记录持久化)
+#   ./logs              -> /root/.atomcode/logs          (日志持久化)
+
+services:
+  atomcode-daemon:
+    image: atomcode-daemon:local
+    container_name: atomcode-daemon
+    restart: unless-stopped
+    ports:
+      # 宿主机端口:容器端口(daemon 默认监听 13456)
+      - "13456:13456"
+    volumes:
+      - ./config.toml:/root/.atomcode/config.toml:ro
+      - ./projects:/workspace
+      - ./sessions:/root/.atomcode/sessions
+      - ./logs:/root/.atomcode/logs
+    environment:
+      # 可选:通过环境变量注入 API Key,优先级高于 config.toml 中的配置
+      # - ANTHROPIC_API_KEY=your-api-key
+      # - OPENAI_API_KEY=your-api-key
+      TZ: Asia/Shanghai
+    security_opt:
+      - no-new-privileges:true
+    # NAS 常见需求:限制资源(群晖/威联通 Container Manager 均支持)
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 2G
