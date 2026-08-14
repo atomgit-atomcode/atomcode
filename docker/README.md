@@ -152,12 +152,14 @@ docker logs -f atomcode-daemon   # 查看日志
 
 ### 准备工作
 
-1. 先构建 Daemon 镜像(与前面章节相同,产物路径为 `dist/v*/atomcode-daemon-*-linux-x64`):
+1. 构建 Daemon 镜像。本机为 x64 架构时直接构建:
 
    ```bash
    ./scripts/release.sh
    docker build -t atomcode-daemon:local -f docker/Dockerfile-Daemon .
    ```
+
+   > **多架构(amd64 + arm64)镜像**:使用 `docker/build-multiarch.sh` 一键构建并推送同时支持 x64 与 ARM64 的镜像(群晖/威联通 ARM 机型同样适用,详见下方「ARM64 架构说明」)。
 
 2. 在 NAS 上创建一个部署目录(例如 `docker/atomcode/`),将 `docker/docker-compose.yml` 与 `docker/config-example.toml` 复制进去,并把 `config-example.toml` 重命名为 `config.toml`、填入你的 Provider 与 API Key:
 
@@ -209,9 +211,15 @@ curl http://<NAS-IP>:13456/
 
 ### ARM64 架构说明
 
-`Dockerfile-Daemon` 目前通过 `COPY dist/v*/atomcode-daemon-*-linux-x64` 内置 **x64** 二进制,适用于绝大多数 x86 群晖/威联通机型。若你的 NAS 为 **ARM64**(部分群晖机型、树莓派类设备),需要:
+`Dockerfile-Daemon` 已支持多架构:通过 `docker buildx` 的 `TARGETARCH` 自动选择对应产物(amd64 → `linux-x64` 二进制,arm64 → `linux-arm64` 二进制),一次构建即可产出同时支持 x86 与 ARM64 的镜像。
 
-1. 在 ARM64 主机或交叉编译环境执行 `./scripts/release.sh` 产出 `linux-aarch64` 产物;
-2. 相应修改 Dockerfile 中的 `COPY` 路径为 `dist/v*/atomcode-daemon-*-linux-aarch64` 后重新构建。
+- **一键构建并推送多架构镜像**(适用于群晖/威联通 ARM 机型、树莓派等):
 
-(官方多架构镜像与自动化构建正在推进中,详见 issue #1421 / #1431。)
+  ```bash
+  docker/build-multiarch.sh                      # 默认镜像名 atomcode-daemon:v<版本>,构建并推送
+  docker/build-multiarch.sh myrepo/atomcode:v1   # 指定镜像名
+  BUILD_ONLY=1 docker/build-multiarch.sh         # 仅本地构建,不推送
+  ```
+
+- 前置条件:安装 musl 交叉编译工具链(`brew install FiloSottile/musl-cross/musl-cross`),脚本会自动调用 `scripts/release.sh` 产出 x64 + arm64 两种 `atomcode-daemon` 产物后交给 buildx。
+- 官方多架构镜像与自动化构建正在推进中,详见 issue #1421 / #1431。
