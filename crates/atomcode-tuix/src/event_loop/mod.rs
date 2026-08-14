@@ -11278,15 +11278,11 @@ fn handle_pointer_hit(
             let Some(items) = menu_for_display(&app.buf, ctx) else {
                 return Ok(());
             };
-            app.menu.select_index(index, items.len());
-            redraw_with_menu(
-                &app.buf,
-                &items,
-                app.menu.selected,
-                &app.state,
-                ctx,
-                renderer,
-            );
+            let buf = &app.buf;
+            let state = &app.state;
+            app.menu.pointer_select_with(index, items.len(), |selected| {
+                redraw_with_menu(buf, &items, selected, state, ctx, renderer)
+            });
         }
         PointerClickAction::Confirm(crate::render::interaction::HitTarget::MenuItem { index }) => {
             let Some(items) = menu_for_display(&app.buf, ctx) else {
@@ -11992,6 +11988,95 @@ mod tests {
     }
 
     #[test]
+    fn pointer_current_command_row_keeps_frame_open_until_second_click_confirms() {
+        let target = HitTarget::MenuItem { index: 0 };
+        let mut menu = super::MenuState::new();
+        let mut redraws = 0;
+        let session = 7;
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        publisher.publish(session, pointer_interaction().regions);
+
+        assert_eq!(
+            menu.pointer_press(target, session),
+            super::PointerClickAction::Select(target)
+        );
+        menu.pointer_select_with(0, 2, |_| {
+            redraws += 1;
+            publisher.invalidate();
+        });
+        assert_eq!(redraws, 0, "selecting the current row must keep the frame actionable");
+        assert!(publisher.snapshot_actionable().is_some());
+        assert_eq!(
+            menu.pointer_release(target, session),
+            super::PointerClickAction::None
+        );
+
+        let _ = menu.pointer_press(target, session);
+        menu.pointer_select_with(0, 2, |_| {
+            redraws += 1;
+            publisher.invalidate();
+        });
+        assert_eq!(
+            menu.pointer_release(target, session),
+            super::PointerClickAction::Confirm(target)
+        );
+        let mut callbacks = 0;
+        assert_eq!(
+            super::handle_pointer_menu_confirmation(
+                &mut menu,
+                |menu| menu,
+                false,
+                2,
+                |_menu, selected| {
+                    assert_eq!(selected, 0);
+                    callbacks += 1;
+                },
+            ),
+            Some(())
+        );
+        assert_eq!(callbacks, 1);
+    }
+
+    #[test]
+    fn pointer_changed_command_row_redraws_once_then_fresh_clicks_can_confirm() {
+        let target = HitTarget::MenuItem { index: 1 };
+        let mut menu = super::MenuState::new();
+        let mut redraws = 0;
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        publisher.publish(1, pointer_interaction().regions);
+
+        let _ = menu.pointer_press(target, 1);
+        menu.pointer_select_with(1, 2, |_| {
+            redraws += 1;
+            publisher.invalidate();
+        });
+        assert_eq!(redraws, 1);
+        assert!(publisher.snapshot_actionable().is_none());
+        let slow_up = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Up,
+            Some(PointerButton::Primary),
+            false,
+        ));
+        let mut prelude_runs = 0;
+        assert_eq!(
+            super::handle_input_preflight(&slow_up, None, &mut menu, || prelude_runs += 1),
+            super::PointerPreflightRoute::ReturnIgnored
+        );
+        assert_eq!(prelude_runs, 0);
+
+        let _ = menu.pointer_press(target, 2);
+        menu.pointer_select_with(1, 2, |_| redraws += 1);
+        assert_eq!(menu.pointer_release(target, 2), super::PointerClickAction::None);
+        let _ = menu.pointer_press(target, 2);
+        menu.pointer_select_with(1, 2, |_| redraws += 1);
+        assert_eq!(
+            menu.pointer_release(target, 2),
+            super::PointerClickAction::Confirm(target)
+        );
+        assert_eq!(redraws, 1);
+    }
+
+    #[test]
     fn pointer_confirmation_arm_does_not_cross_modal_or_content_sessions() {
         let target = HitTarget::ModalItem { index: 0 };
         let mut menu = super::MenuState::new();
@@ -12427,8 +12512,17 @@ impl MenuState {
         allowed
     }
 
-    fn select_index(&mut self, index: usize, len: usize) {
-        self.selected = if len == 0 { 0 } else { index.min(len - 1) };
+    fn select_index(&mut self, index: usize, len: usize) -> bool {
+        let selected = if len == 0 { 0 } else { index.min(len - 1) };
+        let changed = self.selected != selected;
+        self.selected = selected;
+        changed
+    }
+
+    fn pointer_select_with(&mut self, index: usize, len: usize, redraw: impl FnOnce(usize)) {
+        if self.select_index(index, len) {
+            redraw(self.selected);
+        }
     }
 
     fn confirm_selected(&self, len: usize) -> Option<usize> {

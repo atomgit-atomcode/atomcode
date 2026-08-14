@@ -98,12 +98,17 @@ impl DirPicker {
         self.select_index(self.selected.saturating_add(1));
     }
 
-    fn select_index(&mut self, index: usize) {
+    fn select_index(&mut self, index: usize) -> bool {
         let len = self.filtered().len();
-        if len == 0 {
-            self.selected = 0;
-        } else {
-            self.selected = index.min(len - 1);
+        let selected = if len == 0 { 0 } else { index.min(len - 1) };
+        let changed = self.selected != selected;
+        self.selected = selected;
+        changed
+    }
+
+    fn pointer_select_with(&mut self, index: usize, redraw: impl FnOnce(&Self)) {
+        if self.select_index(index) {
+            redraw(self);
         }
     }
 
@@ -324,20 +329,10 @@ impl Modal for DirPicker {
         renderer: &mut dyn Renderer,
     ) -> Result<ModalAction> {
         match action {
-            ModalPointerAction::Select(_) => {
-                let result =
-                    self.apply_pointer_semantic_with(action, &ctx.working_dir, None, |_| Ok(()));
-                if let Err(failure) = result {
-                    return self.finish_confirmation(
-                        Err(failure),
-                        false,
-                        buf,
-                        state,
-                        ctx,
-                        renderer,
-                    );
-                }
-                self.draw(buf, state, ctx, renderer);
+            ModalPointerAction::Select(index) => {
+                self.pointer_select_with(index, |picker| {
+                    picker.draw(buf, state, ctx, renderer)
+                });
                 Ok(ModalAction::Continue)
             }
             ModalPointerAction::Confirm(index) => {
@@ -666,6 +661,22 @@ mod tests {
             crate::render::worker::interaction_surface_for_line(&after),
             "title position and selected chrome are not selectable identity"
         );
+    }
+
+    #[test]
+    fn pointer_selection_redraws_only_when_directory_index_changes() {
+        let mut picker = DirPicker::open(
+            vec![pb("/workspace/alpha"), pb("/workspace/beta")],
+            pb("/workspace/alpha"),
+        );
+        let mut redraws = 0;
+
+        picker.pointer_select_with(0, |_| redraws += 1);
+        picker.pointer_select_with(1, |_| redraws += 1);
+        picker.pointer_select_with(1, |_| redraws += 1);
+
+        assert_eq!(redraws, 1);
+        assert_eq!(picker.selected, 1);
     }
 
     #[test]

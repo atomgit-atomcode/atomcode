@@ -115,7 +115,13 @@ impl SessionPicker {
         }
     }
 
-    fn select_index(&mut self, index: usize) {
+    fn select_index(&mut self, index: usize) -> bool {
+        let previous = (
+            self.selected,
+            self.search_focused,
+            self.confirm_delete,
+            self.delete_status.is_some(),
+        );
         if self.filtered.is_empty() {
             self.selected = 0;
             self.search_focused = false;
@@ -125,11 +131,18 @@ impl SessionPicker {
         }
         self.confirm_delete = None;
         self.delete_status = None;
+        previous
+            != (
+                self.selected,
+                self.search_focused,
+                self.confirm_delete,
+                self.delete_status.is_some(),
+            )
     }
 
-    fn apply_pointer_semantic(&mut self, action: ModalPointerAction) {
-        if let ModalPointerAction::Select(index) = action {
-            self.select_index(index);
+    fn pointer_select_with(&mut self, index: usize, redraw: impl FnOnce(&Self)) {
+        if self.select_index(index) {
+            redraw(self);
         }
     }
 
@@ -439,8 +452,9 @@ impl Modal for SessionPicker {
     ) -> Result<ModalAction> {
         match action {
             ModalPointerAction::Select(index) => {
-                self.apply_pointer_semantic(ModalPointerAction::Select(index));
-                self.draw(buf, state, ctx, renderer);
+                self.pointer_select_with(index, |picker| {
+                    picker.draw(buf, state, ctx, renderer)
+                });
                 Ok(ModalAction::Continue)
             }
             ModalPointerAction::Confirm(index) => {
@@ -931,7 +945,6 @@ pub(crate) fn replay_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modals::ModalPointerAction;
     use std::path::PathBuf;
 
     fn meta(name: &str, msgs: usize) -> SessionMeta {
@@ -954,7 +967,7 @@ mod tests {
         let mut pointer = SessionPicker::open(sessions);
 
         keyboard.down();
-        pointer.apply_pointer_semantic(ModalPointerAction::Select(1));
+        pointer.pointer_select_with(1, |_| {});
 
         assert_eq!(keyboard.selected, pointer.selected);
         assert_eq!(keyboard.search_focused, pointer.search_focused);
@@ -985,6 +998,24 @@ mod tests {
             crate::render::worker::interaction_surface_for_line(&after),
             "title position and selected chrome are not selectable identity"
         );
+    }
+
+    #[test]
+    fn pointer_selection_redraws_for_real_session_state_changes_only() {
+        let mut picker = SessionPicker::open(vec![meta("one", 1), meta("two", 2)]);
+        let mut redraws = 0;
+
+        picker.pointer_select_with(0, |_| redraws += 1);
+        picker.pointer_select_with(1, |_| redraws += 1);
+        picker.pointer_select_with(1, |_| redraws += 1);
+        picker.confirm_delete = Some(1);
+        picker.delete_status = Some("confirm".into());
+        picker.pointer_select_with(1, |_| redraws += 1);
+
+        assert_eq!(redraws, 2, "clearing delete state also requires a redraw");
+        assert_eq!(picker.selected, 1);
+        assert!(picker.confirm_delete.is_none());
+        assert!(picker.delete_status.is_none());
     }
 
     #[test]
