@@ -268,6 +268,10 @@ pub fn render_line_with_width(
     // Marker (• / 1.) rendered in muted gray so it sits quietly next to
     // the default-fg body text — visually distinct without adding another
     // bright colour tier. The space after the marker keeps readability.
+    // Theme-aware: dark themes use SGR 37 (soft light-gray) because the
+    // fixed SGR 90 collapses to ~3:1 against dark backgrounds and the
+    // marker is invisible until selected (Issue #1426) — same fix table
+    // borders already had via `md_border_open`.
     if let Some(item) = parse_list_item(line) {
         state.last_heading = None; // real content ends the dedup window
         let inner = render_inline(&item.rest, caps);
@@ -276,7 +280,7 @@ pub fn render_line_with_width(
             format!(
                 "{}{}{}{}{}",
                 indent,
-                theme::MD_MUTED_OPEN,
+                theme::md_marker_open(),
                 item.marker,
                 theme::MD_MUTED_CLOSE,
                 inner
@@ -2108,14 +2112,14 @@ mod tests {
     fn list_bullets() {
         let mut st = MdState::new();
         let out = render_line("- item", &mut st, caps()).unwrap();
-        // Bullet marker rendered in muted colour.
+        // Bullet marker rendered in muted colour (theme-aware).
         assert!(
             out.contains(&format!(
                 "{}•{}",
-                theme::MD_MUTED_OPEN,
+                theme::md_marker_open(),
                 theme::MD_MUTED_CLOSE
             )),
-            "bullet must use MD_MUTED colour: {:?}",
+            "bullet must use md_marker_open colour: {:?}",
             out
         );
         assert!(out.contains("item"));
@@ -2136,7 +2140,7 @@ mod tests {
         assert!(
             out.starts_with(&format!(
                 "  {}•{}",
-                theme::MD_MUTED_OPEN,
+                theme::md_marker_open(),
                 theme::MD_MUTED_CLOSE
             )),
             "nested bullet with indent: {:?}",
@@ -2151,10 +2155,10 @@ mod tests {
         assert!(
             out.contains(&format!(
                 "{}1.{}",
-                theme::MD_MUTED_OPEN,
+                theme::md_marker_open(),
                 theme::MD_MUTED_CLOSE
             )),
-            "ordered marker must use MD_MUTED colour: {:?}",
+            "ordered marker must use md_marker_open colour: {:?}",
             out
         );
         assert!(out.contains("first item"));
@@ -2167,10 +2171,10 @@ mod tests {
         assert!(
             out.contains(&format!(
                 "{}12.{}",
-                theme::MD_MUTED_OPEN,
+                theme::md_marker_open(),
                 theme::MD_MUTED_CLOSE
             )),
-            "double-digit marker must use MD_MUTED colour: {:?}",
+            "double-digit marker must use md_marker_open colour: {:?}",
             out
         );
         assert!(out.contains("twelfth item"));
