@@ -129,7 +129,7 @@ fn composer_cell_bytes(
                     cells.push(ComposerCellByte {
                         row,
                         col: col + offset,
-                        byte: if offset == 0 && display_byte == span.display_start {
+                        byte: if display_byte == span.display_start && offset * 2 < width {
                             span.source_start
                         } else {
                             span.source_end
@@ -10266,6 +10266,43 @@ mod tests {
         assert_eq!(frame.hit(row, col + 4), Some(crate::render::interaction::HitTarget::ComposerByte { byte: "a你👩‍💻".len() }));
         assert_eq!(frame.hit(row, col + 5), Some(crate::render::interaction::HitTarget::ComposerByte { byte: "a你👩‍💻".len() }));
         assert_eq!(frame.hit(row, col + 6), Some(crate::render::interaction::HitTarget::ComposerByte { byte: input.len() }));
+    }
+
+    #[test]
+    fn interaction_composer_tab_cells_choose_the_nearest_byte_boundary() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            12,
+            24,
+            interactions.clone(),
+        );
+        let input = "\tz";
+        renderer.render(UiLine::InputPrompt {
+            buf: input.into(),
+            cursor_byte: input.len(),
+            menu: None,
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+
+        let frame = interactions.snapshot_actionable().expect("painted composer frame");
+        let first = frame
+            .regions
+            .iter()
+            .find(|region| {
+                region.target
+                    == crate::render::interaction::HitTarget::ComposerByte { byte: 0 }
+            })
+            .expect("tab start cell");
+        let row = first.rect.row;
+        let col = first.rect.col;
+        assert_eq!(frame.hit(row, col), Some(crate::render::interaction::HitTarget::ComposerByte { byte: 0 }));
+        assert_eq!(frame.hit(row, col + 1), Some(crate::render::interaction::HitTarget::ComposerByte { byte: 0 }));
+        assert_eq!(frame.hit(row, col + 2), Some(crate::render::interaction::HitTarget::ComposerByte { byte: 1 }));
+        assert_eq!(frame.hit(row, col + 3), Some(crate::render::interaction::HitTarget::ComposerByte { byte: 1 }));
     }
 
     #[test]

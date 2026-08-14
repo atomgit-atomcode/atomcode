@@ -4315,6 +4315,42 @@ impl Buffer {
         true
     }
 
+    fn replace_all_text(&mut self, text: String) {
+        self.text = text;
+        self.cursor = self.text.len();
+        self.clear_selection();
+    }
+
+    fn clear_text(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+        self.clear_selection();
+    }
+
+    fn replace_text_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        replacement: &str,
+    ) -> bool {
+        if range.start > range.end
+            || range.end > self.text.len()
+            || !self.text.is_char_boundary(range.start)
+            || !self.text.is_char_boundary(range.end)
+        {
+            return false;
+        }
+        self.clear_selection();
+        self.text.replace_range(range.clone(), replacement);
+        self.cursor = range.start + replacement.len();
+        true
+    }
+
+    fn insert_at_cursor(&mut self, text: &str) {
+        self.replace_selection("");
+        self.text.insert_str(self.cursor, text);
+        self.cursor += text.len();
+    }
+
     fn set_pointer_cursor(&mut self, byte: usize, extend: bool) -> bool {
         if byte > self.text.len() || !self.text.is_char_boundary(byte) {
             return false;
@@ -5034,6 +5070,38 @@ mod buffer_tests {
 
         assert_eq!(buf.text, "X");
         assert_eq!(buf.expanded_text(), "X");
+        assert_eq!(buf.selected_range(), None);
+    }
+
+    #[test]
+    fn buffer_selection_skill_enter_clear_then_typing_has_no_stale_range() {
+        let mut buf = Buffer::new();
+        buf.replace_all_text("$br".into());
+        buf.set_pointer_cursor(0, false);
+        buf.set_pointer_cursor(2, true);
+
+        assert_eq!(
+            apply_skill_menu_buffer_selection(&mut buf, "brainstorming", KeyCode::Enter),
+            SkillMenuBufferResult::Committed("$brainstorming".into())
+        );
+        let _ = buf.apply(Action::Insert('x'), &[], &CommandRegistry::builtin());
+
+        assert_eq!(buf.text, "x");
+        assert_eq!(buf.cursor, 1);
+        assert_eq!(buf.selected_range(), None);
+    }
+
+    #[test]
+    fn buffer_image_marker_insertion_replaces_the_active_selection() {
+        let mut buf = Buffer::new();
+        buf.replace_all_text("abc".into());
+        buf.set_pointer_cursor(1, false);
+        buf.set_pointer_cursor(2, true);
+
+        buf.insert_at_cursor("[Image #1]");
+
+        assert_eq!(buf.text, "a[Image #1]c");
+        assert_eq!(buf.cursor, "a[Image #1]".len());
         assert_eq!(buf.selected_range(), None);
     }
 
@@ -11315,8 +11383,7 @@ fn attach_image_to_input(
     app.state.pending_image_markers.push(n);
     cache_write_image(&crate::platform::image_cache_dir(), &img, hash);
     let marker = format!("[Image #{}]", n);
-    app.buf.text.insert_str(app.buf.cursor, &marker);
-    app.buf.cursor += marker.len();
+    app.buf.insert_at_cursor(&marker);
     if matches!(app.state.phase, UiPhase::Streaming) {
         draw_spinner_now(
             &mut app.state,
@@ -11488,6 +11555,14 @@ fn sync_composer_selection(
     publisher.set_composer_selection(&buf.text, buf.selected_range());
 }
 
+fn cleanup_composer_pointer_capture(
+    buf: &mut Buffer,
+    publisher: &crate::render::interaction::InteractionPublisher,
+) {
+    buf.end_pointer_selection();
+    sync_composer_selection(buf, publisher);
+}
+
 fn handle_composer_pointer(
     buf: &mut Buffer,
     publisher: &crate::render::interaction::InteractionPublisher,
@@ -11525,21 +11600,25 @@ fn handle_pointer_hit(
     event: PointerEvent,
     frame: &crate::render::interaction::InteractionFrame,
 ) -> Result<()> {
-    let Some(target) = frame.hit(event.row, event.col) else {
-        if finish_composer_pointer_capture(app, ctx, renderer, event) {
+    let target = frame.hit(event.row, event.col);
+    match route_active_composer_pointer(
+        &mut app.buf,
+        &ctx.interaction_publisher,
+        &mut app.menu,
+        event,
+        target,
+    ) {
+        ComposerPointerRoute::Redraw => {
+            redraw_after_composer_pointer(app, ctx, renderer);
             return Ok(());
         }
+        ComposerPointerRoute::Handled => return Ok(()),
+        ComposerPointerRoute::Ignored => {}
+    }
+    let Some(target) = target else {
         app.menu.pointer_cancel();
         return Ok(());
     };
-    if let crate::render::interaction::HitTarget::ComposerByte { byte } = target {
-        if handle_composer_pointer(&mut app.buf, &ctx.interaction_publisher, event, byte)
-            == ComposerPointerRoute::Redraw
-        {
-            redraw_after_composer_pointer(app, ctx, renderer);
-        }
-        return Ok(());
-    }
     let click = match event.kind {
         PointerKind::Down => app.menu.pointer_press(target, frame.surface_session),
         PointerKind::Up => app.menu.pointer_release(target, frame.surface_session),
@@ -11606,6 +11685,30 @@ fn handle_pointer_hit(
         | PointerClickAction::Confirm(_) => {}
     }
     Ok(())
+}
+
+fn route_active_composer_pointer(
+    buf: &mut Buffer,
+    publisher: &crate::render::interaction::InteractionPublisher,
+    menu: &mut MenuState,
+    event: PointerEvent,
+    target: Option<crate::render::interaction::HitTarget>,
+) -> ComposerPointerRoute {
+    let route = if event.kind == PointerKind::Up && buf.pointer_selection_active() {
+        if let Some(crate::render::interaction::HitTarget::ComposerByte { byte }) = target {
+            handle_composer_pointer(buf, publisher, event, byte)
+        } else {
+            handle_composer_pointer_release(buf, publisher, event)
+        }
+    } else if let Some(crate::render::interaction::HitTarget::ComposerByte { byte }) = target {
+        handle_composer_pointer(buf, publisher, event, byte)
+    } else {
+        ComposerPointerRoute::Ignored
+    };
+    if route != ComposerPointerRoute::Ignored {
+        menu.pointer_cancel();
+    }
+    route
 }
 
 fn redraw_after_composer_pointer(app: &mut App, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
@@ -11680,6 +11783,7 @@ fn handle_pointer_menu_confirmation<S, R>(
 enum PointerPreflightRoute {
     ScrollContinue,
     PointerContinue,
+    ComposerCleanup,
     ReturnIgnored,
     NotPointer,
 }
@@ -11690,6 +11794,19 @@ fn pointer_input_route(
     menu: &mut MenuState,
     composer_pointer_active: bool,
 ) -> PointerPreflightRoute {
+    if composer_pointer_active
+        && matches!(
+            event,
+            InputEvent::Pointer(PointerEvent {
+                kind: PointerKind::Up,
+                button: Some(crate::input::PointerButton::Primary),
+                shift: true,
+                ..
+            })
+        )
+    {
+        return PointerPreflightRoute::ComposerCleanup;
+    }
     let pointer_actionable = match event {
         InputEvent::Pointer(pointer)
             if !pointer.shift
@@ -11741,7 +11858,10 @@ fn handle_input_preflight(
     run_general_prelude: impl FnOnce(),
 ) -> PointerPreflightRoute {
     let route = pointer_input_route(event, interaction, menu, composer_pointer_active);
-    if route != PointerPreflightRoute::ReturnIgnored {
+    if !matches!(
+        route,
+        PointerPreflightRoute::ReturnIgnored | PointerPreflightRoute::ComposerCleanup
+    ) {
         run_general_prelude();
     }
     route
@@ -11829,6 +11949,10 @@ fn handle_input(
         );
         },
     );
+    if preflight == PointerPreflightRoute::ComposerCleanup {
+        cleanup_composer_pointer_capture(&mut app.buf, &ctx.interaction_publisher);
+        return Ok(());
+    }
     if preflight == PointerPreflightRoute::ReturnIgnored {
         return Ok(());
     }
@@ -12478,6 +12602,59 @@ mod tests {
         assert_eq!(buf.text, "abcde", "cursor collapse does not change source");
         assert_eq!(buf.cursor, 1);
         assert!(publisher.composer_selection().is_none());
+    }
+
+    #[test]
+    fn active_composer_release_preempts_a_menu_target() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let mut buf = super::Buffer::new();
+        let mut menu = super::MenuState::new();
+        buf.text = "abcde".into();
+        assert!(buf.set_pointer_cursor(1, false));
+        assert!(buf.set_pointer_cursor(4, true));
+        let target = HitTarget::MenuItem { index: 0 };
+        let _ = menu.pointer_press(target, 1);
+
+        assert_eq!(
+            super::route_active_composer_pointer(
+                &mut buf,
+                &publisher,
+                &mut menu,
+                pointer(PointerKind::Up, Some(PointerButton::Primary), false),
+                Some(target),
+            ),
+            super::ComposerPointerRoute::Redraw
+        );
+        assert!(!buf.pointer_selection_active());
+        assert_eq!(buf.selected_range(), Some(1..4));
+        assert!(!menu.has_pointer_press(), "menu confirmation must be cancelled");
+    }
+
+    #[test]
+    fn shift_release_cleans_composer_capture_without_claiming_ui_action() {
+        let input = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Up,
+            Some(PointerButton::Primary),
+            true,
+        ));
+        let mut menu = super::MenuState::new();
+        let mut prelude_runs = 0;
+        assert_eq!(
+            super::handle_input_preflight(&input, None, &mut menu, true, || {
+                prelude_runs += 1
+            }),
+            super::PointerPreflightRoute::ComposerCleanup
+        );
+        assert_eq!(prelude_runs, 0);
+
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let mut buf = super::Buffer::new();
+        buf.text = "abc".into();
+        assert!(buf.set_pointer_cursor(0, false));
+        assert!(buf.set_pointer_cursor(2, true));
+        super::cleanup_composer_pointer_capture(&mut buf, &publisher);
+        assert!(!buf.pointer_selection_active());
+        assert_eq!(buf.selected_range(), Some(0..2));
     }
 
     #[test]
@@ -13357,6 +13534,27 @@ fn streaming_top_level_slash_selection(
     ))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SkillMenuBufferResult {
+    Completed,
+    Committed(String),
+}
+
+fn apply_skill_menu_buffer_selection(
+    buf: &mut Buffer,
+    name: &str,
+    code: KeyCode,
+) -> SkillMenuBufferResult {
+    if code == KeyCode::Tab {
+        buf.replace_all_text(format!("${name} "));
+        SkillMenuBufferResult::Completed
+    } else {
+        let committed = format!("${name}");
+        buf.clear_text();
+        SkillMenuBufferResult::Committed(committed)
+    }
+}
+
 fn confirm_idle_menu_selected(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -13377,9 +13575,7 @@ fn confirm_idle_menu_selected(
         .unwrap_or(false);
     app.menu.selected = 0;
     if needs_args {
-        app.buf.clear_selection();
-        app.buf.text = format!("/{name} ");
-        app.buf.cursor = app.buf.text.len();
+        app.buf.replace_all_text(format!("/{name} "));
         if matches!(name.as_str(), "skills" | "effort") {
             if let Some(next_items) = build_menu_items(
                 &app.buf.text,
@@ -13409,9 +13605,7 @@ fn confirm_idle_menu_selected(
     let committed = format!("/{name}");
     renderer.render(UiLine::ClearTransient);
     renderer.render(UiLine::User(committed.clone()));
-    app.buf.clear_selection();
-    app.buf.text.clear();
-    app.buf.cursor = 0;
+    app.buf.clear_text();
     ctx.history.push(crate::input::history::HistoryEntry {
         text: committed.clone(),
         images: Vec::new(),
@@ -13624,8 +13818,9 @@ fn handle_idle_key(
                         // adding whitespace so directories can keep completing.
                         let selected_path = items[app.menu.selected].0.clone();
                         let replacement = file_index::format_at_mention_replacement(&selected_path);
-                        app.buf.text.replace_range(at_pos..end, &replacement);
-                        app.buf.cursor = at_pos + replacement.len();
+                        let _ = app
+                            .buf
+                            .replace_text_range(at_pos..end, &replacement);
                         app.menu.selected = 0;
                         if let Some(next_items) = build_menu_items(
                             &app.buf.text,
@@ -13658,18 +13853,15 @@ fn handle_idle_key(
                 if app.buf.text.starts_with('$') && !items.is_empty() {
                     let name = items[app.menu.selected].0.clone();
                     app.menu.selected = 0;
-                    if code == KeyCode::Tab {
-                        app.buf.text = format!("${} ", name);
-                        app.buf.cursor = app.buf.text.len();
+                    let SkillMenuBufferResult::Committed(committed) =
+                        apply_skill_menu_buffer_selection(&mut app.buf, &name, code)
+                    else {
                         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                         return Ok(());
-                    }
+                    };
                     // Enter → invoke now via the shared skills arm.
-                    let committed = format!("${}", name);
                     renderer.render(UiLine::ClearTransient);
                     renderer.render(UiLine::User(committed.clone()));
-                    app.buf.text.clear();
-                    app.buf.cursor = 0;
                     ctx.history.push(crate::input::history::HistoryEntry {
                         text: committed.clone(),
                         images: Vec::new(),
@@ -13710,8 +13902,7 @@ fn handle_idle_key(
                     // Menu rebuilds on next keystroke — with the trailing
                     // space parse_slash_line returns `Some(("name", ""))`
                     // so build_menu_items correctly hides the menu.
-                    app.buf.text = format!("/{} ", name);
-                    app.buf.cursor = app.buf.text.len();
+                    app.buf.replace_all_text(format!("/{} ", name));
 
                     // The `/skills` gateway is special: build_menu_items
                     // recognises the `/skills ` prefix and returns the
@@ -13792,16 +13983,14 @@ fn handle_idle_key(
                 let in_effort_sub_mode = app.buf.text.starts_with("/effort ");
                 if in_effort_sub_mode {
                     if code == KeyCode::Tab {
-                        app.buf.text = format!("/effort {} ", name);
-                        app.buf.cursor = app.buf.text.len();
+                        app.buf.replace_all_text(format!("/effort {} ", name));
                         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                         return Ok(());
                     }
                     let committed = format!("/effort {}", name);
                     renderer.render(UiLine::ClearTransient);
                     renderer.render(UiLine::User(committed.clone()));
-                    app.buf.text.clear();
-                    app.buf.cursor = 0;
+                    app.buf.clear_text();
                     ctx.history.push(crate::input::history::HistoryEntry {
                         text: committed.clone(),
                         images: Vec::new(),
@@ -13832,8 +14021,7 @@ fn handle_idle_key(
 
                 let in_skills_sub_mode = app.buf.text.starts_with("/skills ");
                 if in_skills_sub_mode {
-                    app.buf.text = format!("/skills {} ", name);
-                    app.buf.cursor = app.buf.text.len();
+                    app.buf.replace_all_text(format!("/skills {} ", name));
                     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                     return Ok(());
                 }
@@ -13846,8 +14034,7 @@ fn handle_idle_key(
                 // (parse_slash_line treats `/name ` as a fully-named
                 // command with empty arg).
                 if code == KeyCode::Tab {
-                    app.buf.text = format!("/{} ", name);
-                    app.buf.cursor = app.buf.text.len();
+                    app.buf.replace_all_text(format!("/{} ", name));
                     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                     return Ok(());
                 }
@@ -13856,8 +14043,7 @@ fn handle_idle_key(
                 let committed = format!("/{}", name);
                 renderer.render(UiLine::ClearTransient);
                 renderer.render(UiLine::User(committed.clone()));
-                app.buf.text.clear();
-                app.buf.cursor = 0;
+                app.buf.clear_text();
                 // Mirror the regular-message and queued-message paths
                 // below: pushing the just-submitted line into `ctx.history`
                 // is what Up-arrow recall reads from. Without this, a
@@ -13894,8 +14080,7 @@ fn handle_idle_key(
             }
             (KeyCode::Esc, _) => {
                 // Close menu by clearing buffer.
-                app.buf.text.clear();
-                app.buf.cursor = 0;
+                app.buf.clear_text();
                 app.menu.selected = 0;
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
@@ -14025,9 +14210,7 @@ fn handle_idle_key(
             app.state.pending_image_markers.push(n);
             cache_write_image(&crate::platform::image_cache_dir(), &img, hash);
             let marker = format!("[Image #{}]", n);
-            app.buf.replace_selection("");
-            app.buf.text.insert_str(app.buf.cursor, &marker);
-            app.buf.cursor += marker.len();
+            app.buf.insert_at_cursor(&marker);
             sync_composer_selection(&app.buf, &ctx.interaction_publisher);
             redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
             return Ok(());
@@ -14193,8 +14376,7 @@ fn handle_idle_key(
                 }
             }
             renderer.render(UiLine::ClearTransient);
-            app.buf.text.clear();
-            app.buf.cursor = 0;
+            app.buf.clear_text();
             // NB: `app.buf.clear_pastes()` is deferred until AFTER the
             // submit path calls `expand_pastes(&line)` — wiping the
             // paste Vec here used to leave `expand_pastes` with
@@ -16224,8 +16406,7 @@ fn handle_streaming_key(
                 return Ok(());
             }
             KeyCode::Esc => {
-                app.buf.text.clear();
-                app.buf.cursor = 0;
+                app.buf.clear_text();
                 app.menu.selected = 0;
                 draw_spinner_now(
                     &mut app.state,
@@ -16261,8 +16442,9 @@ fn handle_streaming_key(
                         .expect("guarded above");
                 let selected_path = items[app.menu.selected].0.clone();
                 let replacement = file_index::format_at_mention_replacement(&selected_path);
-                app.buf.text.replace_range(at_pos..end, &replacement);
-                app.buf.cursor = at_pos + replacement.len();
+                let _ = app
+                    .buf
+                    .replace_text_range(at_pos..end, &replacement);
                 app.menu.selected = 0;
                 // Menu shape may have changed — surface on next redraw via
                 // draw_spinner_now (the streaming footer stays visible).
@@ -16289,8 +16471,7 @@ fn handle_streaming_key(
                 if let Some((completed, submit)) =
                     streaming_top_level_slash_selection(&app.buf.text, &name, needs_args, code)
                 {
-                    app.buf.text = completed;
-                    app.buf.cursor = app.buf.text.len();
+                    app.buf.replace_all_text(completed);
                     app.menu.selected = 0;
                     if !submit {
                         draw_spinner_now(
@@ -16438,8 +16619,7 @@ fn handle_streaming_key(
                     app.think.reset();
                     app.reasoning_buffer.clear();
                 }
-                app.buf.text.clear();
-                app.buf.cursor = 0;
+                app.buf.clear_text();
                 app.menu.selected = 0;
                 if readonly {
                     // Restore the streaming footer/spinner after executing the report.
@@ -16466,8 +16646,7 @@ fn handle_streaming_key(
                     "  (slash commands are disabled while a turn is running)\n".into(),
                 ));
                 renderer.flush();
-                app.buf.text.clear();
-                app.buf.cursor = 0;
+                app.buf.clear_text();
                 app.menu.selected = 0;
                 draw_spinner_now(
                     &mut app.state,
@@ -16571,8 +16750,7 @@ fn handle_streaming_key(
                     renderer.render(UiLine::CommandOutput(format!("  ↳ queued: {}\n", line)));
                 }
             }
-            app.buf.text.clear();
-            app.buf.cursor = 0;
+            app.buf.clear_text();
             app.buf.clear_pastes();
             renderer.flush();
             draw_spinner_now(
@@ -23979,8 +24157,7 @@ fn handle_agent_event(
             // user sees blank space where their text should be (bug report:
             // "多张图片发送后丢失文字，只保留了最后一张").
             if let Some(restore) = state.last_submitted_message.take() {
-                buf.text = restore;
-                buf.cursor = buf.text.len();
+                buf.replace_all_text(restore);
             }
             //
             // Hash table is rebuilt as best-effort: we hash the base64
@@ -24005,8 +24182,7 @@ fn handle_agent_event(
                 // positions alongside the user's text.
                 let marker_text = format!("[Image #{}]", marker);
                 if !buf.text.contains(&marker_text) {
-                    buf.text.insert_str(buf.cursor, &marker_text);
-                    buf.cursor += marker_text.len();
+                    buf.insert_at_cursor(&marker_text);
                 }
             }
             // Don't redraw — TUI is in Streaming phase here (turn isn't
