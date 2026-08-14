@@ -3057,6 +3057,8 @@ pub enum ChatEvent {
         tokens: usize,
         tool_calls: usize,
         session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stats: Option<TurnStatsWire>,
         /// Native runtime terminal reason. Additive so older clients can keep
         /// treating `done` as before while newer clients distinguish success,
         /// cancellation, safety fuses, provider failure, and timeouts.
@@ -3123,6 +3125,29 @@ pub enum ChatEvent {
         #[serde(default)]
         server_message: Option<String>,
     },
+}
+
+#[derive(Debug, Serialize)]
+pub struct TurnStatsWire {
+    duration_ms: u64,
+    rounds: usize,
+    tool_calls: usize,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    cached_tokens: usize,
+}
+
+impl From<atomcode_coding::RuntimeTurnStats> for TurnStatsWire {
+    fn from(stats: atomcode_coding::RuntimeTurnStats) -> Self {
+        Self {
+            duration_ms: stats.duration.as_millis().min(u128::from(u64::MAX)) as u64,
+            rounds: stats.turn_count,
+            tool_calls: stats.tool_call_count,
+            prompt_tokens: stats.prompt_tokens,
+            completion_tokens: stats.completion_tokens,
+            cached_tokens: stats.cached_tokens,
+        }
+    }
 }
 
 pub(crate) fn stop_reason_wire(reason: atomcode_kernel::event::StopReason) -> &'static str {
@@ -3230,6 +3255,27 @@ mod chat_event_type_tests {
             }]
         ));
         assert_eq!(projector.total_tokens, 12);
+    }
+
+    #[test]
+    fn turn_stats_wire_keeps_runtime_totals() {
+        let stats = atomcode_coding::RuntimeTurnStats {
+            duration: std::time::Duration::from_millis(10_700),
+            turn_count: 2,
+            tool_call_count: 3,
+            prompt_tokens: 120,
+            completion_tokens: 30,
+            cached_tokens: 90,
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(super::TurnStatsWire::from(stats)).unwrap();
+        assert_eq!(json["duration_ms"], 10_700);
+        assert_eq!(json["rounds"], 2);
+        assert_eq!(json["tool_calls"], 3);
+        assert_eq!(json["prompt_tokens"], 120);
+        assert_eq!(json["completion_tokens"], 30);
+        assert_eq!(json["cached_tokens"], 90);
     }
 
     #[test]
@@ -3792,10 +3838,11 @@ impl ChatRuntimeProjector {
                 }
                 self.terminal_seen = true;
                 self.terminal_reason = Some(reason);
-                if let Some(usage) = stats.last_usage {
+                if let Some(usage) = stats.last_usage.as_ref() {
                     self.total_tokens = (usage.tokens.prompt + usage.tokens.completion) as usize;
                 }
                 self.tool_call_count = self.tool_call_count.max(stats.tool_call_count);
+                let stats = TurnStatsWire::from(stats);
 
                 let mut events = Vec::new();
                 if let Some(event) = self.finish() {
@@ -3805,6 +3852,7 @@ impl ChatRuntimeProjector {
                     tokens: self.total_tokens,
                     tool_calls: self.tool_call_count,
                     session_id: permission_session_id.to_string(),
+                    stats: Some(stats),
                     stop_reason: Some(stop_reason_wire(reason).to_string()),
                     message: self.last_error.clone(),
                 });
@@ -4185,6 +4233,7 @@ async fn finalize_chat_task(
                     tokens: 0,
                     tool_calls: 0,
                     session_id,
+                    stats: None,
                     stop_reason: Some("internal_error".into()),
                     message: Some("chat task failed".into()),
                 });

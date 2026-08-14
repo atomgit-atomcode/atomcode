@@ -715,6 +715,8 @@ pub(crate) enum LiveWireEvent {
         stop_reason: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stats: Option<crate::TurnStatsWire>,
     },
     #[serde(rename = "error")]
     Error { message: String },
@@ -856,6 +858,7 @@ impl NativeLiveWireProjector {
                     running: true,
                     stop_reason: None,
                     message: None,
+                    stats: None,
                 },
                 Kernel::TextDelta(content) => LiveWireEvent::TextDelta { content },
                 Kernel::Reasoning(content) => LiveWireEvent::ReasoningDelta { content },
@@ -992,20 +995,22 @@ impl NativeLiveWireProjector {
             crate::live_hub::LiveViewEvent::Runtime(Runtime::TurnFinished(completion)) => {
                 self.tools.clear();
                 match completion {
-                    atomcode_coding::TurnCompletion::Completed { reason, .. } => {
+                    atomcode_coding::TurnCompletion::Completed { reason, stats, .. } => {
                         LiveWireEvent::State {
                             running: false,
                             stop_reason: Some(crate::stop_reason_wire(reason).to_string()),
                             message: None,
+                            stats: Some(stats.into()),
                         }
                     }
-                    atomcode_coding::TurnCompletion::SnapshotUnavailable { error, .. } => {
-                        LiveWireEvent::State {
-                            running: false,
-                            stop_reason: Some("snapshot_unavailable".into()),
-                            message: Some(error.message),
-                        }
-                    }
+                    atomcode_coding::TurnCompletion::SnapshotUnavailable {
+                        error, stats, ..
+                    } => LiveWireEvent::State {
+                        running: false,
+                        stop_reason: Some("snapshot_unavailable".into()),
+                        message: Some(error.message),
+                        stats: Some(stats.into()),
+                    },
                 }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ModeChanged { mode }) => {
@@ -1081,6 +1086,7 @@ impl NativeLiveWireProjector {
                         exit.reason,
                         if exit.forced { " (forced)" } else { "" }
                     )),
+                    stats: None,
                 }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {

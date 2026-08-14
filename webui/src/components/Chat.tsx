@@ -27,7 +27,7 @@
 
 import { VNode } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, postLiveCompact, postLiveUserInput, postChatUserInput, postLivePolicyInterventionResolution, type CommandResult, UserInputRequestEvent, type PolicyInterventionEvent } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, postLiveCompact, postLiveUserInput, postChatUserInput, postLivePolicyInterventionResolution, type CommandResult, UserInputRequestEvent, type PolicyInterventionEvent, type TurnStats } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -83,6 +83,7 @@ import {
   type PendingLiveSteer,
 } from '../lib/liveSteer';
 import { hasCoarsePointer, shouldSendComposerOnEnter } from '../lib/composerKeyboard';
+import { formatTurnDuration, formatTurnTokens, turnCacheHit } from '../lib/turnStats';
 
 interface Message {
   role: 'user' | 'assistant' | 'system';
@@ -498,6 +499,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     pushCommandNotice(t('chat.steerRecovered'));
   }
   const [tokens, setTokens] = useState<TokenUsage | null>(null);
+  const [turnStats, setTurnStats] = useState<TurnStats | null>(null);
   const [historyHint, setHistoryHint] = useState<string | null>(null);
   // Auxiliary persistence failures belong to application chrome, not the
   // assistant transcript. Replacing this value also deduplicates repeated
@@ -717,6 +719,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       setSearch('');
       setMatchIdx(0);
       setTokens(null);
+      setTurnStats(null);
       setHistoryHint(null);
       setPersistenceWarning(null);
       // 切到一个有 id 的会话 → 进入「加载中」，先抑制落地页（避免闪屏）；
@@ -848,6 +851,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const scrollToBottom = (behavior: ScrollBehavior = 'auto') => {
     atBottomRef.current = true;
     setShowJumpBtn(false);
+    // Completion stats belong to the previous turn. Clear them as soon as a
+    // new message is actually delivered so stale data is never shown while
+    // the next turn is running or after an early transport failure.
+    setTurnStats(null);
     bottomRef.current?.scrollIntoView({ behavior });
   };
 
@@ -1266,6 +1273,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setMatchIdx(0);
         setSearchOpen(false);
         setTokens(null);
+        setTurnStats(null);
         setHistoryHint(null);
         setPersistenceWarning(null);
       }
@@ -1322,6 +1330,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         });
         liveLifecycleRef.current = lifecycle.state;
         setBusy(lifecycle.state.running);
+        if (e.running) setTurnStats(null);
+        else if (e.stats) setTurnStats(e.stats);
         const terminal = lifecycle.terminal;
         if (terminal) {
           if (terminal.discardQueued) {
@@ -1928,6 +1938,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         }
         transitionChatRecovery({ type: 'authoritative_terminal' });
         setBusy(false);
+        if (event.stats) setTurnStats(event.stats);
         onPermissionResolved?.(null); // 回合结束：兜底清掉任何残留审批卡片
         setUserInputReq(null);
         if (event.stop_reason !== 'policy_denied') setPolicyIntervention(null);
@@ -2886,6 +2897,22 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     </div>
   );
 
+  const cacheHit = turnStats ? turnCacheHit(turnStats) : null;
+  const turnStatsText = turnStats ? [
+    t('stats.counts', { rounds: turnStats.rounds, tools: turnStats.tool_calls }),
+    t('stats.duration', { duration: formatTurnDuration(turnStats.duration_ms) }),
+    cacheHit !== null ? t('stats.cacheHit', { percent: cacheHit }) : null,
+    t('stats.tokens', {
+      input: formatTurnTokens(turnStats.prompt_tokens),
+      output: formatTurnTokens(turnStats.completion_tokens),
+    }),
+  ].filter((part): part is string => part !== null).join(' · ') : null;
+  const turnStatsLine = turnStats && (
+    <div class="turn-stats" role="status">
+      {turnStatsText}
+    </div>
+  );
+
   // 文件选择器模态（落地态与常规态共用一份）。
   const filePickerModal = showFilePicker && (
     <FilePicker
@@ -3278,6 +3305,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         <div class="input-wrap">
           {inputBox}
           {inputSubbar}
+          {turnStatsLine}
         </div>
       </div>
       {filePickerModal}

@@ -941,7 +941,7 @@ body {
 .persistence-warning {
   flex-shrink: 0;
   width: calc(100% - 48px);
-  max-width: var(--app-content-max-width);
+  max-width: var(--app-composer-max-width);
   box-sizing: border-box;
   margin: 0 auto;
   display: flex;
@@ -976,7 +976,7 @@ body {
 /* Centered responsive input column (input box + cwd breadcrumb below it; see --app-content-max-width). */
 .input-wrap {
   width: 100%;
-  max-width: var(--app-content-max-width);
+  max-width: var(--app-composer-max-width);
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -1000,6 +1000,18 @@ body {
   text-overflow: ellipsis;
   flex-shrink: 0;
   opacity: 0.9;
+}
+.turn-stats {
+  display: block;
+  min-width: 0;
+  padding: 0 4px;
+  overflow: hidden;
+  color: var(--app-secondary-foreground);
+  font-size: 11px;
+  line-height: 16px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  text-align: center;
 }
 
 /* cwd breadcrumb chip (relocated below the input box). */
@@ -1156,9 +1168,9 @@ body {
 
 /* === Sidebar / session list === */
 .session-list {
-  /* 侧栏随视口适度放宽：≤~1600px 维持 260px 不变，大屏逐步放宽至 320px，
-     避免在 2560px 等大屏上侧栏显得过窄、与主区比例失衡。 */
-  width: clamp(260px, 15vw, 320px);
+  /* Desktop ratio follows DeepSeek Harness: roughly 18% of the viewport,
+     bounded so ordinary laptops and ultrawide displays both stay balanced. */
+  width: clamp(280px, 18vw, 320px);
   /* 暖色二级背景（比主区略深），与主区形成柔和分层（对齐设计）。 */
   background: var(--app-secondary-background);
   border-right: 1px solid var(--app-primary-border-color);
@@ -2946,7 +2958,7 @@ body {
 
 .landing-inner {
   width: 100%;
-  max-width: var(--app-content-max-width);
+  max-width: var(--app-composer-max-width);
   display: flex;
   flex-direction: column;
   align-items: center;
