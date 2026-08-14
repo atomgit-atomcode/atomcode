@@ -167,6 +167,14 @@ docker compose -f docker/docker-compose.yml up -d
 curl http://localhost:13456/health
 ```
 
+> **安全提示**：daemon 暴露聊天、文件编辑、工具执行等敏感端点，镜像默认无鉴权。
+> compose 端口默认仅绑定 `127.0.0.1`（本机访问）。如需从局域网/NAS 访问，用
+> `BIND_ADDR` 显式放开，并务必先部署反向代理 + TLS + token 鉴权：
+>
+> ```bash
+> BIND_ADDR=0.0.0.0 docker compose -f docker/docker-compose.yml up -d
+> ```
+
 ### 常用 compose 命令
 
 ```bash

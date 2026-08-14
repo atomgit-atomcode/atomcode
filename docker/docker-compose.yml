@@ -16,6 +16,12 @@
 #   - 首次使用需先执行 ./scripts/release.sh 生成 Linux 二进制到 dist/，再执行 build；
 #   - 若使用已推送的预构建镜像，可把下方 build 段替换为 image 段（见注释）；
 #   - NAS 上多架构（如 arm64）建议使用 buildx 构建对应平台镜像后改用 image 方式。
+#
+# ⚠️ 安全警告:
+#   daemon 暴露了聊天、文件编辑、工具执行等敏感端点，且本镜像默认无鉴权。
+#   端口默认仅绑定 127.0.0.1（本机访问）；如需从局域网/公网访问，请通过
+#   BIND_ADDR 显式放开，并务必在前方部署反向代理 + TLS + token 鉴权。
+#   例如: BIND_ADDR=0.0.0.0 docker compose -f docker/docker-compose.yml up -d
 
 services:
   atomcode-daemon:
@@ -28,11 +34,14 @@ services:
     # 方式二：使用预构建镜像（构建并推送到镜像仓库后启用，替换上面的 build 段）
     # image: swr.cn-north-4.myhuaweicloud.com/gitcode-be/atomcode-daemon:latest
 
-    # 容器内默认绑定 127.0.0.1，必须显式指定 --host 0.0.0.0 才能在容器外访问
+    # 容器内默认绑定 127.0.0.1，必须显式指定 --host 0.0.0.0 才能在容器外访问；
+    # 宿主侧的对外暴露则由 ports 的 BIND_ADDR 控制（默认仅本机，见上方安全警告）
     command: ["--host", "0.0.0.0", "--port", "13456"]
 
     ports:
-      - "13456:13456"
+      # 默认仅本机可访问；局域网/NAS 场景用 BIND_ADDR 放开，例如:
+      #   BIND_ADDR=0.0.0.0 docker compose -f docker/docker-compose.yml up -d
+      - "${BIND_ADDR:-127.0.0.1}:13456:13456"
 
     volumes:
       # 配置、会话等数据目录（config.toml 放在 docker/data/ 下）
