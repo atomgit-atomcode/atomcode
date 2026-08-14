@@ -393,6 +393,16 @@ pub fn display_width(s: &str) -> usize {
     s.graphemes(true).map(cluster_width).sum()
 }
 
+/// Width available to the composer's editable text after its prompt prefix.
+///
+/// JediTerm needs one additional empty trailing column because writing a glyph
+/// into its last column can trigger a terminal-side wrap on top of our explicit
+/// wrapping. Keep this calculation shared by the event loop's visual navigation
+/// and the retained renderer so resize can never leave them one column apart.
+pub(crate) fn composer_text_width(terminal_cols: usize, jediterm: bool) -> usize {
+    terminal_cols.saturating_sub(if jediterm { 3 } else { 2 })
+}
+
 /// Terminal column width of a string, using the **renderer's** width model
 /// that treats `\t` as [`SOFT_TAB_WIDTH`] display columns. Use this for
 /// line-width comparisons in visual navigation ([`cursor_visual_up`] /
@@ -1153,6 +1163,14 @@ mod tests {
         assert_eq!(spans.len(), 2);
         assert_eq!(row, 1);
         assert_eq!(col, tab_w * 2 + 2);
+    }
+
+    #[test]
+    fn composer_text_width_matches_terminal_reserve() {
+        assert_eq!(composer_text_width(80, false), 78);
+        assert_eq!(composer_text_width(80, true), 77);
+        assert_eq!(composer_text_width(1, false), 0);
+        assert_eq!(composer_text_width(2, true), 0);
     }
 
     // --- truncate_path tests ---

@@ -11,6 +11,7 @@
 use crate::highlight::theme;
 use crate::terminal::TerminalCaps;
 use std::borrow::Cow;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Parser state maintained across lines of a streamed response.
 #[derive(Clone)]
@@ -1144,23 +1145,10 @@ pub(crate) fn normalize_circled_list_spacing(line: &str) -> Cow<'_, str> {
     normalize_circled_list_spacing_with_cursor(line, 0).0
 }
 
-/// Display-only circled-list spacing plus the corresponding cursor position.
-///
-/// The composer owns a byte cursor into the unmodified input buffer. Synthetic
-/// separator bytes inserted before (or exactly at) that cursor must therefore
-/// advance its display projection, while the source text and submitted payload
-/// remain byte-for-byte unchanged.
-pub(crate) fn normalize_circled_list_spacing_with_cursor(
-    line: &str,
-    cursor_byte: usize,
-) -> (Cow<'_, str>, usize) {
+fn visit_circled_list_separator_offsets(line: &str, mut visit: impl FnMut(usize)) {
     let mut chars = line.char_indices().peekable();
     let mut previous = None;
     let mut in_code = false;
-    let mut output: Option<String> = None;
-    let mut segment_start = 0;
-    let source_cursor = cursor_byte.min(line.len());
-    let mut display_cursor = source_cursor;
 
     while let Some((index, ch)) = chars.next() {
         if ch == '`' {
@@ -1172,17 +1160,36 @@ pub(crate) fn normalize_circled_list_spacing_with_cursor(
                 .peek()
                 .is_some_and(|(_, next)| is_list_label_char(*next))
         {
-            let end = index + ch.len_utf8();
-            let output = output.get_or_insert_with(|| String::with_capacity(line.len() + 1));
-            output.push_str(&line[segment_start..end]);
-            output.push(' ');
-            segment_start = end;
-            if end <= source_cursor {
-                display_cursor += 1;
-            }
+            visit(index + ch.len_utf8());
         }
         previous = Some(ch);
     }
+}
+
+/// Display-only circled-list spacing plus the corresponding cursor position.
+///
+/// The composer owns a byte cursor into the unmodified input buffer. Synthetic
+/// separator bytes inserted before (or exactly at) that cursor must therefore
+/// advance its display projection, while the source text and submitted payload
+/// remain byte-for-byte unchanged.
+pub(crate) fn normalize_circled_list_spacing_with_cursor(
+    line: &str,
+    cursor_byte: usize,
+) -> (Cow<'_, str>, usize) {
+    let mut output: Option<String> = None;
+    let mut segment_start = 0;
+    let source_cursor = cursor_byte.min(line.len());
+    let mut display_cursor = source_cursor;
+
+    visit_circled_list_separator_offsets(line, |end| {
+        let output = output.get_or_insert_with(|| String::with_capacity(line.len() + 1));
+        output.push_str(&line[segment_start..end]);
+        output.push(' ');
+        segment_start = end;
+        if end <= source_cursor {
+            display_cursor += 1;
+        }
+    });
 
     let display = match output {
         Some(mut output) => {
@@ -1192,6 +1199,49 @@ pub(crate) fn normalize_circled_list_spacing_with_cursor(
         None => Cow::Borrowed(line),
     };
     (display, display_cursor)
+}
+
+/// Map a byte cursor in the display-only circled-list projection back to the
+/// nearest grapheme boundary in the original composer buffer.
+///
+/// The retained renderer inserts a synthetic space after list-shaped circled
+/// numbers (for example `①Rust` -> `① Rust`) without changing the submitted
+/// text. Visual Up/Down navigation operates on that projected layout, so its
+/// target cursor must be translated back before updating
+/// [`Buffer`](crate::event_loop::Buffer). A target on either side of a
+/// synthetic space maps to the same source boundary immediately after the
+/// circled number.
+pub(crate) fn source_cursor_from_circled_list_display_cursor(
+    source: &str,
+    display_cursor: usize,
+) -> usize {
+    let mut separator_offsets = Vec::new();
+    visit_circled_list_separator_offsets(source, |offset| separator_offsets.push(offset));
+
+    let mut best_source = 0usize;
+    let mut best_distance = display_cursor;
+    let mut separator_index = 0usize;
+
+    for source_cursor in source
+        .grapheme_indices(true)
+        .map(|(index, _)| index)
+        .chain(std::iter::once(source.len()))
+    {
+        while separator_offsets
+            .get(separator_index)
+            .is_some_and(|offset| *offset <= source_cursor)
+        {
+            separator_index += 1;
+        }
+        let projected_cursor = source_cursor + separator_index;
+        let distance = projected_cursor.abs_diff(display_cursor);
+        if distance < best_distance || (distance == best_distance && source_cursor > best_source) {
+            best_source = source_cursor;
+            best_distance = distance;
+        }
+    }
+
+    best_source
 }
 
 fn is_circled_list_boundary(ch: char) -> bool {
@@ -1738,6 +1788,27 @@ mod tests {
         let (display, cursor) = normalize_circled_list_spacing_with_cursor(source, source.len());
         assert_eq!(display, source);
         assert_eq!(cursor, source.len());
+    }
+
+    #[test]
+    fn circled_list_display_cursor_maps_back_to_source_boundary() {
+        let source = "①Rust";
+        let after_label = '①'.len_utf8();
+
+        // Both sides of the synthetic separator represent the same source
+        // insertion point. Later display positions account for that extra byte.
+        assert_eq!(
+            source_cursor_from_circled_list_display_cursor(source, after_label),
+            after_label
+        );
+        assert_eq!(
+            source_cursor_from_circled_list_display_cursor(source, after_label + 1),
+            after_label
+        );
+        assert_eq!(
+            source_cursor_from_circled_list_display_cursor(source, source.len() + 1),
+            source.len()
+        );
     }
 
     #[test]

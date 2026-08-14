@@ -4190,7 +4190,10 @@ impl Buffer {
         Self {
             text: String::new(),
             cursor: 0,
-            input_width: 80,
+            // The real width is supplied by `run_loop` before interactive
+            // input starts. Until then, disable visual wrapping rather than
+            // guessing 80 columns and changing navigation in non-TUI callers.
+            input_width: 0,
             history_idx: None,
             menu_suppressed: false,
             stash: String::new(),
@@ -4793,8 +4796,10 @@ impl Buffer {
         if max_cols == 0 || self.cursor == 0 {
             return self.cursor_line_up();
         }
+        let (display, display_cursor) =
+            crate::markdown::normalize_circled_list_spacing_with_cursor(&self.text, self.cursor);
         let (spans, cur_row, cur_col) =
-            crate::width::wrap_with_spans(&self.text, max_cols, self.cursor);
+            crate::width::wrap_with_spans(&display, max_cols, display_cursor);
         if cur_row == 0 {
             // Already on first visual line → snap to byte 0.
             // `self.cursor > 0` is guaranteed here: the early return
@@ -4804,10 +4809,14 @@ impl Buffer {
         }
         // Previous visual line: spans[cur_row - 1]
         let (prev_start, prev_end) = spans[cur_row - 1];
-        let prev_text = &self.text[prev_start..prev_end];
+        let prev_text = &display[prev_start..prev_end];
         let prev_width = crate::width::display_width_with_tabs(prev_text);
         let target_col = cur_col.min(prev_width);
-        self.cursor = prev_start + byte_offset_at_col(prev_text, target_col);
+        let display_target = prev_start + byte_offset_at_col(prev_text, target_col);
+        self.cursor = crate::markdown::source_cursor_from_circled_list_display_cursor(
+            &self.text,
+            display_target,
+        );
         true
     }
 
@@ -4819,8 +4828,10 @@ impl Buffer {
         if max_cols == 0 || self.cursor == self.text.len() {
             return self.cursor_line_down();
         }
+        let (display, display_cursor) =
+            crate::markdown::normalize_circled_list_spacing_with_cursor(&self.text, self.cursor);
         let (spans, cur_row, cur_col) =
-            crate::width::wrap_with_spans(&self.text, max_cols, self.cursor);
+            crate::width::wrap_with_spans(&display, max_cols, display_cursor);
         // Cursor is on the last visual line: no next span to jump to.
         // Fall back to logical-line down, which snaps to `text.len()`
         // (returning `true`) so the next Down falls through to
@@ -4830,10 +4841,14 @@ impl Buffer {
         }
         // Next visual line: spans[cur_row + 1]
         let (next_start, next_end) = spans[cur_row + 1];
-        let next_text = &self.text[next_start..next_end];
+        let next_text = &display[next_start..next_end];
         let next_width = crate::width::display_width_with_tabs(next_text);
         let target_col = cur_col.min(next_width);
-        self.cursor = next_start + byte_offset_at_col(next_text, target_col);
+        let display_target = next_start + byte_offset_at_col(next_text, target_col);
+        self.cursor = crate::markdown::source_cursor_from_circled_list_display_cursor(
+            &self.text,
+            display_target,
+        );
         true
     }
 }
@@ -6903,6 +6918,29 @@ mod menu_tests {
     }
 
     #[test]
+    fn buffer_starts_with_visual_navigation_disabled_until_geometry_is_known() {
+        assert_eq!(Buffer::new().input_width, 0);
+    }
+
+    #[test]
+    fn cursor_visual_navigation_matches_circled_label_display_projection() {
+        let mut buf = Buffer::new();
+        buf.input_width = 4;
+        buf.text = "①Rustabcde".into();
+        // Renderer projection is "① Rustabcde". The cursor after `s` is on
+        // visual row 1, column 1; Up lands immediately after the circled label,
+        // not at byte 0 as the unprojected layout would.
+        buf.cursor = "①Rus".len();
+
+        assert!(buf.cursor_visual_up());
+        assert_eq!(buf.cursor, '①'.len_utf8());
+        assert_eq!(
+            buf.text, "①Rustabcde",
+            "display spacing must stay ephemeral"
+        );
+    }
+
+    #[test]
     fn history_next_back_to_stash_restores_cursor_to_end() {
         let mut buf = Buffer::new();
         let reg = CommandRegistry::builtin();
@@ -8500,8 +8538,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // (Without this, Buffer defaults to 80 cols and wraps differently from
     // any terminal that isn't exactly 82 columns wide.)
     if let Ok((cols, _)) = crossterm::terminal::size() {
-        let reserve: usize = if ctx.caps.jediterm { 3 } else { 2 };
-        app.buf.input_width = (cols as usize).saturating_sub(reserve);
+        app.buf.input_width = crate::width::composer_text_width(cols as usize, ctx.caps.jediterm);
     }
 
     crate::tuix_trace!(
@@ -11619,8 +11656,8 @@ fn handle_input(
             // navigation uses the new geometry. Account for the "> "
             // prompt prefix (2 cols normally, 3 on JediTerm for the
             // right-edge reserve that its paint layer requires).
-            let reserve: usize = if ctx.caps.jediterm { 3 } else { 2 };
-            app.buf.input_width = (cols as usize).saturating_sub(reserve);
+            app.buf.input_width =
+                crate::width::composer_text_width(cols as usize, ctx.caps.jediterm);
             // A resize invalidates any open modal's cached overlay
             // geometry (it was built for the old size). Rebuild it now so
             // the window re-centres at the new dimensions instead of

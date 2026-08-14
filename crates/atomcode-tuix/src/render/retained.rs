@@ -4124,8 +4124,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // (wide CJK) glyph, colliding that soft-wrap with our own explicit wrap
         // and duplicating/garbling the row. Keeping the last column empty means
         // no glyph ever reaches the edge, so JediTerm never auto-wraps.
-        let prefix_and_reserve = if self.caps.jediterm { 3 } else { 2 };
-        let text_budget = input_rule_width.saturating_sub(prefix_and_reserve);
+        let text_budget = crate::width::composer_text_width(input_rule_width, self.caps.jediterm);
 
         // Wrap input + locate cursor in wrapped layout.
         let ghost_active = self.input_buf.is_empty()
@@ -5207,9 +5206,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Mirror paint_footer: input box is full-width (only "> " prefix), with
         // the same JediTerm last-column reserve so the wrapped ROW COUNT here
         // matches the actual render (else body_bottom is off by a row).
-        let prefix_and_reserve = if self.caps.jediterm { 3 } else { 2 };
         let screen_width = self.screen.width() as usize;
-        let text_budget = screen_width.saturating_sub(prefix_and_reserve);
+        let text_budget = crate::width::composer_text_width(screen_width, self.caps.jediterm);
         let rule_width = screen_width.saturating_sub(PAD_COL * 2);
         let safe = if self.input_buf.is_empty() {
             self.status
