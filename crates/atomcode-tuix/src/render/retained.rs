@@ -18750,6 +18750,69 @@ mod tests {
         );
     }
 
+    /// Regression: a web-search summary containing CJK prose plus long English
+    /// identifiers used to draw a full Unicode box right up to the Windows
+    /// PowerShell/ConPTY edge. Hosts that painted ambiguous box glyphs wide then
+    /// wrapped/overwrote the row, making the start of the answer look truncated.
+    #[test]
+    fn retained_web_search_summary_table_stays_inside_viewport_without_box_borders() {
+        let width = 72u16;
+        let (mut r, _buf) = new_capturing(width, 24);
+        r.render(UiLine::ToolCall {
+            name: "web_search".into(),
+            detail: "Agora CLI multi-agent debate terminal moderator consensus github".into(),
+        });
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: "sources: github.com, npmjs.com +2".into(),
+            diff_stats: None,
+        });
+        r.render(UiLine::AssistantText(
+            "汇总结果如下：\n\
+             | 项目 | 定位 | 状态 |\n\
+             | --- | --- | --- |\n\
+             | Agora CLI multi-agent debate | terminal moderator and consensus workflow | 已验证 |\n\
+             | another-long-project-identifier | coordinates several independent agents | 可用 |\n\
+             以上信息已完整保留。\n"
+                .into(),
+        ));
+
+        let lines: Vec<String> = r
+            .body_lines
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect())
+            .collect();
+        assert!(
+            r.body_lines
+                .iter()
+                .all(|row| row.len() <= usize::from(width)),
+            "retained row exceeded viewport {width}: {lines:#?}"
+        );
+        let visible = lines.join("\n");
+        let compact_visible = visible.replace(' ', "");
+        let separators: Vec<&str> = lines
+            .iter()
+            .map(|line| line.trim())
+            .filter(|line| line.len() >= 3 && line.bytes().all(|byte| byte == b'-'))
+            .collect();
+        assert!(!separators.is_empty(), "table separator missing: {lines:#?}");
+        assert!(
+            separators
+                .iter()
+                .all(|line| line.len() < usize::from(width)),
+            "table separator consumed the right-side guard: {separators:?}"
+        );
+        assert!(compact_visible.contains("汇总结果如下"));
+        assert!(visible.contains("Agora CLI"));
+        assert!(visible.contains("another-long-project-iden"));
+        assert!(visible.contains("tifier"));
+        assert!(compact_visible.contains("以上信息已完整保留"));
+        assert!(
+            !visible.contains('│') && !visible.contains('┼'),
+            "ambiguous-width vertical box glyph leaked: {visible}"
+        );
+    }
+
     #[test]
     fn retained_message_marks_decremented_on_drain() {
         let (mut r, _buf) = new_capturing(80, 24);
