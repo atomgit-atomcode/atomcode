@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>Notification API 探针</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; color: #1f2328; }
+  h1 { font-size: 20px; }
+  pre { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow-x: auto; }
+  button { margin: 6px 6px 6px 0; padding: 8px 14px; border: 1px solid #d0d7de; border-radius: 6px; background: #fff; cursor: pointer; }
+  button:hover { background: #f3f4f6; }
+  .ok { color: #1a7f37; } .bad { color: #cf222e; } .warn { color: #9a6700; }
+</style>
+</head>
+<body>
+<h1>浏览器通知能力探针（Notification API Probe）</h1>
+<p>用途：验证 localhost secure context 下 Web Notification API 的权限流与弹窗行为，
+与 atomcode 代码无关。用任意 localhost 静态服务器托管本页即可：
+<code>python3 -m http.server 8080</code> 后访问 <code>http://127.0.0.1:8080/scripts/notify-probe.html</code>。</p>
+
+<h2>环境检查</h2>
+<pre id="env">加载中…</pre>
+
+<h2>操作</h2>
+<button id="perm">① 请求通知权限</button>
+<button id="notify1">② 弹通知（tag: probe-1）</button>
+<button id="notify2">③ 弹通知（tag: probe-2，验证不同 tag 并存）</button>
+<button id="notifySame">④ 再弹 tag: probe-1（验证同 tag 覆盖）</button>
+<p>验证要点：<b>切到其他应用/标签页让本页变后台</b>再点②～④，系统应弹出通知；
+点击通知应聚焦本页。localhost（127.0.0.1）是 secure context，Notification API 可用；
+若通过 LAN IP（http://192.168.x.x）访问，本探针会提示不可用——与 webui 行为一致。</p>
+
+<script>
+  const env = document.getElementById('env');
+  function render() {
+    const lines = [
+      `location.origin        = ${location.origin}`,
+      `isSecureContext        = ${window.isSecureContext}`,
+      `'Notification' in win  = ${'Notification' in window}`,
+      `Notification.permission= ${'Notification' in window ? Notification.permission : 'N/A'}`,
+    ];
+    env.textContent = lines.join('\n');
+  }
+  render();
+
+  document.getElementById('perm').addEventListener('click', async () => {
+    if (!('Notification' in window)) { alert('此浏览器无 Notification API'); return; }
+    const result = await Notification.requestPermission();
+    alert(`requestPermission → ${result}`);
+    render();
+  });
+
+  function show(title, options) {
+    if (!('Notification' in window)) { alert('此浏览器无 Notification API'); return; }
+    if (!window.isSecureContext) { alert('非 secure context（如 LAN IP HTTP），Notification 不可用'); return; }
+    if (Notification.permission !== 'granted') { alert('未授权：先点「① 请求通知权限」'); return; }
+    const n = new Notification(title, options);
+    n.onclick = () => { window.focus(); n.close(); };
+  }
+
+  document.getElementById('notify1').addEventListener('click', () =>
+    show('AtomCode done', { body: 'Done · 60.0s · probe-1', tag: 'probe-1', icon: '/favicon.png' }));
+  document.getElementById('notify2').addEventListener('click', () =>
+    show('AtomCode done', { body: 'Done · probe-2', tag: 'probe-2' }));
+  document.getElementById('notifySame').addEventListener('click', () =>
+    show('AtomCode done', { body: '覆盖版 · probe-1', tag: 'probe-1' }));
+</script>
+</body>
+</html>

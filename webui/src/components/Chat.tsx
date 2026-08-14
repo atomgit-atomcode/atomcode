@@ -83,6 +83,7 @@ import {
   type PendingLiveSteer,
 } from '../lib/liveSteer';
 import { hasCoarsePointer, shouldSendComposerOnEnter } from '../lib/composerKeyboard';
+import { disposeNotifications, maybeNotifyTurnFinished } from '../lib/notifications';
 
 interface Message {
   role: 'user' | 'assistant' | 'system';
@@ -440,6 +441,27 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     busyRef.current = next;
     setBusyState(next);
   }
+  // 回合开始时刻（本 tab 主动 submit 时记录；live 恢复/重放不得重置），
+  // 用于 min_duration 过滤与通知正文时长；终态事件计算后即清空。
+  const turnStartedAtRef = useRef<number | null>(null);
+  function finishTurnNotification(info: {
+    stopReason?: string;
+    sessionId?: string;
+    message?: string;
+  }) {
+    const durationMs =
+      turnStartedAtRef.current !== null ? Date.now() - turnStartedAtRef.current : undefined;
+    console.warn('[webui-notify] Chat 终态事件到达 → finishTurnNotification', {
+      info,
+      durationMs,
+      sync: syncRef.current,
+      activeSession: activeIdRef.current,
+      liveSession: liveSessionIdRef.current,
+      busy: busyRef.current,
+    });
+    turnStartedAtRef.current = null;
+    maybeNotifyTurnFinished({ ...info, durationMs });
+  }
   const [chatRecovery, setChatRecovery] = useState<ChatRecoveryState>('ready');
   const chatRecoveryRef = useRef<ChatRecoveryState>('ready');
   chatRecoveryRef.current = chatRecovery;
@@ -698,6 +720,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         detachedController?.abort();
       }
       liveLifecycleRef.current = createLiveLifecycleState();
+      turnStartedAtRef.current = null;
+      disposeNotifications();
       setBusy(false);
       setQueued([]);
       setLivePending(null);
@@ -1346,6 +1370,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           setLivePending(null);
           setUserInputReq(null);
           if (e.stop_reason !== 'policy_denied') setPolicyIntervention(null);
+          // 回合结束：计算通知信息并触发浏览器提醒（若守卫通过）。
+          finishTurnNotification({
+            stopReason: e.stop_reason,
+            sessionId: liveSessionIdRef.current ?? undefined,
+            message: e.message,
+          });
           // turn 完成后 session 已落盘，通知 App 刷新侧栏列表。
           onLiveTurnDone?.();
         }
@@ -1931,6 +1961,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         onPermissionResolved?.(null); // 回合结束：兜底清掉任何残留审批卡片
         setUserInputReq(null);
         if (event.stop_reason !== 'policy_denied') setPolicyIntervention(null);
+        finishTurnNotification({
+          stopReason: event.stop_reason,
+          sessionId: event.session_id,
+          message: event.message,
+        });
         break;
       }
 
@@ -1940,6 +1975,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setQueued([]); // 用户中止：丢弃排队消息（对齐 VSCode 插件）
         onPermissionResolved?.(null);
         setUserInputReq(null);
+        finishTurnNotification({
+          stopReason: 'cancelled',
+          sessionId: activeIdRef.current ?? undefined,
+        });
         break;
 
       case 'error':
@@ -1949,6 +1988,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setQueued([]); // 出错：丢弃排队消息
         onPermissionResolved?.(null);
         setUserInputReq(null);
+        finishTurnNotification({
+          stopReason: 'error',
+          sessionId: activeIdRef.current ?? undefined,
+          message: event.message,
+        });
         break;
 
       case 'warning':
@@ -2063,6 +2107,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       //    case via `pendingSelfEchoRef`.
       const steering = busyRef.current;
       setBusy(true);
+      // 回合起点只记录一次（steer 不重置）：供终态通知计算 durationMs。
+      if (turnStartedAtRef.current === null) turnStartedAtRef.current = Date.now();
       const now = Date.now();
       const pendingSteer: PendingLiveSteer = {
         id: crypto.randomUUID(),
@@ -2150,6 +2196,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
     // ── Normal path ──
     setBusy(true);
+    // 回合起点只记录一次：供终态通知计算 durationMs。
+    if (turnStartedAtRef.current === null) turnStartedAtRef.current = Date.now();
     // 消息发出后延迟刷新侧栏列表，给后端落盘时间；
     // done 事件中 onSessionId 会再刷一次确保更新。
     setTimeout(() => onLiveTurnDone?.(), 200);

@@ -289,6 +289,16 @@ function ModelGlyph() {
   );
 }
 
+/** Bell glyph (completion notifications). */
+function BellGlyph() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M8 2.5c-2.2 0-3.8 1.7-3.8 3.8v2.2l-1.2 1.7h10l-1.2-1.7V6.3c0-2.1-1.6-3.8-3.8-3.8z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
+      <path d="M6.4 11.8a1.7 1.7 0 0 0 3.2 0" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" />
+    </svg>
+  );
+}
+
 export function Sidebar({
   activeSessionId,
   onSelect,
@@ -866,6 +876,11 @@ export function Sidebar({
         <button class="item-menu-row" onClick={() => chooseSettings('model')}>
           <ModelGlyph />
           <span>{t('settings.menuModel')}</span>
+        </button>
+        {/* 完成通知：浏览器提醒设置，用弹窗 */}
+        <button class="item-menu-row" onClick={() => chooseSettings('notifications')}>
+          <BellGlyph />
+          <span>{t('settings.menuNotifications')}</span>
         </button>
         {/* 远程访问入口已移到侧栏底部栏（见下方 sidebar-bottom 的 Remote Btn）。 */}
 

@@ -18,6 +18,13 @@ import { useSettings, Theme } from '../settings';
 import { Lang } from '../i18n';
 import { ConfirmDialog } from './ConfirmDialog';
 import { Select } from './Select';
+import {
+  loadPrefs,
+  savePrefs,
+  requestNotificationPermission,
+  notificationsSupported,
+  type NotificationPrefs,
+} from '../lib/notifications';
 
 // AtomGit 托管 provider 的 LLM 网关地址；其上下文窗口由平台固定，前端禁止修改。
 const ATOMGIT_BASE_URL = 'https://llm-api.atomgit.com/v1';
@@ -123,6 +130,83 @@ export function LanguageDialog({ onClose }: { onClose: () => void }) {
               {o.label}
             </button>
           ))}
+        </div>
+      </div>
+    </SettingsModal>
+  );
+}
+
+export function NotificationsDialog({ onClose }: { onClose: () => void }) {
+  const { t } = useSettings();
+  const supported = notificationsSupported();
+  const [prefs, setPrefsState] = useState<NotificationPrefs>(() => loadPrefs());
+  const [permission, setPermission] = useState<NotificationPermission>(() =>
+    typeof Notification !== 'undefined' ? Notification.permission : 'denied',
+  );
+
+  function setPrefs(next: NotificationPrefs) {
+    setPrefsState(next);
+    savePrefs(next);
+  }
+
+  // 用户手势内请求权限：开启开关时若尚未授权，先请求再落库。
+  async function toggleEnabled() {
+    if (!prefs.enabled && permission !== 'granted') {
+      const granted = await requestNotificationPermission();
+      setPermission(granted ? 'granted' : 'denied');
+      if (!granted) return; // 拒绝则不开启，避免“开了但不弹”的静默失效。
+    }
+    setPrefs({ ...prefs, enabled: !prefs.enabled });
+  }
+
+  function setMinDurationSecs(v: string) {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 0) return;
+    setPrefs({ ...prefs, minDurationSecs: Math.floor(n) });
+  }
+
+  return (
+    <SettingsModal title={t('settings.notifications.title')} onClose={onClose}>
+      <div class="field-group">
+        {!supported && (
+          <div class="field-hint">{t('settings.notifications.unsupported')}</div>
+        )}
+        <div class="field-row">
+          <span class="modal-label">{t('settings.notifications.enabled')}</span>
+          <input
+            type="checkbox"
+            checked={prefs.enabled}
+            disabled={!supported}
+            onChange={toggleEnabled}
+          />
+        </div>
+        {prefs.enabled && supported && (
+          <>
+            <div class="field-row">
+              <span class="modal-label">{t('settings.notifications.backgroundOnly')}</span>
+              <input
+                type="checkbox"
+                checked={prefs.backgroundOnly}
+                onChange={() => setPrefs({ ...prefs, backgroundOnly: !prefs.backgroundOnly })}
+              />
+            </div>
+            <div class="field-row">
+              <span class="modal-label">{t('settings.notifications.minDuration')}</span>
+              <input
+                type="number"
+                min={0}
+                step={1}
+                value={prefs.minDurationSecs}
+                disabled={!prefs.enabled}
+                onInput={(e) => setMinDurationSecs((e.target as HTMLInputElement).value)}
+              />
+            </div>
+          </>
+        )}
+        <div class="field-hint">
+          {permission === 'granted' && t('settings.notifications.permissionGranted')}
+          {permission === 'default' && t('settings.notifications.permissionDefault')}
+          {permission === 'denied' && t('settings.notifications.permissionDenied')}
         </div>
       </div>
     </SettingsModal>

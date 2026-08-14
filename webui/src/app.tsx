@@ -4,13 +4,14 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { Chat } from './components/Chat';
 import { Sidebar } from './components/Sidebar';
-import { ThemeDialog, LanguageDialog, ModelConfigDialog, RemoteAccessDialog } from './components/SettingsDialogs';
+import { ThemeDialog, LanguageDialog, ModelConfigDialog, RemoteAccessDialog, NotificationsDialog } from './components/SettingsDialogs';
 import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
 import { PermissionCard } from './components/PermissionCard';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
 import { getProject, getConfig, changeDir, resolveSession, createSession, getSession, SessionMetaWithProject } from './api';
 import { useT, SettingsSection } from './settings';
+import { initNotificationPermissionPrompt } from './lib/notifications';
 import { sessionMessagesToMarkdownLines } from './lib/historyMessages';
 
 // 从 URL (?session=<id>) 读取要打开的会话 id（短 id），用于刷新后恢复。
@@ -142,6 +143,8 @@ export function App() {
 
   // Seed cwd from /project on mount（恢复会话时以会话目录为准，故只在仍为空时填充）
   useEffect(() => {
+    // 首次用户交互时自动请求浏览器通知权限（若开启且未授权）。
+    initNotificationPermissionPrompt();
     let cancelled = false;
     getProject()
       .then((p) => {
@@ -492,6 +495,9 @@ export function App() {
       )}
       {settingsSection === 'remote' && (
         <RemoteAccessDialog onClose={() => setSettingsSection(null)} />
+      )}
+      {settingsSection === 'notifications' && (
+        <NotificationsDialog onClose={() => setSettingsSection(null)} />
       )}
       {pending && <PermissionCard req={pending} onDone={() => setPending((cur: any) => resolvePendingAfterDecision(cur, pending.call_id))} />}
       {headerDialog === 'rename' && activeSession && (

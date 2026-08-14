@@ -9,7 +9,7 @@ import { messages, Lang, MsgKey } from './i18n';
 export type Theme = 'light' | 'dark' | 'system';
 
 /** Which settings dialog to open from the sidebar settings menu. */
-export type SettingsSection = 'theme' | 'language' | 'model' | 'remote';
+export type SettingsSection = 'theme' | 'language' | 'model' | 'remote' | 'notifications';
 
 type TParams = Record<string, string | number>;
 

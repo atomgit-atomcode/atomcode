@@ -133,6 +133,16 @@ pub(crate) struct ConfigResponse {
     pub default_provider: String,
     pub default_workdir: Option<String>,
     pub providers: Vec<ProviderInfo>,
+    /// Sanitized completion-notification config (webui reads it for defaults).
+    pub notifications: NotificationConfigInfo,
+}
+
+/// Sanitized notification config view (subset of `NotificationConfig`).
+#[derive(Debug, Serialize)]
+pub(crate) struct NotificationConfigInfo {
+    pub enabled: bool,
+    pub min_duration_secs: u64,
+    pub bell: bool,
 }
 
 /// Sanitized provider view (no api_key).
