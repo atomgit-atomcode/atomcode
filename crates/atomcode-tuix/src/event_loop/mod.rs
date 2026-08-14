@@ -11769,7 +11769,7 @@ fn handle_transcript_pointer(
             if !reconcile_transcript_selection(state, frame) {
                 *selection = None;
                 publish_transcript_selection(None, publisher);
-                return TranscriptPointerRoute::Handled;
+                return TranscriptPointerRoute::Redraw;
             }
             if let Some(endpoint) = endpoint.filter(|endpoint| {
                 state.surviving_run_ids.contains(&endpoint.run_id)
@@ -11777,7 +11777,7 @@ fn handle_transcript_pointer(
                 state.head = endpoint;
             }
             publish_transcript_selection(selection.as_ref(), publisher);
-            TranscriptPointerRoute::Handled
+            TranscriptPointerRoute::Redraw
         }
         PointerKind::Up => {
             let Some(state) = selection.as_mut().filter(|state| state.dragging) else {
@@ -13008,7 +13008,7 @@ mod tests {
                 &first,
                 Some(HitTarget::TranscriptByte { run_id: 101, byte: 5 }),
             ),
-            super::TranscriptPointerRoute::Handled
+            super::TranscriptPointerRoute::Redraw
         );
 
         let streamed = transcript_frame(
@@ -13144,7 +13144,7 @@ mod tests {
                     byte: "old-b".len(),
                 }),
             ),
-            super::TranscriptPointerRoute::Handled
+            super::TranscriptPointerRoute::Redraw
         );
         publisher.fail_closed();
 

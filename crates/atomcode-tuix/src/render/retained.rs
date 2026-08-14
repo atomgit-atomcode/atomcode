@@ -6302,13 +6302,20 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let start = start.min(bottom);
         let next = if start == bottom { None } else { Some(start) };
         if self.body_scroll_start == next {
+            // TaskRenderer invalidates the old hit map before every queued
+            // viewport command. Even a clamped wheel/top/bottom request must
+            // therefore repaint once and republish the unchanged coordinates;
+            // returning silently here would leave pointer input fail-closed
+            // until some unrelated frame happens to render.
+            self.dirty = true;
+            self.flush_deferred();
             return;
         }
         self.body_scroll_start = next;
         if next.is_none() {
-            // Rows appended while an explicit history view was pinned were not
-            // emitted through the host scrollback path. Rejoin the retained
-            // live tail at its bounded logical start.
+            // Native append/LF continues while an explicit history view is
+            // pinned. Rejoin its retained live-tail projection at the bounded
+            // logical start without replaying any already-emitted row.
             self.scrolled_off = self.scrolled_off.max(bottom);
         }
         self.dirty = true;
@@ -6716,7 +6723,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Unlike the old DECSTBM model we always emit on the first
         // push (no `bottom > 0` short-circuit) because emit_body_line
         // computes its own target row from `body_lines.len()`.
-        if self.body_scroll_start.is_none() && self.next_body_emit_row() > 0 {
+        if self.next_body_emit_row() > 0 {
             self.emit_body_line_inner(&row, 0);
         }
         self.body_lines.push(row);
@@ -6745,6 +6752,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // it consistent or `reflow_welcome_prefix.splice(0..wlc)`
             // would later splice over non-welcome rows.
             self.welcome_line_count = self.welcome_line_count.saturating_sub(drain);
+        }
+        if self.body_scroll_start.is_some() {
+            // The eager append above must still feed the host's native
+            // scrollback, but its LF physically shifts the whole terminal.
+            // Repaint the explicitly pinned projection in the same render
+            // operation so streaming cannot visibly drag the user's history
+            // viewport or leave the footer one row out of place until the
+            // next heartbeat.
+            self.paint_frame();
+            self.flush_frame();
         }
     }
 
@@ -20423,19 +20440,49 @@ mod tests {
         assert_ne!(historical, bottom, "wheel-up must change the painted viewport");
         assert!(buf.lock().unwrap().len() > before, "wheel-up must emit a frame");
 
-        r.render(UiLine::Error("new-tail".into()));
+        buf.lock().unwrap().clear();
+        let appended = 30;
+        for i in 0..appended {
+            r.render(UiLine::Error(format!("pinned-native-{i:02}")));
+            assert_eq!(
+                painted(&r),
+                historical,
+                "native append must immediately restore the pinned viewport: {i}"
+            );
+        }
         r.flush_deferred();
         assert_eq!(
             painted(&r),
             historical,
             "streamed/new history must not steal an explicitly scrolled viewport"
         );
+        let native = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        for i in 0..appended {
+            assert!(
+                native.contains(&format!("pinned-native-{i:02}")),
+                "every row appended while pinned must still enter native scrollback: {i}"
+            );
+        }
+        assert!(
+            native.bytes().filter(|byte| *byte == b'\n').count() >= appended,
+            "each appended row must preserve the append-only LF authority"
+        );
 
         r.scroll_body(10_000);
         let returned = painted(&r);
         assert!(
-            returned.iter().any(|row| row.contains("new-tail")),
+            returned
+                .iter()
+                .any(|row| row.contains("pinned-native-29")),
             "wheel-down must clamp to and reveal the newest tail"
+        );
+
+        let epoch = r.interaction_publisher.invalidate();
+        assert!(r.interaction_publisher.set_worker_authority(epoch, 99));
+        r.scroll_body(10_000);
+        assert!(
+            r.interaction_publisher.snapshot_actionable().is_some(),
+            "a clamped no-op wheel event must repaint and republish current hit coordinates"
         );
     }
 
@@ -20445,6 +20492,10 @@ mod tests {
         r.body_lines = vec![Vec::new(); MAX_SCROLLBACK_ROWS];
         r.scrolled_off = 20;
         r.body_scroll_start = Some(1);
+        // This fixture isolates front-index drain bookkeeping; suppress the
+        // live native-scrollback catch-up that a real retained history has
+        // already completed before it can reach the retention cap.
+        r.initial_history_replay_active = true;
 
         r.push_body_row(Vec::new());
 

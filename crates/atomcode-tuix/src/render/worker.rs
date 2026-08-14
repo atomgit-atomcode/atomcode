@@ -117,13 +117,23 @@ enum RenderCmd {
         surface_session: u64,
     },
     /// Scroll the body viewport by `delta` rows. Negative = up,
-    /// positive = down. RetainedRenderer's append-only path leaves
-    /// scrollback to the host terminal, so this is effectively a
-    /// trait no-op everywhere today.
-    ScrollBody(i32),
+    /// positive = down. Supported mouse terminals use RetainedRenderer's
+    /// bounded application history; unsupported terminals keep native
+    /// scrollback and never route this command.
+    ScrollBody {
+        delta: i32,
+        epoch: u64,
+        surface_session: u64,
+    },
     /// Jump body viewport to absolute top / bottom of scrollback.
-    ScrollBodyToTop,
-    ScrollBodyToBottom,
+    ScrollBodyToTop {
+        epoch: u64,
+        surface_session: u64,
+    },
+    ScrollBodyToBottom {
+        epoch: u64,
+        surface_session: u64,
+    },
     /// Jump body viewport to the prev/next message boundary.
     /// Fire-and-forget — no ACK needed.
     ScrollToPrevMessage,
@@ -361,15 +371,31 @@ impl Renderer for TaskRenderer {
     }
 
     fn scroll_body(&mut self, delta: i32) {
-        let _ = self.cmd_tx.send(RenderCmd::ScrollBody(delta));
+        self.interaction_surface_session = self.interaction_surface_session.saturating_add(1);
+        let epoch = self.invalidate_interactions();
+        let _ = self.cmd_tx.send(RenderCmd::ScrollBody {
+            delta,
+            epoch,
+            surface_session: self.interaction_surface_session,
+        });
     }
 
     fn scroll_body_to_top(&mut self) {
-        let _ = self.cmd_tx.send(RenderCmd::ScrollBodyToTop);
+        self.interaction_surface_session = self.interaction_surface_session.saturating_add(1);
+        let epoch = self.invalidate_interactions();
+        let _ = self.cmd_tx.send(RenderCmd::ScrollBodyToTop {
+            epoch,
+            surface_session: self.interaction_surface_session,
+        });
     }
 
     fn scroll_body_to_bottom(&mut self) {
-        let _ = self.cmd_tx.send(RenderCmd::ScrollBodyToBottom);
+        self.interaction_surface_session = self.interaction_surface_session.saturating_add(1);
+        let epoch = self.invalidate_interactions();
+        let _ = self.cmd_tx.send(RenderCmd::ScrollBodyToBottom {
+            epoch,
+            surface_session: self.interaction_surface_session,
+        });
     }
 
     fn scroll_to_prev_message(&mut self) {
@@ -515,13 +541,32 @@ fn run_worker(
                     t0.elapsed().as_micros()
                 );
             }
-            RenderCmd::ScrollBody(delta) => {
+            RenderCmd::ScrollBody {
+                delta,
+                epoch,
+                surface_session,
+            } => {
+                if let Some(interactions) = &interaction_publisher {
+                    let _ = interactions.set_worker_authority(epoch, surface_session);
+                }
                 inner.scroll_body(delta);
             }
-            RenderCmd::ScrollBodyToTop => {
+            RenderCmd::ScrollBodyToTop {
+                epoch,
+                surface_session,
+            } => {
+                if let Some(interactions) = &interaction_publisher {
+                    let _ = interactions.set_worker_authority(epoch, surface_session);
+                }
                 inner.scroll_body_to_top();
             }
-            RenderCmd::ScrollBodyToBottom => {
+            RenderCmd::ScrollBodyToBottom {
+                epoch,
+                surface_session,
+            } => {
+                if let Some(interactions) = &interaction_publisher {
+                    let _ = interactions.set_worker_authority(epoch, surface_session);
+                }
                 inner.scroll_body_to_bottom();
             }
             RenderCmd::ScrollToPrevMessage => {
@@ -815,6 +860,10 @@ mod tests {
             let _ = self.published.send(published);
         }
 
+        fn scroll_body(&mut self, _delta: i32) {
+            self.flush_deferred();
+        }
+
         fn flush(&mut self) {}
         fn shutdown(&mut self) {}
         fn reset(&mut self) {}
@@ -888,6 +937,64 @@ mod tests {
         assert_eq!(frame.surface_session, 2);
         assert_eq!(frame.hit(7, 1), Some(HitTarget::MenuItem { index: 1 }));
         renderer.shutdown();
+    }
+
+    #[test]
+    fn queued_scroll_immediately_closes_stale_interactions_and_reopens_after_paint() {
+        let interactions = InteractionPublisher::default();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (published_tx, published_rx) = mpsc::channel();
+        let gate = Arc::new((Mutex::new((0, 0)), Condvar::new()));
+        let inner = Box::new(BlockingInteractionRenderer {
+            interactions: interactions.clone(),
+            entered: entered_tx,
+            published: published_tx,
+            gate: gate.clone(),
+        });
+        let mut renderer = TaskRenderer::new_with_interactions(inner, interactions.clone());
+
+        renderer.render(UiLine::User("blocked worker".into()));
+        let entered = entered_rx.recv_timeout(Duration::from_secs(1));
+        let surface_session = interactions
+            .worker_authority()
+            .map(|authority| authority.1)
+            .unwrap_or_default();
+        interactions.publish(
+            surface_session,
+            vec![HitRegion {
+                rect: CellRect {
+                    row: 3,
+                    col: 0,
+                    height: 1,
+                    width: 12,
+                },
+                target: HitTarget::TranscriptByte { run_id: 1, byte: 0 },
+            }],
+        );
+        let old_frame_was_actionable = interactions.snapshot_actionable().is_some();
+        renderer.scroll_body(-3);
+        let old_frame_closed = interactions.snapshot_actionable().is_none();
+
+        // Always release the real worker barrier before asserting. A failed
+        // expectation must never strand TaskRenderer::drop() in join().
+        let (state, wake) = &*gate;
+        state.lock().unwrap().1 = 1;
+        wake.notify_all();
+        let published = published_rx.recv_timeout(Duration::from_secs(1));
+        let fresh_frame_actionable = interactions.snapshot_actionable().is_some();
+        renderer.shutdown();
+
+        assert_eq!(entered.unwrap(), 1);
+        assert!(old_frame_was_actionable);
+        assert!(
+            old_frame_closed,
+            "a queued viewport move must close the old transcript coordinates immediately"
+        );
+        assert!(published.unwrap());
+        assert!(
+            fresh_frame_actionable,
+            "the current scroll paint must publish fresh coordinates"
+        );
     }
 
     #[test]
