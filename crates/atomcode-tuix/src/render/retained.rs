@@ -1077,6 +1077,10 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// region monotonically advance through `body_lines` regardless of
     /// tail mutations.
     scrolled_off: usize,
+    /// Explicit in-app history viewport used while AtomCode owns SGR mouse
+    /// capture. `None` follows the live tail; `Some` pins a bounded logical
+    /// row until the user scrolls back to the bottom.
+    body_scroll_start: Option<usize>,
     /// Cached `(model, working_dir, chosen_pool_indices)` so resize rebuilds
     /// the SAME mascot + tips instead of re-rolling the random pick.
     welcome_banner: Option<(String, String, Vec<usize>)>,
@@ -1367,6 +1371,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             last_painted_footer_rows: 0,
             skip_body_scroll_count: 0,
             scrolled_off: 0,
+            body_scroll_start: None,
             welcome_banner: None,
             welcome_tip_indices: None,
             welcome_line_count: 0,
@@ -6120,7 +6125,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // newest permanent tail visible beneath the pinned logical top. The
         // resulting middle omission is recorded by
         // `live_spinner_tail_compacted` and restored before any permanent push.
-        let mut visible_indices: Vec<usize> = if permanent_visible <= permanent_slots {
+        let explicit_scroll_start = self
+            .body_scroll_start
+            .map(|start| start.min(display_total.saturating_sub(body_height)));
+        let mut visible_indices: Vec<usize> = if let Some(start) = explicit_scroll_start {
+            self.live_spinner_tail_compacted = false;
+            self.user_input_tail_compacted = false;
+            (start..start.saturating_add(body_height).min(display_total)).collect()
+        } else if permanent_visible <= permanent_slots {
             (self.scrolled_off..permanent_end).collect()
         } else if permanent_slots == 0 {
             Vec::new()
@@ -6149,7 +6161,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             visible.extend(tail_start..permanent_end);
             visible
         };
-        if transient_rows > 0 {
+        if transient_rows > 0 && explicit_scroll_start.is_none() {
             visible_indices.extend(display_total - transient_rows..display_total);
         }
         let mut rows: Vec<Vec<Cell>> = visible_indices
@@ -6277,6 +6289,30 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let cap = h.saturating_sub(footer_rows);
         let visible_len = self.body_lines.len().saturating_sub(self.scrolled_off);
         visible_len.min(cap) as u16
+    }
+
+    fn body_scroll_bottom_start(&self) -> usize {
+        let body_height =
+            (self.screen.height() as usize).saturating_sub(self.current_footer_rows());
+        self.body_lines.len().saturating_sub(body_height)
+    }
+
+    fn set_body_scroll_start(&mut self, start: usize) {
+        let bottom = self.body_scroll_bottom_start();
+        let start = start.min(bottom);
+        let next = if start == bottom { None } else { Some(start) };
+        if self.body_scroll_start == next {
+            return;
+        }
+        self.body_scroll_start = next;
+        if next.is_none() {
+            // Rows appended while an explicit history view was pinned were not
+            // emitted through the host scrollback path. Rejoin the retained
+            // live tail at its bounded logical start.
+            self.scrolled_off = self.scrolled_off.max(bottom);
+        }
+        self.dirty = true;
+        self.flush_deferred();
     }
 
     /// 1-indexed row where the NEXT body emit would land. When the
@@ -6680,7 +6716,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Unlike the old DECSTBM model we always emit on the first
         // push (no `bottom > 0` short-circuit) because emit_body_line
         // computes its own target row from `body_lines.len()`.
-        if self.next_body_emit_row() > 0 {
+        if self.body_scroll_start.is_none() && self.next_body_emit_row() > 0 {
             self.emit_body_line_inner(&row, 0);
         }
         self.body_lines.push(row);
@@ -6702,6 +6738,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // to native scrollback once `body_lines` exceeds
             // MAX_SCROLLBACK_ROWS ≫ visible cap).
             self.scrolled_off = self.scrolled_off.saturating_sub(drain);
+            self.body_scroll_start = self
+                .body_scroll_start
+                .map(|start| start.saturating_sub(drain));
             // welcome_line_count is also a front-anchored index; keep
             // it consistent or `reflow_welcome_prefix.splice(0..wlc)`
             // would later splice over non-welcome rows.
@@ -7729,6 +7768,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.body_lines.clear();
         self.body_copy_runs.clear();
         self.scrolled_off = 0;
+        self.body_scroll_start = None;
         self.welcome_line_count = 0;
         self.welcome_banner = None;
         self.message_marks.clear();
@@ -9258,6 +9298,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         self.body_lines.clear();
         self.body_copy_runs.clear();
         self.scrolled_off = 0;
+        self.body_scroll_start = None;
         self.welcome_line_count = 0;
         // Fresh session (`/clear`, `/session`): forget the cached welcome banner
         // AND the rolled tip selection so the next welcome rolls new tips. (A
@@ -9625,31 +9666,23 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         }
     }
 
-    fn scroll_body(&mut self, _delta: i32) {
-        // No-op by design. After the append-only refactor body rows
-        // live in the host terminal's native scrollback once they
-        // scroll off the visible region, so vertical navigation is the
-        // terminal's job.
-        //
-        // Mouse capture is now intentionally disabled at startup
-        // (see `with_writer`), so crossterm never emits Event::Mouse
-        // events on stdin and this method effectively never gets
-        // called from interactive use. The terminal handles wheel
-        // ticks directly — scrollback via plain wheel, native
-        // selection via drag, copy via cmd+C — which is the whole
-        // point of the trade-off.
-        //
-        // See regression test `retained_scroll_body_is_noop_to_preserve_native_scrollback`.
+    fn scroll_body(&mut self, delta: i32) {
+        let bottom = self.body_scroll_bottom_start();
+        let current = self.body_scroll_start.unwrap_or(bottom);
+        let next = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            current.saturating_add(delta as usize).min(bottom)
+        };
+        self.set_body_scroll_start(next);
     }
 
     fn scroll_body_to_top(&mut self) {
-        // No-op: terminal-native scrollback handles vertical navigation
-        // after the append-only refactor.
+        self.set_body_scroll_start(0);
     }
 
     fn scroll_body_to_bottom(&mut self) {
-        // No-op: terminal-native scrollback handles vertical navigation
-        // after the append-only refactor.
+        self.set_body_scroll_start(self.body_scroll_bottom_start());
     }
 
     fn scroll_to_prev_message(&mut self) {
@@ -20359,50 +20392,65 @@ mod tests {
         );
     }
 
-    /// Pins the Issue-1 contract: when a mouse-wheel tick reaches
-    /// `RetainedRenderer::scroll_body`, it must do nothing. We
-    /// receive the event because `?1002h` (enabled for drag
-    /// selection) consumes wheel ticks from the SGR mouse stream,
-    /// but acting on the event would only shift OUR cell grid — the
-    /// host terminal's scrollback would still be unreachable. The
-    /// user-facing scrollback path is the terminal-level Shift+wheel
-    /// / Cmd+↑ bypass, which the terminal resolves BEFORE the event
-    /// hits our stdin.
-    ///
-    /// Regression guard: a future change that wires this method up
-    /// to body movement would silently break "Shift+wheel scrolls
-    /// the terminal" because the body would also jump, and would
-    /// pollute scrollback because emit-side LFs would push stale
-    /// rows into history.
     #[test]
-    fn retained_scroll_body_is_noop_to_preserve_native_scrollback() {
+    fn retained_scroll_body_moves_bounded_history_and_new_rows_do_not_steal_view() {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let sink = CapturingSink(buf.clone());
         let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
-        // Seed enough body content that any naive scroll attempt
-        // would have something to emit (we want to assert that even
-        // with rows present, scroll_body writes nothing).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
         for i in 0..40 {
-            r.render(UiLine::User(format!("L{}", i)));
+            r.render(UiLine::Error(format!("history-{i:02}")));
         }
         r.flush_deferred();
-        // Capture the byte count right BEFORE the wheel arrives so
-        // anything emitted by the wheel call shows up as a delta.
+        let painted = |renderer: &RetainedRenderer<CapturingSink>| {
+            renderer
+                .screen
+                .prev_cells_for_test()
+                .iter()
+                .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+        let bottom = painted(&r);
         let before = buf.lock().unwrap().len();
-        // Simulate a few wheel ticks in each direction.
-        r.scroll_body(-3);
-        r.scroll_body(3);
-        r.scroll_body(-1);
-        r.scroll_body(1);
-        let after = buf.lock().unwrap().len();
+        r.scroll_body(-6);
+        let historical = painted(&r);
+        assert_ne!(historical, bottom, "wheel-up must change the painted viewport");
+        assert!(buf.lock().unwrap().len() > before, "wheel-up must emit a frame");
+
+        r.render(UiLine::Error("new-tail".into()));
+        r.flush_deferred();
         assert_eq!(
-            before,
-            after,
-            "scroll_body must NOT write any bytes — wheel scroll belongs to the \
-             terminal's native scrollback via Shift+wheel / Cmd+↑. Emitted {} \
-             unexpected bytes.",
-            after - before
+            painted(&r),
+            historical,
+            "streamed/new history must not steal an explicitly scrolled viewport"
         );
+
+        r.scroll_body(10_000);
+        let returned = painted(&r);
+        assert!(
+            returned.iter().any(|row| row.contains("new-tail")),
+            "wheel-down must clamp to and reveal the newest tail"
+        );
+    }
+
+    #[test]
+    fn retained_scroll_view_clamps_when_retained_history_prefix_is_drained() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.body_lines = vec![Vec::new(); MAX_SCROLLBACK_ROWS];
+        r.scrolled_off = 20;
+        r.body_scroll_start = Some(1);
+
+        r.push_body_row(Vec::new());
+
+        assert_eq!(r.body_lines.len(), MAX_SCROLLBACK_ROWS);
+        assert_eq!(r.body_scroll_start, Some(0));
+        assert_eq!(r.scrolled_off, 19);
     }
 
     /// Contract inverted from the original `retained_drag_selection_

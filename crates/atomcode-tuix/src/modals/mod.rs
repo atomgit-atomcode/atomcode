@@ -122,6 +122,12 @@ pub enum ModalPointerAction {
 /// — the event loop only calls `draw` once at open time and once more
 /// after `Close` to restore the idle prompt.
 pub trait Modal: Send {
+    /// True only for the existing `/resume` picker, whose selected-card
+    /// preview can be completed by a runtime event while the modal is open.
+    fn accepts_session_preview(&self) -> bool {
+        false
+    }
+
     /// Process one keystroke. Must either fully handle it (including
     /// any re-paint the modal wants) or report that the modal is now
     /// done so the caller can tear it down.

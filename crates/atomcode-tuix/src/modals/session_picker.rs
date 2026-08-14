@@ -333,6 +333,10 @@ impl SessionPicker {
 }
 
 impl Modal for SessionPicker {
+    fn accepts_session_preview(&self) -> bool {
+        true
+    }
+
     fn handle_key(
         &mut self,
         code: KeyCode,

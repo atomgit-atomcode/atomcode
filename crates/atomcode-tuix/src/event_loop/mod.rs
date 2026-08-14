@@ -9228,6 +9228,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             maybe = ctx.runtime_event_rx.recv() => {
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let event_render_effect = runtime_event_render_effect(
+                        ctx.session_preview_selection.as_ref(),
+                        &runtime_event.event,
+                    );
+                    let redraw_policy = runtime_event_redraw_policy(
+                        event_render_effect,
+                        app.active_modal
+                            .as_ref()
+                            .is_some_and(|modal| modal.accepts_session_preview()),
+                    );
                     let redraw_modal_after_terminal =
                         is_provider_reload_terminal(&runtime_event.event);
                     let provider_reload_failed =
@@ -9277,7 +9287,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     }
-                    if matches!(app.state.phase, UiPhase::Idle) {
+                    if matches!(app.state.phase, UiPhase::Idle)
+                        && redraw_policy == RuntimeEventRedrawPolicy::Default
+                    {
                         // The end of a turn is the first safe provider reload
                         // boundary. Reconcile before draining type-ahead so the
                         // next queued message cannot start on the stale model.
@@ -9320,6 +9332,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         } else {
                             crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
                             redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                        }
+                    }
+                    if redraw_policy == RuntimeEventRedrawPolicy::ActiveModal {
+                        if let Some(modal) = app.active_modal.as_ref() {
+                            modal.draw(&app.buf, &app.state, &ctx, renderer);
                         }
                     }
                     if redraw_modal_after_terminal {
@@ -9630,6 +9647,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             maybe = ctx.runtime_event_rx.recv() => {
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let event_render_effect = runtime_event_render_effect(
+                        ctx.session_preview_selection.as_ref(),
+                        &runtime_event.event,
+                    );
+                    let redraw_policy = runtime_event_redraw_policy(
+                        event_render_effect,
+                        app.active_modal
+                            .as_ref()
+                            .is_some_and(|modal| modal.accepts_session_preview()),
+                    );
                     let redraw_modal_after_terminal =
                         is_provider_reload_terminal(&runtime_event.event);
                     let provider_reload_failed =
@@ -9679,7 +9706,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     }
-                    if matches!(app.state.phase, UiPhase::Idle) {
+                    if matches!(app.state.phase, UiPhase::Idle)
+                        && redraw_policy == RuntimeEventRedrawPolicy::Default
+                    {
                         let config_redraw = poll_shared_state(&mut ctx, renderer);
                         if !app.queue_drain_authorized {
                             redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
@@ -9715,6 +9744,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         } else {
                             crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
                             redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                        }
+                    }
+                    if redraw_policy == RuntimeEventRedrawPolicy::ActiveModal {
+                        if let Some(modal) = app.active_modal.as_ref() {
+                            modal.draw(&app.buf, &app.state, &ctx, renderer);
                         }
                     }
                     if redraw_modal_after_terminal {
@@ -22681,6 +22715,51 @@ fn session_preview_result_matches(
     current == Some(incoming)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeEventRenderEffect {
+    Other,
+    SessionPreviewInstalled,
+    SessionPreviewIgnored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeEventRedrawPolicy {
+    Default,
+    ActiveModal,
+    None,
+}
+
+fn runtime_event_render_effect(
+    current: Option<&crate::session::SessionPreviewSelection>,
+    event: &bg_runtime::RuntimeEventPayload,
+) -> RuntimeEventRenderEffect {
+    match event {
+        bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionPreviewLoaded { selection, .. },
+        ) if session_preview_result_matches(current, selection) => {
+            RuntimeEventRenderEffect::SessionPreviewInstalled
+        }
+        bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionPreviewLoaded { .. },
+        ) => RuntimeEventRenderEffect::SessionPreviewIgnored,
+        _ => RuntimeEventRenderEffect::Other,
+    }
+}
+
+fn runtime_event_redraw_policy(
+    effect: RuntimeEventRenderEffect,
+    active_modal_accepts_preview: bool,
+) -> RuntimeEventRedrawPolicy {
+    match (effect, active_modal_accepts_preview) {
+        (RuntimeEventRenderEffect::SessionPreviewInstalled, true) => {
+            RuntimeEventRedrawPolicy::ActiveModal
+        }
+        (RuntimeEventRenderEffect::SessionPreviewInstalled, false)
+        | (RuntimeEventRenderEffect::SessionPreviewIgnored, _) => RuntimeEventRedrawPolicy::None,
+        (RuntimeEventRenderEffect::Other, _) => RuntimeEventRedrawPolicy::Default,
+    }
+}
+
 #[cfg(test)]
 mod session_preview_generation_tests {
     use super::*;
@@ -22706,6 +22785,43 @@ mod session_preview_generation_tests {
             &selection("other", 7),
         ));
         assert!(!session_preview_result_matches(None, &current));
+    }
+
+    #[test]
+    fn preview_runtime_event_redraws_only_the_current_session_picker() {
+        let current = selection("selected", 7);
+        let exact = bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionPreviewLoaded {
+                selection: current.clone(),
+                result: Ok(None),
+            },
+        );
+        let stale = bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionPreviewLoaded {
+                selection: selection("selected", 6),
+                result: Ok(None),
+            },
+        );
+        assert_eq!(
+            runtime_event_render_effect(Some(&current), &exact),
+            RuntimeEventRenderEffect::SessionPreviewInstalled,
+        );
+        assert_eq!(
+            runtime_event_render_effect(Some(&current), &stale),
+            RuntimeEventRenderEffect::SessionPreviewIgnored,
+        );
+        assert_eq!(
+            runtime_event_redraw_policy(RuntimeEventRenderEffect::SessionPreviewInstalled, true),
+            RuntimeEventRedrawPolicy::ActiveModal,
+        );
+        assert_eq!(
+            runtime_event_redraw_policy(RuntimeEventRenderEffect::SessionPreviewIgnored, true),
+            RuntimeEventRedrawPolicy::None,
+        );
+        assert_eq!(
+            runtime_event_redraw_policy(RuntimeEventRenderEffect::SessionPreviewInstalled, false),
+            RuntimeEventRedrawPolicy::None,
+        );
     }
 }
 
