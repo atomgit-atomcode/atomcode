@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   loadPrefs,
   savePrefs,
+  applyConfigDefaults,
   shouldNotify,
   notificationsSupported,
   maybeNotifyTurnFinished,
@@ -141,6 +142,7 @@ class FakeBroadcastChannel {
   name: string;
   onmessage: ((event: { data: unknown }) => void) | null = null;
   sent: unknown[] = [];
+  closed = false;
   constructor(name: string) {
     this.name = name;
     FakeBroadcastChannel.instances.push(this);
@@ -149,7 +151,7 @@ class FakeBroadcastChannel {
     this.sent.push(data);
   }
   close(): void {
-    /* no-op */
+    this.closed = true;
   }
 }
 
@@ -385,6 +387,31 @@ test('savePrefs round-trips through loadPrefs', () => {
   });
 });
 
+test('applyConfigDefaults seeds daemon defaults when user never set prefs', () => {
+  withBrowserGlobals(() => {
+    const ls = (globalThis as Record<string, unknown>).localStorage as FakeStore;
+    assert.equal(ls.getItem('atomcode.webui_notify'), null);
+    applyConfigDefaults({ enabled: false, min_duration_secs: 30 });
+    assert.deepEqual(loadPrefs(), { enabled: false, minDurationSecs: 30, backgroundOnly: true });
+  });
+});
+
+test('applyConfigDefaults does not overwrite an explicit user setting', () => {
+  withBrowserGlobals(() => {
+    savePrefs(makePrefs({ enabled: true, minDurationSecs: 5 }));
+    applyConfigDefaults({ enabled: false, min_duration_secs: 30 });
+    assert.deepEqual(loadPrefs(), { enabled: true, minDurationSecs: 5, backgroundOnly: true });
+  });
+});
+
+test('applyConfigDefaults ignores undefined config', () => {
+  withBrowserGlobals(() => {
+    const ls = (globalThis as Record<string, unknown>).localStorage as FakeStore;
+    applyConfigDefaults(undefined);
+    assert.equal(ls.getItem('atomcode.webui_notify'), null);
+  });
+});
+
 // ── 能力探测 ──────────────────────────────────────────────────────────
 
 test('notificationsSupported: false without Notification global', () => {
@@ -514,6 +541,50 @@ test('maybeNotifyTurnFinished: different session after a notify → notifies aga
   });
 });
 
+// 跨标签去重按会话匹配：收到其他标签页的广播后，只有**同一会话**在 5s 内被抑制，
+// 不同会话的通知不受影响（P2 修复：peerNotified 携带 sessionId）。
+test('maybeNotifyTurnFinished: peer broadcast suppresses same session only', () => {
+  withBrowserGlobals(() => {
+    resetBroadcastChannels();
+    const { instances } = installNotification('granted');
+    // 第一次弹通知并广播（产生 channel）。
+    maybeNotifyTurnFinished(makeInfo({ sessionId: 's1' }));
+    assert.equal(instances.length, 1);
+    const ch = FakeBroadcastChannel.instances.find((c) => !c.closed);
+    assert.ok(ch, 'channel should exist');
+
+    // 模拟其他标签页广播 s1 的通知。
+    const peerTs = Date.now();
+    ch!.onmessage?.({ data: { sessionId: 's1', ts: peerTs } });
+
+    // 同一会话 s1 在 5s 内被抑制。
+    maybeNotifyTurnFinished(makeInfo({ sessionId: 's1' }));
+    assert.equal(instances.length, 1, 'same session should be suppressed');
+
+    // 不同会话 s2 不受抑制。
+    maybeNotifyTurnFinished(makeInfo({ sessionId: 's2' }));
+    assert.equal(instances.length, 2, 'different session must not be suppressed');
+  });
+});
+
+test('maybeNotifyTurnFinished: peer broadcast outside 5s window allows same session', () => {
+  withBrowserGlobals(() => {
+    resetBroadcastChannels();
+    const { instances } = installNotification('granted');
+    maybeNotifyTurnFinished(makeInfo({ sessionId: 's1' }));
+    const ch = FakeBroadcastChannel.instances.find((c) => !c.closed);
+    assert.ok(ch, 'channel should exist');
+    // 隔离变量：把同 tab 权威去重记录也改成 6s 前（否则首次弹窗写入的新记录
+    // 会先被 5s 去重窗口拦截，测不到 peer 广播路径）。
+    const ls = (globalThis as Record<string, unknown>).localStorage as FakeStore;
+    ls.setItem('atomcode.webui_last_notify', JSON.stringify({ sessionId: 's1', ts: Date.now() - 6000 }));
+    // 广播时间戳在 6s 前（超过 5s 去重窗口）。
+    ch!.onmessage?.({ data: { sessionId: 's1', ts: Date.now() - 6000 } });
+    maybeNotifyTurnFinished(makeInfo({ sessionId: 's1' }));
+    assert.equal(instances.length, 2, 'stale peer notify should not suppress');
+  });
+});
+
 test('maybeNotifyTurnFinished: body truncates long message', () => {
   withBrowserGlobals(() => {
     const { instances } = installNotification('granted');
@@ -525,12 +596,20 @@ test('maybeNotifyTurnFinished: body truncates long message', () => {
   });
 });
 
-test('disposeNotifications closes the channel', () => {
+test('disposeNotifications closes the channel it created', () => {
   withBrowserGlobals(() => {
     resetBroadcastChannels();
     maybeNotifyTurnFinished(makeInfo());
+    const created = FakeBroadcastChannel.instances;
+    assert.ok(created.length > 0, 'should have created a channel');
+    assert.ok(created.every((c) => !c.closed), 'channel should start open');
     disposeNotifications();
-    const open = FakeBroadcastChannel.instances.filter((c) => !c.name.startsWith('closed'));
-    assert.ok(open.length >= 0); // close() 为 no-op stub；验证无异常即可
+    assert.ok(created.every((c) => c.closed), 'dispose should close every channel');
+    // 再次通知应复用新通道（旧的已关闭，不能再发）。
+    const { instances } = installNotification('granted');
+    maybeNotifyTurnFinished(makeInfo({ sessionId: 's2' }));
+    const reopened = FakeBroadcastChannel.instances.filter((c) => !c.closed);
+    assert.ok(reopened.length >= 1, 'dispose 后再次通知应新建可用通道');
+    assert.equal(instances.length, 1);
   });
 });

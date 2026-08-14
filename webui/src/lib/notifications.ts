@@ -65,7 +65,7 @@ function safeParsePrefs(raw: string | null): NotificationPrefs | null {
   }
 }
 
-/** 读取偏好：localStorage 显式设置 > 默认值。 */
+/** 读取偏好：localStorage 显式设置 > /config 种入的默认值 > 硬编码默认值。 */
 export function loadPrefs(): NotificationPrefs {
   if (typeof localStorage === 'undefined') return { ...DEFAULT_PREFS };
   const saved = safeParsePrefs(localStorage.getItem(PREFS_KEY));
@@ -75,7 +75,30 @@ export function loadPrefs(): NotificationPrefs {
 /** 持久化偏好（设置面板调用）。 */
 export function savePrefs(prefs: NotificationPrefs): void {
   if (typeof localStorage === 'undefined') return;
-  localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * 从 `/config` 种入 daemon 默认值：仅当用户**未显式设置**过偏好时生效
+ * （localStorage 无 `atomcode.webui_notify` 键）。让与 TUI 共享的
+ * `notifications.enabled` / `min_duration_secs` 对 webui 生效，同时
+ * 用户一旦在设置面板改过则不再被后端默认值覆盖。
+ */
+export function applyConfigDefaults(
+  cfg: { enabled: boolean; min_duration_secs: number } | undefined,
+): void {
+  if (!cfg || typeof localStorage === 'undefined') return;
+  if (localStorage.getItem(PREFS_KEY) !== null) return; // 用户显式设置过，不覆盖
+  const prefs: NotificationPrefs = {
+    enabled: cfg.enabled,
+    minDurationSecs: cfg.min_duration_secs,
+    backgroundOnly: DEFAULT_PREFS.backgroundOnly,
+  };
+  savePrefs(prefs);
 }
 
 /** 浏览器通知能力：secure context（localhost 可用，LAN HTTP 不可用）。 */
@@ -269,13 +292,18 @@ function readLastNotify(): LastNotifyRecord | null {
 
 function writeLastNotify(record: LastNotifyRecord): void {
   if (typeof localStorage === 'undefined') return;
-  localStorage.setItem(LAST_NOTIFY_KEY, JSON.stringify(record));
+  try {
+    localStorage.setItem(LAST_NOTIFY_KEY, JSON.stringify(record));
+  } catch {
+    // 写失败不阻塞弹窗（隐私模式/配额满时静默降级为无跨标签权威去重）。
+  }
 }
 
 // BroadcastChannel 引用（同进程多个 Chat 实例/多次挂载共用同一通道；卸载时 dispose）。
 let channel: BroadcastChannel | null = null;
-// 其他标签页广播最近一次通知时间戳（本 tab 内即时生效的跨标签去重信号）。
-let peerNotifiedAt = 0;
+// 其他标签页广播的最近一次通知（sessionId + 时间戳）。跨标签去重必须**按会话**
+// 匹配：只抑制同一会话 5s 内的重复，不同会话的通知不能被误抑制。
+let peerNotified: { sessionId: string; ts: number } | null = null;
 
 function ensureChannel(): BroadcastChannel | null {
   if (typeof BroadcastChannel === 'undefined') return null;
@@ -285,7 +313,7 @@ function ensureChannel(): BroadcastChannel | null {
     channel.onmessage = (event: MessageEvent) => {
       const data = event.data as { sessionId?: string; ts?: number } | null;
       if (data && typeof data.ts === 'number' && data.sessionId) {
-        peerNotifiedAt = data.ts;
+        peerNotified = { sessionId: data.sessionId, ts: data.ts };
       }
     };
   } catch {
@@ -300,7 +328,7 @@ export function disposeNotifications(): void {
     channel.close();
     channel = null;
   }
-  peerNotifiedAt = 0;
+  peerNotified = null;
 }
 
 /** 从 URL 读取当前查看的会话短 id（用于通知点击恢复）。 */
@@ -356,13 +384,17 @@ export function maybeNotifyTurnFinished(info: TurnFinishedInfo): void {
     lastNotify,
   });
 
-  // 跨标签即时信号（peerNotifiedAt 由 BroadcastChannel 更新）并入去重判定：
-  // 其他 tab 在 5s 内弹过同一会话 → 本 tab 不再弹。
+  // 跨标签即时信号（peerNotified 由 BroadcastChannel 更新）并入去重判定：
+  // 其他 tab 在 5s 内弹过**同一会话** → 本 tab 不再弹。按 sessionId 匹配，
+  // 不同会话的通知不受抑制。
   const peerRecent =
-    info.sessionId && peerNotifiedAt > 0 && now - peerNotifiedAt < DEDUP_WINDOW_MS;
+    info.sessionId &&
+    peerNotified !== null &&
+    peerNotified.sessionId === info.sessionId &&
+    now - peerNotified.ts < DEDUP_WINDOW_MS;
 
   if (peerRecent) {
-    console.warn('[webui-notify] 被拦截：peerNotifiedAt 显示其他标签页 5s 内已弹过');
+    console.warn(`[webui-notify] 被拦截：其他标签页 5s 内已弹过同一会话 ${info.sessionId}`);
     return;
   }
 

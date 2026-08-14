@@ -152,9 +152,13 @@ export function NotificationsDialog({ onClose }: { onClose: () => void }) {
   // 用户手势内请求权限：开启开关时若尚未授权，先请求再落库。
   async function toggleEnabled() {
     if (!prefs.enabled && permission !== 'granted') {
-      const granted = await requestNotificationPermission();
-      setPermission(granted ? 'granted' : 'denied');
-      if (!granted) return; // 拒绝则不开启，避免“开了但不弹”的静默失效。
+      // requestPermission 返回 'granted' | 'denied' | 'default'（忽略弹窗）。
+      // 不能用布尔近似：忽略弹窗时是 'default'，误标 denied 会误导用户。
+      const result = await requestNotificationPermission();
+      const actual: NotificationPermission =
+        typeof Notification !== 'undefined' ? Notification.permission : result ? 'granted' : 'denied';
+      setPermission(actual);
+      if (actual !== 'granted') return; // 未授予则不开启，避免“开了但不弹”的静默失效。
     }
     setPrefs({ ...prefs, enabled: !prefs.enabled });
   }

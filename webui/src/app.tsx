@@ -11,7 +11,7 @@ import { PermissionCard } from './components/PermissionCard';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
 import { getProject, getConfig, changeDir, resolveSession, createSession, getSession, SessionMetaWithProject } from './api';
 import { useT, SettingsSection } from './settings';
-import { initNotificationPermissionPrompt } from './lib/notifications';
+import { initNotificationPermissionPrompt, applyConfigDefaults } from './lib/notifications';
 import { sessionMessagesToMarkdownLines } from './lib/historyMessages';
 
 // 从 URL (?session=<id>) 读取要打开的会话 id（短 id），用于刷新后恢复。
@@ -145,6 +145,13 @@ export function App() {
   useEffect(() => {
     // 首次用户交互时自动请求浏览器通知权限（若开启且未授权）。
     initNotificationPermissionPrompt();
+    // 用 /config 的 notifications 段种入偏好默认值（localStorage 未显式设置时生效），
+    // 让与 TUI 共享的 enabled/min_duration_secs 对 webui 同样生效。
+    getConfig()
+      .then((cfg) => applyConfigDefaults(cfg.notifications))
+      .catch(() => {
+        /* 配置不可用时用前端默认值 */
+      });
     let cancelled = false;
     getProject()
       .then((p) => {
