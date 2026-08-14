@@ -18,6 +18,7 @@
 
 use std::fs::File;
 use std::io::{BufWriter, Stdout, Write};
+use std::sync::Arc;
 
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, PopKeyboardEnhancementFlags,
@@ -47,6 +48,15 @@ struct ComposerCellByte {
     byte: usize,
     source_start: usize,
     source_end: usize,
+}
+
+#[derive(Debug, Clone)]
+struct BodyCopyRun {
+    id: u64,
+    body_index: usize,
+    col: usize,
+    text: Arc<str>,
+    soft_wrap: bool,
 }
 
 fn composer_cell_bytes(
@@ -871,6 +881,27 @@ fn wrap_cells_to_width(cells: &[Cell], max_cols: usize) -> Vec<Vec<Cell>> {
     chunks
 }
 
+fn copy_text_from_body_row(row: &[Cell]) -> (String, usize) {
+    let col = if row
+        .get(..PAD_COL)
+        .is_some_and(|prefix| prefix.iter().all(|cell| cell.width == 1 && cell.ch == ' '))
+    {
+        PAD_COL
+    } else {
+        0
+    };
+    let end = row
+        .iter()
+        .rposition(|cell| cell.width > 0 && cell.ch != ' ')
+        .map_or(col, |index| index + 1);
+    let text = row[col.min(end)..end]
+        .iter()
+        .filter(|cell| cell.width > 0)
+        .map(|cell| cell.ch)
+        .collect();
+    (text, col)
+}
+
 fn apply_sgr(params: &str, style: &mut CellStyle) {
     // `\x1b[m` (empty params) is treated as SGR 0 per ECMA-48.
     let parts: Vec<&str> = if params.is_empty() {
@@ -937,6 +968,7 @@ pub struct RetainedRenderer<W: Write + Send> {
     mouse_capture_enabled: bool,
     interaction_publisher: crate::render::interaction::InteractionPublisher,
     pending_interactions: Vec<crate::render::interaction::HitRegion>,
+    pending_copy_runs: Vec<crate::render::interaction::CopyRun>,
     interaction_surface: Option<(String, super::MenuKind, Vec<(String, String)>)>,
     interaction_surface_session: u64,
     screen: Screen,
@@ -964,6 +996,8 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// `PAD_COL` indent. `paint_body` just `draw_row`s the last N
     /// directly.
     body_lines: Vec<Vec<Cell>>,
+    body_copy_runs: Vec<BodyCopyRun>,
+    next_copy_run_id: u64,
     /// Message boundary markers for "jump to prev/next message" navigation.
     /// Tracks which line_idx marks the start of a User / Assistant / ToolCall / ToolResult message.
     message_marks: Vec<crate::render::MessageMark>,
@@ -1309,6 +1343,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             mouse_capture_enabled,
             interaction_publisher,
             pending_interactions: Vec::new(),
+            pending_copy_runs: Vec::new(),
             interaction_surface: None,
             interaction_surface_session: 0,
             screen: Screen::new(w, h).with_jediterm(caps.jediterm),
@@ -1318,6 +1353,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             status: StatusLine::default(),
             input_attachments: Vec::new(),
             body_lines: Vec::new(),
+            body_copy_runs: Vec::new(),
+            next_copy_run_id: 1,
             message_marks: Vec::new(),
             last_mark_was_assistant: false,
             suppress_auto_copy: false,
@@ -1752,7 +1789,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 remove,
                 self.scrolled_off
             );
-            self.body_lines.truncate(self.body_lines.len() - remove);
+            self.truncate_body_lines(self.body_lines.len() - remove);
             self.inflight_tool_rows = 0;
             return;
         }
@@ -1772,7 +1809,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 prev_rows,
                 self.scrolled_off
             );
-            self.body_lines.truncate(keep);
+            self.truncate_body_lines(keep);
             let first = bottom - n as u16 + 1;
             for row in &new_rows {
                 self.body_lines.push(row.clone());
@@ -1826,7 +1863,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 remove,
                 self.scrolled_off
             );
-            self.body_lines.truncate(self.body_lines.len() - remove);
+            self.truncate_body_lines(self.body_lines.len() - remove);
             // The old strip rows are already gone (truncated above), so clear the count
             // BEFORE re-pushing: otherwise `push_body_row`'s `lift_inflight_strip` would see
             // the stale `prev_rows` and pop that many rows of REAL content off the tail.
@@ -5775,6 +5812,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// we just wrote there.
     fn paint_frame(&mut self) {
         self.pending_interactions.clear();
+        self.pending_copy_runs.clear();
         self.paint_body_into_cells();
         self.paint_footer();
         // Overlay modal drawn on top of body+footer so the diff sees
@@ -6027,8 +6065,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // newest permanent tail visible beneath the pinned logical top. The
         // resulting middle omission is recorded by
         // `live_spinner_tail_compacted` and restored before any permanent push.
-        let mut rows: Vec<Vec<Cell>> = if permanent_visible <= permanent_slots {
-            self.body_lines[self.scrolled_off..permanent_end].to_vec()
+        let mut visible_indices: Vec<usize> = if permanent_visible <= permanent_slots {
+            (self.scrolled_off..permanent_end).collect()
         } else if permanent_slots == 0 {
             Vec::new()
         } else if transient_rows == 0 && !compact_for_user_input {
@@ -6036,7 +6074,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 .scrolled_off
                 .saturating_add(permanent_slots)
                 .min(permanent_end);
-            self.body_lines[self.scrolled_off..continuous_end].to_vec()
+            (self.scrolled_off..continuous_end).collect()
         } else {
             // Pin only physical row 0 (`body_lines[scrolled_off]`, required
             // for overflow-LF alignment) and draw the newest
@@ -6052,12 +6090,96 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let tail_slots = permanent_slots.saturating_sub(prefix_slots);
             let prefix_end = self.scrolled_off.saturating_add(prefix_slots);
             let tail_start = permanent_end.saturating_sub(tail_slots);
-            let mut visible = self.body_lines[self.scrolled_off..prefix_end].to_vec();
-            visible.extend_from_slice(&self.body_lines[tail_start..permanent_end]);
+            let mut visible: Vec<usize> = (self.scrolled_off..prefix_end).collect();
+            visible.extend(tail_start..permanent_end);
             visible
         };
         if transient_rows > 0 {
-            rows.extend_from_slice(&self.body_lines[display_total - transient_rows..display_total]);
+            visible_indices.extend(display_total - transient_rows..display_total);
+        }
+        let mut rows: Vec<Vec<Cell>> = visible_indices
+            .iter()
+            .map(|index| self.body_lines[*index].clone())
+            .collect();
+        for run in &self.body_copy_runs {
+            let Some(row) = visible_indices
+                .iter()
+                .position(|body_index| *body_index == run.body_index)
+            else {
+                continue;
+            };
+            let width = crate::width::display_width(&run.text).max(1);
+            let rect = crate::render::interaction::CellRect {
+                row: row.min(u16::MAX as usize) as u16,
+                col: run.col.min(u16::MAX as usize) as u16,
+                height: 1,
+                width: width.min(u16::MAX as usize) as u16,
+            };
+            self.pending_copy_runs
+                .push(crate::render::interaction::CopyRun {
+                    id: run.id,
+                    rect,
+                    text: run.text.clone(),
+                    soft_wrap: run.soft_wrap,
+                });
+        }
+        let transcript_selection = self
+            .interaction_publisher
+            .reconcile_transcript_selection(&self.pending_copy_runs);
+        for run in &self.body_copy_runs {
+            let Some(row) = visible_indices
+                .iter()
+                .position(|body_index| *body_index == run.body_index)
+            else {
+                continue;
+            };
+            let mut col = run.col;
+            for (byte, grapheme) in run.text.grapheme_indices(true) {
+                let cell_width = if grapheme == "\t" {
+                    crate::render::cell::SOFT_TAB_WIDTH
+                } else {
+                    crate::width::display_width(grapheme)
+                };
+                for offset in 0..cell_width.max(1) {
+                    if transcript_selection.as_ref().is_some_and(|selection| {
+                        let (start, end) = if (selection.anchor.run_id, selection.anchor.byte)
+                            <= (selection.head.run_id, selection.head.byte)
+                        {
+                            (selection.anchor, selection.head)
+                        } else {
+                            (selection.head, selection.anchor)
+                        };
+                        selection.run_ids.contains(&run.id)
+                            && (run.id, byte) < (end.run_id, end.byte)
+                            && (start.run_id, start.byte) < (run.id, byte + grapheme.len())
+                    }) {
+                        if let Some(cell) = rows
+                            .get_mut(row)
+                            .and_then(|cells| cells.get_mut(col + offset))
+                        {
+                            cell.style.reverse = true;
+                        }
+                    }
+                    self.pending_interactions
+                        .push(crate::render::interaction::HitRegion {
+                            rect: crate::render::interaction::CellRect {
+                                row: row.min(u16::MAX as usize) as u16,
+                                col: (col + offset).min(u16::MAX as usize) as u16,
+                                height: 1,
+                                width: 1,
+                            },
+                            target: crate::render::interaction::HitTarget::TranscriptByte {
+                                run_id: run.id,
+                                byte: if offset * 2 < cell_width.max(1) {
+                                    byte
+                                } else {
+                                    byte + grapheme.len()
+                                },
+                            },
+                        });
+                }
+                col += cell_width;
+            }
         }
         for (i, row) in rows.iter().enumerate() {
             let clipped = clip_cells_to_width(row, body_width);
@@ -6509,6 +6631,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if self.body_lines.len() > MAX_SCROLLBACK_ROWS {
             let drain = self.body_lines.len() - MAX_SCROLLBACK_ROWS;
             self.body_lines.drain(0..drain);
+            self.body_copy_runs.retain(|run| run.body_index >= drain);
+            for run in &mut self.body_copy_runs {
+                run.body_index -= drain;
+            }
             self.message_marks.retain(|m| m.line_idx >= drain);
             for m in self.message_marks.iter_mut() {
                 m.line_idx -= drain;
@@ -6525,6 +6651,33 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // would later splice over non-welcome rows.
             self.welcome_line_count = self.welcome_line_count.saturating_sub(drain);
         }
+    }
+
+    fn truncate_body_lines(&mut self, len: usize) {
+        self.body_lines.truncate(len);
+        self.body_copy_runs.retain(|run| run.body_index < len);
+    }
+
+    fn push_copyable_body_row(
+        &mut self,
+        row: Vec<Cell>,
+        text: String,
+        col: usize,
+        soft_wrap: bool,
+    ) {
+        self.push_body_row(row);
+        let Some(body_index) = self.body_lines.len().checked_sub(1) else {
+            return;
+        };
+        let id = self.next_copy_run_id;
+        self.next_copy_run_id = self.next_copy_run_id.saturating_add(1);
+        self.body_copy_runs.push(BodyCopyRun {
+            id,
+            body_index,
+            col,
+            text: Arc::from(text),
+            soft_wrap,
+        });
     }
 
     /// Record the start of a new logical message in `message_marks`.
@@ -6632,7 +6785,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 remove,
                 self.scrolled_off
             );
-            self.body_lines.truncate(self.body_lines.len() - remove);
+            self.truncate_body_lines(self.body_lines.len() - remove);
             self.inflight_tool_rows = 0;
             if bottom_before_truncate > 0 && remove > 0 {
                 // Erase ALL terminal rows previously occupied by the
@@ -6763,12 +6916,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // trailing `\n` — that's a meaningful "give me a separator"
         // signal at the call site, not noise.
         for phys in text.split('\n') {
-            for chunk in crate::width::wrap_line_to_width(phys, w) {
+            let chunks = crate::width::wrap_line_to_width(phys, w);
+            let chunk_count = chunks.len();
+            for (index, chunk) in chunks.into_iter().enumerate() {
                 let mut row = Vec::new();
                 let pad = CellStyle::default();
                 push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
                 push_str_cells(&mut row, &chunk, style);
-                self.push_body_row(row);
+                self.push_copyable_body_row(
+                    row,
+                    chunk.to_string(),
+                    PAD_COL,
+                    index + 1 < chunk_count,
+                );
             }
         }
     }
@@ -6796,11 +6956,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         for phys in text.split('\n') {
             let mut style = CellStyle::default();
-            for chunk in crate::width::wrap_line_to_width(phys, w) {
+            let chunks = crate::width::wrap_line_to_width(phys, w);
+            let chunk_count = chunks.len();
+            for (index, chunk) in chunks.into_iter().enumerate() {
                 let mut row = Vec::new();
                 push_str_cells(&mut row, &" ".repeat(PAD_COL), &CellStyle::default());
                 style = crate::render::cell::push_str_cells_sgr(&mut row, &chunk, style);
-                self.push_body_row(row);
+                let text = crate::sanitize::scrub_controls(&chunk);
+                self.push_copyable_body_row(row, text, PAD_COL, index + 1 < chunk_count);
             }
         }
     }
@@ -6823,9 +6986,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
         body: &str,
         body_style: &CellStyle,
     ) {
-        let rows = self.build_prefixed_rows(prefix, prefix_style, body, body_style, None);
-        for row in rows {
-            self.push_body_row(row);
+        let rows = self.build_prefixed_rows_with_semantics(
+            prefix,
+            prefix_style,
+            body,
+            body_style,
+            None,
+        );
+        for (row, soft_wrap, text) in rows {
+            self.push_copyable_body_row(row, text, 0, soft_wrap);
         }
     }
 
@@ -6845,6 +7014,20 @@ impl<W: Write + Send> RetainedRenderer<W> {
         body_style: &CellStyle,
         cont: Option<(&str, &CellStyle)>,
     ) -> Vec<Vec<Cell>> {
+        self.build_prefixed_rows_with_semantics(prefix, prefix_style, body, body_style, cont)
+            .into_iter()
+            .map(|(row, _, _)| row)
+            .collect()
+    }
+
+    fn build_prefixed_rows_with_semantics(
+        &self,
+        prefix: &str,
+        prefix_style: &CellStyle,
+        body: &str,
+        body_style: &CellStyle,
+        cont: Option<(&str, &CellStyle)>,
+    ) -> Vec<(Vec<Cell>, bool, String)> {
         // Downgrade decorative glyphs (the `●`/`▸` prefixes AND any glyphs in the body)
         // on non-unicode terminals — 1-col ASCII stand-ins keep prefix_w alignment.
         let u = self.caps.unicode_symbols;
@@ -6867,7 +7050,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 .into_iter()
                 .map(|c| c.to_string())
                 .collect();
-            for chunk in &chunks {
+            for (chunk_index, chunk) in chunks.iter().enumerate() {
                 let mut row = Vec::new();
                 if !first_emitted {
                     push_str_cells(&mut row, prefix, prefix_style);
@@ -6877,7 +7060,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     push_str_cells(&mut row, cp, cs);
                 }
                 push_str_cells(&mut row, chunk.as_str(), body_style);
-                rows.push(row);
+                let row_text = if rows.is_empty() {
+                    format!("{prefix}{chunk}")
+                } else {
+                    let (cp, _) = cont.unwrap_or((blank_pad.as_str(), &pad_style));
+                    format!("{cp}{chunk}")
+                };
+                rows.push((row, chunk_index + 1 < chunks.len(), row_text));
             }
         }
         rows
@@ -7055,15 +7244,31 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 return;
             }
         }
+        let semantic = crate::sanitize::scrub_controls(rendered);
+        let semantic_lines: Vec<Vec<String>> = semantic
+            .split('\n')
+            .map(|line| {
+                crate::width::wrap_line_to_width(line, w)
+                    .into_iter()
+                    .map(|chunk| chunk.to_string())
+                    .collect()
+            })
+            .collect();
         let lines_of_cells = parse_markdown_to_cells(rendered);
-        for line_cells in lines_of_cells {
+        for (line_index, line_cells) in lines_of_cells.into_iter().enumerate() {
             let chunks = wrap_cells_to_width(&line_cells, w);
-            for chunk in chunks {
+            let chunk_count = chunks.len();
+            for (index, chunk) in chunks.into_iter().enumerate() {
                 let mut row = Vec::new();
                 let pad = CellStyle::default();
                 push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
                 row.extend(chunk);
-                self.push_body_row(row);
+                let text = semantic_lines
+                    .get(line_index)
+                    .and_then(|line| line.get(index))
+                    .cloned()
+                    .unwrap_or_else(|| copy_text_from_body_row(&row).0);
+                self.push_copyable_body_row(row, text, PAD_COL, index + 1 < chunk_count);
             }
         }
     }
@@ -7460,6 +7665,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Drop pre-reflow body + all state derived from it; the replay
         // rebuilds every field from scratch at the new width.
         self.body_lines.clear();
+        self.body_copy_runs.clear();
         self.scrolled_off = 0;
         self.welcome_line_count = 0;
         self.welcome_banner = None;
@@ -8988,6 +9194,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // keeps the next render_diff from emitting a nested DECSET 2026 envelope.
         self.screen.set_sync_suppressed(self.in_sync_batch);
         self.body_lines.clear();
+        self.body_copy_runs.clear();
         self.scrolled_off = 0;
         self.welcome_line_count = 0;
         // Fresh session (`/clear`, `/session`): forget the cached welcome banner
@@ -9305,10 +9512,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
             if frame_written {
                 self.last_painted_footer_rows = footer_rows;
-                let _ = self.interaction_publisher.publish_if_current(
+                let _ = self.interaction_publisher.publish_frame_if_current(
                     interaction_authority.0,
                     interaction_authority.1,
                     self.pending_interactions.clone(),
+                    self.pending_copy_runs.clone(),
                 );
                 self.dirty = false;
             } else {
@@ -10303,6 +10511,112 @@ mod tests {
         assert_eq!(frame.hit(row, col + 1), Some(crate::render::interaction::HitTarget::ComposerByte { byte: 0 }));
         assert_eq!(frame.hit(row, col + 2), Some(crate::render::interaction::HitTarget::ComposerByte { byte: 1 }));
         assert_eq!(frame.hit(row, col + 3), Some(crate::render::interaction::HitTarget::ComposerByte { byte: 1 }));
+    }
+
+    #[test]
+    fn interaction_transcript_copy_runs_preserve_semantics_and_exclude_chrome() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            12,
+            24,
+            interactions.clone(),
+        );
+        renderer.render(UiLine::AssistantText(
+            "abcdefghij\nhard\n  code\n你好👩‍💻\n".into(),
+        ));
+        renderer.render(UiLine::AssistantLineBreak);
+        renderer.render(UiLine::DiffLine {
+            added: true,
+            text: "added".into(),
+        });
+        renderer.render(UiLine::TurnSeparator {
+            label: "BORDER_SENTINEL".into(),
+        });
+        renderer.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "SPINNER_SENTINEL",
+            label: "STATUS_SENTINEL".into(),
+            status: StatusLine::default(),
+            menu: None,
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+
+        let frame = interactions.snapshot_actionable().expect("painted transcript frame");
+        let runs: Vec<(&str, bool)> = frame
+            .copy_runs
+            .iter()
+            .map(|run| (&*run.text, run.soft_wrap))
+            .collect();
+        assert!(runs.windows(2).any(|pair| pair == [("abcdefgh", true), ("ij", false)]));
+        assert!(runs.iter().any(|run| *run == ("hard", false)));
+        assert!(runs.iter().any(|run| *run == ("  code", false)));
+        assert!(runs.iter().any(|run| run.0.contains("你好")));
+        assert!(runs.windows(2).any(|pair| {
+            pair == [("       +", true), (" added", false)]
+        }));
+        assert!(!runs.iter().any(|run| {
+            run.0.contains("SPINNER_SENTINEL")
+                || run.0.contains("STATUS_SENTINEL")
+                || run.0.contains("BORDER_SENTINEL")
+        }));
+    }
+
+    #[test]
+    fn interaction_transcript_selection_reverses_cjk_and_zwj_continuation_cells() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            20,
+            24,
+            interactions.clone(),
+        );
+        renderer.render(UiLine::AssistantText("a你👩‍💻b".into()));
+        renderer.render(UiLine::AssistantLineBreak);
+        renderer.flush_deferred();
+        let first = interactions.snapshot_actionable().expect("first transcript frame");
+        let run = first
+            .copy_runs
+            .iter()
+            .find(|run| &*run.text == "a你👩‍💻b")
+            .expect("semantic assistant run")
+            .clone();
+        let suffix = run.text.rfind('b').expect("suffix boundary");
+        interactions.set_transcript_selection(Some(
+            crate::render::interaction::TranscriptSelection {
+                anchor: crate::render::interaction::SemanticEndpoint {
+                    run_id: run.id,
+                    byte: 1,
+                },
+                head: crate::render::interaction::SemanticEndpoint {
+                    run_id: run.id,
+                    byte: suffix,
+                },
+                run_ids: vec![run.id].into(),
+            },
+        ));
+        renderer.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+
+        let cells = renderer.screen.prev_cells_for_test();
+        let row = run.rect.row as usize;
+        let col = run.rect.col as usize;
+        assert!(!cells[row][col].style.reverse, "ASCII prefix unchanged");
+        assert!(cells[row][col + 1].style.reverse, "CJK lead selected");
+        assert!(cells[row][col + 2].style.reverse, "CJK continuation selected");
+        assert!(cells[row][col + 3].style.reverse, "ZWJ lead selected");
+        assert!(cells[row][col + 4].style.reverse, "ZWJ continuation selected");
+        assert!(!cells[row][col + 5].style.reverse, "ASCII suffix unchanged");
     }
 
     #[test]

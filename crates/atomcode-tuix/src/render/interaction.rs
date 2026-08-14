@@ -6,6 +6,27 @@ pub struct ComposerSelection {
     pub range: std::ops::Range<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyRun {
+    pub id: u64,
+    pub rect: CellRect,
+    pub text: Arc<str>,
+    pub soft_wrap: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SemanticEndpoint {
+    pub run_id: u64,
+    pub byte: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptSelection {
+    pub anchor: SemanticEndpoint,
+    pub head: SemanticEndpoint,
+    pub run_ids: Arc<[u64]>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CellRect {
     pub row: u16,
@@ -29,6 +50,7 @@ pub enum HitTarget {
     ModalItem { index: usize },
     ModalCancel,
     ComposerByte { byte: usize },
+    TranscriptByte { run_id: u64, byte: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +64,7 @@ pub struct InteractionFrame {
     pub generation: u64,
     pub surface_session: u64,
     pub regions: Vec<HitRegion>,
+    pub copy_runs: Vec<CopyRun>,
 }
 
 impl InteractionFrame {
@@ -66,6 +89,7 @@ struct PublisherState {
     actionable: bool,
     worker_authority: Option<(u64, u64)>,
     composer_selection: Option<ComposerSelection>,
+    transcript_selection: Option<TranscriptSelection>,
 }
 
 impl InteractionPublisher {
@@ -89,6 +113,16 @@ impl InteractionPublisher {
         surface_session: u64,
         regions: Vec<HitRegion>,
     ) -> bool {
+        self.publish_frame_if_current(expected_epoch, surface_session, regions, Vec::new())
+    }
+
+    pub fn publish_frame_if_current(
+        &self,
+        expected_epoch: u64,
+        surface_session: u64,
+        regions: Vec<HitRegion>,
+        copy_runs: Vec<CopyRun>,
+    ) -> bool {
         let mut state = write_recover(&self.inner);
         if state.epoch != expected_epoch {
             return false;
@@ -98,6 +132,7 @@ impl InteractionPublisher {
             generation,
             surface_session,
             regions,
+            copy_runs,
         });
         state.actionable = true;
         true
@@ -150,6 +185,50 @@ impl InteractionPublisher {
 
     pub fn composer_selection(&self) -> Option<ComposerSelection> {
         read_recover(&self.inner).composer_selection.clone()
+    }
+
+    pub fn set_transcript_selection(&self, selection: Option<TranscriptSelection>) {
+        write_recover(&self.inner).transcript_selection = selection;
+    }
+
+    pub fn transcript_selection(&self) -> Option<TranscriptSelection> {
+        read_recover(&self.inner).transcript_selection.clone()
+    }
+
+    pub fn reconcile_transcript_selection(&self, runs: &[CopyRun]) -> Option<TranscriptSelection> {
+        let mut state = write_recover(&self.inner);
+        let mut selection = state.transcript_selection.take()?;
+        selection.run_ids = selection
+            .run_ids
+            .iter()
+            .copied()
+            .filter(|id| runs.iter().any(|run| run.id == *id))
+            .collect::<Vec<_>>()
+            .into();
+        let clamp = |endpoint: SemanticEndpoint| {
+            let run = runs
+                .iter()
+                .filter(|run| selection.run_ids.contains(&run.id))
+                .min_by_key(|run| run.id.abs_diff(endpoint.run_id))?;
+            let mut byte = endpoint.byte.min(run.text.len());
+            while byte > 0 && !run.text.is_char_boundary(byte) {
+                byte -= 1;
+            }
+            Some(SemanticEndpoint {
+                run_id: run.id,
+                byte,
+            })
+        };
+        let Some(anchor) = clamp(selection.anchor) else {
+            return None;
+        };
+        let Some(head) = clamp(selection.head) else {
+            return None;
+        };
+        selection.anchor = anchor;
+        selection.head = head;
+        state.transcript_selection = Some(selection.clone());
+        Some(selection)
     }
 
     #[cfg(test)]
@@ -218,6 +297,36 @@ mod tests {
     }
 
     #[test]
+    fn transcript_presentation_clamps_on_a_stream_frame_without_pointer_input() {
+        let publisher = InteractionPublisher::default();
+        publisher.set_transcript_selection(Some(TranscriptSelection {
+            anchor: SemanticEndpoint { run_id: 1, byte: 4 },
+            head: SemanticEndpoint { run_id: 2, byte: 3 },
+            run_ids: vec![1, 2].into(),
+        }));
+        let runs = vec![CopyRun {
+            id: 2,
+            rect: CellRect {
+                row: 0,
+                col: 0,
+                height: 1,
+                width: 4,
+            },
+            text: Arc::from("你a"),
+            soft_wrap: false,
+        }];
+        let selection = publisher
+            .reconcile_transcript_selection(&runs)
+            .expect("nearest initial run survives");
+        assert_eq!(selection.run_ids.as_ref(), &[2]);
+        assert_eq!(selection.anchor, SemanticEndpoint { run_id: 2, byte: 4 });
+        assert_eq!(selection.head, SemanticEndpoint { run_id: 2, byte: 3 });
+
+        assert!(publisher.reconcile_transcript_selection(&[]).is_none());
+        assert!(publisher.transcript_selection().is_none());
+    }
+
+    #[test]
     fn publisher_recovers_from_a_poisoned_lock() {
         let publisher = InteractionPublisher::default();
         let poison = publisher.clone();
@@ -261,6 +370,7 @@ mod tests {
                     target: HitTarget::ModalItem { index: 0 },
                 },
             ],
+            copy_runs: Vec::new(),
         };
 
         assert_eq!(frame.hit(5, 4), Some(HitTarget::ModalItem { index: 0 }));

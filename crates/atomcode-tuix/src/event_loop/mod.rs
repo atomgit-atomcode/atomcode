@@ -8401,6 +8401,17 @@ pub struct App {
     /// Accumulates reasoning/thinking content for display in verbose mode.
     /// Flushed on newline or when buffer exceeds threshold.
     pub reasoning_buffer: String,
+    transcript_selection: Option<TranscriptSelectionState>,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptSelectionState {
+    generation: u64,
+    surface_session: u64,
+    anchor: crate::render::interaction::SemanticEndpoint,
+    head: crate::render::interaction::SemanticEndpoint,
+    surviving_run_ids: Vec<u64>,
+    dragging: bool,
 }
 
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
@@ -8514,6 +8525,7 @@ impl App {
             esc_undo_last_at: None,
             setup_pending: false,
             reasoning_buffer: String::new(),
+            transcript_selection: None,
         }
     }
 }
@@ -11548,6 +11560,214 @@ enum ComposerPointerRoute {
     Redraw,
 }
 
+fn transcript_endpoint_index(
+    runs: &[crate::render::interaction::CopyRun],
+    endpoint: crate::render::interaction::SemanticEndpoint,
+) -> Option<usize> {
+    runs.iter().position(|run| run.id == endpoint.run_id)
+}
+
+fn extract_transcript_selection(
+    runs: &[crate::render::interaction::CopyRun],
+    anchor: crate::render::interaction::SemanticEndpoint,
+    head: crate::render::interaction::SemanticEndpoint,
+) -> Option<String> {
+    let anchor_index = transcript_endpoint_index(runs, anchor)?;
+    let head_index = transcript_endpoint_index(runs, head)?;
+    let (start_index, start_byte, end_index, end_byte) =
+        if (anchor_index, anchor.byte) <= (head_index, head.byte) {
+            (anchor_index, anchor.byte, head_index, head.byte)
+        } else {
+            (head_index, head.byte, anchor_index, anchor.byte)
+        };
+    let start_run = &runs[start_index];
+    let end_run = &runs[end_index];
+    if start_byte > start_run.text.len()
+        || end_byte > end_run.text.len()
+        || !start_run.text.is_char_boundary(start_byte)
+        || !end_run.text.is_char_boundary(end_byte)
+    {
+        return None;
+    }
+
+    let mut output = String::new();
+    for index in start_index..=end_index {
+        let run = &runs[index];
+        let from = if index == start_index { start_byte } else { 0 };
+        let to = if index == end_index {
+            end_byte
+        } else {
+            run.text.len()
+        };
+        if from > to || !run.text.is_char_boundary(from) || !run.text.is_char_boundary(to) {
+            return None;
+        }
+        output.extend(run.text[from..to].chars().filter(|character| {
+            *character == '\n' || *character == '\t' || !character.is_control()
+        }));
+        if index < end_index && !run.soft_wrap {
+            output.push('\n');
+        }
+    }
+    Some(output)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TranscriptPointerRoute {
+    Ignored,
+    Handled,
+    Redraw,
+    Copy(String),
+}
+
+fn publish_transcript_selection(
+    state: Option<&TranscriptSelectionState>,
+    publisher: &crate::render::interaction::InteractionPublisher,
+) {
+    publisher.set_transcript_selection(state.map(|state| {
+        crate::render::interaction::TranscriptSelection {
+            anchor: state.anchor,
+            head: state.head,
+            run_ids: state.surviving_run_ids.clone().into(),
+        }
+    }));
+}
+
+fn clamp_endpoint_to_runs(
+    endpoint: crate::render::interaction::SemanticEndpoint,
+    runs: &[crate::render::interaction::CopyRun],
+    allowed: &[u64],
+) -> Option<crate::render::interaction::SemanticEndpoint> {
+    let run = runs
+        .iter()
+        .filter(|run| allowed.contains(&run.id))
+        .min_by_key(|run| run.id.abs_diff(endpoint.run_id))?;
+    let mut byte = endpoint.byte.min(run.text.len());
+    while byte > 0 && !run.text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    Some(crate::render::interaction::SemanticEndpoint {
+        run_id: run.id,
+        byte,
+    })
+}
+
+fn reconcile_transcript_selection(
+    selection: &mut TranscriptSelectionState,
+    frame: &crate::render::interaction::InteractionFrame,
+) -> bool {
+    if selection.surface_session != frame.surface_session {
+        return false;
+    }
+    if selection.generation == frame.generation {
+        return true;
+    }
+    selection
+        .surviving_run_ids
+        .retain(|id| frame.copy_runs.iter().any(|run| run.id == *id));
+    let Some(anchor) = clamp_endpoint_to_runs(
+        selection.anchor,
+        &frame.copy_runs,
+        &selection.surviving_run_ids,
+    ) else {
+        return false;
+    };
+    let Some(head) = clamp_endpoint_to_runs(
+        selection.head,
+        &frame.copy_runs,
+        &selection.surviving_run_ids,
+    ) else {
+        return false;
+    };
+    selection.anchor = anchor;
+    selection.head = head;
+    selection.generation = frame.generation;
+    true
+}
+
+fn handle_transcript_pointer(
+    selection: &mut Option<TranscriptSelectionState>,
+    publisher: &crate::render::interaction::InteractionPublisher,
+    event: PointerEvent,
+    frame: &crate::render::interaction::InteractionFrame,
+    target: Option<crate::render::interaction::HitTarget>,
+) -> TranscriptPointerRoute {
+    use crate::render::interaction::{HitTarget, SemanticEndpoint};
+    if event.shift || event.button != Some(crate::input::PointerButton::Primary) {
+        return TranscriptPointerRoute::Ignored;
+    }
+    let endpoint = match target {
+        Some(HitTarget::TranscriptByte { run_id, byte }) => Some(SemanticEndpoint { run_id, byte }),
+        _ => None,
+    };
+    match event.kind {
+        PointerKind::Down => {
+            let Some(endpoint) = endpoint else {
+                return TranscriptPointerRoute::Ignored;
+            };
+            *selection = Some(TranscriptSelectionState {
+                generation: frame.generation,
+                surface_session: frame.surface_session,
+                anchor: endpoint,
+                head: endpoint,
+                surviving_run_ids: frame.copy_runs.iter().map(|run| run.id).collect(),
+                dragging: true,
+            });
+            publish_transcript_selection(selection.as_ref(), publisher);
+            TranscriptPointerRoute::Handled
+        }
+        PointerKind::Drag => {
+            let Some(state) = selection.as_mut().filter(|state| state.dragging) else {
+                return TranscriptPointerRoute::Ignored;
+            };
+            if !reconcile_transcript_selection(state, frame) {
+                *selection = None;
+                publish_transcript_selection(None, publisher);
+                return TranscriptPointerRoute::Handled;
+            }
+            if let Some(endpoint) = endpoint.filter(|endpoint| {
+                state.surviving_run_ids.contains(&endpoint.run_id)
+            }) {
+                state.head = endpoint;
+            }
+            publish_transcript_selection(selection.as_ref(), publisher);
+            TranscriptPointerRoute::Handled
+        }
+        PointerKind::Up => {
+            let Some(state) = selection.as_mut().filter(|state| state.dragging) else {
+                return TranscriptPointerRoute::Ignored;
+            };
+            state.dragging = false;
+            if !reconcile_transcript_selection(state, frame) {
+                *selection = None;
+                publish_transcript_selection(None, publisher);
+                return TranscriptPointerRoute::Handled;
+            }
+            if let Some(endpoint) = endpoint.filter(|endpoint| {
+                state.surviving_run_ids.contains(&endpoint.run_id)
+            }) {
+                state.head = endpoint;
+            }
+            let anchor = state.anchor;
+            let head = state.head;
+            let surviving_runs: Vec<_> = frame
+                .copy_runs
+                .iter()
+                .filter(|run| state.surviving_run_ids.contains(&run.id))
+                .cloned()
+                .collect();
+            publish_transcript_selection(selection.as_ref(), publisher);
+            extract_transcript_selection(&surviving_runs, anchor, head)
+                .filter(|text| !text.is_empty())
+                .map_or(
+                    TranscriptPointerRoute::Redraw,
+                    TranscriptPointerRoute::Copy,
+                )
+        }
+        PointerKind::Move | PointerKind::Scroll(_) => TranscriptPointerRoute::Ignored,
+    }
+}
+
 fn sync_composer_selection(
     buf: &Buffer,
     publisher: &crate::render::interaction::InteractionPublisher,
@@ -11601,6 +11821,37 @@ fn handle_pointer_hit(
     frame: &crate::render::interaction::InteractionFrame,
 ) -> Result<()> {
     let target = frame.hit(event.row, event.col);
+    match handle_transcript_pointer(
+        &mut app.transcript_selection,
+        &ctx.interaction_publisher,
+        event,
+        frame,
+        target,
+    ) {
+        TranscriptPointerRoute::Copy(text) => {
+            redraw_after_composer_pointer(app, ctx, renderer);
+            let allow_osc52 = transcript_osc52_allowed(&ctx.caps);
+            if crate::event_loop::commands::copy_text_to_clipboard(&text, allow_osc52).is_err() {
+                let notice = crate::sanitize::scrub_controls(&crate::i18n::t(
+                    crate::i18n::Msg::CopyFailed,
+                ));
+                renderer.render(UiLine::Warning(notice));
+                renderer.flush();
+            }
+            app.menu.pointer_cancel();
+            return Ok(());
+        }
+        TranscriptPointerRoute::Redraw => {
+            redraw_after_composer_pointer(app, ctx, renderer);
+            app.menu.pointer_cancel();
+            return Ok(());
+        }
+        TranscriptPointerRoute::Handled => {
+            app.menu.pointer_cancel();
+            return Ok(());
+        }
+        TranscriptPointerRoute::Ignored => {}
+    }
     match route_active_composer_pointer(
         &mut app.buf,
         &ctx.interaction_publisher,
@@ -11685,6 +11936,10 @@ fn handle_pointer_hit(
         | PointerClickAction::Confirm(_) => {}
     }
     Ok(())
+}
+
+fn transcript_osc52_allowed(caps: &crate::terminal::TerminalCaps) -> bool {
+    caps.osc52_clipboard
 }
 
 fn route_active_composer_pointer(
@@ -11784,6 +12039,7 @@ enum PointerPreflightRoute {
     ScrollContinue,
     PointerContinue,
     ComposerCleanup,
+    TranscriptCleanup,
     ReturnIgnored,
     NotPointer,
 }
@@ -11793,6 +12049,7 @@ fn pointer_input_route(
     interaction: Option<&crate::render::interaction::InteractionFrame>,
     menu: &mut MenuState,
     composer_pointer_active: bool,
+    transcript_pointer_active: bool,
 ) -> PointerPreflightRoute {
     if composer_pointer_active
         && matches!(
@@ -11807,6 +12064,19 @@ fn pointer_input_route(
     {
         return PointerPreflightRoute::ComposerCleanup;
     }
+    if transcript_pointer_active
+        && matches!(
+            event,
+            InputEvent::Pointer(PointerEvent {
+                kind: PointerKind::Up,
+                button: Some(crate::input::PointerButton::Primary),
+                shift: true,
+                ..
+            })
+        )
+    {
+        return PointerPreflightRoute::TranscriptCleanup;
+    }
     let pointer_actionable = match event {
         InputEvent::Pointer(pointer)
             if !pointer.shift
@@ -11816,13 +12086,15 @@ fn pointer_input_route(
                     PointerKind::Down | PointerKind::Up | PointerKind::Drag
                 ) =>
         {
-            (pointer.kind == PointerKind::Up && composer_pointer_active)
+            (pointer.kind == PointerKind::Up
+                && (composer_pointer_active || transcript_pointer_active))
                 || interaction.is_some_and(|interaction| {
                 let hit = interaction.hit(pointer.row, pointer.col);
                 match pointer.kind {
                     PointerKind::Drag => matches!(
                         hit,
                         Some(crate::render::interaction::HitTarget::ComposerByte { .. })
+                            | Some(crate::render::interaction::HitTarget::TranscriptByte { .. })
                     ),
                     PointerKind::Down => hit.is_some(),
                     PointerKind::Up => hit.is_some() || menu.has_pointer_press(),
@@ -11850,6 +12122,33 @@ fn pointer_preflight_route(event: &InputEvent, pointer_actionable: bool) -> Poin
     }
 }
 
+fn handle_input_preflight_with_transcript(
+    event: &InputEvent,
+    interaction: Option<&crate::render::interaction::InteractionFrame>,
+    menu: &mut MenuState,
+    composer_pointer_active: bool,
+    transcript_pointer_active: bool,
+    run_general_prelude: impl FnOnce(),
+) -> PointerPreflightRoute {
+    let route = pointer_input_route(
+        event,
+        interaction,
+        menu,
+        composer_pointer_active,
+        transcript_pointer_active,
+    );
+    if !matches!(
+        route,
+        PointerPreflightRoute::ReturnIgnored
+            | PointerPreflightRoute::ComposerCleanup
+            | PointerPreflightRoute::TranscriptCleanup
+    ) {
+        run_general_prelude();
+    }
+    route
+}
+
+#[cfg(test)]
 fn handle_input_preflight(
     event: &InputEvent,
     interaction: Option<&crate::render::interaction::InteractionFrame>,
@@ -11857,14 +12156,14 @@ fn handle_input_preflight(
     composer_pointer_active: bool,
     run_general_prelude: impl FnOnce(),
 ) -> PointerPreflightRoute {
-    let route = pointer_input_route(event, interaction, menu, composer_pointer_active);
-    if !matches!(
-        route,
-        PointerPreflightRoute::ReturnIgnored | PointerPreflightRoute::ComposerCleanup
-    ) {
-        run_general_prelude();
-    }
-    route
+    handle_input_preflight_with_transcript(
+        event,
+        interaction,
+        menu,
+        composer_pointer_active,
+        false,
+        run_general_prelude,
+    )
 }
 
 fn cancel_unactionable_pointer_release(
@@ -11897,11 +12196,14 @@ fn handle_input(
     use crate::modals::ModalAction;
 
     let interaction = ctx.interaction_publisher.snapshot_actionable();
-    let preflight = handle_input_preflight(
+    let preflight = handle_input_preflight_with_transcript(
         &ev,
         interaction.as_deref(),
         &mut app.menu,
         app.buf.pointer_selection_active(),
+        app.transcript_selection
+            .as_ref()
+            .is_some_and(|selection| selection.dragging),
         || {
         let has_non_capturing_modal = app
             .active_modal
@@ -11953,6 +12255,12 @@ fn handle_input(
         cleanup_composer_pointer_capture(&mut app.buf, &ctx.interaction_publisher);
         return Ok(());
     }
+    if preflight == PointerPreflightRoute::TranscriptCleanup {
+        if let Some(selection) = app.transcript_selection.as_mut() {
+            selection.dragging = false;
+        }
+        return Ok(());
+    }
     if preflight == PointerPreflightRoute::ReturnIgnored {
         return Ok(());
     }
@@ -11968,8 +12276,11 @@ fn handle_input(
                 if let Some(interaction) = interaction.as_deref() {
                     handle_pointer_hit(app, ctx, renderer, pointer, interaction)?;
                 } else {
-                    debug_assert!(app.buf.pointer_selection_active());
-                    let _ = finish_composer_pointer_capture(app, ctx, renderer, pointer);
+                    if app.buf.pointer_selection_active() {
+                        let _ = finish_composer_pointer_capture(app, ctx, renderer, pointer);
+                    } else if let Some(selection) = app.transcript_selection.as_mut() {
+                        selection.dragging = false;
+                    }
                 }
             }
         }
@@ -12450,6 +12761,7 @@ mod tests {
                 },
                 target: HitTarget::MenuItem { index: 0 },
             }],
+            copy_runs: Vec::new(),
         }
     }
 
@@ -12466,7 +12778,241 @@ mod tests {
                 },
                 target: HitTarget::ComposerByte { byte: 1 },
             }],
+            copy_runs: Vec::new(),
         }
+    }
+
+    fn copy_run(id: u64, text: &str, soft_wrap: bool) -> crate::render::interaction::CopyRun {
+        crate::render::interaction::CopyRun {
+            id,
+            rect: CellRect {
+                row: id as u16,
+                col: 0,
+                height: 1,
+                width: 20,
+            },
+            text: std::sync::Arc::from(text),
+            soft_wrap,
+        }
+    }
+
+    fn transcript_frame(
+        generation: u64,
+        surface_session: u64,
+        runs: Vec<crate::render::interaction::CopyRun>,
+    ) -> InteractionFrame {
+        let regions = runs
+            .iter()
+            .map(|run| HitRegion {
+                rect: run.rect,
+                target: HitTarget::TranscriptByte {
+                    run_id: run.id,
+                    byte: run.text.len(),
+                },
+            })
+            .collect();
+        InteractionFrame {
+            generation,
+            surface_session,
+            regions,
+            copy_runs: runs,
+        }
+    }
+
+    #[test]
+    fn transcript_extraction_joins_soft_wraps_and_preserves_hard_breaks() {
+        use crate::render::interaction::SemanticEndpoint;
+        let runs = vec![
+            copy_run(10, "abcdefgh", true),
+            copy_run(11, "ij", false),
+            copy_run(12, "  code", false),
+            copy_run(13, "你好👩‍💻\u{0007}", false),
+        ];
+        assert_eq!(
+            super::extract_transcript_selection(
+                &runs,
+                SemanticEndpoint { run_id: 10, byte: 0 },
+                SemanticEndpoint {
+                    run_id: 13,
+                    byte: runs[3].text.len(),
+                },
+            )
+            .as_deref(),
+            Some("abcdefghij\n  code\n你好👩‍💻")
+        );
+    }
+
+    #[test]
+    fn transcript_extraction_supports_reverse_utf8_selection_without_terminal_bytes() {
+        use crate::render::interaction::SemanticEndpoint;
+        let runs = vec![copy_run(20, "diff + 你好👩‍💻", false)];
+        let start = "diff + ".len();
+        let end = runs[0].text.len();
+        assert_eq!(
+            super::extract_transcript_selection(
+                &runs,
+                SemanticEndpoint { run_id: 20, byte: end },
+                SemanticEndpoint {
+                    run_id: 20,
+                    byte: start,
+                },
+            )
+            .as_deref(),
+            Some("你好👩‍💻")
+        );
+    }
+
+    #[test]
+    fn transcript_pointer_stream_frame_clamps_to_survivors_and_never_copies_new_run() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let first = transcript_frame(
+            10,
+            7,
+            vec![copy_run(100, "old-a", false), copy_run(101, "old-b", false)],
+        );
+        let mut selection = None;
+        let mut down = pointer(PointerKind::Down, Some(PointerButton::Primary), false);
+        down.row = 100;
+        assert_eq!(
+            super::handle_transcript_pointer(
+                &mut selection,
+                &publisher,
+                down,
+                &first,
+                Some(HitTarget::TranscriptByte { run_id: 100, byte: 0 }),
+            ),
+            super::TranscriptPointerRoute::Handled
+        );
+        let mut drag = pointer(PointerKind::Drag, Some(PointerButton::Primary), false);
+        drag.row = 101;
+        assert_eq!(
+            super::handle_transcript_pointer(
+                &mut selection,
+                &publisher,
+                drag,
+                &first,
+                Some(HitTarget::TranscriptByte { run_id: 101, byte: 5 }),
+            ),
+            super::TranscriptPointerRoute::Handled
+        );
+
+        let streamed = transcript_frame(
+            11,
+            7,
+            vec![copy_run(100, "old-a", false), copy_run(999, "NEW", false)],
+        );
+        let mut up = pointer(PointerKind::Up, Some(PointerButton::Primary), false);
+        up.row = 999;
+        let result = super::handle_transcript_pointer(
+            &mut selection,
+            &publisher,
+            up,
+            &streamed,
+            Some(HitTarget::TranscriptByte { run_id: 999, byte: 3 }),
+        );
+        assert_eq!(result, super::TranscriptPointerRoute::Copy("old-a".into()));
+        assert!(!format!("{result:?}").contains("NEW"));
+        assert_eq!(
+            super::handle_transcript_pointer(
+                &mut selection,
+                &publisher,
+                up,
+                &streamed,
+                Some(HitTarget::TranscriptByte { run_id: 999, byte: 3 }),
+            ),
+            super::TranscriptPointerRoute::Ignored,
+            "one completed gesture copies exactly once"
+        );
+    }
+
+    #[test]
+    fn transcript_pointer_session_switch_clears_stale_capture_without_copy() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let first = transcript_frame(1, 10, vec![copy_run(1, "session-a", false)]);
+        let mut selection = None;
+        assert_eq!(
+            super::handle_transcript_pointer(
+                &mut selection,
+                &publisher,
+                pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+                &first,
+                Some(HitTarget::TranscriptByte { run_id: 1, byte: 0 }),
+            ),
+            super::TranscriptPointerRoute::Handled
+        );
+        let next = transcript_frame(2, 11, vec![copy_run(1, "session-b", false)]);
+        assert_eq!(
+            super::handle_transcript_pointer(
+                &mut selection,
+                &publisher,
+                pointer(PointerKind::Up, Some(PointerButton::Primary), false),
+                &next,
+                Some(HitTarget::TranscriptByte { run_id: 1, byte: 9 }),
+            ),
+            super::TranscriptPointerRoute::Handled
+        );
+        assert!(selection.is_none());
+        assert!(publisher.transcript_selection().is_none());
+    }
+
+    #[test]
+    fn transcript_capture_uses_production_preflight_for_outside_and_shift_release() {
+        let mut menu = super::MenuState::new();
+        let outside_up = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Up,
+            Some(PointerButton::Primary),
+            false,
+        ));
+        assert_eq!(
+            super::handle_input_preflight_with_transcript(
+                &outside_up,
+                None,
+                &mut menu,
+                false,
+                true,
+                || {},
+            ),
+            super::PointerPreflightRoute::PointerContinue
+        );
+        let shift_up = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Up,
+            Some(PointerButton::Primary),
+            true,
+        ));
+        assert_eq!(
+            super::handle_input_preflight_with_transcript(
+                &shift_up,
+                None,
+                &mut menu,
+                false,
+                true,
+                || panic!("cleanup must not run the general prelude"),
+            ),
+            super::PointerPreflightRoute::TranscriptCleanup
+        );
+    }
+
+    #[test]
+    fn transcript_osc52_policy_uses_terminal_capability_not_tty_assumption() {
+        let mut caps = crate::terminal::TerminalCaps {
+            tty: true,
+            colors: true,
+            spinner: true,
+            bracketed_paste: true,
+            raw_mode: true,
+            scroll_region: true,
+            unicode_symbols: true,
+            legacy_conhost: false,
+            jediterm: false,
+            modern_emulator: true,
+            kitty_keyboard: false,
+            mouse_sgr: true,
+            osc52_clipboard: false,
+            tmux_passthrough: false,
+        };
+        assert!(!super::transcript_osc52_allowed(&caps));
+        caps.osc52_clipboard = true;
+        assert!(super::transcript_osc52_allowed(&caps));
     }
 
     #[test]
