@@ -212,6 +212,7 @@ pub fn derive_tier_config(
     tier.thinking_enabled = provider.thinking_enabled;
     tier.user_agent = provider.user_agent.clone();
     tier.skip_tls_verify = provider.skip_tls_verify;
+    tier.retry_max_attempts = provider.retry_max_attempts;
     tier.subagent_fast_provider = None;
     tier.subagent_capable_provider = None;
     tier.subagent_config = None;
@@ -258,6 +259,7 @@ pub fn derive_tier_config_from_resolved(
     tier.thinking_enabled = resolved.thinking_enabled;
     tier.user_agent = resolved.user_agent.clone();
     tier.skip_tls_verify = resolved.skip_tls_verify;
+    tier.retry_max_attempts = resolved.retry_max_attempts;
     tier.subagent_fast_provider = None;
     tier.subagent_capable_provider = None;
     tier.subagent_config = None;
