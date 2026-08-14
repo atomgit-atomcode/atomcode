@@ -14347,39 +14347,6 @@ fn confirm_idle_menu_selected(
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) fn command_action_contract_fixtures_for_test(
-) -> Vec<crate::modals::ModalActionContractFixture> {
-    let registry = CommandRegistry::builtin();
-    let custom = crate::custom_commands::CustomCommandRegistry::empty();
-    let items = build_menu_items("/he", 3, &registry, &custom, None, None)
-        .expect("real slash command menu");
-    let selected = items
-        .iter()
-        .position(|(name, _)| name == "help")
-        .expect("help command in real menu");
-    let (completed, submit) = streaming_top_level_slash_selection(
-        "/he",
-        &items[selected].0,
-        registry
-            .find(&items[selected].0)
-            .expect("real command")
-            .needs_args,
-        KeyCode::Tab,
-    )
-    .expect("real slash selection semantic");
-    vec![crate::modals::ModalActionContractFixture {
-        name: "command_menu_tab_completion".into(),
-        before: serde_json::json!({ "buffer": "/he", "selected": selected }).to_string(),
-        input: "Tab".into(),
-        outcome: format!("Complete(submit={submit})"),
-        after: serde_json::json!({ "buffer": completed, "selected": selected }).to_string(),
-        focus: "command_menu.items".into(),
-        selected: Some(selected),
-        stack: vec!["CommandMenu".into()],
-    }]
-}
-
 fn handle_idle_key(
     app: &mut App,
     ctx: &mut LoopCtx,
