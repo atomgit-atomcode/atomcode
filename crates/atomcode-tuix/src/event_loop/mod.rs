@@ -4138,9 +4138,23 @@ fn rgba_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
 /// spliced back in when the line is submitted. This keeps the visible
 /// input short (matching CC's paste UX) without truncating what the
 /// agent actually sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EditSelection {
+    anchor: usize,
+    head: usize,
+}
+
+impl EditSelection {
+    fn ordered(self) -> std::ops::Range<usize> {
+        self.anchor.min(self.head)..self.anchor.max(self.head)
+    }
+}
+
 pub struct Buffer {
     pub text: String,
     pub cursor: usize,
+    selection: Option<EditSelection>,
+    pointer_selection_active: bool,
     history_idx: Option<usize>,
     /// One-shot: suppress the slash-command menu for text placed into the
     /// buffer programmatically (a cancelled message restored on Esc). Without
@@ -4184,6 +4198,8 @@ impl Buffer {
         Self {
             text: String::new(),
             cursor: 0,
+            selection: None,
+            pointer_selection_active: false,
             history_idx: None,
             menu_suppressed: false,
             stash: String::new(),
@@ -4206,6 +4222,7 @@ impl Buffer {
     pub fn set_restored_text(&mut self, text: String) {
         self.cursor = text.len();
         self.text = text;
+        self.clear_selection();
         self.history_idx = None;
         self.searching = false;
         self.search_query.clear();
@@ -4262,6 +4279,7 @@ impl Buffer {
         self.cursor = self.text.len();
         self.history_idx = None;
         self.menu_suppressed = false;
+        self.clear_selection();
         true
     }
 
@@ -4272,6 +4290,62 @@ impl Buffer {
     /// buffer is showing.
     pub fn history_idx(&self) -> Option<usize> {
         self.history_idx
+    }
+
+    fn selected_range(&self) -> Option<std::ops::Range<usize>> {
+        self.selection
+            .map(EditSelection::ordered)
+            .filter(|range| !range.is_empty())
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.pointer_selection_active = false;
+    }
+
+    fn replace_selection(&mut self, replacement: &str) -> bool {
+        let Some(range) = self.selected_range() else {
+            self.clear_selection();
+            return false;
+        };
+        self.text.replace_range(range.clone(), replacement);
+        self.cursor = range.start + replacement.len();
+        self.clear_selection();
+        self.history_idx = None;
+        true
+    }
+
+    fn set_pointer_cursor(&mut self, byte: usize, extend: bool) -> bool {
+        if byte > self.text.len() || !self.text.is_char_boundary(byte) {
+            return false;
+        }
+        if extend {
+            if !self.pointer_selection_active {
+                return false;
+            }
+            let anchor = self.selection.map_or(self.cursor, |selection| selection.anchor);
+            self.selection = Some(EditSelection { anchor, head: byte });
+        } else {
+            self.selection = Some(EditSelection {
+                anchor: byte,
+                head: byte,
+            });
+            self.pointer_selection_active = true;
+        }
+        self.cursor = byte;
+        self.history_idx = None;
+        true
+    }
+
+    fn pointer_selection_active(&self) -> bool {
+        self.pointer_selection_active
+    }
+
+    fn end_pointer_selection(&mut self) {
+        self.pointer_selection_active = false;
+        if self.selected_range().is_none() {
+            self.selection = None;
+        }
     }
 
     /// Insert a pasted block. Folds into a `[Pasted …]` placeholder if
@@ -4292,6 +4366,7 @@ impl Buffer {
     /// and the expanded agent payload are in canonical form.
     pub fn insert_paste(&mut self, text: String) -> String {
         let text = normalize_newlines(&text);
+        self.replace_selection("");
         let line_count = text.lines().count().max(1);
         let char_count = text.chars().count();
         if line_count >= PASTE_FOLD_LINES || char_count >= PASTE_FOLD_CHARS {
@@ -4384,12 +4459,14 @@ impl Buffer {
         }
         match action {
             Action::Insert(c) => {
+                self.replace_selection("");
                 self.text.insert(self.cursor, c);
                 self.cursor += c.len_utf8();
                 self.history_idx = None;
                 BufferResult::Redraw
             }
             Action::Submit => {
+                self.clear_selection();
                 // Line continuation: a `\` immediately before the cursor
                 // is consumed and replaced with `\n`. Lets users insert
                 // newlines on terminals that swallow Shift/Ctrl/Alt+Enter
@@ -4428,6 +4505,7 @@ impl Buffer {
                 BufferResult::Commit(line)
             }
             Action::InsertNewline => {
+                self.replace_selection("");
                 self.text.insert(self.cursor, '\n');
                 self.cursor += 1;
                 BufferResult::Redraw
@@ -4438,6 +4516,7 @@ impl Buffer {
                 } else {
                     self.text.clear();
                     self.cursor = 0;
+                    self.clear_selection();
                     self.history_idx = None;
                     self.pastes.clear();
                     BufferResult::Redraw
@@ -4446,10 +4525,14 @@ impl Buffer {
             Action::ClearLine => {
                 self.text.clear();
                 self.cursor = 0;
+                self.clear_selection();
                 self.pastes.clear();
                 BufferResult::Redraw
             }
             Action::DeleteWordBackward => {
+                if self.replace_selection("") {
+                    return BufferResult::Redraw;
+                }
                 let before = &self.text[..self.cursor];
                 let trimmed = before.trim_end_matches(' ');
                 let word_start = trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0);
@@ -4458,6 +4541,9 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::DeleteToEnd => {
+                if self.replace_selection("") {
+                    return BufferResult::Redraw;
+                }
                 let end = self.text[self.cursor..]
                     .find('\n')
                     .map(|i| self.cursor + i)
@@ -4466,6 +4552,9 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::Backspace => {
+                if self.replace_selection("") {
+                    return BufferResult::Redraw;
+                }
                 if self.cursor > 0 {
                     let p = prev_boundary(&self.text, self.cursor);
                     self.text.drain(p..self.cursor);
@@ -4474,6 +4563,9 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::DeleteForward => {
+                if self.replace_selection("") {
+                    return BufferResult::Redraw;
+                }
                 if self.cursor < self.text.len() {
                     let n = next_boundary(&self.text, self.cursor);
                     self.text.drain(self.cursor..n);
@@ -4481,18 +4573,31 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::CursorLeft => {
+                if let Some(range) = self.selected_range() {
+                    self.cursor = range.start;
+                    self.clear_selection();
+                    return BufferResult::Redraw;
+                }
+                self.clear_selection();
                 if self.cursor > 0 {
                     self.cursor = prev_boundary(&self.text, self.cursor);
                 }
                 BufferResult::Redraw
             }
             Action::CursorRight => {
+                if let Some(range) = self.selected_range() {
+                    self.cursor = range.end;
+                    self.clear_selection();
+                    return BufferResult::Redraw;
+                }
+                self.clear_selection();
                 if self.cursor < self.text.len() {
                     self.cursor = next_boundary(&self.text, self.cursor);
                 }
                 BufferResult::Redraw
             }
             Action::LineStart => {
+                self.clear_selection();
                 let start = self.text[..self.cursor]
                     .rfind('\n')
                     .map(|i| i + 1)
@@ -4501,6 +4606,7 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::LineEnd => {
+                self.clear_selection();
                 let end = self.text[self.cursor..]
                     .find('\n')
                     .map(|i| self.cursor + i)
@@ -4509,6 +4615,7 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::HistorySearch => {
+                self.clear_selection();
                 // Enter Ctrl+R reverse-i-search. The current draft is
                 // stashed so Esc restores it; `search_query` seeds from the
                 // draft (readline-style: Ctrl+R on a non-empty line searches
@@ -4527,6 +4634,7 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::HistoryPrev => {
+                self.clear_selection();
                 if history.is_empty() {
                     return BufferResult::Redraw;
                 }
@@ -4567,6 +4675,7 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::HistoryNext => {
+                self.clear_selection();
                 if let Some(i) = self.history_idx {
                     if i + 1 < history.len() {
                         // Still inside history — same cursor-at-0 rule
@@ -4591,6 +4700,7 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::Complete => {
+                self.clear_selection();
                 if self.text.starts_with('/') {
                     let prefix = &self.text[1..];
                     let matches = commands.matching_prefix(prefix);
@@ -4667,6 +4777,7 @@ impl Buffer {
     /// typed; an empty query matches every entry, so the most recent
     /// one is shown (readline behaviour).
     fn search_jump_newest(&mut self, history: &[crate::input::history::HistoryEntry]) {
+        self.clear_selection();
         let q = self.search_query.to_lowercase();
         let hit = (0..history.len())
             .rev()
@@ -4702,6 +4813,7 @@ impl Buffer {
     /// Display history entry `i` as the current search match: rehydrate
     /// text + paste registry and park the cursor (mirrors HistoryPrev).
     fn search_show(&mut self, history: &[crate::input::history::HistoryEntry], i: usize) {
+        self.clear_selection();
         self.history_idx = Some(i);
         self.text = history[i].text.clone();
         self.pastes = history[i].pastes.clone();
@@ -4719,6 +4831,12 @@ impl Buffer {
     /// kicks in but rescues anyone who paged Up to fix a typo on
     /// line 1 from losing their draft.
     pub fn cursor_line_up(&mut self) -> bool {
+        if let Some(range) = self.selected_range() {
+            self.cursor = range.start;
+            self.clear_selection();
+            return true;
+        }
+        self.clear_selection();
         let cur_line_start = self.text[..self.cursor]
             .rfind('\n')
             .map(|i| i + 1)
@@ -4749,6 +4867,12 @@ impl Buffer {
     /// first snaps to end-of-buffer; the keystroke after that hands
     /// off to history.
     pub fn cursor_line_down(&mut self) -> bool {
+        if let Some(range) = self.selected_range() {
+            self.cursor = range.end;
+            self.clear_selection();
+            return true;
+        }
+        self.clear_selection();
         let Some(rel_end) = self.text[self.cursor..].find('\n') else {
             if self.cursor < self.text.len() {
                 self.cursor = self.text.len();
@@ -4790,6 +4914,128 @@ fn byte_offset_at_col(line: &str, target_col: usize) -> usize {
 #[cfg(test)]
 mod buffer_tests {
     use super::*;
+
+    #[test]
+    fn buffer_selection_tracks_utf8_grapheme_boundaries_in_both_directions() {
+        let mut buf = Buffer::new();
+        buf.text = "a你好👩‍💻z".into();
+        let after_ascii = "a".len();
+        let after_emoji = "a你好👩‍💻".len();
+
+        buf.set_pointer_cursor(after_ascii, false);
+        buf.set_pointer_cursor(after_emoji, true);
+        assert_eq!(buf.selected_range(), Some(after_ascii..after_emoji));
+        assert_eq!(buf.cursor, after_emoji);
+
+        buf.set_pointer_cursor(after_emoji, false);
+        buf.set_pointer_cursor(after_ascii, true);
+        assert_eq!(buf.selected_range(), Some(after_ascii..after_emoji));
+        assert_eq!(buf.cursor, after_ascii);
+    }
+
+    #[test]
+    fn buffer_selection_is_replaced_by_typing_backspace_delete_and_paste() {
+        let history = Vec::new();
+        let commands = CommandRegistry::builtin();
+
+        let mut typed = Buffer::new();
+        typed.text = "abcde".into();
+        typed.set_pointer_cursor(1, false);
+        typed.set_pointer_cursor(4, true);
+        assert!(matches!(
+            typed.apply(Action::Insert('X'), &history, &commands),
+            BufferResult::Redraw
+        ));
+        assert_eq!((typed.text.as_str(), typed.cursor), ("aXe", 2));
+        assert_eq!(typed.selected_range(), None);
+
+        for action in [Action::Backspace, Action::DeleteForward] {
+            let mut deleted = Buffer::new();
+            deleted.text = "abcde".into();
+            deleted.set_pointer_cursor(1, false);
+            deleted.set_pointer_cursor(4, true);
+            assert!(matches!(
+                deleted.apply(action, &history, &commands),
+                BufferResult::Redraw
+            ));
+            assert_eq!((deleted.text.as_str(), deleted.cursor), ("ae", 1));
+            assert_eq!(deleted.selected_range(), None);
+        }
+
+        let mut pasted = Buffer::new();
+        pasted.text = "abcde".into();
+        pasted.set_pointer_cursor(1, false);
+        pasted.set_pointer_cursor(4, true);
+        assert_eq!(pasted.insert_paste("ZZ".into()), "ZZ");
+        assert_eq!((pasted.text.as_str(), pasted.cursor), ("aZZe", 3));
+        assert_eq!(pasted.selected_range(), None);
+    }
+
+    #[test]
+    fn buffer_selection_collapses_to_the_directional_cursor_edge() {
+        let history = Vec::new();
+        let commands = CommandRegistry::builtin();
+
+        let mut left = Buffer::new();
+        left.text = "abcde".into();
+        left.set_pointer_cursor(1, false);
+        left.set_pointer_cursor(4, true);
+        let _ = left.apply(Action::CursorLeft, &history, &commands);
+        assert_eq!(left.cursor, 1);
+        assert_eq!(left.selected_range(), None);
+
+        let mut right = Buffer::new();
+        right.text = "abcde".into();
+        right.set_pointer_cursor(4, false);
+        right.set_pointer_cursor(1, true);
+        let _ = right.apply(Action::CursorRight, &history, &commands);
+        assert_eq!(right.cursor, 4);
+        assert_eq!(right.selected_range(), None);
+    }
+
+    #[test]
+    fn buffer_selection_clears_on_history_recall_and_submit() {
+        let commands = CommandRegistry::builtin();
+        let history = vec![crate::input::history::HistoryEntry {
+            text: "recalled".into(),
+            images: Vec::new(),
+            pastes: Vec::new(),
+        }];
+        let mut recalled = Buffer::new();
+        recalled.text = "draft".into();
+        recalled.set_pointer_cursor(1, false);
+        recalled.set_pointer_cursor(4, true);
+        let _ = recalled.apply(Action::HistoryPrev, &history, &commands);
+        assert_eq!(recalled.text, "recalled");
+        assert_eq!(recalled.selected_range(), None);
+
+        let mut submitted = Buffer::new();
+        submitted.text = "submit me".into();
+        submitted.set_pointer_cursor(0, false);
+        submitted.set_pointer_cursor(6, true);
+        assert!(matches!(
+            submitted.apply(Action::Submit, &[], &commands),
+            BufferResult::Commit(line) if line == "submit me"
+        ));
+        assert_eq!(submitted.selected_range(), None);
+    }
+
+    #[test]
+    fn buffer_selection_replacing_a_folded_paste_cannot_expand_stale_metadata() {
+        let mut buf = Buffer::new();
+        let original = "fold me\n".repeat(PASTE_FOLD_LINES);
+        let placeholder = buf.insert_paste(original.clone());
+        assert!(placeholder.starts_with("[Pasted #1 "));
+        assert_eq!(buf.expanded_text(), original);
+
+        buf.set_pointer_cursor(0, false);
+        buf.set_pointer_cursor(buf.text.len(), true);
+        let _ = buf.apply(Action::Insert('X'), &[], &CommandRegistry::builtin());
+
+        assert_eq!(buf.text, "X");
+        assert_eq!(buf.expanded_text(), "X");
+        assert_eq!(buf.selected_range(), None);
+    }
 
     #[test]
     fn second_esc_within_window_triggers_undo() {
@@ -11228,6 +11474,50 @@ fn apply_pointer_event(event: PointerEvent, renderer: &mut dyn Renderer) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerPointerRoute {
+    Ignored,
+    Handled,
+    Redraw,
+}
+
+fn sync_composer_selection(
+    buf: &Buffer,
+    publisher: &crate::render::interaction::InteractionPublisher,
+) {
+    publisher.set_composer_selection(&buf.text, buf.selected_range());
+}
+
+fn handle_composer_pointer(
+    buf: &mut Buffer,
+    publisher: &crate::render::interaction::InteractionPublisher,
+    event: PointerEvent,
+    byte: usize,
+) -> ComposerPointerRoute {
+    if event.shift || event.button != Some(crate::input::PointerButton::Primary) {
+        return ComposerPointerRoute::Ignored;
+    }
+    let route = match event.kind {
+        PointerKind::Down if buf.set_pointer_cursor(byte, false) => {
+            ComposerPointerRoute::Handled
+        }
+        PointerKind::Drag if buf.set_pointer_cursor(byte, true) => {
+            ComposerPointerRoute::Handled
+        }
+        PointerKind::Up if buf.pointer_selection_active() => {
+            let _ = buf.set_pointer_cursor(byte, true);
+            buf.end_pointer_selection();
+            ComposerPointerRoute::Redraw
+        }
+        PointerKind::Down | PointerKind::Up | PointerKind::Drag => ComposerPointerRoute::Ignored,
+        PointerKind::Move | PointerKind::Scroll(_) => ComposerPointerRoute::Ignored,
+    };
+    if route != ComposerPointerRoute::Ignored {
+        sync_composer_selection(buf, publisher);
+    }
+    route
+}
+
 fn handle_pointer_hit(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -11236,9 +11526,20 @@ fn handle_pointer_hit(
     frame: &crate::render::interaction::InteractionFrame,
 ) -> Result<()> {
     let Some(target) = frame.hit(event.row, event.col) else {
+        if finish_composer_pointer_capture(app, ctx, renderer, event) {
+            return Ok(());
+        }
         app.menu.pointer_cancel();
         return Ok(());
     };
+    if let crate::render::interaction::HitTarget::ComposerByte { byte } = target {
+        if handle_composer_pointer(&mut app.buf, &ctx.interaction_publisher, event, byte)
+            == ComposerPointerRoute::Redraw
+        {
+            redraw_after_composer_pointer(app, ctx, renderer);
+        }
+        return Ok(());
+    }
     let click = match event.kind {
         PointerKind::Down => app.menu.pointer_press(target, frame.surface_session),
         PointerKind::Up => app.menu.pointer_release(target, frame.surface_session),
@@ -11307,6 +11608,57 @@ fn handle_pointer_hit(
     Ok(())
 }
 
+fn redraw_after_composer_pointer(app: &mut App, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+    if matches!(app.state.phase, UiPhase::Idle) {
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    } else {
+        draw_spinner_now(
+            &mut app.state,
+            &app.buf,
+            ctx,
+            renderer,
+            app.message_queue.len(),
+            app.menu.selected,
+        );
+    }
+}
+
+fn finish_composer_pointer_capture(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    event: PointerEvent,
+) -> bool {
+    if handle_composer_pointer_release(
+        &mut app.buf,
+        &ctx.interaction_publisher,
+        event,
+    ) != ComposerPointerRoute::Redraw
+    {
+        return false;
+    }
+    app.menu.pointer_cancel();
+    redraw_after_composer_pointer(app, ctx, renderer);
+    true
+}
+
+fn handle_composer_pointer_release(
+    buf: &mut Buffer,
+    publisher: &crate::render::interaction::InteractionPublisher,
+    event: PointerEvent,
+) -> ComposerPointerRoute {
+    if event.shift
+        || event.button != Some(crate::input::PointerButton::Primary)
+        || event.kind != PointerKind::Up
+        || !buf.pointer_selection_active()
+    {
+        return ComposerPointerRoute::Ignored;
+    }
+    buf.end_pointer_selection();
+    sync_composer_selection(buf, publisher);
+    ComposerPointerRoute::Redraw
+}
+
 fn handle_pointer_menu_confirmation<S, R>(
     state: &mut S,
     menu_for_state: impl for<'a> Fn(&'a mut S) -> &'a mut MenuState,
@@ -11336,17 +11688,30 @@ fn pointer_input_route(
     event: &InputEvent,
     interaction: Option<&crate::render::interaction::InteractionFrame>,
     menu: &mut MenuState,
+    composer_pointer_active: bool,
 ) -> PointerPreflightRoute {
     let pointer_actionable = match event {
         InputEvent::Pointer(pointer)
             if !pointer.shift
                 && pointer.button == Some(crate::input::PointerButton::Primary)
-                && matches!(pointer.kind, PointerKind::Down | PointerKind::Up) =>
+                && matches!(
+                    pointer.kind,
+                    PointerKind::Down | PointerKind::Up | PointerKind::Drag
+                ) =>
         {
-            interaction.is_some_and(|interaction| {
-                interaction.hit(pointer.row, pointer.col).is_some()
-                    || (pointer.kind == PointerKind::Up && menu.has_pointer_press())
-            })
+            (pointer.kind == PointerKind::Up && composer_pointer_active)
+                || interaction.is_some_and(|interaction| {
+                let hit = interaction.hit(pointer.row, pointer.col);
+                match pointer.kind {
+                    PointerKind::Drag => matches!(
+                        hit,
+                        Some(crate::render::interaction::HitTarget::ComposerByte { .. })
+                    ),
+                    PointerKind::Down => hit.is_some(),
+                    PointerKind::Up => hit.is_some() || menu.has_pointer_press(),
+                    PointerKind::Move | PointerKind::Scroll(_) => false,
+                }
+                })
         }
         _ => false,
     };
@@ -11372,9 +11737,10 @@ fn handle_input_preflight(
     event: &InputEvent,
     interaction: Option<&crate::render::interaction::InteractionFrame>,
     menu: &mut MenuState,
+    composer_pointer_active: bool,
     run_general_prelude: impl FnOnce(),
 ) -> PointerPreflightRoute {
-    let route = pointer_input_route(event, interaction, menu);
+    let route = pointer_input_route(event, interaction, menu, composer_pointer_active);
     if route != PointerPreflightRoute::ReturnIgnored {
         run_general_prelude();
     }
@@ -11411,7 +11777,12 @@ fn handle_input(
     use crate::modals::ModalAction;
 
     let interaction = ctx.interaction_publisher.snapshot_actionable();
-    let preflight = handle_input_preflight(&ev, interaction.as_deref(), &mut app.menu, || {
+    let preflight = handle_input_preflight(
+        &ev,
+        interaction.as_deref(),
+        &mut app.menu,
+        app.buf.pointer_selection_active(),
+        || {
         let has_non_capturing_modal = app
             .active_modal
             .as_ref()
@@ -11456,7 +11827,8 @@ fn handle_input(
                 InputEvent::Pointer(pointer) => format!("pointer({:?})", pointer),
             }
         );
-    });
+        },
+    );
     if preflight == PointerPreflightRoute::ReturnIgnored {
         return Ok(());
     }
@@ -11469,10 +11841,12 @@ fn handle_input(
             if preflight == PointerPreflightRoute::ScrollContinue {
                 apply_pointer_event(pointer, renderer);
             } else {
-                let interaction = interaction
-                    .as_deref()
-                    .expect("actionable pointer preflight requires a published frame");
-                handle_pointer_hit(app, ctx, renderer, pointer, interaction)?;
+                if let Some(interaction) = interaction.as_deref() {
+                    handle_pointer_hit(app, ctx, renderer, pointer, interaction)?;
+                } else {
+                    debug_assert!(app.buf.pointer_selection_active());
+                    let _ = finish_composer_pointer_capture(app, ctx, renderer, pointer);
+                }
             }
         }
         InputEvent::Resize(mut cols, mut rows) => {
@@ -11612,6 +11986,7 @@ fn handle_input(
                     return Ok(());
                 }
                 app.buf.insert_paste(text);
+                sync_composer_selection(&app.buf, &ctx.interaction_publisher);
                 if matches!(app.state.phase, UiPhase::Streaming) {
                     draw_spinner_now(
                         &mut app.state,
@@ -11954,6 +12329,157 @@ mod tests {
         }
     }
 
+    fn composer_pointer_interaction() -> InteractionFrame {
+        InteractionFrame {
+            generation: 1,
+            surface_session: 1,
+            regions: vec![HitRegion {
+                rect: CellRect {
+                    row: 12,
+                    col: 34,
+                    height: 1,
+                    width: 1,
+                },
+                target: HitTarget::ComposerByte { byte: 1 },
+            }],
+        }
+    }
+
+    #[test]
+    fn pointer_composer_down_drag_up_keeps_the_frame_until_one_release_redraw() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        publisher.publish(1, composer_pointer_interaction().regions);
+        let mut buf = super::Buffer::new();
+        buf.text = "abcde".into();
+        assert_eq!(
+            super::handle_composer_pointer(
+            &mut buf,
+            &publisher,
+            pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+            1,
+            ),
+            super::ComposerPointerRoute::Handled
+        );
+        assert!(publisher.snapshot_actionable().is_some());
+
+        assert_eq!(
+            super::handle_composer_pointer(
+            &mut buf,
+            &publisher,
+            pointer(PointerKind::Drag, Some(PointerButton::Primary), false),
+            4,
+            ),
+            super::ComposerPointerRoute::Handled
+        );
+        assert_eq!(buf.selected_range(), Some(1..4));
+        assert!(publisher.snapshot_actionable().is_some());
+
+        assert_eq!(
+            super::handle_composer_pointer(
+                &mut buf,
+                &publisher,
+                pointer(PointerKind::Up, Some(PointerButton::Primary), false),
+                4,
+            ),
+            super::ComposerPointerRoute::Redraw
+        );
+        publisher.invalidate();
+        assert!(!buf.pointer_selection_active());
+        assert!(publisher.snapshot_actionable().is_none());
+    }
+
+    #[test]
+    fn pointer_composer_drag_continues_through_the_production_preflight() {
+        let input = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Drag,
+            Some(PointerButton::Primary),
+            false,
+        ));
+        let interaction = composer_pointer_interaction();
+        let mut menu = super::MenuState::new();
+        let mut prelude_runs = 0;
+
+        assert_eq!(
+            super::handle_input_preflight(&input, Some(&interaction), &mut menu, false, || {
+                prelude_runs += 1
+            }),
+            super::PointerPreflightRoute::PointerContinue
+        );
+        assert_eq!(prelude_runs, 1);
+    }
+
+    #[test]
+    fn pointer_composer_release_outside_still_finishes_capture() {
+        let input = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Up,
+            Some(PointerButton::Primary),
+            false,
+        ));
+        let interaction = composer_pointer_interaction();
+        let mut menu = super::MenuState::new();
+        let mut prelude_runs = 0;
+
+        assert_eq!(
+            super::handle_input_preflight(
+                &input,
+                Some(&interaction),
+                &mut menu,
+                true,
+                || prelude_runs += 1,
+            ),
+            super::PointerPreflightRoute::PointerContinue
+        );
+        assert_eq!(prelude_runs, 1);
+
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let mut buf = super::Buffer::new();
+        buf.text = "abcde".into();
+        assert!(buf.set_pointer_cursor(1, false));
+        assert!(buf.set_pointer_cursor(4, true));
+        assert_eq!(
+            super::handle_composer_pointer_release(
+                &mut buf,
+                &publisher,
+                pointer(PointerKind::Up, Some(PointerButton::Primary), false),
+            ),
+            super::ComposerPointerRoute::Redraw
+        );
+        assert!(!buf.pointer_selection_active());
+        assert_eq!(buf.selected_range(), Some(1..4));
+        assert_eq!(
+            super::handle_composer_pointer(
+                &mut buf,
+                &publisher,
+                pointer(PointerKind::Drag, Some(PointerButton::Primary), false),
+                5,
+            ),
+            super::ComposerPointerRoute::Ignored
+        );
+        assert_eq!(buf.selected_range(), Some(1..4));
+    }
+
+    #[test]
+    fn keyboard_cursor_collapse_clears_same_source_published_selection() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let mut buf = super::Buffer::new();
+        buf.text = "abcde".into();
+        assert!(buf.set_pointer_cursor(1, false));
+        assert!(buf.set_pointer_cursor(4, true));
+        super::sync_composer_selection(&buf, &publisher);
+        assert!(publisher.composer_selection().is_some());
+
+        let _ = buf.apply(
+            super::Action::CursorLeft,
+            &[],
+            &crate::commands::CommandRegistry::builtin(),
+        );
+        super::sync_composer_selection(&buf, &publisher);
+
+        assert_eq!(buf.text, "abcde", "cursor collapse does not change source");
+        assert_eq!(buf.cursor, 1);
+        assert!(publisher.composer_selection().is_none());
+    }
+
     #[test]
     fn pointer_click_selects_first_and_only_a_second_same_target_click_confirms() {
         let target = HitTarget::MenuItem { index: 2 };
@@ -12059,7 +12585,7 @@ mod tests {
         ));
         let mut prelude_runs = 0;
         assert_eq!(
-            super::handle_input_preflight(&slow_up, None, &mut menu, || prelude_runs += 1),
+            super::handle_input_preflight(&slow_up, None, &mut menu, false, || prelude_runs += 1),
             super::PointerPreflightRoute::ReturnIgnored
         );
         assert_eq!(prelude_runs, 0);
@@ -12160,7 +12686,8 @@ mod tests {
             let renderer = ScrollCapture::default();
             let mut menu = super::MenuState::new();
 
-            let route = handle_input_preflight(&input, None, &mut menu, || prelude_runs += 1);
+            let route =
+                handle_input_preflight(&input, None, &mut menu, false, || prelude_runs += 1);
 
             assert_eq!(route, PointerPreflightRoute::ReturnIgnored);
             assert_eq!(prelude_runs, 0);
@@ -12177,7 +12704,8 @@ mod tests {
             let mut renderer = ScrollCapture::default();
             let mut menu = super::MenuState::new();
 
-            let route = handle_input_preflight(&input, None, &mut menu, || prelude_runs += 1);
+            let route =
+                handle_input_preflight(&input, None, &mut menu, false, || prelude_runs += 1);
             if let PointerPreflightRoute::ScrollContinue = route {
                 apply_pointer_event(event, &mut renderer);
             }
@@ -12199,7 +12727,7 @@ mod tests {
         let mut menu = super::MenuState::new();
         let interaction = pointer_interaction();
 
-        let route = handle_input_preflight(&input, Some(&interaction), &mut menu, || {
+        let route = handle_input_preflight(&input, Some(&interaction), &mut menu, false, || {
             prelude_runs += 1
         });
 
@@ -12220,7 +12748,7 @@ mod tests {
         ));
 
         assert_eq!(
-            super::handle_input_preflight(&up, None, &mut menu, || prelude_runs += 1),
+            super::handle_input_preflight(&up, None, &mut menu, false, || prelude_runs += 1),
             super::PointerPreflightRoute::ReturnIgnored
         );
         assert_eq!(prelude_runs, 0);
@@ -12849,6 +13377,7 @@ fn confirm_idle_menu_selected(
         .unwrap_or(false);
     app.menu.selected = 0;
     if needs_args {
+        app.buf.clear_selection();
         app.buf.text = format!("/{name} ");
         app.buf.cursor = app.buf.text.len();
         if matches!(name.as_str(), "skills" | "effort") {
@@ -12880,6 +13409,7 @@ fn confirm_idle_menu_selected(
     let committed = format!("/{name}");
     renderer.render(UiLine::ClearTransient);
     renderer.render(UiLine::User(committed.clone()));
+    app.buf.clear_selection();
     app.buf.text.clear();
     app.buf.cursor = 0;
     ctx.history.push(crate::input::history::HistoryEntry {
@@ -13495,8 +14025,10 @@ fn handle_idle_key(
             app.state.pending_image_markers.push(n);
             cache_write_image(&crate::platform::image_cache_dir(), &img, hash);
             let marker = format!("[Image #{}]", n);
+            app.buf.replace_selection("");
             app.buf.text.insert_str(app.buf.cursor, &marker);
             app.buf.cursor += marker.len();
+            sync_composer_selection(&app.buf, &ctx.interaction_publisher);
             redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
             return Ok(());
         }
@@ -13544,10 +14076,12 @@ fn handle_idle_key(
     if modifiers.is_empty() {
         match code {
             KeyCode::Up if app.buf.cursor_line_up() => {
+                sync_composer_selection(&app.buf, &ctx.interaction_publisher);
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
             }
             KeyCode::Down if app.buf.cursor_line_down() => {
+                sync_composer_selection(&app.buf, &ctx.interaction_publisher);
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
             }
@@ -13561,6 +14095,7 @@ fn handle_idle_key(
         if let Some(suggestion) = app.state.next_prompt_suggestion.clone() {
             if app.buf.accept_next_prompt_suggestion(&suggestion) {
                 app.state.next_prompt_suggestion = None;
+                sync_composer_selection(&app.buf, &ctx.interaction_publisher);
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
             }
@@ -13571,6 +14106,7 @@ fn handle_idle_key(
     }
 
     let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
+    sync_composer_selection(&app.buf, &ctx.interaction_publisher);
     sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
     crate::tuix_trace!(
         "KEY",
@@ -14054,6 +14590,7 @@ fn redraw_with_menu(
     ctx: &LoopCtx,
     renderer: &mut dyn Renderer,
 ) {
+    sync_composer_selection(buf, &ctx.interaction_publisher);
     let kind = if file_index::detect_at_mention_range(&buf.text, buf.cursor).is_some() {
         crate::render::MenuKind::AtMention
     } else if buf.text.starts_with('$') {
@@ -14342,6 +14879,7 @@ pub(crate) fn set_agent_mode(
 }
 
 fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    sync_composer_selection(buf, &ctx.interaction_publisher);
     let attachments = compute_input_attachments(state, &buf.text);
     let mut status = build_input_status(state, ctx, buf);
     // Discoverability: while composing a `!` shell command, surface a brand-purple
@@ -15785,6 +16323,7 @@ fn handle_streaming_key(
     if modifiers.is_empty() {
         match code {
             KeyCode::Up if app.buf.cursor_line_up() => {
+                sync_composer_selection(&app.buf, &ctx.interaction_publisher);
                 draw_spinner_now(
                     &mut app.state,
                     &app.buf,
@@ -15796,6 +16335,7 @@ fn handle_streaming_key(
                 return Ok(());
             }
             KeyCode::Down if app.buf.cursor_line_down() => {
+                sync_composer_selection(&app.buf, &ctx.interaction_publisher);
                 draw_spinner_now(
                     &mut app.state,
                     &app.buf,
@@ -15812,6 +16352,7 @@ fn handle_streaming_key(
 
     let action = classify(code, modifiers);
     let apply_result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
+    sync_composer_selection(&app.buf, &ctx.interaction_publisher);
     sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
     match apply_result {
         BufferResult::NoOp => {}
@@ -25326,6 +25867,7 @@ fn draw_spinner_now(
     queue_len: usize,
     menu_selected: usize,
 ) {
+    sync_composer_selection(buf, &ctx.interaction_publisher);
     let frame = state.tick_spinner();
     // Same source + applicability gate as the status bar's `[high]`, so the
     // spinner's effort hint and the status line never disagree. (Reading

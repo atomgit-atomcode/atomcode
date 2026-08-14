@@ -1,5 +1,11 @@
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerSelection {
+    pub source: Arc<str>,
+    pub range: std::ops::Range<usize>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CellRect {
     pub row: u16,
@@ -22,6 +28,7 @@ pub enum HitTarget {
     MenuItem { index: usize },
     ModalItem { index: usize },
     ModalCancel,
+    ComposerByte { byte: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +65,7 @@ struct PublisherState {
     epoch: u64,
     actionable: bool,
     worker_authority: Option<(u64, u64)>,
+    composer_selection: Option<ComposerSelection>,
 }
 
 impl InteractionPublisher {
@@ -123,6 +131,27 @@ impl InteractionPublisher {
         read_recover(&self.inner).epoch
     }
 
+    pub fn set_composer_selection(
+        &self,
+        source: &str,
+        selection: Option<std::ops::Range<usize>>,
+    ) {
+        let valid = selection.filter(|range| {
+            range.start < range.end
+                && range.end <= source.len()
+                && source.is_char_boundary(range.start)
+                && source.is_char_boundary(range.end)
+        });
+        write_recover(&self.inner).composer_selection = valid.map(|range| ComposerSelection {
+            source: Arc::from(source),
+            range,
+        });
+    }
+
+    pub fn composer_selection(&self) -> Option<ComposerSelection> {
+        read_recover(&self.inner).composer_selection.clone()
+    }
+
     #[cfg(test)]
     fn poison_for_test(&self) {
         let _guard = self
@@ -170,6 +199,22 @@ mod tests {
         publisher.fail_closed();
         assert!(publisher.snapshot_actionable().is_none());
         assert_eq!(publisher.snapshot().generation, 1);
+    }
+
+    #[test]
+    fn composer_selection_presentation_requires_matching_utf8_boundaries() {
+        let publisher = InteractionPublisher::default();
+        publisher.set_composer_selection("你ab", Some("你".len().."你a".len()));
+        let selection = publisher
+            .composer_selection()
+            .expect("non-empty valid selection");
+        assert_eq!(&*selection.source, "你ab");
+        assert_eq!(selection.range, "你".len().."你a".len());
+
+        publisher.set_composer_selection("你ab", Some(1..2));
+        assert!(publisher.composer_selection().is_none());
+        publisher.set_composer_selection("你ab", None);
+        assert!(publisher.composer_selection().is_none());
     }
 
     #[test]

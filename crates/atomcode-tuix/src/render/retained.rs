@@ -36,8 +36,137 @@ use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
 use atomcode_coding;
 use crossterm::style::Color;
+use unicode_segmentation::UnicodeSegmentation;
 
 const PAD_COL: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComposerCellByte {
+    row: usize,
+    col: usize,
+    byte: usize,
+    source_start: usize,
+    source_end: usize,
+}
+
+fn composer_cell_bytes(
+    source: &str,
+    lines: &[String],
+    max_cols: usize,
+    visible_rows: std::ops::Range<usize>,
+) -> Vec<ComposerCellByte> {
+    if max_cols == 0 || lines.is_empty() {
+        return Vec::new();
+    }
+    let safe = scrub_controls(source);
+    if safe != source {
+        return Vec::new();
+    }
+    let (display, _) = crate::markdown::normalize_circled_list_spacing_with_cursor(&safe, 0);
+    let source_graphemes: Vec<(usize, &str)> = source.grapheme_indices(true).collect();
+    let mut display_starts = Vec::with_capacity(source_graphemes.len());
+    let mut display_cursor = 0usize;
+    for (_, grapheme) in &source_graphemes {
+        let Some(relative) = display[display_cursor..].find(grapheme) else {
+            return Vec::new();
+        };
+        let start = display_cursor + relative;
+        display_starts.push(start);
+        display_cursor = start + grapheme.len();
+    }
+
+    #[derive(Clone, Copy)]
+    struct DisplaySpan {
+        display_start: usize,
+        display_end: usize,
+        source_start: usize,
+        source_end: usize,
+    }
+    let spans: Vec<DisplaySpan> = source_graphemes
+        .iter()
+        .enumerate()
+        .map(|(index, (source_start, grapheme))| DisplaySpan {
+            display_start: display_starts[index],
+            display_end: display_starts
+                .get(index + 1)
+                .copied()
+                .unwrap_or(display.len()),
+            source_start: *source_start,
+            source_end: source_start + grapheme.len(),
+        })
+        .collect();
+
+    let mut cells = Vec::new();
+    let mut next_display_byte = 0usize;
+    let mut span_index = 0usize;
+    for (row, line) in lines.iter().enumerate() {
+        let mut col = 0usize;
+        for grapheme in line.graphemes(true) {
+            let Some(relative) = display[next_display_byte..].find(grapheme) else {
+                return Vec::new();
+            };
+            let display_byte = next_display_byte + relative;
+            next_display_byte = display_byte + grapheme.len();
+            while spans
+                .get(span_index)
+                .is_some_and(|span| span.display_end <= display_byte)
+            {
+                span_index += 1;
+            }
+            let Some(span) = spans.get(span_index).copied().filter(|span| {
+                span.display_start <= display_byte && display_byte < span.display_end
+            }) else {
+                col += crate::width::display_width(grapheme);
+                continue;
+            };
+            let width = if grapheme == "\t" {
+                crate::render::cell::SOFT_TAB_WIDTH
+            } else {
+                crate::width::display_width(grapheme)
+            };
+            if visible_rows.contains(&row) {
+                for offset in 0..width {
+                    cells.push(ComposerCellByte {
+                        row,
+                        col: col + offset,
+                        byte: if offset == 0 && display_byte == span.display_start {
+                            span.source_start
+                        } else {
+                            span.source_end
+                        },
+                        source_start: span.source_start,
+                        source_end: span.source_end,
+                    });
+                }
+            }
+            col += width;
+        }
+    }
+
+    let end_row = lines.len() - 1;
+    let end_col = lines[end_row]
+        .graphemes(true)
+        .map(|grapheme| {
+            if grapheme == "\t" {
+                crate::render::cell::SOFT_TAB_WIDTH
+            } else {
+                crate::width::display_width(grapheme)
+            }
+        })
+        .sum::<usize>();
+    if visible_rows.contains(&end_row) {
+        for col in end_col..max_cols {
+            cells.push(ComposerCellByte {
+                row: end_row,
+                col,
+                byte: source.len(),
+                source_start: source.len(),
+                source_end: source.len(),
+            });
+        }
+    }
+    cells
+}
 
 /// Max body_lines kept in the in-app scrollback buffer (matches alt-screen).
 /// Bounded so memory doesn't grow without limit on long sessions.
@@ -4567,7 +4696,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.status.search.as_ref(),
             shell,
         );
-        let middle_cells: Vec<Vec<Cell>> = lines[input_view_start..input_view_start + middle_rows]
+        let composer_cells = if !approval_active && !hide_input_box && !ghost_active {
+            composer_cell_bytes(
+                &self.input_buf,
+                &lines,
+                text_budget,
+                input_view_start..input_view_start.saturating_add(middle_rows),
+            )
+        } else {
+            Vec::new()
+        };
+        let mut middle_cells: Vec<Vec<Cell>> =
+            lines[input_view_start..input_view_start + middle_rows]
             .iter()
             .enumerate()
             .map(|(i, line)| {
@@ -4579,6 +4719,25 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 }
             })
             .collect();
+        if let Some(selection) = self
+            .interaction_publisher
+            .composer_selection()
+            .filter(|selection| &*selection.source == self.input_buf)
+        {
+            for cell in &composer_cells {
+                if selection.range.start < cell.source_end
+                    && cell.source_start < selection.range.end
+                {
+                    let relative_row = cell.row.saturating_sub(input_view_start);
+                    if let Some(painted) = middle_cells
+                        .get_mut(relative_row)
+                        .and_then(|row| row.get_mut(2 + cell.col))
+                    {
+                        painted.style.reverse = true;
+                    }
+                }
+            }
+        }
         // When the input is scrolled (windowed), show "+N more lines" on the
         // bottom rule so it's visible that content is hidden, not lost.
         let hidden_rows = lines.len() - middle_rows;
@@ -5012,6 +5171,27 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.screen.draw_row(todo_top + i, 0, &padded);
         }
         let rules_top = footer_top + top_panel_rows;
+
+        if !approval_active && !hide_input_box && !ghost_active {
+            self.pending_interactions.extend(
+                composer_cells
+                    .iter()
+                    .map(|cell| crate::render::interaction::HitRegion {
+                        rect: crate::render::interaction::CellRect {
+                            row: (rules_top
+                                + 1
+                                + cell.row.saturating_sub(input_view_start))
+                            .min(u16::MAX as usize) as u16,
+                            col: (2 + cell.col).min(u16::MAX as usize) as u16,
+                            height: 1,
+                            width: 1,
+                        },
+                        target: crate::render::interaction::HitTarget::ComposerByte {
+                            byte: cell.byte,
+                        },
+                    }),
+            );
+        }
 
         if hide_input_box {
             let mut border_rule = Vec::with_capacity(rule_width);
@@ -10046,6 +10226,235 @@ mod tests {
         assert_eq!(session_regions[0].rect.height, 2);
         assert_eq!(session_regions[1].rect.height, 2);
         assert_eq!(session_regions[1].rect.row, session_regions[0].rect.row + 3);
+    }
+
+    #[test]
+    fn interaction_composer_maps_cjk_and_zwj_continuation_cells_to_utf8_boundaries() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            12,
+            24,
+            interactions.clone(),
+        );
+        let input = "a你👩‍💻z";
+        renderer.render(UiLine::InputPrompt {
+            buf: input.into(),
+            cursor_byte: input.len(),
+            menu: None,
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+
+        let frame = interactions.snapshot_actionable().expect("painted composer frame");
+        let first = frame
+            .regions
+            .iter()
+            .find(|region| {
+                region.target
+                    == crate::render::interaction::HitTarget::ComposerByte { byte: 0 }
+            })
+            .expect("ASCII start cell");
+        let row = first.rect.row;
+        let col = first.rect.col;
+        assert_eq!(frame.hit(row, col), Some(crate::render::interaction::HitTarget::ComposerByte { byte: 0 }));
+        assert_eq!(frame.hit(row, col + 1), Some(crate::render::interaction::HitTarget::ComposerByte { byte: 1 }));
+        assert_eq!(frame.hit(row, col + 2), Some(crate::render::interaction::HitTarget::ComposerByte { byte: "a你".len() }));
+        assert_eq!(frame.hit(row, col + 3), Some(crate::render::interaction::HitTarget::ComposerByte { byte: "a你".len() }));
+        assert_eq!(frame.hit(row, col + 4), Some(crate::render::interaction::HitTarget::ComposerByte { byte: "a你👩‍💻".len() }));
+        assert_eq!(frame.hit(row, col + 5), Some(crate::render::interaction::HitTarget::ComposerByte { byte: "a你👩‍💻".len() }));
+        assert_eq!(frame.hit(row, col + 6), Some(crate::render::interaction::HitTarget::ComposerByte { byte: input.len() }));
+    }
+
+    #[test]
+    fn interaction_composer_uses_the_actual_soft_wrap_and_trailing_padding() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            8,
+            24,
+            interactions.clone(),
+        );
+        let input = "abcd你z";
+        renderer.render(UiLine::InputPrompt {
+            buf: input.into(),
+            cursor_byte: input.len(),
+            menu: None,
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+
+        let frame = interactions.snapshot_actionable().expect("painted composer frame");
+        let z_byte = "abcd你".len();
+        let z = frame
+            .regions
+            .iter()
+            .filter(|region| {
+                region.target
+                    == crate::render::interaction::HitTarget::ComposerByte { byte: z_byte }
+            })
+            .max_by_key(|region| region.rect.row)
+            .expect("soft-wrapped z cell");
+        let first_row = frame
+            .regions
+            .iter()
+            .find(|region| {
+                region.target
+                    == crate::render::interaction::HitTarget::ComposerByte { byte: 0 }
+            })
+            .expect("first composer cell")
+            .rect
+            .row;
+        assert_eq!(z.rect.row, first_row + 1);
+        assert_eq!(z.rect.col, 2);
+        assert_eq!(
+            frame.hit(z.rect.row, z.rect.col + 1),
+            Some(crate::render::interaction::HitTarget::ComposerByte { byte: input.len() }),
+            "padding after the wrapped tail places the cursor at buffer end"
+        );
+    }
+
+    #[test]
+    fn interaction_composer_maps_final_hard_newline_blank_row_but_not_prior_padding() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            12,
+            24,
+            interactions.clone(),
+        );
+        let input = "a\n";
+        renderer.render(UiLine::InputPrompt {
+            buf: input.into(),
+            cursor_byte: input.len(),
+            menu: None,
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+
+        let frame = interactions.snapshot_actionable().expect("painted composer frame");
+        let a = frame
+            .regions
+            .iter()
+            .find(|region| {
+                region.target
+                    == crate::render::interaction::HitTarget::ComposerByte { byte: 0 }
+            })
+            .expect("first hard line glyph");
+        let blank_row = frame
+            .regions
+            .iter()
+            .filter(|region| {
+                region.target
+                    == crate::render::interaction::HitTarget::ComposerByte { byte: input.len() }
+            })
+            .map(|region| region.rect.row)
+            .max()
+            .expect("final blank hard line row");
+        let blank = frame
+            .regions
+            .iter()
+            .filter(|region| {
+                region.rect.row == blank_row
+                    && region.target
+                        == crate::render::interaction::HitTarget::ComposerByte {
+                            byte: input.len(),
+                        }
+            })
+            .min_by_key(|region| region.rect.col)
+            .expect("final blank hard line padding");
+        assert_eq!(blank.rect.row, a.rect.row + 1);
+        assert_eq!(blank.rect.col, 2);
+        assert_eq!(frame.hit(a.rect.row, a.rect.col + 1), None);
+    }
+
+    #[test]
+    fn interaction_composer_bounds_published_cells_for_a_long_windowed_input() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            80,
+            24,
+            interactions.clone(),
+        );
+        let input = "0123456789".repeat(10_000);
+        renderer.render(UiLine::InputPrompt {
+            buf: input.clone(),
+            cursor_byte: input.len(),
+            menu: None,
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+
+        let composer_regions = interactions
+            .snapshot_actionable()
+            .expect("painted composer frame")
+            .regions
+            .iter()
+            .filter(|region| {
+                matches!(
+                    region.target,
+                    crate::render::interaction::HitTarget::ComposerByte { .. }
+                )
+            })
+            .count();
+        assert!(
+            composer_regions <= 80 * 24,
+            "published composer cells must stay bounded by the visible screen: {composer_regions}"
+        );
+    }
+
+    #[test]
+    fn interaction_composer_selection_reverses_only_the_selected_grapheme_cells() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let input = "a你👩‍💻b";
+        let suffix = input.rfind('b').expect("suffix boundary");
+        interactions.set_composer_selection(input, Some(1..suffix));
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            20,
+            24,
+            interactions.clone(),
+        );
+        renderer.render(UiLine::InputPrompt {
+            buf: input.into(),
+            cursor_byte: suffix,
+            menu: None,
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+
+        let frame = interactions.snapshot_actionable().expect("painted composer frame");
+        let a = frame
+            .regions
+            .iter()
+            .find(|region| {
+                region.target
+                    == crate::render::interaction::HitTarget::ComposerByte { byte: 0 }
+            })
+            .expect("a cell");
+        let cells = renderer.screen.prev_cells_for_test();
+        let row = a.rect.row as usize;
+        let col = a.rect.col as usize;
+        assert!(!cells[row][col].style.reverse, "ASCII prefix stays unchanged");
+        assert!(cells[row][col + 1].style.reverse, "CJK lead cell selected");
+        assert!(cells[row][col + 2].style.reverse, "CJK continuation selected");
+        assert!(cells[row][col + 3].style.reverse, "ZWJ lead cell selected");
+        assert!(
+            cells[row][col + 4].style.reverse,
+            "ZWJ continuation selected"
+        );
+        assert!(!cells[row][col + 5].style.reverse, "ASCII suffix stays unchanged");
     }
 
     #[test]
