@@ -789,6 +789,12 @@ pub async fn run(
         event_rx,
         runtime_event_tx.clone(),
     );
+    let (session_preview_request_tx, session_preview_request_rx) =
+        tokio::sync::watch::channel(None);
+    event_loop::bg_runtime::spawn_session_preview_loader(
+        session_preview_request_rx,
+        runtime_event_tx.clone(),
+    );
     let bg_manager = event_loop::bg_runtime::BgRuntimeManager::new(
         current_session.clone(),
         working_dir.clone(),
@@ -918,6 +924,10 @@ pub async fn run(
         pending_session_resume_preparation: None,
         next_session_resume_operation_id: 1,
         pending_session_picker: None,
+        session_preview_request_tx,
+        next_session_preview_generation: 1,
+        session_preview_selection: None,
+        session_preview_result: None,
         pending_rewind_catalog: None,
         pending_session_transition: None,
         pending_external_session_projection: None,

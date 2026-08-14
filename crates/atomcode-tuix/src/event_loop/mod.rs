@@ -4014,6 +4014,16 @@ pub struct LoopCtx {
         std::path::PathBuf,
         Result<Vec<crate::session::SessionMeta>, String>,
     )>,
+    pub(crate) session_preview_request_tx:
+        tokio::sync::watch::Sender<Option<bg_runtime::SessionPreviewRequest>>,
+    pub(crate) next_session_preview_generation: u64,
+    pub(crate) session_preview_selection: Option<crate::session::SessionPreviewSelection>,
+    pub(crate) session_preview_result: Option<
+        Result<
+            Option<atomcode_daemon::legacy_convert::CatalogSessionPreview>,
+            atomcode_daemon::legacy_convert::CatalogSessionPreviewError,
+        >,
+    >,
     /// Runtime-owned Rewind points loaded after the double-Esc gesture. The
     /// main loop installs the modal because this event handler does not own
     /// `App::active_modal`.
@@ -21455,8 +21465,9 @@ fn install_pending_session_picker(app: &mut App, ctx: &mut LoopCtx, renderer: &m
             renderer.flush();
         }
         Ok(sessions) => {
-            let picker: Box<dyn crate::modals::Modal> =
-                Box::new(crate::modals::SessionPicker::open(sessions));
+            let picker = crate::modals::SessionPicker::open(sessions);
+            picker.begin_preview(ctx);
+            let picker: Box<dyn crate::modals::Modal> = Box::new(picker);
             picker.draw(&app.buf, &app.state, ctx, renderer);
             app.active_modal = Some(picker);
         }
@@ -22584,6 +22595,16 @@ fn handle_runtime_event(
             ctx.pending_session_picker = Some((working_dir, result));
         }
         bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionPreviewLoaded { selection, result },
+        ) => {
+            if session_preview_result_matches(
+                ctx.session_preview_selection.as_ref(),
+                &selection,
+            ) {
+                ctx.session_preview_result = Some(result);
+            }
+        }
+        bg_runtime::RuntimeEventPayload::Driver(
             bg_runtime::DriverEvent::SessionTransitionFinished { operation, result },
         ) => match result {
             Err(error) => {
@@ -22650,6 +22671,41 @@ fn handle_runtime_event(
                 }
             }
         },
+    }
+}
+
+fn session_preview_result_matches(
+    current: Option<&crate::session::SessionPreviewSelection>,
+    incoming: &crate::session::SessionPreviewSelection,
+) -> bool {
+    current == Some(incoming)
+}
+
+#[cfg(test)]
+mod session_preview_generation_tests {
+    use super::*;
+
+    fn selection(id: &str, generation: u64) -> crate::session::SessionPreviewSelection {
+        crate::session::SessionPreviewSelection {
+            project_bucket: "0123456789abcdef".into(),
+            session_id: id.into(),
+            generation,
+        }
+    }
+
+    #[test]
+    fn preview_result_requires_the_current_bucket_id_and_generation() {
+        let current = selection("selected", 7);
+        assert!(session_preview_result_matches(Some(&current), &current));
+        assert!(!session_preview_result_matches(
+            Some(&current),
+            &selection("selected", 6),
+        ));
+        assert!(!session_preview_result_matches(
+            Some(&current),
+            &selection("other", 7),
+        ));
+        assert!(!session_preview_result_matches(None, &current));
     }
 }
 

@@ -1459,19 +1459,30 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
-    /// Rendered row count for a `/resume` session item at menu index
-    /// `orig_idx` (>= HEADER_ROWS): 2 rows (title + metadata) for the first
-    /// session, 3 for the rest — the extra row is the leading blank spacer that
-    /// separates cards. This MUST stay in lockstep with the render loop's
+    /// Rendered detail-row count for a `/resume` item. Ordinary and narrow rows
+    /// remain one metadata line; a wide selected preview may use the remaining
+    /// half-screen modal budget. This MUST stay in lockstep with the render loop's
     /// `if orig_idx > HEADER_ROWS { push blank }`; both the paginator's
     /// fit-loops and the footer `menu_rows` reservation call it so the three
     /// height accountings never drift.
-    fn session_item_height(orig_idx: usize) -> usize {
-        if orig_idx == crate::modals::session_picker::HEADER_ROWS {
-            2
-        } else {
-            3
+    fn session_detail_rows(&self, orig_idx: usize, desc: &str, rule_width: usize) -> usize {
+        if rule_width < 96 || !desc.contains('\n') {
+            return 1;
         }
+        let spacer = usize::from(orig_idx != crate::modals::session_picker::HEADER_ROWS);
+        let modal_cap = (self.screen.height() as usize / 2).max(9);
+        let available = modal_cap.saturating_sub(7 + 1 + spacer).max(1);
+        desc.lines().take(9).take(available).count().max(1)
+    }
+
+    fn session_item_height(&self, orig_idx: usize, desc: &str, rule_width: usize) -> usize {
+        let detail_rows = if rule_width >= 96 {
+            self.session_detail_rows(orig_idx, desc, rule_width)
+        } else {
+            1
+        };
+        1 + detail_rows
+            + usize::from(orig_idx != crate::modals::session_picker::HEADER_ROWS)
     }
 
     fn max_menu_rows(&self, h: usize, default: usize) -> usize {
@@ -1489,6 +1500,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     // menu plus that row remains within the half-screen budget.
                     let cap = (h / 2).saturating_sub(1).max(1);
                     return natural.min(cap);
+                }
+                if m.kind == super::MenuKind::SessionList
+                    && m.items.iter().any(|(_, desc)| desc.contains('\n'))
+                {
+                    // The selected preview consumes the picker's existing
+                    // half-screen modal budget; pagination removes other cards
+                    // before this cap can affect global layout.
+                    return (h / 2).max(9);
                 }
                 let base = m.kind.max_visible_rows(h, m.items.len());
                 let has_hint = m
@@ -2716,7 +2735,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         rows
     }
 
-    /// Two-line renderer for a `/resume` session row. Simpler than
+    /// Renderer for a `/resume` session row. The ordinary/narrow form stays two
+    /// lines; only a wide selected item appends bounded preview details. Simpler than
     /// `build_plugin_menu_rows`: row 1 is an optional `▸ ` marker (Border when
     /// selected, else spaces) + the session title in the terminal's default fg
     /// (bold when selected) — NO `✓`, NO name padding, NO installed/scope suffix
@@ -2729,6 +2749,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         desc: &str,
         selected: bool,
         rule_width: usize,
+        orig_idx: usize,
     ) -> Vec<Vec<Cell>> {
         // Selected title + marker use the theme-aware highlight colour (cyan on
         // dark, magenta on light); unselected rows stay in the terminal default.
@@ -2761,30 +2782,41 @@ impl<W: Write + Send> RetainedRenderer<W> {
             });
         }
 
-        // Row 2: gray metadata, indented four spaces.
+        // Row 2+: gray metadata and, on wide terminals only, the selected
+        // session's bounded cwd/provider/excerpt preview. Narrow cards retain
+        // their historical two-row shape exactly.
         let meta_style = self.style_for(Role::Muted);
-        let line_str = if desc.is_empty() {
-            String::new()
+        let detail_lines: Vec<&str> = if rule_width >= 96 && selected {
+            let cap = self.session_detail_rows(orig_idx, desc, rule_width);
+            desc.lines().take(cap).collect()
         } else {
-            format!("    {}", desc)
+            vec![desc.lines().next().unwrap_or_default()]
         };
-        let mut row2 = Vec::new();
-        push_str_cells_sgr(&mut row2, &line_str, meta_style.clone());
-        let content_w2 = crate::width::display_width(&line_str);
-        let right_pad2 = rule_width.saturating_sub(content_w2);
-        for _ in 0..right_pad2 {
-            row2.push(Cell {
-                ch: ' ',
-                width: 1,
-                style: if selected {
-                    meta_style.clone()
-                } else {
-                    CellStyle::default()
-                },
-            });
+        let mut rows = vec![row1];
+        for detail in detail_lines {
+            let detail = crate::width::truncate_with_ellipsis(detail, rule_width.saturating_sub(4));
+            let line_str = if detail.is_empty() {
+                String::new()
+            } else {
+                format!("    {detail}")
+            };
+            let mut row = Vec::new();
+            push_str_cells_sgr(&mut row, &line_str, meta_style.clone());
+            let content_width = crate::width::display_width(&line_str);
+            for _ in 0..rule_width.saturating_sub(content_width) {
+                row.push(Cell {
+                    ch: ' ',
+                    width: 1,
+                    style: if selected {
+                        meta_style.clone()
+                    } else {
+                        CellStyle::default()
+                    },
+                });
+            }
+            rows.push(row);
         }
-
-        vec![row1, row2]
+        rows
     }
 
     fn build_marketplace_menu_rows(
@@ -4407,7 +4439,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                             && end >= 4
                             && end < len - hint_h
                         {
-                            Self::session_item_height(end)
+                            self.session_item_height(end, &m.items[end].1, rule_width)
                         } else if menu_kind == super::MenuKind::Plugin
                             && end >= 4
                             && end < len - hint_h
@@ -4443,7 +4475,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                                     && end >= 4
                                     && end < len - hint_h
                                 {
-                                    Self::session_item_height(end)
+                                    self.session_item_height(end, &m.items[end].1, rule_width)
                                 } else if menu_kind == super::MenuKind::Plugin
                                     && end >= 4
                                     && end < len - hint_h
@@ -4591,7 +4623,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         // return 2 here and this reservation would undercount the
                         // footer height — overlapping the goal/status rows onto
                         // the last card.
-                        Self::session_item_height(orig_idx)
+                        self.session_item_height(orig_idx, &m.items[orig_idx].1, rule_width)
                     } else if menu_kind == super::MenuKind::Plugin
                         && orig_idx >= 4
                         && orig_idx < m.items.len().saturating_sub(1)
@@ -5022,7 +5054,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 if orig_idx > crate::modals::session_picker::HEADER_ROWS {
                     menu_cells.push(Vec::new());
                 }
-                menu_cells.extend(self.build_session_menu_rows(name, desc, selected, rule_width));
+                menu_cells.extend(
+                    self.build_session_menu_rows(name, desc, selected, rule_width, orig_idx),
+                );
             } else if menu_kind == super::MenuKind::Plugin
                 && orig_idx >= 4
                 && orig_idx < final_len.saturating_sub(1)
@@ -10465,6 +10499,55 @@ mod tests {
     }
 
     #[test]
+    fn wide_session_preview_hit_region_matches_all_painted_detail_rows() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            120,
+            40,
+            interactions.clone(),
+        );
+        renderer.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: Some(MenuPayload {
+                items: vec![
+                    ("Resume".into(), String::new()),
+                    (String::new(), String::new()),
+                    (String::new(), String::new()),
+                    (String::new(), String::new()),
+                    (
+                        "selected".into(),
+                        "meta\n/cwd\nprovider · model\none\ntwo\nthree\nfour\nfive\nsix".into(),
+                    ),
+                    ("— hint —".into(), String::new()),
+                ],
+                selected: 4,
+                kind: crate::render::MenuKind::SessionList,
+            }),
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+
+        let frame = interactions.snapshot_actionable().expect("painted preview frame");
+        let region = frame
+            .regions
+            .iter()
+            .find(|region| {
+                region.target
+                    == crate::render::interaction::HitTarget::ModalItem { index: 0 }
+            })
+            .expect("selected preview card hit region");
+        assert_eq!(region.rect.height, 10, "title plus nine bounded detail rows");
+        assert_eq!(
+            frame.hit(region.rect.row + 9, region.rect.col),
+            Some(crate::render::interaction::HitTarget::ModalItem { index: 0 }),
+        );
+    }
+
+    #[test]
     fn interaction_composer_maps_cjk_and_zwj_continuation_cells_to_utf8_boundaries() {
         let interactions = crate::render::interaction::InteractionPublisher::default();
         let mut renderer = RetainedRenderer::with_writer_and_interactions(
@@ -12004,15 +12087,10 @@ mod tests {
         // the two paginator fit-loops and the footer `menu_rows` reservation —
         // share this helper, so they can never disagree with the render loop.
         let h0 = crate::modals::session_picker::HEADER_ROWS;
-        assert_eq!(RetainedRenderer::<CountingSink>::session_item_height(h0), 2);
-        assert_eq!(
-            RetainedRenderer::<CountingSink>::session_item_height(h0 + 1),
-            3
-        );
-        assert_eq!(
-            RetainedRenderer::<CountingSink>::session_item_height(h0 + 5),
-            3
-        );
+        let (r, _counter) = new_counting(80, 24);
+        assert_eq!(r.session_item_height(h0, "meta", 80), 2);
+        assert_eq!(r.session_item_height(h0 + 1, "meta", 80), 3);
+        assert_eq!(r.session_item_height(h0 + 5, "meta", 80), 3);
     }
 
     #[test]
@@ -12053,7 +12131,7 @@ mod tests {
         // Selected row: PAD_COL spaces, then `▸ `, then the title. So col 2 is
         // the marker and col 4 is the first title glyph — flush with the search
         // box's `│` border (col 2) and its text (col 4).
-        let rows = r.build_session_menu_rows("Xtitle", "9 msgs", true, 70);
+        let rows = r.build_session_menu_rows("Xtitle", "9 msgs", true, 70, 4);
         let title = &rows[0];
         assert_eq!(title[0].ch, ' ');
         assert_eq!(title[1].ch, ' ');
@@ -12063,9 +12141,40 @@ mod tests {
         let meta = &rows[1];
         assert_eq!(meta[4].ch, '9', "metadata aligns with the title at col 4");
         // Unselected row: no marker, but the title still lands at col 4.
-        let rows_u = r.build_session_menu_rows("Xtitle", "9 msgs", false, 70);
+        let rows_u = r.build_session_menu_rows("Xtitle", "9 msgs", false, 70, 4);
         assert_eq!(rows_u[0][2].ch, ' ', "no marker when unselected");
         assert_eq!(rows_u[0][4].ch, 'X', "unselected title also at col 4");
+    }
+
+    #[test]
+    fn session_preview_expands_only_inside_wide_selected_card() {
+        let (r, _counter) = new_counting(120, 40);
+        let desc = "12 messages · now\n/workspace/project\nprovider · model\nline 1\nline 2\nline 3\nline 4\nline 5\nline 6";
+
+        let wide = r.build_session_menu_rows("Selected", desc, true, 116, 4);
+        assert_eq!(
+            wide.len(),
+            10,
+            "title + metadata + cwd/model + six excerpts"
+        );
+        let visible = |row: &[Cell]| {
+            row.iter()
+                .filter(|cell| cell.width > 0)
+                .map(|cell| cell.ch)
+                .collect::<String>()
+        };
+        assert!(visible(&wide[2]).contains("/workspace/project"));
+        assert!(visible(&wide[3]).contains("provider · model"));
+        assert!(visible(&wide[9]).contains("line 6"));
+
+        let narrow = r.build_session_menu_rows("Selected", desc, true, 76, 4);
+        assert_eq!(
+            narrow.len(),
+            2,
+            "narrow card stays byte-for-byte list shaped"
+        );
+        assert!(visible(&narrow[1]).contains("12 messages · now"));
+        assert!(!visible(&narrow[1]).contains("provider"));
     }
 
     /// `None` session_name keeps the top rule pristine — no reverse

@@ -140,10 +140,52 @@ impl SessionPicker {
             )
     }
 
+    #[cfg(test)]
     fn pointer_select_with(&mut self, index: usize, redraw: impl FnOnce(&Self)) {
         if self.select_index(index) {
             redraw(self);
         }
+    }
+
+    pub(crate) fn begin_preview(&self, ctx: &mut LoopCtx) {
+        ctx.session_preview_selection = None;
+        ctx.session_preview_result = None;
+        self.sync_preview_request(ctx);
+    }
+
+    fn sync_preview_request(&self, ctx: &mut LoopCtx) {
+        let selected = self
+            .chosen_session()
+            .map(|session| (session.project_bucket.clone(), session.id.clone()));
+        let unchanged = match (&ctx.session_preview_selection, &selected) {
+            (Some(current), Some((project_bucket, session_id))) => {
+                current.project_bucket == *project_bucket && current.session_id == *session_id
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged {
+            return;
+        }
+        ctx.session_preview_result = None;
+        let request = selected.map(|(project_bucket, session_id)| {
+            let generation = ctx.next_session_preview_generation;
+            ctx.next_session_preview_generation = generation.wrapping_add(1).max(1);
+            let selection = crate::session::SessionPreviewSelection {
+                project_bucket,
+                session_id,
+                generation,
+            };
+            ctx.session_preview_selection = Some(selection.clone());
+            crate::event_loop::bg_runtime::SessionPreviewRequest {
+                runtime_id: ctx.foreground_runtime_id,
+                selection,
+            }
+        });
+        if request.is_none() {
+            ctx.session_preview_selection = None;
+        }
+        ctx.session_preview_request_tx.send_replace(request);
     }
 
     pub fn chosen_id(&self) -> Option<String> {
@@ -304,12 +346,14 @@ impl Modal for SessionPicker {
             KeyCode::Up => {
                 self.up();
                 self.delete_status = None;
+                self.sync_preview_request(ctx);
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
             KeyCode::Down => {
                 self.down();
                 self.delete_status = None;
+                self.sync_preview_request(ctx);
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
@@ -321,6 +365,7 @@ impl Modal for SessionPicker {
                 self.search_focused = true;
                 self.confirm_delete = None;
                 self.delete_status = None;
+                self.sync_preview_request(ctx);
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
@@ -330,6 +375,7 @@ impl Modal for SessionPicker {
                 self.search_focused = true;
                 self.confirm_delete = None;
                 self.delete_status = None;
+                self.sync_preview_request(ctx);
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
@@ -373,6 +419,7 @@ impl Modal for SessionPicker {
                                     })
                                     .into_owned(),
                                 );
+                                self.sync_preview_request(ctx);
                             }
                             Err(e) => {
                                 self.confirm_delete = None;
@@ -438,6 +485,7 @@ impl Modal for SessionPicker {
         self.confirm_delete = None;
         self.delete_status = None;
         self.selected = 0;
+        self.sync_preview_request(ctx);
         self.draw(buf, state, ctx, renderer);
         Ok(ModalAction::Continue)
     }
@@ -452,13 +500,16 @@ impl Modal for SessionPicker {
     ) -> Result<ModalAction> {
         match action {
             ModalPointerAction::Select(index) => {
-                self.pointer_select_with(index, |picker| {
-                    picker.draw(buf, state, ctx, renderer)
-                });
+                let changed = self.select_index(index);
+                self.sync_preview_request(ctx);
+                if changed {
+                    self.draw(buf, state, ctx, renderer);
+                }
                 Ok(ModalAction::Continue)
             }
             ModalPointerAction::Confirm(index) => {
                 self.select_index(index);
+                self.sync_preview_request(ctx);
                 self.confirm_selected(state, ctx, renderer)
             }
             ModalPointerAction::Cancel => Ok(ModalAction::Close),
@@ -483,13 +534,15 @@ impl Modal for SessionPicker {
             });
         let current_project_bucket =
             atomcode_capabilities::session::SessionManager::project_hash(&ctx.working_dir);
-        let payload = build_menu_payload(
+        let payload = build_menu_payload_with_preview(
             self,
             &project,
             Some((
                 ctx.current_session.id.as_str(),
                 current_project_bucket.as_str(),
             )),
+            ctx.session_preview_selection.as_ref(),
+            ctx.session_preview_result.as_ref(),
         );
         let mut status = build_status(state, ctx);
         // Delete confirmation/result is the user's own active interaction — it
@@ -525,10 +578,26 @@ impl Modal for SessionPicker {
 /// lands on the right row (mirrors `plugin_manager`'s `selected_offset`).
 pub(crate) const HEADER_ROWS: usize = 4;
 
+#[cfg(test)]
 fn build_menu_payload(
     p: &SessionPicker,
     project: &str,
     current_session: Option<(&str, &str)>,
+) -> MenuPayload {
+    build_menu_payload_with_preview(p, project, current_session, None, None)
+}
+
+fn build_menu_payload_with_preview(
+    p: &SessionPicker,
+    project: &str,
+    current_session: Option<(&str, &str)>,
+    preview_selection: Option<&crate::session::SessionPreviewSelection>,
+    preview_result: Option<
+        &Result<
+            Option<atomcode_daemon::legacy_convert::CatalogSessionPreview>,
+            atomcode_daemon::legacy_convert::CatalogSessionPreviewError,
+        >,
+    >,
 ) -> MenuPayload {
     // Title row: when the search box is focused, show just the bare heading
     // ("恢复会话" / "Resume session") without position/total/project, so the
@@ -581,7 +650,7 @@ fn build_menu_payload(
             kind: crate::render::MenuKind::SessionList,
         };
     }
-    for &session_idx in &p.filtered {
+    for (filtered_index, &session_idx) in p.filtered.iter().enumerate() {
         let s = &p.sessions[session_idx];
         let msgs = crate::i18n::t(crate::i18n::Msg::SessionMsgCount {
             count: s.message_count,
@@ -592,6 +661,38 @@ fn build_menu_payload(
         {
             metadata.push_str(" · ");
             metadata.push_str(&crate::i18n::t(crate::i18n::Msg::DirCurrent));
+        }
+        let is_previewed = !p.search_focused
+            && filtered_index == p.selected
+            && preview_selection.is_some_and(|selection| {
+                selection.project_bucket == s.project_bucket && selection.session_id == s.id
+            });
+        if is_previewed {
+            metadata.push('\n');
+            metadata.push_str(&crate::sanitize::scrub_controls(
+                &s.working_dir.to_string_lossy(),
+            ));
+            match preview_result {
+                Some(Ok(Some(preview))) => {
+                    metadata.push('\n');
+                    metadata.push_str(&match (&preview.provider_id, &preview.model_id) {
+                        (Some(provider), Some(model)) => format!("{provider} · {model}"),
+                        _ => preview_unavailable_label().to_string(),
+                    });
+                    for line in &preview.excerpt {
+                        metadata.push('\n');
+                        metadata.push_str(line);
+                    }
+                }
+                Some(Ok(None)) | Some(Err(_)) => {
+                    metadata.push('\n');
+                    metadata.push_str(preview_unavailable_label());
+                }
+                None => {
+                    metadata.push('\n');
+                    metadata.push_str(preview_loading_label());
+                }
+            }
         }
         items.push((s.name.clone(), metadata));
     }
@@ -610,6 +711,20 @@ fn build_menu_payload(
         selected,
         items,
         kind: crate::render::MenuKind::SessionList,
+    }
+}
+
+fn preview_loading_label() -> &'static str {
+    match crate::i18n::current_locale() {
+        crate::i18n::Locale::ZhCn => "正在加载预览…",
+        crate::i18n::Locale::En => "Loading preview…",
+    }
+}
+
+fn preview_unavailable_label() -> &'static str {
+    match crate::i18n::current_locale() {
+        crate::i18n::Locale::ZhCn => "预览不可用",
+        crate::i18n::Locale::En => "Preview unavailable",
     }
 }
 
@@ -1480,6 +1595,38 @@ mod tests {
             "only the active session may carry the current marker: {:?}",
             payload.items
         );
+    }
+
+    #[test]
+    fn selected_preview_enriches_only_the_selected_descriptor() {
+        let p = SessionPicker::open(vec![meta("alpha", 3), meta("beta", 5)]);
+        let selected = p.chosen_session().unwrap();
+        let selection = crate::session::SessionPreviewSelection {
+            project_bucket: selected.project_bucket.clone(),
+            session_id: selected.id.clone(),
+            generation: 9,
+        };
+        let result = Ok(Some(
+            atomcode_daemon::legacy_convert::CatalogSessionPreview {
+                session_id: selected.id.clone(),
+                project_bucket: selected.project_bucket.clone(),
+                provider_id: Some("provider".into()),
+                model_id: Some("model".into()),
+                excerpt: vec!["first".into(), "second".into()],
+            },
+        ));
+
+        let payload = build_menu_payload_with_preview(
+            &p,
+            "project",
+            None,
+            Some(&selection),
+            Some(&result),
+        );
+        let selected_desc = &payload.items[HEADER_ROWS].1;
+        assert!(selected_desc.contains("provider · model"));
+        assert!(selected_desc.ends_with("first\nsecond"));
+        assert!(!payload.items[HEADER_ROWS + 1].1.contains('\n'));
     }
 
     // On /resume, todowrite calls no longer render an inline block. Instead the
