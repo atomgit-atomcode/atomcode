@@ -2110,16 +2110,17 @@ mod tests {
 
     #[test]
     fn list_bullets() {
+        // Pin the dark palette so the marker's final ANSI is deterministic
+        // (SGR 37). Asserting the literal escape sequence — not
+        // `theme::md_marker_open()` — keeps the regression guard: if the
+        // production helper regresses to SGR 90 on dark, this fails.
+        let _guard = theme::test_lock();
+        theme::set_theme_mode(false);
         let mut st = MdState::new();
         let out = render_line("- item", &mut st, caps()).unwrap();
-        // Bullet marker rendered in muted colour (theme-aware).
         assert!(
-            out.contains(&format!(
-                "{}•{}",
-                theme::md_marker_open(),
-                theme::MD_MUTED_CLOSE
-            )),
-            "bullet must use md_marker_open colour: {:?}",
+            out.contains(&format!("{}•{}", "\x1b[37m", theme::MD_MUTED_CLOSE)),
+            "bullet must use the dark marker colour (SGR 37): {:?}",
             out
         );
         assert!(out.contains("item"));
@@ -2135,14 +2136,12 @@ mod tests {
 
     #[test]
     fn list_nested_indent() {
+        let _guard = theme::test_lock();
+        theme::set_theme_mode(false);
         let mut st = MdState::new();
         let out = render_line("  - nested", &mut st, caps()).unwrap();
         assert!(
-            out.starts_with(&format!(
-                "  {}•{}",
-                theme::md_marker_open(),
-                theme::MD_MUTED_CLOSE
-            )),
+            out.starts_with(&format!("  {}•{}", "\x1b[37m", theme::MD_MUTED_CLOSE)),
             "nested bullet with indent: {:?}",
             out
         );
@@ -2150,15 +2149,13 @@ mod tests {
 
     #[test]
     fn ordered_list_single_digit() {
+        let _guard = theme::test_lock();
+        theme::set_theme_mode(false);
         let mut st = MdState::new();
         let out = render_line("1. first item", &mut st, caps()).unwrap();
         assert!(
-            out.contains(&format!(
-                "{}1.{}",
-                theme::md_marker_open(),
-                theme::MD_MUTED_CLOSE
-            )),
-            "ordered marker must use md_marker_open colour: {:?}",
+            out.contains(&format!("{}1.{}", "\x1b[37m", theme::MD_MUTED_CLOSE)),
+            "ordered marker must use the dark marker colour (SGR 37): {:?}",
             out
         );
         assert!(out.contains("first item"));
@@ -2166,15 +2163,13 @@ mod tests {
 
     #[test]
     fn ordered_list_double_digit() {
+        let _guard = theme::test_lock();
+        theme::set_theme_mode(false);
         let mut st = MdState::new();
         let out = render_line("12. twelfth item", &mut st, caps()).unwrap();
         assert!(
-            out.contains(&format!(
-                "{}12.{}",
-                theme::md_marker_open(),
-                theme::MD_MUTED_CLOSE
-            )),
-            "double-digit marker must use md_marker_open colour: {:?}",
+            out.contains(&format!("{}12.{}", "\x1b[37m", theme::MD_MUTED_CLOSE)),
+            "double-digit marker must use the dark marker colour (SGR 37): {:?}",
             out
         );
         assert!(out.contains("twelfth item"));
@@ -2190,14 +2185,17 @@ mod tests {
 
     #[test]
     fn ordered_list_nested() {
+        // P1 regression: this test was still asserting the OLD fixed
+        // MD_MUTED_OPEN (SGR 90), which can never match the production
+        // theme-aware marker output (SGR 37 on dark) and fails under the
+        // default MODE_DARK. Pin the dark palette and assert the literal
+        // escape sequence like the sibling list tests.
+        let _guard = theme::test_lock();
+        theme::set_theme_mode(false);
         let mut st = MdState::new();
         let out = render_line("  5. nested ordered", &mut st, caps()).unwrap();
         assert!(
-            out.starts_with(&format!(
-                "  {}5.{}",
-                theme::MD_MUTED_OPEN,
-                theme::MD_MUTED_CLOSE
-            )),
+            out.starts_with(&format!("  {}5.{}", "\x1b[37m", theme::MD_MUTED_CLOSE)),
             "nested ordered with indent: {:?}",
             out
         );
