@@ -67,6 +67,20 @@ docker run --rm -it \
 docker build -t atomcode-daemon:v5.0.3 -f docker/Dockerfile-Daemon .
 ```
 
+### 多架构构建（amd64 + arm64）
+
+`Dockerfile-Daemon` 支持多架构：通过 buildx 的 `TARGETARCH` 自动选择对应产物（amd64 → `linux-x64` 二进制，arm64 → `linux-arm64` 二进制），一次构建即可产出同时支持 x86 与 ARM64（群晖/威联通 ARM 机型、树莓派等）的镜像。
+
+一键构建并推送多架构镜像：
+
+```bash
+docker/build-multiarch.sh                      # 默认镜像名 atomcode-daemon:v<版本>，构建并推送
+docker/build-multiarch.sh myrepo/atomcode:v1   # 指定镜像名
+BUILD_ONLY=1 docker/build-multiarch.sh         # 仅本地构建，不推送
+```
+
+脚本会自动调用 `scripts/release.sh`（`ATOMCODE_INCLUDE_DAEMON=1`）交叉编译 x64 + arm64 两种 daemon 产物后交给 buildx。前置条件：安装 musl 交叉编译工具链（`brew install FiloSottile/musl-cross/musl-cross`）。
+
 ### 推送到华为云 SWR
 
 华为云 SWR 基础版不支持 OCI 规范的镜像格式。如果你使用的是较新版本的 Docker（BuildKit），需要添加 `--provenance=false` 参数：
