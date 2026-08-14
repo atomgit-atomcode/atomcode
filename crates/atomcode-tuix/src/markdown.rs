@@ -11,6 +11,7 @@
 use crate::highlight::theme;
 use crate::terminal::TerminalCaps;
 use std::borrow::Cow;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Parser state maintained across lines of a streamed response.
 #[derive(Clone)]
@@ -393,9 +394,9 @@ fn box_drawing_table_row(trimmed: &str) -> Option<String> {
 }
 
 /// Flush a buffered markdown table as a column-aligned block. Computes the
-/// max display width per column, pads every cell accordingly, renders with
-/// `│`/`┼`/`─` box chars in muted gray. Inline markdown inside cells is
-/// honoured.
+/// max display width per column and pads every cell accordingly. Columns use
+/// whitespace gutters and ASCII separators, avoiding ambiguous-width Unicode
+/// borders on Windows console hosts. Inline markdown inside cells is honoured.
 pub fn flush_aligned_table(rows: &[String], caps: TerminalCaps) -> String {
     flush_aligned_table_with_width(rows, caps, 0)
 }
@@ -468,7 +469,7 @@ fn split_table_row(line: &str) -> Vec<String> {
 
 /// A GFM delimiter row (`---|:--:|--:`) — cells are made up only of `-`, `:`
 /// and spaces. Shared by every table stage so the "is this the separator?"
-/// rule can't drift between the box, wrapped-grid and flat paths.
+/// rule can't drift between the aligned-grid and flat paths.
 fn is_separator_row(row: &[String]) -> bool {
     row.iter()
         .all(|c| !c.is_empty() && c.chars().all(|ch| matches!(ch, '-' | ':' | ' ')))
@@ -557,28 +558,33 @@ fn word_wrap_cell(plain: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// Middle tier between the natural box and the flat key/value fallback: try to
+/// Middle tier between the natural grid and the flat key/value fallback: try to
 /// keep the GRID by shrinking wide columns (wrapping their cells to multiple
 /// lines) so a table that's only *somewhat* too wide doesn't collapse straight
-/// to a vertical list. Returns per-column widths that fit `max_width` (borders
+/// to a vertical list. Returns per-column widths that fit `max_width` (gutters
 /// + padding included), or `None` when even at each column's floor the row
 /// can't fit — then the caller uses the flat fallback.
-///
-/// `bar_w` is the `│` border width (1 in the default non-CJK-border mode this
-/// tier runs in). Column floors clamp to `[MIN_COL, TOKEN_CAP]` around each
+/// Column floors clamp to `[MIN_COL, TOKEN_CAP]` around each
 /// column's longest token so identifiers aren't broken mid-word, while a single
 /// enormous token can't veto the whole grid.
+const TABLE_COLUMN_GAP: usize = 2;
+const TABLE_CELL_PADDING: usize = 1;
+const TABLE_RIGHT_GUARD: usize = 1;
+
 fn fit_columns_to_grid(
     parsed: &[Vec<String>],
     natural: &[usize],
     ncols: usize,
     max_width: usize,
-    bar_w: usize,
 ) -> Option<Vec<usize>> {
     const MIN_COL: usize = 4;
     const TOKEN_CAP: usize = 16;
-    // One row's chrome: leading │, then per column ` cell ` (2 spaces) + a `│`.
-    let chrome = bar_w * (ncols + 1) + 2 * ncols;
+    // Codex-style borderless layout: one-cell padding on both sides of each
+    // value, plus a two-cell gap between columns. Avoiding vertical Unicode
+    // borders is deliberate: PowerShell/ConPTY/font combinations disagree on
+    // the width of East Asian Ambiguous box characters, and the error used to
+    // accumulate once per column until the row crossed the terminal edge.
+    let chrome = TABLE_CELL_PADDING * 2 * ncols + TABLE_COLUMN_GAP * ncols.saturating_sub(1);
     let content_budget = max_width.checked_sub(chrome)?;
     if content_budget == 0 {
         return None;
@@ -626,76 +632,71 @@ fn fit_columns_to_grid(
 }
 
 /// True when the wrapped grid would be so cramped that a flat key/value record
-/// reads better: any data row wraps taller than `MAX_ROW_LINES`. Mirrors codex's
-/// "starved cell" fallback so a moderately-wide table stays a grid, but a table
-/// with a genuinely huge cell squeezed into a narrow column drops to flat instead
-/// of drawing a 20-line-tall box row.
+/// reads better. Mirrors codex's "starved cell" fallback: fragmented tokens,
+/// several cramped cells, or catastrophically tall rows count against the grid,
+/// while one exceptional row does not flatten an otherwise useful large table.
 fn grid_too_starved(parsed: &[Vec<String>], col_widths: &[usize]) -> bool {
-    const MAX_ROW_LINES: usize = 8;
-    for row in parsed {
-        if is_separator_row(row) {
-            continue;
-        }
-        let height = col_widths
-            .iter()
-            .enumerate()
-            .map(|(j, &w)| {
-                let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
-                word_wrap_cell(&strip_md_for_width(cell), w).len()
-            })
-            .max()
-            .unwrap_or(1);
-        if height > MAX_ROW_LINES {
-            return true;
-        }
+    const MIN_SCANNABLE_WIDTH: usize = 12;
+    const CRAMPED_CELL_LINES: usize = 4;
+    const CATASTROPHIC_CELL_LINES: usize = 7;
+
+    // The first non-separator row is the header; judge readability from body
+    // records only. One affected record is enough for a one-row table. For a
+    // larger table, require either two rows or one third of the records so one
+    // exceptional cell does not unnecessarily flatten an otherwise useful grid.
+    let body_rows: Vec<&Vec<String>> = parsed
+        .iter()
+        .filter(|row| !is_separator_row(row))
+        .skip(1)
+        .collect();
+    if body_rows.is_empty() {
+        return false;
     }
-    false
+
+    let affected = body_rows
+        .iter()
+        .filter(|row| {
+            let mut cramped_cells = 0usize;
+            let mut catastrophic = false;
+            let mut fragmented_token = false;
+            let mut row_height = 1usize;
+            for (j, &width) in col_widths.iter().enumerate() {
+                let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
+                let plain = strip_md_for_width(cell);
+                let height = word_wrap_cell(&plain, width).len();
+                row_height = row_height.max(height);
+                cramped_cells += usize::from(height >= CRAMPED_CELL_LINES);
+                catastrophic |= width < MIN_SCANNABLE_WIDTH && height >= CATASTROPHIC_CELL_LINES;
+                fragmented_token |= width < MIN_SCANNABLE_WIDTH
+                    && plain
+                        .split_whitespace()
+                        .any(|token| crate::width::display_width(token) > width);
+            }
+            fragmented_token || cramped_cells >= 2 || catastrophic || row_height > 8
+        })
+        .count();
+    let threshold = if body_rows.len() == 1 {
+        1
+    } else {
+        2.max(body_rows.len().div_ceil(3))
+    };
+    affected >= threshold
 }
 
-/// Render the wrapped-grid middle tier: a box table whose cells wrap to their
+/// Render the wrapped-grid middle tier: a borderless table whose cells wrap to their
 /// (shrunk) column widths. Cell content is rendered as PLAIN text (inline
 /// styling dropped) in this degraded mode — wrapping styled SGR spans across a
-/// line boundary would desync the per-line padding and break box alignment.
+/// line boundary would desync the per-line padding and break column alignment.
 /// The gain is that no content is lost and the scannable grid survives.
-///
-/// Runs only in the default border mode (`─`/`│` are 1 cell), so no CJK
-/// dash-rounding is needed here.
-fn render_wrapped_box_table(
+fn render_wrapped_table(
     parsed: &[Vec<String>],
     col_widths: &[usize],
     caps: TerminalCaps,
 ) -> String {
-    let border_on = if caps.colors {
-        theme::md_border_open()
-    } else {
-        ""
-    };
-    let border_off = if caps.colors {
-        theme::MD_MUTED_CLOSE
-    } else {
-        ""
-    };
     let ncols = col_widths.len();
-    let rule = |left: char, mid: char, right: char| -> String {
-        let mut s = String::new();
-        s.push_str(border_on);
-        s.push(left);
-        for (j, w) in col_widths.iter().enumerate() {
-            for _ in 0..(w + 2) {
-                s.push('─');
-            }
-            if j + 1 < ncols {
-                s.push(mid);
-            }
-        }
-        s.push(right);
-        s.push_str(border_off);
-        s
-    };
     let data_rows: Vec<&Vec<String>> = parsed.iter().filter(|r| !is_separator_row(r)).collect();
-
     let mut out = String::new();
-    out.push_str(&rule('┌', '┬', '┐'));
+    out.push_str(&render_table_boundary(col_widths, caps));
     out.push('\n');
     for (i, row) in data_rows.iter().enumerate() {
         // Wrap every cell to its column width; row height = tallest cell.
@@ -707,37 +708,97 @@ fn render_wrapped_box_table(
             .collect();
         let height = wrapped.iter().map(|c| c.len()).max().unwrap_or(1).max(1);
         for line_idx in 0..height {
-            out.push_str(border_on);
-            out.push('│');
-            out.push_str(border_off);
             for (j, w) in col_widths.iter().enumerate() {
                 let cell_line = wrapped[j].get(line_idx).map(|s| s.as_str()).unwrap_or("");
                 let lw = crate::width::display_width(cell_line);
-                out.push(' ');
+                out.push_str(&" ".repeat(TABLE_CELL_PADDING));
+                if i == 0 && caps.colors {
+                    out.push_str(theme::md_heading_open());
+                }
                 out.push_str(cell_line);
+                if i == 0 && caps.colors {
+                    out.push_str(theme::MD_HEADING_CLOSE);
+                }
                 for _ in 0..w.saturating_sub(lw) {
                     out.push(' ');
                 }
-                out.push(' ');
-                out.push_str(border_on);
-                out.push('│');
-                out.push_str(border_off);
+                out.push_str(&" ".repeat(TABLE_CELL_PADDING));
+                if j + 1 < ncols {
+                    out.push_str(&" ".repeat(TABLE_COLUMN_GAP));
+                }
             }
             out.push('\n');
         }
         if i + 1 < data_rows.len() {
-            out.push_str(&rule('├', '┼', '┤'));
+            out.push_str(&render_table_separator(
+                col_widths,
+                if i == 0 { '━' } else { '─' },
+                caps,
+            ));
             out.push('\n');
         }
     }
-    out.push_str(&rule('└', '┴', '┘'));
+    out.push_str(&render_table_boundary(col_widths, caps));
+    if out.ends_with('\n') {
+        out.pop();
+    }
     out
+}
+
+fn render_table_boundary(col_widths: &[usize], caps: TerminalCaps) -> String {
+    let width = col_widths.iter().sum::<usize>()
+        + TABLE_CELL_PADDING * 2 * col_widths.len()
+        + TABLE_COLUMN_GAP * col_widths.len().saturating_sub(1);
+    let rule = stable_table_rule_char('━').to_string().repeat(width);
+    if caps.colors {
+        format!("{}{}{}", theme::md_border_open(), rule, theme::MD_MUTED_CLOSE)
+    } else {
+        rule
+    }
+}
+
+/// Prefer Codex's Unicode rules where their width is reliable. Windows console
+/// hosts (including WSL sessions rendered by Windows Terminal) have historically
+/// disagreed with Unicode's East Asian Ambiguous width for box-drawing glyphs;
+/// use invariant-width ASCII there and whenever the configured width model says
+/// the preferred glyph occupies more than one cell.
+fn stable_table_rule_char(preferred: char) -> char {
+    let windows_console = cfg!(windows)
+        || std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || std::env::var_os("WSL_INTEROP").is_some();
+    if windows_console || crate::width::cell_char_width(preferred).unwrap_or(1) != 1 {
+        if preferred == '━' { '=' } else { '-' }
+    } else {
+        preferred
+    }
+}
+
+/// Render the same open table rules as Codex: every column owns one rule
+/// segment, with the normal inter-column gap left blank. There are no vertical
+/// borders, corners, or junction glyphs, so content stays readable without
+/// recreating the ambiguous-width boxed layout.
+fn render_table_separator(
+    col_widths: &[usize],
+    separator_char: char,
+    caps: TerminalCaps,
+) -> String {
+    let segment = stable_table_rule_char(separator_char).to_string();
+    let rule = col_widths
+        .iter()
+        .map(|width| segment.repeat(*width + TABLE_CELL_PADDING * 2))
+        .collect::<Vec<_>>()
+        .join(&" ".repeat(TABLE_COLUMN_GAP));
+    if caps.colors {
+        format!("{}{}{}", theme::md_border_open(), rule, theme::MD_MUTED_CLOSE)
+    } else {
+        rule
+    }
 }
 
 /// Width-aware variant. When `max_width > 0` and the table can't fit at its
 /// natural column widths, fall back to a flat key/value record format
 /// (`header: cell` per line, blank line between rows) so no information is
-/// lost to per-cell truncation. `max_width = 0` keeps box-table rendering
+/// lost to per-cell truncation. `max_width = 0` keeps aligned-table rendering
 /// at natural widths regardless of size.
 pub fn flush_aligned_table_with_width(
     rows: &[String],
@@ -774,20 +835,6 @@ pub fn flush_aligned_table_with_width(
     // terminals unreadable. Instead, if the natural table doesn't fit, the
     // flat-mode fallback below renders every cell in full.
     //
-    // However, when the border dash glyph `─` occupies more than 1 cell
-    // (CJK mode: `ATOMCODE_CJK_WIDTH=1` makes East Asian Ambiguous
-    // codepoints width-2), the number of dashes we push per column is
-    // `ceil((w + 2) / dash_w)`, and their *actual* rendered width is
-    // `ceil((w + 2) / dash_w) * dash_w` — which may exceed `w + 2` when
-    // `dash_w > 1` and `w + 2` isn't a multiple of `dash_w`. That makes
-    // the border rows wider than the data rows and the `│` borders
-    // mis-align.
-    //
-    // Fix: round each column width UP so that `w + 2` is a multiple of
-    // `dash_w`. This adds at most `dash_w - 1` cells of extra padding per
-    // column — a minor cosmetic cost that guarantees every row (border or
-    // data) has exactly the same display width.
-    let dash_w = crate::width::cell_char_width('─').unwrap_or(1).max(1);
     let mut col_widths = vec![0usize; ncols];
     for row in &parsed {
         if is_sep(row) {
@@ -802,140 +849,82 @@ pub fn flush_aligned_table_with_width(
             col_widths[j] = col_widths[j].max(w);
         }
     }
-    // Round up each column width so (w + 2) is a multiple of dash_w.
-    // For dash_w == 1 (default, non-CJK), this is a no-op.
-    if dash_w > 1 {
-        for w in &mut col_widths {
-            let budget = *w + 2;
-            let rounded = budget.div_ceil(dash_w) * dash_w;
-            *w = rounded.saturating_sub(2);
-        }
-    }
-
-    // Total width of one rendered row at natural widths:
-    //   `│` + per-col ` cell ` + `│` between/after each col
-    // In CJK mode, `│` (U+2502) is East Asian Ambiguous and occupies 2
-    // cells, so the per-border contribution is `bar_w`, not a hardcoded 1.
-    //   = bar_w + sum(w + 2 + bar_w for w in col_widths)
-    // where the per-column budget is: 1 leading space + w content + pad +
-    // 1 trailing space + bar_w for the following `│`.
-    //
-    // If this exceeds the terminal budget, switch to flat mode.
-    let bar_w = crate::width::cell_char_width('│').unwrap_or(1).max(1);
-    let natural_row_width: usize = bar_w + col_widths.iter().map(|w| w + 2 + bar_w).sum::<usize>();
-    if max_width > 0 && natural_row_width > max_width {
+    // Borderless Codex-style row width. Keep one column unused at the right
+    // edge whenever a real viewport budget is available. Besides looking less
+    // cramped, this prevents ConPTY from wrapping a line that exactly touches
+    // the final cell while a resize or font fallback is being reconciled.
+    let natural_row_width: usize = col_widths.iter().sum::<usize>()
+        + TABLE_CELL_PADDING * 2 * ncols
+        + TABLE_COLUMN_GAP * ncols.saturating_sub(1);
+    let effective_max_width = if max_width > 0 {
+        max_width.saturating_sub(TABLE_RIGHT_GUARD)
+    } else {
+        0
+    };
+    // `max_width == 0` alone means "unbounded". A real viewport of one column
+    // also produces an effective budget of zero after reserving the guard, and
+    // must still take the flat fallback rather than accidentally rendering an
+    // unbounded table during a resize transition.
+    if max_width > 0 && natural_row_width > effective_max_width {
         // Middle tier (codex-style graceful degradation): before collapsing to a
         // flat vertical list, try to keep the GRID by shrinking wide columns and
-        // wrapping their cells. Skipped when the border glyphs occupy >1 cell
-        // (`ATOMCODE_CJK_WIDTH=1`) — multi-line box alignment with wide dashes is
-        // hairier, so those go straight to the safe flat path.
-        let cjk_border = dash_w > 1 || bar_w > 1;
-        if !cjk_border {
-            if let Some(shrunk) = fit_columns_to_grid(&parsed, &col_widths, ncols, max_width, bar_w)
-            {
-                // Starvation guard (codex-style): if keeping the grid squeezes a
-                // column so hard that a cell wraps into a tall stack, a flat
-                // one-field-per-line record is more scannable — don't force a box.
-                if !grid_too_starved(&parsed, &shrunk) {
-                    return render_wrapped_box_table(&parsed, &shrunk, caps);
-                }
+        // wrapping their cells. The absence of vertical border glyphs makes this
+        // path independent of the host's East Asian Ambiguous-width policy.
+        if let Some(shrunk) = fit_columns_to_grid(&parsed, &col_widths, ncols, effective_max_width)
+        {
+            // Starvation guard (codex-style): if keeping the grid squeezes a
+            // column so hard that values fragment into tall strips, a flat
+            // one-field-per-line record is more scannable.
+            if !grid_too_starved(&parsed, &shrunk) {
+                return render_wrapped_table(&parsed, &shrunk, caps);
             }
         }
         return render_flat_table(&parsed, caps);
     }
 
-    // Gray chrome — table borders are structure, not content (cyan made
-    // them collide with the input-box separator and inline-code colour).
-    // But the shade must be theme-aware: a fixed SGR 90 (DarkGrey) maps to
-    // ~#3F3F3F on dark themes, ~3:1 against the bg, so the whole grid went
-    // invisible until a selection highlight revealed it. `md_border_open`
-    // keeps SGR 90 on light and switches to SGR 37 (soft light-gray) on
-    // dark — quiet structure that stays visible on both.
-    let border_on = if caps.colors {
-        theme::md_border_open()
-    } else {
-        ""
-    };
-    let border_off = if caps.colors {
-        theme::MD_MUTED_CLOSE
-    } else {
-        ""
-    };
-
-    // Draw a horizontal rule row with given connector characters.
-    //
-    // Each inner column reserves `(w + 2)` *visual cells* of border —
-    // matching the content row's ` <body><pad> ` budget (1 leading space
-    // + w cells of content/padding + 1 trailing space) so border, content
-    // and separators align column-by-column.
-    //
-    // Box-drawing glyphs are East Asian Ambiguous. With
-    // `cell_char_width('─') == 2` (i.e. `ATOMCODE_CJK_WIDTH=1`), each
-    // dash we push occupies 2 cells. Column widths have already been
-    // rounded so that `w + 2` is a multiple of `dash_w` (see above),
-    // so `ceil((w + 2) / dash_w) * dash_w == w + 2` exactly — the
-    // border row fills precisely the same number of cells as the data
-    // row's ` <body><pad> ` budget.
-    //
-    // Junction glyphs (┬ ┼ ┤ etc.) occupy `bar_w` cells each in CJK
-    // mode, matching the `│` in the data row. The left/right corner
-    // glyphs (┌ ┐ ├ ┤ └ ┘) also occupy `bar_w` cells each.
-    let rule = |left: char, mid: char, right: char| -> String {
-        let mut s = String::new();
-        s.push_str(border_on);
-        s.push(left);
-        for (j, w) in col_widths.iter().enumerate() {
-            let n_dashes = (w + 2).div_ceil(dash_w);
-            for _ in 0..n_dashes {
-                s.push('─');
-            }
-            if j + 1 < col_widths.len() {
-                s.push(mid);
-            }
-        }
-        s.push(right);
-        s.push_str(border_off);
-        s
-    };
-
     let data_rows: Vec<&Vec<String>> = parsed.iter().filter(|r| !is_sep(r)).collect();
 
     let mut out = String::new();
-    // Top border: ┌─┬─┐
-    out.push_str(&rule('┌', '┬', '┐'));
+    out.push_str(&render_table_boundary(&col_widths, caps));
     out.push('\n');
-
     for (i, row) in data_rows.iter().enumerate() {
-        // Data row: │ cell │ cell │
-        out.push_str(border_on);
-        out.push('│');
-        out.push_str(border_off);
         for (j, w) in col_widths.iter().enumerate() {
             let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
             let plain_w = crate::width::display_width(&strip_md_for_width(cell));
-            let body = render_inline(cell, caps);
-            out.push(' ');
+            let mut body = render_inline(cell, caps);
+            if i == 0 && caps.colors {
+                body = format!(
+                    "{}{}{}",
+                    theme::md_heading_open(),
+                    body,
+                    theme::MD_HEADING_CLOSE
+                );
+            }
+            out.push_str(&" ".repeat(TABLE_CELL_PADDING));
             out.push_str(&body);
             let pad = w.saturating_sub(plain_w);
             for _ in 0..pad {
                 out.push(' ');
             }
-            out.push(' ');
-            out.push_str(border_on);
-            out.push('│');
-            out.push_str(border_off);
+            out.push_str(&" ".repeat(TABLE_CELL_PADDING));
+            if j + 1 < col_widths.len() {
+                out.push_str(&" ".repeat(TABLE_COLUMN_GAP));
+            }
         }
         out.push('\n');
-
-        // Separator between every pair of rows: ├─┼─┤
         if i + 1 < data_rows.len() {
-            out.push_str(&rule('├', '┼', '┤'));
+            out.push_str(&render_table_separator(
+                &col_widths,
+                if i == 0 { '━' } else { '─' },
+                caps,
+            ));
             out.push('\n');
         }
     }
-
-    // Bottom border: └─┴─┘
-    out.push_str(&rule('└', '┴', '┘'));
+    out.push_str(&render_table_boundary(&col_widths, caps));
+    if out.ends_with('\n') {
+        out.pop();
+    }
     out
 }
 
@@ -1210,23 +1199,10 @@ pub(crate) fn normalize_circled_list_spacing(line: &str) -> Cow<'_, str> {
     normalize_circled_list_spacing_with_cursor(line, 0).0
 }
 
-/// Display-only circled-list spacing plus the corresponding cursor position.
-///
-/// The composer owns a byte cursor into the unmodified input buffer. Synthetic
-/// separator bytes inserted before (or exactly at) that cursor must therefore
-/// advance its display projection, while the source text and submitted payload
-/// remain byte-for-byte unchanged.
-pub(crate) fn normalize_circled_list_spacing_with_cursor(
-    line: &str,
-    cursor_byte: usize,
-) -> (Cow<'_, str>, usize) {
+fn visit_circled_list_separator_offsets(line: &str, mut visit: impl FnMut(usize)) {
     let mut chars = line.char_indices().peekable();
     let mut previous = None;
     let mut in_code = false;
-    let mut output: Option<String> = None;
-    let mut segment_start = 0;
-    let source_cursor = cursor_byte.min(line.len());
-    let mut display_cursor = source_cursor;
 
     while let Some((index, ch)) = chars.next() {
         if ch == '`' {
@@ -1238,17 +1214,36 @@ pub(crate) fn normalize_circled_list_spacing_with_cursor(
                 .peek()
                 .is_some_and(|(_, next)| is_list_label_char(*next))
         {
-            let end = index + ch.len_utf8();
-            let output = output.get_or_insert_with(|| String::with_capacity(line.len() + 1));
-            output.push_str(&line[segment_start..end]);
-            output.push(' ');
-            segment_start = end;
-            if end <= source_cursor {
-                display_cursor += 1;
-            }
+            visit(index + ch.len_utf8());
         }
         previous = Some(ch);
     }
+}
+
+/// Display-only circled-list spacing plus the corresponding cursor position.
+///
+/// The composer owns a byte cursor into the unmodified input buffer. Synthetic
+/// separator bytes inserted before (or exactly at) that cursor must therefore
+/// advance its display projection, while the source text and submitted payload
+/// remain byte-for-byte unchanged.
+pub(crate) fn normalize_circled_list_spacing_with_cursor(
+    line: &str,
+    cursor_byte: usize,
+) -> (Cow<'_, str>, usize) {
+    let mut output: Option<String> = None;
+    let mut segment_start = 0;
+    let source_cursor = cursor_byte.min(line.len());
+    let mut display_cursor = source_cursor;
+
+    visit_circled_list_separator_offsets(line, |end| {
+        let output = output.get_or_insert_with(|| String::with_capacity(line.len() + 1));
+        output.push_str(&line[segment_start..end]);
+        output.push(' ');
+        segment_start = end;
+        if end <= source_cursor {
+            display_cursor += 1;
+        }
+    });
 
     let display = match output {
         Some(mut output) => {
@@ -1258,6 +1253,49 @@ pub(crate) fn normalize_circled_list_spacing_with_cursor(
         None => Cow::Borrowed(line),
     };
     (display, display_cursor)
+}
+
+/// Map a byte cursor in the display-only circled-list projection back to the
+/// nearest grapheme boundary in the original composer buffer.
+///
+/// The retained renderer inserts a synthetic space after list-shaped circled
+/// numbers (for example `①Rust` -> `① Rust`) without changing the submitted
+/// text. Visual Up/Down navigation operates on that projected layout, so its
+/// target cursor must be translated back before updating
+/// [`Buffer`](crate::event_loop::Buffer). A target on either side of a
+/// synthetic space maps to the same source boundary immediately after the
+/// circled number.
+pub(crate) fn source_cursor_from_circled_list_display_cursor(
+    source: &str,
+    display_cursor: usize,
+) -> usize {
+    let mut separator_offsets = Vec::new();
+    visit_circled_list_separator_offsets(source, |offset| separator_offsets.push(offset));
+
+    let mut best_source = 0usize;
+    let mut best_distance = display_cursor;
+    let mut separator_index = 0usize;
+
+    for source_cursor in source
+        .grapheme_indices(true)
+        .map(|(index, _)| index)
+        .chain(std::iter::once(source.len()))
+    {
+        while separator_offsets
+            .get(separator_index)
+            .is_some_and(|offset| *offset <= source_cursor)
+        {
+            separator_index += 1;
+        }
+        let projected_cursor = source_cursor + separator_index;
+        let distance = projected_cursor.abs_diff(display_cursor);
+        if distance < best_distance || (distance == best_distance && source_cursor > best_source) {
+            best_source = source_cursor;
+            best_distance = distance;
+        }
+    }
+
+    best_source
 }
 
 fn is_circled_list_boundary(ch: char) -> bool {
@@ -1438,6 +1476,16 @@ mod tests {
         hay.matches(needle).count()
     }
 
+    fn has_table_rule(rendered: &str, rule: char) -> bool {
+        rendered.lines().any(|line| {
+            let line = line.trim();
+            line.contains(rule)
+                && line
+                    .chars()
+                    .all(|ch| ch == rule || ch.is_ascii_whitespace())
+        })
+    }
+
     #[test]
     fn duplicate_heading_after_table_is_dropped() {
         // Weak-model artefact: same heading emitted twice with only a (stray)
@@ -1570,9 +1618,9 @@ mod tests {
         // End-to-end: a table cell containing a Rust closure should
         // NOT explode into phantom columns. Before the split_table_row
         // fix, `|a, b|` inside the cell got split as separators and
-        // the body row showed 4+ vertical bars (header + 3 phantom
-        // separators). After the fix, only the real cell separator
-        // remains: borders + 1 between cell — at most 3 bars total.
+        // the body row showed phantom columns. The borderless renderer must
+        // preserve the literal closure pipes as content without introducing
+        // any structural box glyphs.
         let rows = vec![
             "| 元素 | 示例 |".to_string(),
             "| --- | --- |".to_string(),
@@ -1583,16 +1631,9 @@ mod tests {
             .lines()
             .find(|l| l.contains("闭包"))
             .expect("body row missing");
-        // Count only the box-drawing vertical `│` (U+2502) — the
-        // literal ASCII `|` inside the cell content `|a, b|` is
-        // expected and shouldn't be conflated with column borders.
-        let box_bar_count = body_line.chars().filter(|c| *c == '│').count();
-        assert_eq!(
-            box_bar_count, 3,
-            "expected exactly 3 box-drawing bars (left border + 1 sep + right border); \
-             got {} in {:?}",
-            box_bar_count, body_line,
-        );
+        assert!(body_line.contains("|a, b| b.cmp(&a)"));
+        assert!(!body_line.contains('│'), "borderless row: {body_line:?}");
+        assert!(!out.contains("---"), "raw delimiter leaked: {out}");
     }
 
     #[test]
@@ -1804,6 +1845,27 @@ mod tests {
         let (display, cursor) = normalize_circled_list_spacing_with_cursor(source, source.len());
         assert_eq!(display, source);
         assert_eq!(cursor, source.len());
+    }
+
+    #[test]
+    fn circled_list_display_cursor_maps_back_to_source_boundary() {
+        let source = "①Rust";
+        let after_label = '①'.len_utf8();
+
+        // Both sides of the synthetic separator represent the same source
+        // insertion point. Later display positions account for that extra byte.
+        assert_eq!(
+            source_cursor_from_circled_list_display_cursor(source, after_label),
+            after_label
+        );
+        assert_eq!(
+            source_cursor_from_circled_list_display_cursor(source, after_label + 1),
+            after_label
+        );
+        assert_eq!(
+            source_cursor_from_circled_list_display_cursor(source, source.len() + 1),
+            source.len()
+        );
     }
 
     #[test]
@@ -2221,10 +2283,10 @@ mod tests {
         );
     }
 
-    /// Wide-enough terminal: render as a normal box-drawing table at the
+    /// Wide-enough terminal: render as a Codex-style borderless table at the
     /// table's natural column widths. No truncation, no ellipsis.
     #[test]
-    fn wide_table_renders_as_box_at_natural_widths() {
+    fn wide_table_renders_borderless_at_natural_widths() {
         let rows = vec![
             "| Feature | Status |".to_string(),
             "|---------|--------|".to_string(),
@@ -2233,14 +2295,50 @@ mod tests {
         ];
         // Plenty of room — natural width is well under 80.
         let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
-        assert!(out.contains('┌'));
-        assert!(out.contains('│'));
-        assert!(out.contains('└'));
+        assert!(!out.contains("---"), "raw delimiter leaked: {out}");
+        assert!(!out.contains('┌') && !out.contains('│') && !out.contains('└'));
         // Cell contents survive in full.
         assert!(out.contains("login"));
         assert!(out.contains("signup"));
         // No ellipsis introduced.
         assert!(!out.contains('…'));
+        assert_eq!(
+            out.lines().count(),
+            7,
+            "outer boundaries, header, segmented rules, and two data rows:\n{out}"
+        );
+        assert_eq!(
+            out.lines()
+                .filter(|line| {
+                    line.trim()
+                        .chars()
+                        .all(|ch| ch == stable_table_rule_char('━'))
+                })
+                .count(),
+            2,
+            "top and bottom boundaries missing:\n{out}"
+        );
+        let header_rule = stable_table_rule_char('━');
+        let body_rule = stable_table_rule_char('─');
+        assert!(
+            out.lines().any(|line| {
+                line.contains("  ")
+                    && line
+                        .chars()
+                        .all(|ch| ch == header_rule || ch.is_ascii_whitespace())
+            }),
+            "segmented header rule missing:\n{out}"
+        );
+        assert!(
+            has_table_rule(&out, body_rule),
+            "body rule missing:\n{out}"
+        );
+        let styled = flush_aligned_table_with_width(&rows, caps(), 80);
+        assert!(
+            styled.contains(theme::md_heading_open())
+                && styled.contains(theme::MD_HEADING_CLOSE),
+            "styled terminals should emphasize the table header:\n{styled}"
+        );
     }
 
     #[test]
@@ -2263,10 +2361,6 @@ mod tests {
         );
         let out =
             render_line("下一段", &mut st, plain_caps()).expect("trailing line flushes table");
-        assert!(
-            out.contains('┌') || out.contains('│'),
-            "must render as a table box: {out}"
-        );
         assert!(
             !out.contains("---|---"),
             "raw delimiter must not leak: {out}"
@@ -2293,7 +2387,6 @@ mod tests {
             a.contains("option A") && a.contains("option B"),
             "content preserved: {a}"
         );
-        assert!(!a.contains('┌'), "must not be boxed: {a}");
         // The `---|---` delimiter is NOT a list item, so real pipe-less tables still work.
         let mut st2 = MdState::new();
         assert!(render_line("H1 | H2", &mut st2, plain_caps()).is_none());
@@ -2303,8 +2396,8 @@ mod tests {
         );
         let out = render_line("done", &mut st2, plain_caps()).expect("flush");
         assert!(
-            out.contains('┌') || out.contains('│'),
-            "pipe-less table still renders: {out}"
+            out.contains("H1") && out.contains("H2") && !out.contains("---|---"),
+            "pipe-less header table still renders without leaking its delimiter: {out}"
         );
     }
 
@@ -2328,7 +2421,7 @@ mod tests {
 
     #[test]
     fn flush_pipeless_rows_render_as_table_and_no_sep_renders_inline() {
-        // Flush directly: pipe-less rows WITH a delimiter → box.
+        // Flush directly: pipe-less rows WITH a delimiter → table.
         let table = flush_aligned_table_with_width(
             &[
                 "A | B".to_string(),
@@ -2338,10 +2431,8 @@ mod tests {
             plain_caps(),
             80,
         );
-        assert!(
-            table.contains('┌') && table.contains('│'),
-            "pipe-less table renders as box: {table}"
-        );
+        assert!(!table.contains("---|---"), "raw delimiter must not leak: {table}");
+        assert!(!table.contains('│'), "table must be borderless: {table}");
         assert!(
             table.contains('A') && table.contains('d'),
             "cells preserved: {table}"
@@ -2406,17 +2497,17 @@ mod tests {
     fn over_long_delimiter_does_not_paint_a_ghost_column() {
         // Weak models sometimes emit a delimiter row with one group too many.
         // The extra column has no data — it must not be drawn (GFM: content rows
-        // define the shape). 3 real columns → exactly two interior `┬` junctions.
+        // define the shape).
         let rows = vec![
             "| 功能 | 说明 | 状态 |".to_string(),
             "| --- | --- | --- | --- |".to_string(),
             "| 补全 | 提示代码片段 | 已完成 |".to_string(),
         ];
         let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
-        let top = out.lines().next().unwrap();
+        let top = out.lines().find(|line| line.contains("功能")).unwrap();
         assert_eq!(
-            top.matches('┬').count(),
-            2,
+            top.split_whitespace().count(),
+            3,
             "3 columns expected, no ghost column:\n{out}"
         );
         assert!(out.contains("已完成"), "content preserved:\n{out}");
@@ -2433,8 +2524,12 @@ mod tests {
         ];
         let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
         assert_eq!(
-            out.lines().next().unwrap().matches('┬').count(),
-            2,
+            out.lines()
+                .find(|line| line.contains('a'))
+                .unwrap()
+                .split_whitespace()
+                .count(),
+            3,
             "trailing empty cell must be trimmed:\n{out}"
         );
     }
@@ -2480,9 +2575,9 @@ mod tests {
         // fit as a grid once the Description column is shrunk + wrapped.
         let out = flush_aligned_table_with_width(&rows, plain_caps(), 40);
 
-        // Grid survives — box corners present, NOT the flat fallback.
+        // Grid survives — aligned rows remain and there are no flat labels.
         assert!(
-            out.contains('┌'),
+            !out.contains('：'),
             "grid must be kept, not flattened:\n{out}"
         );
         // No content lost to the wrap.
@@ -2502,10 +2597,9 @@ mod tests {
                 crate::width::display_width(line)
             );
         }
-        // Wrapping actually happened: more physical lines than a single-row box
-        // (top + ≥2 wrapped body lines + bottom).
+        // Wrapping actually happened: header plus at least two physical body lines.
         assert!(
-            out.lines().count() >= 4,
+            out.lines().count() >= 3,
             "expected the description cell to wrap across lines:\n{out}"
         );
     }
@@ -2529,6 +2623,7 @@ mod tests {
             !out.contains('│'),
             "a cell squeezed into a tall stack must drop to flat:\n{out}"
         );
+        assert!(out.contains('：'), "must use key/value records:\n{out}");
         assert!(out.contains("tall stack"), "content preserved:\n{out}");
     }
 
@@ -2550,6 +2645,19 @@ mod tests {
             out.contains("Handles"),
             "content preserved in flat mode:\n{out}"
         );
+    }
+
+    #[test]
+    fn one_column_viewport_does_not_become_unbounded() {
+        let rows = vec![
+            "| Feature | Status |".to_string(),
+            "|---|---|".to_string(),
+            "| Authentication | Complete |".to_string(),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 1);
+
+        assert!(out.contains('：'), "must use the flat fallback:\n{out}");
+        assert!(out.contains("Authentication") && out.contains("Complete"));
     }
 
     #[test]
@@ -2591,10 +2699,13 @@ mod tests {
         ];
         // Natural width ~ 1 + (5+3) + (10+3) + (1+3) = 26.
         let wide = flush_aligned_table_with_width(&rows, plain_caps(), 80);
-        assert!(wide.contains('│'), "80 cols should render as box");
+        assert!(
+            !wide.contains('：'),
+            "80 cols should render as a grid"
+        );
 
         let narrow = flush_aligned_table_with_width(&rows, plain_caps(), 20);
-        assert!(!narrow.contains('│'), "20 cols should fall back to flat");
+        assert!(narrow.contains('：'), "20 cols should fall back to flat");
     }
 
     /// Pre-drawn Unicode box-drawing tables (the `┌─┬─┐ │ ├─┼─┤ └─┴─┘`
@@ -2639,11 +2750,10 @@ mod tests {
         assert!(out.contains("初始 4 轮"));
     }
 
-    /// Wide terminal: a box-drawing table re-renders as a clean box at
-    /// natural widths (the input is converted to pipe form, then
-    /// `flush_aligned_table_with_width` re-emits its own box drawing).
+    /// Wide terminal: pre-drawn input is normalized into the same safe
+    /// borderless table used for ordinary markdown.
     #[test]
-    fn box_drawing_table_re_renders_as_box_when_fits() {
+    fn box_drawing_table_re_renders_borderless_when_fits() {
         let mut st = MdState::new();
         let lines = [
             "┌─────┬─────┐",
@@ -2660,11 +2770,8 @@ mod tests {
                 out.push('\n');
             }
         }
-        assert!(
-            out.contains('┌'),
-            "wide terminal should keep box rendering:\n{out}"
-        );
-        assert!(out.contains('└'));
+        assert!(!out.contains('：'), "wide terminal should keep a grid:\n{out}");
+        assert!(!out.contains('┌') && !out.contains('└') && !out.contains('│'));
         assert!(out.contains("a") && out.contains("2"));
     }
 

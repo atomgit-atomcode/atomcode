@@ -17,10 +17,11 @@
   --app-tool-background:#1f1e1d; --app-header-background:#262624; --app-primary-border-color:#393633; --app-accent-color:#d97757;
   /* Table cell border — brighter than the primary border so GFM tables read on the dark canvas. */
   --app-table-border:#57534d;
-  /* Shared max-width for the centered message + input columns (kept equal so they align).
-     Responsive: uses the full padded column below 1100px (the container already supplies
-     side padding, so no extra %-margin to compound), caps at 1100px on ultrawide. */
-  --app-content-max-width:min(1100px, 100%);
+  /* DeepSeek-Harness-style reading measure: transcript stays compact while the
+     composer is 32px wider (16px of breathing room on each side). Both remain
+     responsive inside their already-padded containers. */
+  --app-content-max-width:min(748px, 100%);
+  --app-composer-max-width:min(780px, 100%);
   --app-list-hover-background:#302f2c; --app-list-active-background:#3b3935; --app-list-active-foreground:#ffffff;
   --app-menu-background:#30302e; --app-menu-border:#454340; --app-menu-foreground:#e8e6df; --app-menu-selection-background:#3a2f28;
   --app-command-menu-hover-background:color-mix(in srgb,var(--app-brand) 10%,var(--app-menu-background)); --app-command-menu-active-background:color-mix(in srgb,var(--app-brand) 22%,var(--app-menu-background)); --app-command-menu-active-accent:var(--app-brand);

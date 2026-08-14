@@ -3768,7 +3768,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     ///     each with an optional faint description line, and a final inline
     ///     custom-answer row (faint placeholder when empty, typed text + cursor
     ///     indicator when non-empty / active). The cursor row is marked `❯`;
-    ///     multiple adds `[x]`/`[ ]` checkboxes; the cursor label is emphasized
+    ///     multiple adds `[✓]`/`[ ]` checkboxes; the cursor label is emphasized
     ///     in the orange highlight colour.
     ///   - Text: a single `> {buffer}` input row.
     /// The caller measures returned rows directly because wrapping makes height
@@ -3831,9 +3831,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     } else {
                         "  "
                     };
-                    // Multiple mode prepends a checkbox.
+                    // Multiple mode prepends a checkbox. The checked glyph is a
+                    // light check ✓ (matching Claude Code's selection style), with
+                    // the ASCII `[x]` fallback on non-unicode terminals.
                     let checkbox = if multiple {
-                        if checked { "[x] " } else { "[ ] " }
+                        if checked {
+                            if unicode { "[\u{2713}] " } else { "[x] " }
+                        } else {
+                            "[ ] "
+                        }
                     } else {
                         ""
                     };
@@ -3919,7 +3925,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         "  "
                     };
                     let checkbox = if multiple {
-                        if other_has_text { "[x] " } else { "[ ] " }
+                        if other_has_text {
+                            if unicode { "[\u{2713}] " } else { "[x] " }
+                        } else {
+                            "[ ] "
+                        }
                     } else {
                         ""
                     };
@@ -4358,8 +4368,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // (wide CJK) glyph, colliding that soft-wrap with our own explicit wrap
         // and duplicating/garbling the row. Keeping the last column empty means
         // no glyph ever reaches the edge, so JediTerm never auto-wraps.
-        let prefix_and_reserve = if self.caps.jediterm { 3 } else { 2 };
-        let text_budget = input_rule_width.saturating_sub(prefix_and_reserve);
+        let text_budget = crate::width::composer_text_width(input_rule_width, self.caps.jediterm);
 
         // Wrap input + locate cursor in wrapped layout.
         let ghost_active = self.input_buf.is_empty()
@@ -5552,9 +5561,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Mirror paint_footer: input box is full-width (only "> " prefix), with
         // the same JediTerm last-column reserve so the wrapped ROW COUNT here
         // matches the actual render (else body_bottom is off by a row).
-        let prefix_and_reserve = if self.caps.jediterm { 3 } else { 2 };
         let screen_width = self.screen.width() as usize;
-        let text_budget = screen_width.saturating_sub(prefix_and_reserve);
+        let text_budget = crate::width::composer_text_width(screen_width, self.caps.jediterm);
         let rule_width = screen_width.saturating_sub(PAD_COL * 2);
         let safe = if self.input_buf.is_empty() {
             self.status
@@ -18748,7 +18756,7 @@ mod tests {
             drain_into_vterm(&buf, &mut vterm);
             let dump = vterm.dump();
             assert!(
-                vterm.any_row(|r| r.contains("[x] 1. Streaming")),
+                vterm.any_row(|r| r.contains("[\u{2713}] 1. Streaming")),
                 "Streaming checked\n{dump}"
             );
             assert!(
@@ -18760,7 +18768,7 @@ mod tests {
                 "Tool use unchecked\n{dump}"
             );
             assert!(
-                vterm.any_row(|r| r.contains("[x] 3. Zig")),
+                vterm.any_row(|r| r.contains("[\u{2713}] 3. Zig")),
                 "custom-answer row: checkbox + number + typed text (no 'Other' word)\n{dump}"
             );
             assert!(
@@ -20208,6 +20216,81 @@ mod tests {
             lines[3].contains("今"),
             "Expected line 3 to contain assistant text, got {:?}",
             lines[3]
+        );
+    }
+
+    /// Regression: a web-search summary containing CJK prose plus long English
+    /// identifiers used to draw a full Unicode box right up to the Windows
+    /// PowerShell/ConPTY edge. Hosts that painted ambiguous box glyphs wide then
+    /// wrapped/overwrote the row, making the start of the answer look truncated.
+    #[test]
+    fn retained_web_search_summary_table_stays_inside_viewport_without_box_borders() {
+        let width = 72u16;
+        let (mut r, _buf) = new_capturing(width, 24);
+        r.render(UiLine::ToolCall {
+            name: "web_search".into(),
+            detail: "Agora CLI multi-agent debate terminal moderator consensus github".into(),
+        });
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: "sources: github.com, npmjs.com +2".into(),
+            diff_stats: None,
+        });
+        r.render(UiLine::AssistantText(
+            "汇总结果如下：\n\
+             | 项目 | 定位 | 状态 |\n\
+             | --- | --- | --- |\n\
+             | Agora CLI multi-agent debate | terminal moderator and consensus workflow | 已验证 |\n\
+             | another-long-project-identifier | coordinates several independent agents | 可用 |\n\
+             以上信息已完整保留。\n"
+                .into(),
+        ));
+
+        let lines: Vec<String> = r
+            .body_lines
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect())
+            .collect();
+        assert!(
+            r.body_lines
+                .iter()
+                .all(|row| row.len() <= usize::from(width)),
+            "retained row exceeded viewport {width}: {lines:#?}"
+        );
+        let visible = lines.join("\n");
+        let compact_visible = visible.replace(' ', "");
+        let rules: Vec<&str> = lines
+            .iter()
+            .map(|line| line.trim())
+            .filter(|line| {
+                line.len() >= 3
+                    && line
+                        .chars()
+                        .all(|ch| matches!(ch, '━' | '─' | '=' | '-' | ' '))
+            })
+            .collect();
+        assert!(
+            rules.iter().any(|line| line.contains("  ")),
+            "segmented table rule missing: {lines:#?}"
+        );
+        assert!(
+            rules.iter().any(|line| !line.contains(' ')),
+            "top or bottom table boundary missing: {lines:#?}"
+        );
+        assert!(
+            rules
+                .iter()
+                .all(|line| crate::width::display_width(line) < usize::from(width)),
+            "table rules consumed the right-side guard: {rules:?}"
+        );
+        assert!(compact_visible.contains("汇总结果如下"));
+        assert!(visible.contains("Agora CLI"));
+        assert!(visible.contains("another-long-project-iden"));
+        assert!(visible.contains("tifier"));
+        assert!(compact_visible.contains("以上信息已完整保留"));
+        assert!(
+            !visible.contains('│') && !visible.contains('┼'),
+            "ambiguous-width vertical box glyph leaked: {visible}"
         );
     }
 

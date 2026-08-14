@@ -28,7 +28,7 @@ export type SSEEvent =
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown }
   | UserInputRequestEvent
-  | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stop_reason?: string; message?: string }
+  | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stats?: TurnStats; stop_reason?: string; message?: string }
   | { type: 'stopped' }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
@@ -697,6 +697,15 @@ export interface ApprovalModeResponse {
   mode: ApprovalMode;
 }
 
+export interface TurnStats {
+  duration_ms: number;
+  rounds: number;
+  tool_calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cached_tokens: number;
+}
+
 export type PolicyRecoveryAction =
   | 'complete_externally'
   | 'skip_step'
@@ -722,7 +731,7 @@ export type LiveWireEvent =
   | { type: 'tool_progress'; id: string; progress: string }
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
-  | { type: 'state'; running: boolean; stop_reason?: string; message?: string }
+  | { type: 'state'; running: boolean; stop_reason?: string; message?: string; stats?: TurnStats }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
   | { type: 'persistence_warning'; message: string }

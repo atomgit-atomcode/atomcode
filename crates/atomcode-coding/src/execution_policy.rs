@@ -17,6 +17,7 @@ const NO_BUILD: u8 = 1 << 0;
 const NO_TEST: u8 = 1 << 1;
 const NO_SCRIPT: u8 = 1 << 2;
 const NO_SHELL: u8 = 1 << 3;
+const NO_VERIFY: u8 = 1 << 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ExecutionPolicy(u8);
@@ -24,6 +25,14 @@ pub(crate) struct ExecutionPolicy(u8);
 impl ExecutionPolicy {
     pub(crate) fn is_default(self) -> bool {
         self.0 == 0
+    }
+
+    pub(crate) fn skips_verification(self) -> bool {
+        self.contains(NO_VERIFY)
+            || self.contains(NO_BUILD)
+            || self.contains(NO_TEST)
+            || self.contains(NO_SCRIPT)
+            || self.contains(NO_SHELL)
     }
 
     fn contains(self, flag: u8) -> bool {
@@ -219,18 +228,52 @@ fn execution_policy_from_text(text: &str) -> ExecutionPolicy {
     ) {
         flags |= NO_SCRIPT;
     }
-    if contains_any(
-        &lower,
-        &[
-            "只改代码，不做验证",
-            "只修改代码，不做验证",
-            "不要做任何验证",
-            "skip verification",
-        ],
-    ) {
-        flags |= NO_BUILD | NO_TEST | NO_SCRIPT;
+    if contains_no_verification_directive(&lower) {
+        flags |= NO_VERIFY;
     }
     ExecutionPolicy(flags)
+}
+
+fn contains_no_verification_directive(text: &str) -> bool {
+    if contains_any(
+        text,
+        &[
+            "不要做验证",
+            "不要做任何验证",
+            "跳过验证",
+            "省略验证",
+            "无需做验证",
+            "不用做验证",
+            "不需要做验证",
+            "只改代码，不验证",
+            "只改代码 不验证",
+            "只改代码，不做验证",
+            "只改代码 不做验证",
+            "只修改代码，不验证",
+            "只修改代码 不验证",
+            "只修改代码，不做验证",
+            "只修改代码 不做验证",
+            "直接写代码，不验证",
+            "直接写代码 不验证",
+            "直接写代码，不做验证",
+            "直接写代码 不做验证",
+            "直接写完代码，不验证",
+            "直接写完代码 不验证",
+            "直接写完代码，不做验证",
+            "直接写完代码 不做验证",
+            "do not verify",
+            "don't verify",
+            "without verification",
+            "skip verification",
+            "no verification",
+        ],
+    ) {
+        return true;
+    }
+
+    // A standalone short directive is unambiguous, while a bare substring is not:
+    // `为什么不验证？` describes behavior and must not revoke runtime authority.
+    text.trim_matches(|ch: char| ch.is_whitespace() || ",，。.!！;；".contains(ch)) == "不验证"
 }
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {
@@ -449,6 +492,38 @@ mod tests {
                 execution_policy_from_text(text).contains(NO_SCRIPT),
                 "{text:?}"
             );
+        }
+    }
+
+    #[test]
+    fn recognizes_explicit_no_verification_directives() {
+        for text in [
+            "直接写完代码 不验证",
+            "只修改代码，不验证。",
+            "只改代码，不做验证",
+            "不用做验证，改完就结束",
+            "不验证",
+            "Make the edit without verification.",
+        ] {
+            let policy = execution_policy_from_text(text);
+            assert!(policy.skips_verification(), "{text:?}");
+            assert!(!policy.contains(NO_BUILD), "{text:?}");
+            assert!(!policy.contains(NO_TEST), "{text:?}");
+            assert!(!policy.contains(NO_SCRIPT), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn descriptions_of_missing_verification_do_not_change_authority() {
+        for text in [
+            "为什么它不验证？",
+            "模型改完代码不验证，这是一个问题",
+            "它没有验证修改后的代码",
+            "登录不用验证码",
+            "这个接口不需要验证用户身份",
+            "修复不要验证 token 的问题",
+        ] {
+            assert!(execution_policy_from_text(text).is_default(), "{text:?}");
         }
     }
 

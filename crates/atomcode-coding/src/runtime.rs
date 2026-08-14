@@ -390,9 +390,29 @@ pub struct RuntimeRequest {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RuntimeTurnStats {
     pub last_usage: Option<MessageMeta>,
+    /// Sum of provider usage across every model round in this user turn.
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub cached_tokens: usize,
     pub duration: std::time::Duration,
     pub turn_count: usize,
     pub tool_call_count: usize,
+}
+
+impl RuntimeTurnStats {
+    fn record_usage(&mut self, meta: &MessageMeta) {
+        self.turn_count = self.turn_count.saturating_add(1);
+        self.prompt_tokens = self
+            .prompt_tokens
+            .saturating_add(meta.tokens.prompt as usize);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(meta.tokens.completion as usize);
+        self.cached_tokens = self
+            .cached_tokens
+            .saturating_add(meta.tokens.cached as usize);
+        self.last_usage = Some(meta.clone());
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -5592,8 +5612,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                             AgentEvent::Usage(meta) => {
                                 observed_tokens = Some(meta.used_tokens as usize);
-                                turn_stats.turn_count = turn_stats.turn_count.saturating_add(1);
-                                turn_stats.last_usage = Some(meta.clone());
+                                turn_stats.record_usage(&meta);
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(
                                     AgentEvent::Usage(meta),
                                 ));
@@ -7582,6 +7601,34 @@ async fn resolve_goal_round_cap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_turn_stats_sum_usage_across_rounds() {
+        let mut stats = RuntimeTurnStats::default();
+        for tokens in [
+            atomcode_kernel::stream::TokenUsage {
+                prompt: 100,
+                completion: 10,
+                cached: 80,
+            },
+            atomcode_kernel::stream::TokenUsage {
+                prompt: 150,
+                completion: 20,
+                cached: 120,
+            },
+        ] {
+            stats.record_usage(&MessageMeta {
+                tokens,
+                ..Default::default()
+            });
+        }
+
+        assert_eq!(stats.turn_count, 2);
+        assert_eq!(stats.prompt_tokens, 250);
+        assert_eq!(stats.completion_tokens, 30);
+        assert_eq!(stats.cached_tokens, 200);
+        assert_eq!(stats.last_usage.unwrap().tokens.prompt, 150);
+    }
 
     fn team_event(
         generation: u64,
