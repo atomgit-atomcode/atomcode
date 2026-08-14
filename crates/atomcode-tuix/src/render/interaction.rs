@@ -12,6 +12,7 @@ pub struct CopyRun {
     pub rect: CellRect,
     pub text: Arc<str>,
     pub soft_wrap: bool,
+    pub next_run_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +42,13 @@ impl CellRect {
             && row < self.row.saturating_add(self.height)
             && col >= self.col
             && col < self.col.saturating_add(self.width)
+    }
+
+    pub(crate) fn intersects(self, other: Self) -> bool {
+        self.row < other.row.saturating_add(other.height)
+            && other.row < self.row.saturating_add(self.height)
+            && self.col < other.col.saturating_add(other.width)
+            && other.col < self.col.saturating_add(self.width)
     }
 }
 
@@ -123,10 +131,33 @@ impl InteractionPublisher {
         regions: Vec<HitRegion>,
         copy_runs: Vec<CopyRun>,
     ) -> bool {
+        self.publish_frame_with_selection_if_current(
+            expected_epoch,
+            surface_session,
+            regions,
+            copy_runs,
+        )
+    }
+
+    pub fn publish_frame_with_selection_if_current(
+        &self,
+        expected_epoch: u64,
+        surface_session: u64,
+        regions: Vec<HitRegion>,
+        copy_runs: Vec<CopyRun>,
+    ) -> bool {
         let mut state = write_recover(&self.inner);
-        if state.epoch != expected_epoch {
+        if state.epoch != expected_epoch
+            || state
+                .worker_authority
+                .is_some_and(|authority| authority != (expected_epoch, surface_session))
+        {
             return false;
         }
+        state.transcript_selection = state
+            .transcript_selection
+            .as_ref()
+            .and_then(|selection| reconcile_selection(selection, &copy_runs));
         let generation = state.frame.generation.saturating_add(1);
         state.frame = Arc::new(InteractionFrame {
             generation,
@@ -195,40 +226,22 @@ impl InteractionPublisher {
         read_recover(&self.inner).transcript_selection.clone()
     }
 
-    pub fn reconcile_transcript_selection(&self, runs: &[CopyRun]) -> Option<TranscriptSelection> {
+    #[cfg(test)]
+    fn reconcile_transcript_selection(&self, runs: &[CopyRun]) -> Option<TranscriptSelection> {
         let mut state = write_recover(&self.inner);
-        let mut selection = state.transcript_selection.take()?;
-        selection.run_ids = selection
-            .run_ids
-            .iter()
-            .copied()
-            .filter(|id| runs.iter().any(|run| run.id == *id))
-            .collect::<Vec<_>>()
-            .into();
-        let clamp = |endpoint: SemanticEndpoint| {
-            let run = runs
-                .iter()
-                .filter(|run| selection.run_ids.contains(&run.id))
-                .min_by_key(|run| run.id.abs_diff(endpoint.run_id))?;
-            let mut byte = endpoint.byte.min(run.text.len());
-            while byte > 0 && !run.text.is_char_boundary(byte) {
-                byte -= 1;
-            }
-            Some(SemanticEndpoint {
-                run_id: run.id,
-                byte,
-            })
-        };
-        let Some(anchor) = clamp(selection.anchor) else {
-            return None;
-        };
-        let Some(head) = clamp(selection.head) else {
-            return None;
-        };
-        selection.anchor = anchor;
-        selection.head = head;
-        state.transcript_selection = Some(selection.clone());
-        Some(selection)
+        let selection = state
+            .transcript_selection
+            .as_ref()
+            .and_then(|selection| reconcile_selection(selection, runs));
+        state.transcript_selection = selection.clone();
+        selection
+    }
+
+    pub fn projected_transcript_selection(&self, runs: &[CopyRun]) -> Option<TranscriptSelection> {
+        read_recover(&self.inner)
+            .transcript_selection
+            .as_ref()
+            .and_then(|selection| reconcile_selection(selection, runs))
     }
 
     #[cfg(test)]
@@ -239,6 +252,37 @@ impl InteractionPublisher {
             .unwrap_or_else(|poison| poison.into_inner());
         panic!("poison interaction publisher for recovery test");
     }
+}
+
+fn reconcile_selection(
+    selection: &TranscriptSelection,
+    runs: &[CopyRun],
+) -> Option<TranscriptSelection> {
+    let mut selection = selection.clone();
+    selection.run_ids = selection
+        .run_ids
+        .iter()
+        .copied()
+        .filter(|id| runs.iter().any(|run| run.id == *id))
+        .collect::<Vec<_>>()
+        .into();
+    let clamp = |endpoint: SemanticEndpoint| {
+        let run = runs
+            .iter()
+            .filter(|run| selection.run_ids.contains(&run.id))
+            .min_by_key(|run| run.id.abs_diff(endpoint.run_id))?;
+        let mut byte = endpoint.byte.min(run.text.len());
+        while byte > 0 && !run.text.is_char_boundary(byte) {
+            byte -= 1;
+        }
+        Some(SemanticEndpoint {
+            run_id: run.id,
+            byte,
+        })
+    };
+    selection.anchor = clamp(selection.anchor)?;
+    selection.head = clamp(selection.head)?;
+    Some(selection)
 }
 
 fn read_recover<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
@@ -314,6 +358,7 @@ mod tests {
             },
             text: Arc::from("你a"),
             soft_wrap: false,
+            next_run_id: None,
         }];
         let selection = publisher
             .reconcile_transcript_selection(&runs)
@@ -324,6 +369,64 @@ mod tests {
 
         assert!(publisher.reconcile_transcript_selection(&[]).is_none());
         assert!(publisher.transcript_selection().is_none());
+    }
+
+    #[test]
+    fn stale_blocked_worker_cannot_reconcile_selection_before_epoch_publish_rejects_it() {
+        fn run(id: u64) -> CopyRun {
+            CopyRun {
+                id,
+                rect: CellRect {
+                    row: id as u16,
+                    col: 0,
+                    height: 1,
+                    width: 1,
+                },
+                text: Arc::from("x"),
+                soft_wrap: false,
+                next_run_id: None,
+            }
+        }
+
+        let publisher = InteractionPublisher::default();
+        publisher.set_transcript_selection(Some(TranscriptSelection {
+            anchor: SemanticEndpoint { run_id: 1, byte: 0 },
+            head: SemanticEndpoint { run_id: 2, byte: 1 },
+            run_ids: vec![1, 2].into(),
+        }));
+        let stale_epoch = publisher.current_epoch();
+        assert!(publisher.set_worker_authority(stale_epoch, 9));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let stale_publisher = publisher.clone();
+        let stale_worker = std::thread::spawn(move || {
+            release_rx.recv().expect("release stale worker");
+            stale_publisher.publish_frame_with_selection_if_current(
+                stale_epoch,
+                9,
+                Vec::new(),
+                vec![run(2)],
+            )
+        });
+
+        let current_epoch = publisher.invalidate();
+        assert!(publisher.set_worker_authority(current_epoch, 9));
+        assert!(publisher.publish_frame_with_selection_if_current(
+            current_epoch,
+            9,
+            Vec::new(),
+            vec![run(1), run(2)],
+        ));
+        release_tx.send(()).expect("unblock stale worker");
+        assert!(!stale_worker.join().expect("stale worker joined"));
+        assert_eq!(
+            publisher
+                .transcript_selection()
+                .expect("current selection survives")
+                .run_ids
+                .as_ref(),
+            &[1, 2],
+            "stale reconciliation must not mutate presentation before rejected publish"
+        );
     }
 
     #[test]

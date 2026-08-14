@@ -57,6 +57,7 @@ struct BodyCopyRun {
     col: usize,
     text: Arc<str>,
     soft_wrap: bool,
+    next_run_id: Option<u64>,
 }
 
 fn composer_cell_bytes(
@@ -5818,6 +5819,26 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Overlay modal drawn on top of body+footer so the diff sees
         // the combined frame. When modal_overlay is None this is a no-op.
         if let Some(ref overlay) = self.modal_overlay {
+            let overlay_rect = crate::render::interaction::CellRect {
+                row: overlay.y,
+                col: overlay.x,
+                height: overlay.cells.len().min(u16::MAX as usize) as u16,
+                width: overlay
+                    .cells
+                    .iter()
+                    .map(Vec::len)
+                    .max()
+                    .unwrap_or(0)
+                    .min(u16::MAX as usize) as u16,
+            };
+            self.pending_interactions.retain(|region| {
+                !matches!(
+                    region.target,
+                    crate::render::interaction::HitTarget::TranscriptByte { .. }
+                ) || !region.rect.intersects(overlay_rect)
+            });
+            self.pending_copy_runs
+                .retain(|run| !run.rect.intersects(overlay_rect));
             for (dy, row) in overlay.cells.iter().enumerate() {
                 self.screen
                     .draw_row(overlay.y as usize + dy, overlay.x as usize, row);
@@ -6121,11 +6142,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     rect,
                     text: run.text.clone(),
                     soft_wrap: run.soft_wrap,
+                    next_run_id: run.next_run_id,
                 });
         }
         let transcript_selection = self
             .interaction_publisher
-            .reconcile_transcript_selection(&self.pending_copy_runs);
+            .projected_transcript_selection(&self.pending_copy_runs);
         for run in &self.body_copy_runs {
             let Some(row) = visible_indices
                 .iter()
@@ -6671,12 +6693,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         };
         let id = self.next_copy_run_id;
         self.next_copy_run_id = self.next_copy_run_id.saturating_add(1);
+        if let Some(previous) = self.body_copy_runs.last_mut().filter(|previous| {
+            previous.soft_wrap && previous.body_index.saturating_add(1) == body_index
+        }) {
+            previous.next_run_id = Some(id);
+        }
         self.body_copy_runs.push(BodyCopyRun {
             id,
             body_index,
             col,
             text: Arc::from(text),
             soft_wrap,
+            next_run_id: None,
         });
     }
 
@@ -10563,6 +10591,124 @@ mod tests {
                 || run.0.contains("STATUS_SENTINEL")
                 || run.0.contains("BORDER_SENTINEL")
         }));
+    }
+
+    #[test]
+    fn interaction_modal_overlay_blocks_underlying_transcript_hits_and_copy_runs() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            20,
+            8,
+            interactions.clone(),
+        );
+        renderer.render(UiLine::AssistantText("first\nsecond\nUNDERLAY\nfourth\n".into()));
+        renderer.render(UiLine::AssistantLineBreak);
+        renderer.render(UiLine::DiffPanel {
+            title: DiffPanelRow::new(vec![DiffPanelSpan::new(
+                "Diff",
+                DiffPanelTone::Default,
+            )]),
+            rows: vec![DiffPanelRow::new(vec![DiffPanelSpan::new(
+                "overlay",
+                DiffPanelTone::Highlight,
+            )])],
+            footer: "Esc close".into(),
+            win_width: 20,
+            win_height: 6,
+        });
+        renderer.flush_deferred();
+
+        let overlay = renderer.modal_overlay.as_ref().expect("actual modal rect");
+        let top = overlay.y;
+        let bottom = overlay.y.saturating_add(overlay.cells.len() as u16);
+        let frame = interactions.snapshot_actionable().expect("modal frame");
+        assert!(
+            frame.copy_runs.iter().all(|run| {
+                run.rect.row.saturating_add(run.rect.height) <= top || run.rect.row >= bottom
+            }),
+            "semantic copy projection must not include rows hidden by the modal"
+        );
+        for row in top..bottom {
+            assert!(
+                !matches!(
+                    frame.hit(row, 1),
+                    Some(crate::render::interaction::HitTarget::TranscriptByte { .. })
+                ),
+                "modal row {row} must not click through to the transcript"
+            );
+        }
+    }
+
+    #[test]
+    fn interaction_compacted_projection_preserves_hidden_continuation_gap() {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            40,
+            20,
+            interactions.clone(),
+        );
+        let status = status_basic();
+        renderer.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        let capacity = 20usize.saturating_sub(renderer.current_footer_rows());
+        for index in 0..capacity {
+            let text = match index {
+                0 => "A",
+                1 => "B",
+                _ if index + 1 == capacity => "C",
+                _ => "middle",
+            };
+            let mut row = Vec::new();
+            push_str_cells(&mut row, text, &CellStyle::default());
+            renderer.push_copyable_body_row(row, text.into(), 0, index == 0);
+        }
+        let mut modal_status = status;
+        modal_status.user_input = Some(crate::render::UserInputPanelView {
+            header: "Choose".into(),
+            question: "Continue?".into(),
+            mode: UserInputMode::Text,
+            options: Vec::new(),
+            cursor: 0,
+            checked: Vec::new(),
+            text: String::new(),
+            text_cursor_byte: 0,
+            custom_text: String::new(),
+            custom_text_cursor_byte: 0,
+            custom: false,
+            scroll_offset: 0,
+            batch: None,
+        });
+        renderer.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: modal_status,
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+
+        assert!(renderer.user_input_tail_compacted);
+        let frame = interactions.snapshot_actionable().expect("compacted frame");
+        let first = frame.copy_runs.first().expect("pinned prefix");
+        let second = frame.copy_runs.get(1).expect("visible tail after gap");
+        assert_eq!(&*first.text, "A");
+        assert_ne!(&*second.text, "B", "continuation must be hidden by fixture");
+        assert_ne!(
+            first.next_run_id,
+            Some(second.id),
+            "published projection must expose that A and the visible tail are not adjacent"
+        );
     }
 
     #[test]
