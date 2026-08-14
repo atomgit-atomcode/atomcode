@@ -143,3 +143,38 @@ docker restart atomcode-daemon   # 重启
 docker rm -f atomcode-daemon     # 删除
 docker logs -f atomcode-daemon   # 查看日志
 ```
+
+---
+
+## docker-compose 一键部署（NAS 常驻推荐）
+
+项目提供 `docker-compose.yml`，适合在 NAS / 服务器上常驻运行 daemon：崩溃自动重启（`restart: unless-stopped`）、健康检查、数据目录与工作目录持久化，配合手机 GitCode App（`/app`）或 daemon HTTP API 随时远程调试。
+
+### 快速开始
+
+```bash
+# 1. 准备配置与数据目录（daemon 以 root 运行，配置目录为 /root/.atomcode）
+mkdir -p docker/data docker/workspace
+cp docker/config-example.toml docker/data/config.toml   # 填入 provider / api_key
+
+# 2. 首次使用需先编译 Linux 二进制（生成 dist/ 目录）再构建镜像
+./scripts/release.sh
+
+# 3. 构建并后台启动
+docker compose -f docker/docker-compose.yml up -d
+
+# 4. 验证
+curl http://localhost:13456/health
+```
+
+### 常用 compose 命令
+
+```bash
+docker compose -f docker/docker-compose.yml logs -f   # 查看日志
+docker compose -f docker/docker-compose.yml restart   # 重启
+docker compose -f docker/docker-compose.yml down      # 停止并移除容器
+```
+
+### 使用预构建镜像
+
+`docker-compose.yml` 默认使用 `build` 本地构建。如果你已经把镜像推送到镜像仓库（例如华为云 SWR），可以把 `build` 段替换为 `image` 段（见文件内注释），NAS 上即可直接拉取，无需本地编译。
