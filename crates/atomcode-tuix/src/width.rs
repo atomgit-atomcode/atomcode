@@ -393,6 +393,35 @@ pub fn display_width(s: &str) -> usize {
     s.graphemes(true).map(cluster_width).sum()
 }
 
+/// Terminal column width of a string, using the **renderer's** width model
+/// that treats `\t` as [`SOFT_TAB_WIDTH`] display columns. Use this for
+/// line-width comparisons in visual navigation ([`cursor_visual_up`] /
+/// [`cursor_visual_down`]) so tabs don't cause misalignment between the
+/// cursor column and the clamp target.
+///
+/// See [`cluster_display_width`] for the per-cluster rule.
+pub(crate) fn display_width_with_tabs(s: &str) -> usize {
+    s.graphemes(true).map(cluster_display_width).sum()
+}
+
+/// Display width of a single grapheme cluster, using the **same** width
+/// model the renderer's cell painter uses. A `\t` is drawn by
+/// `push_str_cells` as [`SOFT_TAB_WIDTH`] spaces, so it must be measured
+/// as that many columns — otherwise the input caret renders
+/// SOFT_TAB_WIDTH cols left of the real insertion point on every
+/// tab-indented line.
+///
+/// This is the single source of truth that both [`wrap_with_spans`] and
+/// [`byte_offset_at_col`] should use to stay consistent with the
+/// renderer's paint model.
+pub(crate) fn cluster_display_width(g: &str) -> usize {
+    if g == "\t" {
+        crate::render::cell::SOFT_TAB_WIDTH
+    } else {
+        cluster_width(g)
+    }
+}
+
 /// Split a line (possibly containing SGR escape sequences) into chunks
 /// whose visible display width is at most `max_cols`. SGR bytes pass
 /// through without consuming display columns. Handles CJK/emoji width.
@@ -549,6 +578,82 @@ pub fn wrap_with_cursor(
         }
     }
     (lines, cursor_row, cursor_col)
+}
+
+/// Lightweight alternative to [`wrap_with_cursor`] that returns byte-offset
+/// spans for each visual (wrapped) line instead of allocating new strings.
+///
+/// `spans[i] = (byte_start, byte_end)` where `byte_end` is **exclusive**.
+/// The 2nd and 3rd return values `(cursor_visual_row, cursor_visual_col)` are
+/// the same semantics as [`wrap_with_cursor`]'s cursor position.
+///
+/// Designed for consumer code that only needs to map between byte positions
+/// and visual rows — cursor-line-up/down by visual line, mouse-hit-test in
+/// the input box — without paying for string copies or allocation of the
+/// line contents.
+pub fn wrap_with_spans(
+    text: &str,
+    max_cols: usize,
+    cursor_byte: usize,
+) -> (Vec<(usize, usize)>, usize, usize) {
+    if max_cols == 0 {
+        return (vec![(0, 0)], 0, 0);
+    }
+
+    let mut spans: Vec<(usize, usize)> = vec![(0, 0)];
+    let mut col = 0usize;
+    let mut cursor_row = 0usize;
+    let mut cursor_col = 0usize;
+    let mut cursor_set = false;
+
+    for (byte_pos, g) in text.grapheme_indices(true) {
+        let is_newline = g == "\n";
+        let g_end = byte_pos + g.len();
+        // Compute width once and reuse — same value for both the wrap check
+        // and the column update below.
+        let w = cluster_display_width(g);
+
+        // Wrap check BEFORE recording the span end, so a cursor at the
+        // wrap boundary lands on the new row at col 0.
+        if !is_newline {
+            if col + w > max_cols && spans.last().unwrap().0 < byte_pos {
+                spans.last_mut().unwrap().1 = byte_pos;
+                spans.push((byte_pos, g_end));
+                col = 0;
+            } else {
+                spans.last_mut().unwrap().1 = g_end;
+            }
+        }
+
+        if !cursor_set && byte_pos == cursor_byte {
+            cursor_row = spans.len() - 1;
+            cursor_col = col;
+            cursor_set = true;
+        }
+
+        if is_newline {
+            spans.last_mut().unwrap().1 = byte_pos;
+            spans.push((g_end, g_end));
+            col = 0;
+        } else {
+            col += w;
+        }
+    }
+
+    // Cursor at end-of-buffer falls through — mirror wrap_with_cursor.
+    if !cursor_set {
+        if col >= max_cols {
+            let end = text.len();
+            spans.push((end, end));
+            cursor_row = spans.len() - 1;
+            cursor_col = 0;
+        } else {
+            cursor_row = spans.len() - 1;
+            cursor_col = col;
+        }
+    }
+
+    (spans, cursor_row, cursor_col)
 }
 
 /// Slice `s` starting at display column `start_col`, taking up to `max_cols`
@@ -987,6 +1092,66 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(row, 1, "cursor on the 2nd line");
         // end-of-line column = 2 tabs * tab_w + width("cd")
+        assert_eq!(col, tab_w * 2 + 2);
+    }
+
+    // --- wrap_with_spans tests (parallel to wrap_with_cursor) ---
+
+    #[test]
+    fn wrap_with_spans_short_text_single_row() {
+        let (spans, r, c) = wrap_with_spans("hi", 10, 2);
+        assert_eq!(spans, vec![(0, 2)]);
+        assert_eq!((r, c), (0, 2));
+    }
+
+    #[test]
+    fn wrap_with_spans_overflow_moves_to_next_row() {
+        let (spans, r, c) = wrap_with_spans("abcdef", 3, 3);
+        assert_eq!(spans, vec![(0, 3), (3, 6)]);
+        assert_eq!((r, c), (1, 0));
+    }
+
+    #[test]
+    fn wrap_with_spans_honours_explicit_newline() {
+        let (spans, r, c) = wrap_with_spans("ab\ncd", 10, 4);
+        assert_eq!(spans, vec![(0, 2), (3, 5)]);
+        assert_eq!((r, c), (1, 1));
+    }
+
+    #[test]
+    fn wrap_with_spans_end_of_buffer() {
+        let (spans, r, c) = wrap_with_spans("hello", 10, 5);
+        assert_eq!(spans, vec![(0, 5)]);
+        assert_eq!((r, c), (0, 5));
+    }
+
+    #[test]
+    fn wrap_with_spans_end_of_buffer_full_line_wraps_to_next_row() {
+        let (spans, r, c) = wrap_with_spans("abc", 3, 3);
+        assert_eq!(spans, vec![(0, 3), (3, 3)]);
+        assert_eq!((r, c), (1, 0));
+    }
+
+    #[test]
+    fn wrap_with_spans_end_of_buffer_cjk() {
+        let (spans, r, c) = wrap_with_spans("ab你", 4, 5);
+        assert_eq!(spans, vec![(0, 5), (5, 5)]);
+        assert_eq!((r, c), (1, 0));
+    }
+
+    #[test]
+    fn wrap_with_spans_cjk_widths() {
+        let (spans, _, _) = wrap_with_spans("你好", 3, 0);
+        assert_eq!(spans, vec![(0, 3), (3, 6)]);
+    }
+
+    #[test]
+    fn wrap_with_spans_tab_counts_as_soft_tab_width() {
+        let tab_w = crate::render::cell::SOFT_TAB_WIDTH;
+        let text = "ab\n\t\tcd";
+        let (spans, row, col) = wrap_with_spans(text, 80, text.len());
+        assert_eq!(spans.len(), 2);
+        assert_eq!(row, 1);
         assert_eq!(col, tab_w * 2 + 2);
     }
 
