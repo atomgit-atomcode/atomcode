@@ -3012,7 +3012,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     }
                     let mut finish_reason = None;
                     let mut continuation = None;
-                    // Only GoalResult::Met keeps the goal registered after the turn ends.
+                    // GoalResult::Met keeps the goal registered after the turn ends.
                     // All other finish_reason paths (e.g. evaluator Error) must still clear it.
                     let mut keep_goal_on_eval = false;
                     match outcome.result {
@@ -3038,6 +3038,23 @@ fn spawn_runtime_owner_with_optional_agent(
                                     Some(goal_continuation_message(&verdict, &state.condition));
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
+                        }
+                        GoalResult::Inconclusive(reason) => {
+                            // The evaluator returned no usable verdict (e.g. an
+                            // empty stream). This is NOT a failure of the agent's
+                            // work and NOT a provider error: the evaluator simply
+                            // produced nothing to judge. End the goal as Stopped
+                            // (not Failed) and skip the red ControllerWarning —
+                            // repeatedly yelling about an empty verdict made the
+                            // agent spin in pointless retries (issue #17).
+                            if let Some(state) = goal.as_mut() {
+                                state.finish(
+                                    GoalTerminal::Stopped,
+                                    format!("goal evaluation inconclusive: {reason}"),
+                                );
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                            }
+                            finish_reason = Some(StopReason::Stopped);
                         }
                         GoalResult::Error(error) => {
                             if let Some(state) = goal.as_mut() {
@@ -8133,6 +8150,23 @@ mod tests {
         }
     }
 
+    /// A provider whose stream yields NO text — simulating an evaluator that
+    /// returns an empty response (issue #17). The goal must end as `Stopped`
+    /// (not `Failed`) and must NOT emit a `ControllerWarning` spam line.
+    struct GoalInconclusiveProviderFactory;
+
+    impl CodingProviderFactory for GoalInconclusiveProviderFactory {
+        fn build(
+            &self,
+            _config: &CodingAgentConfig,
+            _session_id: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+            Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(vec![vec![
+                atomcode_kernel::stream::StreamEvent::Done { truncated: false },
+            ]])))
+        }
+    }
+
     impl CodingProviderFactory for GoalMetProviderFactory {
         fn build(
             &self,
@@ -9286,6 +9320,99 @@ mod tests {
                 .await
                 .is_err(),
             "an evaluator failure must not dispatch a synthetic main-agent retry"
+        );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_evaluator_response_ends_goal_stopped_without_warning_spam() {
+        // Regression for issue #17: when the goal evaluator returns an EMPTY
+        // stream, the goal must end as `Stopped` (the agent's work is not failed)
+        // and the runtime must NOT emit the `goal evaluator failed` warning line
+        // that previously spammed the transcript and made the agent retry.
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(GoalInconclusiveProviderFactory)).await;
+
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await;
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("done", vec![])]),
+            })
+            .unwrap();
+
+        let mut saw_stopped_goal = false;
+        let mut saw_failed_goal = false;
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                        active: false,
+                        terminal: Some(GoalTerminal::Stopped),
+                        ..
+                    })) => saw_stopped_goal = true,
+                    Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                        active: false,
+                        terminal: Some(GoalTerminal::Failed),
+                        ..
+                    })) => saw_failed_goal = true,
+                    Some(CodingRuntimeEvent::TurnFinished(completion)) => break completion,
+                    Some(CodingRuntimeEvent::ControllerWarning(_)) => {
+                        panic!("empty evaluator response must not emit a ControllerWarning")
+                    }
+                    Some(_) => {}
+                    None => panic!("runtime events closed before goal terminal"),
+                }
+            }
+        })
+        .await
+        .expect("empty evaluator response lost the held terminal");
+        assert!(
+            saw_stopped_goal,
+            "empty evaluator response must end the goal as Stopped, not Failed"
+        );
+        assert!(
+            !saw_failed_goal,
+            "empty evaluator response must not mark the goal Failed"
+        );
+        assert!(matches!(
+            terminal,
+            TurnCompletion::Completed {
+                reason: StopReason::Stopped,
+                ..
+            }
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), kernel_commands.recv())
+                .await
+                .is_err(),
+            "an inconclusive evaluation must not dispatch a synthetic main-agent retry"
         );
 
         handle.shutdown().await.unwrap();
