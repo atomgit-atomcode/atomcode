@@ -40,6 +40,7 @@ pub struct SettingSpec {
 const TODO_EAGERNESS: &[&str] = &["auto", "preferred", "always"];
 const THEMES: &[&str] = &["auto", "dark", "light"];
 const LANGUAGES: &[&str] = &["auto", "en", "zh_CN"];
+const SHELL_GUARD_POLICIES: &[&str] = &["recover", "strict"];
 
 pub static SETTINGS: &[SettingSpec] = &[
     bool_setting(
@@ -83,6 +84,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         aliases: &["rounds"],
         kind: SettingKind::Integer { min: 0, max: 10000 },
         apply: ApplyPolicy::AgentReassemble,
+    },
+    SettingSpec {
+        id: "coding.shell_guard_policy",
+        path: &["coding", "shell_guard_policy"],
+        label_en: "Shell safety policy",
+        label_zh: "Shell 安全策略",
+        aliases: &["安全", "中断"],
+        kind: SettingKind::Choice(SHELL_GUARD_POLICIES),
+        apply: ApplyPolicy::CapabilityReprepare,
     },
     SettingSpec {
         id: "loop_config.max_rounds",
@@ -258,6 +268,9 @@ impl SettingSpec {
             "tools.todo.enabled" => config.tools.todo.enabled.to_string(),
             "tools.todo.eager" => format!("{:?}", config.tools.todo.eager).to_lowercase(),
             "coding.max_rounds" => config.coding.max_rounds.to_string(),
+            "coding.shell_guard_policy" => {
+                format!("{:?}", config.coding.shell_guard_policy).to_lowercase()
+            }
             "loop_config.max_rounds" => config.loop_config.max_rounds.to_string(),
             "subagent.max_concurrent" => config.subagent.max_concurrent.to_string(),
             "subagent.max_rounds" => config.subagent.max_rounds.to_string(),
@@ -492,6 +505,25 @@ mod tests {
     }
 
     #[test]
+    fn shell_guard_policy_defaults_to_recover_and_patches_strict() {
+        let setting = SETTINGS
+            .iter()
+            .find(|setting| setting.id == "coding.shell_guard_policy")
+            .unwrap();
+        let mut document = DocumentMut::new();
+        let defaults = Config::default();
+        assert_eq!(setting.value(&defaults), "recover");
+        assert_eq!(setting.apply, ApplyPolicy::CapabilityReprepare);
+
+        setting.patch(&mut document, "strict").unwrap();
+        let configured: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(setting.value(&configured), "strict");
+        assert!(document
+            .to_string()
+            .contains("shell_guard_policy = \"strict\""));
+    }
+
+    #[test]
     fn resumed_history_toggle_preserves_custom_row_cap() {
         let setting = SETTINGS
             .iter()
@@ -553,6 +585,7 @@ mod tests {
             "tools.todo.enabled",
             "tools.todo.eager",
             "coding.max_rounds",
+            "coding.shell_guard_policy",
             "subagent.max_concurrent",
             "subagent.max_rounds",
             "ui.ai_session_naming",
@@ -567,7 +600,8 @@ mod tests {
                 | "subagent.max_rounds"
                 | "datalog.enabled"
                 | "lsp.enabled"
-                | "lsp.auto_detect" => ApplyPolicy::CapabilityReprepare,
+                | "lsp.auto_detect"
+                | "coding.shell_guard_policy" => ApplyPolicy::CapabilityReprepare,
                 _ => ApplyPolicy::AgentReassemble,
             };
             assert_eq!(setting.apply, expected, "{id}");

@@ -96,7 +96,7 @@ pub use bash::{
 };
 pub use bash_workspace_gate::BashWorkspaceGate;
 pub use cd::ChangeDirTool;
-pub use credential_bash_gate::CredentialBashGate;
+pub use credential_bash_gate::{CredentialBashGate, CredentialShellPolicy};
 pub use edit::EditFileTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
@@ -112,7 +112,10 @@ pub use repair::{repair_tool_args, RepairToolArgsMiddleware};
 pub use report_finding::{Finding, ReportFindingTool};
 pub use search_replace::SearchReplaceTool;
 pub use sensitive_path::{path_is_sensitive, references_sensitive_path, SensitivePathGate};
-pub use task::{subagent_child_middlewares, team_child_middlewares, TaskTool};
+pub use task::{
+    subagent_child_middlewares, subagent_child_middlewares_for_policy, team_child_middlewares,
+    team_child_middlewares_for_policy, TaskTool,
+};
 pub use todo::TodoTool;
 #[cfg(feature = "web")]
 pub use web_fetch::WebFetchTool;

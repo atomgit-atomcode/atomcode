@@ -325,6 +325,9 @@ pub(crate) fn chat_runtime_config(
         // Keep the fail-closed approval timeout for the daemon (current behavior).
         interactive: false,
         keep_interrupted_context: config.keep_interrupted_context,
+        credential_shell_policy: atomcode_coding::config::credential_shell_policy_from_config(
+            config.coding.shell_guard_policy,
+        ),
         user_agent: p.and_then(|p| p.user_agent.clone()),
         skip_tls_verify: p.map(|p| p.skip_tls_verify).unwrap_or(false),
         loop_max_rounds: atomcode_coding::resolve_loop_max_rounds(

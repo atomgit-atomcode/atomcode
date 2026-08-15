@@ -128,6 +128,7 @@ pub struct CodingAgentConfig {
     /// an interruption marker, forwarded to the kernel `Agent` builder
     /// (`keep_interrupted_context`). Sourced from `Config::keep_interrupted_context`.
     pub keep_interrupted_context: bool,
+    pub credential_shell_policy: atomcode_capabilities::tools::CredentialShellPolicy,
     /// Per-provider User-Agent override (`ProviderConfig::user_agent`). `None` ⇒
     /// `build_provider` falls back to the product `atomcode/<version>` so the gateway
     /// can attribute/slice traffic by version. Restores parity with v1's
@@ -174,6 +175,7 @@ pub struct CodingRuntimeConfig {
     pub dangerously_skip_permissions: bool,
     pub interactive: bool,
     pub keep_interrupted_context: bool,
+    pub credential_shell_policy: atomcode_capabilities::tools::CredentialShellPolicy,
     pub user_agent: Option<String>,
     pub skip_tls_verify: bool,
     pub loop_max_rounds: u32,
@@ -213,6 +215,19 @@ pub fn lsp_settings_from_config(
                 )
             })
             .collect(),
+    }
+}
+
+pub fn credential_shell_policy_from_config(
+    policy: atomcode_config::config::ShellGuardPolicy,
+) -> atomcode_capabilities::tools::CredentialShellPolicy {
+    match policy {
+        atomcode_config::config::ShellGuardPolicy::Recover => {
+            atomcode_capabilities::tools::CredentialShellPolicy::Recover
+        }
+        atomcode_config::config::ShellGuardPolicy::Strict => {
+            atomcode_capabilities::tools::CredentialShellPolicy::Strict
+        }
     }
 }
 
@@ -272,6 +287,9 @@ impl CodingRuntimeConfig {
             dangerously_skip_permissions,
             interactive,
             keep_interrupted_context: config.keep_interrupted_context,
+            credential_shell_policy: credential_shell_policy_from_config(
+                config.coding.shell_guard_policy,
+            ),
             user_agent: r.and_then(|r| r.user_agent.clone()),
             skip_tls_verify: r.map(|r| r.skip_tls_verify).unwrap_or(false),
             loop_max_rounds: resolve_loop_max_rounds(
@@ -324,6 +342,7 @@ impl CodingRuntimeConfig {
             config.request_timeout = None;
         }
         config.keep_interrupted_context = self.keep_interrupted_context;
+        config.credential_shell_policy = self.credential_shell_policy;
         config.round_cap_checkpoint = self.round_cap_checkpoint;
         config.next_prompt_suggestions = self.next_prompt_suggestions;
         config.lsp = self.lsp.clone();
@@ -630,6 +649,7 @@ impl CodingAgentConfig {
             web_search_provider: None,
             lsp: Default::default(),
             keep_interrupted_context: false,
+            credential_shell_policy: Default::default(),
             user_agent: None,
             skip_tls_verify: false,
             subagent_config: None,
@@ -642,6 +662,18 @@ impl CodingAgentConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_guard_policy_maps_at_the_coding_boundary() {
+        assert_eq!(
+            credential_shell_policy_from_config(atomcode_config::config::ShellGuardPolicy::Recover),
+            atomcode_capabilities::tools::CredentialShellPolicy::Recover
+        );
+        assert_eq!(
+            credential_shell_policy_from_config(atomcode_config::config::ShellGuardPolicy::Strict),
+            atomcode_capabilities::tools::CredentialShellPolicy::Strict
+        );
+    }
 
     #[test]
     fn round_caps_have_generous_defaults() {

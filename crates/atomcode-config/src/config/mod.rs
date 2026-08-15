@@ -58,6 +58,15 @@ pub fn platform_rules() -> &'static str {
 #[serde(default)]
 pub struct CodingConfig {
     pub max_rounds: u32,
+    pub shell_guard_policy: ShellGuardPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShellGuardPolicy {
+    Strict,
+    #[default]
+    Recover,
 }
 
 /// How aggressively the coding agent should start a structured todo list.
@@ -98,7 +107,10 @@ pub struct ToolsConfig {
 }
 impl Default for CodingConfig {
     fn default() -> Self {
-        Self { max_rounds: 200 }
+        Self {
+            max_rounds: 200,
+            shell_guard_policy: ShellGuardPolicy::Recover,
+        }
     }
 }
 

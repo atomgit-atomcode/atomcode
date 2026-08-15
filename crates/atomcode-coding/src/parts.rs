@@ -503,6 +503,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 .with_max_concurrent(subagent_max_concurrent)
                 .with_max_rounds(subagent_max_rounds)
                 .with_tool_loop_policy(cfg.tool_loop_policy)
+                .with_credential_shell_policy(cfg.credential_shell_policy)
                 .with_worker_middleware(turn_execution_policy.clone())
                 .with_team_event_sink(Arc::new(move |event| {
                     task_team_manager.publish_external(event);
@@ -561,6 +562,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 Some(cfg.stream_timeout),
                 cfg.request_timeout,
             )
+            .with_credential_shell_policy(cfg.credential_shell_policy)
             .with_worker_middleware(turn_execution_policy.clone());
         registry.register(Arc::new(crate::team::TeamTool::new(
             team_manager.clone(),
@@ -1511,7 +1513,7 @@ pub fn assemble(
         // approval-oriented SensitivePathGate so an explicit extraction cannot be
         // downgraded from terminal denial into a retryable approval denial.
         .middleware(Arc::new(
-            atomcode_capabilities::tools::CredentialBashGate::new(),
+            atomcode_capabilities::tools::CredentialBashGate::new(cfg.credential_shell_policy),
         ))
         // Sensitive-path read gate: read tools are Safe (skip approval), so without this an
         // agent could silently read ~/.ssh / .env / creds and leak them to the provider.

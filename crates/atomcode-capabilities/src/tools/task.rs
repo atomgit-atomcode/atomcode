@@ -390,12 +390,29 @@ pub fn subagent_child_middlewares(
     working_dir: &Path,
     inherited_worker_middlewares: &[Arc<dyn ToolMiddleware>],
 ) -> Vec<Arc<dyn ToolMiddleware>> {
+    subagent_child_middlewares_for_policy(
+        is_worker,
+        scope,
+        working_dir,
+        inherited_worker_middlewares,
+        Default::default(),
+    )
+}
+
+pub fn subagent_child_middlewares_for_policy(
+    is_worker: bool,
+    scope: &[String],
+    working_dir: &Path,
+    inherited_worker_middlewares: &[Arc<dyn ToolMiddleware>],
+    credential_shell_policy: super::CredentialShellPolicy,
+) -> Vec<Arc<dyn ToolMiddleware>> {
     subagent_child_middlewares_with_policy(
         is_worker,
         scope,
         working_dir,
         inherited_worker_middlewares,
         false,
+        credential_shell_policy,
     )
 }
 
@@ -405,9 +422,10 @@ fn subagent_child_middlewares_with_policy(
     working_dir: &Path,
     inherited_worker_middlewares: &[Arc<dyn ToolMiddleware>],
     confine_reads: bool,
+    credential_shell_policy: super::CredentialShellPolicy,
 ) -> Vec<Arc<dyn ToolMiddleware>> {
     let mut mw: Vec<Arc<dyn ToolMiddleware>> = vec![
-        Arc::new(super::CredentialBashGate::new()),
+        Arc::new(super::CredentialBashGate::new(credential_shell_policy)),
         Arc::new(DenySensitivePaths),
     ];
     if is_worker {
@@ -435,12 +453,29 @@ pub fn team_child_middlewares(
     working_dir: &Path,
     inherited_worker_middlewares: &[Arc<dyn ToolMiddleware>],
 ) -> Vec<Arc<dyn ToolMiddleware>> {
+    team_child_middlewares_for_policy(
+        is_worker,
+        scope,
+        working_dir,
+        inherited_worker_middlewares,
+        Default::default(),
+    )
+}
+
+pub fn team_child_middlewares_for_policy(
+    is_worker: bool,
+    scope: &[String],
+    working_dir: &Path,
+    inherited_worker_middlewares: &[Arc<dyn ToolMiddleware>],
+    credential_shell_policy: super::CredentialShellPolicy,
+) -> Vec<Arc<dyn ToolMiddleware>> {
     subagent_child_middlewares_with_policy(
         is_worker,
         scope,
         working_dir,
         inherited_worker_middlewares,
         true,
+        credential_shell_policy,
     )
 }
 
@@ -490,6 +525,7 @@ pub struct TaskTool {
     tool_loop_policy: Option<ToolLoopPolicy>,
     inherited_worker_middlewares: Vec<Arc<dyn ToolMiddleware>>,
     team_event_sink: Option<Arc<dyn Fn(crate::team::TeamEvent) + Send + Sync>>,
+    credential_shell_policy: super::CredentialShellPolicy,
 }
 
 impl TaskTool {
@@ -509,6 +545,7 @@ impl TaskTool {
             tool_loop_policy: Some(ToolLoopPolicy::default()),
             inherited_worker_middlewares: Vec::new(),
             team_event_sink: None,
+            credential_shell_policy: Default::default(),
         }
     }
 
@@ -528,6 +565,14 @@ impl TaskTool {
     /// for intentional repeated operations; the independent round cap remains.
     pub fn with_tool_loop_policy(mut self, policy: Option<ToolLoopPolicy>) -> Self {
         self.tool_loop_policy = policy;
+        self
+    }
+
+    pub fn with_credential_shell_policy(
+        mut self,
+        policy: super::CredentialShellPolicy,
+    ) -> Self {
+        self.credential_shell_policy = policy;
         self
     }
 
@@ -766,6 +811,7 @@ parallel workers NON-OVERLAPPING scopes."
                 subtask_progress_line(&format!("\u{25cb} queued \u{b7} {label}"), &model, &desc,)
             ));
 
+            let credential_shell_policy = self.credential_shell_policy;
             set.spawn(async move {
                 let _permit = sem.acquire_owned().await.expect("semaphore not closed");
                 if let Some(events) = &member_events {
@@ -807,11 +853,12 @@ parallel workers NON-OVERLAPPING scopes."
                 // The child runs AutoRespond::AllowAll (no human in its loop), so the parent's
                 // prompting gates wouldn't protect it. Hard-deny sensitive-path ops for every
                 // child (#1); additionally confine a `worker`'s WRITES to its declared scope.
-                for mw in subagent_child_middlewares(
+                for mw in subagent_child_middlewares_for_policy(
                     is_worker,
                     &scope,
                     &wd,
                     &inherited_worker_middlewares,
+                    credential_shell_policy,
                 ) {
                     builder = builder.middleware(mw);
                 }
