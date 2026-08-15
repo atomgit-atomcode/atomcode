@@ -188,7 +188,17 @@ fn spawn_runtime(
 /// `AgentEvent::ApprovalNeeded` (which carries a snapshot of
 /// `conversation.messages`).  So by the time `/bg` runs,
 /// `ctx.current_session.messages` should be up-to-date.
-fn sync_bg_foreground(ctx: &mut LoopCtx) {
+fn sync_bg_foreground(ctx: &mut LoopCtx, state: &UiState) {
+    // Keep the runtime-owned projection that is currently rendered.  This is
+    // important after `/bg resume`: `ctx.config` still describes the config
+    // used to spawn new runtimes, while the resumed endpoint may own a
+    // different model/window.
+    let context_window = state
+        .last_context
+        .as_ref()
+        .map(|snapshot| snapshot.ctx_window)
+        .filter(|window| *window > 0)
+        .unwrap_or_else(|| ctx.config.default_context_window());
     ctx.bg_manager.set_foreground_runtime(
         ctx.foreground_runtime_id,
         super::RuntimeEndpoint {
@@ -196,6 +206,7 @@ fn sync_bg_foreground(ctx: &mut LoopCtx) {
         },
         ctx.current_session.clone(),
         ctx.working_dir.clone(),
+        context_window,
     );
 }
 
@@ -2581,7 +2592,7 @@ fn execute_slash_command_impl(
                         renderer.flush();
                         return Ok(());
                     }
-                    sync_bg_foreground(ctx);
+                    sync_bg_foreground(ctx, state);
                     if !ctx.bg_manager.has_capacity() {
                         renderer.render(UiLine::Error(
                             t(Msg::BgSlotLimitReached {
@@ -2662,7 +2673,7 @@ fn execute_slash_command_impl(
                         renderer.flush();
                         return Ok(());
                     }
-                    sync_bg_foreground(ctx);
+                    sync_bg_foreground(ctx, state);
                     let outcome = match ctx
                         .bg_manager
                         .resume_slot(slot, foreground_state_from_ui(state))
@@ -2714,6 +2725,8 @@ fn execute_slash_command_impl(
                     ctx.current_session = outcome.resumed_session;
                     bind_telemetry_to_session(ctx, &ctx.current_session);
                     apply_resumed_runtime_state(state, outcome.resumed_state);
+                    state.last_context = None;
+                    state.on_model_window_changed(outcome.resumed_context_window);
                     crate::modals::session_picker::replay_session(
                         renderer,
                         state,
@@ -2809,6 +2822,7 @@ fn execute_slash_command_impl(
                 endpoint.clone(),
                 session,
                 ctx.working_dir.clone(),
+                ctx.config.default_context_window(),
                 bg_runtime::RuntimeState::Running,
             ) {
                 Ok(slot) => slot,

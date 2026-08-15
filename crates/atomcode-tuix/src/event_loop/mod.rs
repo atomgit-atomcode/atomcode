@@ -8871,6 +8871,12 @@ pub(crate) fn handle_loop_decision(
 
 pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<ExitReason> {
     let mut app = App::new(&ctx.caps);
+    // The active runtime/model owns the context-window denominator. Seed it
+    // before `-c` history replay below: persisted turn stats may have been
+    // produced by a different model, so replay may restore their used-token
+    // count but must not replace the current model's window.
+    app.state
+        .on_model_window_changed(ctx.config.default_context_window());
     apply_startup_bypass(
         ctx.dangerously_skip_permissions,
         &mut app.state.agent_mode,
@@ -23518,6 +23524,11 @@ fn commit_native_session_changed(
     state.completion_tokens = 0;
     state.cached_tokens = 0;
     state.last_context = None;
+    // Session history can outlive the model that produced it. Establish the
+    // current runtime/model window before replay restores persisted usage, so
+    // switching to an old DeepSeek session while GLM is active cannot put the
+    // stale 1M denominator back into the footer.
+    state.on_model_window_changed(ctx.config.default_context_window());
     state.pending_context_render = None;
     state.thinking_idx = 0;
     state.on_turn_complete();

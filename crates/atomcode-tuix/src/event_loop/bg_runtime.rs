@@ -167,6 +167,9 @@ pub struct ForegroundRuntime {
     /// Runtime-owned project directory. `Session::working_dir` is persisted
     /// display metadata and can be stale after legacy migrations.
     pub working_dir: PathBuf,
+    /// Context window owned by this runtime's active model. This projection
+    /// travels with the endpoint across foreground/background swaps.
+    pub context_window: usize,
 }
 
 pub struct BackgroundSlot {
@@ -175,6 +178,8 @@ pub struct BackgroundSlot {
     pub session: Session,
     /// Physical project bucket owned by this runtime.
     pub working_dir: PathBuf,
+    /// Context window owned by this slot's runtime/model.
+    pub context_window: usize,
     pub state: RuntimeState,
     pub created_at: u64,
     pub summary: String,
@@ -199,6 +204,7 @@ impl BackgroundSlot {
             endpoint: self.endpoint,
             session: self.session,
             working_dir: self.working_dir,
+            context_window: self.context_window,
         }
     }
 }
@@ -382,6 +388,7 @@ impl BackgroundSlots {
             endpoint: None,
             summary: session.name.clone(),
             working_dir: session.working_dir.clone(),
+            context_window: 0,
             session,
             state,
             created_at: 0,
@@ -395,6 +402,7 @@ impl BackgroundSlots {
 pub struct ResumeOutcome {
     pub resumed_session: Session,
     pub resumed_working_dir: PathBuf,
+    pub resumed_context_window: usize,
     pub resumed_runtime_id: RuntimeId,
     pub resumed_endpoint: RuntimeEndpoint,
     pub resumed_state: RuntimeState,
@@ -478,6 +486,7 @@ impl BgRuntimeManager {
                 endpoint: Some(endpoint),
                 session,
                 working_dir,
+                context_window: 0,
             },
             backgrounds: BackgroundSlots::new(MAX_BACKGROUND_SLOTS),
             next_runtime_id: runtime_id.0,
@@ -508,12 +517,14 @@ impl BgRuntimeManager {
         endpoint: RuntimeEndpoint,
         session: Session,
         working_dir: PathBuf,
+        context_window: usize,
     ) {
         self.foreground = ForegroundRuntime {
             runtime_id,
             endpoint: Some(endpoint),
             session,
             working_dir,
+            context_window,
         };
     }
 
@@ -549,6 +560,7 @@ impl BgRuntimeManager {
                 max: self.backgrounds.max_slots,
             });
         }
+        let replacement_context_window = self.foreground.context_window;
         let old = std::mem::replace(
             &mut self.foreground,
             ForegroundRuntime {
@@ -556,6 +568,7 @@ impl BgRuntimeManager {
                 endpoint: Some(new_endpoint),
                 session: new_session,
                 working_dir: new_working_dir,
+                context_window: replacement_context_window,
             },
         );
         let summary = session_summary(&old.session);
@@ -564,6 +577,7 @@ impl BgRuntimeManager {
             endpoint: old.endpoint,
             session: old.session,
             working_dir: old.working_dir,
+            context_window: old.context_window,
             state: current_state,
             created_at: current_timestamp(),
             summary,
@@ -579,6 +593,7 @@ impl BgRuntimeManager {
         endpoint: RuntimeEndpoint,
         session: Session,
         working_dir: PathBuf,
+        context_window: usize,
         state: RuntimeState,
     ) -> Result<usize, BgError> {
         let summary = session_summary(&session);
@@ -587,6 +602,7 @@ impl BgRuntimeManager {
             endpoint: Some(endpoint),
             session,
             working_dir,
+            context_window,
             state,
             created_at: current_timestamp(),
             summary,
@@ -650,6 +666,7 @@ impl BgRuntimeManager {
                 endpoint: old_foreground.endpoint,
                 session: old_foreground.session,
                 working_dir: old_foreground.working_dir,
+                context_window: old_foreground.context_window,
                 state: current_state,
                 created_at: current_timestamp(),
                 summary,
@@ -665,6 +682,7 @@ impl BgRuntimeManager {
         Ok(ResumeOutcome {
             resumed_session: self.foreground.session.clone(),
             resumed_working_dir: self.foreground.working_dir.clone(),
+            resumed_context_window: self.foreground.context_window,
             resumed_runtime_id: self.foreground.runtime_id,
             resumed_endpoint,
             resumed_state,
@@ -981,6 +999,7 @@ impl BgRuntimeManager {
                 endpoint: Some(test_endpoint()),
                 session,
                 working_dir,
+                context_window: 0,
             },
             backgrounds: BackgroundSlots::new(MAX_BACKGROUND_SLOTS),
             next_runtime_id: 1,
@@ -1016,6 +1035,7 @@ impl BgRuntimeManager {
             endpoint: Some(test_endpoint()),
             session,
             working_dir,
+            context_window: 0,
             state,
             created_at: 0,
             summary,
@@ -1286,6 +1306,28 @@ mod tests {
         assert_eq!(manager.backgrounds().len(), 1);
         assert_eq!(manager.backgrounds().list_rows()[0].summary, "active task");
         assert_eq!(manager.foreground_session().name, "default");
+    }
+
+    #[test]
+    fn resume_returns_the_selected_runtime_context_window() {
+        let mut manager = BgRuntimeManager::new_for_test(Session::default_session(PathBuf::from(
+            "/tmp/project",
+        )));
+        manager.foreground.context_window = 1_000_000;
+        manager.foreground_session_mut().messages =
+            vec![atomcode_kernel::message::Message::user("old model")];
+        let slot = manager.background_current_for_test().unwrap();
+
+        // The replacement foreground can move to a different model while the
+        // original runtime remains in the background.
+        manager.foreground.context_window = 200_000;
+        manager.foreground_session_mut().messages =
+            vec![atomcode_kernel::message::Message::user("new model")];
+        let resumed = manager.resume_slot(slot, RuntimeState::Idle).unwrap();
+
+        assert_eq!(resumed.resumed_context_window, 1_000_000);
+        assert_eq!(manager.foreground.context_window, 1_000_000);
+        assert_eq!(manager.backgrounds.slots[0].context_window, 200_000);
     }
 
     #[test]

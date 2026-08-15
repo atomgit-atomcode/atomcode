@@ -2082,7 +2082,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_ignores_accounting_only_turn_positions() {
+    fn replay_keeps_current_model_window_and_ignores_accounting_only_turn_positions() {
         use atomcode_kernel::message::Message;
 
         #[derive(Default)]
@@ -2133,6 +2133,9 @@ mod tests {
         });
 
         let mut state = UiState::with_unicode(true);
+        // The active model is authoritative for the denominator. The persisted
+        // stat below came from an older model with a 100-token window.
+        state.on_model_window_changed(200);
         let mut rec = Rec::default();
         replay_session(&mut rec, &mut state, &session, false);
 
@@ -2150,7 +2153,7 @@ mod tests {
         );
         let context = state.last_context.as_ref().expect("valid context restored");
         assert_eq!(context.sent_tokens, 77);
-        assert_eq!(context.ctx_window, 100);
+        assert_eq!(context.ctx_window, 200);
     }
 }
 #[tokio::test]
