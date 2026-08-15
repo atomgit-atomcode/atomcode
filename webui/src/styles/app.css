@@ -2072,6 +2072,40 @@ body {
   color: var(--app-secondary-foreground);
 }
 
+/* === Turn-blocking interaction dock ===
+   Approval, structured questions, and policy recovery take over the composer
+   instead of covering the transcript with a full-screen modal. */
+.interaction-dock-seat {
+  width: 100%;
+  min-width: 0;
+}
+
+.interaction-dock-card {
+  width: 100%;
+  max-height: min(48dvh, 520px);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  color: var(--app-menu-foreground);
+  background: var(--app-menu-background);
+  border: 1px solid var(--app-menu-border);
+  border-radius: var(--corner-radius-large);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.24);
+}
+
+.interaction-dock-header,
+.interaction-dock-footer {
+  flex-shrink: 0;
+}
+
+.interaction-dock-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
 /* === Permission card (tool approval) — matches landing/home brand style ===
    The generic modal is reused, but the approval popup adopts the home page's
    warm clay accent, diamond brand mark and serif title so it feels of-a-piece
@@ -2881,6 +2915,17 @@ body {
   }
   .input-container {
     padding: 6px 8px max(8px, env(safe-area-inset-bottom));
+  }
+  .interaction-dock-card {
+    max-height: min(58dvh, 520px);
+    border-radius: var(--corner-radius-medium);
+  }
+  .interaction-dock-card .permission-header {
+    padding-inline: 14px;
+  }
+  .interaction-dock-card .modal-body,
+  .interaction-dock-card .permission-footer {
+    padding-inline: 14px;
   }
 
   /* Tap targets */

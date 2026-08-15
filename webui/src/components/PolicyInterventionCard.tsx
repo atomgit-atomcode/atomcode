@@ -2,6 +2,7 @@ import { useState } from 'preact/hooks';
 import type { PolicyInterventionEvent, PolicyRecoveryAction } from '../api';
 import type { MsgKey } from '../i18n';
 import { useT } from '../settings';
+import { InteractionDock } from './InteractionDock';
 
 interface PolicyInterventionCardProps {
   intervention: PolicyInterventionEvent;
@@ -84,34 +85,26 @@ export function PolicyInterventionCard({
   }
 
   return (
-    <div class="modal-overlay" onClick={(event) => event.stopPropagation()}>
-      <div class="modal-card permission-card" role="dialog" aria-modal="true" aria-labelledby="policy-recovery-title">
-        <div class="modal-header permission-header">
-          <span class="permission-logo" aria-hidden="true">⚠</span>
-          <h3 id="policy-recovery-title" class="permission-title">{t('policyRecovery.title')}</h3>
-        </div>
-        <div class="modal-body">
-          <p class="permission-lead">{t('policyRecovery.question')}</p>
-          <div class="field-group policy-recovery-actions">
-            {actions.map((action) => (
-                <button
-                  key={action}
-                  type="button"
-                  class="user-input-option policy-recovery-action"
-                  disabled={disabled}
-                  onClick={() => void choose(action)}
-                >
-                  <span class="user-input-option-body">
-                    <span class="user-input-option-label">{t(ACTION_COPY[action].label)}</span>
-                    <span class="user-input-option-desc">{t(ACTION_COPY[action].description)}</span>
-                  </span>
-                </button>
-              ))}
-          </div>
-          {showInstructions && <p class="policy-recovery-instructions">{t('policyRecovery.safeInstructions')}</p>}
-          {error && <p class="user-input-error">{t('policyRecovery.submitError')}</p>}
-        </div>
+    <InteractionDock title={t('policyRecovery.title')} icon="⚠">
+      <p class="permission-lead">{t('policyRecovery.question')}</p>
+      <div class="field-group policy-recovery-actions">
+        {actions.map((action) => (
+          <button
+            key={action}
+            type="button"
+            class="user-input-option policy-recovery-action"
+            disabled={disabled}
+            onClick={() => void choose(action)}
+          >
+            <span class="user-input-option-body">
+              <span class="user-input-option-label">{t(ACTION_COPY[action].label)}</span>
+              <span class="user-input-option-desc">{t(ACTION_COPY[action].description)}</span>
+            </span>
+          </button>
+        ))}
       </div>
-    </div>
+      {showInstructions && <p class="policy-recovery-instructions">{t('policyRecovery.safeInstructions')}</p>}
+      {error && <p class="user-input-error">{t('policyRecovery.submitError')}</p>}
+    </InteractionDock>
   );
 }

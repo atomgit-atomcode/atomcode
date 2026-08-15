@@ -246,6 +246,8 @@ interface ChatProps {
   onSessionId: (id: string) => void;
   cwd: string;
   onPermission: (req: PermissionRequestEvent) => void;
+  /** App-owned `/chat` approval projected into this component's composer seat. */
+  pendingPermission?: PermissionRequestEvent | null;
   /** 审批已被解决时通知 App 清掉 /chat 的审批卡片：传 call_id 仅在匹配时清（工具已执行），
    *  传 null 则无条件清（回合 done/stopped/error 或用户中止——此时不可能再有待批准项）。 */
   onPermissionResolved?: (callId: string | null) => void;
@@ -425,7 +427,7 @@ function detectSkillContent(text: string): string | null {
   return title || null;
 }
 
-export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, onSessionRenamed }: ChatProps) {
+export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, onSessionRenamed }: ChatProps) {
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -2932,6 +2934,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     />
   );
 
+  // `/chat` owns its pending approval in App, but presentation belongs to the
+  // same composer seat as `/live` interactions.
+  const chatPermissionCard = pendingPermission && (
+    <PermissionCard
+      req={pendingPermission}
+      onDone={() => onPermissionResolved?.(pendingPermission.call_id)}
+    />
+  );
+
   // Shared structured-input card for `/chat` and `/live`.
   const userInputCard = userInputReq && (
     <UserInputCard
@@ -2968,6 +2979,27 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     />
   );
 
+  // A runtime should expose only one pending human decision. This ordering is
+  // defensive against stale cross-channel UI state and keeps recovery actions
+  // reachable before approvals and questions.
+  const blockingInteraction = policyInterventionCard
+    ?? livePermissionCard
+    ?? chatPermissionCard
+    ?? userInputCard;
+  const hasBlockingInteraction = blockingInteraction != null;
+  const wasBlockingInteractionRef = useRef(false);
+
+  useEffect(() => {
+    const wasBlocking = wasBlockingInteractionRef.current;
+    wasBlockingInteractionRef.current = hasBlockingInteraction;
+    if (!wasBlocking || hasBlockingInteraction) return;
+
+    const frame = requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [hasBlockingInteraction]);
+
   // 落地页快捷提示胶囊：点击把文本填入输入框并聚焦（不自动发送，便于二次编辑）。
   const quickChips: { label: string; insert: string }[] = [
     { label: t('chat.chipReview'), insert: '/review ' },
@@ -3002,22 +3034,27 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             </div>
             <div class="landing-tagline">{t('chat.greeting')}</div>
             <div class="landing-input">
-              {inputBox}
-              {inputSubbar}
+              {blockingInteraction ? (
+                <div class="interaction-dock-seat">{blockingInteraction}</div>
+              ) : (
+                <>
+                  {inputBox}
+                  {inputSubbar}
+                </>
+              )}
             </div>
-            <div class="landing-chips">
-              {quickChips.map((c) => (
-                <button key={c.label} class="landing-chip" onClick={() => fillInput(c.insert)}>
-                  {c.label}
-                </button>
-              ))}
-            </div>
+            {!blockingInteraction && (
+              <div class="landing-chips">
+                {quickChips.map((c) => (
+                  <button key={c.label} class="landing-chip" onClick={() => fillInput(c.insert)}>
+                    {c.label}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         </div>
         {filePickerModal}
-        {livePermissionCard}
-        {userInputCard}
-        {policyInterventionCard}
       </>
     );
   }
@@ -3303,15 +3340,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       )}
       <div class="input-container">
         <div class="input-wrap">
-          {inputBox}
-          {inputSubbar}
-          {turnStatsLine}
+          {blockingInteraction ? (
+            <div class="interaction-dock-seat">{blockingInteraction}</div>
+          ) : (
+            <>
+              {inputBox}
+              {inputSubbar}
+              {turnStatsLine}
+            </>
+          )}
         </div>
       </div>
       {filePickerModal}
-      {livePermissionCard}
-      {userInputCard}
-      {policyInterventionCard}
     </>
   );
 }
