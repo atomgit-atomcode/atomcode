@@ -1,4 +1,5 @@
 // crates/atomcode-tuix/src/input/reader.rs
+use std::io::{self, IsTerminal};
 use std::sync::mpsc::{self as stdmpsc, TryRecvError};
 use std::time::Duration;
 
@@ -221,7 +222,13 @@ pub fn spawn(tx: mpsc::UnboundedSender<InputEvent>) -> ReaderHandle {
     let focus_tracking_enabled = terminal_supports_focus_tracking();
     if focus_tracking_enabled {
         let _ = execute!(std::io::stdout(), EnableFocusChange);
-        atomcode_capabilities::notify::set_terminal_focus_state(Some(true));
+        // Preserve the existing foreground-notification behaviour on hosts
+        // already known to implement focus reporting. For an otherwise
+        // unknown interactive terminal, request reporting but keep the state
+        // unknown until its first real focus event; unsupported terminals then
+        // cannot suppress background-only notifications forever.
+        let initial_focus = terminal_focus_is_reliable_at_startup().then_some(true);
+        atomcode_capabilities::notify::set_terminal_focus_state(initial_focus);
     }
     let (cmd_tx, cmd_rx) = stdmpsc::channel::<(ReaderCommand, Option<stdmpsc::Sender<()>>)>();
     let join = std::thread::spawn(move || run(tx, cmd_rx));
@@ -233,11 +240,47 @@ pub fn spawn(tx: mpsc::UnboundedSender<InputEvent>) -> ReaderHandle {
 }
 
 fn terminal_supports_focus_tracking() -> bool {
+    focus_tracking_supported_for_terminal(
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+        std::env::var("TERM").ok().as_deref(),
+        terminal_focus_is_reliable_at_startup(),
+    )
+}
+
+fn terminal_focus_is_reliable_at_startup() -> bool {
     let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
     let lc_terminal = std::env::var("LC_TERMINAL").unwrap_or_default();
     term_program == "iTerm.app"
         || term_program.eq_ignore_ascii_case("iTerm2")
         || lc_terminal.eq_ignore_ascii_case("iTerm2")
+        || term_program.eq_ignore_ascii_case("vscode")
+        || term_program.eq_ignore_ascii_case("WezTerm")
+        || term_program.eq_ignore_ascii_case("Hyper")
+        || std::env::var_os("WT_SESSION").is_some()
+        || std::env::var_os("WEZTERM_PANE").is_some()
+        || std::env::var_os("KITTY_WINDOW_ID").is_some()
+        || std::env::var_os("VTE_VERSION").is_some()
+        || std::env::var_os("KONSOLE_VERSION").is_some()
+}
+
+fn focus_tracking_supported_for_terminal(
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+    term: Option<&str>,
+    reliable_host_hint: bool,
+) -> bool {
+    (stdin_is_terminal && stdout_is_terminal || reliable_host_hint)
+        && !term.is_some_and(|value| value.eq_ignore_ascii_case("dumb"))
+}
+
+fn focus_input_event(focused: bool) -> InputEvent {
+    InputEvent::FocusChanged(focused)
+}
+
+fn track_focus_change(focused: bool) -> InputEvent {
+    atomcode_capabilities::notify::set_terminal_focus_state(Some(focused));
+    focus_input_event(focused)
 }
 
 /// Decide what the reader loop should do next, given the `event::poll`
@@ -487,14 +530,8 @@ fn run(
                         Some(ev) => ev,
                         None => continue,
                     },
-                    Event::FocusGained => {
-                        atomcode_capabilities::notify::set_terminal_focus_state(Some(true));
-                        continue;
-                    }
-                    Event::FocusLost => {
-                        atomcode_capabilities::notify::set_terminal_focus_state(Some(false));
-                        continue;
-                    }
+                    Event::FocusGained => track_focus_change(true),
+                    Event::FocusLost => track_focus_change(false),
                 };
                 if tx.send(msg).is_err() {
                     return;
@@ -565,14 +602,8 @@ fn run(
                 Some(ev) => ev,
                 None => continue,
             },
-            Event::FocusGained => {
-                atomcode_capabilities::notify::set_terminal_focus_state(Some(true));
-                continue;
-            }
-            Event::FocusLost => {
-                atomcode_capabilities::notify::set_terminal_focus_state(Some(false));
-                continue;
-            }
+            Event::FocusGained => track_focus_change(true),
+            Event::FocusLost => track_focus_change(false),
         };
         if tx.send(msg).is_err() {
             return;
@@ -607,8 +638,8 @@ fn mouse_input_event(m: crossterm::event::MouseEvent) -> Option<InputEvent> {
 }
 
 /// Translate a crossterm `Event` into the `InputEvent` the loop consumes,
-/// applying the focus-tracking side effects. Returns `None` for events that
-/// carry no input (focus changes, unmapped mouse kinds). Used to dispatch
+/// applying the focus-tracking side effects. Returns `None` only for unmapped
+/// mouse kinds. Used to dispatch
 /// the non-paste event that terminates a coalesced paste run.
 fn to_input_event(ev: Event) -> Option<InputEvent> {
     match ev {
@@ -616,14 +647,8 @@ fn to_input_event(ev: Event) -> Option<InputEvent> {
         Event::Paste(p) => Some(InputEvent::Paste(p)),
         Event::Resize(w, h) => Some(InputEvent::Resize(w, h)),
         Event::Mouse(m) => mouse_input_event(m),
-        Event::FocusGained => {
-            atomcode_capabilities::notify::set_terminal_focus_state(Some(true));
-            None
-        }
-        Event::FocusLost => {
-            atomcode_capabilities::notify::set_terminal_focus_state(Some(false));
-            None
-        }
+        Event::FocusGained => Some(track_focus_change(true)),
+        Event::FocusLost => Some(track_focus_change(false)),
     }
 }
 
@@ -664,6 +689,56 @@ fn coalesce_paste(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focus_events_reach_the_main_loop_for_projection_resync() {
+        assert!(matches!(
+            focus_input_event(true),
+            InputEvent::FocusChanged(true)
+        ));
+        assert!(matches!(
+            focus_input_event(false),
+            InputEvent::FocusChanged(false)
+        ));
+    }
+
+    #[test]
+    fn focus_tracking_is_requested_for_interactive_non_dumb_terminals() {
+        assert!(focus_tracking_supported_for_terminal(
+            true, true, None, false
+        ));
+        assert!(focus_tracking_supported_for_terminal(
+            true,
+            true,
+            Some("xterm-256color"),
+            false
+        ));
+        // Some IDE/ConPTY hosts are known to misreport their TTY status.
+        assert!(focus_tracking_supported_for_terminal(
+            false,
+            false,
+            Some("xterm-256color"),
+            true
+        ));
+        assert!(!focus_tracking_supported_for_terminal(
+            true,
+            true,
+            Some("dumb"),
+            true
+        ));
+        assert!(!focus_tracking_supported_for_terminal(
+            false,
+            true,
+            Some("xterm-256color"),
+            false
+        ));
+        assert!(!focus_tracking_supported_for_terminal(
+            true,
+            false,
+            Some("xterm-256color"),
+            false
+        ));
+    }
 
     /// A long bracketed paste arriving as several `Event::Paste` chunks (the
     /// Windows Terminal / conhost behaviour) collapses into ONE payload — so

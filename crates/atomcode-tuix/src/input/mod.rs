@@ -14,6 +14,11 @@ pub enum InputEvent {
     Paste(String),
     /// Stdin closed (reader thread exiting).
     Eof,
+    /// Terminal focus changed. The reader still updates the process-wide
+    /// notification focus state, while the main loop uses `true` to force a
+    /// repaint of the retained terminal projection after the host regains
+    /// focus. No runtime or conversation state changes on this event.
+    FocusChanged(bool),
     /// Terminal window resized; carries the new `(cols, rows)`.
     /// The event loop forwards this to the renderer so the DECSTBM
     /// scroll region can re-flow to the new height (footer stays

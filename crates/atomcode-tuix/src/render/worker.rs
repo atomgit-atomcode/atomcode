@@ -53,6 +53,9 @@ enum RenderCmd {
     Line(UiLine),
     Flush,
     FlushDeferred,
+    /// Re-emit the retained terminal projection after focus recovery even if
+    /// the logical widget state is unchanged.
+    ForceRepaint,
     /// Terminal resize — fire-and-forget, the worker updates its
     /// internal DECSTBM region and repaints the footer.
     Resize(u16, u16),
@@ -237,6 +240,10 @@ impl Renderer for TaskRenderer {
         }
     }
 
+    fn force_repaint(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::ForceRepaint);
+    }
+
     fn on_resize(&mut self, cols: u16, rows: u16) {
         let _ = self.cmd_tx.send(RenderCmd::Resize(cols, rows));
     }
@@ -329,6 +336,9 @@ fn run_worker(
                 if d.as_micros() > 100 {
                     crate::tuix_trace!("REN", "FlushDeferred deferred={}µs", d.as_micros());
                 }
+            }
+            RenderCmd::ForceRepaint => {
+                inner.force_repaint();
             }
             RenderCmd::Resize(mut cols, mut rows) => {
                 // Rebuild only after the terminal has stopped reporting
@@ -520,6 +530,7 @@ mod tests {
         suspends: usize,
         resumes: usize,
         deferred: usize,
+        force_repaints: usize,
         begin_syncs: usize,
         end_syncs: usize,
         history_replay_caps: Vec<Option<usize>>,
@@ -557,6 +568,9 @@ mod tests {
         }
         fn flush_deferred(&mut self) {
             self.counts.lock().unwrap().deferred += 1;
+        }
+        fn force_repaint(&mut self) {
+            self.counts.lock().unwrap().force_repaints += 1;
         }
         fn begin_sync(&mut self) {
             self.counts.lock().unwrap().begin_syncs += 1;
@@ -686,6 +700,15 @@ mod tests {
         // to observe it deterministically.
         r.reset();
         assert_eq!(counts.lock().unwrap().deferred, 1);
+    }
+
+    #[test]
+    fn force_repaint_forwards_to_inner() {
+        let (mut r, counts) = setup();
+        r.force_repaint();
+        // The ACK command fences the fire-and-forget repaint command.
+        r.reset();
+        assert_eq!(counts.lock().unwrap().force_repaints, 1);
     }
 
     #[test]

@@ -11598,6 +11598,7 @@ fn handle_input(
         match &ev {
             InputEvent::Paste(t) => format!("paste({})", t.len()),
             InputEvent::Eof => "eof".into(),
+            InputEvent::FocusChanged(focused) => format!("focus({focused})"),
             InputEvent::Key(k) => format!("key({:?},{:?})", k.kind, k.code),
             InputEvent::Resize(w, h) => format!("resize({}x{})", w, h),
             InputEvent::MouseScroll(d) => format!("mouse_scroll({})", d),
@@ -11605,6 +11606,15 @@ fn handle_input(
     );
 
     match ev {
+        InputEvent::FocusChanged(focused) => {
+            if focused {
+                // Focus events are delivered after the terminal host resumes.
+                // Re-emit the renderer's authoritative retained projection;
+                // merely rendering the same InputPrompt again is insufficient
+                // because the diff cache would classify it as unchanged.
+                renderer.force_repaint();
+            }
+        }
         InputEvent::MouseScroll(delta) => {
             // Mouse wheel is a no-op: SGR mouse capture (`?1002h` /
             // `?1006h`) is intentionally NOT enabled, so wheel ticks

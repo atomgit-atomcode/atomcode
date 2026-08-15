@@ -9044,6 +9044,16 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let _ = self.out.flush();
     }
 
+    fn force_repaint(&mut self) {
+        // The host terminal may have dropped visible updates while unfocused,
+        // but our diff cache still describes the last frame as painted. Make
+        // the next diff cold-start from blank cells and emit the authoritative
+        // retained body/footer/modal projection immediately.
+        self.screen.invalidate();
+        self.dirty = true;
+        self.flush_deferred();
+    }
+
     fn scroll_body(&mut self, _delta: i32) {
         // No-op by design. After the append-only refactor body rows
         // live in the host terminal's native scrollback once they
@@ -10037,6 +10047,34 @@ mod tests {
                 .flatten()
                 .all(|cell| cell.ch != '\x1b' && cell.ch != '['),
             "SGR must become cell style, never visible text"
+        );
+    }
+
+    #[test]
+    fn force_repaint_emits_unchanged_retained_projection() {
+        let (mut r, output) = new_capturing(80, 24);
+        r.render(UiLine::InputPrompt {
+            buf: "focus recovery".into(),
+            cursor_byte: "focus recovery".len(),
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        output.lock().unwrap().clear();
+
+        // With no state change, the ordinary deferred flush emits no patch.
+        r.flush_deferred();
+        assert!(output.lock().unwrap().is_empty());
+
+        // Focus recovery must re-emit the authoritative frame even though its
+        // logical state still matches the renderer's previous-frame cache.
+        r.force_repaint();
+        let bytes = output.lock().unwrap();
+        assert!(!bytes.is_empty(), "focus recovery must emit a fresh frame");
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("focus recovery"),
+            "fresh frame must include the retained input text"
         );
     }
 
