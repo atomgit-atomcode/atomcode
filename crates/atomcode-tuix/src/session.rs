@@ -62,6 +62,13 @@ impl From<atomcode_capabilities::session::TurnStat> for TurnStat {
 pub type SessionId = String;
 pub type Session = TuiSession;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPreviewSelection {
+    pub project_bucket: String,
+    pub session_id: String,
+    pub generation: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionMeta {
     pub id: SessionId,

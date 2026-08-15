@@ -32,6 +32,39 @@ pub struct CatalogSessionView {
     pub presentation: PresentationFile,
 }
 
+/// Bounded, presentation-only read model for `/resume` selection previews.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogSessionPreview {
+    pub session_id: String,
+    pub project_bucket: String,
+    pub provider_id: Option<String>,
+    pub model_id: Option<String>,
+    pub excerpt: Vec<String>,
+}
+
+/// Sanitized preview failures. Display strings intentionally contain no paths,
+/// raw serde diagnostics, or stored session content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogSessionPreviewError {
+    InvalidLocation,
+    Corrupt,
+    TooLarge,
+    Unavailable,
+}
+
+impl std::fmt::Display for CatalogSessionPreviewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidLocation => "invalid session preview location",
+            Self::Corrupt => "session preview data is corrupt",
+            Self::TooLarge => "session preview data is too large",
+            Self::Unavailable => "session preview is unavailable",
+        })
+    }
+}
+
+impl std::error::Error for CatalogSessionPreviewError {}
+
 /// Exact catalog selection prepared for a runtime resume. The importer and the
 /// replacement runtime share `lease`; dropping this value before handing the
 /// guard to `CodingRuntime` intentionally abandons the switch.
@@ -1112,6 +1145,120 @@ pub fn load_catalog_session_view_in_project(
     id: &str,
 ) -> anyhow::Result<Option<CatalogSessionView>> {
     load_catalog_session_view_in_project_root(&SessionManager::sessions_root(), project_bucket, id)
+}
+
+pub fn preview_catalog_session_in_project(
+    project_bucket: &str,
+    id: &str,
+) -> Result<Option<CatalogSessionPreview>, CatalogSessionPreviewError> {
+    preview_catalog_session_in_project_root(&SessionManager::sessions_root(), project_bucket, id)
+}
+
+pub(crate) fn preview_catalog_session_in_project_root(
+    sessions_root: &std::path::Path,
+    project_bucket: &str,
+    id: &str,
+) -> Result<Option<CatalogSessionPreview>, CatalogSessionPreviewError> {
+    validate_project_bucket(project_bucket)
+        .map_err(|_| CatalogSessionPreviewError::InvalidLocation)?;
+    let manager = SessionManager::with_root(sessions_root.join(project_bucket));
+    let (meta, presentation) = match manager.read_preview_artifacts(id) {
+        Ok(artifacts) => artifacts,
+        Err(SessionStoreError::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(classify_preview_error(&error)),
+    };
+    let latest_usage = meta
+        .turn_stats
+        .iter()
+        .rev()
+        .find(|turn| !turn.model_usage.is_empty())
+        .and_then(|turn| turn.model_usage.last());
+    let provider_id = latest_usage
+        .map(|usage| sanitize_preview_line(&usage.provider_id))
+        .filter(|value| !value.is_empty());
+    let model_id = latest_usage
+        .map(|usage| sanitize_preview_line(&usage.model_id))
+        .filter(|value| !value.is_empty());
+    let mut excerpt = std::collections::VecDeque::with_capacity(6);
+    for entry in &presentation.entries {
+        for line in entry.text.lines() {
+            let line = sanitize_preview_line(line);
+            if line.is_empty() {
+                continue;
+            }
+            if excerpt.len() == 6 {
+                excerpt.pop_front();
+            }
+            excerpt.push_back(line);
+        }
+    }
+    Ok(Some(CatalogSessionPreview {
+        session_id: meta.id,
+        project_bucket: project_bucket.to_string(),
+        provider_id,
+        model_id,
+        excerpt: excerpt.into(),
+    }))
+}
+
+fn classify_preview_error(error: &SessionStoreError) -> CatalogSessionPreviewError {
+    match error {
+        SessionStoreError::InvalidId { .. } | SessionStoreError::UnsafeFile { .. } => {
+            CatalogSessionPreviewError::InvalidLocation
+        }
+        SessionStoreError::TooLarge { .. } => CatalogSessionPreviewError::TooLarge,
+        SessionStoreError::FutureSchema { .. } | SessionStoreError::Corrupt { .. } => {
+            CatalogSessionPreviewError::Corrupt
+        }
+        SessionStoreError::NotFound { .. }
+        | SessionStoreError::SessionInUse { .. }
+        | SessionStoreError::AmbiguousId { .. }
+        | SessionStoreError::LeaseMismatch { .. }
+        | SessionStoreError::OwnershipConflict { .. }
+        | SessionStoreError::Io { .. }
+        | SessionStoreError::UncertainCommit { .. } => CatalogSessionPreviewError::Unavailable,
+    }
+}
+
+fn sanitize_preview_line(line: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum Escape {
+        Text,
+        Start,
+        Csi,
+        Osc,
+        OscEscape,
+    }
+
+    let mut state = Escape::Text;
+    let mut clean = String::with_capacity(line.len().min(512));
+    let mut visible = 0usize;
+    for character in line.chars() {
+        state = match state {
+            Escape::Text if character == '\u{1b}' => Escape::Start,
+            Escape::Text => {
+                if character == '\t' && visible < 512 {
+                    clean.push(' ');
+                    visible += 1;
+                } else if !character.is_control() && visible < 512 {
+                    clean.push(character);
+                    visible += 1;
+                }
+                Escape::Text
+            }
+            Escape::Start if character == '[' => Escape::Csi,
+            Escape::Start if character == ']' => Escape::Osc,
+            Escape::Start => Escape::Text,
+            Escape::Csi if ('@'..='~').contains(&character) => Escape::Text,
+            Escape::Csi => Escape::Csi,
+            Escape::Osc if character == '\u{7}' => Escape::Text,
+            Escape::Osc if character == '\u{1b}' => Escape::OscEscape,
+            Escape::Osc => Escape::Osc,
+            Escape::OscEscape if character == '\\' => Escape::Text,
+            Escape::OscEscape => Escape::Osc,
+        };
+    }
+    clean.trim().to_string()
 }
 
 /// Resolve one exact catalog location, converge it to native ownership under an
@@ -3401,6 +3548,137 @@ mod tests {
 
         std::fs::remove_file(manager.presentation_path(id).unwrap()).unwrap();
         assert!(load_catalog_session_view_in_root(dir.path(), &entry).is_err());
+    }
+
+    #[test]
+    fn catalog_preview_is_bounded_sanitized_and_does_not_load_snapshot() {
+        use atomcode_capabilities::session::{ModelUsageStat, TokenBreakdown};
+
+        let root = tempfile::tempdir().unwrap();
+        let bucket = "0123456789abcdef";
+        let id = "preview-native";
+        let manager = SessionManager::with_root(root.path().join(bucket));
+        let lease = manager.acquire_lease(id).unwrap();
+        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+            KernelMessage::user("snapshot must not be loaded"),
+        ]);
+        let mut meta = SessionMeta::new(id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 1;
+        for (turn_id, usage) in [
+            (1, None),
+            (2, Some(("provider-old", "model-old"))),
+            (3, None),
+            (4, Some(("provider-new", "model-new"))),
+        ] {
+            meta.turn_stats.push(TurnStat {
+                after_message: 1,
+                position_valid: true,
+                turn_id,
+                round_count: 1,
+                tool_call_count: 0,
+                duration_ms: 1,
+                total_tokens: 1,
+                errored: false,
+                used_tokens: 1,
+                ctx_window: 128,
+                model_usage: usage
+                    .map(|(provider_id, model_id)| {
+                        vec![ModelUsageStat {
+                            provider_id: provider_id.into(),
+                            model_id: model_id.into(),
+                            tokens: TokenBreakdown {
+                                input: 1,
+                                output: 1,
+                                cached_input: 0,
+                            },
+                        }]
+                    })
+                    .unwrap_or_default(),
+            });
+        }
+        let presentation = PresentationFile {
+            v: PRESENTATION_VERSION,
+            entries: (0..10)
+                .map(|line| PresentationEntry {
+                    anchor: DisplayAnchor::AtStart,
+                    role: PresentationRole::Assistant,
+                    text: if line == 9 {
+                        "tail\u{1b}[31m\u{7}".into()
+                    } else {
+                        format!("line-{line}")
+                    },
+                })
+                .collect(),
+        };
+        manager
+            .commit_native_import(&lease, Some(&snapshot), Some(&presentation), &meta)
+            .unwrap();
+        drop(lease);
+
+        // Poison the snapshot after the aggregate is committed. Preview is a
+        // meta + presentation projection and must remain usable.
+        std::fs::write(manager.snapshot_path(id).unwrap(), b"not-json").unwrap();
+        let preview = preview_catalog_session_in_project_root(root.path(), bucket, id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(preview.session_id, id);
+        assert_eq!(preview.project_bucket, bucket);
+        assert_eq!(preview.provider_id.as_deref(), Some("provider-new"));
+        assert_eq!(preview.model_id.as_deref(), Some("model-new"));
+        assert_eq!(preview.excerpt.len(), 6);
+        assert_eq!(
+            preview.excerpt.first().map(String::as_str),
+            Some("line-4")
+        );
+        assert_eq!(preview.excerpt.last().map(String::as_str), Some("tail"));
+        assert!(preview.excerpt.iter().all(|line| {
+            !line.chars().any(char::is_control) && !line.contains("[31m")
+        }));
+    }
+
+    #[test]
+    fn catalog_preview_returns_typed_sanitized_corrupt_and_oversize_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = "0123456789abcdef";
+        let id = "preview-errors";
+        let manager = SessionManager::with_root(root.path().join(bucket));
+        let lease = manager.acquire_lease(id).unwrap();
+        let mut meta = SessionMeta::new(id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&atomcode_kernel::message::SessionSnapshot::new(Vec::new())),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        drop(lease);
+        let presentation_path = manager.presentation_path(id).unwrap();
+
+        std::fs::write(&presentation_path, b"{not-json").unwrap();
+        let corrupt = preview_catalog_session_in_project_root(root.path(), bucket, id).unwrap_err();
+        assert_eq!(corrupt, CatalogSessionPreviewError::Corrupt);
+        assert_eq!(corrupt.to_string(), "session preview data is corrupt");
+        assert!(!corrupt.to_string().contains(id));
+        assert!(!corrupt
+            .to_string()
+            .contains(&root.path().to_string_lossy().to_string()));
+
+        let file = std::fs::File::create(&presentation_path).unwrap();
+        file.set_len(
+            u64::try_from(
+                atomcode_capabilities::session::presentation::MAX_PRESENTATION_BYTES + 1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let oversized =
+            preview_catalog_session_in_project_root(root.path(), bucket, id).unwrap_err();
+        assert_eq!(oversized, CatalogSessionPreviewError::TooLarge);
+        assert_eq!(oversized.to_string(), "session preview data is too large");
     }
 
     #[test]

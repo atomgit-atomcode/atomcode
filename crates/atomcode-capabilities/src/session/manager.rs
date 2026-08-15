@@ -1724,6 +1724,26 @@ impl SessionManager {
         Ok(presentation)
     }
 
+    /// Read only the bounded sidecars needed by catalog previews. This deliberately
+    /// excludes the conversation snapshot and does not acquire session ownership.
+    pub fn read_preview_artifacts(
+        &self,
+        id: &str,
+    ) -> SessionResult<(SessionMeta, PresentationFile)> {
+        let meta = self.read_meta(id)?;
+        let presentation = match self.read_presentation(id) {
+            Ok(presentation) => presentation,
+            Err(SessionStoreError::NotFound { .. }) => {
+                return Err(SessionStoreError::Corrupt {
+                    kind: "session preview",
+                    message: "presentation sidecar is missing".into(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        Ok((meta, presentation))
+    }
+
     /// Load the complete authoritative native state. A legacy/unconfirmed owner or
     /// any missing artifact is an explicit error; callers must cut over through the
     /// importer instead of manufacturing defaults.

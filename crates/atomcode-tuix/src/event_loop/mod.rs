@@ -48,7 +48,7 @@ use crate::commands::{parse_bash_command, parse_slash_line, CommandRegistry};
 use crate::custom_commands::ArgsRequirement;
 use crate::input::history::History;
 use crate::input::key_action::{classify, Action};
-use crate::input::InputEvent;
+use crate::input::{InputEvent, PointerEvent, PointerKind};
 use crate::render::{Renderer, UiLine};
 use crate::state::{UiPhase, UiState};
 use crate::think::ThinkStripper;
@@ -3806,6 +3806,7 @@ impl AuthObservation {
 }
 
 pub struct LoopCtx {
+    pub(crate) interaction_publisher: crate::render::interaction::InteractionPublisher,
     pub config: Config,
     /// Exact active model selection id. Unlike `model_name`, this remains
     /// unambiguous when two accounts expose the same wire model.
@@ -4014,6 +4015,16 @@ pub struct LoopCtx {
         std::path::PathBuf,
         Result<Vec<crate::session::SessionMeta>, String>,
     )>,
+    pub(crate) session_preview_request_tx:
+        tokio::sync::watch::Sender<Option<bg_runtime::SessionPreviewRequest>>,
+    pub(crate) next_session_preview_generation: u64,
+    pub(crate) session_preview_selection: Option<crate::session::SessionPreviewSelection>,
+    pub(crate) session_preview_result: Option<
+        Result<
+            Option<atomcode_daemon::legacy_convert::CatalogSessionPreview>,
+            atomcode_daemon::legacy_convert::CatalogSessionPreviewError,
+        >,
+    >,
     /// Runtime-owned Rewind points loaded after the double-Esc gesture. The
     /// main loop installs the modal because this event handler does not own
     /// `App::active_modal`.
@@ -4138,9 +4149,23 @@ fn rgba_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
 /// spliced back in when the line is submitted. This keeps the visible
 /// input short (matching CC's paste UX) without truncating what the
 /// agent actually sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EditSelection {
+    anchor: usize,
+    head: usize,
+}
+
+impl EditSelection {
+    fn ordered(self) -> std::ops::Range<usize> {
+        self.anchor.min(self.head)..self.anchor.max(self.head)
+    }
+}
+
 pub struct Buffer {
     pub text: String,
     pub cursor: usize,
+    selection: Option<EditSelection>,
+    pointer_selection_active: bool,
     /// Display width of the input area (in terminal columns), used by
     /// [`cursor_visual_up`] / [`cursor_visual_down`] to navigate by
     /// **visual** (soft-wrapped) lines rather than logical `\n` lines.
@@ -4190,6 +4215,8 @@ impl Buffer {
         Self {
             text: String::new(),
             cursor: 0,
+            selection: None,
+            pointer_selection_active: false,
             // The real width is supplied by `run_loop` before interactive
             // input starts. Until then, disable visual wrapping rather than
             // guessing 80 columns and changing navigation in non-TUI callers.
@@ -4216,6 +4243,7 @@ impl Buffer {
     pub fn set_restored_text(&mut self, text: String) {
         self.cursor = text.len();
         self.text = text;
+        self.clear_selection();
         self.history_idx = None;
         self.searching = false;
         self.search_query.clear();
@@ -4272,6 +4300,7 @@ impl Buffer {
         self.cursor = self.text.len();
         self.history_idx = None;
         self.menu_suppressed = false;
+        self.clear_selection();
         true
     }
 
@@ -4282,6 +4311,98 @@ impl Buffer {
     /// buffer is showing.
     pub fn history_idx(&self) -> Option<usize> {
         self.history_idx
+    }
+
+    fn selected_range(&self) -> Option<std::ops::Range<usize>> {
+        self.selection
+            .map(EditSelection::ordered)
+            .filter(|range| !range.is_empty())
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.pointer_selection_active = false;
+    }
+
+    fn replace_selection(&mut self, replacement: &str) -> bool {
+        let Some(range) = self.selected_range() else {
+            self.clear_selection();
+            return false;
+        };
+        self.text.replace_range(range.clone(), replacement);
+        self.cursor = range.start + replacement.len();
+        self.clear_selection();
+        self.history_idx = None;
+        true
+    }
+
+    fn replace_all_text(&mut self, text: String) {
+        self.text = text;
+        self.cursor = self.text.len();
+        self.clear_selection();
+    }
+
+    fn clear_text(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+        self.clear_selection();
+    }
+
+    fn replace_text_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        replacement: &str,
+    ) -> bool {
+        if range.start > range.end
+            || range.end > self.text.len()
+            || !self.text.is_char_boundary(range.start)
+            || !self.text.is_char_boundary(range.end)
+        {
+            return false;
+        }
+        self.clear_selection();
+        self.text.replace_range(range.clone(), replacement);
+        self.cursor = range.start + replacement.len();
+        true
+    }
+
+    fn insert_at_cursor(&mut self, text: &str) {
+        self.replace_selection("");
+        self.text.insert_str(self.cursor, text);
+        self.cursor += text.len();
+    }
+
+    fn set_pointer_cursor(&mut self, byte: usize, extend: bool) -> bool {
+        if byte > self.text.len() || !self.text.is_char_boundary(byte) {
+            return false;
+        }
+        if extend {
+            if !self.pointer_selection_active {
+                return false;
+            }
+            let anchor = self.selection.map_or(self.cursor, |selection| selection.anchor);
+            self.selection = Some(EditSelection { anchor, head: byte });
+        } else {
+            self.selection = Some(EditSelection {
+                anchor: byte,
+                head: byte,
+            });
+            self.pointer_selection_active = true;
+        }
+        self.cursor = byte;
+        self.history_idx = None;
+        true
+    }
+
+    fn pointer_selection_active(&self) -> bool {
+        self.pointer_selection_active
+    }
+
+    fn end_pointer_selection(&mut self) {
+        self.pointer_selection_active = false;
+        if self.selected_range().is_none() {
+            self.selection = None;
+        }
     }
 
     /// Insert a pasted block. Folds into a `[Pasted …]` placeholder if
@@ -4302,6 +4423,7 @@ impl Buffer {
     /// and the expanded agent payload are in canonical form.
     pub fn insert_paste(&mut self, text: String) -> String {
         let text = normalize_newlines(&text);
+        self.replace_selection("");
         let line_count = text.lines().count().max(1);
         let char_count = text.chars().count();
         if line_count >= PASTE_FOLD_LINES || char_count >= PASTE_FOLD_CHARS {
@@ -4394,12 +4516,14 @@ impl Buffer {
         }
         match action {
             Action::Insert(c) => {
+                self.replace_selection("");
                 self.text.insert(self.cursor, c);
                 self.cursor += c.len_utf8();
                 self.history_idx = None;
                 BufferResult::Redraw
             }
             Action::Submit => {
+                self.clear_selection();
                 // Line continuation: a `\` immediately before the cursor
                 // is consumed and replaced with `\n`. Lets users insert
                 // newlines on terminals that swallow Shift/Ctrl/Alt+Enter
@@ -4438,6 +4562,7 @@ impl Buffer {
                 BufferResult::Commit(line)
             }
             Action::InsertNewline => {
+                self.replace_selection("");
                 self.text.insert(self.cursor, '\n');
                 self.cursor += 1;
                 BufferResult::Redraw
@@ -4448,6 +4573,7 @@ impl Buffer {
                 } else {
                     self.text.clear();
                     self.cursor = 0;
+                    self.clear_selection();
                     self.history_idx = None;
                     self.pastes.clear();
                     BufferResult::Redraw
@@ -4456,10 +4582,14 @@ impl Buffer {
             Action::ClearLine => {
                 self.text.clear();
                 self.cursor = 0;
+                self.clear_selection();
                 self.pastes.clear();
                 BufferResult::Redraw
             }
             Action::DeleteWordBackward => {
+                if self.replace_selection("") {
+                    return BufferResult::Redraw;
+                }
                 let before = &self.text[..self.cursor];
                 let trimmed = before.trim_end_matches(' ');
                 let word_start = trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0);
@@ -4468,6 +4598,9 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::DeleteToEnd => {
+                if self.replace_selection("") {
+                    return BufferResult::Redraw;
+                }
                 let end = self.text[self.cursor..]
                     .find('\n')
                     .map(|i| self.cursor + i)
@@ -4476,6 +4609,9 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::Backspace => {
+                if self.replace_selection("") {
+                    return BufferResult::Redraw;
+                }
                 if self.cursor > 0 {
                     let p = prev_boundary(&self.text, self.cursor);
                     self.text.drain(p..self.cursor);
@@ -4484,6 +4620,9 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::DeleteForward => {
+                if self.replace_selection("") {
+                    return BufferResult::Redraw;
+                }
                 if self.cursor < self.text.len() {
                     let n = next_boundary(&self.text, self.cursor);
                     self.text.drain(self.cursor..n);
@@ -4491,18 +4630,31 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::CursorLeft => {
+                if let Some(range) = self.selected_range() {
+                    self.cursor = range.start;
+                    self.clear_selection();
+                    return BufferResult::Redraw;
+                }
+                self.clear_selection();
                 if self.cursor > 0 {
                     self.cursor = prev_boundary(&self.text, self.cursor);
                 }
                 BufferResult::Redraw
             }
             Action::CursorRight => {
+                if let Some(range) = self.selected_range() {
+                    self.cursor = range.end;
+                    self.clear_selection();
+                    return BufferResult::Redraw;
+                }
+                self.clear_selection();
                 if self.cursor < self.text.len() {
                     self.cursor = next_boundary(&self.text, self.cursor);
                 }
                 BufferResult::Redraw
             }
             Action::LineStart => {
+                self.clear_selection();
                 let start = self.text[..self.cursor]
                     .rfind('\n')
                     .map(|i| i + 1)
@@ -4511,6 +4663,7 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::LineEnd => {
+                self.clear_selection();
                 let end = self.text[self.cursor..]
                     .find('\n')
                     .map(|i| self.cursor + i)
@@ -4519,6 +4672,7 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::HistorySearch => {
+                self.clear_selection();
                 // Enter Ctrl+R reverse-i-search. The current draft is
                 // stashed so Esc restores it; `search_query` seeds from the
                 // draft (readline-style: Ctrl+R on a non-empty line searches
@@ -4537,6 +4691,7 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::HistoryPrev => {
+                self.clear_selection();
                 if history.is_empty() {
                     return BufferResult::Redraw;
                 }
@@ -4577,6 +4732,7 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::HistoryNext => {
+                self.clear_selection();
                 if let Some(i) = self.history_idx {
                     if i + 1 < history.len() {
                         // Still inside history — same cursor-at-0 rule
@@ -4601,6 +4757,7 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::Complete => {
+                self.clear_selection();
                 if self.text.starts_with('/') {
                     let prefix = &self.text[1..];
                     let matches = commands.matching_prefix(prefix);
@@ -4677,6 +4834,7 @@ impl Buffer {
     /// typed; an empty query matches every entry, so the most recent
     /// one is shown (readline behaviour).
     fn search_jump_newest(&mut self, history: &[crate::input::history::HistoryEntry]) {
+        self.clear_selection();
         let q = self.search_query.to_lowercase();
         let hit = (0..history.len())
             .rev()
@@ -4712,6 +4870,7 @@ impl Buffer {
     /// Display history entry `i` as the current search match: rehydrate
     /// text + paste registry and park the cursor (mirrors HistoryPrev).
     fn search_show(&mut self, history: &[crate::input::history::HistoryEntry], i: usize) {
+        self.clear_selection();
         self.history_idx = Some(i);
         self.text = history[i].text.clone();
         self.pastes = history[i].pastes.clone();
@@ -4729,6 +4888,12 @@ impl Buffer {
     /// kicks in but rescues anyone who paged Up to fix a typo on
     /// line 1 from losing their draft.
     pub fn cursor_line_up(&mut self) -> bool {
+        if let Some(range) = self.selected_range() {
+            self.cursor = range.start;
+            self.clear_selection();
+            return true;
+        }
+        self.clear_selection();
         let cur_line_start = self.text[..self.cursor]
             .rfind('\n')
             .map(|i| i + 1)
@@ -4759,6 +4924,12 @@ impl Buffer {
     /// first snaps to end-of-buffer; the keystroke after that hands
     /// off to history.
     pub fn cursor_line_down(&mut self) -> bool {
+        if let Some(range) = self.selected_range() {
+            self.cursor = range.end;
+            self.clear_selection();
+            return true;
+        }
+        self.clear_selection();
         let Some(rel_end) = self.text[self.cursor..].find('\n') else {
             if self.cursor < self.text.len() {
                 self.cursor = self.text.len();
@@ -4875,6 +5046,160 @@ fn byte_offset_at_col(line: &str, target_col: usize) -> usize {
 #[cfg(test)]
 mod buffer_tests {
     use super::*;
+
+    #[test]
+    fn buffer_selection_tracks_utf8_grapheme_boundaries_in_both_directions() {
+        let mut buf = Buffer::new();
+        buf.text = "a你好👩‍💻z".into();
+        let after_ascii = "a".len();
+        let after_emoji = "a你好👩‍💻".len();
+
+        buf.set_pointer_cursor(after_ascii, false);
+        buf.set_pointer_cursor(after_emoji, true);
+        assert_eq!(buf.selected_range(), Some(after_ascii..after_emoji));
+        assert_eq!(buf.cursor, after_emoji);
+
+        buf.set_pointer_cursor(after_emoji, false);
+        buf.set_pointer_cursor(after_ascii, true);
+        assert_eq!(buf.selected_range(), Some(after_ascii..after_emoji));
+        assert_eq!(buf.cursor, after_ascii);
+    }
+
+    #[test]
+    fn buffer_selection_is_replaced_by_typing_backspace_delete_and_paste() {
+        let history = Vec::new();
+        let commands = CommandRegistry::builtin();
+
+        let mut typed = Buffer::new();
+        typed.text = "abcde".into();
+        typed.set_pointer_cursor(1, false);
+        typed.set_pointer_cursor(4, true);
+        assert!(matches!(
+            typed.apply(Action::Insert('X'), &history, &commands),
+            BufferResult::Redraw
+        ));
+        assert_eq!((typed.text.as_str(), typed.cursor), ("aXe", 2));
+        assert_eq!(typed.selected_range(), None);
+
+        for action in [Action::Backspace, Action::DeleteForward] {
+            let mut deleted = Buffer::new();
+            deleted.text = "abcde".into();
+            deleted.set_pointer_cursor(1, false);
+            deleted.set_pointer_cursor(4, true);
+            assert!(matches!(
+                deleted.apply(action, &history, &commands),
+                BufferResult::Redraw
+            ));
+            assert_eq!((deleted.text.as_str(), deleted.cursor), ("ae", 1));
+            assert_eq!(deleted.selected_range(), None);
+        }
+
+        let mut pasted = Buffer::new();
+        pasted.text = "abcde".into();
+        pasted.set_pointer_cursor(1, false);
+        pasted.set_pointer_cursor(4, true);
+        assert_eq!(pasted.insert_paste("ZZ".into()), "ZZ");
+        assert_eq!((pasted.text.as_str(), pasted.cursor), ("aZZe", 3));
+        assert_eq!(pasted.selected_range(), None);
+    }
+
+    #[test]
+    fn buffer_selection_collapses_to_the_directional_cursor_edge() {
+        let history = Vec::new();
+        let commands = CommandRegistry::builtin();
+
+        let mut left = Buffer::new();
+        left.text = "abcde".into();
+        left.set_pointer_cursor(1, false);
+        left.set_pointer_cursor(4, true);
+        let _ = left.apply(Action::CursorLeft, &history, &commands);
+        assert_eq!(left.cursor, 1);
+        assert_eq!(left.selected_range(), None);
+
+        let mut right = Buffer::new();
+        right.text = "abcde".into();
+        right.set_pointer_cursor(4, false);
+        right.set_pointer_cursor(1, true);
+        let _ = right.apply(Action::CursorRight, &history, &commands);
+        assert_eq!(right.cursor, 4);
+        assert_eq!(right.selected_range(), None);
+    }
+
+    #[test]
+    fn buffer_selection_clears_on_history_recall_and_submit() {
+        let commands = CommandRegistry::builtin();
+        let history = vec![crate::input::history::HistoryEntry {
+            text: "recalled".into(),
+            images: Vec::new(),
+            pastes: Vec::new(),
+        }];
+        let mut recalled = Buffer::new();
+        recalled.text = "draft".into();
+        recalled.set_pointer_cursor(1, false);
+        recalled.set_pointer_cursor(4, true);
+        let _ = recalled.apply(Action::HistoryPrev, &history, &commands);
+        assert_eq!(recalled.text, "recalled");
+        assert_eq!(recalled.selected_range(), None);
+
+        let mut submitted = Buffer::new();
+        submitted.text = "submit me".into();
+        submitted.set_pointer_cursor(0, false);
+        submitted.set_pointer_cursor(6, true);
+        assert!(matches!(
+            submitted.apply(Action::Submit, &[], &commands),
+            BufferResult::Commit(line) if line == "submit me"
+        ));
+        assert_eq!(submitted.selected_range(), None);
+    }
+
+    #[test]
+    fn buffer_selection_replacing_a_folded_paste_cannot_expand_stale_metadata() {
+        let mut buf = Buffer::new();
+        let original = "fold me\n".repeat(PASTE_FOLD_LINES);
+        let placeholder = buf.insert_paste(original.clone());
+        assert!(placeholder.starts_with("[Pasted #1 "));
+        assert_eq!(buf.expanded_text(), original);
+
+        buf.set_pointer_cursor(0, false);
+        buf.set_pointer_cursor(buf.text.len(), true);
+        let _ = buf.apply(Action::Insert('X'), &[], &CommandRegistry::builtin());
+
+        assert_eq!(buf.text, "X");
+        assert_eq!(buf.expanded_text(), "X");
+        assert_eq!(buf.selected_range(), None);
+    }
+
+    #[test]
+    fn buffer_selection_skill_enter_clear_then_typing_has_no_stale_range() {
+        let mut buf = Buffer::new();
+        buf.replace_all_text("$br".into());
+        buf.set_pointer_cursor(0, false);
+        buf.set_pointer_cursor(2, true);
+
+        assert_eq!(
+            apply_skill_menu_buffer_selection(&mut buf, "brainstorming", KeyCode::Enter),
+            SkillMenuBufferResult::Committed("$brainstorming".into())
+        );
+        let _ = buf.apply(Action::Insert('x'), &[], &CommandRegistry::builtin());
+
+        assert_eq!(buf.text, "x");
+        assert_eq!(buf.cursor, 1);
+        assert_eq!(buf.selected_range(), None);
+    }
+
+    #[test]
+    fn buffer_image_marker_insertion_replaces_the_active_selection() {
+        let mut buf = Buffer::new();
+        buf.replace_all_text("abc".into());
+        buf.set_pointer_cursor(1, false);
+        buf.set_pointer_cursor(2, true);
+
+        buf.insert_at_cursor("[Image #1]");
+
+        assert_eq!(buf.text, "a[Image #1]c");
+        assert_eq!(buf.cursor, "a[Image #1]".len());
+        assert_eq!(buf.selected_range(), None);
+    }
 
     #[test]
     fn second_esc_within_window_triggers_undo() {
@@ -8333,6 +8658,17 @@ pub struct App {
     /// Accumulates reasoning/thinking content for display in verbose mode.
     /// Flushed on newline or when buffer exceeds threshold.
     pub reasoning_buffer: String,
+    transcript_selection: Option<TranscriptSelectionState>,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptSelectionState {
+    generation: u64,
+    surface_session: u64,
+    anchor: crate::render::interaction::SemanticEndpoint,
+    head: crate::render::interaction::SemanticEndpoint,
+    surviving_run_ids: Vec<u64>,
+    dragging: bool,
 }
 
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
@@ -8446,6 +8782,7 @@ impl App {
             esc_undo_last_at: None,
             setup_pending: false,
             reasoning_buffer: String::new(),
+            transcript_selection: None,
         }
     }
 }
@@ -9146,6 +9483,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             maybe = ctx.runtime_event_rx.recv() => {
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let event_render_effect = runtime_event_render_effect(
+                        ctx.session_preview_selection.as_ref(),
+                        &runtime_event.event,
+                    );
+                    let redraw_policy = runtime_event_redraw_policy(
+                        event_render_effect,
+                        app.active_modal
+                            .as_ref()
+                            .is_some_and(|modal| modal.accepts_session_preview()),
+                    );
                     let redraw_modal_after_terminal =
                         is_provider_reload_terminal(&runtime_event.event);
                     let provider_reload_failed =
@@ -9195,7 +9542,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     }
-                    if matches!(app.state.phase, UiPhase::Idle) {
+                    if matches!(app.state.phase, UiPhase::Idle)
+                        && redraw_policy == RuntimeEventRedrawPolicy::Default
+                    {
                         // The end of a turn is the first safe provider reload
                         // boundary. Reconcile before draining type-ahead so the
                         // next queued message cannot start on the stale model.
@@ -9238,6 +9587,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         } else {
                             crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
                             redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                        }
+                    }
+                    if redraw_policy == RuntimeEventRedrawPolicy::ActiveModal {
+                        if let Some(modal) = app.active_modal.as_ref() {
+                            modal.draw(&app.buf, &app.state, &ctx, renderer);
                         }
                     }
                     if redraw_modal_after_terminal {
@@ -9548,6 +9902,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             maybe = ctx.runtime_event_rx.recv() => {
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let event_render_effect = runtime_event_render_effect(
+                        ctx.session_preview_selection.as_ref(),
+                        &runtime_event.event,
+                    );
+                    let redraw_policy = runtime_event_redraw_policy(
+                        event_render_effect,
+                        app.active_modal
+                            .as_ref()
+                            .is_some_and(|modal| modal.accepts_session_preview()),
+                    );
                     let redraw_modal_after_terminal =
                         is_provider_reload_terminal(&runtime_event.event);
                     let provider_reload_failed =
@@ -9597,7 +9961,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     }
-                    if matches!(app.state.phase, UiPhase::Idle) {
+                    if matches!(app.state.phase, UiPhase::Idle)
+                        && redraw_policy == RuntimeEventRedrawPolicy::Default
+                    {
                         let config_redraw = poll_shared_state(&mut ctx, renderer);
                         if !app.queue_drain_authorized {
                             redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
@@ -9633,6 +9999,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         } else {
                             crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
                             redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                        }
+                    }
+                    if redraw_policy == RuntimeEventRedrawPolicy::ActiveModal {
+                        if let Some(modal) = app.active_modal.as_ref() {
+                            modal.draw(&app.buf, &app.state, &ctx, renderer);
                         }
                     }
                     if redraw_modal_after_terminal {
@@ -11323,8 +11694,7 @@ fn attach_image_to_input(
     app.state.pending_image_markers.push(n);
     cache_write_image(&crate::platform::image_cache_dir(), &img, hash);
     let marker = format!("[Image #{}]", n);
-    app.buf.text.insert_str(app.buf.cursor, &marker);
-    app.buf.cursor += marker.len();
+    app.buf.insert_at_cursor(&marker);
     if matches!(app.state.phase, UiPhase::Streaming) {
         draw_spinner_now(
             &mut app.state,
@@ -11552,6 +11922,712 @@ fn handle_paste_command(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerRoute {
+    ScrollBody(i32),
+    Ignored,
+}
+
+fn route_pointer(event: PointerEvent) -> PointerRoute {
+    if event.shift && matches!(event.kind, PointerKind::Drag) {
+        return PointerRoute::Ignored;
+    }
+
+    match event.kind {
+        PointerKind::Scroll(delta) => PointerRoute::ScrollBody(i32::from(delta)),
+        PointerKind::Down | PointerKind::Up | PointerKind::Drag | PointerKind::Move => {
+            PointerRoute::Ignored
+        }
+    }
+}
+
+fn apply_pointer_event(event: PointerEvent, renderer: &mut dyn Renderer) {
+    match route_pointer(event) {
+        PointerRoute::ScrollBody(delta) => renderer.scroll_body(delta),
+        PointerRoute::Ignored => {}
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerPointerRoute {
+    Ignored,
+    Handled,
+    Redraw,
+}
+
+fn transcript_endpoint_index(
+    runs: &[crate::render::interaction::CopyRun],
+    endpoint: crate::render::interaction::SemanticEndpoint,
+) -> Option<usize> {
+    runs.iter().position(|run| run.id == endpoint.run_id)
+}
+
+fn extract_transcript_selection(
+    runs: &[crate::render::interaction::CopyRun],
+    anchor: crate::render::interaction::SemanticEndpoint,
+    head: crate::render::interaction::SemanticEndpoint,
+) -> Option<String> {
+    let anchor_index = transcript_endpoint_index(runs, anchor)?;
+    let head_index = transcript_endpoint_index(runs, head)?;
+    let (start_index, start_byte, end_index, end_byte) =
+        if (anchor_index, anchor.byte) <= (head_index, head.byte) {
+            (anchor_index, anchor.byte, head_index, head.byte)
+        } else {
+            (head_index, head.byte, anchor_index, anchor.byte)
+        };
+    let start_run = &runs[start_index];
+    let end_run = &runs[end_index];
+    if start_byte > start_run.text.len()
+        || end_byte > end_run.text.len()
+        || !start_run.text.is_char_boundary(start_byte)
+        || !end_run.text.is_char_boundary(end_byte)
+    {
+        return None;
+    }
+
+    let mut output = String::new();
+    for index in start_index..=end_index {
+        let run = &runs[index];
+        let from = if index == start_index { start_byte } else { 0 };
+        let to = if index == end_index {
+            end_byte
+        } else {
+            run.text.len()
+        };
+        if from > to || !run.text.is_char_boundary(from) || !run.text.is_char_boundary(to) {
+            return None;
+        }
+        output.extend(run.text[from..to].chars().filter(|character| {
+            *character == '\n' || *character == '\t' || !character.is_control()
+        }));
+        if index < end_index
+            && (!run.soft_wrap || run.next_run_id != Some(runs[index + 1].id))
+        {
+            output.push('\n');
+        }
+    }
+    Some(output)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TranscriptPointerRoute {
+    Ignored,
+    Handled,
+    Redraw,
+    Copy(String),
+}
+
+fn publish_transcript_selection(
+    state: Option<&TranscriptSelectionState>,
+    publisher: &crate::render::interaction::InteractionPublisher,
+) {
+    publisher.set_transcript_selection(state.map(|state| {
+        crate::render::interaction::TranscriptSelection {
+            anchor: state.anchor,
+            head: state.head,
+            run_ids: state.surviving_run_ids.clone().into(),
+        }
+    }));
+}
+
+fn clamp_endpoint_to_runs(
+    endpoint: crate::render::interaction::SemanticEndpoint,
+    runs: &[crate::render::interaction::CopyRun],
+    allowed: &[u64],
+) -> Option<crate::render::interaction::SemanticEndpoint> {
+    let run = runs
+        .iter()
+        .filter(|run| allowed.contains(&run.id))
+        .min_by_key(|run| run.id.abs_diff(endpoint.run_id))?;
+    let mut byte = endpoint.byte.min(run.text.len());
+    while byte > 0 && !run.text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    Some(crate::render::interaction::SemanticEndpoint {
+        run_id: run.id,
+        byte,
+    })
+}
+
+fn reconcile_transcript_selection(
+    selection: &mut TranscriptSelectionState,
+    frame: &crate::render::interaction::InteractionFrame,
+) -> bool {
+    if selection.surface_session != frame.surface_session {
+        return false;
+    }
+    if selection.generation == frame.generation {
+        return true;
+    }
+    selection
+        .surviving_run_ids
+        .retain(|id| frame.copy_runs.iter().any(|run| run.id == *id));
+    let Some(anchor) = clamp_endpoint_to_runs(
+        selection.anchor,
+        &frame.copy_runs,
+        &selection.surviving_run_ids,
+    ) else {
+        return false;
+    };
+    let Some(head) = clamp_endpoint_to_runs(
+        selection.head,
+        &frame.copy_runs,
+        &selection.surviving_run_ids,
+    ) else {
+        return false;
+    };
+    selection.anchor = anchor;
+    selection.head = head;
+    selection.generation = frame.generation;
+    true
+}
+
+fn handle_transcript_pointer(
+    selection: &mut Option<TranscriptSelectionState>,
+    publisher: &crate::render::interaction::InteractionPublisher,
+    event: PointerEvent,
+    frame: &crate::render::interaction::InteractionFrame,
+    target: Option<crate::render::interaction::HitTarget>,
+) -> TranscriptPointerRoute {
+    use crate::render::interaction::{HitTarget, SemanticEndpoint};
+    if event.shift || event.button != Some(crate::input::PointerButton::Primary) {
+        return TranscriptPointerRoute::Ignored;
+    }
+    let endpoint = match target {
+        Some(HitTarget::TranscriptByte { run_id, byte }) => Some(SemanticEndpoint { run_id, byte }),
+        _ => None,
+    };
+    match event.kind {
+        PointerKind::Down => {
+            let Some(endpoint) = endpoint else {
+                return TranscriptPointerRoute::Ignored;
+            };
+            *selection = Some(TranscriptSelectionState {
+                generation: frame.generation,
+                surface_session: frame.surface_session,
+                anchor: endpoint,
+                head: endpoint,
+                surviving_run_ids: frame.copy_runs.iter().map(|run| run.id).collect(),
+                dragging: true,
+            });
+            publish_transcript_selection(selection.as_ref(), publisher);
+            TranscriptPointerRoute::Handled
+        }
+        PointerKind::Drag => {
+            let Some(state) = selection.as_mut().filter(|state| state.dragging) else {
+                return TranscriptPointerRoute::Ignored;
+            };
+            if !reconcile_transcript_selection(state, frame) {
+                *selection = None;
+                publish_transcript_selection(None, publisher);
+                return TranscriptPointerRoute::Redraw;
+            }
+            if let Some(endpoint) = endpoint.filter(|endpoint| {
+                state.surviving_run_ids.contains(&endpoint.run_id)
+            }) {
+                state.head = endpoint;
+            }
+            publish_transcript_selection(selection.as_ref(), publisher);
+            TranscriptPointerRoute::Redraw
+        }
+        PointerKind::Up => {
+            let Some(state) = selection.as_mut().filter(|state| state.dragging) else {
+                return TranscriptPointerRoute::Ignored;
+            };
+            state.dragging = false;
+            if !reconcile_transcript_selection(state, frame) {
+                *selection = None;
+                publish_transcript_selection(None, publisher);
+                return TranscriptPointerRoute::Handled;
+            }
+            if let Some(endpoint) = endpoint.filter(|endpoint| {
+                state.surviving_run_ids.contains(&endpoint.run_id)
+            }) {
+                state.head = endpoint;
+            }
+            let anchor = state.anchor;
+            let head = state.head;
+            let surviving_runs: Vec<_> = frame
+                .copy_runs
+                .iter()
+                .filter(|run| state.surviving_run_ids.contains(&run.id))
+                .cloned()
+                .collect();
+            publish_transcript_selection(selection.as_ref(), publisher);
+            extract_transcript_selection(&surviving_runs, anchor, head)
+                .filter(|text| !text.is_empty())
+                .map_or(
+                    TranscriptPointerRoute::Redraw,
+                    TranscriptPointerRoute::Copy,
+                )
+        }
+        PointerKind::Move | PointerKind::Scroll(_) => TranscriptPointerRoute::Ignored,
+    }
+}
+
+fn finish_transcript_pointer_capture(
+    selection: &mut Option<TranscriptSelectionState>,
+    publisher: &crate::render::interaction::InteractionPublisher,
+) -> TranscriptPointerRoute {
+    let Some(state) = selection.as_mut().filter(|state| state.dragging) else {
+        return TranscriptPointerRoute::Ignored;
+    };
+    state.dragging = false;
+    let frame = publisher.snapshot();
+    if publisher
+        .worker_authority()
+        .is_some_and(|(_, surface_session)| surface_session != state.surface_session)
+        || !reconcile_transcript_selection(state, &frame)
+    {
+        *selection = None;
+        publish_transcript_selection(None, publisher);
+        return TranscriptPointerRoute::Handled;
+    }
+    let anchor = state.anchor;
+    let head = state.head;
+    let surviving_runs: Vec<_> = frame
+        .copy_runs
+        .iter()
+        .filter(|run| state.surviving_run_ids.contains(&run.id))
+        .cloned()
+        .collect();
+    publish_transcript_selection(selection.as_ref(), publisher);
+    extract_transcript_selection(&surviving_runs, anchor, head)
+        .filter(|text| !text.is_empty())
+        .map_or(TranscriptPointerRoute::Redraw, TranscriptPointerRoute::Copy)
+}
+
+fn sync_composer_selection(
+    buf: &Buffer,
+    publisher: &crate::render::interaction::InteractionPublisher,
+) {
+    publisher.set_composer_selection(&buf.text, buf.selected_range());
+}
+
+fn cleanup_composer_pointer_capture(
+    buf: &mut Buffer,
+    publisher: &crate::render::interaction::InteractionPublisher,
+) {
+    buf.end_pointer_selection();
+    sync_composer_selection(buf, publisher);
+}
+
+fn handle_composer_pointer(
+    buf: &mut Buffer,
+    publisher: &crate::render::interaction::InteractionPublisher,
+    event: PointerEvent,
+    byte: usize,
+) -> ComposerPointerRoute {
+    if event.shift || event.button != Some(crate::input::PointerButton::Primary) {
+        return ComposerPointerRoute::Ignored;
+    }
+    let route = match event.kind {
+        PointerKind::Down if buf.set_pointer_cursor(byte, false) => {
+            ComposerPointerRoute::Handled
+        }
+        PointerKind::Drag if buf.set_pointer_cursor(byte, true) => {
+            ComposerPointerRoute::Handled
+        }
+        PointerKind::Up if buf.pointer_selection_active() => {
+            let _ = buf.set_pointer_cursor(byte, true);
+            buf.end_pointer_selection();
+            ComposerPointerRoute::Redraw
+        }
+        PointerKind::Down | PointerKind::Up | PointerKind::Drag => ComposerPointerRoute::Ignored,
+        PointerKind::Move | PointerKind::Scroll(_) => ComposerPointerRoute::Ignored,
+    };
+    if route != ComposerPointerRoute::Ignored {
+        sync_composer_selection(buf, publisher);
+    }
+    route
+}
+
+fn handle_pointer_hit(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    event: PointerEvent,
+    frame: &crate::render::interaction::InteractionFrame,
+) -> Result<()> {
+    let target = frame.hit(event.row, event.col);
+    let transcript_route = handle_transcript_pointer(
+        &mut app.transcript_selection,
+        &ctx.interaction_publisher,
+        event,
+        frame,
+        target,
+    );
+    if apply_transcript_pointer_route(app, ctx, renderer, transcript_route)? {
+        return Ok(());
+    }
+    match route_active_composer_pointer(
+        &mut app.buf,
+        &ctx.interaction_publisher,
+        &mut app.menu,
+        event,
+        target,
+    ) {
+        ComposerPointerRoute::Redraw => {
+            redraw_after_composer_pointer(app, ctx, renderer);
+            return Ok(());
+        }
+        ComposerPointerRoute::Handled => return Ok(()),
+        ComposerPointerRoute::Ignored => {}
+    }
+    let Some(target) = target else {
+        app.menu.pointer_cancel();
+        return Ok(());
+    };
+    let click = match event.kind {
+        PointerKind::Down => app.menu.pointer_press(target, frame.surface_session),
+        PointerKind::Up => app.menu.pointer_release(target, frame.surface_session),
+        PointerKind::Drag | PointerKind::Move | PointerKind::Scroll(_) => {
+            return Ok(());
+        }
+    };
+    let pointer_action = match click {
+        PointerClickAction::Select(crate::render::interaction::HitTarget::ModalItem { index }) => {
+            Some(crate::modals::ModalPointerAction::Select(index))
+        }
+        PointerClickAction::Confirm(crate::render::interaction::HitTarget::ModalItem { index }) => {
+            Some(crate::modals::ModalPointerAction::Confirm(index))
+        }
+        PointerClickAction::Select(crate::render::interaction::HitTarget::ModalCancel)
+        | PointerClickAction::Confirm(crate::render::interaction::HitTarget::ModalCancel) => {
+            Some(crate::modals::ModalPointerAction::Cancel)
+        }
+        _ => None,
+    };
+    if let Some(action) = pointer_action {
+        if matches!(app.state.phase, UiPhase::Idle) {
+            if let Some(modal) = app.active_modal.as_mut() {
+                let outcome =
+                    modal.handle_pointer(action, &mut app.buf, &mut app.state, ctx, renderer)?;
+                if outcome == crate::modals::ModalAction::Close {
+                    app.menu.pointer_cancel();
+                    app.active_modal = None;
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                }
+            }
+        }
+        return Ok(());
+    }
+    match click {
+        PointerClickAction::Select(crate::render::interaction::HitTarget::MenuItem { index }) => {
+            let Some(items) = menu_for_display(&app.buf, ctx) else {
+                return Ok(());
+            };
+            let buf = &app.buf;
+            let state = &app.state;
+            app.menu.pointer_select_with(index, items.len(), |selected| {
+                redraw_with_menu(buf, &items, selected, state, ctx, renderer)
+            });
+        }
+        PointerClickAction::Confirm(crate::render::interaction::HitTarget::MenuItem { index }) => {
+            let Some(items) = menu_for_display(&app.buf, ctx) else {
+                return Ok(());
+            };
+            app.menu.select_index(index, items.len());
+            let commit_gate_pending = idle_commit_gate_pending(ctx);
+            if let Some(result) = handle_pointer_menu_confirmation(
+                app,
+                |app| &mut app.menu,
+                commit_gate_pending,
+                items.len(),
+                |app, selected| confirm_idle_menu_selected(app, ctx, renderer, &items, selected),
+            ) {
+                result?;
+            }
+        }
+        PointerClickAction::None
+        | PointerClickAction::Select(_)
+        | PointerClickAction::Confirm(_) => {}
+    }
+    Ok(())
+}
+
+fn apply_transcript_pointer_route(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    route: TranscriptPointerRoute,
+) -> Result<bool> {
+    match route {
+        TranscriptPointerRoute::Copy(text) => {
+            redraw_after_composer_pointer(app, ctx, renderer);
+            let allow_osc52 = transcript_osc52_allowed(&ctx.caps);
+            if crate::event_loop::commands::copy_text_to_clipboard(&text, allow_osc52).is_err() {
+                let notice = crate::sanitize::scrub_controls(&crate::i18n::t(
+                    crate::i18n::Msg::CopyFailed,
+                ));
+                renderer.render(UiLine::Warning(notice));
+                renderer.flush();
+            }
+            app.menu.pointer_cancel();
+            Ok(true)
+        }
+        TranscriptPointerRoute::Redraw => {
+            redraw_after_composer_pointer(app, ctx, renderer);
+            app.menu.pointer_cancel();
+            Ok(true)
+        }
+        TranscriptPointerRoute::Handled => {
+            app.menu.pointer_cancel();
+            Ok(true)
+        }
+        TranscriptPointerRoute::Ignored => Ok(false),
+    }
+}
+
+fn transcript_osc52_allowed(caps: &crate::terminal::TerminalCaps) -> bool {
+    caps.osc52_clipboard
+}
+
+fn route_active_composer_pointer(
+    buf: &mut Buffer,
+    publisher: &crate::render::interaction::InteractionPublisher,
+    menu: &mut MenuState,
+    event: PointerEvent,
+    target: Option<crate::render::interaction::HitTarget>,
+) -> ComposerPointerRoute {
+    let route = if event.kind == PointerKind::Up && buf.pointer_selection_active() {
+        if let Some(crate::render::interaction::HitTarget::ComposerByte { byte }) = target {
+            handle_composer_pointer(buf, publisher, event, byte)
+        } else {
+            handle_composer_pointer_release(buf, publisher, event)
+        }
+    } else if let Some(crate::render::interaction::HitTarget::ComposerByte { byte }) = target {
+        handle_composer_pointer(buf, publisher, event, byte)
+    } else {
+        ComposerPointerRoute::Ignored
+    };
+    if route != ComposerPointerRoute::Ignored {
+        menu.pointer_cancel();
+    }
+    route
+}
+
+fn redraw_after_composer_pointer(app: &mut App, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+    if matches!(app.state.phase, UiPhase::Idle) {
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    } else {
+        draw_spinner_now(
+            &mut app.state,
+            &app.buf,
+            ctx,
+            renderer,
+            app.message_queue.len(),
+            app.menu.selected,
+        );
+    }
+}
+
+fn finish_composer_pointer_capture(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    event: PointerEvent,
+) -> bool {
+    if handle_composer_pointer_release(
+        &mut app.buf,
+        &ctx.interaction_publisher,
+        event,
+    ) != ComposerPointerRoute::Redraw
+    {
+        return false;
+    }
+    app.menu.pointer_cancel();
+    redraw_after_composer_pointer(app, ctx, renderer);
+    true
+}
+
+fn handle_composer_pointer_release(
+    buf: &mut Buffer,
+    publisher: &crate::render::interaction::InteractionPublisher,
+    event: PointerEvent,
+) -> ComposerPointerRoute {
+    if event.shift
+        || event.button != Some(crate::input::PointerButton::Primary)
+        || event.kind != PointerKind::Up
+        || !buf.pointer_selection_active()
+    {
+        return ComposerPointerRoute::Ignored;
+    }
+    buf.end_pointer_selection();
+    sync_composer_selection(buf, publisher);
+    ComposerPointerRoute::Redraw
+}
+
+fn handle_pointer_menu_confirmation<S, R>(
+    state: &mut S,
+    menu_for_state: impl for<'a> Fn(&'a mut S) -> &'a mut MenuState,
+    commit_gate_pending: bool,
+    item_count: usize,
+    execute: impl FnOnce(&mut S, usize) -> R,
+) -> Option<R> {
+    let selected = {
+        let menu = menu_for_state(state);
+        if !menu.pointer_confirmation_allowed(commit_gate_pending) {
+            return None;
+        }
+        menu.confirm_selected(item_count)?
+    };
+    Some(execute(state, selected))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerPreflightRoute {
+    ScrollContinue,
+    PointerContinue,
+    ComposerCleanup,
+    TranscriptCleanup,
+    ReturnIgnored,
+    NotPointer,
+}
+
+fn pointer_input_route(
+    event: &InputEvent,
+    interaction: Option<&crate::render::interaction::InteractionFrame>,
+    menu: &mut MenuState,
+    composer_pointer_active: bool,
+    transcript_pointer_active: bool,
+) -> PointerPreflightRoute {
+    if composer_pointer_active
+        && matches!(
+            event,
+            InputEvent::Pointer(PointerEvent {
+                kind: PointerKind::Up,
+                button: Some(crate::input::PointerButton::Primary),
+                shift: true,
+                ..
+            })
+        )
+    {
+        return PointerPreflightRoute::ComposerCleanup;
+    }
+    if transcript_pointer_active
+        && matches!(
+            event,
+            InputEvent::Pointer(PointerEvent {
+                kind: PointerKind::Up,
+                button: Some(crate::input::PointerButton::Primary),
+                shift: true,
+                ..
+            })
+        )
+    {
+        return PointerPreflightRoute::TranscriptCleanup;
+    }
+    let pointer_actionable = match event {
+        InputEvent::Pointer(pointer)
+            if !pointer.shift
+                && pointer.button == Some(crate::input::PointerButton::Primary)
+                && matches!(
+                    pointer.kind,
+                    PointerKind::Down | PointerKind::Up | PointerKind::Drag
+                ) =>
+        {
+            (pointer.kind == PointerKind::Up
+                && (composer_pointer_active || transcript_pointer_active))
+                || interaction.is_some_and(|interaction| {
+                let hit = interaction.hit(pointer.row, pointer.col);
+                match pointer.kind {
+                    PointerKind::Drag => matches!(
+                        hit,
+                        Some(crate::render::interaction::HitTarget::ComposerByte { .. })
+                            | Some(crate::render::interaction::HitTarget::TranscriptByte { .. })
+                    ),
+                    PointerKind::Down => hit.is_some(),
+                    PointerKind::Up => hit.is_some() || menu.has_pointer_press(),
+                    PointerKind::Move | PointerKind::Scroll(_) => false,
+                }
+                })
+        }
+        _ => false,
+    };
+    if cancel_unactionable_pointer_release(event, pointer_actionable, menu) {
+        return PointerPreflightRoute::ReturnIgnored;
+    }
+    pointer_preflight_route(event, pointer_actionable)
+}
+
+fn pointer_preflight_route(event: &InputEvent, pointer_actionable: bool) -> PointerPreflightRoute {
+    match event {
+        InputEvent::Pointer(PointerEvent {
+            kind: PointerKind::Scroll(_),
+            ..
+        }) => PointerPreflightRoute::ScrollContinue,
+        InputEvent::Pointer(_) if pointer_actionable => PointerPreflightRoute::PointerContinue,
+        InputEvent::Pointer(_) => PointerPreflightRoute::ReturnIgnored,
+        _ => PointerPreflightRoute::NotPointer,
+    }
+}
+
+fn handle_input_preflight_with_transcript(
+    event: &InputEvent,
+    interaction: Option<&crate::render::interaction::InteractionFrame>,
+    menu: &mut MenuState,
+    composer_pointer_active: bool,
+    transcript_pointer_active: bool,
+    run_general_prelude: impl FnOnce(),
+) -> PointerPreflightRoute {
+    let route = pointer_input_route(
+        event,
+        interaction,
+        menu,
+        composer_pointer_active,
+        transcript_pointer_active,
+    );
+    if !matches!(
+        route,
+        PointerPreflightRoute::ReturnIgnored
+            | PointerPreflightRoute::ComposerCleanup
+            | PointerPreflightRoute::TranscriptCleanup
+    ) {
+        run_general_prelude();
+    }
+    route
+}
+
+#[cfg(test)]
+fn handle_input_preflight(
+    event: &InputEvent,
+    interaction: Option<&crate::render::interaction::InteractionFrame>,
+    menu: &mut MenuState,
+    composer_pointer_active: bool,
+    run_general_prelude: impl FnOnce(),
+) -> PointerPreflightRoute {
+    handle_input_preflight_with_transcript(
+        event,
+        interaction,
+        menu,
+        composer_pointer_active,
+        false,
+        run_general_prelude,
+    )
+}
+
+fn cancel_unactionable_pointer_release(
+    event: &InputEvent,
+    pointer_actionable: bool,
+    menu: &mut MenuState,
+) -> bool {
+    let cancel = !pointer_actionable
+        && matches!(
+            event,
+            InputEvent::Pointer(PointerEvent {
+                kind: PointerKind::Up,
+                button: Some(crate::input::PointerButton::Primary),
+                ..
+            })
+        )
+        && menu.has_pointer_press();
+    if cancel {
+        menu.pointer_cancel();
+    }
+    cancel
+}
+
 fn handle_input(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -11560,50 +12636,79 @@ fn handle_input(
 ) -> Result<()> {
     use crate::modals::ModalAction;
 
-    let has_non_capturing_modal = app
-        .active_modal
-        .as_ref()
-        .is_some_and(|modal| !modal.captures_all_keys());
-    let has_replay_payload = !app.message_queue.is_empty() || !app.state.pending_steers.is_empty();
-    if should_release_stale_modal_interrupt_wait(
-        app.state.phase,
-        app.interrupt_drain_pending,
-        has_non_capturing_modal,
-        ctx.runtime.has_active_turn(),
-        has_replay_payload,
-    ) {
-        crate::tuix_trace!(
-            "KEY",
-            "release stale interrupt wait before routing visible modal"
-        );
-        app.interrupt_drain_pending = false;
-        app.state.phase = UiPhase::Idle;
-    }
-
-    if matches!(app.state.phase, UiPhase::Idle)
-        && app.active_modal.is_none()
-        && poll_shared_state(ctx, renderer)
-    {
-        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
-    }
-    // `/codingplan` has extra warning/quota caches beyond the generic config.
-    refresh_after_cross_process_codingplan_sync(ctx);
-
-    crate::tuix_trace!(
-        "IN",
-        "phase={:?} modal={} qlen={} ev={}",
-        app.state.phase,
-        app.active_modal.is_some(),
-        app.message_queue.len(),
-        match &ev {
-            InputEvent::Paste(t) => format!("paste({})", t.len()),
-            InputEvent::Eof => "eof".into(),
-            InputEvent::FocusChanged(focused) => format!("focus({focused})"),
-            InputEvent::Key(k) => format!("key({:?},{:?})", k.kind, k.code),
-            InputEvent::Resize(w, h) => format!("resize({}x{})", w, h),
-            InputEvent::MouseScroll(d) => format!("mouse_scroll({})", d),
+    let interaction = ctx.interaction_publisher.snapshot_actionable();
+    let preflight = handle_input_preflight_with_transcript(
+        &ev,
+        interaction.as_deref(),
+        &mut app.menu,
+        app.buf.pointer_selection_active(),
+        app.transcript_selection
+            .as_ref()
+            .is_some_and(|selection| selection.dragging),
+        || {
+        let has_non_capturing_modal = app
+            .active_modal
+            .as_ref()
+            .is_some_and(|modal| !modal.captures_all_keys());
+        let has_replay_payload =
+            !app.message_queue.is_empty() || !app.state.pending_steers.is_empty();
+        if should_release_stale_modal_interrupt_wait(
+            app.state.phase,
+            app.interrupt_drain_pending,
+            has_non_capturing_modal,
+            ctx.runtime.has_active_turn(),
+            has_replay_payload,
+        ) {
+            crate::tuix_trace!(
+                "KEY",
+                "release stale interrupt wait before routing visible modal"
+            );
+            app.interrupt_drain_pending = false;
+            app.state.phase = UiPhase::Idle;
         }
+
+        if matches!(app.state.phase, UiPhase::Idle)
+            && app.active_modal.is_none()
+            && poll_shared_state(ctx, renderer)
+        {
+            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        }
+        // `/codingplan` has extra warning/quota caches beyond the generic config.
+        refresh_after_cross_process_codingplan_sync(ctx);
+
+        crate::tuix_trace!(
+            "IN",
+            "phase={:?} modal={} qlen={} ev={}",
+            app.state.phase,
+            app.active_modal.is_some(),
+            app.message_queue.len(),
+            match &ev {
+                InputEvent::Paste(t) => format!("paste({})", t.len()),
+                InputEvent::Eof => "eof".into(),
+                InputEvent::Key(k) => format!("key({:?},{:?})", k.kind, k.code),
+                InputEvent::Resize(w, h) => format!("resize({}x{})", w, h),
+                InputEvent::FocusChanged(focused) => format!("focus({focused})"),
+                InputEvent::Pointer(pointer) => format!("pointer({:?})", pointer),
+            }
+        );
+        },
     );
+    if preflight == PointerPreflightRoute::ComposerCleanup {
+        cleanup_composer_pointer_capture(&mut app.buf, &ctx.interaction_publisher);
+        return Ok(());
+    }
+    if preflight == PointerPreflightRoute::TranscriptCleanup {
+        if let Some(selection) = app.transcript_selection.as_mut() {
+            selection.dragging = false;
+        }
+        return Ok(());
+    }
+    if preflight == PointerPreflightRoute::ReturnIgnored {
+        return Ok(());
+    }
+    if !matches!(ev, InputEvent::Pointer(_)) {
+        app.menu.pointer_cancel();
+    }
 
     match ev {
         InputEvent::FocusChanged(focused) => {
@@ -11615,14 +12720,28 @@ fn handle_input(
                 renderer.force_repaint();
             }
         }
-        InputEvent::MouseScroll(delta) => {
-            // Mouse wheel is a no-op: SGR mouse capture (`?1002h` /
-            // `?1006h`) is intentionally NOT enabled, so wheel ticks
-            // resolve at the terminal level (native scrollback) before
-            // reaching us. This arm survives only as a defensive
-            // catch-all for terminals that forward wheel events
-            // outside the SGR mouse protocol.
-            renderer.scroll_body(delta);
+        InputEvent::Pointer(pointer) => {
+            if preflight == PointerPreflightRoute::ScrollContinue {
+                apply_pointer_event(pointer, renderer);
+            } else {
+                if let Some(interaction) = interaction.as_deref() {
+                    handle_pointer_hit(app, ctx, renderer, pointer, interaction)?;
+                } else {
+                    if app.buf.pointer_selection_active() {
+                        let _ = finish_composer_pointer_capture(app, ctx, renderer, pointer);
+                    } else if app
+                        .transcript_selection
+                        .as_ref()
+                        .is_some_and(|selection| selection.dragging)
+                    {
+                        let route = finish_transcript_pointer_capture(
+                            &mut app.transcript_selection,
+                            &ctx.interaction_publisher,
+                        );
+                        let _ = apply_transcript_pointer_route(app, ctx, renderer, route)?;
+                    }
+                }
+            }
         }
         InputEvent::Resize(mut cols, mut rows) => {
             // Coalesce burst-fired SIGWINCH events. gnome-terminal /
@@ -11774,6 +12893,7 @@ fn handle_input(
                     return Ok(());
                 }
                 app.buf.insert_paste(text);
+                sync_composer_selection(&app.buf, &ctx.interaction_publisher);
                 if matches!(app.state.phase, UiPhase::Streaming) {
                     draw_spinner_now(
                         &mut app.state,
@@ -12071,6 +13191,960 @@ fn provider_transition_allows_idle_commit(line: &str) -> bool {
 }
 
 #[cfg(test)]
+mod tests {
+    use super::{
+        apply_pointer_event, handle_input_preflight, route_pointer, PointerPreflightRoute,
+        PointerRoute,
+    };
+    use crate::input::{PointerButton, PointerEvent, PointerKind};
+    use crate::render::interaction::{CellRect, HitRegion, HitTarget, InteractionFrame};
+    use crate::render::{Renderer, UiLine};
+
+    #[derive(Default)]
+    struct ScrollCapture {
+        deltas: Vec<i32>,
+    }
+
+    impl Renderer for ScrollCapture {
+        fn render(&mut self, _line: UiLine) {}
+        fn flush(&mut self) {}
+        fn shutdown(&mut self) {}
+        fn reset(&mut self) {}
+        fn clear_screen(&mut self) {}
+        fn suspend_for_external(&mut self) {}
+        fn resume_from_external(&mut self) {}
+        fn flush_deferred(&mut self) {}
+
+        fn scroll_body(&mut self, delta: i32) {
+            self.deltas.push(delta);
+        }
+    }
+
+    fn pointer(kind: PointerKind, button: Option<PointerButton>, shift: bool) -> PointerEvent {
+        PointerEvent {
+            kind,
+            button,
+            row: 12,
+            col: 34,
+            shift,
+            control: false,
+            alt: false,
+        }
+    }
+
+    fn pointer_interaction() -> InteractionFrame {
+        InteractionFrame {
+            generation: 1,
+            surface_session: 1,
+            regions: vec![HitRegion {
+                rect: CellRect {
+                    row: 12,
+                    col: 34,
+                    height: 1,
+                    width: 1,
+                },
+                target: HitTarget::MenuItem { index: 0 },
+            }],
+            copy_runs: Vec::new(),
+        }
+    }
+
+    fn composer_pointer_interaction() -> InteractionFrame {
+        InteractionFrame {
+            generation: 1,
+            surface_session: 1,
+            regions: vec![HitRegion {
+                rect: CellRect {
+                    row: 12,
+                    col: 34,
+                    height: 1,
+                    width: 1,
+                },
+                target: HitTarget::ComposerByte { byte: 1 },
+            }],
+            copy_runs: Vec::new(),
+        }
+    }
+
+    fn copy_run(id: u64, text: &str, soft_wrap: bool) -> crate::render::interaction::CopyRun {
+        crate::render::interaction::CopyRun {
+            id,
+            rect: CellRect {
+                row: id as u16,
+                col: 0,
+                height: 1,
+                width: 20,
+            },
+            text: std::sync::Arc::from(text),
+            soft_wrap,
+            next_run_id: soft_wrap.then_some(id.saturating_add(1)),
+        }
+    }
+
+    fn transcript_frame(
+        generation: u64,
+        surface_session: u64,
+        runs: Vec<crate::render::interaction::CopyRun>,
+    ) -> InteractionFrame {
+        let regions = runs
+            .iter()
+            .map(|run| HitRegion {
+                rect: run.rect,
+                target: HitTarget::TranscriptByte {
+                    run_id: run.id,
+                    byte: run.text.len(),
+                },
+            })
+            .collect();
+        InteractionFrame {
+            generation,
+            surface_session,
+            regions,
+            copy_runs: runs,
+        }
+    }
+
+    #[test]
+    fn transcript_extraction_joins_soft_wraps_and_preserves_hard_breaks() {
+        use crate::render::interaction::SemanticEndpoint;
+        let runs = vec![
+            copy_run(10, "abcdefgh", true),
+            copy_run(11, "ij", false),
+            copy_run(12, "  code", false),
+            copy_run(13, "你好👩‍💻\u{0007}", false),
+        ];
+        assert_eq!(
+            super::extract_transcript_selection(
+                &runs,
+                SemanticEndpoint { run_id: 10, byte: 0 },
+                SemanticEndpoint {
+                    run_id: 13,
+                    byte: runs[3].text.len(),
+                },
+            )
+            .as_deref(),
+            Some("abcdefghij\n  code\n你好👩‍💻")
+        );
+    }
+
+    #[test]
+    fn transcript_extraction_does_not_join_across_hidden_soft_wrap_continuation() {
+        use crate::render::interaction::SemanticEndpoint;
+        let runs = vec![copy_run(30, "A", true), copy_run(32, "C", false)];
+        assert_eq!(
+            super::extract_transcript_selection(
+                &runs,
+                SemanticEndpoint { run_id: 30, byte: 0 },
+                SemanticEndpoint { run_id: 32, byte: 1 },
+            )
+            .as_deref(),
+            Some("A\nC"),
+            "a hidden continuation is a semantic projection boundary"
+        );
+    }
+
+    #[test]
+    fn transcript_extraction_supports_reverse_utf8_selection_without_terminal_bytes() {
+        use crate::render::interaction::SemanticEndpoint;
+        let runs = vec![copy_run(20, "diff + 你好👩‍💻", false)];
+        let start = "diff + ".len();
+        let end = runs[0].text.len();
+        assert_eq!(
+            super::extract_transcript_selection(
+                &runs,
+                SemanticEndpoint { run_id: 20, byte: end },
+                SemanticEndpoint {
+                    run_id: 20,
+                    byte: start,
+                },
+            )
+            .as_deref(),
+            Some("你好👩‍💻")
+        );
+    }
+
+    #[test]
+    fn transcript_pointer_stream_frame_clamps_to_survivors_and_never_copies_new_run() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let first = transcript_frame(
+            10,
+            7,
+            vec![copy_run(100, "old-a", false), copy_run(101, "old-b", false)],
+        );
+        let mut selection = None;
+        let mut down = pointer(PointerKind::Down, Some(PointerButton::Primary), false);
+        down.row = 100;
+        assert_eq!(
+            super::handle_transcript_pointer(
+                &mut selection,
+                &publisher,
+                down,
+                &first,
+                Some(HitTarget::TranscriptByte { run_id: 100, byte: 0 }),
+            ),
+            super::TranscriptPointerRoute::Handled
+        );
+        let mut drag = pointer(PointerKind::Drag, Some(PointerButton::Primary), false);
+        drag.row = 101;
+        assert_eq!(
+            super::handle_transcript_pointer(
+                &mut selection,
+                &publisher,
+                drag,
+                &first,
+                Some(HitTarget::TranscriptByte { run_id: 101, byte: 5 }),
+            ),
+            super::TranscriptPointerRoute::Redraw
+        );
+
+        let streamed = transcript_frame(
+            11,
+            7,
+            vec![copy_run(100, "old-a", false), copy_run(999, "NEW", false)],
+        );
+        let mut up = pointer(PointerKind::Up, Some(PointerButton::Primary), false);
+        up.row = 999;
+        let result = super::handle_transcript_pointer(
+            &mut selection,
+            &publisher,
+            up,
+            &streamed,
+            Some(HitTarget::TranscriptByte { run_id: 999, byte: 3 }),
+        );
+        assert_eq!(result, super::TranscriptPointerRoute::Copy("old-a".into()));
+        assert!(!format!("{result:?}").contains("NEW"));
+        assert_eq!(
+            super::handle_transcript_pointer(
+                &mut selection,
+                &publisher,
+                up,
+                &streamed,
+                Some(HitTarget::TranscriptByte { run_id: 999, byte: 3 }),
+            ),
+            super::TranscriptPointerRoute::Ignored,
+            "one completed gesture copies exactly once"
+        );
+    }
+
+    #[test]
+    fn transcript_pointer_session_switch_clears_stale_capture_without_copy() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let first = transcript_frame(1, 10, vec![copy_run(1, "session-a", false)]);
+        let mut selection = None;
+        assert_eq!(
+            super::handle_transcript_pointer(
+                &mut selection,
+                &publisher,
+                pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+                &first,
+                Some(HitTarget::TranscriptByte { run_id: 1, byte: 0 }),
+            ),
+            super::TranscriptPointerRoute::Handled
+        );
+        let next = transcript_frame(2, 11, vec![copy_run(1, "session-b", false)]);
+        assert_eq!(
+            super::handle_transcript_pointer(
+                &mut selection,
+                &publisher,
+                pointer(PointerKind::Up, Some(PointerButton::Primary), false),
+                &next,
+                Some(HitTarget::TranscriptByte { run_id: 1, byte: 9 }),
+            ),
+            super::TranscriptPointerRoute::Handled
+        );
+        assert!(selection.is_none());
+        assert!(publisher.transcript_selection().is_none());
+    }
+
+    #[test]
+    fn transcript_capture_uses_production_preflight_for_outside_and_shift_release() {
+        let mut menu = super::MenuState::new();
+        let outside_up = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Up,
+            Some(PointerButton::Primary),
+            false,
+        ));
+        assert_eq!(
+            super::handle_input_preflight_with_transcript(
+                &outside_up,
+                None,
+                &mut menu,
+                false,
+                true,
+                || {},
+            ),
+            super::PointerPreflightRoute::PointerContinue
+        );
+        let shift_up = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Up,
+            Some(PointerButton::Primary),
+            true,
+        ));
+        assert_eq!(
+            super::handle_input_preflight_with_transcript(
+                &shift_up,
+                None,
+                &mut menu,
+                false,
+                true,
+                || panic!("cleanup must not run the general prelude"),
+            ),
+            super::PointerPreflightRoute::TranscriptCleanup
+        );
+    }
+
+    #[test]
+    fn transcript_release_without_actionable_frame_uses_last_safe_semantic_authority_once() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let source = transcript_frame(
+            41,
+            7,
+            vec![copy_run(100, "old-a", false), copy_run(101, "old-b", false)],
+        );
+        assert!(publisher.publish_frame_if_current(
+            publisher.current_epoch(),
+            source.surface_session,
+            source.regions,
+            source.copy_runs,
+        ));
+        let frame = publisher.snapshot();
+        let mut selection = None;
+        assert_eq!(
+            super::handle_transcript_pointer(
+                &mut selection,
+                &publisher,
+                pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+                &frame,
+                Some(HitTarget::TranscriptByte { run_id: 100, byte: 0 }),
+            ),
+            super::TranscriptPointerRoute::Handled
+        );
+        assert_eq!(
+            super::handle_transcript_pointer(
+                &mut selection,
+                &publisher,
+                pointer(PointerKind::Drag, Some(PointerButton::Primary), false),
+                &frame,
+                Some(HitTarget::TranscriptByte {
+                    run_id: 101,
+                    byte: "old-b".len(),
+                }),
+            ),
+            super::TranscriptPointerRoute::Redraw
+        );
+        publisher.fail_closed();
+
+        assert_eq!(
+            super::finish_transcript_pointer_capture(&mut selection, &publisher),
+            super::TranscriptPointerRoute::Copy("old-a\nold-b".into()),
+            "slow worker invalidation must not discard the semantic release"
+        );
+        assert_eq!(
+            super::finish_transcript_pointer_capture(&mut selection, &publisher),
+            super::TranscriptPointerRoute::Ignored,
+            "one gesture owns exactly one copy attempt"
+        );
+        assert!(selection.as_ref().is_some_and(|state| !state.dragging));
+    }
+
+    #[test]
+    fn transcript_osc52_policy_uses_terminal_capability_not_tty_assumption() {
+        let mut caps = crate::terminal::TerminalCaps {
+            tty: true,
+            colors: true,
+            spinner: true,
+            bracketed_paste: true,
+            raw_mode: true,
+            scroll_region: true,
+            unicode_symbols: true,
+            legacy_conhost: false,
+            jediterm: false,
+            modern_emulator: true,
+            kitty_keyboard: false,
+            mouse_sgr: true,
+            osc52_clipboard: false,
+            tmux_passthrough: false,
+        };
+        assert!(!super::transcript_osc52_allowed(&caps));
+        caps.osc52_clipboard = true;
+        assert!(super::transcript_osc52_allowed(&caps));
+    }
+
+    #[test]
+    fn pointer_composer_down_drag_up_keeps_the_frame_until_one_release_redraw() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        publisher.publish(1, composer_pointer_interaction().regions);
+        let mut buf = super::Buffer::new();
+        buf.text = "abcde".into();
+        assert_eq!(
+            super::handle_composer_pointer(
+            &mut buf,
+            &publisher,
+            pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+            1,
+            ),
+            super::ComposerPointerRoute::Handled
+        );
+        assert!(publisher.snapshot_actionable().is_some());
+
+        assert_eq!(
+            super::handle_composer_pointer(
+            &mut buf,
+            &publisher,
+            pointer(PointerKind::Drag, Some(PointerButton::Primary), false),
+            4,
+            ),
+            super::ComposerPointerRoute::Handled
+        );
+        assert_eq!(buf.selected_range(), Some(1..4));
+        assert!(publisher.snapshot_actionable().is_some());
+
+        assert_eq!(
+            super::handle_composer_pointer(
+                &mut buf,
+                &publisher,
+                pointer(PointerKind::Up, Some(PointerButton::Primary), false),
+                4,
+            ),
+            super::ComposerPointerRoute::Redraw
+        );
+        publisher.invalidate();
+        assert!(!buf.pointer_selection_active());
+        assert!(publisher.snapshot_actionable().is_none());
+    }
+
+    #[test]
+    fn pointer_composer_drag_continues_through_the_production_preflight() {
+        let input = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Drag,
+            Some(PointerButton::Primary),
+            false,
+        ));
+        let interaction = composer_pointer_interaction();
+        let mut menu = super::MenuState::new();
+        let mut prelude_runs = 0;
+
+        assert_eq!(
+            super::handle_input_preflight(&input, Some(&interaction), &mut menu, false, || {
+                prelude_runs += 1
+            }),
+            super::PointerPreflightRoute::PointerContinue
+        );
+        assert_eq!(prelude_runs, 1);
+    }
+
+    #[test]
+    fn pointer_composer_release_outside_still_finishes_capture() {
+        let input = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Up,
+            Some(PointerButton::Primary),
+            false,
+        ));
+        let interaction = composer_pointer_interaction();
+        let mut menu = super::MenuState::new();
+        let mut prelude_runs = 0;
+
+        assert_eq!(
+            super::handle_input_preflight(
+                &input,
+                Some(&interaction),
+                &mut menu,
+                true,
+                || prelude_runs += 1,
+            ),
+            super::PointerPreflightRoute::PointerContinue
+        );
+        assert_eq!(prelude_runs, 1);
+
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let mut buf = super::Buffer::new();
+        buf.text = "abcde".into();
+        assert!(buf.set_pointer_cursor(1, false));
+        assert!(buf.set_pointer_cursor(4, true));
+        assert_eq!(
+            super::handle_composer_pointer_release(
+                &mut buf,
+                &publisher,
+                pointer(PointerKind::Up, Some(PointerButton::Primary), false),
+            ),
+            super::ComposerPointerRoute::Redraw
+        );
+        assert!(!buf.pointer_selection_active());
+        assert_eq!(buf.selected_range(), Some(1..4));
+        assert_eq!(
+            super::handle_composer_pointer(
+                &mut buf,
+                &publisher,
+                pointer(PointerKind::Drag, Some(PointerButton::Primary), false),
+                5,
+            ),
+            super::ComposerPointerRoute::Ignored
+        );
+        assert_eq!(buf.selected_range(), Some(1..4));
+    }
+
+    #[test]
+    fn keyboard_cursor_collapse_clears_same_source_published_selection() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let mut buf = super::Buffer::new();
+        buf.text = "abcde".into();
+        assert!(buf.set_pointer_cursor(1, false));
+        assert!(buf.set_pointer_cursor(4, true));
+        super::sync_composer_selection(&buf, &publisher);
+        assert!(publisher.composer_selection().is_some());
+
+        let _ = buf.apply(
+            super::Action::CursorLeft,
+            &[],
+            &crate::commands::CommandRegistry::builtin(),
+        );
+        super::sync_composer_selection(&buf, &publisher);
+
+        assert_eq!(buf.text, "abcde", "cursor collapse does not change source");
+        assert_eq!(buf.cursor, 1);
+        assert!(publisher.composer_selection().is_none());
+    }
+
+    #[test]
+    fn active_composer_release_preempts_a_menu_target() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let mut buf = super::Buffer::new();
+        let mut menu = super::MenuState::new();
+        buf.text = "abcde".into();
+        assert!(buf.set_pointer_cursor(1, false));
+        assert!(buf.set_pointer_cursor(4, true));
+        let target = HitTarget::MenuItem { index: 0 };
+        let _ = menu.pointer_press(target, 1);
+
+        assert_eq!(
+            super::route_active_composer_pointer(
+                &mut buf,
+                &publisher,
+                &mut menu,
+                pointer(PointerKind::Up, Some(PointerButton::Primary), false),
+                Some(target),
+            ),
+            super::ComposerPointerRoute::Redraw
+        );
+        assert!(!buf.pointer_selection_active());
+        assert_eq!(buf.selected_range(), Some(1..4));
+        assert!(!menu.has_pointer_press(), "menu confirmation must be cancelled");
+    }
+
+    #[test]
+    fn shift_release_cleans_composer_capture_without_claiming_ui_action() {
+        let input = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Up,
+            Some(PointerButton::Primary),
+            true,
+        ));
+        let mut menu = super::MenuState::new();
+        let mut prelude_runs = 0;
+        assert_eq!(
+            super::handle_input_preflight(&input, None, &mut menu, true, || {
+                prelude_runs += 1
+            }),
+            super::PointerPreflightRoute::ComposerCleanup
+        );
+        assert_eq!(prelude_runs, 0);
+
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let mut buf = super::Buffer::new();
+        buf.text = "abc".into();
+        assert!(buf.set_pointer_cursor(0, false));
+        assert!(buf.set_pointer_cursor(2, true));
+        super::cleanup_composer_pointer_capture(&mut buf, &publisher);
+        assert!(!buf.pointer_selection_active());
+        assert_eq!(buf.selected_range(), Some(0..2));
+    }
+
+    #[test]
+    fn pointer_click_selects_first_and_only_a_second_same_target_click_confirms() {
+        let target = HitTarget::MenuItem { index: 2 };
+        let other = HitTarget::MenuItem { index: 3 };
+        let mut menu = super::MenuState::new();
+        let session = 7;
+
+        assert_eq!(
+            menu.pointer_press(target, session),
+            super::PointerClickAction::Select(target)
+        );
+        assert_eq!(
+            menu.pointer_release(target, session),
+            super::PointerClickAction::None
+        );
+        assert_eq!(
+            menu.pointer_press(other, session),
+            super::PointerClickAction::Select(other)
+        );
+        assert_eq!(
+            menu.pointer_release(other, session),
+            super::PointerClickAction::None
+        );
+        assert_eq!(
+            menu.pointer_press(other, session),
+            super::PointerClickAction::Select(other)
+        );
+        assert_eq!(
+            menu.pointer_release(other, session),
+            super::PointerClickAction::Confirm(other)
+        );
+    }
+
+    #[test]
+    fn pointer_current_command_row_keeps_frame_open_until_second_click_confirms() {
+        let target = HitTarget::MenuItem { index: 0 };
+        let mut menu = super::MenuState::new();
+        let mut redraws = 0;
+        let session = 7;
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        publisher.publish(session, pointer_interaction().regions);
+
+        assert_eq!(
+            menu.pointer_press(target, session),
+            super::PointerClickAction::Select(target)
+        );
+        menu.pointer_select_with(0, 2, |_| {
+            redraws += 1;
+            publisher.invalidate();
+        });
+        assert_eq!(redraws, 0, "selecting the current row must keep the frame actionable");
+        assert!(publisher.snapshot_actionable().is_some());
+        assert_eq!(
+            menu.pointer_release(target, session),
+            super::PointerClickAction::None
+        );
+
+        let _ = menu.pointer_press(target, session);
+        menu.pointer_select_with(0, 2, |_| {
+            redraws += 1;
+            publisher.invalidate();
+        });
+        assert_eq!(
+            menu.pointer_release(target, session),
+            super::PointerClickAction::Confirm(target)
+        );
+        let mut callbacks = 0;
+        assert_eq!(
+            super::handle_pointer_menu_confirmation(
+                &mut menu,
+                |menu| menu,
+                false,
+                2,
+                |_menu, selected| {
+                    assert_eq!(selected, 0);
+                    callbacks += 1;
+                },
+            ),
+            Some(())
+        );
+        assert_eq!(callbacks, 1);
+    }
+
+    #[test]
+    fn pointer_changed_command_row_redraws_once_then_fresh_clicks_can_confirm() {
+        let target = HitTarget::MenuItem { index: 1 };
+        let mut menu = super::MenuState::new();
+        let mut redraws = 0;
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        publisher.publish(1, pointer_interaction().regions);
+
+        let _ = menu.pointer_press(target, 1);
+        menu.pointer_select_with(1, 2, |_| {
+            redraws += 1;
+            publisher.invalidate();
+        });
+        assert_eq!(redraws, 1);
+        assert!(publisher.snapshot_actionable().is_none());
+        let slow_up = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Up,
+            Some(PointerButton::Primary),
+            false,
+        ));
+        let mut prelude_runs = 0;
+        assert_eq!(
+            super::handle_input_preflight(&slow_up, None, &mut menu, false, || prelude_runs += 1),
+            super::PointerPreflightRoute::ReturnIgnored
+        );
+        assert_eq!(prelude_runs, 0);
+
+        let _ = menu.pointer_press(target, 2);
+        menu.pointer_select_with(1, 2, |_| redraws += 1);
+        assert_eq!(menu.pointer_release(target, 2), super::PointerClickAction::None);
+        let _ = menu.pointer_press(target, 2);
+        menu.pointer_select_with(1, 2, |_| redraws += 1);
+        assert_eq!(
+            menu.pointer_release(target, 2),
+            super::PointerClickAction::Confirm(target)
+        );
+        assert_eq!(redraws, 1);
+    }
+
+    #[test]
+    fn pointer_confirmation_arm_does_not_cross_modal_or_content_sessions() {
+        let target = HitTarget::ModalItem { index: 0 };
+        let mut menu = super::MenuState::new();
+
+        assert_eq!(
+            menu.pointer_press(target, 11),
+            super::PointerClickAction::Select(target)
+        );
+        assert_eq!(
+            menu.pointer_release(target, 11),
+            super::PointerClickAction::None
+        );
+
+        // The same target index in a newly painted modal/content session is a
+        // fresh selection, not confirmation inherited from the prior picker.
+        assert_eq!(
+            menu.pointer_press(target, 12),
+            super::PointerClickAction::Select(target)
+        );
+        assert_eq!(
+            menu.pointer_release(target, 12),
+            super::PointerClickAction::None
+        );
+        assert_eq!(
+            menu.pointer_press(target, 12),
+            super::PointerClickAction::Select(target)
+        );
+        assert_eq!(
+            menu.pointer_release(target, 12),
+            super::PointerClickAction::Confirm(target)
+        );
+    }
+
+    #[test]
+    fn pointer_release_outside_the_pressed_target_cancels_confirmation() {
+        let target = HitTarget::MenuItem { index: 2 };
+        let outside = HitTarget::MenuItem { index: 4 };
+        let mut menu = super::MenuState::new();
+        let session = 3;
+
+        assert_eq!(
+            menu.pointer_press(target, session),
+            super::PointerClickAction::Select(target)
+        );
+        assert_eq!(
+            menu.pointer_release(outside, session),
+            super::PointerClickAction::None
+        );
+        assert_eq!(
+            menu.pointer_press(target, session),
+            super::PointerClickAction::Select(target)
+        );
+        assert_eq!(
+            menu.pointer_release(outside, session),
+            super::PointerClickAction::None
+        );
+    }
+
+    #[test]
+    fn pointer_shift_drag_uses_terminal_selection_escape_hatch() {
+        assert_eq!(
+            route_pointer(pointer(
+                PointerKind::Drag,
+                Some(PointerButton::Primary),
+                true,
+            )),
+            PointerRoute::Ignored
+        );
+    }
+
+    #[test]
+    fn pointer_non_scroll_fails_closed_before_general_input_prelude() {
+        for event in [
+            pointer(PointerKind::Drag, Some(PointerButton::Primary), true),
+            pointer(PointerKind::Move, None, false),
+            pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+            pointer(PointerKind::Up, Some(PointerButton::Primary), false),
+        ] {
+            let input = crate::input::InputEvent::Pointer(event);
+            let mut prelude_runs = 0;
+            let renderer = ScrollCapture::default();
+            let mut menu = super::MenuState::new();
+
+            let route =
+                handle_input_preflight(&input, None, &mut menu, false, || prelude_runs += 1);
+
+            assert_eq!(route, PointerPreflightRoute::ReturnIgnored);
+            assert_eq!(prelude_runs, 0);
+            assert!(renderer.deltas.is_empty());
+        }
+    }
+
+    #[test]
+    fn pointer_scroll_continues_through_general_input_prelude() {
+        for delta in [-3, 3] {
+            let event = pointer(PointerKind::Scroll(delta), None, false);
+            let input = crate::input::InputEvent::Pointer(event);
+            let mut prelude_runs = 0;
+            let mut renderer = ScrollCapture::default();
+            let mut menu = super::MenuState::new();
+
+            let route =
+                handle_input_preflight(&input, None, &mut menu, false, || prelude_runs += 1);
+            if let PointerPreflightRoute::ScrollContinue = route {
+                apply_pointer_event(event, &mut renderer);
+            }
+
+            assert_eq!(route, PointerPreflightRoute::ScrollContinue);
+            assert_eq!(prelude_runs, 1);
+            assert_eq!(renderer.deltas, vec![i32::from(delta)]);
+        }
+    }
+
+    #[test]
+    fn pointer_hit_continues_through_the_same_production_prelude_gate() {
+        let input = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Down,
+            Some(PointerButton::Primary),
+            false,
+        ));
+        let mut prelude_runs = 0;
+        let mut menu = super::MenuState::new();
+        let interaction = pointer_interaction();
+
+        let route = handle_input_preflight(&input, Some(&interaction), &mut menu, false, || {
+            prelude_runs += 1
+        });
+
+        assert_eq!(route, PointerPreflightRoute::PointerContinue);
+        assert_eq!(prelude_runs, 1);
+    }
+
+    #[test]
+    fn unactionable_primary_up_cancels_a_slow_click_before_the_general_prelude() {
+        let target = HitTarget::MenuItem { index: 0 };
+        let mut menu = super::MenuState::new();
+        let _ = menu.pointer_press(target, 1);
+        let mut prelude_runs = 0;
+        let up = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Up,
+            Some(PointerButton::Primary),
+            false,
+        ));
+
+        assert_eq!(
+            super::handle_input_preflight(&up, None, &mut menu, false, || prelude_runs += 1),
+            super::PointerPreflightRoute::ReturnIgnored
+        );
+        assert_eq!(prelude_runs, 0);
+        assert!(!menu.has_pointer_press());
+        let _ = menu.pointer_press(target, 2);
+        assert_eq!(
+            menu.pointer_release(target, 2),
+            super::PointerClickAction::None,
+            "a new frame needs two complete clicks after the slow release"
+        );
+        let _ = menu.pointer_press(target, 2);
+        assert_eq!(
+            menu.pointer_release(target, 2),
+            super::PointerClickAction::Confirm(target)
+        );
+    }
+
+    #[test]
+    fn blocked_pointer_confirmation_rearms_as_a_fresh_selection() {
+        struct ConfirmationHarness {
+            menu: super::MenuState,
+            callbacks: usize,
+        }
+
+        let target = HitTarget::MenuItem { index: 1 };
+        let mut harness = ConfirmationHarness {
+            menu: super::MenuState::new(),
+            callbacks: 0,
+        };
+        harness.menu.select_index(1, 2);
+        let session = 9;
+        let _ = harness.menu.pointer_press(target, session);
+        let _ = harness.menu.pointer_release(target, session);
+        let _ = harness.menu.pointer_press(target, session);
+        assert_eq!(
+            harness.menu.pointer_release(target, session),
+            super::PointerClickAction::Confirm(target)
+        );
+
+        assert_eq!(
+            super::handle_pointer_menu_confirmation(
+                &mut harness,
+                |harness| &mut harness.menu,
+                true,
+                2,
+                |harness, _selected| harness.callbacks += 1,
+            ),
+            None
+        );
+        assert_eq!(harness.callbacks, 0);
+        let _ = harness.menu.pointer_press(target, session);
+        assert_eq!(
+            harness.menu.pointer_release(target, session),
+            super::PointerClickAction::None,
+            "after a blocked commit, the next click must select again"
+        );
+        let _ = harness.menu.pointer_press(target, session);
+        assert_eq!(
+            harness.menu.pointer_release(target, session),
+            super::PointerClickAction::Confirm(target)
+        );
+        assert_eq!(
+            super::handle_pointer_menu_confirmation(
+                &mut harness,
+                |harness| &mut harness.menu,
+                false,
+                2,
+                |harness, selected| {
+                    assert_eq!(selected, 1);
+                    harness.callbacks += 1;
+                },
+            ),
+            Some(())
+        );
+        assert_eq!(harness.callbacks, 1);
+    }
+
+    #[test]
+    fn pointer_vertical_scroll_preserves_existing_body_scroll_amount() {
+        assert_eq!(
+            route_pointer(pointer(PointerKind::Scroll(-3), None, false)),
+            PointerRoute::ScrollBody(-3)
+        );
+        assert_eq!(
+            route_pointer(pointer(PointerKind::Scroll(3), None, false)),
+            PointerRoute::ScrollBody(3)
+        );
+    }
+
+    #[test]
+    fn pointer_scroll_is_forwarded_once_to_existing_renderer_scroll_body() {
+        let mut renderer = ScrollCapture::default();
+
+        apply_pointer_event(pointer(PointerKind::Scroll(-3), None, false), &mut renderer);
+        apply_pointer_event(pointer(PointerKind::Scroll(3), None, false), &mut renderer);
+
+        assert_eq!(renderer.deltas, vec![-3, 3]);
+    }
+
+    #[test]
+    fn pointer_buttons_and_motion_are_ignored_until_hit_routing_exists() {
+        for (kind, button) in [
+            (PointerKind::Down, Some(PointerButton::Primary)),
+            (PointerKind::Up, Some(PointerButton::Primary)),
+            (PointerKind::Drag, Some(PointerButton::Primary)),
+            (PointerKind::Move, None),
+            (PointerKind::Down, Some(PointerButton::Secondary)),
+            (PointerKind::Down, Some(PointerButton::Middle)),
+        ] {
+            assert_eq!(
+                route_pointer(pointer(kind, button, false)),
+                PointerRoute::Ignored
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod provider_transition_input_tests {
     use super::provider_transition_allows_idle_commit;
 
@@ -12180,12 +14254,93 @@ fn handle_scroll_key(
 /// Slash-command palette state. Active whenever buf starts with '/'.
 pub struct MenuState {
     pub selected: usize,
+    pointer_selected: Option<(u64, crate::render::interaction::HitTarget)>,
+    pointer_pressed: Option<(u64, crate::render::interaction::HitTarget)>,
+    pointer_confirm_on_release: bool,
 }
 
 impl MenuState {
     pub fn new() -> Self {
-        Self { selected: 0 }
+        Self {
+            selected: 0,
+            pointer_selected: None,
+            pointer_pressed: None,
+            pointer_confirm_on_release: false,
+        }
     }
+
+    fn pointer_press(
+        &mut self,
+        target: crate::render::interaction::HitTarget,
+        surface_session: u64,
+    ) -> PointerClickAction {
+        let identity = (surface_session, target);
+        self.pointer_confirm_on_release = self.pointer_selected == Some(identity);
+        self.pointer_selected = Some(identity);
+        self.pointer_pressed = Some(identity);
+        PointerClickAction::Select(target)
+    }
+
+    fn pointer_release(
+        &mut self,
+        target: crate::render::interaction::HitTarget,
+        surface_session: u64,
+    ) -> PointerClickAction {
+        let identity = (surface_session, target);
+        let confirm = self.pointer_pressed == Some(identity) && self.pointer_confirm_on_release;
+        self.pointer_pressed = None;
+        self.pointer_confirm_on_release = false;
+        if self.pointer_selected != Some(identity) {
+            self.pointer_selected = None;
+        }
+        if confirm {
+            PointerClickAction::Confirm(target)
+        } else {
+            PointerClickAction::None
+        }
+    }
+
+    fn pointer_cancel(&mut self) {
+        self.pointer_selected = None;
+        self.pointer_pressed = None;
+        self.pointer_confirm_on_release = false;
+    }
+
+    fn has_pointer_press(&self) -> bool {
+        self.pointer_pressed.is_some()
+    }
+
+    fn pointer_confirmation_allowed(&mut self, commit_gate_pending: bool) -> bool {
+        let allowed = idle_menu_confirmation_allowed(commit_gate_pending);
+        if !allowed {
+            self.pointer_cancel();
+        }
+        allowed
+    }
+
+    fn select_index(&mut self, index: usize, len: usize) -> bool {
+        let selected = if len == 0 { 0 } else { index.min(len - 1) };
+        let changed = self.selected != selected;
+        self.selected = selected;
+        changed
+    }
+
+    fn pointer_select_with(&mut self, index: usize, len: usize, redraw: impl FnOnce(usize)) {
+        if self.select_index(index, len) {
+            redraw(self.selected);
+        }
+    }
+
+    fn confirm_selected(&self, len: usize) -> Option<usize> {
+        (len > 0).then(|| self.selected.min(len - 1))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerClickAction {
+    Select(crate::render::interaction::HitTarget),
+    Confirm(crate::render::interaction::HitTarget),
+    None,
 }
 
 // `ModelPicker` moved to `crate::modals::model_picker`; re-exported at
@@ -12456,7 +14611,11 @@ fn menu_handles_selection_key(
 ) -> bool {
     matches!(code, KeyCode::Enter | KeyCode::Tab)
         && !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
-        && !(code == KeyCode::Enter && commit_gate_pending)
+        && (code != KeyCode::Enter || idle_menu_confirmation_allowed(commit_gate_pending))
+}
+
+fn idle_menu_confirmation_allowed(commit_gate_pending: bool) -> bool {
+    !commit_gate_pending
 }
 
 fn streaming_top_level_slash_selection(
@@ -12474,6 +14633,104 @@ fn streaming_top_level_slash_selection(
         format!("/{selected_name}{}", if submit { "" } else { " " }),
         submit,
     ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SkillMenuBufferResult {
+    Completed,
+    Committed(String),
+}
+
+fn apply_skill_menu_buffer_selection(
+    buf: &mut Buffer,
+    name: &str,
+    code: KeyCode,
+) -> SkillMenuBufferResult {
+    if code == KeyCode::Tab {
+        buf.replace_all_text(format!("${name} "));
+        SkillMenuBufferResult::Completed
+    } else {
+        let committed = format!("${name}");
+        buf.clear_text();
+        SkillMenuBufferResult::Committed(committed)
+    }
+}
+
+fn confirm_idle_menu_selected(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    items: &[(String, String)],
+    selected: usize,
+) -> Result<()> {
+    let name = items[selected].0.clone();
+    let needs_args = ctx
+        .commands
+        .find(&name)
+        .map(|command| command.needs_args)
+        .or_else(|| {
+            ctx.custom_commands
+                .resolve(&name)
+                .map(|command| command.args_requirement != ArgsRequirement::None)
+        })
+        .unwrap_or(false);
+    app.menu.selected = 0;
+    if needs_args {
+        app.buf.replace_all_text(format!("/{name} "));
+        if matches!(name.as_str(), "skills" | "effort") {
+            if let Some(next_items) = build_menu_items(
+                &app.buf.text,
+                app.buf.cursor,
+                &ctx.commands,
+                &ctx.custom_commands,
+                Some(&ctx.skill_registry),
+                Some(&ctx.file_index),
+            ) {
+                redraw_with_menu(&app.buf, &next_items, 0, &app.state, ctx, renderer);
+                return Ok(());
+            }
+            if name == "skills" {
+                renderer.render(UiLine::CommandOutput(
+                    "  ⓘ No user-invocable skills installed yet.\n    \
+                    • Drop SKILL.md into ~/.atomcode/skills/<name>/ \n      \
+                      (Windows: %USERPROFILE%\\.atomcode\\skills\\<name>\\)\n    \
+                    • Or install a plugin that ships skills via /plugin install <git-url>\n\n"
+                        .into(),
+                ));
+            }
+        }
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
+    let committed = format!("/{name}");
+    renderer.render(UiLine::ClearTransient);
+    renderer.render(UiLine::User(committed.clone()));
+    app.buf.clear_text();
+    ctx.history.push(crate::input::history::HistoryEntry {
+        text: committed.clone(),
+        images: Vec::new(),
+        pastes: Vec::new(),
+    });
+    if let Some((command, arg)) = parse_slash_line(&committed) {
+        if command.eq_ignore_ascii_case("paste") {
+            handle_paste_command(app, ctx, renderer)?;
+        } else {
+            execute_slash_command(
+                command,
+                arg,
+                &mut app.state,
+                ctx,
+                renderer,
+                &mut app.active_modal,
+                &mut app.setup_pending,
+            )?;
+        }
+        if matches!(app.state.phase, UiPhase::Idle) {
+            redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
+        }
+    }
+    Ok(())
 }
 
 fn handle_idle_key(
@@ -12594,6 +14851,15 @@ fn handle_idle_key(
             (selection_key @ (KeyCode::Enter | KeyCode::Tab), m)
                 if menu_handles_selection_key(selection_key, m, idle_commit_gate_pending(ctx)) =>
             {
+                if selection_key == KeyCode::Enter
+                    && app.buf.text.starts_with('/')
+                    && !app.buf.text[1..].contains(char::is_whitespace)
+                {
+                    let Some(selected) = app.menu.confirm_selected(items.len()) else {
+                        return Ok(());
+                    };
+                    return confirm_idle_menu_selected(app, ctx, renderer, items, selected);
+                }
                 // Tab and Enter both pick the highlighted entry, but
                 // they diverge on no-arg top-level commands:
                 //   * Enter   → execute immediately (legacy behavior).
@@ -12620,8 +14886,9 @@ fn handle_idle_key(
                         // adding whitespace so directories can keep completing.
                         let selected_path = items[app.menu.selected].0.clone();
                         let replacement = file_index::format_at_mention_replacement(&selected_path);
-                        app.buf.text.replace_range(at_pos..end, &replacement);
-                        app.buf.cursor = at_pos + replacement.len();
+                        let _ = app
+                            .buf
+                            .replace_text_range(at_pos..end, &replacement);
                         app.menu.selected = 0;
                         if let Some(next_items) = build_menu_items(
                             &app.buf.text,
@@ -12654,18 +14921,15 @@ fn handle_idle_key(
                 if app.buf.text.starts_with('$') && !items.is_empty() {
                     let name = items[app.menu.selected].0.clone();
                     app.menu.selected = 0;
-                    if code == KeyCode::Tab {
-                        app.buf.text = format!("${} ", name);
-                        app.buf.cursor = app.buf.text.len();
+                    let SkillMenuBufferResult::Committed(committed) =
+                        apply_skill_menu_buffer_selection(&mut app.buf, &name, code)
+                    else {
                         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                         return Ok(());
-                    }
+                    };
                     // Enter → invoke now via the shared skills arm.
-                    let committed = format!("${}", name);
                     renderer.render(UiLine::ClearTransient);
                     renderer.render(UiLine::User(committed.clone()));
-                    app.buf.text.clear();
-                    app.buf.cursor = 0;
                     ctx.history.push(crate::input::history::HistoryEntry {
                         text: committed.clone(),
                         images: Vec::new(),
@@ -12706,8 +14970,7 @@ fn handle_idle_key(
                     // Menu rebuilds on next keystroke — with the trailing
                     // space parse_slash_line returns `Some(("name", ""))`
                     // so build_menu_items correctly hides the menu.
-                    app.buf.text = format!("/{} ", name);
-                    app.buf.cursor = app.buf.text.len();
+                    app.buf.replace_all_text(format!("/{} ", name));
 
                     // The `/skills` gateway is special: build_menu_items
                     // recognises the `/skills ` prefix and returns the
@@ -12788,16 +15051,14 @@ fn handle_idle_key(
                 let in_effort_sub_mode = app.buf.text.starts_with("/effort ");
                 if in_effort_sub_mode {
                     if code == KeyCode::Tab {
-                        app.buf.text = format!("/effort {} ", name);
-                        app.buf.cursor = app.buf.text.len();
+                        app.buf.replace_all_text(format!("/effort {} ", name));
                         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                         return Ok(());
                     }
                     let committed = format!("/effort {}", name);
                     renderer.render(UiLine::ClearTransient);
                     renderer.render(UiLine::User(committed.clone()));
-                    app.buf.text.clear();
-                    app.buf.cursor = 0;
+                    app.buf.clear_text();
                     ctx.history.push(crate::input::history::HistoryEntry {
                         text: committed.clone(),
                         images: Vec::new(),
@@ -12828,8 +15089,7 @@ fn handle_idle_key(
 
                 let in_skills_sub_mode = app.buf.text.starts_with("/skills ");
                 if in_skills_sub_mode {
-                    app.buf.text = format!("/skills {} ", name);
-                    app.buf.cursor = app.buf.text.len();
+                    app.buf.replace_all_text(format!("/skills {} ", name));
                     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                     return Ok(());
                 }
@@ -12842,8 +15102,7 @@ fn handle_idle_key(
                 // (parse_slash_line treats `/name ` as a fully-named
                 // command with empty arg).
                 if code == KeyCode::Tab {
-                    app.buf.text = format!("/{} ", name);
-                    app.buf.cursor = app.buf.text.len();
+                    app.buf.replace_all_text(format!("/{} ", name));
                     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                     return Ok(());
                 }
@@ -12852,8 +15111,7 @@ fn handle_idle_key(
                 let committed = format!("/{}", name);
                 renderer.render(UiLine::ClearTransient);
                 renderer.render(UiLine::User(committed.clone()));
-                app.buf.text.clear();
-                app.buf.cursor = 0;
+                app.buf.clear_text();
                 // Mirror the regular-message and queued-message paths
                 // below: pushing the just-submitted line into `ctx.history`
                 // is what Up-arrow recall reads from. Without this, a
@@ -12890,8 +15148,7 @@ fn handle_idle_key(
             }
             (KeyCode::Esc, _) => {
                 // Close menu by clearing buffer.
-                app.buf.text.clear();
-                app.buf.cursor = 0;
+                app.buf.clear_text();
                 app.menu.selected = 0;
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
@@ -13021,8 +15278,8 @@ fn handle_idle_key(
             app.state.pending_image_markers.push(n);
             cache_write_image(&crate::platform::image_cache_dir(), &img, hash);
             let marker = format!("[Image #{}]", n);
-            app.buf.text.insert_str(app.buf.cursor, &marker);
-            app.buf.cursor += marker.len();
+            app.buf.insert_at_cursor(&marker);
+            sync_composer_selection(&app.buf, &ctx.interaction_publisher);
             redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
             return Ok(());
         }
@@ -13070,10 +15327,12 @@ fn handle_idle_key(
     if modifiers.is_empty() {
         match code {
             KeyCode::Up if app.buf.cursor_visual_up() => {
+                sync_composer_selection(&app.buf, &ctx.interaction_publisher);
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
             }
             KeyCode::Down if app.buf.cursor_visual_down() => {
+                sync_composer_selection(&app.buf, &ctx.interaction_publisher);
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
             }
@@ -13087,6 +15346,7 @@ fn handle_idle_key(
         if let Some(suggestion) = app.state.next_prompt_suggestion.clone() {
             if app.buf.accept_next_prompt_suggestion(&suggestion) {
                 app.state.next_prompt_suggestion = None;
+                sync_composer_selection(&app.buf, &ctx.interaction_publisher);
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
             }
@@ -13097,6 +15357,7 @@ fn handle_idle_key(
     }
 
     let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
+    sync_composer_selection(&app.buf, &ctx.interaction_publisher);
     sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
     crate::tuix_trace!(
         "KEY",
@@ -13183,8 +15444,7 @@ fn handle_idle_key(
                 }
             }
             renderer.render(UiLine::ClearTransient);
-            app.buf.text.clear();
-            app.buf.cursor = 0;
+            app.buf.clear_text();
             // NB: `app.buf.clear_pastes()` is deferred until AFTER the
             // submit path calls `expand_pastes(&line)` — wiping the
             // paste Vec here used to leave `expand_pastes` with
@@ -13580,6 +15840,7 @@ fn redraw_with_menu(
     ctx: &LoopCtx,
     renderer: &mut dyn Renderer,
 ) {
+    sync_composer_selection(buf, &ctx.interaction_publisher);
     let kind = if file_index::detect_at_mention_range(&buf.text, buf.cursor).is_some() {
         crate::render::MenuKind::AtMention
     } else if buf.text.starts_with('$') {
@@ -13868,6 +16129,7 @@ pub(crate) fn set_agent_mode(
 }
 
 fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    sync_composer_selection(buf, &ctx.interaction_publisher);
     let attachments = compute_input_attachments(state, &buf.text);
     let mut status = build_input_status(state, ctx, buf);
     // Discoverability: while composing a `!` shell command, surface a brand-purple
@@ -15212,8 +17474,7 @@ fn handle_streaming_key(
                 return Ok(());
             }
             KeyCode::Esc => {
-                app.buf.text.clear();
-                app.buf.cursor = 0;
+                app.buf.clear_text();
                 app.menu.selected = 0;
                 draw_spinner_now(
                     &mut app.state,
@@ -15249,8 +17510,9 @@ fn handle_streaming_key(
                         .expect("guarded above");
                 let selected_path = items[app.menu.selected].0.clone();
                 let replacement = file_index::format_at_mention_replacement(&selected_path);
-                app.buf.text.replace_range(at_pos..end, &replacement);
-                app.buf.cursor = at_pos + replacement.len();
+                let _ = app
+                    .buf
+                    .replace_text_range(at_pos..end, &replacement);
                 app.menu.selected = 0;
                 // Menu shape may have changed — surface on next redraw via
                 // draw_spinner_now (the streaming footer stays visible).
@@ -15277,8 +17539,7 @@ fn handle_streaming_key(
                 if let Some((completed, submit)) =
                     streaming_top_level_slash_selection(&app.buf.text, &name, needs_args, code)
                 {
-                    app.buf.text = completed;
-                    app.buf.cursor = app.buf.text.len();
+                    app.buf.replace_all_text(completed);
                     app.menu.selected = 0;
                     if !submit {
                         draw_spinner_now(
@@ -15308,6 +17569,7 @@ fn handle_streaming_key(
     if modifiers.is_empty() {
         match code {
             KeyCode::Up if app.buf.cursor_visual_up() => {
+                sync_composer_selection(&app.buf, &ctx.interaction_publisher);
                 draw_spinner_now(
                     &mut app.state,
                     &app.buf,
@@ -15319,6 +17581,7 @@ fn handle_streaming_key(
                 return Ok(());
             }
             KeyCode::Down if app.buf.cursor_visual_down() => {
+                sync_composer_selection(&app.buf, &ctx.interaction_publisher);
                 draw_spinner_now(
                     &mut app.state,
                     &app.buf,
@@ -15335,6 +17598,7 @@ fn handle_streaming_key(
 
     let action = classify(code, modifiers);
     let apply_result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
+    sync_composer_selection(&app.buf, &ctx.interaction_publisher);
     sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
     match apply_result {
         BufferResult::NoOp => {}
@@ -15420,8 +17684,7 @@ fn handle_streaming_key(
                     app.think.reset();
                     app.reasoning_buffer.clear();
                 }
-                app.buf.text.clear();
-                app.buf.cursor = 0;
+                app.buf.clear_text();
                 app.menu.selected = 0;
                 if readonly {
                     // Restore the streaming footer/spinner after executing the report.
@@ -15448,8 +17711,7 @@ fn handle_streaming_key(
                     "  (slash commands are disabled while a turn is running)\n".into(),
                 ));
                 renderer.flush();
-                app.buf.text.clear();
-                app.buf.cursor = 0;
+                app.buf.clear_text();
                 app.menu.selected = 0;
                 draw_spinner_now(
                     &mut app.state,
@@ -15553,8 +17815,7 @@ fn handle_streaming_key(
                     renderer.render(UiLine::CommandOutput(format!("  ↳ queued: {}\n", line)));
                 }
             }
-            app.buf.text.clear();
-            app.buf.cursor = 0;
+            app.buf.clear_text();
             app.buf.clear_pastes();
             renderer.flush();
             draw_spinner_now(
@@ -19657,8 +21918,9 @@ fn install_pending_session_picker(app: &mut App, ctx: &mut LoopCtx, renderer: &m
             renderer.flush();
         }
         Ok(sessions) => {
-            let picker: Box<dyn crate::modals::Modal> =
-                Box::new(crate::modals::SessionPicker::open(sessions));
+            let picker = crate::modals::SessionPicker::open(sessions);
+            picker.begin_preview(ctx);
+            let picker: Box<dyn crate::modals::Modal> = Box::new(picker);
             picker.draw(&app.buf, &app.state, ctx, renderer);
             app.active_modal = Some(picker);
         }
@@ -20786,6 +23048,16 @@ fn handle_runtime_event(
             ctx.pending_session_picker = Some((working_dir, result));
         }
         bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionPreviewLoaded { selection, result },
+        ) => {
+            if session_preview_result_matches(
+                ctx.session_preview_selection.as_ref(),
+                &selection,
+            ) {
+                ctx.session_preview_result = Some(result);
+            }
+        }
+        bg_runtime::RuntimeEventPayload::Driver(
             bg_runtime::DriverEvent::SessionTransitionFinished { operation, result },
         ) => match result {
             Err(error) => {
@@ -20852,6 +23124,123 @@ fn handle_runtime_event(
                 }
             }
         },
+    }
+}
+
+fn session_preview_result_matches(
+    current: Option<&crate::session::SessionPreviewSelection>,
+    incoming: &crate::session::SessionPreviewSelection,
+) -> bool {
+    current == Some(incoming)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeEventRenderEffect {
+    Other,
+    SessionPreviewInstalled,
+    SessionPreviewIgnored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeEventRedrawPolicy {
+    Default,
+    ActiveModal,
+    None,
+}
+
+fn runtime_event_render_effect(
+    current: Option<&crate::session::SessionPreviewSelection>,
+    event: &bg_runtime::RuntimeEventPayload,
+) -> RuntimeEventRenderEffect {
+    match event {
+        bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionPreviewLoaded { selection, .. },
+        ) if session_preview_result_matches(current, selection) => {
+            RuntimeEventRenderEffect::SessionPreviewInstalled
+        }
+        bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionPreviewLoaded { .. },
+        ) => RuntimeEventRenderEffect::SessionPreviewIgnored,
+        _ => RuntimeEventRenderEffect::Other,
+    }
+}
+
+fn runtime_event_redraw_policy(
+    effect: RuntimeEventRenderEffect,
+    active_modal_accepts_preview: bool,
+) -> RuntimeEventRedrawPolicy {
+    match (effect, active_modal_accepts_preview) {
+        (RuntimeEventRenderEffect::SessionPreviewInstalled, true) => {
+            RuntimeEventRedrawPolicy::ActiveModal
+        }
+        (RuntimeEventRenderEffect::SessionPreviewInstalled, false)
+        | (RuntimeEventRenderEffect::SessionPreviewIgnored, _) => RuntimeEventRedrawPolicy::None,
+        (RuntimeEventRenderEffect::Other, _) => RuntimeEventRedrawPolicy::Default,
+    }
+}
+
+#[cfg(test)]
+mod session_preview_generation_tests {
+    use super::*;
+
+    fn selection(id: &str, generation: u64) -> crate::session::SessionPreviewSelection {
+        crate::session::SessionPreviewSelection {
+            project_bucket: "0123456789abcdef".into(),
+            session_id: id.into(),
+            generation,
+        }
+    }
+
+    #[test]
+    fn preview_result_requires_the_current_bucket_id_and_generation() {
+        let current = selection("selected", 7);
+        assert!(session_preview_result_matches(Some(&current), &current));
+        assert!(!session_preview_result_matches(
+            Some(&current),
+            &selection("selected", 6),
+        ));
+        assert!(!session_preview_result_matches(
+            Some(&current),
+            &selection("other", 7),
+        ));
+        assert!(!session_preview_result_matches(None, &current));
+    }
+
+    #[test]
+    fn preview_runtime_event_redraws_only_the_current_session_picker() {
+        let current = selection("selected", 7);
+        let exact = bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionPreviewLoaded {
+                selection: current.clone(),
+                result: Ok(None),
+            },
+        );
+        let stale = bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionPreviewLoaded {
+                selection: selection("selected", 6),
+                result: Ok(None),
+            },
+        );
+        assert_eq!(
+            runtime_event_render_effect(Some(&current), &exact),
+            RuntimeEventRenderEffect::SessionPreviewInstalled,
+        );
+        assert_eq!(
+            runtime_event_render_effect(Some(&current), &stale),
+            RuntimeEventRenderEffect::SessionPreviewIgnored,
+        );
+        assert_eq!(
+            runtime_event_redraw_policy(RuntimeEventRenderEffect::SessionPreviewInstalled, true),
+            RuntimeEventRedrawPolicy::ActiveModal,
+        );
+        assert_eq!(
+            runtime_event_redraw_policy(RuntimeEventRenderEffect::SessionPreviewIgnored, true),
+            RuntimeEventRedrawPolicy::None,
+        );
+        assert_eq!(
+            runtime_event_redraw_policy(RuntimeEventRenderEffect::SessionPreviewInstalled, false),
+            RuntimeEventRedrawPolicy::None,
+        );
     }
 }
 
@@ -23030,8 +25419,7 @@ fn handle_agent_event(
             // user sees blank space where their text should be (bug report:
             // "多张图片发送后丢失文字，只保留了最后一张").
             if let Some(restore) = state.last_submitted_message.take() {
-                buf.text = restore;
-                buf.cursor = buf.text.len();
+                buf.replace_all_text(restore);
             }
             //
             // Hash table is rebuilt as best-effort: we hash the base64
@@ -23056,8 +25444,7 @@ fn handle_agent_event(
                 // positions alongside the user's text.
                 let marker_text = format!("[Image #{}]", marker);
                 if !buf.text.contains(&marker_text) {
-                    buf.text.insert_str(buf.cursor, &marker_text);
-                    buf.cursor += marker_text.len();
+                    buf.insert_at_cursor(&marker_text);
                 }
             }
             // Don't redraw — TUI is in Streaming phase here (turn isn't
@@ -24918,6 +27305,7 @@ fn draw_spinner_now(
     queue_len: usize,
     menu_selected: usize,
 ) {
+    sync_composer_selection(buf, &ctx.interaction_publisher);
     let frame = state.tick_spinner();
     // Same source + applicability gate as the status bar's `[high]`, so the
     // spinner's effort hint and the status line never disagree. (Reading
@@ -26775,6 +29163,9 @@ mod install_password_modal_tests {
             jediterm: false,
             modern_emulator: false,
             kitty_keyboard: false,
+            mouse_sgr: false,
+            osc52_clipboard: false,
+            tmux_passthrough: false,
         }
     }
 

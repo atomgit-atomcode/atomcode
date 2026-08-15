@@ -1,6 +1,7 @@
 // crates/atomcode-tuix/src/render/mod.rs
 pub mod cell;
 pub(crate) mod diff;
+pub mod interaction;
 pub mod mascot;
 pub mod plain;
 pub mod qr;

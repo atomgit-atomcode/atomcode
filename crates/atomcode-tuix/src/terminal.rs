@@ -64,6 +64,20 @@ pub struct EnvView {
     pub kitty_window_id: Option<String>,
     pub wezterm_version: Option<String>,
     pub alacritty_socket: Option<String>,
+    /// `TMUX` identifies an indirect terminal session. Protocol forwarding is
+    /// disabled unless the user separately confirms passthrough support.
+    pub tmux: Option<String>,
+    /// Any SSH marker makes client-side terminal capabilities unproven unless
+    /// the matching protocol override is explicitly enabled.
+    pub ssh_connection: Option<String>,
+    pub ssh_client: Option<String>,
+    pub ssh_tty: Option<String>,
+    /// Strict `0`/`1` overrides. A malformed, present value is treated as
+    /// `false`; unlike older compatibility toggles, words such as `true` are
+    /// deliberately not accepted as capability evidence.
+    pub force_mouse_sgr: Option<bool>,
+    pub force_osc52_clipboard: Option<bool>,
+    pub force_tmux_passthrough: Option<bool>,
 }
 
 impl EnvView {
@@ -90,8 +104,25 @@ impl EnvView {
             kitty_window_id: std::env::var("KITTY_WINDOW_ID").ok(),
             wezterm_version: std::env::var("WEZTERM_VERSION").ok(),
             alacritty_socket: std::env::var("ALACRITTY_SOCKET").ok(),
+            tmux: std::env::var("TMUX").ok(),
+            ssh_connection: std::env::var("SSH_CONNECTION").ok(),
+            ssh_client: std::env::var("SSH_CLIENT").ok(),
+            ssh_tty: std::env::var("SSH_TTY").ok(),
+            force_mouse_sgr: strict_capability_override("ATOMCODE_MOUSE_SGR"),
+            force_osc52_clipboard: strict_capability_override("ATOMCODE_OSC52"),
+            force_tmux_passthrough: strict_capability_override("ATOMCODE_TMUX_PASSTHROUGH"),
         }
     }
+}
+
+fn strict_capability_override(name: &str) -> Option<bool> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| parse_strict_bool_override(&value))
+}
+
+fn parse_strict_bool_override(value: &str) -> Option<bool> {
+    Some(matches!(value, "1"))
 }
 
 fn parse_bool_override(value: &str) -> Option<bool> {
@@ -109,7 +140,9 @@ fn parse_bool_override(value: &str) -> Option<bool> {
 }
 
 fn is_non_empty(value: &Option<String>) -> bool {
-    value.as_deref().is_some_and(|value| !value.trim().is_empty())
+    value
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -176,6 +209,13 @@ pub struct TerminalCaps {
     /// JumpServer and other xterm.js web terminals commonly expose that value
     /// while only partially implementing enhanced key reporting.
     pub kitty_keyboard: bool,
+    /// Proven support for button-event tracking with SGR coordinates.
+    pub mouse_sgr: bool,
+    /// Proven support for writing clipboard contents with OSC 52.
+    pub osc52_clipboard: bool,
+    /// Explicit evidence that the current tmux server forwards terminal
+    /// protocols used by this TUI.
+    pub tmux_passthrough: bool,
 }
 
 impl TerminalCaps {
@@ -257,6 +297,34 @@ impl TerminalCaps {
             );
         let kitty_keyboard = env.force_kitty_keyboard.unwrap_or(known_kitty_keyboard) && !jediterm;
 
+        let in_tmux = is_non_empty(&env.tmux);
+        let in_ssh = is_non_empty(&env.ssh_connection)
+            || is_non_empty(&env.ssh_client)
+            || is_non_empty(&env.ssh_tty);
+        let tmux_passthrough = in_tmux && env.force_tmux_passthrough == Some(true);
+        let known_protocol_emulator = is_non_empty(&env.kitty_window_id)
+            || is_non_empty(&env.wezterm_version)
+            || is_non_empty(&env.alacritty_socket)
+            || is_non_empty(&env.wt_session)
+            || matches!(term.as_str(), "kitty" | "xterm-kitty")
+            || matches!(
+                term_program.as_str(),
+                "kitty" | "wezterm" | "alacritty" | "ghostty" | "iterm.app" | "iterm2"
+            );
+        let capability_safe = tty && !is_dumb && !jediterm && !windows_legacy_console;
+        let mouse_passthrough = (!in_tmux || tmux_passthrough)
+            && (!in_ssh || env.force_mouse_sgr == Some(true));
+        let clipboard_passthrough = (!in_tmux || tmux_passthrough)
+            && (!in_ssh || env.force_osc52_clipboard == Some(true));
+        let mouse_sgr = capability_safe
+            && known_protocol_emulator
+            && env.force_mouse_sgr != Some(false)
+            && mouse_passthrough;
+        let osc52_clipboard = capability_safe
+            && known_protocol_emulator
+            && env.force_osc52_clipboard != Some(false)
+            && clipboard_passthrough;
+
         Self {
             tty,
             colors: tty && !env.no_color && !is_dumb,
@@ -269,6 +337,9 @@ impl TerminalCaps {
             jediterm,
             modern_emulator: on_modern_emulator,
             kitty_keyboard,
+            mouse_sgr,
+            osc52_clipboard,
+            tmux_passthrough,
         }
     }
 
@@ -316,6 +387,13 @@ mod tests {
             kitty_window_id: None,
             wezterm_version: None,
             alacritty_socket: None,
+            tmux: None,
+            ssh_connection: None,
+            ssh_client: None,
+            ssh_tty: None,
+            force_mouse_sgr: None,
+            force_osc52_clipboard: None,
+            force_tmux_passthrough: None,
         }
     }
 
@@ -389,6 +467,239 @@ mod tests {
         assert!(!caps.spinner);
         assert!(!caps.raw_mode, "dumb TERM on Unix has no raw mode");
         assert!(!caps.unicode_symbols, "dumb TERM forces ASCII fallback");
+    }
+
+    #[test]
+    fn mouse_and_clipboard_caps_are_conservative_across_terminal_boundaries() {
+        struct Case {
+            name: &'static str,
+            env: EnvView,
+            mouse_sgr: bool,
+            osc52_clipboard: bool,
+            tmux_passthrough: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "kitty",
+                env: EnvView {
+                    kitty_window_id: Some("1".into()),
+                    ..env()
+                },
+                mouse_sgr: true,
+                osc52_clipboard: true,
+                tmux_passthrough: false,
+            },
+            Case {
+                name: "wezterm",
+                env: EnvView {
+                    wezterm_version: Some("20240203".into()),
+                    ..env()
+                },
+                mouse_sgr: true,
+                osc52_clipboard: true,
+                tmux_passthrough: false,
+            },
+            Case {
+                name: "iterm2",
+                env: EnvView {
+                    term_program: Some("iTerm.app".into()),
+                    ..env()
+                },
+                mouse_sgr: true,
+                osc52_clipboard: true,
+                tmux_passthrough: false,
+            },
+            Case {
+                name: "windows_terminal",
+                env: EnvView {
+                    is_windows: true,
+                    wt_session: Some("session".into()),
+                    ..env()
+                },
+                mouse_sgr: true,
+                osc52_clipboard: true,
+                tmux_passthrough: false,
+            },
+            Case {
+                name: "legacy_conhost",
+                env: EnvView {
+                    is_windows: true,
+                    force_mouse_sgr: Some(true),
+                    force_osc52_clipboard: Some(true),
+                    ..env()
+                },
+                mouse_sgr: false,
+                osc52_clipboard: false,
+                tmux_passthrough: false,
+            },
+            Case {
+                name: "tmux_without_passthrough",
+                env: EnvView {
+                    term: Some("screen-256color".into()),
+                    tmux: Some("/tmp/tmux-501/default,1,0".into()),
+                    kitty_window_id: Some("1".into()),
+                    ..env()
+                },
+                mouse_sgr: false,
+                osc52_clipboard: false,
+                tmux_passthrough: false,
+            },
+            Case {
+                name: "ssh_unknown",
+                env: EnvView {
+                    ssh_connection: Some("192.0.2.1 50000 192.0.2.2 22".into()),
+                    ..env()
+                },
+                mouse_sgr: false,
+                osc52_clipboard: false,
+                tmux_passthrough: false,
+            },
+            Case {
+                name: "jediterm",
+                env: EnvView {
+                    terminal_emulator: Some("JetBrains-JediTerm".into()),
+                    force_mouse_sgr: Some(true),
+                    force_osc52_clipboard: Some(true),
+                    ..env()
+                },
+                mouse_sgr: false,
+                osc52_clipboard: false,
+                tmux_passthrough: false,
+            },
+            Case {
+                name: "dumb",
+                env: EnvView {
+                    term: Some("dumb".into()),
+                    ..env()
+                },
+                mouse_sgr: false,
+                osc52_clipboard: false,
+                tmux_passthrough: false,
+            },
+            Case {
+                name: "non_tty",
+                env: EnvView {
+                    is_stdout_tty: false,
+                    kitty_window_id: Some("1".into()),
+                    force_mouse_sgr: Some(true),
+                    force_osc52_clipboard: Some(true),
+                    ..env()
+                },
+                mouse_sgr: false,
+                osc52_clipboard: false,
+                tmux_passthrough: false,
+            },
+        ];
+
+        for case in cases {
+            let caps = TerminalCaps::from_env(case.env);
+            assert_eq!(caps.mouse_sgr, case.mouse_sgr, "{} mouse", case.name);
+            assert_eq!(
+                caps.osc52_clipboard, case.osc52_clipboard,
+                "{} clipboard",
+                case.name
+            );
+            assert_eq!(
+                caps.tmux_passthrough, case.tmux_passthrough,
+                "{} tmux passthrough",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn mouse_and_clipboard_caps_require_explicit_remote_passthrough() {
+        let remote_kitty = EnvView {
+            kitty_window_id: Some("1".into()),
+            ssh_connection: Some("192.0.2.1 50000 192.0.2.2 22".into()),
+            force_mouse_sgr: Some(true),
+            force_osc52_clipboard: Some(true),
+            force_tmux_passthrough: Some(true),
+            ..env()
+        };
+        let caps = TerminalCaps::from_env(remote_kitty);
+        assert!(caps.mouse_sgr);
+        assert!(caps.osc52_clipboard);
+        assert!(!caps.tmux_passthrough, "SSH alone is not a tmux session");
+
+        let tmux_kitty = EnvView {
+            kitty_window_id: Some("1".into()),
+            tmux: Some("/tmp/tmux-501/default,1,0".into()),
+            force_mouse_sgr: Some(true),
+            force_osc52_clipboard: Some(true),
+            force_tmux_passthrough: Some(true),
+            ..env()
+        };
+        let caps = TerminalCaps::from_env(tmux_kitty);
+        assert!(caps.mouse_sgr);
+        assert!(caps.osc52_clipboard);
+        assert!(caps.tmux_passthrough);
+    }
+
+    #[test]
+    fn capability_overrides_accept_only_zero_or_one_and_malformed_is_false() {
+        assert_eq!(parse_strict_bool_override("1"), Some(true));
+        assert_eq!(parse_strict_bool_override("0"), Some(false));
+        assert_eq!(parse_strict_bool_override("true"), Some(false));
+        assert_eq!(parse_strict_bool_override("garbage"), Some(false));
+    }
+
+    #[test]
+    fn ssh_inside_tmux_requires_both_remote_and_tmux_evidence() {
+        let fixture = |mouse, clipboard, passthrough| EnvView {
+            term: Some("xterm-kitty".into()),
+            kitty_window_id: Some("1".into()),
+            ssh_connection: Some("192.0.2.1 50000 192.0.2.2 22".into()),
+            tmux: Some("/tmp/tmux-501/default,1,0".into()),
+            force_mouse_sgr: mouse,
+            force_osc52_clipboard: clipboard,
+            force_tmux_passthrough: passthrough,
+            ..env()
+        };
+
+        let all = TerminalCaps::from_env(fixture(Some(true), Some(true), Some(true)));
+        assert!(all.mouse_sgr);
+        assert!(all.osc52_clipboard);
+        assert!(all.tmux_passthrough);
+
+        let missing_ssh = TerminalCaps::from_env(fixture(None, None, Some(true)));
+        assert!(!missing_ssh.mouse_sgr);
+        assert!(!missing_ssh.osc52_clipboard);
+
+        let missing_tmux = TerminalCaps::from_env(fixture(Some(true), Some(true), None));
+        assert!(!missing_tmux.mouse_sgr);
+        assert!(!missing_tmux.osc52_clipboard);
+        assert!(!missing_tmux.tmux_passthrough);
+
+        let malformed = TerminalCaps::from_env(fixture(Some(false), Some(false), Some(false)));
+        assert!(!malformed.mouse_sgr);
+        assert!(!malformed.osc52_clipboard);
+        assert!(!malformed.tmux_passthrough);
+    }
+
+    #[test]
+    fn kitty_term_detection_is_an_exact_allowlist() {
+        for term in ["not-kitty-compatible", "kittyish", "", "  "] {
+            let caps = TerminalCaps::from_env(EnvView {
+                term: Some(term.into()),
+                ..env()
+            });
+            assert!(!caps.mouse_sgr, "{term:?} must not prove mouse support");
+            assert!(
+                !caps.osc52_clipboard,
+                "{term:?} must not prove clipboard support"
+            );
+        }
+
+        for term in ["kitty", "xterm-kitty"] {
+            let caps = TerminalCaps::from_env(EnvView {
+                term: Some(term.into()),
+                ..env()
+            });
+            assert!(caps.mouse_sgr, "{term:?} is allowlisted");
+            assert!(caps.osc52_clipboard, "{term:?} is allowlisted");
+        }
     }
 
     // Regression: a Windows user reported that arrow keys couldn't navigate

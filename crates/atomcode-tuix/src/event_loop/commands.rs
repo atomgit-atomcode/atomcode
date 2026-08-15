@@ -6095,16 +6095,51 @@ fn resolve_copy(md: &str, arg: &str) -> CopyResolve {
     }
 }
 
-/// Write `text` to the system clipboard. Tries arboard (system clipboard
-/// API) first; falls back to OSC 52 emitted to `stdout` for headless / SSH
-/// sessions where no windowing system is available.
-///
-/// OSC 52 format: `\x1b]52;c;<base64>\x1b\\`
-///
-/// This is the public entry-point used by both the `/copy` command and the
-/// retained renderer's auto-copy path (issue #699).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClipboardBackend {
+    Arboard,
+    Osc52,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClipboardError {
+    Unavailable,
+    Writer,
+}
+
+/// Copy through the system clipboard first and permit OSC 52 only when the
+/// caller's probed terminal capabilities explicitly allow that fallback.
+pub(crate) fn copy_text_to_clipboard(
+    text: &str,
+    allow_osc52: bool,
+) -> Result<ClipboardBackend, ClipboardError> {
+    if try_arboard_clipboard(text) {
+        return Ok(ClipboardBackend::Arboard);
+    }
+    if !allow_osc52 {
+        return Err(ClipboardError::Unavailable);
+    }
+    copy_text_to_clipboard_via_impl(&mut std::io::stdout(), text, true, |_| false)
+}
+
+fn copy_text_to_clipboard_via_impl(
+    writer: &mut impl std::io::Write,
+    text: &str,
+    allow_osc52: bool,
+    try_arboard: impl FnOnce(&str) -> bool,
+) -> Result<ClipboardBackend, ClipboardError> {
+    if try_arboard(text) {
+        return Ok(ClipboardBackend::Arboard);
+    }
+    if !allow_osc52 {
+        return Err(ClipboardError::Unavailable);
+    }
+    write_osc52_clipboard_to(writer, text)
+        .then_some(ClipboardBackend::Osc52)
+        .ok_or(ClipboardError::Writer)
+}
+
 pub(crate) fn copy_text_to_clipboard_osc52(text: &str) -> bool {
-    // Tier 1: system clipboard via arboard (desktop)
     if try_arboard_clipboard(text) {
         return true;
     }
@@ -6115,7 +6150,7 @@ pub(crate) fn copy_text_to_clipboard_osc52(text: &str) -> bool {
     if !std::io::stdout().is_terminal() {
         return false;
     }
-    write_osc52_clipboard_to(&mut std::io::stdout(), text)
+    copy_text_to_clipboard_via_impl(&mut std::io::stdout(), text, true, |_| false).is_ok()
 }
 
 /// Variant of [`copy_text_to_clipboard_osc52`] that emits the OSC 52
@@ -6126,10 +6161,7 @@ pub(crate) fn copy_text_to_clipboard_osc52_via(
     writer: &mut impl std::io::Write,
     text: &str,
 ) -> bool {
-    if try_arboard_clipboard(text) {
-        return true;
-    }
-    write_osc52_clipboard_to(writer, text)
+    copy_text_to_clipboard_via_impl(writer, text, true, try_arboard_clipboard).is_ok()
 }
 
 fn try_arboard_clipboard(text: &str) -> bool {
@@ -7477,6 +7509,43 @@ mod expand_cd_target_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_policy_denies_osc52_without_explicit_permission() {
+        let mut bytes = Vec::new();
+        assert_eq!(
+            copy_text_to_clipboard_via_impl(&mut bytes, "secret", false, |_| false),
+            Err(ClipboardError::Unavailable)
+        );
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn clipboard_policy_reports_osc52_writer_failure() {
+        struct DeniedWriter;
+        impl std::io::Write for DeniedWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(
+            copy_text_to_clipboard_via_impl(&mut DeniedWriter, "secret", true, |_| false),
+            Err(ClipboardError::Writer)
+        );
+    }
+
+    #[test]
+    fn clipboard_policy_prefers_arboard_and_emits_no_osc52() {
+        let mut bytes = Vec::new();
+        assert_eq!(
+            copy_text_to_clipboard_via_impl(&mut bytes, "text", true, |_| true),
+            Ok(ClipboardBackend::Arboard)
+        );
+        assert!(bytes.is_empty());
+    }
 
     #[derive(Default)]
     struct ReplayLifecycleProbe {

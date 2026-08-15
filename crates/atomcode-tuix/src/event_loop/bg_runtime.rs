@@ -65,6 +65,55 @@ pub enum DriverEvent {
         working_dir: PathBuf,
         result: Result<Vec<crate::session::SessionMeta>, String>,
     },
+    SessionPreviewLoaded {
+        selection: crate::session::SessionPreviewSelection,
+        result: Result<
+            Option<atomcode_daemon::legacy_convert::CatalogSessionPreview>,
+            atomcode_daemon::legacy_convert::CatalogSessionPreviewError,
+        >,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionPreviewRequest {
+    pub runtime_id: RuntimeId,
+    pub selection: crate::session::SessionPreviewSelection,
+}
+
+/// One sequential worker consumes only the latest watched selection. A move
+/// invalidates the old generation immediately; no second blocking read runs in
+/// parallel with the current one.
+pub fn spawn_session_preview_loader(
+    mut requests: tokio::sync::watch::Receiver<Option<SessionPreviewRequest>>,
+    event_tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+) {
+    tokio::spawn(async move {
+        while requests.changed().await.is_ok() {
+            let Some(request) = requests.borrow_and_update().clone() else {
+                continue;
+            };
+            let selection = request.selection.clone();
+            let project_bucket = selection.project_bucket.clone();
+            let session_id = selection.session_id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                atomcode_daemon::legacy_convert::preview_catalog_session_in_project(
+                    &project_bucket,
+                    &session_id,
+                )
+            })
+            .await
+            .unwrap_or(Err(
+                atomcode_daemon::legacy_convert::CatalogSessionPreviewError::Unavailable,
+            ));
+            let _ = event_tx.send(RuntimeEvent {
+                runtime_id: request.runtime_id,
+                event: RuntimeEventPayload::Driver(DriverEvent::SessionPreviewLoaded {
+                    selection,
+                    result,
+                }),
+            });
+        }
+    });
 }
 
 pub fn spawn_event_forwarder(
@@ -1115,6 +1164,45 @@ mod tests {
         let mut s = Session::default_session(PathBuf::from("/tmp/project"));
         s.name = name.to_string();
         s
+    }
+
+    #[tokio::test]
+    async fn preview_worker_coalesces_pending_moves_to_the_latest_generation() {
+        let (request_tx, request_rx) = tokio::sync::watch::channel(None);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let request = |generation| SessionPreviewRequest {
+            runtime_id: RuntimeId::new(1),
+            selection: crate::session::SessionPreviewSelection {
+                project_bucket: "invalid-bucket".into(),
+                session_id: "session".into(),
+                generation,
+            },
+        };
+        request_tx.send_replace(Some(request(1)));
+        request_tx.send_replace(Some(request(2)));
+        spawn_session_preview_loader(request_rx, event_tx);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("latest preview terminal")
+            .expect("worker event");
+        let RuntimeEventPayload::Driver(DriverEvent::SessionPreviewLoaded { selection, result }) =
+            event.event
+        else {
+            panic!("unexpected preview worker event");
+        };
+        assert_eq!(selection.generation, 2);
+        assert_eq!(
+            result.unwrap_err(),
+            atomcode_daemon::legacy_convert::CatalogSessionPreviewError::InvalidLocation,
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), event_rx.recv())
+                .await
+                .is_err(),
+            "coalesced generation 1 must not produce a terminal",
+        );
+        drop(request_tx);
     }
 
     #[test]

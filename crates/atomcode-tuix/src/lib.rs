@@ -497,8 +497,12 @@ pub async fn run(
     // auto-trigger; the modal would otherwise try to draw a
     // Cyan-bordered box into a stdout that no human is watching.
     let is_plain_renderer = !caps.tty;
+    let interaction_publisher = crate::render::interaction::InteractionPublisher::default();
     let mut inner: Box<dyn Renderer> = if caps.tty {
-        Box::new(RetainedRenderer::new(caps))
+        Box::new(RetainedRenderer::new_with_interactions(
+            caps,
+            interaction_publisher.clone(),
+        ))
     } else {
         // Pass caps + the ORIGINAL tty value so PlainRenderer can:
         // (a) gate colours / unicode / spinner on caps.{colors,
@@ -526,7 +530,14 @@ pub async fn run(
     inner.set_auto_copy_enabled(auto_copy);
     let history_replay_max_rows = resolve_history_replay_max_rows(&config, &caps);
     inner.set_history_replay_max_rows(history_replay_max_rows);
-    let mut renderer: Box<dyn Renderer> = Box::new(TaskRenderer::new(inner));
+    let mut renderer: Box<dyn Renderer> = if caps.tty {
+        Box::new(TaskRenderer::new_with_interactions(
+            inner,
+            interaction_publisher.clone(),
+        ))
+    } else {
+        Box::new(TaskRenderer::new(inner))
+    };
 
     // Input thread (only spawn when raw-mode/TTY available; pipe mode
     // reads stdin directly). `reader_handle` exposes Pause / Resume so
@@ -731,6 +742,12 @@ pub async fn run(
         event_rx,
         runtime_event_tx.clone(),
     );
+    let (session_preview_request_tx, session_preview_request_rx) =
+        tokio::sync::watch::channel(None);
+    event_loop::bg_runtime::spawn_session_preview_loader(
+        session_preview_request_rx,
+        runtime_event_tx.clone(),
+    );
     let bg_manager = event_loop::bg_runtime::BgRuntimeManager::new(
         current_session.clone(),
         working_dir.clone(),
@@ -787,6 +804,7 @@ pub async fn run(
 
     let file_index_root = working_dir.clone();
     let ctx = LoopCtx {
+        interaction_publisher,
         config,
         provider_selection,
         model_name,
@@ -859,6 +877,10 @@ pub async fn run(
         pending_session_resume_preparation: None,
         next_session_resume_operation_id: 1,
         pending_session_picker: None,
+        session_preview_request_tx,
+        next_session_preview_generation: 1,
+        session_preview_selection: None,
+        session_preview_result: None,
         pending_rewind_catalog: None,
         pending_session_transition: None,
         pending_external_session_projection: None,
@@ -963,6 +985,9 @@ mod panic_restore_tests {
             jediterm: false,
             modern_emulator: true,
             kitty_keyboard: true,
+            mouse_sgr: true,
+            osc52_clipboard: true,
+            tmux_passthrough: false,
         }
     }
 
