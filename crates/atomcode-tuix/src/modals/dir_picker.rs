@@ -10,7 +10,10 @@ use std::path::PathBuf;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use super::{Modal, ModalAction, ModalPointerAction};
+use super::{
+    backspace_at_cursor, delete_at_cursor, insert_at_cursor, next_grapheme_boundary,
+    previous_grapheme_boundary, Modal, ModalAction, ModalPointerAction,
+};
 use crate::event_loop::commands::apply_cd;
 use crate::event_loop::{build_status, Buffer, LoopCtx};
 use crate::render::{MenuPayload, Renderer, UiLine};
@@ -28,6 +31,7 @@ pub struct DirPicker {
     /// Search text or a new path. Enter opens the selected match when one exists;
     /// only a zero-match query is resolved as a literal `/cd <path>` target.
     pub query: String,
+    pub query_cursor_byte: usize,
     tab_matches: Vec<String>,
     tab_index: usize,
 }
@@ -45,6 +49,7 @@ impl DirPicker {
             current,
             selected: 0,
             query: String::new(),
+            query_cursor_byte: 0,
             tab_matches: Vec::new(),
             tab_index: 0,
         }
@@ -70,17 +75,21 @@ impl DirPicker {
             .collect()
     }
 
-    /// Append a typed character to the path query and reset the highlight to the
+    /// Insert a typed character into the path query and reset the highlight to the
     /// top of the (re-filtered) list.
     fn on_char(&mut self, c: char) {
-        self.query.push(c);
+        insert_at_cursor(
+            &mut self.query,
+            &mut self.query_cursor_byte,
+            c.encode_utf8(&mut [0; 4]),
+        );
         self.selected = 0;
         self.reset_tab_completion();
     }
 
-    /// Delete the last character of the path query and reset the highlight.
+    /// Delete the grapheme before the query cursor and reset the highlight.
     fn on_backspace(&mut self) {
-        self.query.pop();
+        backspace_at_cursor(&mut self.query, &mut self.query_cursor_byte);
         self.selected = 0;
         self.reset_tab_completion();
     }
@@ -223,18 +232,21 @@ impl DirPicker {
             {
                 self.tab_index = (self.tab_index + 1) % self.tab_matches.len();
                 self.query = self.tab_matches[self.tab_index].clone();
+                self.query_cursor_byte = self.query.len();
                 self.selected = 0;
                 return;
             }
             let completions = directory_completions(&self.query, cwd);
             if let Some(completion) = best_completion(&self.query, &completions) {
                 self.query = completion;
+                self.query_cursor_byte = self.query.len();
                 self.selected = 0;
                 self.reset_tab_completion();
             } else if !completions.is_empty() {
                 self.tab_matches = completions;
                 self.tab_index = 0;
                 self.query = self.tab_matches[0].clone();
+                self.query_cursor_byte = self.query.len();
                 self.selected = 0;
             }
             return;
@@ -242,6 +254,7 @@ impl DirPicker {
 
         if let Some(path) = self.filtered().get(self.selected) {
             self.query = crate::platform::collapse_home(&path.to_string_lossy());
+            self.query_cursor_byte = self.query.len();
             self.selected = 0;
             self.reset_tab_completion();
         }
@@ -293,6 +306,39 @@ impl Modal for DirPicker {
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
+            KeyCode::Left => {
+                self.query_cursor_byte =
+                    previous_grapheme_boundary(&self.query, self.query_cursor_byte);
+                self.reset_tab_completion();
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::Right => {
+                self.query_cursor_byte =
+                    next_grapheme_boundary(&self.query, self.query_cursor_byte);
+                self.reset_tab_completion();
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::Home => {
+                self.query_cursor_byte = 0;
+                self.reset_tab_completion();
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::End => {
+                self.query_cursor_byte = self.query.len();
+                self.reset_tab_completion();
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::Delete => {
+                delete_at_cursor(&mut self.query, &mut self.query_cursor_byte);
+                self.selected = 0;
+                self.reset_tab_completion();
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
             KeyCode::Enter => self.confirm_selected(buf, state, ctx, renderer),
             KeyCode::Esc => Ok(ModalAction::Close),
             _ => Ok(ModalAction::Continue),
@@ -308,12 +354,8 @@ impl Modal for DirPicker {
         renderer: &mut dyn Renderer,
     ) -> Result<ModalAction> {
         // Paste goes into the query, not the main buffer
-        for c in text.chars() {
-            if c.is_control() {
-                continue; // skip newlines/control characters
-            }
-            self.query.push(c);
-        }
+        let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+        insert_at_cursor(&mut self.query, &mut self.query_cursor_byte, &clean);
         self.selected = 0;
         self.reset_tab_completion();
         self.draw(buf, state, ctx, renderer);
@@ -330,9 +372,7 @@ impl Modal for DirPicker {
     ) -> Result<ModalAction> {
         match action {
             ModalPointerAction::Select(index) => {
-                self.pointer_select_with(index, |picker| {
-                    picker.draw(buf, state, ctx, renderer)
-                });
+                self.pointer_select_with(index, |picker| picker.draw(buf, state, ctx, renderer));
                 Ok(ModalAction::Continue)
             }
             ModalPointerAction::Confirm(index) => {
@@ -361,7 +401,7 @@ impl Modal for DirPicker {
         // buffer, which stays untouched while the modal is open).
         renderer.render(UiLine::InputPrompt {
             buf: self.query.clone(),
-            cursor_byte: self.query.len(),
+            cursor_byte: self.query_cursor_byte,
             menu: Some(payload),
             status: build_status(state, ctx),
             attachments: Vec::new(),
@@ -403,8 +443,7 @@ fn build_menu_payload(p: &DirPicker) -> MenuPayload {
         let mut current_labeled = false;
         items.extend(filtered.iter().map(|d| {
             let name = crate::platform::collapse_home(&d.to_string_lossy());
-            let desc = if !current_labeled
-                && crate::event_loop::commands::paths_same(d, &p.current)
+            let desc = if !current_labeled && crate::event_loop::commands::paths_same(d, &p.current)
             {
                 current_labeled = true;
                 crate::i18n::t(crate::i18n::Msg::DirCurrent).into_owned()
@@ -876,7 +915,10 @@ mod tests {
         // carry the "current" label — two "current" markers is a bug.
         let p = DirPicker::open(vec![pb("/proj"), pb("/proj")], pb("/proj"));
         let payload = build_menu_payload(&p);
-        assert_eq!(payload.items[DIR_HEADER_ROWS].1, "current", "first match labeled");
+        assert_eq!(
+            payload.items[DIR_HEADER_ROWS].1, "current",
+            "first match labeled"
+        );
         assert_eq!(
             payload.items[DIR_HEADER_ROWS + 1].1,
             "",

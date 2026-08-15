@@ -17,7 +17,10 @@ use crate::session::{Session, SessionMeta, TurnStat};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use super::{Modal, ModalAction, ModalPointerAction};
+use super::{
+    backspace_at_cursor, delete_at_cursor, insert_at_cursor, next_grapheme_boundary,
+    previous_grapheme_boundary, Modal, ModalAction, ModalPointerAction,
+};
 use crate::event_loop::{
     build_status, format_tool_detail, provider_transition_pending, summarise, Buffer, LoopCtx,
 };
@@ -37,6 +40,8 @@ pub struct SessionPicker {
     pub sessions: Vec<SessionMeta>,
     /// User-typed filter text. Empty string = show all.
     pub query: String,
+    /// Byte offset at a grapheme boundary in `query`.
+    pub query_cursor_byte: usize,
     /// Indices into `sessions` that match `query` (case-insensitive substring).
     pub filtered: Vec<usize>,
     /// Index into `filtered`.
@@ -57,6 +62,7 @@ impl SessionPicker {
         Self {
             sessions,
             query: String::new(),
+            query_cursor_byte: 0,
             filtered,
             selected: 0,
             search_focused: false,
@@ -362,7 +368,7 @@ impl Modal for SessionPicker {
                 Ok(ModalAction::Continue)
             }
             KeyCode::Backspace => {
-                self.query.pop();
+                backspace_at_cursor(&mut self.query, &mut self.query_cursor_byte);
                 self.update_filter();
                 // Editing the query is editing the search box — pull focus there
                 // so the caret appears and no session row looks active.
@@ -374,7 +380,47 @@ impl Modal for SessionPicker {
                 Ok(ModalAction::Continue)
             }
             KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
-                self.query.push(c);
+                insert_at_cursor(
+                    &mut self.query,
+                    &mut self.query_cursor_byte,
+                    c.encode_utf8(&mut [0; 4]),
+                );
+                self.update_filter();
+                self.search_focused = true;
+                self.confirm_delete = None;
+                self.delete_status = None;
+                self.sync_preview_request(ctx);
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::Left => {
+                self.query_cursor_byte =
+                    previous_grapheme_boundary(&self.query, self.query_cursor_byte);
+                self.search_focused = true;
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::Right => {
+                self.query_cursor_byte =
+                    next_grapheme_boundary(&self.query, self.query_cursor_byte);
+                self.search_focused = true;
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::Home => {
+                self.query_cursor_byte = 0;
+                self.search_focused = true;
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::End => {
+                self.query_cursor_byte = self.query.len();
+                self.search_focused = true;
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::Delete => {
+                delete_at_cursor(&mut self.query, &mut self.query_cursor_byte);
                 self.update_filter();
                 self.search_focused = true;
                 self.confirm_delete = None;
@@ -478,12 +524,8 @@ impl Modal for SessionPicker {
         renderer: &mut dyn Renderer,
     ) -> Result<ModalAction> {
         // Paste goes into the query filter, not the main buffer
-        for c in text.chars() {
-            if c.is_control() {
-                continue; // skip newlines/control characters
-            }
-            self.query.push(c);
-        }
+        let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+        insert_at_cursor(&mut self.query, &mut self.query_cursor_byte, &clean);
         self.update_filter();
         self.search_focused = true;
         self.confirm_delete = None;
@@ -567,7 +609,7 @@ impl Modal for SessionPicker {
         // composer — exactly like `/plugin`.
         renderer.render(UiLine::InputPrompt {
             buf: self.query.clone(),
-            cursor_byte: self.query.len(),
+            cursor_byte: self.query_cursor_byte,
             menu: Some(payload),
             status,
             attachments: Vec::new(),
@@ -1620,13 +1662,8 @@ mod tests {
             },
         ));
 
-        let payload = build_menu_payload_with_preview(
-            &p,
-            "project",
-            None,
-            Some(&selection),
-            Some(&result),
-        );
+        let payload =
+            build_menu_payload_with_preview(&p, "project", None, Some(&selection), Some(&result));
         let selected_desc = &payload.items[HEADER_ROWS].1;
         assert!(selected_desc.contains("provider · model"));
         assert!(selected_desc.ends_with("first\nsecond"));

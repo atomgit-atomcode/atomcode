@@ -24,7 +24,10 @@ use atomcode_capabilities::plugin::InstallScope;
 use atomcode_capabilities::plugin::PluginJobEvent;
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use super::{Modal, ModalAction};
+use super::{
+    backspace_at_cursor, delete_at_cursor, insert_at_cursor, next_grapheme_boundary,
+    previous_grapheme_boundary, Modal, ModalAction,
+};
 use crate::event_loop::{build_status, reload_plugins, Buffer, LoopCtx};
 use crate::i18n::{t, Msg};
 use crate::render::{MenuKind, MenuPayload, Renderer, UiLine};
@@ -99,6 +102,8 @@ pub struct PluginManager {
     /// Search / filter query. Captures printable characters when typing
     /// on Browse, Plugins, and Installed screens.
     search_query: String,
+    /// UTF-8 byte cursor for the list search query.
+    search_cursor_byte: usize,
     /// The install scope selected for the plugin currently being installed.
     installing_scope: Option<InstallScope>,
     is_updating: bool,
@@ -136,6 +141,7 @@ impl PluginManager {
             cancelled_installs: HashSet::new(),
             close_requested: false,
             search_query: String::new(),
+            search_cursor_byte: 0,
             installing_scope: None,
             is_updating: false,
         };
@@ -239,6 +245,7 @@ impl PluginManager {
             (current_tab + 2) % 3
         };
         self.search_query.clear();
+        self.search_cursor_byte = 0;
         match next_tab {
             0 => self.goto(Screen::Browse),
             1 => self.goto(Screen::Installed),
@@ -488,6 +495,7 @@ impl PluginManager {
             match self.selected {
                 0 => {
                     self.search_query = mp_name;
+                    self.search_cursor_byte = self.search_query.len();
                     self.goto(Screen::Browse);
                 }
                 1 => {
@@ -1109,7 +1117,7 @@ impl Modal for PluginManager {
                     self.selected += 1;
                 }
             }
-            KeyCode::Left | KeyCode::BackTab => {
+            KeyCode::BackTab => {
                 if matches!(
                     self.screen,
                     Screen::Browse | Screen::Installed | Screen::Marketplaces
@@ -1117,7 +1125,7 @@ impl Modal for PluginManager {
                     self.switch_tab(false);
                 }
             }
-            KeyCode::Right | KeyCode::Tab => {
+            KeyCode::Tab => {
                 if matches!(
                     self.screen,
                     Screen::Browse | Screen::Installed | Screen::Marketplaces
@@ -1127,7 +1135,7 @@ impl Modal for PluginManager {
             }
             KeyCode::Backspace => {
                 if !self.search_query.is_empty() {
-                    self.search_query.pop();
+                    backspace_at_cursor(&mut self.search_query, &mut self.search_cursor_byte);
                     self.selected = 0;
                 } else if matches!(self.screen, Screen::Browse) {
                     self.enter_remove(ctx, renderer);
@@ -1136,7 +1144,10 @@ impl Modal for PluginManager {
                 }
             }
             KeyCode::Delete => {
-                if matches!(self.screen, Screen::Browse) {
+                if !self.search_query.is_empty() {
+                    delete_at_cursor(&mut self.search_query, &mut self.search_cursor_byte);
+                    self.selected = 0;
+                } else if matches!(self.screen, Screen::Browse) {
                     self.enter_remove(ctx, renderer);
                 } else if matches!(self.screen, Screen::Marketplaces) {
                     self.confirm_remove_selected_marketplace();
@@ -1145,6 +1156,7 @@ impl Modal for PluginManager {
             KeyCode::Esc => {
                 if !self.search_query.is_empty() {
                     self.search_query.clear();
+                    self.search_cursor_byte = 0;
                     self.selected = 0;
                 } else {
                     match &self.screen {
@@ -1220,9 +1232,23 @@ impl Modal for PluginManager {
                 }
             }
             KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
-                self.search_query.push(c);
+                insert_at_cursor(
+                    &mut self.search_query,
+                    &mut self.search_cursor_byte,
+                    c.encode_utf8(&mut [0; 4]),
+                );
                 self.selected = 0;
             }
+            KeyCode::Left => {
+                self.search_cursor_byte =
+                    previous_grapheme_boundary(&self.search_query, self.search_cursor_byte);
+            }
+            KeyCode::Right => {
+                self.search_cursor_byte =
+                    next_grapheme_boundary(&self.search_query, self.search_cursor_byte);
+            }
+            KeyCode::Home => self.search_cursor_byte = 0,
+            KeyCode::End => self.search_cursor_byte = self.search_query.len(),
             _ => {}
         }
         if std::mem::take(&mut self.close_requested) {
@@ -1512,7 +1538,7 @@ impl Modal for PluginManager {
                 .sum::<usize>();
             (self.url_input.clone(), byte_idx)
         } else {
-            (self.search_query.clone(), self.search_query.len())
+            (self.search_query.clone(), self.search_cursor_byte)
         };
         renderer.render(UiLine::InputPrompt {
             buf: text,
@@ -1703,6 +1729,7 @@ mod tests {
             cancelled_installs: HashSet::new(),
             close_requested: false,
             search_query: String::new(),
+            search_cursor_byte: 0,
             installing_scope: None,
             is_updating: false,
         }

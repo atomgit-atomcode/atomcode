@@ -4,7 +4,10 @@ use anyhow::Result;
 use atomcode_config::settings::{ApplyPolicy, SettingKind, SettingSpec, SETTINGS};
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use super::{Modal, ModalAction};
+use super::{
+    backspace_at_cursor, delete_at_cursor, insert_at_cursor, next_grapheme_boundary,
+    previous_grapheme_boundary, Modal, ModalAction,
+};
 use crate::event_loop::{
     apply_config_panel_commit, build_status, Buffer, LoopCtx, PersistedConfigReload,
 };
@@ -13,9 +16,11 @@ use crate::state::UiState;
 
 pub struct ConfigPanel {
     query: String,
+    query_cursor_byte: usize,
     selected: usize,
     editing: Option<&'static SettingSpec>,
     edit_value: String,
+    edit_cursor_byte: usize,
     replace_edit_value_on_input: bool,
     pending_reset: Option<&'static str>,
 }
@@ -24,9 +29,11 @@ impl ConfigPanel {
     pub fn open() -> Self {
         Self {
             query: String::new(),
+            query_cursor_byte: 0,
             selected: 0,
             editing: None,
             edit_value: String::new(),
+            edit_cursor_byte: 0,
             replace_edit_value_on_input: false,
             pending_reset: None,
         }
@@ -128,6 +135,7 @@ impl ConfigPanel {
             SettingKind::Integer { .. } => {
                 self.editing = Some(setting);
                 self.edit_value = current;
+                self.edit_cursor_byte = self.edit_value.len();
                 self.replace_edit_value_on_input = true;
                 Ok(())
             }
@@ -243,6 +251,7 @@ impl Modal for ConfigPanel {
                         Ok(()) => {
                             self.editing = None;
                             self.edit_value.clear();
+                            self.edit_cursor_byte = 0;
                             self.replace_edit_value_on_input = false;
                         }
                         Err(error) => renderer.render(UiLine::Error(error.to_string())),
@@ -251,22 +260,51 @@ impl Modal for ConfigPanel {
                 KeyCode::Esc => {
                     self.editing = None;
                     self.edit_value.clear();
+                    self.edit_cursor_byte = 0;
                     self.replace_edit_value_on_input = false;
                 }
                 KeyCode::Backspace => {
                     if self.replace_edit_value_on_input {
                         self.edit_value.clear();
+                        self.edit_cursor_byte = 0;
                         self.replace_edit_value_on_input = false;
                     } else {
-                        self.edit_value.pop();
+                        backspace_at_cursor(&mut self.edit_value, &mut self.edit_cursor_byte);
                     }
                 }
                 KeyCode::Char(c) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
                     if self.replace_edit_value_on_input {
                         self.edit_value.clear();
+                        self.edit_cursor_byte = 0;
                         self.replace_edit_value_on_input = false;
                     }
-                    self.edit_value.push(c)
+                    insert_at_cursor(
+                        &mut self.edit_value,
+                        &mut self.edit_cursor_byte,
+                        c.encode_utf8(&mut [0; 4]),
+                    )
+                }
+                KeyCode::Left => {
+                    self.replace_edit_value_on_input = false;
+                    self.edit_cursor_byte =
+                        previous_grapheme_boundary(&self.edit_value, self.edit_cursor_byte);
+                }
+                KeyCode::Right => {
+                    self.replace_edit_value_on_input = false;
+                    self.edit_cursor_byte =
+                        next_grapheme_boundary(&self.edit_value, self.edit_cursor_byte);
+                }
+                KeyCode::Home => {
+                    self.replace_edit_value_on_input = false;
+                    self.edit_cursor_byte = 0;
+                }
+                KeyCode::End => {
+                    self.replace_edit_value_on_input = false;
+                    self.edit_cursor_byte = self.edit_value.len();
+                }
+                KeyCode::Delete => {
+                    self.replace_edit_value_on_input = false;
+                    delete_at_cursor(&mut self.edit_value, &mut self.edit_cursor_byte);
                 }
                 _ => {}
             }
@@ -299,13 +337,26 @@ impl Modal for ConfigPanel {
                 }
             }
             KeyCode::Backspace => {
-                self.query.pop();
+                backspace_at_cursor(&mut self.query, &mut self.query_cursor_byte);
                 self.selected = 0;
             }
             KeyCode::Char(c) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
-                self.query.push(c);
+                insert_at_cursor(
+                    &mut self.query,
+                    &mut self.query_cursor_byte,
+                    c.encode_utf8(&mut [0; 4]),
+                );
                 self.selected = 0;
             }
+            KeyCode::Left => {
+                self.query_cursor_byte =
+                    previous_grapheme_boundary(&self.query, self.query_cursor_byte)
+            }
+            KeyCode::Right => {
+                self.query_cursor_byte = next_grapheme_boundary(&self.query, self.query_cursor_byte)
+            }
+            KeyCode::Home => self.query_cursor_byte = 0,
+            KeyCode::End => self.query_cursor_byte = self.query.len(),
             KeyCode::Esc => return Ok(ModalAction::Close),
             _ => return Ok(ModalAction::Continue),
         }
@@ -321,12 +372,18 @@ impl Modal for ConfigPanel {
         ctx: &mut LoopCtx,
         renderer: &mut dyn Renderer,
     ) -> Result<ModalAction> {
-        let target = if self.editing.is_some() {
-            &mut self.edit_value
+        if self.editing.is_some() && self.replace_edit_value_on_input {
+            self.edit_value.clear();
+            self.edit_cursor_byte = 0;
+            self.replace_edit_value_on_input = false;
+        }
+        let (target, cursor) = if self.editing.is_some() {
+            (&mut self.edit_value, &mut self.edit_cursor_byte)
         } else {
-            &mut self.query
+            (&mut self.query, &mut self.query_cursor_byte)
         };
-        target.extend(text.chars().filter(|c| !c.is_control()));
+        let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+        insert_at_cursor(target, cursor, &clean);
         self.selected = 0;
         self.draw(buf, state, ctx, renderer);
         Ok(ModalAction::Continue)
@@ -340,9 +397,9 @@ impl Modal for ConfigPanel {
                 self.query.clone()
             },
             cursor_byte: if self.editing.is_some() {
-                self.edit_value.len()
+                self.edit_cursor_byte
             } else {
-                self.query.len()
+                self.query_cursor_byte
             },
             menu: Some(self.draw_payload(ctx)),
             status: build_status(state, ctx),

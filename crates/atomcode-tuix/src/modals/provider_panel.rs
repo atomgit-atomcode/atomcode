@@ -6,14 +6,14 @@
 
 use anyhow::Result;
 use atomcode_config::config::provider::{ModelProfileConfig, ProviderAccountConfig};
-use atomcode_config::config::{Config, provider_preset};
+use atomcode_config::config::{provider_preset, Config};
 use crossterm::event::{KeyCode, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::{Modal, ModalAction, tab_chip};
+use super::{tab_chip, Modal, ModalAction};
 use crate::event_loop::{
-    Buffer, ConfigReloadSelection, LoopCtx, build_status, set_default_provider_and_reload,
-    update_config_and_reload,
+    build_status, set_default_provider_and_reload, update_config_and_reload, Buffer,
+    ConfigReloadSelection, LoopCtx,
 };
 use crate::render::{MenuKind, MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
@@ -357,6 +357,8 @@ struct ModelForm {
     window: String,
     make_default: bool,
     focus: ModelField,
+    /// UTF-8 byte cursor for the currently focused text field.
+    cursor_byte: usize,
     /// When set, this is an edit of an existing model id (account locked).
     edit_id: Option<String>,
 }
@@ -387,6 +389,7 @@ impl ModelForm {
             window: String::new(),
             make_default: true,
             focus: ModelField::Account,
+            cursor_byte: 0,
             edit_id: None,
         })
     }
@@ -404,6 +407,7 @@ impl ModelForm {
             window: m.context_window.to_string(),
             make_default: config.effective_model_selection().as_deref() == Some(id),
             focus: ModelField::Model,
+            cursor_byte: m.model.len(),
             edit_id: Some(id.to_string()),
         })
     }
@@ -445,6 +449,19 @@ impl ModelForm {
             (cur + fields.len() - 1) % fields.len()
         };
         self.focus = fields[next];
+        self.cursor_byte = self.focused_text().map(str::len).unwrap_or(0);
+    }
+
+    fn focused_text(&self) -> Option<&str> {
+        match self.focus {
+            ModelField::ApiKey => Some(&self.api_key),
+            ModelField::Model => Some(&self.model),
+            ModelField::Window => Some(&self.window),
+            ModelField::Account
+            | ModelField::Vision
+            | ModelField::Effort
+            | ModelField::MakeDefault => None,
+        }
     }
 
     fn cycle_account(&mut self, forward: bool) {
@@ -508,7 +525,9 @@ impl ModelForm {
     fn effort_label(&self) -> String {
         match self.reasoning_effort.as_deref() {
             None => crate::i18n::t(crate::i18n::Msg::ProviderPanelVisionDisabled).into_owned(),
-            Some("auto") => crate::i18n::t(crate::i18n::Msg::ProviderPanelDefaultValue).into_owned(),
+            Some("auto") => {
+                crate::i18n::t(crate::i18n::Msg::ProviderPanelDefaultValue).into_owned()
+            }
             Some(value) => value.to_string(),
         }
     }
@@ -527,6 +546,8 @@ pub struct ProviderPanel {
     mode: Mode,
     /// Search/filter query for the list (the plugin-style search box).
     query: String,
+    /// UTF-8 byte cursor for the list search query.
+    query_cursor_byte: usize,
     /// When set (via drilling into an account with ↵), the Models tab shows only
     /// this account's models. Cleared by Tab / Esc.
     account_filter: Option<String>,
@@ -583,18 +604,23 @@ impl ProviderPanel {
                 FormField::Name | FormField::Preset => {}
             },
             Mode::Model(form) => match form.focus {
-                ModelField::ApiKey => form.api_key.push_str(clean),
-                ModelField::Model => form.model.push_str(clean),
-                ModelField::Window => form
-                    .window
-                    .extend(clean.chars().filter(char::is_ascii_digit)),
+                ModelField::ApiKey => {
+                    insert_at_cursor(&mut form.api_key, &mut form.cursor_byte, clean)
+                }
+                ModelField::Model => {
+                    insert_at_cursor(&mut form.model, &mut form.cursor_byte, clean)
+                }
+                ModelField::Window => {
+                    let digits: String = clean.chars().filter(char::is_ascii_digit).collect();
+                    insert_at_cursor(&mut form.window, &mut form.cursor_byte, &digits)
+                }
                 ModelField::Account
                 | ModelField::Vision
                 | ModelField::Effort
                 | ModelField::MakeDefault => {}
             },
             Mode::List => {
-                self.query.push_str(clean);
+                insert_at_cursor(&mut self.query, &mut self.query_cursor_byte, clean);
                 self.selected = 0;
                 self.pending_delete = None;
             }
@@ -607,6 +633,7 @@ impl ProviderPanel {
             selected: 0,
             mode: Mode::List,
             query: String::new(),
+            query_cursor_byte: 0,
             account_filter: None,
             pending_delete: None,
         }
@@ -740,6 +767,7 @@ impl ProviderPanel {
         self.tab = tab;
         self.selected = 0;
         self.query.clear();
+        self.query_cursor_byte = 0;
         self.account_filter = None;
         self.pending_delete = None;
     }
@@ -751,6 +779,7 @@ impl ProviderPanel {
         self.selected = 0;
         self.mode = Mode::List;
         self.query.clear();
+        self.query_cursor_byte = 0;
         self.account_filter = Some(account_id.to_string());
         self.pending_delete = None;
     }
@@ -1383,6 +1412,20 @@ impl Modal for ProviderPanel {
                 KeyCode::Right if form.focus == ModelField::Vision => form.cycle_vision(true),
                 KeyCode::Left if form.focus == ModelField::Effort => form.cycle_effort(false),
                 KeyCode::Right if form.focus == ModelField::Effort => form.cycle_effort(true),
+                KeyCode::Left => {
+                    if let Some(text) = form.focused_text() {
+                        form.cursor_byte = previous_grapheme_boundary(text, form.cursor_byte);
+                    }
+                }
+                KeyCode::Right => {
+                    if let Some(text) = form.focused_text() {
+                        form.cursor_byte = next_grapheme_boundary(text, form.cursor_byte);
+                    }
+                }
+                KeyCode::Home => form.cursor_byte = 0,
+                KeyCode::End => {
+                    form.cursor_byte = form.focused_text().map(str::len).unwrap_or(0);
+                }
                 KeyCode::Char(' ') if form.focus == ModelField::Vision => {
                     form.cycle_vision(true);
                 }
@@ -1393,21 +1436,41 @@ impl Modal for ProviderPanel {
                     form.make_default = !form.make_default;
                 }
                 KeyCode::Char(c) => match form.focus {
-                    ModelField::ApiKey => form.api_key.push(c),
-                    ModelField::Model => form.model.push(c),
-                    ModelField::Window if c.is_ascii_digit() => form.window.push(c),
+                    ModelField::ApiKey => insert_at_cursor(
+                        &mut form.api_key,
+                        &mut form.cursor_byte,
+                        c.encode_utf8(&mut [0; 4]),
+                    ),
+                    ModelField::Model => insert_at_cursor(
+                        &mut form.model,
+                        &mut form.cursor_byte,
+                        c.encode_utf8(&mut [0; 4]),
+                    ),
+                    ModelField::Window if c.is_ascii_digit() => insert_at_cursor(
+                        &mut form.window,
+                        &mut form.cursor_byte,
+                        c.encode_utf8(&mut [0; 4]),
+                    ),
                     _ => {}
                 },
                 KeyCode::Backspace => match form.focus {
                     ModelField::ApiKey => {
-                        form.api_key.pop();
+                        backspace_at_cursor(&mut form.api_key, &mut form.cursor_byte)
                     }
                     ModelField::Model => {
-                        form.model.pop();
+                        backspace_at_cursor(&mut form.model, &mut form.cursor_byte)
                     }
                     ModelField::Window => {
-                        form.window.pop();
+                        backspace_at_cursor(&mut form.window, &mut form.cursor_byte)
                     }
+                    _ => {}
+                },
+                KeyCode::Delete => match form.focus {
+                    ModelField::ApiKey => {
+                        delete_at_cursor(&mut form.api_key, &mut form.cursor_byte)
+                    }
+                    ModelField::Model => delete_at_cursor(&mut form.model, &mut form.cursor_byte),
+                    ModelField::Window => delete_at_cursor(&mut form.window, &mut form.cursor_byte),
                     _ => {}
                 },
                 KeyCode::Enter => {
@@ -1427,14 +1490,9 @@ impl Modal for ProviderPanel {
         let len = self.current_len(&ctx.config);
         let ctrl = mods.contains(KeyModifiers::CONTROL);
         match code {
-            // Esc closes the panel outright. Clearing a filter is done with
-            // ←→ / Tab (which also switch tabs and reset both filters).
+            // Esc closes the panel outright. Tab / Shift-Tab switch tabs and
+            // reset both filters; arrows edit the search query.
             KeyCode::Esc => return Ok(ModalAction::Close),
-            // ← / → jump to that tab; Tab / Shift-Tab toggle (cycle) so you're
-            // never stuck. A manual tab switch drops the account drill-in filter
-            // (show all) — the search box has no cursor, so arrows are free here.
-            KeyCode::Left => self.switch_tab(Tab::Accounts),
-            KeyCode::Right => self.switch_tab(Tab::Models),
             KeyCode::Tab | KeyCode::BackTab => {
                 let next = match self.tab {
                     Tab::Accounts => Tab::Models,
@@ -1500,12 +1558,31 @@ impl Modal for ProviderPanel {
             }
             // Type to filter.
             KeyCode::Char(c) if !ctrl => {
-                self.query.push(c);
+                insert_at_cursor(
+                    &mut self.query,
+                    &mut self.query_cursor_byte,
+                    c.encode_utf8(&mut [0; 4]),
+                );
                 self.selected = 0;
                 self.pending_delete = None;
             }
             KeyCode::Backspace => {
-                self.query.pop();
+                backspace_at_cursor(&mut self.query, &mut self.query_cursor_byte);
+                self.selected = 0;
+                self.pending_delete = None;
+            }
+            KeyCode::Left => {
+                self.query_cursor_byte =
+                    previous_grapheme_boundary(&self.query, self.query_cursor_byte);
+            }
+            KeyCode::Right => {
+                self.query_cursor_byte =
+                    next_grapheme_boundary(&self.query, self.query_cursor_byte);
+            }
+            KeyCode::Home => self.query_cursor_byte = 0,
+            KeyCode::End => self.query_cursor_byte = self.query.len(),
+            KeyCode::Delete => {
+                delete_at_cursor(&mut self.query, &mut self.query_cursor_byte);
                 self.selected = 0;
                 self.pending_delete = None;
             }
@@ -1532,6 +1609,7 @@ impl Modal for ProviderPanel {
                             self.tab = Tab::Models;
                             self.account_filter = Some(id);
                             self.query.clear();
+                            self.query_cursor_byte = 0;
                             self.selected = 0;
                         }
                     }
@@ -1558,8 +1636,8 @@ impl Modal for ProviderPanel {
 
         let mut selected = items.len(); // nothing highlighted by default
         let hint: String; // assigned once per match arm below
-        // Forms use the box-less `PluginInfo` layout; the list uses the `Plugin`
-        // layout whose reserved index-2 slot is rendered as the search box.
+                          // Forms use the box-less `PluginInfo` layout; the list uses the `Plugin`
+                          // layout whose reserved index-2 slot is rendered as the search box.
         let mut kind = MenuKind::PluginInfo;
         let mut buf = String::new();
         // PluginInfo rows are flush-left inside a one-column rule margin.
@@ -1839,17 +1917,26 @@ impl Modal for ProviderPanel {
                     // This provider has no api_key yet — collect it once here.
                     if form.account_needs_key() {
                         let masked = "•".repeat(form.api_key.chars().count());
-                        items.push(field_row(
+                        let masked_cursor = form.api_key
+                            [..form.cursor_byte.min(form.api_key.len())]
+                            .chars()
+                            .count()
+                            * '•'.len_utf8();
+                        items.push(editable_field_row(
                             "api_key",
-                            format!("{masked}   (该 provider 尚未配置)"),
+                            &masked,
                             form.focus == ModelField::ApiKey,
+                            masked_cursor,
+                            form_cols,
                         ));
                     }
                 }
-                items.push(field_row(
+                items.push(editable_field_row(
                     &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldModel),
-                    form.model.clone(),
+                    &form.model,
                     form.focus == ModelField::Model,
+                    form.cursor_byte,
+                    form_cols,
                 ));
                 items.push(field_row(
                     &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldVision),
@@ -1869,10 +1956,12 @@ impl Modal for ProviderPanel {
                 } else {
                     form.window.clone()
                 };
-                items.push(field_row(
+                items.push(editable_field_row(
                     &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldWindow),
-                    win,
+                    &win,
                     form.focus == ModelField::Window,
+                    form.cursor_byte,
+                    form_cols,
                 ));
                 items.push(field_row(
                     &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldMakeDefault),
@@ -1890,7 +1979,11 @@ impl Modal for ProviderPanel {
             selected,
             kind,
         };
-        let cursor_byte = buf.len();
+        let cursor_byte = if matches!(self.mode, Mode::List) {
+            self.query_cursor_byte
+        } else {
+            buf.len()
+        };
         renderer.render(UiLine::InputPrompt {
             buf,
             cursor_byte,
@@ -2088,7 +2181,7 @@ mod tests {
         assert!(!acc.is_legacy);
         assert_eq!(acc.base_url, "https://mirror/v1");
         assert!(acc.api_key.is_empty()); // blank = keep existing
-        // deepseek is openai-wire → OpenAI-compatible toggle.
+                                         // deepseek is openai-wire → OpenAI-compatible toggle.
         assert_eq!(acc.protocol_label(), "OpenAI");
     }
 
@@ -2448,18 +2541,14 @@ mod tests {
         // CodingPlan uses the gateway signer — never prompt.
         assert!(!account_needs_key(&cfg, "AtomGit"));
         // The model form shows an api_key field only for the keyless provider.
-        assert!(
-            ModelForm::new_add(&cfg, Some("custom"))
-                .unwrap()
-                .fields()
-                .contains(&ModelField::ApiKey)
-        );
-        assert!(
-            !ModelForm::new_add(&cfg, Some("keyed"))
-                .unwrap()
-                .fields()
-                .contains(&ModelField::ApiKey)
-        );
+        assert!(ModelForm::new_add(&cfg, Some("custom"))
+            .unwrap()
+            .fields()
+            .contains(&ModelField::ApiKey));
+        assert!(!ModelForm::new_add(&cfg, Some("keyed"))
+            .unwrap()
+            .fields()
+            .contains(&ModelField::ApiKey));
     }
 
     #[test]
