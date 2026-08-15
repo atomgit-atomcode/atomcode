@@ -67,6 +67,20 @@ docker run --rm -it \
 docker build -t atomcode-daemon:v5.0.3 -f docker/Dockerfile-Daemon .
 ```
 
+### 多架构构建（amd64 + arm64）
+
+`Dockerfile-Daemon` 支持多架构：通过 buildx 的 `TARGETARCH` 自动选择对应产物（amd64 → `linux-x64` 二进制，arm64 → `linux-arm64` 二进制），一次构建即可产出同时支持 x86 与 ARM64（群晖/威联通 ARM 机型、树莓派等）的镜像。
+
+一键构建并推送多架构镜像：
+
+```bash
+docker/build-multiarch.sh                      # 默认镜像名 atomcode-daemon:v<版本>，构建并推送
+docker/build-multiarch.sh myrepo/atomcode:v1   # 指定镜像名
+BUILD_ONLY=1 docker/build-multiarch.sh         # 构建并加载当前主机架构，不推送
+```
+
+脚本会自动调用 `scripts/release.sh`（`ATOMCODE_INCLUDE_DAEMON=1`）交叉编译 x64 + arm64 两种 daemon 产物后交给 buildx。前置条件：安装 musl 交叉编译工具链（`brew install FiloSottile/musl-cross/musl-cross`）。
+
 ### 推送到华为云 SWR
 
 华为云 SWR 基础版不支持 OCI 规范的镜像格式。如果你使用的是较新版本的 Docker（BuildKit），需要添加 `--provenance=false` 参数：
@@ -213,14 +227,4 @@ docker compose -f docker/docker-compose.yml down      # 停止并移除容器
 
 `docker-compose.yml` 默认从完整仓库本地构建。如果 NAS 上只有独立部署目录，必须先导入本地镜像或使用镜像仓库，并把 `build` 段替换为 `image` 段（见文件内注释）。
 
-### ARM64 与多架构镜像
-
-`Dockerfile-Daemon` 通过 buildx 的 `TARGETARCH` 选择 `linux-x64` 或 `linux-arm64` 产物。可使用新增脚本构建并推送多架构镜像：
-
-```bash
-docker/build-multiarch.sh                      # 使用默认镜像名
-docker/build-multiarch.sh myrepo/atomcode:v1   # 指定镜像名
-BUILD_ONLY=1 docker/build-multiarch.sh         # 构建并加载当前主机架构，不推送
-```
-
-运行脚本前需安装对应的 musl 交叉编译工具链和 Docker buildx。官方多架构镜像与自动化构建仍在推进中，详见 issue #1421 / #1431。
+ARM64 与多架构构建方式见上方「多架构构建」章节。官方多架构镜像与自动化构建仍在推进中，详见 issue #1421 / #1431。
