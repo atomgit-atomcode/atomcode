@@ -425,7 +425,11 @@ fn subagent_child_middlewares_with_policy(
     credential_shell_policy: super::CredentialShellPolicy,
 ) -> Vec<Arc<dyn ToolMiddleware>> {
     let mut mw: Vec<Arc<dyn ToolMiddleware>> = vec![
-        Arc::new(super::CredentialBashGate::new(credential_shell_policy)),
+        // Children run `AutoRespond::AllowAll`, so a prompt would auto-approve itself —
+        // the non-interactive gate fails `Prompt` closed to a call-only deny instead.
+        Arc::new(super::CredentialBashGate::non_interactive(
+            credential_shell_policy,
+        )),
         Arc::new(DenySensitivePaths),
     ];
     if is_worker {

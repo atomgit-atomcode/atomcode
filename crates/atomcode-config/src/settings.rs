@@ -40,7 +40,7 @@ pub struct SettingSpec {
 const TODO_EAGERNESS: &[&str] = &["auto", "preferred", "always"];
 const THEMES: &[&str] = &["auto", "dark", "light"];
 const LANGUAGES: &[&str] = &["auto", "en", "zh_CN"];
-const SHELL_GUARD_POLICIES: &[&str] = &["recover", "strict"];
+const SHELL_GUARD_POLICIES: &[&str] = &["prompt", "strict", "off"];
 
 pub static SETTINGS: &[SettingSpec] = &[
     bool_setting(
@@ -505,14 +505,14 @@ mod tests {
     }
 
     #[test]
-    fn shell_guard_policy_defaults_to_recover_and_patches_strict() {
+    fn shell_guard_policy_defaults_to_prompt_and_patches_strict() {
         let setting = SETTINGS
             .iter()
             .find(|setting| setting.id == "coding.shell_guard_policy")
             .unwrap();
         let mut document = DocumentMut::new();
         let defaults = Config::default();
-        assert_eq!(setting.value(&defaults), "recover");
+        assert_eq!(setting.value(&defaults), "prompt");
         assert_eq!(setting.apply, ApplyPolicy::CapabilityReprepare);
 
         setting.patch(&mut document, "strict").unwrap();
@@ -521,6 +521,19 @@ mod tests {
         assert!(document
             .to_string()
             .contains("shell_guard_policy = \"strict\""));
+    }
+
+    #[test]
+    fn shell_guard_policy_reads_legacy_recover_as_prompt() {
+        // The retired `recover` value must keep parsing (as `prompt`) so an existing
+        // TOML does not break on upgrade.
+        let configured: Config =
+            toml::from_str("[coding]\nshell_guard_policy = \"recover\"\n").unwrap();
+        let setting = SETTINGS
+            .iter()
+            .find(|setting| setting.id == "coding.shell_guard_policy")
+            .unwrap();
+        assert_eq!(setting.value(&configured), "prompt");
     }
 
     #[test]

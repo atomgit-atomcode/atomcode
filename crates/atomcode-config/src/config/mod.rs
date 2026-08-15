@@ -64,9 +64,16 @@ pub struct CodingConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ShellGuardPolicy {
-    Strict,
+    /// No extra credential detection — ordinary tool-approval rules apply.
+    Off,
+    /// Prompt for approval on detected credential access; never terminate the turn.
+    /// The retired `recover` value maps here. Default.
     #[default]
-    Recover,
+    #[serde(alias = "recover")]
+    Prompt,
+    /// Block credentials in the generic shell; terminate the turn where a retry
+    /// through another spelling would be unsafe.
+    Strict,
 }
 
 /// How aggressively the coding agent should start a structured todo list.
@@ -109,7 +116,7 @@ impl Default for CodingConfig {
     fn default() -> Self {
         Self {
             max_rounds: 200,
-            shell_guard_policy: ShellGuardPolicy::Recover,
+            shell_guard_policy: ShellGuardPolicy::Prompt,
         }
     }
 }

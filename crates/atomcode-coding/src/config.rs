@@ -226,8 +226,11 @@ pub fn credential_shell_policy_from_config(
     policy: atomcode_config::config::ShellGuardPolicy,
 ) -> atomcode_capabilities::tools::CredentialShellPolicy {
     match policy {
-        atomcode_config::config::ShellGuardPolicy::Recover => {
-            atomcode_capabilities::tools::CredentialShellPolicy::Recover
+        atomcode_config::config::ShellGuardPolicy::Off => {
+            atomcode_capabilities::tools::CredentialShellPolicy::Off
+        }
+        atomcode_config::config::ShellGuardPolicy::Prompt => {
+            atomcode_capabilities::tools::CredentialShellPolicy::Prompt
         }
         atomcode_config::config::ShellGuardPolicy::Strict => {
             atomcode_capabilities::tools::CredentialShellPolicy::Strict
@@ -675,8 +678,12 @@ mod tests {
     #[test]
     fn shell_guard_policy_maps_at_the_coding_boundary() {
         assert_eq!(
-            credential_shell_policy_from_config(atomcode_config::config::ShellGuardPolicy::Recover),
-            atomcode_capabilities::tools::CredentialShellPolicy::Recover
+            credential_shell_policy_from_config(atomcode_config::config::ShellGuardPolicy::Off),
+            atomcode_capabilities::tools::CredentialShellPolicy::Off
+        );
+        assert_eq!(
+            credential_shell_policy_from_config(atomcode_config::config::ShellGuardPolicy::Prompt),
+            atomcode_capabilities::tools::CredentialShellPolicy::Prompt
         );
         assert_eq!(
             credential_shell_policy_from_config(atomcode_config::config::ShellGuardPolicy::Strict),
