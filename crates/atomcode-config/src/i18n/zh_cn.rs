@@ -396,6 +396,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
                 format!("允许 {tool}（{detail}）？").into()
             }
         }
+        Msg::CredentialApprovalNote => "⚠ 可能把凭据或敏感内容发送给模型 Provider".into(),
         Msg::ToolDenied => "已拒绝".into(),
         Msg::ToolBlockedBySecurityPolicy =>
             "安全策略已阻止工具调用：凭据不能通过通用 shell 参数、临时文件或环境变量传递".into(),

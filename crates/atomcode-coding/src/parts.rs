@@ -257,6 +257,10 @@ pub struct CodingParts {
     pub write_approval_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
     pub bash_workspace_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
     pub sensitive_path_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+    /// "Always allow" grants for the credential shell gate. Shared so an approved
+    /// credential command survives a model swap / capability re-prepare (mirrors the
+    /// sibling gates above); otherwise the user re-approves it every time.
+    pub credential_shell_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
     /// Provider slot for the `code_review` sub-agent tool, FILLED by [`assemble`] (the tool
     /// is built in `prepare` before the provider exists). Shared so a respawn/model-swap
     /// updates the reviewer's provider too. `None` when `opts.review` was false.
@@ -859,6 +863,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         sensitive_path_grants: std::sync::Arc::new(
             atomcode_capabilities::tools::InMemoryPermissionStore::new(),
         ),
+        credential_shell_grants: std::sync::Arc::new(
+            atomcode_capabilities::tools::InMemoryPermissionStore::new(),
+        ),
         registry,
         tool_names: names,
         todo_enabled,
@@ -997,6 +1004,7 @@ impl CodingParts {
         self.write_approval_grants = Arc::clone(&previous.write_approval_grants);
         self.bash_workspace_grants = Arc::clone(&previous.bash_workspace_grants);
         self.sensitive_path_grants = Arc::clone(&previous.sensitive_path_grants);
+        self.credential_shell_grants = Arc::clone(&previous.credential_shell_grants);
     }
 
     /// Preserve the exact current conversation across a sessionless provider reassembly.
@@ -1513,7 +1521,10 @@ pub fn assemble(
         // approval-oriented SensitivePathGate so an explicit extraction cannot be
         // downgraded from terminal denial into a retryable approval denial.
         .middleware(Arc::new(
-            atomcode_capabilities::tools::CredentialBashGate::new(cfg.credential_shell_policy),
+            atomcode_capabilities::tools::CredentialBashGate::with_store(
+                cfg.credential_shell_policy,
+                parts.credential_shell_grants.clone(),
+            ),
         ))
         // Sensitive-path read gate: read tools are Safe (skip approval), so without this an
         // agent could silently read ~/.ssh / .env / creds and leak them to the provider.
@@ -2566,6 +2577,10 @@ mod tests {
         assert!(Arc::ptr_eq(
             &candidate.sensitive_path_grants,
             &previous.sensitive_path_grants,
+        ));
+        assert!(Arc::ptr_eq(
+            &candidate.credential_shell_grants,
+            &previous.credential_shell_grants,
         ));
         assert!(candidate
             .plan_mode

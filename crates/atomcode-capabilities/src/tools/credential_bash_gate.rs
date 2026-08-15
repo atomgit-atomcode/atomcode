@@ -398,6 +398,17 @@ fn credential_bash_decision(raw_args: &str, command: &str) -> Option<CredentialB
     }
 }
 
+/// Read-only predicate: would this `bash` tool-call's arguments trip the credential
+/// guard (extraction, exfil, a literal credential, or a config-file secret read)?
+/// Drivers use it to annotate an approval prompt — e.g. "this may send secrets to the
+/// model provider" — without duplicating the detection heuristics.
+pub fn bash_command_may_expose_credentials(arguments: &str) -> bool {
+    match serde_json::from_str::<BashArgs>(arguments) {
+        Ok(args) => credential_bash_decision(arguments, &args.command).is_some(),
+        Err(_) => false,
+    }
+}
+
 pub struct CredentialBashGate {
     policy: CredentialShellPolicy,
     // `Some` ⇒ interactive: under `Prompt`, route a detected access through an approval
@@ -484,24 +495,26 @@ impl ToolMiddleware for CredentialBashGate {
         let Ok(args) = serde_json::from_str::<BashArgs>(&call.arguments) else {
             return BeforeOutcome::Proceed;
         };
-        // The detected severity (`DenyTurn` = extraction/exfil, `DenyCall` = literal) is
-        // collapsed by policy below: `Prompt` never terminates the turn, `Strict` always
-        // does. The reason is retained on the decision for detection tests / telemetry.
+        // The detected severity (`DenyTurn` vs `DenyCall`) drives only `strict` vs the
+        // detection tests; `Prompt` treats every detection the same (prompt / fail-closed,
+        // never terminating the turn), so a legitimate sensitive read is not interrupted.
         if credential_bash_decision(&call.arguments, &args.command).is_none() {
             return BeforeOutcome::Proceed;
         }
         match self.policy {
             // Detection disabled — defer to ordinary tool approval.
             CredentialShellPolicy::Off => BeforeOutcome::Proceed,
-            // Hard boundary: block and terminate the turn so an explicit extraction
-            // cannot be retried through another shell spelling.
+            // Hard boundary: block and terminate the turn. For headless / bypass /
+            // high-security deployments that want credentials un-bypassable.
             CredentialShellPolicy::Strict => BeforeOutcome::deny_turn_with_intervention(
                 CREDENTIAL_BASH_DENIAL_REASON,
                 PolicyIntervention::credential_shell_blocked(),
             ),
-            // Prompt the user (interactive), or fail closed to a call-only deny for
-            // non-interactive children. Either way the turn continues — a reject ends
-            // only this call.
+            // Prompt the user (interactive), or fail closed to a call-only deny for a
+            // non-interactive child (which runs AutoRespond::AllowAll and would otherwise
+            // auto-approve itself). Never terminates the turn — a reject ends only this
+            // call; with a human in the loop the user gates each attempt, and `strict`
+            // remains the hard wall for no-human contexts.
             CredentialShellPolicy::Prompt => match &self.approval_store {
                 Some(store) => self.request_approval(call, tool, rt, store).await,
                 None => BeforeOutcome::deny(CREDENTIAL_BASH_DENIAL_REASON),
@@ -666,16 +679,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_interactive_denies_only_the_call_when_rejected() {
-        // Silent driver → the approval round-trip degrades to a deny; the turn is
-        // NOT terminated, even for an exfil-shaped command (requirement: reject ends
-        // only this call).
+    async fn prompt_never_terminates_the_turn_when_rejected() {
+        // Under `Prompt`, NO detection terminates the turn — not even extraction / exfil.
+        // A silent driver degrades the round-trip to a call-only deny (reject ends only
+        // this call), so a legitimate sensitive read is never interrupted.
         let gate = CredentialBashGate::new(CredentialShellPolicy::Prompt);
-        assert!(matches!(
-            run(&gate, DETECTED).await,
-            BeforeOutcome::Deny { .. }
-        ));
-        assert!(matches!(run(&gate, EXFIL).await, BeforeOutcome::Deny { .. }));
+        for command in [DETECTED, EXFIL] {
+            assert!(
+                matches!(run(&gate, command).await, BeforeOutcome::Deny { .. }),
+                "prompt must not terminate the turn: {command}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -693,12 +707,15 @@ mod tests {
     #[tokio::test]
     async fn prompt_non_interactive_child_fails_closed() {
         // A subagent/team child cannot prompt (AllowAll auto-approves), so `Prompt`
-        // denies just the call; undetected commands still proceed.
+        // denies just the call (both literal and extraction) without terminating the
+        // turn; undetected commands still proceed.
         let gate = CredentialBashGate::non_interactive(CredentialShellPolicy::Prompt);
-        assert!(matches!(
-            run(&gate, DETECTED).await,
-            BeforeOutcome::Deny { .. }
-        ));
+        for command in [DETECTED, EXFIL] {
+            assert!(
+                matches!(run(&gate, command).await, BeforeOutcome::Deny { .. }),
+                "child must fail closed to a call-only deny: {command}"
+            );
+        }
         assert_eq!(run(&gate, "cat Cargo.toml").await, BeforeOutcome::Proceed);
     }
 }

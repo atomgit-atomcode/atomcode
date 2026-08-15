@@ -417,6 +417,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
                 format!("Allow {tool}({detail})?").into()
             }
         }
+        Msg::CredentialApprovalNote => {
+            "⚠ May send credentials or sensitive content to the model provider".into()
+        }
         Msg::ToolDenied => "denied".into(),
         Msg::ToolBlockedBySecurityPolicy =>
             "Tool call blocked by security policy: credentials cannot be passed through generic shell arguments, temporary files, or environment variables".into(),

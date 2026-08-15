@@ -90,7 +90,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         path: &["coding", "shell_guard_policy"],
         label_en: "Shell safety policy",
         label_zh: "Shell 安全策略",
-        aliases: &["安全", "中断"],
+        aliases: &["安全", "凭据", "credential", "shell"],
         kind: SettingKind::Choice(SHELL_GUARD_POLICIES),
         apply: ApplyPolicy::CapabilityReprepare,
     },

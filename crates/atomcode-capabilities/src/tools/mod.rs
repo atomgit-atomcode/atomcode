@@ -96,7 +96,9 @@ pub use bash::{
 };
 pub use bash_workspace_gate::BashWorkspaceGate;
 pub use cd::ChangeDirTool;
-pub use credential_bash_gate::{CredentialBashGate, CredentialShellPolicy};
+pub use credential_bash_gate::{
+    bash_command_may_expose_credentials, CredentialBashGate, CredentialShellPolicy,
+};
 pub use edit::EditFileTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;

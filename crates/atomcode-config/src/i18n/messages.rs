@@ -451,6 +451,9 @@ pub enum Msg<'a> {
         tool: &'a str,
         detail: &'a str,
     },
+    /// Advisory line shown under a credential-suspected Bash approval, warning that
+    /// allowing it may send secrets or sensitive content to the model provider.
+    CredentialApprovalNote,
 
     // ── Tool result markers ──
     ToolDenied,
