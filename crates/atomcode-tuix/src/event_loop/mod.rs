@@ -12712,6 +12712,13 @@ fn handle_input(
 
     match ev {
         InputEvent::FocusChanged(focused) => {
+            // A focus change can swallow an in-flight drag's mouse-Up (it lands on
+            // the window that took focus), leaving `dragging` stuck so the next
+            // motion report phantom-extends the selection. Abort the drag; the
+            // already-selected span stays highlighted until the next Down.
+            if let Some(selection) = app.transcript_selection.as_mut() {
+                selection.dragging = false;
+            }
             if focused {
                 // Focus events are delivered after the terminal host resumes.
                 // Re-emit the renderer's authoritative retained projection;
@@ -12744,6 +12751,11 @@ fn handle_input(
             }
         }
         InputEvent::Resize(mut cols, mut rows) => {
+            // A resize can swallow an in-flight drag's mouse-Up; abort the drag so
+            // a later motion report can't phantom-extend a now-stale selection.
+            if let Some(selection) = app.transcript_selection.as_mut() {
+                selection.dragging = false;
+            }
             // Coalesce burst-fired SIGWINCH events. gnome-terminal /
             // alacritty / iTerm2 send a Resize per pixel during a
             // window drag — a 200ms drag fires 30+ events. Without

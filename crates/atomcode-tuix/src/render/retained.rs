@@ -9920,6 +9920,21 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let _ = self.out.flush();
         crate::tuix_trace!("RSZ", "done");
         self.last_painted_footer_rows = self.current_footer_rows();
+        // Publish the freshly-painted hit map under the current authority so
+        // pointer input isn't left fail-closed after a resize until some unrelated
+        // frame happens to render (mirrors `set_body_scroll_start`'s republish).
+        // `publish_frame_if_current` is authority-gated, so a resize that raced
+        // ahead (epoch already bumped again) still fails closed.
+        let interaction_authority = self.interaction_publisher.worker_authority().unwrap_or((
+            self.interaction_publisher.current_epoch(),
+            self.interaction_surface_session,
+        ));
+        let _ = self.interaction_publisher.publish_frame_if_current(
+            interaction_authority.0,
+            interaction_authority.1,
+            self.pending_interactions.clone(),
+            self.pending_copy_runs.clone(),
+        );
         self.dirty = false;
     }
 }
@@ -10417,6 +10432,51 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    #[test]
+    fn on_resize_republishes_pointer_hit_map_after_epoch_invalidation() {
+        // After a resize the epoch is invalidated (worker sets actionable=false)
+        // and on_resize repaints the frame. It must REPUBLISH the fresh hit map,
+        // else pointer input stays fail-closed until an unrelated frame renders —
+        // parity with the scroll path (set_body_scroll_start).
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            Vec::<u8>::new(),
+            caps_with_color(),
+            80,
+            24,
+            interactions.clone(),
+        );
+        renderer.render(UiLine::InputPrompt {
+            buf: "/h".into(),
+            cursor_byte: 2,
+            menu: Some(MenuPayload {
+                items: vec![("help".into(), "Show help".into())],
+                selected: 0,
+                kind: crate::render::MenuKind::SlashCommand,
+            }),
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+        assert!(
+            interactions.snapshot_actionable().is_some(),
+            "a flushed frame publishes its clickable coordinates"
+        );
+
+        // The pre-resize epoch bump fails pointer input closed until a republish.
+        interactions.invalidate();
+        assert!(
+            interactions.snapshot_actionable().is_none(),
+            "invalidation fails pointer input closed"
+        );
+
+        renderer.on_resize(100, 30);
+        assert!(
+            interactions.snapshot_actionable().is_some(),
+            "on_resize must republish the repainted hit map, not leave clicks dropped"
+        );
     }
 
     #[test]
