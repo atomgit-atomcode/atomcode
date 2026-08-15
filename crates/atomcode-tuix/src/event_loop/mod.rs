@@ -6546,23 +6546,24 @@ mod menu_tests {
         let items = build_menu_items("/effort", 0, &reg, &custom, None, None)
             .expect("/effort gateway must appear");
         assert!(items.iter().any(|(n, _)| n == "effort"));
-        assert!(
-            !items
-                .iter()
-                .any(|(n, _)| n == "high" || n == "max" || n == "off")
-        );
+        assert!(!items.iter().any(|(n, _)| matches!(
+            n.as_str(),
+            "low" | "medium" | "high" | "max" | "default"
+        )));
     }
 
     #[test]
     fn effort_sub_mode_lists_and_filters_choices() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        // `/effort ` (trailing space) → all three choices.
+        // `/effort ` (trailing space) → every reasoning-effort choice.
         let all = build_menu_items("/effort ", 0, &reg, &custom, None, None)
             .expect("/effort sub-mode must list choices");
         let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
         assert!(
-            names.contains(&"high") && names.contains(&"max") && names.contains(&"off"),
+            ["low", "medium", "high", "max", "default"]
+                .iter()
+                .all(|v| names.contains(v)),
             "got: {names:?}"
         );
         // Prefix narrows.
@@ -6574,6 +6575,21 @@ mod menu_tests {
         assert!(build_menu_items("/effort zz", 0, &reg, &custom, None, None).is_none());
         // A chosen value followed by a space (typing past) hides the menu.
         assert!(build_menu_items("/effort high ", 0, &reg, &custom, None, None).is_none());
+    }
+
+    #[test]
+    fn effort_applicable_ignores_provider_type_and_matches_webui() {
+        // Any endpoint with an explicitly configured effort is applicable — the
+        // TUI must no longer hide the control behind a `{deepseek, openai}`
+        // provider_type gate the webui/wire never applied.
+        assert!(effort_applicable(Some("medium"), "internal-anthropic", "claude-x"));
+        assert!(effort_applicable(Some("high"), "internal-ollama", "qwen"));
+        // Unconfigured custom endpoint → not applicable.
+        assert!(!effort_applicable(None, "internal-glm", "glm-5.2"));
+        // Built-in CodingPlan DeepSeek V4 Flash → applicable without a config value
+        // (matches `models_from_config`); a codingplan name with another model is not.
+        assert!(effort_applicable(None, "AtomGit-deepseek-v4-flash", "deepseek-v4-flash"));
+        assert!(!effort_applicable(None, "AtomGit-deepseek-v4-flash", "glm-5.2"));
     }
 
     #[test]
@@ -14534,7 +14550,7 @@ fn build_menu_items(
     }
 
     // Two-level palette for `/effort` (same gateway pattern as `/skills`).
-    // Once `/effort ` (trailing space) is in the buffer, list the three
+    // Once `/effort ` (trailing space) is in the buffer, list the
     // reasoning-effort choices; submission commits `/effort <choice>`.
     if let Some(after) = buf.strip_prefix("/effort ") {
         if after.contains(char::is_whitespace) {
@@ -14542,9 +14558,11 @@ fn build_menu_items(
         }
         let prefix = after.to_ascii_lowercase();
         let items: Vec<(String, String)> = [
-            ("high", "Deeper reasoning (DeepSeek V4)"),
-            ("max", "Maximum reasoning depth (DeepSeek V4)"),
-            ("off", "Use the API default"),
+            ("low", "Minimal reasoning effort"),
+            ("medium", "Moderate reasoning effort"),
+            ("high", "Deeper reasoning"),
+            ("max", "Maximum reasoning depth"),
+            ("default", "Return to the API default (keeps capability)"),
         ]
         .into_iter()
         .filter(|(n, _)| n.starts_with(prefix.as_str()))
@@ -15317,7 +15335,13 @@ fn handle_idle_key(
             redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
             return Ok(());
         }
-        let new_val = app.state.cycle_reasoning_effort();
+        // Seed from the authoritative `ctx` value (the display already trusts it):
+        // `app.state.reasoning_effort` is otherwise never seeded from config, so a
+        // bare cycle would downgrade a persisted level to the chain head on the
+        // first press.
+        let new_val = app
+            .state
+            .cycle_reasoning_effort_from(ctx.reasoning_effort.as_deref());
         ctx.reasoning_effort = new_val.map(|s| s.to_string());
         persist_reasoning_effort(ctx);
         let msg = match new_val {
@@ -28646,17 +28670,26 @@ fn persist_reasoning_effort(ctx: &mut LoopCtx) {
     }
 }
 
+/// Whether the current selection exposes a reasoning-effort control. Mirrors the
+/// daemon's `models_from_config` derivation EXACTLY (an explicitly configured
+/// value declares the capability, plus the one built-in CodingPlan DeepSeek V4
+/// Flash fallback) so the TUI `/effort`, the webui selector, and the wire gate
+/// never disagree. Deliberately NOT gated on `provider_type`: the old
+/// `{deepseek, openai}` restriction hid the control in the TUI for any other
+/// endpoint the user had explicitly configured with an effort, while the webui
+/// still showed it.
+fn effort_applicable(reasoning_effort: Option<&str>, selection: &str, model: &str) -> bool {
+    reasoning_effort.is_some()
+        || (atomcode_config::config::is_codingplan_provider_name(selection)
+            && model.eq_ignore_ascii_case("deepseek-v4-flash"))
+}
+
 pub(crate) fn reasoning_effort_applicable_on_provider(ctx: &LoopCtx) -> bool {
     let selection = ctx.config.effective_model_selection().unwrap_or_default();
     let Some(provider) = ctx.config.provider_config_for_selection(&selection) else {
         return false;
     };
-    if !matches!(provider.provider_type.as_str(), "deepseek" | "openai") {
-        return false;
-    }
-    provider.reasoning_effort.is_some()
-        || (atomcode_config::config::is_codingplan_provider_name(&selection)
-            && ctx.model_name.eq_ignore_ascii_case("deepseek-v4-flash"))
+    effort_applicable(provider.reasoning_effort.as_deref(), &selection, &ctx.model_name)
 }
 
 /// Install a [`crate::modals::password::PasswordModal`] as the active modal on

@@ -3331,9 +3331,9 @@ fn execute_slash_command_impl(
                 Some(p) => {
                     if sub.is_empty() {
                         // Show current status
-                        let current = p.reasoning_effort.as_deref().unwrap_or("unsupported");
+                        let current = effort_status_label(p.reasoning_effort.as_deref());
                         renderer.render(UiLine::CommandOutput(format!(
-                            "  Current reasoning effort: {current}\n  Usage: /effort low | medium | high | max | auto\n  Shortcut: Ctrl+T\n"
+                            "  Current reasoning effort: {current}\n  Usage: /effort low | medium | high | max | default\n  Shortcut: Ctrl+T\n"
                         )));
                         renderer.flush();
                     } else if matches!(sub.as_str(), "low" | "medium" | "high" | "max") {
@@ -3348,23 +3348,26 @@ fn execute_slash_command_impl(
                             format!("  ○ Reasoning effort set to: {sub}\n"),
                             false,
                         );
-                    } else if matches!(sub.as_str(), "auto" | "default" | "off") {
+                    } else if matches!(sub.as_str(), "default" | "auto" | "off") {
+                        // `default` is the documented keyword; `auto`/`off` are
+                        // accepted aliases. All return to the API-selected effort
+                        // while KEEPING the endpoint capability (disable it in
+                        // /provider). Persisted as the `"auto"` sentinel.
                         let mut desired = ctx.config.clone();
                         desired.update_selection_reasoning(&provider_name, |r| {
-                            // Keep the endpoint capability while returning to
-                            // its API-selected default effort.
                             *r.reasoning_effort = Some("auto".to_string())
                         });
                         crate::event_loop::save_and_reload(
                             ctx,
                             desired,
                             renderer,
-                            "  ○ Reasoning effort: default (API auto)\n".to_string(),
+                            "  ○ Reasoning effort: default (API-selected; capability kept)\n"
+                                .to_string(),
                             false,
                         );
                     } else {
                         renderer.render(UiLine::CommandOutput(
-                            "  Usage: /effort low | medium | high | max | auto\n  Shortcut: Ctrl+T\n".into(),
+                            "  Usage: /effort low | medium | high | max | default\n  Shortcut: Ctrl+T\n".into(),
                         ));
                         renderer.flush();
                     }
@@ -7508,9 +7511,28 @@ mod expand_cd_target_tests {
     }
 }
 
+/// Human label for the persisted `reasoning_effort` in the `/effort` status line.
+/// `None` = the endpoint has no effort capability; the `"auto"` sentinel means
+/// "capable, using the API default" and must never surface as the raw string.
+fn effort_status_label(persisted: Option<&str>) -> &str {
+    match persisted {
+        None => "unsupported",
+        Some(v) if v.eq_ignore_ascii_case("auto") => "default (API default)",
+        Some(v) => v,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effort_status_label_hides_the_auto_sentinel() {
+        assert_eq!(effort_status_label(None), "unsupported");
+        assert_eq!(effort_status_label(Some("auto")), "default (API default)");
+        assert_eq!(effort_status_label(Some("AUTO")), "default (API default)");
+        assert_eq!(effort_status_label(Some("high")), "high");
+    }
 
     #[test]
     fn clipboard_policy_denies_osc52_without_explicit_permission() {

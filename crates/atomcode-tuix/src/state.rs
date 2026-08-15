@@ -2241,6 +2241,17 @@ impl UiState {
         next
     }
 
+    /// Cycle starting from an authoritative external value (the `ctx`-synced
+    /// effort), then advance one step. `self.reasoning_effort` is otherwise only
+    /// ever written by [`Self::cycle_reasoning_effort`] and starts `None`, so a
+    /// caller that cycles without seeding first would downgrade a persisted level
+    /// (e.g. `"high"`) straight to the chain head on the first press. Callers must
+    /// pass the current authoritative value so the first cycle advances correctly.
+    pub fn cycle_reasoning_effort_from(&mut self, current: Option<&str>) -> Option<&'static str> {
+        self.reasoning_effort = current.map(|s| s.to_string());
+        self.cycle_reasoning_effort()
+    }
+
     pub fn tick_spinner(&mut self) -> &'static str {
         self.tick_spinner_at(std::time::Instant::now())
     }
@@ -3480,6 +3491,21 @@ mod tests {
         assert_eq!(state.cycle_reasoning_effort(), Some("high"));
         assert_eq!(state.cycle_reasoning_effort(), Some("max"));
         assert_eq!(state.cycle_reasoning_effort(), None);
+    }
+
+    #[test]
+    fn cycle_from_seeds_authoritative_value_before_advancing() {
+        // Regression: `reasoning_effort` starts None and is only ever written by
+        // the cycle itself, so cycling a fresh UiState whose provider persisted
+        // "high" would return "low" (chain head) and silently downgrade the user's
+        // level. Cycling FROM the authoritative value must advance from it.
+        let mut state = UiState::new();
+        assert_eq!(state.reasoning_effort, None, "stale field starts empty");
+        assert_eq!(state.cycle_reasoning_effort_from(Some("high")), Some("max"));
+        // And the now-seeded state continues correctly (max → None).
+        assert_eq!(state.cycle_reasoning_effort(), None);
+        // A synced None (API default / capability-off) still starts the chain.
+        assert_eq!(state.cycle_reasoning_effort_from(None), Some("low"));
     }
 
     #[test]
