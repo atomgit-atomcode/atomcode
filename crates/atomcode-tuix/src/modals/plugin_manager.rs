@@ -104,6 +104,8 @@ pub struct PluginManager {
     search_query: String,
     /// UTF-8 byte cursor for the list search query.
     search_cursor_byte: usize,
+    /// Whether Left/Right edit the search query instead of switching tabs.
+    search_focused: bool,
     /// The install scope selected for the plugin currently being installed.
     installing_scope: Option<InstallScope>,
     is_updating: bool,
@@ -142,6 +144,7 @@ impl PluginManager {
             close_requested: false,
             search_query: String::new(),
             search_cursor_byte: 0,
+            search_focused: false,
             installing_scope: None,
             is_updating: false,
         };
@@ -246,6 +249,7 @@ impl PluginManager {
         };
         self.search_query.clear();
         self.search_cursor_byte = 0;
+        self.search_focused = false;
         match next_tab {
             0 => self.goto(Screen::Browse),
             1 => self.goto(Screen::Installed),
@@ -496,6 +500,7 @@ impl PluginManager {
                 0 => {
                     self.search_query = mp_name;
                     self.search_cursor_byte = self.search_query.len();
+                    self.search_focused = true;
                     self.goto(Screen::Browse);
                 }
                 1 => {
@@ -1109,9 +1114,11 @@ impl Modal for PluginManager {
 
         match code {
             KeyCode::Up => {
+                self.search_focused = false;
                 self.selected = self.selected.saturating_sub(1);
             }
             KeyCode::Down => {
+                self.search_focused = false;
                 let max = self.current_len().saturating_sub(1);
                 if self.selected < max {
                     self.selected += 1;
@@ -1134,8 +1141,9 @@ impl Modal for PluginManager {
                 }
             }
             KeyCode::Backspace => {
-                if !self.search_query.is_empty() {
+                if self.search_focused || !self.search_query.is_empty() {
                     backspace_at_cursor(&mut self.search_query, &mut self.search_cursor_byte);
+                    self.search_focused = true;
                     self.selected = 0;
                 } else if matches!(self.screen, Screen::Browse) {
                     self.enter_remove(ctx, renderer);
@@ -1144,8 +1152,9 @@ impl Modal for PluginManager {
                 }
             }
             KeyCode::Delete => {
-                if !self.search_query.is_empty() {
+                if self.search_focused || !self.search_query.is_empty() {
                     delete_at_cursor(&mut self.search_query, &mut self.search_cursor_byte);
+                    self.search_focused = true;
                     self.selected = 0;
                 } else if matches!(self.screen, Screen::Browse) {
                     self.enter_remove(ctx, renderer);
@@ -1154,9 +1163,10 @@ impl Modal for PluginManager {
                 }
             }
             KeyCode::Esc => {
-                if !self.search_query.is_empty() {
+                if self.search_focused || !self.search_query.is_empty() {
                     self.search_query.clear();
                     self.search_cursor_byte = 0;
+                    self.search_focused = false;
                     self.selected = 0;
                 } else {
                     match &self.screen {
@@ -1231,24 +1241,46 @@ impl Modal for PluginManager {
                     }
                 }
             }
-            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(c)
+                if !mods.contains(KeyModifiers::CONTROL)
+                    && matches!(self.screen, Screen::Browse | Screen::Installed) =>
+            {
                 insert_at_cursor(
                     &mut self.search_query,
                     &mut self.search_cursor_byte,
                     c.encode_utf8(&mut [0; 4]),
                 );
+                self.search_focused = true;
                 self.selected = 0;
             }
-            KeyCode::Left => {
+            KeyCode::Left if self.search_focused => {
                 self.search_cursor_byte =
                     previous_grapheme_boundary(&self.search_query, self.search_cursor_byte);
             }
-            KeyCode::Right => {
+            KeyCode::Right if self.search_focused => {
                 self.search_cursor_byte =
                     next_grapheme_boundary(&self.search_query, self.search_cursor_byte);
             }
-            KeyCode::Home => self.search_cursor_byte = 0,
-            KeyCode::End => self.search_cursor_byte = self.search_query.len(),
+            KeyCode::Left => {
+                if matches!(
+                    self.screen,
+                    Screen::Browse | Screen::Installed | Screen::Marketplaces
+                ) {
+                    self.switch_tab(false);
+                }
+            }
+            KeyCode::Right => {
+                if matches!(
+                    self.screen,
+                    Screen::Browse | Screen::Installed | Screen::Marketplaces
+                ) {
+                    self.switch_tab(true);
+                }
+            }
+            KeyCode::Home if self.search_focused => self.search_cursor_byte = 0,
+            KeyCode::End if self.search_focused => {
+                self.search_cursor_byte = self.search_query.len()
+            }
             _ => {}
         }
         if std::mem::take(&mut self.close_requested) {
@@ -1558,12 +1590,19 @@ impl Modal for PluginManager {
         ctx: &mut LoopCtx,
         renderer: &mut dyn Renderer,
     ) -> Result<ModalAction> {
-        // On the Add-marketplace screen, paste lands in the URL field (git
-        // URLs are usually pasted). Elsewhere there is no text entry, so drop
-        // the paste rather than disturbing the hidden composer buffer.
+        // Paste into the visible field without disturbing the hidden composer.
         if matches!(self.screen, Screen::AddUrl) {
-            self.url_input
-                .push_str(text.trim().lines().next().unwrap_or("").trim());
+            let clean = text.trim().lines().next().unwrap_or("").trim();
+            let mut chars: Vec<char> = self.url_input.chars().collect();
+            let at = self.url_cursor.min(chars.len());
+            chars.splice(at..at, clean.chars());
+            self.url_cursor = at + clean.chars().count();
+            self.url_input = chars.into_iter().collect();
+        } else if matches!(self.screen, Screen::Browse | Screen::Installed) {
+            let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+            insert_at_cursor(&mut self.search_query, &mut self.search_cursor_byte, &clean);
+            self.search_focused = true;
+            self.selected = 0;
         }
         self.draw(buf, state, ctx, renderer);
         Ok(ModalAction::Continue)
@@ -1730,6 +1769,7 @@ mod tests {
             close_requested: false,
             search_query: String::new(),
             search_cursor_byte: 0,
+            search_focused: false,
             installing_scope: None,
             is_updating: false,
         }

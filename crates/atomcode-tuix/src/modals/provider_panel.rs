@@ -548,6 +548,8 @@ pub struct ProviderPanel {
     query: String,
     /// UTF-8 byte cursor for the list search query.
     query_cursor_byte: usize,
+    /// Whether Left/Right edit the query instead of switching list tabs.
+    search_focused: bool,
     /// When set (via drilling into an account with ↵), the Models tab shows only
     /// this account's models. Cleared by Tab / Esc.
     account_filter: Option<String>,
@@ -621,6 +623,7 @@ impl ProviderPanel {
             },
             Mode::List => {
                 insert_at_cursor(&mut self.query, &mut self.query_cursor_byte, clean);
+                self.search_focused = true;
                 self.selected = 0;
                 self.pending_delete = None;
             }
@@ -634,6 +637,7 @@ impl ProviderPanel {
             mode: Mode::List,
             query: String::new(),
             query_cursor_byte: 0,
+            search_focused: false,
             account_filter: None,
             pending_delete: None,
         }
@@ -768,6 +772,7 @@ impl ProviderPanel {
         self.selected = 0;
         self.query.clear();
         self.query_cursor_byte = 0;
+        self.search_focused = false;
         self.account_filter = None;
         self.pending_delete = None;
     }
@@ -780,6 +785,7 @@ impl ProviderPanel {
         self.mode = Mode::List;
         self.query.clear();
         self.query_cursor_byte = 0;
+        self.search_focused = false;
         self.account_filter = Some(account_id.to_string());
         self.pending_delete = None;
     }
@@ -1501,10 +1507,12 @@ impl Modal for ProviderPanel {
                 self.switch_tab(next);
             }
             KeyCode::Up => {
+                self.search_focused = false;
                 self.selected = self.selected.saturating_sub(1);
                 self.pending_delete = None;
             }
             KeyCode::Down => {
+                self.search_focused = false;
                 if self.selected + 1 < len {
                     self.selected += 1;
                 }
@@ -1563,25 +1571,29 @@ impl Modal for ProviderPanel {
                     &mut self.query_cursor_byte,
                     c.encode_utf8(&mut [0; 4]),
                 );
+                self.search_focused = true;
                 self.selected = 0;
                 self.pending_delete = None;
             }
             KeyCode::Backspace => {
                 backspace_at_cursor(&mut self.query, &mut self.query_cursor_byte);
+                self.search_focused = true;
                 self.selected = 0;
                 self.pending_delete = None;
             }
-            KeyCode::Left => {
+            KeyCode::Left if self.search_focused => {
                 self.query_cursor_byte =
                     previous_grapheme_boundary(&self.query, self.query_cursor_byte);
             }
-            KeyCode::Right => {
+            KeyCode::Right if self.search_focused => {
                 self.query_cursor_byte =
                     next_grapheme_boundary(&self.query, self.query_cursor_byte);
             }
-            KeyCode::Home => self.query_cursor_byte = 0,
-            KeyCode::End => self.query_cursor_byte = self.query.len(),
-            KeyCode::Delete => {
+            KeyCode::Left => self.switch_tab(Tab::Accounts),
+            KeyCode::Right => self.switch_tab(Tab::Models),
+            KeyCode::Home if self.search_focused => self.query_cursor_byte = 0,
+            KeyCode::End if self.search_focused => self.query_cursor_byte = self.query.len(),
+            KeyCode::Delete if self.search_focused => {
                 delete_at_cursor(&mut self.query, &mut self.query_cursor_byte);
                 self.selected = 0;
                 self.pending_delete = None;
@@ -1610,6 +1622,7 @@ impl Modal for ProviderPanel {
                             self.account_filter = Some(id);
                             self.query.clear();
                             self.query_cursor_byte = 0;
+                            self.search_focused = false;
                             self.selected = 0;
                         }
                     }
@@ -1924,7 +1937,7 @@ impl Modal for ProviderPanel {
                             * '•'.len_utf8();
                         items.push(editable_field_row(
                             "api_key",
-                            &masked,
+                            &format!("{masked}   (该 provider 尚未配置)"),
                             form.focus == ModelField::ApiKey,
                             masked_cursor,
                             form_cols,

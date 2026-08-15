@@ -17,6 +17,7 @@ use crate::state::UiState;
 pub struct ConfigPanel {
     query: String,
     query_cursor_byte: usize,
+    search_focused: bool,
     selected: usize,
     editing: Option<&'static SettingSpec>,
     edit_value: String,
@@ -30,6 +31,7 @@ impl ConfigPanel {
         Self {
             query: String::new(),
             query_cursor_byte: 0,
+            search_focused: false,
             selected: 0,
             editing: None,
             edit_value: String::new(),
@@ -312,17 +314,27 @@ impl Modal for ConfigPanel {
             return Ok(ModalAction::Continue);
         }
 
-        if !matches!(code, KeyCode::Delete) {
+        if !matches!(code, KeyCode::Delete) || self.search_focused {
             self.pending_reset = None;
         }
 
         match code {
-            KeyCode::Up => self.move_up(),
-            KeyCode::Down => self.move_down(),
+            KeyCode::Up => {
+                self.search_focused = false;
+                self.move_up();
+            }
+            KeyCode::Down => {
+                self.search_focused = false;
+                self.move_down();
+            }
             KeyCode::Enter => {
                 if let Err(error) = self.activate(ctx, renderer) {
                     renderer.render(UiLine::Error(error.to_string()));
                 }
+            }
+            KeyCode::Delete if self.search_focused => {
+                delete_at_cursor(&mut self.query, &mut self.query_cursor_byte);
+                self.selected = 0;
             }
             KeyCode::Delete => {
                 if let Some(setting) = self.selected_setting() {
@@ -338,6 +350,7 @@ impl Modal for ConfigPanel {
             }
             KeyCode::Backspace => {
                 backspace_at_cursor(&mut self.query, &mut self.query_cursor_byte);
+                self.search_focused = true;
                 self.selected = 0;
             }
             KeyCode::Char(c) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
@@ -346,17 +359,26 @@ impl Modal for ConfigPanel {
                     &mut self.query_cursor_byte,
                     c.encode_utf8(&mut [0; 4]),
                 );
+                self.search_focused = true;
                 self.selected = 0;
             }
             KeyCode::Left => {
+                self.search_focused = true;
                 self.query_cursor_byte =
                     previous_grapheme_boundary(&self.query, self.query_cursor_byte)
             }
             KeyCode::Right => {
+                self.search_focused = true;
                 self.query_cursor_byte = next_grapheme_boundary(&self.query, self.query_cursor_byte)
             }
-            KeyCode::Home => self.query_cursor_byte = 0,
-            KeyCode::End => self.query_cursor_byte = self.query.len(),
+            KeyCode::Home => {
+                self.search_focused = true;
+                self.query_cursor_byte = 0;
+            }
+            KeyCode::End => {
+                self.search_focused = true;
+                self.query_cursor_byte = self.query.len();
+            }
             KeyCode::Esc => return Ok(ModalAction::Close),
             _ => return Ok(ModalAction::Continue),
         }
@@ -384,6 +406,9 @@ impl Modal for ConfigPanel {
         };
         let clean: String = text.chars().filter(|c| !c.is_control()).collect();
         insert_at_cursor(target, cursor, &clean);
+        if self.editing.is_none() {
+            self.search_focused = true;
+        }
         self.selected = 0;
         self.draw(buf, state, ctx, renderer);
         Ok(ModalAction::Continue)
