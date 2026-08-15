@@ -98,9 +98,11 @@ const zh = {
   'mode.plan': 'Plan',
   'mode.plan.desc': '只读探索，先出方案',
 
-  // Reasoning effort selector (DeepSeek V4 only)
+  // Reasoning effort selector for endpoints that explicitly enable it.
   'effort.label': '强度',
   'effort.default': '默认',
+  'effort.low': 'Low',
+  'effort.medium': 'Medium',
   'effort.high': 'High',
   'effort.max': 'Max',
 
@@ -454,9 +456,11 @@ const en: Record<MsgKey, string> = {
   'mode.plan': 'Plan',
   'mode.plan.desc': 'Read-only — explore and plan first',
 
-  // Reasoning effort selector (DeepSeek V4 only)
+  // Reasoning effort selector for endpoints that explicitly enable it.
   'effort.label': 'Effort',
   'effort.default': 'Default',
+  'effort.low': 'Low',
+  'effort.medium': 'Medium',
   'effort.high': 'High',
   'effort.max': 'Max',
 

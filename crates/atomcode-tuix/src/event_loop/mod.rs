@@ -28615,6 +28615,7 @@ fn sync_reasoning_effort_from_provider(ctx: &mut LoopCtx) {
         ctx.config
             .provider_config_for_selection(&sel)
             .and_then(|p| p.reasoning_effort)
+            .filter(|effort| !effort.eq_ignore_ascii_case("auto"))
     } else {
         None
     };
@@ -28624,12 +28625,18 @@ fn sync_reasoning_effort_from_provider(ctx: &mut LoopCtx) {
 fn persist_reasoning_effort(ctx: &mut LoopCtx) {
     let selection = ctx.config.effective_model_selection().unwrap_or_default();
     let effort = ctx.reasoning_effort.clone();
+    // Preserve capability when cycling back to API default. `None` in the
+    // persisted model means unsupported; `auto` means supported but omitted.
+    let persisted_effort = effort.clone().or_else(|| Some("auto".to_string()));
     // Schema-aware write (new-schema `[models.*]` or legacy `[providers.*]`).
     ctx.config
-        .update_selection_reasoning(&selection, |r| *r.reasoning_effort = effort.clone());
+        .update_selection_reasoning(&selection, |r| {
+            *r.reasoning_effort = persisted_effort.clone()
+        });
     match ctx.config_store.update(|config| {
-        if !config.update_selection_reasoning(&selection, |r| *r.reasoning_effort = effort.clone())
-        {
+        if !config.update_selection_reasoning(&selection, |r| {
+            *r.reasoning_effort = persisted_effort.clone()
+        }) {
             anyhow::bail!("provider {selection:?} not found");
         }
         Ok(())
@@ -28641,15 +28648,15 @@ fn persist_reasoning_effort(ctx: &mut LoopCtx) {
 
 pub(crate) fn reasoning_effort_applicable_on_provider(ctx: &LoopCtx) -> bool {
     let selection = ctx.config.effective_model_selection().unwrap_or_default();
-    let ptype = ctx
-        .config
-        .provider_config_for_selection(&selection)
-        .map(|p| p.provider_type)
-        .unwrap_or_default();
-    // Model-name check delegates to the provider so the UI "applicable" hint
-    // and the actual request-body gate (OpenAiProvider) can never diverge.
-    (ptype == "deepseek" || ptype == "openai")
-        && atomcode_capabilities::provider::reason_effort_applicable(&ctx.model_name)
+    let Some(provider) = ctx.config.provider_config_for_selection(&selection) else {
+        return false;
+    };
+    if !matches!(provider.provider_type.as_str(), "deepseek" | "openai") {
+        return false;
+    }
+    provider.reasoning_effort.is_some()
+        || (atomcode_config::config::is_codingplan_provider_name(&selection)
+            && ctx.model_name.eq_ignore_ascii_case("deepseek-v4-flash"))
 }
 
 /// Install a [`crate::modals::password::PasswordModal`] as the active modal on

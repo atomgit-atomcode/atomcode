@@ -349,6 +349,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelVisionAuto => "自动".into(),
         Msg::ProviderPanelVisionEnabled => "启用".into(),
         Msg::ProviderPanelVisionDisabled => "禁用".into(),
+        Msg::ProviderPanelFieldEffort => "默认思考强度".into(),
         Msg::ProviderPanelFieldWindow => "上下文窗口".into(),
         Msg::ProviderPanelFieldMakeDefault => "设为默认".into(),
         Msg::ProviderPanelSwitchHint => "←→ 切换".into(),
@@ -982,7 +983,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescBuild => "切换到 Build 模式（完整执行）".into(),
         Msg::CmdDescAuto => "切换到 Auto 模式（所有工具自动批准）".into(),
         Msg::CmdDescThink => "深度思考控制（on/off/budget N）".into(),
-        Msg::CmdDescEffort => "DeepSeek 推理强度控制（high / max / off）".into(),
+        Msg::CmdDescEffort => "模型推理强度控制（low / medium / high / max / auto）".into(),
         Msg::CmdDescHelp => "显示帮助".into(),
         Msg::CmdDescKeys => "显示键盘快捷键".into(),
         Msg::CmdDescLanguage => "切换显示语言".into(),
@@ -1055,7 +1056,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         }
 
         // ── reasoning effort ──
-        Msg::ReasoningEffortNoEffect => "当前模型不支持 reasoning_effort（仅对 DeepSeek V4 有效）".into(),
+        Msg::ReasoningEffortNoEffect => "当前模型未配置 reasoning_effort 支持，请在 /provider 中启用".into(),
 
         // ── 配置保存失败 ──
         Msg::ConfigSaveFailed { error } =>

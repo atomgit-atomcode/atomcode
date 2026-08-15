@@ -144,6 +144,10 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 pc.idle_timeout = cfg.stream_timeout;
                 pc.supports_vision = cfg.supports_vision;
                 pc.max_tokens = Some(default_max_tokens(cfg.context_window));
+                // An explicit per-model default is also an explicit capability
+                // declaration. CodingPlan's DeepSeek V4 Flash predates server-side
+                // capability metadata, so keep that one exact built-in fallback.
+                pc.supports_reasoning_effort = supports_reasoning_effort(cfg);
                 pc.reasoning_policy =
                     ReasoningPolicy::from_config(cfg.reasoning_history.as_deref())
                         .map_err(ProviderBuildError::Adapter)?;
@@ -165,6 +169,12 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
         }
         Ok(provider)
     }
+}
+
+fn supports_reasoning_effort(cfg: &CodingAgentConfig) -> bool {
+    cfg.supports_reasoning_effort
+        || (atomcode_config::config::is_codingplan_provider_name(&cfg.provider_name)
+            && cfg.model.eq_ignore_ascii_case("deepseek-v4-flash"))
 }
 
 pub fn default_max_tokens(context_window: u32) -> u32 {
@@ -192,6 +202,12 @@ pub fn derive_tier_config(
     tier.thinking_type = provider.thinking_type.clone();
     tier.thinking_keep = provider.thinking_keep.clone();
     tier.reasoning_history = provider.reasoning_history.clone();
+    tier.chat_options.reasoning_effort = atomcode_kernel::provider::ReasoningEffort::from_config(
+        provider.reasoning_effort.as_deref(),
+    );
+    tier.supports_reasoning_effort = provider.reasoning_effort.is_some()
+        || (atomcode_config::config::is_codingplan_provider_name(provider_name)
+            && provider.model.eq_ignore_ascii_case("deepseek-v4-flash"));
     tier.thinking_enabled = provider.thinking_enabled;
     tier.user_agent = provider.user_agent.clone();
     tier.skip_tls_verify = provider.skip_tls_verify;
@@ -238,6 +254,12 @@ pub fn derive_tier_config_from_resolved(
     tier.thinking_type = resolved.thinking_type.clone();
     tier.thinking_keep = resolved.thinking_keep.clone();
     tier.reasoning_history = resolved.reasoning_history.clone();
+    tier.chat_options.reasoning_effort = atomcode_kernel::provider::ReasoningEffort::from_config(
+        resolved.reasoning_effort.as_deref(),
+    );
+    tier.supports_reasoning_effort = resolved.reasoning_effort.is_some()
+        || (atomcode_config::config::is_codingplan_provider_name(&resolved.selection_id)
+            && resolved.model.eq_ignore_ascii_case("deepseek-v4-flash"));
     tier.thinking_enabled = resolved.thinking_enabled;
     tier.user_agent = resolved.user_agent.clone();
     tier.skip_tls_verify = resolved.skip_tls_verify;
@@ -346,5 +368,53 @@ mod tests {
         assert_eq!(default_max_tokens(16_000), 8_000);
         assert_eq!(default_max_tokens(64_000), 16_000);
         assert_eq!(default_max_tokens(200_000), 16_384);
+    }
+
+    #[test]
+    fn effort_capability_is_explicit_except_for_atomgit_deepseek_flash() {
+        let mut custom = config("openai");
+        custom.model = "glm-5.2".into();
+        custom.provider_name = "internal-glm".into();
+        assert!(!supports_reasoning_effort(&custom));
+
+        custom.supports_reasoning_effort = true;
+        assert!(supports_reasoning_effort(&custom));
+
+        let mut atomgit = config("openai");
+        atomgit.model = "deepseek-v4-flash".into();
+        atomgit.provider_name = "AtomGit-deepseek-v4-flash".into();
+        assert!(supports_reasoning_effort(&atomgit));
+
+        atomgit.provider_name = "private-deepseek".into();
+        assert!(!supports_reasoning_effort(&atomgit));
+    }
+
+    #[test]
+    fn tier_configs_preserve_default_effort_and_capability() {
+        let catalog: atomcode_config::config::Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "custom": {
+                    "provider": "openai-compatible",
+                    "base_url": "https://example.invalid/v1"
+                }
+            },
+            "models": {
+                "custom/model": {
+                    "account": "custom",
+                    "model": "vendor-model",
+                    "reasoning_effort": "medium"
+                }
+            },
+            "default_model": "custom/model"
+        }))
+        .unwrap();
+        let resolved = catalog.resolve_model(Some("custom/model")).unwrap();
+        let tier = derive_tier_config_from_resolved(&config("openai"), &resolved);
+
+        assert!(tier.supports_reasoning_effort);
+        assert_eq!(
+            tier.chat_options.reasoning_effort,
+            Some(atomcode_kernel::provider::ReasoningEffort::Medium)
+        );
     }
 }

@@ -21,6 +21,10 @@ pub struct CodingAgentConfig {
     /// Final image-input capability resolved from the model profile override or
     /// the backwards-compatible Auto heuristic.
     pub supports_vision: bool,
+    /// Whether this concrete endpoint accepts a reasoning-effort control.
+    /// Kept separate from `chat_options.reasoning_effort`: API-default effort is
+    /// still a supported endpoint with no per-call value.
+    pub supports_reasoning_effort: bool,
     /// Preferred language for natural-language commit subjects and bodies.
     /// `None` means follow the current conversation language.
     pub preferred_language: Option<Locale>,
@@ -318,6 +322,9 @@ impl CodingRuntimeConfig {
         );
         config.context_window = self.context_window;
         config.supports_vision = self.supports_vision;
+        config.supports_reasoning_effort = self.reasoning_effort.is_some()
+            || (atomcode_config::config::is_codingplan_provider_name(&self.provider_name)
+                && self.model.eq_ignore_ascii_case("deepseek-v4-flash"));
         config.preferred_language = self.preferred_language;
         config.todo = self.todo.clone();
         config.provider_name = self.provider_name.clone();
@@ -367,6 +374,7 @@ pub fn apply_provider_config(
     config.chat_options.reasoning_effort = atomcode_kernel::provider::ReasoningEffort::from_config(
         provider.reasoning_effort.as_deref(),
     );
+    config.supports_reasoning_effort = provider.reasoning_effort.is_some();
     config.provider_type = provider.provider_type.clone();
     config.reasoning_history = provider.reasoning_history.clone();
     config.thinking_enabled = provider.thinking_enabled;
@@ -622,6 +630,7 @@ impl CodingAgentConfig {
             base_url: base_url.into(),
             provider_name: model.clone(),
             supports_vision: atomcode_capabilities::provider::model_suggests_vision(&model),
+            supports_reasoning_effort: false,
             model,
             preferred_language: None,
             todo: Default::default(),

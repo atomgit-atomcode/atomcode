@@ -48,11 +48,13 @@ pub struct ProviderConfig {
     /// Lets users work around new provider quirks without a code change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_history: Option<String>,
-    /// DeepSeek V4 reasoning effort control ("high" | "max").
+    /// Reasoning effort control. `"auto"` declares that this concrete endpoint
+    /// supports effort switching while leaving the API default in effect;
+    /// `"low" | "medium" | "high" | "max"` also set the model default.
     /// Sent as top-level `reasoning_effort` in the request body.
-    /// None = don't send the field (API uses its own default).
-    /// Only emitted when the provider's base_url or model name
-    /// matches the applicable heuristic (see OpenAiProvider).
+    /// None = endpoint capability is unknown/disabled; don't send the field.
+    /// For OpenAI-compatible endpoints, a configured value explicitly enables
+    /// the field for this model profile; unconfigured custom endpoints omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     /// Whether extended thinking is enabled for this provider.

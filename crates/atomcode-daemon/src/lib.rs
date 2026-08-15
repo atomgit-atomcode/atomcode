@@ -2874,12 +2874,10 @@ pub struct ModelInfo {
     pub provider_type: String,
     /// Whether this is the default provider
     pub is_default: bool,
-    /// Whether this model accepts the DeepSeek `reasoning_effort` control
-    /// (the deepseek-v4 family). The webui shows the effort selector only
-    /// for models where this is true.
+    /// Whether this concrete model endpoint accepts `reasoning_effort`.
     pub effort_applicable: bool,
-    /// Current `reasoning_effort` for this provider: `"high"`, `"max"`, or
-    /// `null` (the model's own default). Lets the webui reflect the active
+    /// Current `reasoning_effort`: `"low"`, `"medium"`, `"high"`, `"max"`,
+    /// or `null` (the model's own default). Lets the webui reflect the active
     /// effort in the selector.
     pub reasoning_effort: Option<String>,
 }
@@ -2900,10 +2898,13 @@ fn models_from_config(config: &Config) -> Vec<ModelInfo> {
                 model: p.model.clone(),
                 provider_type: p.provider_type.clone(),
                 is_default: id == &default_selection,
-                effort_applicable: atomcode_capabilities::provider::reason_effort_applicable(
-                    &p.model,
-                ),
-                reasoning_effort: p.reasoning_effort.clone(),
+                effort_applicable: p.reasoning_effort.is_some()
+                    || (atomcode_config::config::is_codingplan_provider_name(id)
+                        && p.model.eq_ignore_ascii_case("deepseek-v4-flash")),
+                reasoning_effort: p
+                    .reasoning_effort
+                    .clone()
+                    .filter(|effort| !effort.eq_ignore_ascii_case("auto")),
             })
         })
         .collect()

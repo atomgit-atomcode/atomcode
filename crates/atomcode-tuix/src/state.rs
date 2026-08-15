@@ -2225,14 +2225,17 @@ impl UiState {
         self.toggle_tool_output();
     }
 
-    /// Cycle through reasoning_effort values: None → "high" → "max" → None.
+    /// Cycle through reasoning_effort values:
+    /// None → "low" → "medium" → "high" → "max" → None.
     /// Returns the new value (None = use API default).
     pub fn cycle_reasoning_effort(&mut self) -> Option<&'static str> {
         let next: Option<&'static str> = match self.reasoning_effort.as_deref() {
-            None => Some("high"),
+            None => Some("low"),
+            Some("low") => Some("medium"),
+            Some("medium") => Some("high"),
             Some("high") => Some("max"),
             Some("max") => None,
-            _ => Some("high"),
+            _ => Some("low"),
         };
         self.reasoning_effort = next.map(|s| s.to_string());
         next
@@ -3467,6 +3470,16 @@ mod tests {
 
         assert_eq!(st.phase, UiPhase::Idle);
         assert!(st.last_submitted_message.is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_cycles_all_supported_levels() {
+        let mut state = UiState::new();
+        assert_eq!(state.cycle_reasoning_effort(), Some("low"));
+        assert_eq!(state.cycle_reasoning_effort(), Some("medium"));
+        assert_eq!(state.cycle_reasoning_effort(), Some("high"));
+        assert_eq!(state.cycle_reasoning_effort(), Some("max"));
+        assert_eq!(state.cycle_reasoning_effort(), None);
     }
 
     #[test]

@@ -3331,12 +3331,12 @@ fn execute_slash_command_impl(
                 Some(p) => {
                     if sub.is_empty() {
                         // Show current status
-                        let current = p.reasoning_effort.as_deref().unwrap_or("off (API default)");
+                        let current = p.reasoning_effort.as_deref().unwrap_or("unsupported");
                         renderer.render(UiLine::CommandOutput(format!(
-                            "  Current reasoning effort: {current}\n  Usage: /effort high | max | off\n  Shortcut: Ctrl+T\n"
+                            "  Current reasoning effort: {current}\n  Usage: /effort low | medium | high | max | auto\n  Shortcut: Ctrl+T\n"
                         )));
                         renderer.flush();
-                    } else if sub == "high" || sub == "max" {
+                    } else if matches!(sub.as_str(), "low" | "medium" | "high" | "max") {
                         let mut desired = ctx.config.clone();
                         desired.update_selection_reasoning(&provider_name, |r| {
                             *r.reasoning_effort = Some(sub.to_string())
@@ -3348,10 +3348,12 @@ fn execute_slash_command_impl(
                             format!("  ○ Reasoning effort set to: {sub}\n"),
                             false,
                         );
-                    } else if sub == "off" {
+                    } else if matches!(sub.as_str(), "auto" | "default" | "off") {
                         let mut desired = ctx.config.clone();
                         desired.update_selection_reasoning(&provider_name, |r| {
-                            *r.reasoning_effort = None
+                            // Keep the endpoint capability while returning to
+                            // its API-selected default effort.
+                            *r.reasoning_effort = Some("auto".to_string())
                         });
                         crate::event_loop::save_and_reload(
                             ctx,
@@ -3362,7 +3364,7 @@ fn execute_slash_command_impl(
                         );
                     } else {
                         renderer.render(UiLine::CommandOutput(
-                            "  Usage: /effort high | max | off\n  Shortcut: Ctrl+T\n".into(),
+                            "  Usage: /effort low | medium | high | max | auto\n  Shortcut: Ctrl+T\n".into(),
                         ));
                         renderer.flush();
                     }

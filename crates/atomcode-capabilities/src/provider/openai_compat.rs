@@ -43,6 +43,11 @@ pub struct OpenAiCompatConfig {
     pub context_window: u32,
     /// Fallback output cap when `ChatOptions::max_tokens` is `None`.
     pub max_tokens: Option<u32>,
+    /// Whether this concrete model endpoint accepts the top-level
+    /// `reasoning_effort` request field. This is endpoint capability, not a
+    /// model-name property: compatible gateways serving the same wire model can
+    /// expose different controls.
+    pub supports_reasoning_effort: bool,
     /// Explicit reasoning round-trip policy; `None` ⇒ derived from the model name.
     pub reasoning_policy: Option<ReasoningPolicy>,
     /// Kimi-family thinking control: `thinking.type` in the request body
@@ -130,6 +135,7 @@ impl OpenAiCompatConfig {
             model,
             context_window: 128_000,
             max_tokens: None,
+            supports_reasoning_effort: false,
             reasoning_policy: None,
             thinking_type: None,
             thinking_keep: None,
@@ -1035,7 +1041,7 @@ fn build_request_body(
         }
     }
     if let Some(effort) = options.reasoning_effort {
-        if reason_effort_applicable(model) {
+        if cfg.supports_reasoning_effort {
             body.insert("reasoning_effort".into(), json!(effort_str(effort)));
         }
     }
@@ -1073,8 +1079,9 @@ fn supports_tool_choice(model: &str) -> bool {
     !model.contains("deepseek-v4")
 }
 
-/// Whether a model accepts a top-level `reasoning_effort` control. Exposed so a UI
-/// (the TUI effort hint) and the request-body gate can never diverge.
+/// Legacy model-name hint for DeepSeek V4. New runtime construction must prefer
+/// the concrete endpoint capability carried by [`OpenAiCompatConfig`]; identical
+/// model ids can expose different controls behind different gateways.
 pub fn reason_effort_applicable(model: &str) -> bool {
     // Only DeepSeek-V4 takes a top-level `reasoning_effort`; others reject/ignore it.
     model.to_ascii_lowercase().contains("deepseek-v4")
@@ -2261,6 +2268,7 @@ mod tests {
     fn body_options_mapped() {
         let mut cfg = OpenAiCompatConfig::new("k", "https://x", "deepseek-v4-flash");
         cfg.max_tokens = Some(100);
+        cfg.supports_reasoning_effort = true;
         let opts = ChatOptions {
             reasoning_effort: Some(ReasoningEffort::High),
             max_tokens: None,
@@ -2294,7 +2302,8 @@ mod tests {
     #[test]
     fn reasoning_effort_max_reaches_wire() {
         // DeepSeek V4 accepts "max" beyond low/medium/high — the `/effort max` path.
-        let cfg = OpenAiCompatConfig::new("k", "https://x", "deepseek-v4-flash");
+        let mut cfg = OpenAiCompatConfig::new("k", "https://x", "deepseek-v4-flash");
+        cfg.supports_reasoning_effort = true;
         let opts = ChatOptions {
             reasoning_effort: Some(ReasoningEffort::Max),
             ..Default::default()
@@ -2311,7 +2320,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_only_for_v4() {
+    fn unknown_endpoint_omits_reasoning_effort() {
         let cfg = OpenAiCompatConfig::new("k", "https://x", "glm-5.1");
         let opts = ChatOptions {
             reasoning_effort: Some(ReasoningEffort::High),
@@ -2327,8 +2336,27 @@ mod tests {
         );
         assert!(
             body.get("reasoning_effort").is_none(),
-            "non-v4 omits reasoning_effort"
+            "an endpoint without an explicit capability omits reasoning_effort"
         );
+    }
+
+    #[test]
+    fn explicit_custom_model_capability_reaches_wire() {
+        let mut cfg = OpenAiCompatConfig::new("k", "https://custom", "vendor-model");
+        cfg.supports_reasoning_effort = true;
+        let opts = ChatOptions {
+            reasoning_effort: Some(ReasoningEffort::Medium),
+            ..Default::default()
+        };
+        let body = build_request_body(
+            "vendor-model",
+            &[Message::user("hi")],
+            &[],
+            &opts,
+            &cfg,
+            ReasoningPolicy::Exclude,
+        );
+        assert_eq!(body["reasoning_effort"], "medium");
     }
 
     #[test]
@@ -3194,11 +3222,7 @@ mod tests {
             fresh.flush().unwrap();
         });
 
-        let mut cfg = OpenAiCompatConfig::new(
-            "k",
-            format!("http://127.0.0.1:{port}"),
-            "glm-test",
-        );
+        let mut cfg = OpenAiCompatConfig::new("k", format!("http://127.0.0.1:{port}"), "glm-test");
         cfg.retry.base_delay = std::time::Duration::from_millis(1);
         cfg.retry.max_delay = std::time::Duration::from_millis(2);
         let provider = OpenAiCompatProvider::new(cfg).unwrap();
@@ -3225,7 +3249,9 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["resp_fresh"]);
         assert_eq!(models, vec!["model-fresh"]);
-        assert!(!events.iter().any(|event| matches!(event, StreamEvent::Error(_))));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Error(_))));
 
         let _ = handle.join();
     }
@@ -3576,8 +3602,9 @@ mod tests {
             drop(s2);
         });
 
-        let cfg =
+        let mut cfg =
             OpenAiCompatConfig::new("k", format!("http://127.0.0.1:{port}"), "deepseek-v4-flash");
+        cfg.supports_reasoning_effort = true;
         let provider = OpenAiCompatProvider::new(cfg).unwrap();
         let opts = ChatOptions {
             reasoning_effort: Some(ReasoningEffort::Max),

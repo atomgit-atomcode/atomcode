@@ -3,10 +3,12 @@ import { getModels, ModelInfo, postLiveReasoningEffort } from '../api';
 import { useT } from '../settings';
 import { MsgKey } from '../i18n';
 
-// DeepSeek V4 reasoning effort levels. `null` clears the field → the model's
-// own default. Order is the cycle order shown in the dropdown.
+// Endpoint-declared reasoning effort levels. `null` returns to the model's
+// own default while retaining its configured capability.
 const EFFORT_OPTIONS: { val: string | null; key: MsgKey }[] = [
   { val: null, key: 'effort.default' },
+  { val: 'low', key: 'effort.low' },
+  { val: 'medium', key: 'effort.medium' },
   { val: 'high', key: 'effort.high' },
   { val: 'max', key: 'effort.max' },
 ];

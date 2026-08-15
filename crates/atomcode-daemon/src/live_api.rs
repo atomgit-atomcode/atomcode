@@ -1887,24 +1887,25 @@ pub(crate) struct LiveReasoningEffortReq {
     /// 目标 provider；None 时取当前默认 provider。
     #[serde(default)]
     pub provider: Option<String>,
-    /// "high" | "max" | null（清除 → 用模型自身默认）。其他取值拒绝。
+    /// "low" | "medium" | "high" | "max" | null（API 默认）。
     #[serde(default)]
     pub reasoning_effort: Option<String>,
 }
 
-/// POST /live/reasoning_effort — webui 设置 DeepSeek V4 的 reasoning_effort。
+/// POST /live/reasoning_effort — webui 设置当前模型实例的 reasoning_effort。
 ///
 /// 与 /live/provider 同源：持久化进目标 provider 的 `config.reasoning_effort`，
 /// 下一轮 turn 经 `build_turn_parts` → `create_provider` 自动生效——live 与
-/// /chat 两条路径都现读 config，故两端都会跟随。只有 deepseek-v4 系模型真正
-/// 消费该字段（见 OpenAiProvider::reason_effort_applicable），webui 已据此门控
-/// UI；服务端仅校验取值合法。
+/// /chat 两条路径都现读 config，故两端都会跟随。模型实例必须由配置或内置
+/// CodingPlan 能力声明支持；服务端同时校验取值。
 pub(crate) async fn live_reasoning_effort(
     State(state): State<AppState>,
     Json(req): Json<LiveReasoningEffortReq>,
 ) -> impl IntoResponse {
     let effort = match req.reasoning_effort.as_deref().map(str::trim) {
         None | Some("") => None,
+        Some(v) if v.eq_ignore_ascii_case("low") => Some("low".to_string()),
+        Some(v) if v.eq_ignore_ascii_case("medium") => Some("medium".to_string()),
         Some(v) if v.eq_ignore_ascii_case("high") => Some("high".to_string()),
         Some(v) if v.eq_ignore_ascii_case("max") => Some("max".to_string()),
         Some(other) => {
@@ -1928,11 +1929,18 @@ pub(crate) async fn live_reasoning_effort(
             .clone()
             .or_else(|| config.effective_model_selection())
             .unwrap_or_default();
+        let builtin_effort = atomcode_config::config::is_codingplan_provider_name(&target)
+            && config
+                .provider_config_for_selection(&target)
+                .is_some_and(|p| p.model.eq_ignore_ascii_case("deepseek-v4-flash"));
         // Schema-aware write: new-schema models live in `[models.*]`, legacy in
         // `[providers.*]`.
         let found = config.update_selection_reasoning(&target, |r| {
             previous_effort = r.reasoning_effort.clone();
-            *r.reasoning_effort = effort.clone();
+            let keep_capability = previous_effort.is_some() || builtin_effort;
+            *r.reasoning_effort = effort
+                .clone()
+                .or_else(|| keep_capability.then(|| "auto".to_string()));
         });
         if !found {
             provider_missing = true;

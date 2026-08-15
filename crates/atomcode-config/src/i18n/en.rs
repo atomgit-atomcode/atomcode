@@ -367,6 +367,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelVisionAuto => "Auto".into(),
         Msg::ProviderPanelVisionEnabled => "Enabled".into(),
         Msg::ProviderPanelVisionDisabled => "Disabled".into(),
+        Msg::ProviderPanelFieldEffort => "Default reasoning effort".into(),
         Msg::ProviderPanelFieldWindow => "Context window".into(),
         Msg::ProviderPanelFieldMakeDefault => "Set as default".into(),
         Msg::ProviderPanelSwitchHint => "←→ to switch".into(),
@@ -1008,7 +1009,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescBuild => "Switch to Build mode (full execution)".into(),
         Msg::CmdDescAuto => "Switch to Auto mode (auto-approve all tools)".into(),
         Msg::CmdDescThink => "Extended thinking control (on/off/budget N)".into(),
-        Msg::CmdDescEffort => "DeepSeek reasoning effort control (high / max / off)".into(),
+        Msg::CmdDescEffort => "Model reasoning effort control (low / medium / high / max / auto)".into(),
         Msg::CmdDescHelp => "Show this help".into(),
         Msg::CmdDescKeys => "Show keyboard shortcuts".into(),
         Msg::CmdDescLanguage => "Switch display language".into(),
@@ -1081,7 +1082,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         }
 
         // ── reasoning effort ──
-        Msg::ReasoningEffortNoEffect => "reasoning_effort has no effect on the current model (only DeepSeek V4)".into(),
+        Msg::ReasoningEffortNoEffect => "The current model is not configured to support reasoning_effort; enable it in /provider".into(),
 
         // ── config save failed ──
         Msg::ConfigSaveFailed { error } =>

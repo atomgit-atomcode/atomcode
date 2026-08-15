@@ -317,6 +317,7 @@ enum ModelField {
     ApiKey,
     Model,
     Vision,
+    Effort,
     Window,
     MakeDefault,
 }
@@ -351,6 +352,8 @@ struct ModelForm {
     model: String,
     /// `None` = Auto, `Some(true)` = Enabled, `Some(false)` = Disabled.
     supports_vision: Option<bool>,
+    /// `None` = unsupported, `Some("auto")` = supported with API default.
+    reasoning_effort: Option<String>,
     window: String,
     make_default: bool,
     focus: ModelField,
@@ -380,6 +383,7 @@ impl ModelForm {
             api_key: String::new(),
             model: String::new(),
             supports_vision: None,
+            reasoning_effort: None,
             window: String::new(),
             make_default: true,
             focus: ModelField::Account,
@@ -396,6 +400,7 @@ impl ModelForm {
             api_key: String::new(),
             model: m.model.clone(),
             supports_vision: m.supports_vision,
+            reasoning_effort: m.reasoning_effort.clone(),
             window: m.context_window.to_string(),
             make_default: config.effective_model_selection().as_deref() == Some(id),
             focus: ModelField::Model,
@@ -425,6 +430,7 @@ impl ModelForm {
         }
         v.push(ModelField::Model);
         v.push(ModelField::Vision);
+        v.push(ModelField::Effort);
         v.push(ModelField::Window);
         v.push(ModelField::MakeDefault);
         v
@@ -475,6 +481,35 @@ impl ModelForm {
             Some(false) => {
                 crate::i18n::t(crate::i18n::Msg::ProviderPanelVisionDisabled).into_owned()
             }
+        }
+    }
+
+    fn cycle_effort(&mut self, forward: bool) {
+        const VALUES: [Option<&str>; 6] = [
+            None,
+            Some("auto"),
+            Some("low"),
+            Some("medium"),
+            Some("high"),
+            Some("max"),
+        ];
+        let current = VALUES
+            .iter()
+            .position(|value| *value == self.reasoning_effort.as_deref())
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % VALUES.len()
+        } else {
+            (current + VALUES.len() - 1) % VALUES.len()
+        };
+        self.reasoning_effort = VALUES[next].map(str::to_string);
+    }
+
+    fn effort_label(&self) -> String {
+        match self.reasoning_effort.as_deref() {
+            None => crate::i18n::t(crate::i18n::Msg::ProviderPanelVisionDisabled).into_owned(),
+            Some("auto") => crate::i18n::t(crate::i18n::Msg::ProviderPanelDefaultValue).into_owned(),
+            Some(value) => value.to_string(),
         }
     }
 }
@@ -553,7 +588,10 @@ impl ProviderPanel {
                 ModelField::Window => form
                     .window
                     .extend(clean.chars().filter(char::is_ascii_digit)),
-                ModelField::Account | ModelField::Vision | ModelField::MakeDefault => {}
+                ModelField::Account
+                | ModelField::Vision
+                | ModelField::Effort
+                | ModelField::MakeDefault => {}
             },
             Mode::List => {
                 self.query.push_str(clean);
@@ -987,6 +1025,7 @@ impl ProviderPanel {
         let account_id = form.account_id().to_string();
         let model_name = form.model.trim().to_string();
         let supports_vision = form.supports_vision;
+        let reasoning_effort = form.reasoning_effort.clone();
         if model_name.is_empty() {
             return false;
         }
@@ -1052,10 +1091,12 @@ impl ProviderPanel {
                     if let Some(model) = persisted.models.get_mut(id) {
                         model.model = model_name.clone();
                         model.supports_vision = supports_vision;
+                        model.reasoning_effort = reasoning_effort.clone();
                         model.context_window = context_window;
                     } else if let Some(provider) = persisted.providers.get_mut(id) {
                         provider.model = model_name.clone();
                         provider.supports_vision = supports_vision;
+                        provider.reasoning_effort = reasoning_effort.clone();
                         provider.context_window = context_window;
                     } else {
                         anyhow::bail!("model {id:?} changed; reopen /provider");
@@ -1090,7 +1131,7 @@ impl ProviderPanel {
                             thinking_type: None,
                             thinking_keep: None,
                             reasoning_history: None,
-                            reasoning_effort: None,
+                            reasoning_effort: reasoning_effort.clone(),
                             thinking_enabled: None,
                             thinking_budget: None,
                         },
@@ -1340,8 +1381,13 @@ impl Modal for ProviderPanel {
                 KeyCode::Right if form.focus == ModelField::Account => form.cycle_account(true),
                 KeyCode::Left if form.focus == ModelField::Vision => form.cycle_vision(false),
                 KeyCode::Right if form.focus == ModelField::Vision => form.cycle_vision(true),
+                KeyCode::Left if form.focus == ModelField::Effort => form.cycle_effort(false),
+                KeyCode::Right if form.focus == ModelField::Effort => form.cycle_effort(true),
                 KeyCode::Char(' ') if form.focus == ModelField::Vision => {
                     form.cycle_vision(true);
+                }
+                KeyCode::Char(' ') if form.focus == ModelField::Effort => {
+                    form.cycle_effort(true);
                 }
                 KeyCode::Char(' ') if form.focus == ModelField::MakeDefault => {
                     form.make_default = !form.make_default;
@@ -1810,6 +1856,11 @@ impl Modal for ProviderPanel {
                     format!("‹ {} ›", form.vision_label()),
                     form.focus == ModelField::Vision,
                 ));
+                items.push(field_row(
+                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldEffort),
+                    format!("‹ {} ›", form.effort_label()),
+                    form.focus == ModelField::Effort,
+                ));
                 let win = if form.window.is_empty() {
                     format!(
                         "({})",
@@ -2167,6 +2218,37 @@ mod tests {
         let edit = ModelForm::new_edit(&cfg, "acc/qwen").unwrap();
         assert_eq!(edit.supports_vision, Some(true));
         assert!(edit.fields().contains(&ModelField::Vision));
+    }
+
+    #[test]
+    fn model_form_effort_defaults_off_cycles_and_restores_edit_value() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "acc": { "provider": "openai-compatible" } },
+            "models": {
+                "acc/custom": {
+                    "account": "acc",
+                    "model": "vendor-model",
+                    "reasoning_effort": "high",
+                    "context_window": 131072
+                }
+            }
+        }))
+        .unwrap();
+
+        let mut add = ModelForm::new_add(&cfg, Some("acc")).unwrap();
+        assert_eq!(add.reasoning_effort, None);
+        add.cycle_effort(true);
+        assert_eq!(add.reasoning_effort.as_deref(), Some("auto"));
+        add.cycle_effort(true);
+        assert_eq!(add.reasoning_effort.as_deref(), Some("low"));
+        add.cycle_effort(false);
+        assert_eq!(add.reasoning_effort.as_deref(), Some("auto"));
+        add.cycle_effort(false);
+        assert_eq!(add.reasoning_effort, None);
+
+        let edit = ModelForm::new_edit(&cfg, "acc/custom").unwrap();
+        assert_eq!(edit.reasoning_effort.as_deref(), Some("high"));
+        assert!(edit.fields().contains(&ModelField::Effort));
     }
 
     #[test]
