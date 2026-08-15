@@ -14,12 +14,20 @@ RUN useradd -r -s /bin/bash atomcode
 
 WORKDIR /home/atomcode
 
-# Copy pre-built Linux binaries from dist directory
-COPY dist/v*/atomcode-daemon-*-linux-x64 /tmp/atomcode-daemon
+# Copy pre-built Linux binaries from dist directory.
+# dist/ may hold both linux-x64 and linux-arm64 artifacts (see scripts/release.sh);
+# buildx injects TARGETARCH automatically, so the right binary is selected per platform.
+COPY dist/v*/atomcode-daemon-*-linux-* /tmp/
 
-# Install binaries
-RUN chmod +x /tmp/atomcode-daemon && \
-    mv /tmp/atomcode-daemon /usr/local/bin/atomcode-daemon
+# Install the binary matching the build platform (amd64 -> linux-x64, arm64 -> linux-arm64)
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+        mv /tmp/atomcode-daemon-*-linux-arm64 /usr/local/bin/atomcode-daemon; \
+    else \
+        mv /tmp/atomcode-daemon-*-linux-x64 /usr/local/bin/atomcode-daemon; \
+    fi && \
+    chmod +x /usr/local/bin/atomcode-daemon && \
+    rm -f /tmp/atomcode-daemon-*-linux-*
 
 # Expose daemon port
 EXPOSE 13456

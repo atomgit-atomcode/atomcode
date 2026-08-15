@@ -146,16 +146,16 @@ docker logs -f atomcode-daemon   # 查看日志
 
 ---
 
-## docker-compose 一键部署（NAS 常驻推荐）
+## NAS 一键部署（群晖 / 威联通等）
 
-项目提供 `docker-compose.yml`，适合在 NAS / 服务器上常驻运行 daemon：崩溃自动重启（`restart: unless-stopped`）、健康检查、数据目录与工作目录持久化，配合手机 GitCode App（`/app`）或 daemon HTTP API 随时远程调试。
+项目提供 `docker-compose.yml`，适合在 NAS / 服务器上常驻运行 daemon：崩溃自动重启（`restart: unless-stopped`）、健康检查、运行数据与项目目录持久化，配合手机 GitCode App（`/app`）、WebUI 或 daemon HTTP API 随时远程调试。
 
 ### 快速开始
 
 ```bash
-# 1. 准备配置与数据目录（daemon 以 root 运行，配置目录为 /root/.atomcode）
-mkdir -p docker/data docker/workspace
-cp docker/config-example.toml docker/data/config.toml   # 填入 provider / api_key
+# 1. 准备配置、数据与项目目录（daemon 以 root 运行）
+mkdir -p docker/data docker/projects
+cp docker/config-example.toml docker/config.toml   # 填入 provider / api_key
 
 # 2. 首次使用需先编译 Linux 二进制（生成 dist/ 目录）再构建镜像
 ./scripts/release.sh
@@ -175,6 +175,32 @@ curl http://localhost:13456/health
 > BIND_ADDR=0.0.0.0 docker compose -f docker/docker-compose.yml up -d
 > ```
 
+`data/` 会持久化会话、日志、认证、插件等完整运行状态；`config.toml` 会以只读方式覆盖挂载到容器，`projects/` 会挂载为 `/workspace`。
+
+### 群晖 Container Manager
+
+1. 打开「Container Manager」→「项目」→「新增」。
+2. 项目名称填写 `atomcode`，路径选择完整 AtomCode 仓库中的 `docker/` 目录；默认 compose 使用 `..` 作为镜像构建上下文，因此不能只复制单个 compose 文件。
+3. 来源选择「使用 docker-compose.yml」，确认后启动项目。
+4. 在「容器」页确认 `atomcode-daemon` 状态为运行中。
+
+### 威联通 Container Station
+
+1. 打开「Container Station」→「应用程序」→「创建应用程序」。
+2. 选择完整仓库 `docker/` 目录中的 `docker-compose.yml`，验证通过后创建。
+3. 若使用本地镜像，先在「映像」页构建或导入对应架构的 daemon 镜像。
+
+### 手机访问
+
+默认端口只绑定宿主机 `127.0.0.1`。仅在可信局域网中需要手机直连时，使用：
+
+```bash
+BIND_ADDR=0.0.0.0 docker compose -f docker/docker-compose.yml up -d
+curl http://<NAS-IP>:13456/health
+```
+
+随后可通过 `http://<NAS-IP>:13456` 访问。公网访问必须使用反向代理、HTTPS 与 token 鉴权，或使用 Tailscale 等可信内网方案，切勿直接暴露 daemon 端口。
+
 ### 常用 compose 命令
 
 ```bash
@@ -185,4 +211,16 @@ docker compose -f docker/docker-compose.yml down      # 停止并移除容器
 
 ### 使用预构建镜像
 
-`docker-compose.yml` 默认使用 `build` 本地构建。如果你已经把镜像推送到镜像仓库（例如华为云 SWR），可以把 `build` 段替换为 `image` 段（见文件内注释），NAS 上即可直接拉取，无需本地编译。
+`docker-compose.yml` 默认从完整仓库本地构建。如果 NAS 上只有独立部署目录，必须先导入本地镜像或使用镜像仓库，并把 `build` 段替换为 `image` 段（见文件内注释）。
+
+### ARM64 与多架构镜像
+
+`Dockerfile-Daemon` 通过 buildx 的 `TARGETARCH` 选择 `linux-x64` 或 `linux-arm64` 产物。可使用新增脚本构建并推送多架构镜像：
+
+```bash
+docker/build-multiarch.sh                      # 使用默认镜像名
+docker/build-multiarch.sh myrepo/atomcode:v1   # 指定镜像名
+BUILD_ONLY=1 docker/build-multiarch.sh         # 构建并加载当前主机架构，不推送
+```
+
+运行脚本前需安装对应的 musl 交叉编译工具链和 Docker buildx。官方多架构镜像与自动化构建仍在推进中，详见 issue #1421 / #1431。

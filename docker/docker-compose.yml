@@ -5,8 +5,8 @@
 #
 # 快速开始:
 #   1. 准备配置与数据目录（daemon 以 root 运行，配置目录为 /root/.atomcode）:
-#        mkdir -p docker/data docker/workspace
-#        cp docker/config-example.toml docker/data/config.toml   # 填入 provider / api_key
+#        mkdir -p docker/data docker/projects
+#        cp docker/config-example.toml docker/config.toml   # 填入 provider / api_key
 #   2. 构建并启动:
 #        docker compose -f docker/docker-compose.yml up -d
 #   3. 验证:
@@ -15,7 +15,7 @@
 # 说明:
 #   - 首次使用需先执行 ./scripts/release.sh 生成 Linux 二进制到 dist/，再执行 build；
 #   - 若使用已推送的预构建镜像，可把下方 build 段替换为 image 段（见注释）；
-#   - NAS 上多架构（如 arm64）建议使用 buildx 构建对应平台镜像后改用 image 方式。
+#   - NAS 上多架构（如 arm64）可使用 build-multiarch.sh 构建并推送镜像后改用 image 方式。
 #
 # ⚠️ 安全警告:
 #   daemon 暴露了聊天、文件编辑、工具执行等敏感端点，且本镜像默认无鉴权。
@@ -44,20 +44,32 @@ services:
       - "${BIND_ADDR:-127.0.0.1}:13456:13456"
 
     volumes:
-      # 配置、会话等数据目录（config.toml 放在 docker/data/ 下）
+      # 持久化全部运行数据（会话、日志、认证、插件等）
       - ./data:/root/.atomcode
+      # 配置单独只读挂载，避免容器意外改写；宿主文件必须预先存在
+      - ./config.toml:/root/.atomcode/config.toml:ro
       # 待编辑的项目代码
-      - ./workspace:/workspace
+      - ./projects:/workspace
 
     environment:
       # 模型 API Key 按需传入，或在 config.toml 的 provider 中配置
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - TZ=${TZ:-Asia/Shanghai}
       # 仅在可信网络内启用 bash / 写文件等敏感 daemon 工具
       # - ATOMCODE_DAEMON_ENABLE_DANGEROUS_TOOLS=1
 
     # NAS 常驻：崩溃/重启后自动拉起
     restart: unless-stopped
+
+    security_opt:
+      - no-new-privileges:true
+
+    # NAS 可按设备能力启用资源限制
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 2G
 
     # 健康检查（镜像基于 debian slim，无 curl/wget，使用 bash /dev/tcp 探活）
     healthcheck:
