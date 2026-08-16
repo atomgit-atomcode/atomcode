@@ -4143,9 +4143,12 @@ fn spawn_runtime_owner_with_optional_agent(
                         next.subagent_fast_provider = runtime.config.subagent_fast_provider.clone();
                         next.subagent_capable_provider =
                             runtime.config.subagent_capable_provider.clone();
+                        next.subagent_model_providers =
+                            runtime.config.subagent_model_providers.clone();
                         let refresh_routing = if let Some(config) = routing {
                             if next.subagent_fast_provider.is_none()
                                 && next.subagent_capable_provider.is_none()
+                                && next.subagent_model_providers.is_none()
                             {
                                 crate::provider_factory::install_subagent_tiers(
                                     runtime.provider_factory.clone(),
@@ -4372,6 +4375,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                                 ),
                                                 http_status: None,
                                                 code: None,
+                                                retryable: None,
                                             }),
                                         );
                                     }
@@ -4901,6 +4905,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             ),
                                             http_status: None,
                                             code: None,
+                                            retryable: None,
                                         },
                                     ));
                                 }
@@ -5003,6 +5008,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             ),
                                             http_status: None,
                                             code: None,
+                                            retryable: None,
                                         },
                                     ));
                                 } else {
@@ -5035,6 +5041,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                                     ),
                                                     http_status: None,
                                                     code: None,
+                                                    retryable: None,
                                                 }),
                                             );
                                         }
@@ -5200,6 +5207,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             ),
                                             http_status: None,
                                             code: None,
+                                            retryable: None,
                                         },
                                     ));
                                 } else {
@@ -5232,6 +5240,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                                     ),
                                                     http_status: None,
                                                     code: None,
+                                                    retryable: None,
                                                 }),
                                             );
                                         }
@@ -5593,6 +5602,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     message: message.clone(),
                                     http_status: None,
                                     code: None,
+                                    retryable: None,
                                 },
                             ));
                             if let Some(turn_id) = active_turn.take() {
@@ -5734,6 +5744,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             message: message.clone(),
                                             http_status: None,
                                             code: None,
+                                            retryable: None,
                                         },
                                     ));
                                     let _ = runtime_event_tx.send(
@@ -6737,6 +6748,7 @@ fn build_goal_evaluator_provider(
                 evaluator.skip_tls_verify = resolved.skip_tls_verify;
                 evaluator.subagent_fast_provider = None;
                 evaluator.subagent_capable_provider = None;
+                evaluator.subagent_model_providers = None;
                 evaluator.subagent_config = None;
                 // An evaluator is an independent provider boundary. Never let a
                 // missing target credential/endpoint inherit the host provider's
@@ -7421,6 +7433,7 @@ fn fail_close_after_stopped_persistence(
         message: message.clone(),
         http_status: None,
         code: None,
+        retryable: None,
     }));
     Some(RuntimeError::ReconfigureFailed(message))
 }
@@ -7490,6 +7503,7 @@ fn fail_close_after_forced_provider_stop(
         message: message.to_string(),
         http_status: None,
         code: None,
+        retryable: None,
     }));
 }
 
@@ -8286,6 +8300,7 @@ mod tests {
             thinking_keep: None,
             reasoning_history: None,
             reasoning_effort: None,
+            reasoning_effort_levels: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,

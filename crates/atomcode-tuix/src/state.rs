@@ -85,6 +85,9 @@ pub struct ApprovalPanel {
     pub options: Vec<ApprovalOption>,
     pub selected: usize,
     pub cache_key: String,
+    /// Optional advisory line rendered under the header (e.g. a credential-exposure
+    /// warning). `None` for ordinary approvals.
+    pub note: Option<String>,
 }
 
 impl ApprovalPanel {
@@ -2241,15 +2244,33 @@ impl UiState {
         next
     }
 
-    /// Cycle starting from an authoritative external value (the `ctx`-synced
-    /// effort), then advance one step. `self.reasoning_effort` is otherwise only
-    /// ever written by [`Self::cycle_reasoning_effort`] and starts `None`, so a
-    /// caller that cycles without seeding first would downgrade a persisted level
-    /// (e.g. `"high"`) straight to the chain head on the first press. Callers must
-    /// pass the current authoritative value so the first cycle advances correctly.
-    pub fn cycle_reasoning_effort_from(&mut self, current: Option<&str>) -> Option<&'static str> {
-        self.reasoning_effort = current.map(|s| s.to_string());
-        self.cycle_reasoning_effort()
+    /// Cycle to the next reasoning-effort value WITHIN the allowed set, seeding
+    /// from the authoritative `current` value first (`self.reasoning_effort` is
+    /// otherwise only ever written here and starts `None`, so cycling without
+    /// seeding would downgrade a persisted level on the first press). The sequence
+    /// is `None` (API default) then each `allowed` level in order, wrapping back to
+    /// `None`. `allowed` comes from
+    /// [`atomcode_config::config::allowed_effort_levels`], so an endpoint that
+    /// exposes only `low`/`high`/`max` never cycles onto `medium`. A `current`
+    /// value no longer in `allowed` (e.g. a level the endpoint dropped) restarts at
+    /// the first allowed level rather than sticking.
+    pub fn cycle_reasoning_effort_within(
+        &mut self,
+        current: Option<&str>,
+        allowed: &[&str],
+    ) -> Option<String> {
+        let cur_slot = match current {
+            Some(c) => allowed
+                .iter()
+                .position(|level| level.eq_ignore_ascii_case(c))
+                .map(|i| i + 1)
+                .unwrap_or(0),
+            None => 0,
+        };
+        let next_slot = (cur_slot + 1) % (allowed.len() + 1);
+        let next = (next_slot != 0).then(|| allowed[next_slot - 1].to_string());
+        self.reasoning_effort = next.clone();
+        next
     }
 
     pub fn tick_spinner(&mut self) -> &'static str {
@@ -3230,6 +3251,7 @@ mod tests {
             ],
             selected: 0,
             cache_key: String::new(),
+            note: None,
         };
         p.move_up();
         assert_eq!(p.selected, 2, "up from 0 wraps to last");
@@ -3494,18 +3516,48 @@ mod tests {
     }
 
     #[test]
-    fn cycle_from_seeds_authoritative_value_before_advancing() {
+    fn cycle_within_seeds_authoritative_value_before_advancing() {
         // Regression: `reasoning_effort` starts None and is only ever written by
         // the cycle itself, so cycling a fresh UiState whose provider persisted
         // "high" would return "low" (chain head) and silently downgrade the user's
         // level. Cycling FROM the authoritative value must advance from it.
+        let all = ["low", "medium", "high", "max"];
         let mut state = UiState::new();
         assert_eq!(state.reasoning_effort, None, "stale field starts empty");
-        assert_eq!(state.cycle_reasoning_effort_from(Some("high")), Some("max"));
+        assert_eq!(
+            state.cycle_reasoning_effort_within(Some("high"), &all).as_deref(),
+            Some("max")
+        );
         // And the now-seeded state continues correctly (max → None).
-        assert_eq!(state.cycle_reasoning_effort(), None);
-        // A synced None (API default / capability-off) still starts the chain.
-        assert_eq!(state.cycle_reasoning_effort_from(None), Some("low"));
+        assert_eq!(state.cycle_reasoning_effort_within(Some("max"), &all), None);
+        // A synced None (API default) still starts the chain.
+        assert_eq!(
+            state.cycle_reasoning_effort_within(None, &all).as_deref(),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn cycle_within_allowed_skips_unsupported_levels() {
+        // The motivating case: an endpoint exposing low/high/max but NOT medium.
+        let allowed = ["low", "high", "max"];
+        let mut st = UiState::new();
+        assert_eq!(st.cycle_reasoning_effort_within(None, &allowed).as_deref(), Some("low"));
+        // low → high: medium is skipped because it is not allowed.
+        assert_eq!(
+            st.cycle_reasoning_effort_within(Some("low"), &allowed).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            st.cycle_reasoning_effort_within(Some("high"), &allowed).as_deref(),
+            Some("max")
+        );
+        assert_eq!(st.cycle_reasoning_effort_within(Some("max"), &allowed), None);
+        // A value no longer in the allowed set restarts at the first allowed level.
+        assert_eq!(
+            st.cycle_reasoning_effort_within(Some("medium"), &allowed).as_deref(),
+            Some("low")
+        );
     }
 
     #[test]

@@ -504,6 +504,10 @@ struct SubTask {
     subagent_type: String,
     #[serde(default)]
     difficulty: String,
+    /// Optional configured model selection id. When present it overrides the
+    /// simple/fast and hard/capable tier for this subtask only.
+    #[serde(default)]
+    model: Option<String>,
     /// Optional specialized profile. Defaults to explorer/implementer according
     /// to `subagent_type`; the profile's permission must match that type.
     #[serde(default)]
@@ -522,6 +526,9 @@ struct Args {
 pub struct TaskTool {
     make_fast_provider: Box<dyn Fn() -> Arc<dyn LlmProvider> + Send + Sync>,
     make_capable_provider: Box<dyn Fn() -> Arc<dyn LlmProvider> + Send + Sync>,
+    make_host_provider: Option<Box<dyn Fn() -> Arc<dyn LlmProvider> + Send + Sync>>,
+    make_named_provider:
+        Option<Box<dyn Fn(&str) -> Result<Option<Arc<dyn LlmProvider>>, String> + Send + Sync>>,
     make_explore_tools: Box<dyn Fn() -> MountedTools + Send + Sync>,
     make_worker_tools: Box<dyn Fn() -> MountedTools + Send + Sync>,
     max_concurrent: usize,
@@ -542,6 +549,8 @@ impl TaskTool {
         Self {
             make_fast_provider: Box::new(make_fast_provider),
             make_capable_provider: Box::new(make_capable_provider),
+            make_host_provider: None,
+            make_named_provider: None,
             make_explore_tools: Box::new(make_explore_tools),
             make_worker_tools: Box::new(make_worker_tools),
             max_concurrent: DEFAULT_MAX_CONCURRENT,
@@ -551,6 +560,29 @@ impl TaskTool {
             team_event_sink: None,
             credential_shell_policy: Default::default(),
         }
+    }
+
+    /// Install the current host provider as the safe fallback target for a
+    /// content-free, retryable hard/explore failure.
+    pub fn with_host_provider(
+        mut self,
+        make_provider: impl Fn() -> Arc<dyn LlmProvider> + Send + Sync + 'static,
+    ) -> Self {
+        self.make_host_provider = Some(Box::new(make_provider));
+        self
+    }
+
+    /// Resolve a configured model selection id for a single task. `Ok(None)`
+    /// means that selection is the current host model and should reuse its slot.
+    pub fn with_named_provider(
+        mut self,
+        make_provider: impl Fn(&str) -> Result<Option<Arc<dyn LlmProvider>>, String>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.make_named_provider = Some(Box::new(make_provider));
+        self
     }
 
     pub fn with_max_concurrent(mut self, n: usize) -> Self {
@@ -606,7 +638,7 @@ impl Tool for TaskTool {
 
     fn description(&self) -> &str {
         "Dispatch one or more subtasks to isolated subagents. Each task: {description, \
-prompt, subagent_type: 'explore'|'worker', difficulty: 'simple'|'hard', role?: profile}. 'explore' = \
+prompt, subagent_type: 'explore'|'worker', difficulty: 'simple'|'hard', model?: configured_model_id, role?: profile}. 'explore' = \
 read-only investigation returning findings; 'worker' = edits files then stops (you review \
 the diff afterward). Optional roles include architect, reviewer, tester, rust, and tui_ux; \
 the role permission must match subagent_type. 'simple' runs on the fast model, 'hard' on the capable model. Give \
@@ -649,6 +681,10 @@ parallel workers NON-OVERLAPPING scopes."
                             "prompt": {"type": "string", "description": "The full subtask for the subagent"},
                             "subagent_type": {"type": "string", "enum": ["explore", "worker"]},
                             "difficulty": {"type": "string", "enum": ["simple", "hard"]},
+                            "model": {
+                                "type": "string",
+                                "description": "Optional configured model selection id for this subtask; overrides difficulty tier routing"
+                            },
                             "role": {
                                 "type": "string",
                                 "enum": ["planner", "architect", "explorer", "implementer", "rust", "tui_ux", "reviewer", "tester", "debugger", "security", "performance", "docs_writer", "release_manager", "migration_compat"]
@@ -741,6 +777,70 @@ parallel workers NON-OVERLAPPING scopes."
             };
         }
 
+        // Resolve every provider before starting the batch. A misspelled explicit
+        // model must fail atomically instead of launching some siblings first.
+        let mut prepared = Vec::with_capacity(specs.len());
+        for (spec, raw) in specs.into_iter().zip(parsed.tasks.iter()) {
+            let requested_model = raw
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let provider = if let Some(selection) = requested_model {
+                let Some(resolve) = self.make_named_provider.as_ref() else {
+                    return ToolResult {
+                        call_id: String::new(),
+                        content: "this runtime does not support per-task model selection".into(),
+                        is_error: true,
+                        images: vec![],
+                    };
+                };
+                match resolve(selection) {
+                    Ok(Some(provider)) => provider,
+                    Ok(None) => match self.make_host_provider.as_ref() {
+                        Some(make_host) => make_host(),
+                        None => {
+                            return ToolResult {
+                                call_id: String::new(),
+                                content: format!(
+                                    "model `{selection}` resolves to the host model, but the host provider is unavailable"
+                                ),
+                                is_error: true,
+                                images: vec![],
+                            }
+                        }
+                    },
+                    Err(error) => {
+                        return ToolResult {
+                            call_id: String::new(),
+                            content: format!("invalid task model `{selection}`: {error}"),
+                            is_error: true,
+                            images: vec![],
+                        }
+                    }
+                }
+            } else if spec.difficulty == crate::team::TeamDifficulty::Hard {
+                (self.make_capable_provider)()
+            } else {
+                (self.make_fast_provider)()
+            };
+            let fallback = (requested_model.is_none()
+                && spec.permission == crate::team::TeamPermission::Explore
+                && spec.difficulty == crate::team::TeamDifficulty::Hard)
+                .then(|| {
+                    self.make_host_provider
+                        .as_ref()
+                        .map(|make_host| make_host())
+                })
+                .flatten()
+                // A different configured provider may legitimately expose the
+                // same raw model name (for example two gateways serving GLM).
+                // Provider identity, not display text, determines whether this
+                // is a real fallback target.
+                .filter(|host| !Arc::ptr_eq(host, &provider));
+            prepared.push((spec, provider, fallback));
+        }
+
         let sem = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent));
         let max_rounds = self.max_rounds;
         let tool_loop_policy = self.tool_loop_policy;
@@ -758,23 +858,18 @@ parallel workers NON-OVERLAPPING scopes."
             emit_lock: Arc::new(Mutex::new(())),
         });
         if let Some(events) = &event_emitter {
-            events.emit(crate::team::TeamEventPayload::RunStarted { total: specs.len() });
+            events.emit(crate::team::TeamEventPayload::RunStarted {
+                total: prepared.len(),
+            });
         }
         // Live progress: the whole batch would otherwise be a black box until every subtask
         // finishes. Emit a header + per-subtask start/done so the driver renders them live.
         ctx.progress
-            .emit(format!("dispatching {} subtask(s)…", specs.len()));
+            .emit(format!("dispatching {} subtask(s)…", prepared.len()));
 
-        for (idx, t) in specs.into_iter().enumerate() {
+        for (idx, (t, provider, fallback_provider)) in prepared.into_iter().enumerate() {
             let is_worker = t.permission == crate::team::TeamPermission::Worker;
             let scope = t.scope.clone();
-            let is_hard = t.difficulty == crate::team::TeamDifficulty::Hard;
-            // Fresh provider + fresh tools per child (a session consumes its provider).
-            let provider = if is_hard {
-                (self.make_capable_provider)()
-            } else {
-                (self.make_fast_provider)()
-            };
             // Capture the actual model this subtask runs on (for display + routing proof)
             // BEFORE the provider is moved into the child builder.
             let model = provider.model_name().to_string();
@@ -841,32 +936,27 @@ parallel workers NON-OVERLAPPING scopes."
                     member_events.clone(),
                     member_id.clone(),
                 ));
-                let mut builder = Agent::builder()
-                    .provider(provider)
-                    .tools(tools)
-                    .persona(persona)
-                    .working_dir(wd.clone())
-                    .cancel_token(child_cancel)
-                    .hook(progress_hook.clone());
-                if let Some(policy) = tool_loop_policy {
-                    builder = builder.tool_loop_policy(policy);
-                }
-                if let Some(max_rounds) = max_rounds {
-                    builder = builder.max_rounds(max_rounds);
-                }
                 // The child runs AutoRespond::AllowAll (no human in its loop), so the parent's
                 // prompting gates wouldn't protect it. Hard-deny sensitive-path ops for every
                 // child (#1); additionally confine a `worker`'s WRITES to its declared scope.
-                for mw in subagent_child_middlewares_for_policy(
+                let child_middlewares = subagent_child_middlewares_for_policy(
                     is_worker,
                     &scope,
                     &wd,
                     &inherited_worker_middlewares,
                     credential_shell_policy,
-                ) {
-                    builder = builder.middleware(mw);
-                }
-                let child = builder.build();
+                );
+                let child = build_task_child(
+                    provider,
+                    tools.clone(),
+                    persona.clone(),
+                    wd.clone(),
+                    child_cancel.clone(),
+                    progress_hook.clone(),
+                    tool_loop_policy,
+                    max_rounds,
+                    child_middlewares.clone(),
+                );
                 // DETACH: inner spawn lets the child run independent of this future;
                 // cancel propagates only via the child_token.
                 //
@@ -875,14 +965,14 @@ parallel workers NON-OVERLAPPING scopes."
                 // below cannot fire from a panic. Defensive parity with parallel_edit.rs.
                 let handle = tokio::spawn(run_child_to_completion(
                     child,
-                    prompt,
+                    prompt.clone(),
                     AutoRespond::AllowAll,
-                    progress_hook,
+                    progress_hook.clone(),
                 ));
                 // There is deliberately no total wall-clock timeout here. Long-running
                 // research may make steady progress for many minutes; liveness is bounded by
                 // provider idle timeouts, the child round cap, and explicit parent/user cancel.
-                let outcome = match handle.await {
+                let mut outcome = match handle.await {
                     Ok(o) => o,
                     Err(join_err) => Outcome {
                         stop: StopReason::ProviderError,
@@ -890,6 +980,51 @@ parallel workers NON-OVERLAPPING scopes."
                         ..Default::default()
                     },
                 };
+                let mut final_model = model.clone();
+                if fallback_provider.is_some()
+                    && retryable_content_free_failure(&outcome)
+                    && !child_cancel.is_cancelled()
+                {
+                    let fallback = fallback_provider.expect("checked above");
+                    let fallback_model = fallback.model_name().to_string();
+                    // `MemberStarted` is attempt-scoped: publishing the retry
+                    // keeps typed Team projections aligned with the provider
+                    // that is actually running. Existing consumers already
+                    // update an existing member in place on repeated starts.
+                    if let Some(events) = &member_events {
+                        events.emit(crate::team::TeamEventPayload::MemberStarted {
+                            member_id: member_id.clone(),
+                            role: t.role,
+                            model: fallback_model.clone(),
+                            description: desc.clone(),
+                        });
+                    }
+                    progress_hook.publish(
+                        Some(format!(
+                            "{model} failed before producing output; retrying with {fallback_model}"
+                        )),
+                        true,
+                    );
+                    let fallback_child = build_task_child(
+                        fallback,
+                        tools,
+                        persona,
+                        wd,
+                        child_cancel,
+                        progress_hook.clone(),
+                        tool_loop_policy,
+                        max_rounds,
+                        child_middlewares,
+                    );
+                    outcome = run_child_to_completion(
+                        fallback_child,
+                        prompt,
+                        AutoRespond::AllowAll,
+                        progress_hook,
+                    )
+                    .await;
+                    final_model = fallback_model;
+                }
                 // Include the failure reason on the terminal ✗ line. Retained UIs
                 // commit terminal child events to scrollback while keeping only
                 // running children in the fixed panel.
@@ -898,7 +1033,7 @@ parallel workers NON-OVERLAPPING scopes."
                 } else {
                     format!("\u{2717} failed ({:?}) \u{b7} {label}", outcome.stop)
                 };
-                progress.emit(subtask_progress_line(&head, &model, &desc));
+                progress.emit(subtask_progress_line(&head, &final_model, &desc));
                 if let Some(events) = &member_events {
                     events.emit(crate::team::TeamEventPayload::MemberFinished {
                         member_id,
@@ -913,7 +1048,7 @@ parallel workers NON-OVERLAPPING scopes."
                         output_tokens: (outcome.text.chars().count() / 4) as u64,
                     });
                 }
-                (label, desc, model, outcome)
+                (label, desc, final_model, outcome)
             });
         }
 
@@ -1342,6 +1477,57 @@ fn readable_progress_tail(text: &str) -> Option<String> {
     (!clean.is_empty()).then(|| first_line_capped(&clean, 88))
 }
 
+fn build_task_child(
+    provider: Arc<dyn LlmProvider>,
+    tools: MountedTools,
+    persona: String,
+    working_dir: PathBuf,
+    cancel: tokio_util::sync::CancellationToken,
+    progress: Arc<SubtaskProgressHook>,
+    tool_loop_policy: Option<ToolLoopPolicy>,
+    max_rounds: Option<u32>,
+    middlewares: Vec<Arc<dyn ToolMiddleware>>,
+) -> Agent {
+    let mut builder = Agent::builder()
+        .provider(provider)
+        .tools(tools)
+        .persona(persona)
+        .working_dir(working_dir)
+        .cancel_token(cancel)
+        .hook(progress);
+    if let Some(policy) = tool_loop_policy {
+        builder = builder.tool_loop_policy(policy);
+    }
+    if let Some(max_rounds) = max_rounds {
+        builder = builder.max_rounds(max_rounds);
+    }
+    for middleware in middlewares {
+        builder = builder.middleware(middleware);
+    }
+    builder.build()
+}
+
+/// A hard/explore retry is safe only before the child produced any semantic
+/// output or tool result. Restrict provider failures to structured transient
+/// HTTP classes; an unclassified error may be auth/config and must not silently
+/// switch models. A stream idle timeout is intrinsically transient.
+fn retryable_content_free_failure(outcome: &Outcome) -> bool {
+    if !outcome.text.is_empty() || !outcome.tool_results.is_empty() {
+        return false;
+    }
+    match outcome.stop {
+        StopReason::Timeout | StopReason::RateLimited => true,
+        StopReason::ProviderError => match outcome.provider_retryable {
+            // A provider's structured classification is authoritative. In
+            // particular, do not replay a terminal failure merely because a
+            // compatible endpoint attached a nominally transient status.
+            Some(retryable) => retryable,
+            None => matches!(outcome.http_status, Some(408 | 425 | 429) | Some(500..=599)),
+        },
+        _ => false,
+    }
+}
+
 /// One-shot child driver with the same aggregation/failure semantics as
 /// `Agent::run_to_completion`, plus truthful execution-boundary progress. Tool
 /// middleware `before` is a classification seam and may run for a whole batch
@@ -1381,10 +1567,12 @@ async fn run_child_to_completion(
                 message,
                 http_status,
                 code,
+                retryable,
             } => {
                 outcome.error = Some(message);
                 outcome.http_status = http_status;
                 outcome.error_code = code;
+                outcome.provider_retryable = retryable;
             }
             AgentEvent::PolicyIntervention { intervention } => {
                 outcome.policy_intervention = Some(intervention);
@@ -2032,6 +2220,230 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_model_selection_overrides_the_difficulty_tier() {
+        let reg = Arc::new(ToolRegistry::new());
+        let r1 = reg.clone();
+        let r2 = reg.clone();
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        let captured = requested.clone();
+        let tool = TaskTool::new(
+            || Arc::new(MockProvider { reply: Some("FAST".into()) }) as Arc<dyn LlmProvider>,
+            || Arc::new(MockProvider { reply: Some("CAPABLE".into()) }) as Arc<dyn LlmProvider>,
+            move || r1.mount(&[]),
+            move || r2.mount(&[]),
+        )
+        .with_host_provider(|| {
+            Arc::new(MockProvider { reply: Some("HOST".into()) }) as Arc<dyn LlmProvider>
+        })
+        .with_named_provider(move |selection| {
+            captured.lock().unwrap().push(selection.to_string());
+            Ok(Some(Arc::new(MockProvider {
+                reply: Some("NAMED".into()),
+            }) as Arc<dyn LlmProvider>))
+        });
+
+        let out = tool
+            .execute(
+                r#"{"tasks":[{"description":"find","prompt":"where","subagent_type":"explore","difficulty":"hard","model":"custom/fast"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("NAMED"), "{}", out.content);
+        assert_eq!(*requested.lock().unwrap(), vec!["custom/fast"]);
+    }
+
+    #[tokio::test]
+    async fn invalid_explicit_model_rejects_the_batch_before_any_child_runs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingProvider(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl LlmProvider for CountingProvider {
+            fn model_name(&self) -> &str {
+                "counting"
+            }
+
+            async fn chat_stream(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolDef],
+                _options: &ChatOptions,
+            ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::pin(futures::stream::empty()))
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fast_calls = calls.clone();
+        let capable_calls = calls.clone();
+        let reg = Arc::new(ToolRegistry::new());
+        let r1 = reg.clone();
+        let r2 = reg.clone();
+        let tool = TaskTool::new(
+            move || Arc::new(CountingProvider(fast_calls.clone())) as Arc<dyn LlmProvider>,
+            move || Arc::new(CountingProvider(capable_calls.clone())) as Arc<dyn LlmProvider>,
+            move || r1.mount(&[]),
+            move || r2.mount(&[]),
+        )
+        .with_host_provider(|| {
+            Arc::new(MockProvider {
+                reply: Some("HOST".into()),
+            }) as Arc<dyn LlmProvider>
+        })
+        .with_named_provider(|selection| Err(format!("unknown model selection `{selection}`")));
+
+        let out = tool
+            .execute(
+                r#"{"tasks":[{"description":"normal","prompt":"run","subagent_type":"explore","difficulty":"simple"},{"description":"bad","prompt":"run","subagent_type":"explore","difficulty":"hard","model":"missing"}]}"#,
+                &ctx(),
+            )
+            .await;
+
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("invalid task model `missing`"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "model validation must finish before any sibling starts"
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_explore_transient_failure_retries_once_with_host_model() {
+        struct NamedProvider {
+            model: &'static str,
+            reply: Option<&'static str>,
+        }
+        #[async_trait::async_trait]
+        impl LlmProvider for NamedProvider {
+            fn model_name(&self) -> &str {
+                self.model
+            }
+
+            async fn chat_stream(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolDef],
+                _options: &ChatOptions,
+            ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+                if let Some(reply) = self.reply {
+                    return Ok(stream::iter(vec![
+                        StreamEvent::TextDelta(reply.to_string()),
+                        StreamEvent::Done { truncated: false },
+                    ])
+                    .boxed());
+                }
+                Err(ProviderError {
+                    retryable: true,
+                    http_status: Some(503),
+                    message: "capable model unavailable".into(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let reg = Arc::new(ToolRegistry::new());
+        let r1 = reg.clone();
+        let r2 = reg.clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured_events = events.clone();
+        let tool = TaskTool::new(
+            || {
+                Arc::new(NamedProvider {
+                    model: "fast",
+                    reply: Some("FAST"),
+                }) as Arc<dyn LlmProvider>
+            },
+            || {
+                Arc::new(NamedProvider {
+                    model: "shared-model",
+                    reply: None,
+                }) as Arc<dyn LlmProvider>
+            },
+            move || r1.mount(&[]),
+            move || r2.mount(&[]),
+        )
+        .with_host_provider(|| {
+            Arc::new(NamedProvider {
+                model: "shared-model",
+                reply: Some("HOST RECOVERED"),
+            }) as Arc<dyn LlmProvider>
+        })
+        .with_team_event_sink(Arc::new(move |event| {
+            captured_events.lock().unwrap().push(event);
+        }));
+
+        let out = tool
+            .execute(
+                r#"{"tasks":[{"description":"recover","prompt":"run","subagent_type":"explore","difficulty":"hard"}]}"#,
+                &ctx(),
+            )
+            .await;
+
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("HOST RECOVERED"), "{}", out.content);
+        assert!(
+            out.content.contains("model=\"shared-model\""),
+            "{}",
+            out.content
+        );
+        let started_models = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match &event.payload {
+                crate::team::TeamEventPayload::MemberStarted { model, .. } => Some(model.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            started_models,
+            vec!["shared-model".to_string(), "shared-model".to_string()],
+            "the typed Team projection must observe both provider attempts even when their raw model names match"
+        );
+    }
+
+    #[test]
+    fn fallback_requires_a_content_free_structured_transient_failure() {
+        assert!(retryable_content_free_failure(&Outcome {
+            stop: StopReason::Timeout,
+            ..Default::default()
+        }));
+        assert!(retryable_content_free_failure(&Outcome {
+            stop: StopReason::RateLimited,
+            ..Default::default()
+        }));
+        assert!(retryable_content_free_failure(&Outcome {
+            stop: StopReason::ProviderError,
+            http_status: Some(503),
+            ..Default::default()
+        }));
+        assert!(retryable_content_free_failure(&Outcome {
+            stop: StopReason::ProviderError,
+            provider_retryable: Some(true),
+            ..Default::default()
+        }));
+        assert!(!retryable_content_free_failure(&Outcome {
+            stop: StopReason::ProviderError,
+            provider_retryable: Some(false),
+            http_status: Some(503),
+            ..Default::default()
+        }));
+        assert!(!retryable_content_free_failure(&Outcome {
+            stop: StopReason::ProviderError,
+            http_status: Some(401),
+            ..Default::default()
+        }));
+        assert!(!retryable_content_free_failure(&Outcome {
+            stop: StopReason::Timeout,
+            text: "partial".into(),
+            ..Default::default()
+        }));
+    }
+
+    #[tokio::test]
     async fn task_projects_typed_team_lifecycle_events() {
         let registry = Arc::new(ToolRegistry::new());
         let explore_registry = Arc::clone(&registry);
@@ -2494,6 +2906,7 @@ mod tests {
             prompt: "p".into(),
             subagent_type: ty.into(),
             difficulty: String::new(),
+            model: None,
             role: None,
             scope: scope.into_iter().map(String::from).collect(),
         };

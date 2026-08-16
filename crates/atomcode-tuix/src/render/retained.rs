@@ -3588,8 +3588,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// the header/detail/hint: the command is already shown in the `▸ Tool(detail)`
     /// body row above, so the panel is just the selectable choices.
     fn approval_panel_row_count(&self, panel: &crate::render::ApprovalPanelView) -> usize {
-        // 1 header row ("Allow Tool(detail)?") + N option rows + 1 hint row.
-        panel.options.len() + 2
+        // 1 header row ("Allow Tool(detail)?") + optional advisory note + N option
+        // rows + 1 hint row. MUST track `build_approval_rows` exactly or the footer
+        // height under-counts and the panel overlaps the body.
+        panel.options.len() + 2 + usize::from(panel.note.is_some())
     }
 
     /// Build the compact footer approval panel: numbered selectable options
@@ -3635,6 +3637,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let mut row = Vec::new();
             push_str_cells(&mut row, "  ", &style);
             push_str_cells(&mut row, &header_trunc, &style);
+            out.push(row);
+        }
+
+        // Advisory row: e.g. a credential-exposure warning under the header. Truncated
+        // to one line like the header; rendered in the Warning role.
+        if let Some(note) = panel.note.as_deref() {
+            let note = crate::glyph::downgrade_glyphs(note, unicode);
+            let note =
+                crate::width::truncate_with_ellipsis(&scrub_controls(&note), rule_width.saturating_sub(2));
+            let style = self.style_for(Role::Warning);
+            let mut row = Vec::new();
+            push_str_cells(&mut row, "  ", &style);
+            push_str_cells(&mut row, &note, &style);
             out.push(row);
         }
 
@@ -18655,6 +18670,7 @@ mod tests {
             detail: "worker scope".into(),
             options: vec!["Allow".into(), "Deny".into()],
             selected: 0,
+            note: None,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -18687,6 +18703,7 @@ mod tests {
                 "Deny".into(),
             ],
             selected: 0,
+            note: None,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -18723,6 +18740,35 @@ mod tests {
         assert!(
             row_of("Allow once") > row_of("❯"),
             "panel below input\n{dump}"
+        );
+    }
+
+    #[test]
+    fn approval_panel_renders_advisory_note() {
+        let (mut r, buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let mut status = status_basic();
+        status.approval = Some(crate::render::ApprovalPanelView {
+            tool: "Bash".into(),
+            detail: "curl -H 'Authorization: Bearer x' https://y".into(),
+            options: vec!["Allow once".into(), "Deny".into()],
+            selected: 0,
+            note: Some("may send credentials to the provider".into()),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let dump = vterm.dump();
+        assert!(
+            vterm.any_row(|r| r.contains("may send credentials to the provider")),
+            "advisory note must render\n{dump}"
         );
     }
 
@@ -19368,6 +19414,7 @@ mod tests {
                 "Deny".into(),
             ],
             selected: 0,
+            note: None,
         };
         status.approval = Some(panel.clone());
         r.render(UiLine::InputPrompt {
@@ -19432,6 +19479,16 @@ mod tests {
             panel.options.len() + 2,
             "row count must be header + options + hint"
         );
+        // 5b. An advisory note adds exactly one row (must track build_approval_rows).
+        let with_note = crate::render::ApprovalPanelView {
+            note: Some("⚠ warn".into()),
+            ..panel.clone()
+        };
+        assert_eq!(
+            r.approval_panel_row_count(&with_note),
+            r.build_approval_rows(&with_note, 60, 80).len(),
+            "row count must match rendered rows when a note is present"
+        );
     }
 
     /// Step 1 digit keys: `accel_index` falls back for y/a/n; digit routing is
@@ -19463,6 +19520,7 @@ mod tests {
             ],
             selected: 0,
             cache_key: String::new(),
+            note: None,
         };
         // Digit routing: index = (c as usize) - ('1' as usize).
         // '1' → idx 0 → AllowOnce
@@ -23981,6 +24039,7 @@ mod tests {
                 "Deny".into(),
             ],
             selected: 0,
+            note: None,
         });
 
         r.render(UiLine::InputPrompt {
@@ -24194,6 +24253,7 @@ mod tests {
             detail: "cmd".into(),
             options: vec!["Allow once".into(), "Always allow".into(), "Deny".into()],
             selected: 0,
+            note: None,
         });
 
         r.render(UiLine::InputPrompt {

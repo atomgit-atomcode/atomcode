@@ -3401,6 +3401,7 @@ mod chat_event_type_tests {
                 message: "provider failed".into(),
                 http_status: Some(500),
                 code: None,
+                retryable: Some(true),
             }),
             "session-1",
         );
@@ -7146,6 +7147,7 @@ mod tests {
             thinking_keep: None,
             reasoning_history: None,
             reasoning_effort: None,
+            reasoning_effort_levels: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,

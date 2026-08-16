@@ -3343,14 +3343,20 @@ fn execute_slash_command_impl(
                     renderer.flush();
                 }
                 Some(p) => {
+                    // Only offer/accept the levels THIS endpoint exposes.
+                    let allowed = crate::event_loop::selection_allowed_efforts(ctx);
+                    let usage = format!(
+                        "  Usage: /effort {} | default\n  Shortcut: Ctrl+T\n",
+                        allowed.join(" | ")
+                    );
                     if sub.is_empty() {
                         // Show current status
                         let current = effort_status_label(p.reasoning_effort.as_deref());
                         renderer.render(UiLine::CommandOutput(format!(
-                            "  Current reasoning effort: {current}\n  Usage: /effort low | medium | high | max | default\n  Shortcut: Ctrl+T\n"
+                            "  Current reasoning effort: {current}\n{usage}"
                         )));
                         renderer.flush();
-                    } else if matches!(sub.as_str(), "low" | "medium" | "high" | "max") {
+                    } else if allowed.iter().any(|level| level.eq_ignore_ascii_case(&sub)) {
                         let mut desired = ctx.config.clone();
                         desired.update_selection_reasoning(&provider_name, |r| {
                             *r.reasoning_effort = Some(sub.to_string())
@@ -3380,9 +3386,7 @@ fn execute_slash_command_impl(
                             false,
                         );
                     } else {
-                        renderer.render(UiLine::CommandOutput(
-                            "  Usage: /effort low | medium | high | max | default\n  Shortcut: Ctrl+T\n".into(),
-                        ));
+                        renderer.render(UiLine::CommandOutput(usage));
                         renderer.flush();
                     }
                 }

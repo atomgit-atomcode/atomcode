@@ -372,6 +372,7 @@ fn send_chat_runtime_error(
             message: message.into(),
             http_status: None,
             code: None,
+            retryable: None,
         },
     ));
 }

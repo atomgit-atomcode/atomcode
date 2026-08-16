@@ -1881,6 +1881,7 @@ mod submit_hold_tests {
                 message: "round limit reached".into(),
                 http_status: None,
                 code: None,
+                retryable: None,
             },
         ));
         assert_eq!(type_ahead_queue_action(&event), TypeAheadQueueAction::None);
@@ -2150,6 +2151,7 @@ mod submit_hold_tests {
                 message: "maximum rounds reached".into(),
                 http_status: None,
                 code: None,
+                retryable: None,
             },
         ));
         let mut state = UiState::new();
@@ -2480,6 +2482,7 @@ impl ReadyRuntimeControl {
                 message: format!("coding runtime {operation} delivery failed"),
                 http_status: None,
                 code: None,
+                retryable: None,
             }),
         ));
     }
@@ -10387,6 +10390,7 @@ mod external_config_tests {
                 thinking_keep: None,
                 reasoning_history: None,
                 reasoning_effort: None,
+                reasoning_effort_levels: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
@@ -15344,13 +15348,14 @@ fn handle_idle_key(
         // Seed from the authoritative `ctx` value (the display already trusts it):
         // `app.state.reasoning_effort` is otherwise never seeded from config, so a
         // bare cycle would downgrade a persisted level to the chain head on the
-        // first press.
+        // first press. Cycle only within the levels this endpoint exposes.
+        let allowed = selection_allowed_efforts(ctx);
         let new_val = app
             .state
-            .cycle_reasoning_effort_from(ctx.reasoning_effort.as_deref());
-        ctx.reasoning_effort = new_val.map(|s| s.to_string());
+            .cycle_reasoning_effort_within(ctx.reasoning_effort.as_deref(), &allowed);
+        ctx.reasoning_effort = new_val.clone();
         persist_reasoning_effort(ctx);
-        let msg = match new_val {
+        let msg = match new_val.as_deref() {
             Some(v) => format!("  reasoning_effort → {}\n", v),
             None => "  reasoning_effort cleared (API default)\n".into(),
         };
@@ -25025,12 +25030,20 @@ fn handle_agent_event(
                 pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), true));
             }
 
+            // Warn when the command about to be approved would trip the credential
+            // guard: allowing it may forward secrets/sensitive content to the provider.
+            let note = (call.name == "bash"
+                && atomcode_capabilities::tools::bash_command_may_expose_credentials(
+                    &call.arguments,
+                ))
+            .then(|| crate::i18n::t(crate::i18n::Msg::CredentialApprovalNote).into_owned());
             state.approval_panel = Some(crate::state::ApprovalPanel {
                 tool: display.clone(),
                 detail: detail.clone(),
                 options: build_approval_options(&display),
                 selected: 0,
                 cache_key,
+                note,
             });
             renderer.flush();
             atomcode_capabilities::notify::notify(
@@ -27111,6 +27124,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             detail: p.detail.clone(),
             options: p.options.iter().map(|o| o.label.clone()).collect(),
             selected: p.selected,
+            note: p.note.clone(),
         });
     // A pending batch takes precedence over a single panel (mutually exclusive in
     // practice). The view carries the CURRENT question's fields plus batch navigator
@@ -28701,6 +28715,19 @@ pub(crate) fn reasoning_effort_applicable_on_provider(ctx: &LoopCtx) -> bool {
         return false;
     };
     effort_applicable(provider.reasoning_effort.as_deref(), &selection, &ctx.model_name)
+}
+
+/// The reasoning-effort levels the current selection exposes (canonical order),
+/// from its `reasoning_effort_levels` declaration. `None`/empty ⇒ all levels. The
+/// single source of truth the Ctrl+T cycle and `/effort` both consult so neither
+/// offers a level the endpoint rejects.
+pub(crate) fn selection_allowed_efforts(ctx: &LoopCtx) -> Vec<&'static str> {
+    let selection = ctx.config.effective_model_selection().unwrap_or_default();
+    let levels = ctx
+        .config
+        .provider_config_for_selection(&selection)
+        .and_then(|p| p.reasoning_effort_levels);
+    atomcode_config::config::allowed_effort_levels(levels.as_deref())
 }
 
 /// Install a [`crate::modals::password::PasswordModal`] as the active modal on

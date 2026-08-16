@@ -152,6 +152,8 @@ pub struct CodingAgentConfig {
     pub subagent_fast_provider: Option<Arc<TierProvider>>,
     /// Swap-aware, lazily-built CAPABLE-tier provider (same contract as above).
     pub subagent_capable_provider: Option<Arc<TierProvider>>,
+    /// Swap-aware resolver for an explicit `task.tasks[].model` selection id.
+    pub subagent_model_providers: Option<Arc<SubagentModelProviders>>,
 }
 
 /// Host-resolved inputs shared by CLI and daemon runtime construction.
@@ -391,6 +393,113 @@ pub fn apply_provider_config(
 /// success, `None` if construction failed (⇒ the tier falls back to the host provider).
 pub type SubagentProvider =
     Arc<dyn Fn() -> Option<Arc<dyn atomcode_kernel::provider::LlmProvider>> + Send + Sync>;
+
+pub type SubagentModelResolver = Arc<
+    dyn Fn(&str) -> Result<Option<Arc<dyn atomcode_kernel::provider::LlmProvider>>, String>
+        + Send
+        + Sync,
+>;
+
+pub(crate) type SubagentUsageRecorderFactory =
+    Arc<dyn Fn(&str, &str) -> atomcode_capabilities::session::DetachedUsageRecorder + Send + Sync>;
+pub(crate) type SubagentTelemetryProviderFactory = Arc<
+    dyn Fn(
+            &str,
+            Arc<dyn atomcode_kernel::provider::LlmProvider>,
+        ) -> Result<Arc<dyn atomcode_kernel::provider::LlmProvider>, String>
+        + Send
+        + Sync,
+>;
+
+/// Swap-aware resolver for an explicit per-task model selection. Unlike a tier
+/// cell it intentionally does not cache: every isolated child gets a fresh
+/// provider, while `/model` reload atomically replaces the resolver.
+pub struct SubagentModelProviders {
+    resolver: std::sync::RwLock<SubagentModelResolver>,
+    session_id: std::sync::RwLock<Option<String>>,
+    usage_recorder_factory: std::sync::RwLock<Option<SubagentUsageRecorderFactory>>,
+    telemetry_provider_factory: std::sync::RwLock<Option<SubagentTelemetryProviderFactory>>,
+}
+
+impl SubagentModelProviders {
+    pub fn new(resolver: SubagentModelResolver) -> Arc<Self> {
+        Arc::new(Self {
+            resolver: std::sync::RwLock::new(resolver),
+            session_id: std::sync::RwLock::new(None),
+            usage_recorder_factory: std::sync::RwLock::new(None),
+            telemetry_provider_factory: std::sync::RwLock::new(None),
+        })
+    }
+
+    pub fn get(
+        &self,
+        selection: &str,
+    ) -> Result<Option<Arc<dyn atomcode_kernel::provider::LlmProvider>>, String> {
+        let resolver = self
+            .resolver
+            .read()
+            .map_err(|_| "subagent model resolver is unavailable".to_string())?
+            .clone();
+        let mut provider = resolver(selection)?;
+        if let Some(inner) = provider.take() {
+            let model = inner.model_name().to_string();
+            let factory = self
+                .usage_recorder_factory
+                .read()
+                .ok()
+                .and_then(|value| value.clone());
+            let mut wrapped: Arc<dyn atomcode_kernel::provider::LlmProvider> = match factory {
+                Some(factory) => {
+                    Arc::new(atomcode_capabilities::session::UsageRecordingProvider::new(
+                        inner,
+                        factory(selection, &model),
+                    ))
+                }
+                None => inner,
+            };
+            let telemetry_factory = self
+                .telemetry_provider_factory
+                .read()
+                .map_err(|_| "subagent telemetry provider factory is unavailable".to_string())?
+                .clone();
+            if let Some(factory) = telemetry_factory {
+                wrapped = factory(selection, wrapped)?;
+            }
+            if let Some(session_id) = self.session_id.read().ok().and_then(|value| value.clone()) {
+                wrapped.bind_session_id(&session_id);
+            }
+            provider = Some(wrapped);
+        }
+        Ok(provider)
+    }
+
+    pub fn reset(&self, resolver: SubagentModelResolver) {
+        if let Ok(mut current) = self.resolver.write() {
+            *current = resolver;
+        }
+    }
+
+    pub fn set_session_id(&self, session_id: &str) {
+        if let Ok(mut current) = self.session_id.write() {
+            *current = Some(session_id.to_string());
+        }
+    }
+
+    pub(crate) fn set_usage_recorder_factory(&self, factory: SubagentUsageRecorderFactory) {
+        if let Ok(mut current) = self.usage_recorder_factory.write() {
+            *current = Some(factory);
+        }
+    }
+
+    pub(crate) fn set_telemetry_provider_factory(
+        &self,
+        factory: Option<SubagentTelemetryProviderFactory>,
+    ) {
+        if let Ok(mut current) = self.telemetry_provider_factory.write() {
+            *current = factory;
+        }
+    }
+}
 
 /// A `task`-tier provider cell: lazily built and SWAP-AWARE. Holds a `thunk` (re-resolvable
 /// on a `/model` swap) plus a lazily-populated build `cache`. `get()` builds on first use and
@@ -667,6 +776,7 @@ impl CodingAgentConfig {
             subagent_config: None,
             subagent_fast_provider: None,
             subagent_capable_provider: None,
+            subagent_model_providers: None,
         }
     }
 }
@@ -987,6 +1097,118 @@ mod tests {
         let c = CodingAgentConfig::new("k", "https://api.example.com/v1", "m", "/tmp");
         assert!(c.subagent_fast_provider.is_none());
         assert!(c.subagent_capable_provider.is_none());
+        assert!(c.subagent_model_providers.is_none());
+    }
+
+    #[test]
+    fn explicit_subagent_model_resolver_refreshes_and_binds_parent_session() {
+        use std::sync::Mutex;
+
+        struct RecP {
+            model: &'static str,
+            bound: Arc<Mutex<Option<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl atomcode_kernel::provider::LlmProvider for RecP {
+            fn model_name(&self) -> &str {
+                self.model
+            }
+
+            fn bind_session_id(&self, id: &str) {
+                *self.bound.lock().unwrap() = Some(id.to_string());
+            }
+
+            async fn chat_stream(
+                &self,
+                _messages: &[atomcode_kernel::message::Message],
+                _tools: &[atomcode_kernel::tool::ToolDef],
+                _options: &atomcode_kernel::provider::ChatOptions,
+            ) -> Result<
+                futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+                atomcode_kernel::stream::ProviderError,
+            > {
+                unreachable!("not called in this test")
+            }
+        }
+
+        let first_bound = Arc::new(Mutex::new(None));
+        let first_capture = first_bound.clone();
+        let resolver: SubagentModelResolver = Arc::new(move |selection| {
+            assert_eq!(selection, "chosen");
+            Ok(Some(Arc::new(RecP {
+                model: "first",
+                bound: first_capture.clone(),
+            })))
+        });
+        let cell = SubagentModelProviders::new(resolver);
+        cell.set_session_id("parent-session");
+        let usage_calls = Arc::new(Mutex::new(Vec::new()));
+        let usage_capture = usage_calls.clone();
+        let usage_dir = tempfile::tempdir().unwrap();
+        let usage_manager = Arc::new(atomcode_capabilities::session::SessionManager::with_root(
+            usage_dir.path(),
+        ));
+        cell.set_usage_recorder_factory(Arc::new(move |selection, model| {
+            usage_capture
+                .lock()
+                .unwrap()
+                .push((selection.to_string(), model.to_string()));
+            atomcode_capabilities::session::DetachedUsageRecorder::new(
+                usage_manager.clone(),
+                "parent-session",
+                selection,
+                model,
+            )
+        }));
+        let telemetry_calls = Arc::new(Mutex::new(Vec::new()));
+        let telemetry_capture = telemetry_calls.clone();
+        cell.set_telemetry_provider_factory(Some(Arc::new(move |selection, provider| {
+            telemetry_capture
+                .lock()
+                .unwrap()
+                .push((selection.to_string(), provider.model_name().to_string()));
+            Ok(provider)
+        })));
+
+        let first = cell.get("chosen").unwrap().unwrap();
+        assert_eq!(first.model_name(), "first");
+        assert_eq!(
+            first_bound.lock().unwrap().as_deref(),
+            Some("parent-session")
+        );
+
+        let second_bound = Arc::new(Mutex::new(None));
+        let second_capture = second_bound.clone();
+        cell.reset(Arc::new(move |_| {
+            Ok(Some(Arc::new(RecP {
+                model: "second",
+                bound: second_capture.clone(),
+            })))
+        }));
+
+        let second = cell.get("chosen").unwrap().unwrap();
+        assert_eq!(second.model_name(), "second");
+        assert_eq!(
+            second_bound.lock().unwrap().as_deref(),
+            Some("parent-session"),
+            "resolver refresh must preserve the conversation identity"
+        );
+        assert_eq!(
+            *usage_calls.lock().unwrap(),
+            vec![
+                ("chosen".to_string(), "first".to_string()),
+                ("chosen".to_string(), "second".to_string()),
+            ],
+            "every explicit model child must receive fresh cost attribution"
+        );
+        assert_eq!(
+            *telemetry_calls.lock().unwrap(),
+            vec![
+                ("chosen".to_string(), "first".to_string()),
+                ("chosen".to_string(), "second".to_string()),
+            ],
+            "every explicit model child must pass through the telemetry decorator"
+        );
     }
 
     #[test]

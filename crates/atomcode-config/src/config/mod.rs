@@ -824,6 +824,7 @@ impl Config {
             thinking_keep: model.thinking_keep.clone(),
             reasoning_history: model.reasoning_history.clone(),
             reasoning_effort: model.reasoning_effort.clone(),
+            reasoning_effort_levels: model.reasoning_effort_levels.clone(),
             thinking_enabled: model.thinking_enabled,
             thinking_budget: model.thinking_budget,
             capable_model: model.capable_model,
@@ -1068,6 +1069,32 @@ pub fn codingplan_group_account_id(provider_type: &str) -> &'static str {
     }
 }
 
+/// The canonical reasoning-effort levels, in the order UIs cycle through them.
+/// The single source of truth for the level SET, so the TUI cycle, the
+/// `/provider` panel, `/effort`, the daemon, and the webui can never disagree
+/// about which levels exist. (`"auto"`/`None` are capability states handled
+/// separately, not levels.)
+pub const REASONING_EFFORT_LEVELS: [&str; 4] = ["low", "medium", "high", "max"];
+
+/// The ordered subset of reasoning-effort levels an endpoint exposes.
+///
+/// `declared` is the per-endpoint `reasoning_effort_levels` list (from config).
+/// `None` or an EMPTY list means "unrestricted" ⇒ every [`REASONING_EFFORT_LEVELS`]
+/// level. A non-empty list restricts to exactly the canonical levels it names,
+/// matched case-insensitively, always returned in canonical order (not the
+/// config's order) and with unknown tokens dropped. So an endpoint that supports
+/// `low`/`high`/`max` but not `medium` yields `["low", "high", "max"]`.
+pub fn allowed_effort_levels(declared: Option<&[String]>) -> Vec<&'static str> {
+    match declared {
+        Some(list) if !list.is_empty() => REASONING_EFFORT_LEVELS
+            .iter()
+            .copied()
+            .filter(|level| list.iter().any(|d| d.trim().eq_ignore_ascii_case(level)))
+            .collect(),
+        _ => REASONING_EFFORT_LEVELS.to_vec(),
+    }
+}
+
 #[cfg(test)]
 mod codingplan_prefix_tests {
     use super::*;
@@ -1167,6 +1194,7 @@ fn project_legacy_model(account_id: &str, p: &ProviderConfig) -> ModelProfileCon
         thinking_keep: p.thinking_keep.clone(),
         reasoning_history: p.reasoning_history.clone(),
         reasoning_effort: p.reasoning_effort.clone(),
+        reasoning_effort_levels: p.reasoning_effort_levels.clone(),
         thinking_enabled: p.thinking_enabled,
         thinking_budget: p.thinking_budget,
     }
@@ -1867,6 +1895,67 @@ pub enum SeedOutcome {
 mod tests {
     use super::*;
 
+    #[test]
+    fn allowed_effort_levels_defaults_to_all_and_filters_a_subset() {
+        // No declared subset ⇒ the full canonical set, in cycle order.
+        assert_eq!(
+            allowed_effort_levels(None),
+            vec!["low", "medium", "high", "max"]
+        );
+        // An empty list is treated as "unrestricted", not "no levels".
+        assert_eq!(
+            allowed_effort_levels(Some(&[])),
+            vec!["low", "medium", "high", "max"]
+        );
+        // A declared subset keeps CANONICAL order (not the config's order),
+        // is case-insensitive, and drops unknown tokens.
+        let declared = [
+            "MAX".to_string(),
+            "low".to_string(),
+            "bogus".to_string(),
+            "high".to_string(),
+        ];
+        assert_eq!(allowed_effort_levels(Some(&declared)), vec!["low", "high", "max"]);
+        // The motivating case: an endpoint that supports low/high/max but NOT medium.
+        let no_medium = ["low".to_string(), "high".to_string(), "max".to_string()];
+        assert_eq!(
+            allowed_effort_levels(Some(&no_medium)),
+            vec!["low", "high", "max"]
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_levels_survive_deser_and_resolution() {
+        // A per-model `reasoning_effort_levels` must deserialize and flow through
+        // `resolve_model` to the flattened `ResolvedModelConfig` unchanged, so every
+        // downstream consumer can restrict the offered levels.
+        let catalog: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "custom": { "provider": "openai-compatible", "base_url": "https://example.invalid/v1" }
+            },
+            "models": {
+                "custom/model": {
+                    "account": "custom",
+                    "model": "vendor-model",
+                    "reasoning_effort_levels": ["low", "high", "max"]
+                }
+            },
+            "default_model": "custom/model"
+        }))
+        .unwrap();
+        let resolved = catalog.resolve_model(Some("custom/model")).unwrap();
+        assert_eq!(
+            resolved.reasoning_effort_levels.as_deref(),
+            Some(["low".to_string(), "high".to_string(), "max".to_string()].as_slice()),
+            "declared levels must survive resolution"
+        );
+        // …and the single source of truth restricts to exactly that subset.
+        assert_eq!(
+            allowed_effort_levels(resolved.reasoning_effort_levels.as_deref()),
+            vec!["low", "high", "max"]
+        );
+    }
+
     // NOTE: the provider-type key in TOML is `type` (ProviderConfig uses
     // #[serde(rename = "type")]), NOT `provider_type`.
     const SEED_TOML: &str = "default_provider = \"glm-internal\"\n\
@@ -2562,6 +2651,7 @@ model = "missing-type"
                 thinking_keep: None,
                 reasoning_history: None,
                 reasoning_effort: None,
+                reasoning_effort_levels: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
@@ -2778,6 +2868,7 @@ model = "missing-type"
                 thinking_keep: None,
                 reasoning_history: None,
                 reasoning_effort: None,
+                reasoning_effort_levels: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
@@ -2858,6 +2949,7 @@ model = "missing-type"
                 thinking_keep: None,
                 reasoning_history: None,
                 reasoning_effort: None,
+                reasoning_effort_levels: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
@@ -2991,6 +3083,7 @@ model = "missing-type"
                 thinking_keep: None,
                 reasoning_history: None,
                 reasoning_effort: None,
+                reasoning_effort_levels: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
@@ -3208,6 +3301,7 @@ capable_model = 5
                 thinking_keep: None,
                 reasoning_history: None,
                 reasoning_effort: None,
+                reasoning_effort_levels: None,
                 thinking_enabled: None,
                 thinking_budget: None,
             },
@@ -3256,6 +3350,7 @@ capable_model = 5
                 thinking_keep: None,
                 reasoning_history: None,
                 reasoning_effort: None,
+                reasoning_effort_levels: None,
                 thinking_enabled: None,
                 thinking_budget: None,
             },

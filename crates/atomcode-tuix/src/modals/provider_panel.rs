@@ -1167,6 +1167,7 @@ impl ProviderPanel {
                             thinking_keep: None,
                             reasoning_history: None,
                             reasoning_effort: reasoning_effort.clone(),
+                            reasoning_effort_levels: None,
                             thinking_enabled: None,
                             thinking_budget: None,
                         },

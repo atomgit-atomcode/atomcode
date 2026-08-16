@@ -708,6 +708,8 @@ pub struct ApprovalPanelView {
     pub detail: String,
     pub options: Vec<String>,
     pub selected: usize,
+    /// Optional advisory line rendered under the header (e.g. a credential warning).
+    pub note: Option<String>,
 }
 
 /// Renderer-facing snapshot of the `request_user_input` panel (mirrors

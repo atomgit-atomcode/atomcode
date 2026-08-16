@@ -548,6 +548,11 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                                     detail: &scrub_controls(&panel.detail),
                                 })
                             );
+                            // The advisory (e.g. credential-exposure warning) must not
+                            // vanish on a plain/dumb terminal.
+                            if let Some(note) = panel.note.as_deref() {
+                                let _ = writeln!(self.out, "{}", scrub_controls(note));
+                            }
                         }
                         // request_user_input has no retained footer panel in this
                         // renderer either — print the question (and options, if any)
@@ -1081,6 +1086,7 @@ mod tests {
                 detail: "rm -rf /tmp/x".to_string(),
                 options: vec![],
                 selected: 0,
+                note: None,
             }),
             ..Default::default()
         };
@@ -1183,6 +1189,7 @@ mod tests {
                 detail: "rm -rf /tmp/x".to_string(),
                 options: vec![],
                 selected: 0,
+                note: None,
             }),
             ..Default::default()
         };

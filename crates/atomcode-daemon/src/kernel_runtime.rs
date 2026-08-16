@@ -212,6 +212,7 @@ pub fn spawn_native_runtime_for_session_deferred_with_preprocessor(
                         message: message.clone(),
                         http_status: None,
                         code: None,
+                        retryable: None,
                     }),
                 );
                 while let Some(control) = control_rx.recv().await {
@@ -226,6 +227,7 @@ pub fn spawn_native_runtime_for_session_deferred_with_preprocessor(
                             message: format!("runtime unavailable: {message}"),
                             http_status: None,
                             code: None,
+                            retryable: None,
                         }),
                     );
                 }
@@ -287,6 +289,7 @@ pub fn spawn_native_runtime_for_session_deferred_with_preprocessor(
                                         message: error.to_string(),
                                         http_status: None,
                                         code: None,
+                                        retryable: None,
                                     }),
                                 );
                             }

@@ -749,6 +749,9 @@ pub struct Outcome {
     /// on the code instead of string-matching `error`.
     pub http_status: Option<u16>,
     pub error_code: Option<String>,
+    /// Provider-classified retryability for the last error. Kept separate
+    /// from HTTP status because transport failures often have no response.
+    pub provider_retryable: Option<bool>,
     /// A hard policy boundary raised during this run. One-shot child drivers
     /// preserve it so their parent tool can lift the same structured recovery
     /// contract instead of reducing it to an ordinary string failure.
@@ -981,10 +984,12 @@ impl Agent {
                     message,
                     http_status,
                     code,
+                    retryable,
                 } => {
                     outcome.error = Some(message);
                     outcome.http_status = http_status;
                     outcome.error_code = code;
+                    outcome.provider_retryable = retryable;
                 }
                 AgentEvent::PolicyIntervention { intervention } => {
                     outcome.policy_intervention = Some(intervention);
@@ -1460,6 +1465,7 @@ impl RunningAgent {
                 message: format!("prompt rejected: {reason}"),
                 http_status: None,
                 code: None,
+                retryable: None,
             });
             self.rt.emit(AgentEvent::TurnComplete {
                 reason: StopReason::PromptRejected,
@@ -1966,6 +1972,7 @@ impl RunningAgent {
                             message: format!("max rounds ({cap}) reached"),
                             http_status: None,
                             code: None,
+                            retryable: None,
                         });
                         self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
                             .await;
@@ -2280,6 +2287,7 @@ impl RunningAgent {
                         message: e.message,
                         http_status: e.http_status,
                         code: e.code,
+                        retryable: Some(e.retryable),
                     });
                     self.finish_turn(convo, StopReason::ProviderError, &turn_ctx)
                         .await;
@@ -2432,7 +2440,12 @@ impl RunningAgent {
                             "stream timeout after automatic reconnects"
                         }.to_string();
                         self.hooks.on_error(&msg).await;
-                        self.rt.emit(AgentEvent::Error { message: msg, http_status: None, code: None });
+                        self.rt.emit(AgentEvent::Error {
+                            message: msg,
+                            http_status: None,
+                            code: None,
+                            retryable: None,
+                        });
                         self.finish_turn(convo, StopReason::Timeout, &turn_ctx).await;
                         return;
                     }
@@ -2689,6 +2702,7 @@ impl RunningAgent {
                             message: e.message,
                             http_status: e.http_status,
                             code: e.code,
+                            retryable: Some(e.retryable),
                         });
                         self.finish_turn(convo, StopReason::ProviderError, &turn_ctx)
                             .await;
@@ -2807,6 +2821,7 @@ impl RunningAgent {
                     message: msg,
                     http_status: None,
                     code: None,
+                    retryable: None,
                 });
                 self.finish_turn(convo, StopReason::ProviderError, &turn_ctx)
                     .await;
@@ -2981,6 +2996,7 @@ impl RunningAgent {
                                 ),
                                 http_status: None,
                                 code: None,
+                                retryable: None,
                             });
                             self.finish_turn(convo, StopReason::MaxContinuations, &turn_ctx)
                                 .await;
@@ -3735,6 +3751,7 @@ impl RunningAgent {
                     ),
                     http_status: None,
                     code: None,
+                    retryable: None,
                 });
                 self.finish_turn(convo, StopReason::RepeatLoop, &turn_ctx)
                     .await;

@@ -267,6 +267,11 @@ pub enum AgentEvent {
         http_status: Option<u16>,
         #[serde(default)]
         code: Option<String>,
+        /// Provider-classified retryability. `None` means this is an internal
+        /// error or came from an older serialized event that did not carry the
+        /// classification.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retryable: Option<bool>,
     },
     /// The turn was cooperatively cancelled (AgentCommand::Cancel mid-turn).
     /// Emitted immediately before the terminal TurnComplete on a cancel path;
@@ -455,6 +460,37 @@ mod tests {
         assert!(matches!(
             event,
             AgentEvent::Compacted { snapshot: None, .. }
+        ));
+    }
+
+    #[test]
+    fn error_retryability_is_additive_and_round_trips() {
+        let old: AgentEvent = serde_json::from_str(
+            r#"{"Error":{"message":"network","http_status":null,"code":null}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            old,
+            AgentEvent::Error {
+                retryable: None,
+                ..
+            }
+        ));
+
+        let event = AgentEvent::Error {
+            message: "network".into(),
+            http_status: None,
+            code: None,
+            retryable: Some(true),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            AgentEvent::Error {
+                retryable: Some(true),
+                ..
+            }
         ));
     }
 

@@ -926,6 +926,7 @@ impl BgRuntimeManager {
                                         message: error.message,
                                         http_status: None,
                                         code: None,
+                                        retryable: None,
                                     },
                                 ),
                             ));
@@ -1730,6 +1731,7 @@ mod tests {
                     message: "provider could not start".into(),
                     http_status: None,
                     code: None,
+                    retryable: None,
                 },
             )),
         );

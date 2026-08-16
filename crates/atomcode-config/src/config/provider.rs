@@ -57,6 +57,12 @@ pub struct ProviderConfig {
     /// the field for this model profile; unconfigured custom endpoints omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Optional per-endpoint restriction of which reasoning-effort LEVELS this
+    /// model exposes (a subset of `["low","medium","high","max"]`). `None`/empty
+    /// ⇒ all levels. See [`super::allowed_effort_levels`]. Constrains only what the
+    /// UI offers and what `/effort` accepts; the wire still sends a single value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort_levels: Option<Vec<String>>,
     /// Whether extended thinking is enabled for this provider.
     /// For Claude: sends `thinking.type = "enabled"` in request body.
     /// Default: not set (thinking disabled).
@@ -153,6 +159,8 @@ pub struct ModelProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort_levels: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_budget: Option<u32>,
@@ -186,6 +194,7 @@ pub struct ResolvedModelConfig {
     pub thinking_keep: Option<String>,
     pub reasoning_history: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub reasoning_effort_levels: Option<Vec<String>>,
     pub thinking_enabled: Option<bool>,
     pub thinking_budget: Option<u32>,
     pub capable_model: Option<i64>,
@@ -228,6 +237,7 @@ impl ResolvedModelConfig {
             thinking_keep: self.thinking_keep.clone(),
             reasoning_history: self.reasoning_history.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
+            reasoning_effort_levels: self.reasoning_effort_levels.clone(),
             thinking_enabled: self.thinking_enabled,
             thinking_budget: self.thinking_budget,
             skip_tls_verify: self.skip_tls_verify,
@@ -511,6 +521,7 @@ mod tests {
             thinking_keep: None,
             reasoning_history: None,
             reasoning_effort: None,
+            reasoning_effort_levels: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -540,6 +551,7 @@ mod tests {
             thinking_keep: None,
             reasoning_history: None,
             reasoning_effort: None,
+            reasoning_effort_levels: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: true,
@@ -616,6 +628,7 @@ mod tests {
             thinking_keep: None,
             reasoning_history: None,
             reasoning_effort: None,
+            reasoning_effort_levels: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -644,6 +657,7 @@ mod tests {
             thinking_keep: None,
             reasoning_history: None,
             reasoning_effort: None,
+            reasoning_effort_levels: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -672,6 +686,7 @@ mod tests {
             thinking_keep: None,
             reasoning_history: None,
             reasoning_effort: None,
+            reasoning_effort_levels: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,

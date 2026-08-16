@@ -475,6 +475,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             let cap_cell = cfg.subagent_capable_provider.clone();
             let slot_fast = slot.clone();
             let slot_cap = slot.clone();
+            let slot_host = slot.clone();
             let make_fast = move || {
                 fast_cell.as_ref().and_then(|c| c.get()).unwrap_or_else(|| {
                     slot_fast
@@ -493,17 +494,24 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                         .expect("subagent provider slot filled at assemble before any turn")
                 })
             };
+            let make_host = move || {
+                slot_host
+                    .read()
+                    .ok()
+                    .and_then(|provider| provider.clone())
+                    .expect("subagent provider slot filled at assemble before any turn")
+            };
 
             // `[subagent]` live knobs. `timeout_secs` remains parse-only compatibility:
             // a productive child is never cancelled for total wall-clock age.
             let task_team_manager = team_manager.clone();
-            registry.register(Arc::new(
-                TaskTool::new(
-                    make_fast,
-                    make_capable,
-                    make_explore_tools,
-                    make_worker_tools,
-                )
+            let mut task_tool = TaskTool::new(
+                make_fast,
+                make_capable,
+                make_explore_tools,
+                make_worker_tools,
+            )
+                .with_host_provider(make_host)
                 .with_max_concurrent(subagent_max_concurrent)
                 .with_max_rounds(subagent_max_rounds)
                 .with_tool_loop_policy(cfg.tool_loop_policy)
@@ -511,8 +519,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 .with_worker_middleware(turn_execution_policy.clone())
                 .with_team_event_sink(Arc::new(move |event| {
                     task_team_manager.publish_external(event);
-                })),
-            ));
+                }));
+            if let Some(models) = cfg.subagent_model_providers.clone() {
+                task_tool = task_tool.with_named_provider(move |selection| models.get(selection));
+            }
+            registry.register(Arc::new(task_tool));
             names.push("task".to_string());
             Some(slot)
         } else {
@@ -1659,6 +1670,25 @@ pub fn assemble(
         if let Some(cell) = &cfg.subagent_capable_provider {
             cell.set_session_id(&b.id);
         }
+        if let Some(models) = &cfg.subagent_model_providers {
+            models.set_session_id(&b.id);
+            let manager = b.manager.clone();
+            let session_id = b.id.clone();
+            let persistence_status = parts.snapshot_persistence_status();
+            models.set_usage_recorder_factory(Arc::new(move |selection, model| {
+                let mut recorder =
+                    atomcode_capabilities::session::DetachedUsageRecorder::new(
+                        manager.clone(),
+                        &session_id,
+                        selection,
+                        model,
+                    );
+                if let Some(status) = persistence_status.clone() {
+                    recorder = recorder.with_persistence_status(status);
+                }
+                recorder
+            }));
+        }
         if let Some(registry) = cfg.subagent_config.as_deref() {
             if let Some((fast_key, capable_key)) =
                 crate::subagent_tiers::resolve_tier_keys(registry, &cfg.model)
@@ -1702,6 +1732,45 @@ pub fn assemble(
             parts.subagent_provider.is_some(),
         );
         builder = builder.resume(snapshot);
+    }
+    if let Some(models) = cfg.subagent_model_providers.as_ref() {
+        let telemetry_factory = match (cfg.telemetry.as_ref(), cfg.subagent_config.as_ref()) {
+            (Some(telemetry), Some(model_config)) => {
+                let telemetry = telemetry.clone();
+                let model_config = model_config.clone();
+                let mut base_config = cfg.clone();
+                // The decorator is stored inside `subagent_model_providers`; do not
+                // capture that same Arc through the cloned runtime config.
+                base_config.subagent_fast_provider = None;
+                base_config.subagent_capable_provider = None;
+                base_config.subagent_model_providers = None;
+                base_config.subagent_config = None;
+                let session_id = parts.session.as_ref().map(|binding| binding.id.clone());
+                Some(Arc::new(move |selection: &str, provider| {
+                    let resolved = model_config
+                        .resolve_model(Some(selection))
+                        .map_err(|error| error.to_string())?;
+                    let tier = crate::provider_factory::derive_tier_config_from_resolved(
+                        &base_config,
+                        &resolved,
+                    );
+                    Ok(Arc::new(
+                        crate::telemetry::MeteredProvider::new(
+                            provider,
+                            telemetry.clone(),
+                            tier.provider_type.as_str(),
+                            &tier.base_url,
+                            &tier.model,
+                            session_id.as_deref(),
+                        )
+                        .with_surface("subagent"),
+                    ) as Arc<dyn LlmProvider>)
+                })
+                    as crate::config::SubagentTelemetryProviderFactory)
+            }
+            _ => None,
+        };
+        models.set_telemetry_provider_factory(telemetry_factory);
     }
     // Ensure the repo's `atomcode` project label after a successful `git push` to a
     // gitcode/atomgit remote. THIS is the production mount: the terminal TUI, daemon, and
@@ -1896,7 +1965,6 @@ mod tests {
             }
         }
     }
-
     #[test]
     fn subagent_env_gate() {
         use super::subagent_enabled_from_env as g;

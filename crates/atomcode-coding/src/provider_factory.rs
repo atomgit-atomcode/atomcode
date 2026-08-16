@@ -8,7 +8,7 @@ use atomcode_capabilities::provider::{
 use atomcode_kernel::provider::LlmProvider;
 
 use crate::CodingAgentConfig;
-use crate::{SubagentProvider, TierProvider};
+use crate::{SubagentModelProviders, SubagentModelResolver, SubagentProvider, TierProvider};
 
 #[derive(Debug)]
 pub enum ProviderBuildError {
@@ -213,6 +213,7 @@ pub fn derive_tier_config(
     tier.skip_tls_verify = provider.skip_tls_verify;
     tier.subagent_fast_provider = None;
     tier.subagent_capable_provider = None;
+    tier.subagent_model_providers = None;
     tier.subagent_config = None;
     tier
 }
@@ -265,6 +266,7 @@ pub fn derive_tier_config_from_resolved(
     tier.skip_tls_verify = resolved.skip_tls_verify;
     tier.subagent_fast_provider = None;
     tier.subagent_capable_provider = None;
+    tier.subagent_model_providers = None;
     tier.subagent_config = None;
     tier
 }
@@ -307,20 +309,49 @@ pub fn resolve_subagent_tier_thunks(
     (thunk_for(&fast_key), thunk_for(&capable_key))
 }
 
+pub fn resolve_subagent_model_thunk(
+    factory: Arc<dyn CodingProviderFactory>,
+    base: &CodingAgentConfig,
+    config: &atomcode_config::config::Config,
+) -> SubagentModelResolver {
+    let base = base.clone();
+    let config = config.clone();
+    Arc::new(move |selection| {
+        let resolved = config
+            .resolve_model(Some(selection))
+            .map_err(|error| error.to_string())?;
+        if resolved.selection_id == base.provider_name {
+            return Ok(None);
+        }
+        let tier = derive_tier_config_from_resolved(&base, &resolved);
+        factory
+            .build(&tier, None)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    })
+}
+
 pub fn refresh_subagent_tiers(
     factory: Arc<dyn CodingProviderFactory>,
     coding: &CodingAgentConfig,
     config: &atomcode_config::config::Config,
 ) {
-    if coding.subagent_fast_provider.is_none() && coding.subagent_capable_provider.is_none() {
+    if coding.subagent_fast_provider.is_none()
+        && coding.subagent_capable_provider.is_none()
+        && coding.subagent_model_providers.is_none()
+    {
         return;
     }
-    let (fast, capable) = resolve_subagent_tier_thunks(factory, coding, &coding.model, config);
+    let (fast, capable) =
+        resolve_subagent_tier_thunks(factory.clone(), coding, &coding.model, config);
     if let Some(cell) = &coding.subagent_fast_provider {
         cell.reset(fast);
     }
     if let Some(cell) = &coding.subagent_capable_provider {
         cell.reset(capable);
+    }
+    if let Some(models) = &coding.subagent_model_providers {
+        models.reset(resolve_subagent_model_thunk(factory, coding, config));
     }
 }
 
@@ -329,9 +360,13 @@ pub fn install_subagent_tiers(
     coding: &mut CodingAgentConfig,
     config: &atomcode_config::config::Config,
 ) {
-    let (fast, capable) = resolve_subagent_tier_thunks(factory, coding, &coding.model, config);
+    let (fast, capable) =
+        resolve_subagent_tier_thunks(factory.clone(), coding, &coding.model, config);
     coding.subagent_fast_provider = Some(TierProvider::new(fast));
     coding.subagent_capable_provider = Some(TierProvider::new(capable));
+    coding.subagent_model_providers = Some(SubagentModelProviders::new(
+        resolve_subagent_model_thunk(factory, coding, config),
+    ));
 }
 
 #[cfg(test)]
