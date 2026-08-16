@@ -372,19 +372,17 @@ struct ModelForm {
 /// Convert a persisted `reasoning_effort_levels` list into per-level toggles
 /// (canonical low/medium/high/max order). `None`/empty ⇒ all levels enabled.
 fn effort_levels_from_config(declared: Option<&[String]>) -> [bool; 4] {
-    match declared {
-        Some(list) if !list.is_empty() => {
-            let mut bits = [false; 4];
-            for (i, level) in atomcode_config::config::REASONING_EFFORT_LEVELS
-                .iter()
-                .enumerate()
-            {
-                bits[i] = list.iter().any(|d| d.trim().eq_ignore_ascii_case(level));
-            }
-            bits
-        }
-        _ => [true; 4],
+    // Derive from the single source of truth so the toggles agree with what every
+    // other surface offers (incl. the "unknown-only list ⇒ all levels" rule).
+    let allowed = atomcode_config::config::allowed_effort_levels(declared);
+    let mut bits = [false; 4];
+    for (i, level) in atomcode_config::config::REASONING_EFFORT_LEVELS
+        .iter()
+        .enumerate()
+    {
+        bits[i] = allowed.contains(level);
     }
+    bits
 }
 
 /// Convert per-level toggles back to a persisted `reasoning_effort_levels`.
@@ -1156,8 +1154,22 @@ impl ProviderPanel {
         let account_id = form.account_id().to_string();
         let model_name = form.model.trim().to_string();
         let supports_vision = form.supports_vision;
-        let reasoning_effort = form.reasoning_effort.clone();
         let reasoning_effort_levels = effort_levels_to_config(form.effort_levels);
+        // Keep the persisted default within the enabled levels. The interactive
+        // toggle already self-heals, but a value LOADED from a hand-edited config
+        // (medium selected while medium is off) would otherwise be saved verbatim.
+        let reasoning_effort = if form.reasoning_effort.as_deref().is_some_and(|v| {
+            !v.eq_ignore_ascii_case("auto")
+                && atomcode_config::config::clamp_effort_to_levels(
+                    Some(v),
+                    reasoning_effort_levels.as_deref(),
+                )
+                .is_none()
+        }) {
+            Some("auto".to_string())
+        } else {
+            form.reasoning_effort.clone()
+        };
         if model_name.is_empty() {
             return false;
         }

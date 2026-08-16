@@ -1925,6 +1925,7 @@ pub(crate) async fn live_reasoning_effort(
     let mut target = String::new();
     let mut previous_effort = None;
     let mut provider_missing = false;
+    let mut level_disallowed = false;
     let commit = match store.update(|config| {
         target = requested
             .clone()
@@ -1934,6 +1935,20 @@ pub(crate) async fn live_reasoning_effort(
             && config
                 .provider_config_for_selection(&target)
                 .is_some_and(|p| p.model.eq_ignore_ascii_case("deepseek-v4-flash"));
+        // Reject a concrete level the endpoint does not expose. The webui filters
+        // its dropdown, but a stale/rogue client could still POST a hidden level;
+        // without this it would persist and reach the wire.
+        if let Some(level) = effort.as_deref() {
+            let levels = config
+                .provider_config_for_selection(&target)
+                .and_then(|p| p.reasoning_effort_levels);
+            if atomcode_config::config::clamp_effort_to_levels(Some(level), levels.as_deref())
+                .is_none()
+            {
+                level_disallowed = true;
+                anyhow::bail!("reasoning_effort {level:?} not supported by {target:?}");
+            }
+        }
         // Schema-aware write: new-schema models live in `[models.*]`, legacy in
         // `[providers.*]`.
         let found = config.update_selection_reasoning(&target, |r| {
@@ -1956,6 +1971,16 @@ pub(crate) async fn live_reasoning_effort(
                 Json(serde_json::json!({
                     "ok": false,
                     "error": format!("provider {target:?} not found"),
+                })),
+            )
+                .into_response();
+        }
+        Err(_) if level_disallowed => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("reasoning_effort not supported by {target:?}"),
                 })),
             )
                 .into_response();

@@ -2905,10 +2905,13 @@ fn models_from_config(config: &Config) -> Vec<ModelInfo> {
                 effort_applicable: p.reasoning_effort.is_some()
                     || (atomcode_config::config::is_codingplan_provider_name(id)
                         && p.model.eq_ignore_ascii_case("deepseek-v4-flash")),
-                reasoning_effort: p
-                    .reasoning_effort
-                    .clone()
-                    .filter(|effort| !effort.eq_ignore_ascii_case("auto")),
+                // Clamp to the allowed levels so the webui trigger never shows a
+                // level the dropdown hides (then drop the `auto` sentinel).
+                reasoning_effort: atomcode_config::config::clamp_effort_to_levels(
+                    p.reasoning_effort.as_deref(),
+                    p.reasoning_effort_levels.as_deref(),
+                )
+                .filter(|effort| !effort.eq_ignore_ascii_case("auto")),
                 effort_levels: atomcode_config::config::allowed_effort_levels(
                     p.reasoning_effort_levels.as_deref(),
                 )

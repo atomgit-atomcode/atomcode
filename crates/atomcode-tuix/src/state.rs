@@ -2259,10 +2259,17 @@ impl UiState {
         current: Option<&str>,
         allowed: &[&str],
     ) -> Option<String> {
+        // No allowed levels ⇒ nothing to cycle; keep the current value rather than
+        // silently clearing it (defensive — `allowed_effort_levels` never returns
+        // empty in practice).
+        if allowed.is_empty() {
+            self.reasoning_effort = current.map(str::to_string);
+            return self.reasoning_effort.clone();
+        }
         let cur_slot = match current {
             Some(c) => allowed
                 .iter()
-                .position(|level| level.eq_ignore_ascii_case(c))
+                .position(|level| level.eq_ignore_ascii_case(c.trim()))
                 .map(|i| i + 1)
                 .unwrap_or(0),
             None => 0,

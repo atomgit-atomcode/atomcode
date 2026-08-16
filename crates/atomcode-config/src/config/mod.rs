@@ -823,7 +823,13 @@ impl Config {
             thinking_type: model.thinking_type.clone(),
             thinking_keep: model.thinking_keep.clone(),
             reasoning_history: model.reasoning_history.clone(),
-            reasoning_effort: model.reasoning_effort.clone(),
+            // Clamp the resolved effort to the endpoint's allowed levels so the
+            // wire never sends a level the model declares unsupported (covers a
+            // hand-edited config, or a stale value left after the level set shrank).
+            reasoning_effort: clamp_effort_to_levels(
+                model.reasoning_effort.as_deref(),
+                model.reasoning_effort_levels.as_deref(),
+            ),
             reasoning_effort_levels: model.reasoning_effort_levels.clone(),
             thinking_enabled: model.thinking_enabled,
             thinking_budget: model.thinking_budget,
@@ -1085,13 +1091,46 @@ pub const REASONING_EFFORT_LEVELS: [&str; 4] = ["low", "medium", "high", "max"];
 /// config's order) and with unknown tokens dropped. So an endpoint that supports
 /// `low`/`high`/`max` but not `medium` yields `["low", "high", "max"]`.
 pub fn allowed_effort_levels(declared: Option<&[String]>) -> Vec<&'static str> {
-    match declared {
-        Some(list) if !list.is_empty() => REASONING_EFFORT_LEVELS
-            .iter()
-            .copied()
-            .filter(|level| list.iter().any(|d| d.trim().eq_ignore_ascii_case(level)))
-            .collect(),
-        _ => REASONING_EFFORT_LEVELS.to_vec(),
+    let Some(list) = declared.filter(|l| !l.is_empty()) else {
+        return REASONING_EFFORT_LEVELS.to_vec();
+    };
+    let restricted: Vec<&'static str> = REASONING_EFFORT_LEVELS
+        .iter()
+        .copied()
+        .filter(|level| list.iter().any(|d| d.trim().eq_ignore_ascii_case(level)))
+        .collect();
+    // A list naming ONLY unknown tokens filters to nothing — treat that as
+    // unrestricted (same as an empty list), NOT "zero levels". Otherwise a typo
+    // silently hides every level, and the panel's `effort_levels_from_config`
+    // (which derives from this) would round-trip the restriction away.
+    if restricted.is_empty() {
+        REASONING_EFFORT_LEVELS.to_vec()
+    } else {
+        restricted
+    }
+}
+
+/// Clamp a persisted `reasoning_effort` VALUE to an endpoint's allowed levels, so
+/// the wire (and every display) can never carry a level the endpoint declares
+/// unsupported. A concrete level (`low`/`medium`/`high`/`max`) outside
+/// [`allowed_effort_levels`] becomes `None` (the API default); `"auto"` and
+/// `None` are capability states, not levels, and pass through unchanged. A valid
+/// value is returned verbatim (no normalization).
+pub fn clamp_effort_to_levels(
+    effort: Option<&str>,
+    declared: Option<&[String]>,
+) -> Option<String> {
+    let value = effort?;
+    if value.trim().eq_ignore_ascii_case("auto") {
+        return Some(value.to_string());
+    }
+    if allowed_effort_levels(declared)
+        .iter()
+        .any(|level| level.eq_ignore_ascii_case(value.trim()))
+    {
+        Some(value.to_string())
+    } else {
+        None
     }
 }
 
@@ -1921,6 +1960,70 @@ mod tests {
         assert_eq!(
             allowed_effort_levels(Some(&no_medium)),
             vec!["low", "high", "max"]
+        );
+        // A list naming ONLY unknown tokens is unrestricted, NOT "no levels" — a
+        // typo must not silently hide every level (and diverge from the panel's
+        // toggles, which read this).
+        let only_unknown = ["none".to_string(), "bogus".to_string()];
+        assert_eq!(
+            allowed_effort_levels(Some(&only_unknown)),
+            vec!["low", "medium", "high", "max"]
+        );
+    }
+
+    #[test]
+    fn clamp_effort_to_levels_drops_out_of_set_values() {
+        let low_high = ["low".to_string(), "high".to_string()];
+        // A concrete level not in the allowed set ⇒ None (API default), so the wire
+        // never sends a level the endpoint declares unsupported.
+        assert_eq!(clamp_effort_to_levels(Some("medium"), Some(&low_high)), None);
+        // An allowed level passes through (case/space-insensitive membership).
+        assert_eq!(
+            clamp_effort_to_levels(Some(" High "), Some(&low_high)).as_deref(),
+            Some(" High ")
+        );
+        // `auto` and None are capability states, not levels — always pass through.
+        assert_eq!(
+            clamp_effort_to_levels(Some("auto"), Some(&low_high)).as_deref(),
+            Some("auto")
+        );
+        assert_eq!(clamp_effort_to_levels(None, Some(&low_high)), None);
+        // An unrestricted endpoint keeps any level.
+        assert_eq!(
+            clamp_effort_to_levels(Some("medium"), None).as_deref(),
+            Some("medium")
+        );
+    }
+
+    #[test]
+    fn resolve_model_clamps_effort_outside_declared_levels() {
+        // A (hand-edited or stale) config whose default effort names a level the
+        // endpoint no longer exposes must NOT reach the wire: resolution drops it
+        // to the API default so `openai_compat` never sends the forbidden level.
+        let catalog: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "custom": { "provider": "openai-compatible", "base_url": "https://example.invalid/v1" }
+            },
+            "models": {
+                "custom/model": {
+                    "account": "custom",
+                    "model": "vendor-model",
+                    "reasoning_effort": "medium",
+                    "reasoning_effort_levels": ["low", "high", "max"]
+                }
+            },
+            "default_model": "custom/model"
+        }))
+        .unwrap();
+        let resolved = catalog.resolve_model(Some("custom/model")).unwrap();
+        assert_eq!(
+            resolved.reasoning_effort, None,
+            "medium is not in [low,high,max] ⇒ dropped to API default at resolution"
+        );
+        // The declared levels themselves still flow through.
+        assert_eq!(
+            resolved.reasoning_effort_levels.as_deref(),
+            Some(["low".to_string(), "high".to_string(), "max".to_string()].as_slice())
         );
     }
 
