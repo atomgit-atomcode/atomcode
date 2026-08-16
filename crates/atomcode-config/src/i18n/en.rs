@@ -368,6 +368,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelVisionEnabled => "Enabled".into(),
         Msg::ProviderPanelVisionDisabled => "Disabled".into(),
         Msg::ProviderPanelFieldEffort => "Default reasoning effort".into(),
+        Msg::ProviderPanelFieldEffortLevels => "Supported levels".into(),
         Msg::ProviderPanelFieldWindow => "Context window".into(),
         Msg::ProviderPanelFieldMakeDefault => "Set as default".into(),
         Msg::ProviderPanelSwitchHint => "←→ to switch".into(),

@@ -318,6 +318,7 @@ enum ModelField {
     Model,
     Vision,
     Effort,
+    EffortLevels,
     Window,
     MakeDefault,
 }
@@ -354,6 +355,11 @@ struct ModelForm {
     supports_vision: Option<bool>,
     /// `None` = unsupported, `Some("auto")` = supported with API default.
     reasoning_effort: Option<String>,
+    /// Per-level toggles for `reasoning_effort_levels` (index = canonical
+    /// low/medium/high/max order). All-true ⇒ unrestricted (persisted as None).
+    effort_levels: [bool; 4],
+    /// Sub-cursor for the EffortLevels multi-select (which level Space toggles).
+    effort_level_cursor: usize,
     window: String,
     make_default: bool,
     focus: ModelField,
@@ -361,6 +367,41 @@ struct ModelForm {
     cursor_byte: usize,
     /// When set, this is an edit of an existing model id (account locked).
     edit_id: Option<String>,
+}
+
+/// Convert a persisted `reasoning_effort_levels` list into per-level toggles
+/// (canonical low/medium/high/max order). `None`/empty ⇒ all levels enabled.
+fn effort_levels_from_config(declared: Option<&[String]>) -> [bool; 4] {
+    match declared {
+        Some(list) if !list.is_empty() => {
+            let mut bits = [false; 4];
+            for (i, level) in atomcode_config::config::REASONING_EFFORT_LEVELS
+                .iter()
+                .enumerate()
+            {
+                bits[i] = list.iter().any(|d| d.trim().eq_ignore_ascii_case(level));
+            }
+            bits
+        }
+        _ => [true; 4],
+    }
+}
+
+/// Convert per-level toggles back to a persisted `reasoning_effort_levels`.
+/// All-enabled (or, degenerately, all-disabled) ⇒ `None` = unrestricted; there is
+/// no "zero levels" state, since `allowed_effort_levels` treats empty as all.
+fn effort_levels_to_config(bits: [bool; 4]) -> Option<Vec<String>> {
+    if bits.iter().all(|b| *b) || bits.iter().all(|b| !*b) {
+        return None;
+    }
+    Some(
+        atomcode_config::config::REASONING_EFFORT_LEVELS
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| bits[*i])
+            .map(|(_, level)| level.to_string())
+            .collect(),
+    )
 }
 
 impl ModelForm {
@@ -386,6 +427,8 @@ impl ModelForm {
             model: String::new(),
             supports_vision: None,
             reasoning_effort: None,
+            effort_levels: [true; 4],
+            effort_level_cursor: 0,
             window: String::new(),
             make_default: true,
             focus: ModelField::Account,
@@ -404,6 +447,8 @@ impl ModelForm {
             model: m.model.clone(),
             supports_vision: m.supports_vision,
             reasoning_effort: m.reasoning_effort.clone(),
+            effort_levels: effort_levels_from_config(m.reasoning_effort_levels.as_deref()),
+            effort_level_cursor: 0,
             window: m.context_window.to_string(),
             make_default: config.effective_model_selection().as_deref() == Some(id),
             focus: ModelField::Model,
@@ -435,6 +480,7 @@ impl ModelForm {
         v.push(ModelField::Model);
         v.push(ModelField::Vision);
         v.push(ModelField::Effort);
+        v.push(ModelField::EffortLevels);
         v.push(ModelField::Window);
         v.push(ModelField::MakeDefault);
         v
@@ -460,6 +506,7 @@ impl ModelForm {
             ModelField::Account
             | ModelField::Vision
             | ModelField::Effort
+            | ModelField::EffortLevels
             | ModelField::MakeDefault => None,
         }
     }
@@ -502,24 +549,72 @@ impl ModelForm {
     }
 
     fn cycle_effort(&mut self, forward: bool) {
-        const VALUES: [Option<&str>; 6] = [
-            None,
-            Some("auto"),
-            Some("low"),
-            Some("medium"),
-            Some("high"),
-            Some("max"),
-        ];
-        let current = VALUES
+        // Cycle the DEFAULT value through None, "auto", then only the ENABLED
+        // levels — so a model that dropped `medium` can't take `medium` as its
+        // default.
+        let mut values: Vec<Option<&str>> = vec![None, Some("auto")];
+        for (i, level) in atomcode_config::config::REASONING_EFFORT_LEVELS
+            .iter()
+            .enumerate()
+        {
+            if self.effort_levels[i] {
+                values.push(Some(level));
+            }
+        }
+        let current = values
             .iter()
             .position(|value| *value == self.reasoning_effort.as_deref())
             .unwrap_or(0);
         let next = if forward {
-            (current + 1) % VALUES.len()
+            (current + 1) % values.len()
         } else {
-            (current + VALUES.len() - 1) % VALUES.len()
+            (current + values.len() - 1) % values.len()
         };
-        self.reasoning_effort = VALUES[next].map(str::to_string);
+        self.reasoning_effort = values[next].map(str::to_string);
+    }
+
+    fn move_effort_cursor(&mut self, forward: bool) {
+        let n = self.effort_levels.len();
+        self.effort_level_cursor = if forward {
+            (self.effort_level_cursor + 1) % n
+        } else {
+            (self.effort_level_cursor + n - 1) % n
+        };
+    }
+
+    fn toggle_effort_level(&mut self) {
+        let i = self.effort_level_cursor.min(self.effort_levels.len() - 1);
+        self.effort_levels[i] = !self.effort_levels[i];
+        // Keep the default value valid: if it now names a disabled level, drop it
+        // back to the API default.
+        if let Some(current) = self.reasoning_effort.clone() {
+            let still_valid = current.eq_ignore_ascii_case("auto")
+                || atomcode_config::config::REASONING_EFFORT_LEVELS
+                    .iter()
+                    .enumerate()
+                    .any(|(idx, level)| self.effort_levels[idx] && level.eq_ignore_ascii_case(&current));
+            if !still_valid {
+                self.reasoning_effort = Some("auto".to_string());
+            }
+        }
+    }
+
+    /// Render the level toggles with the sub-cursor marked, e.g.
+    /// ` [x]low ‹[ ]medium› [x]high [x]max ` (focused level in guillemets).
+    fn effort_levels_label(&self, focused: bool) -> String {
+        atomcode_config::config::REASONING_EFFORT_LEVELS
+            .iter()
+            .enumerate()
+            .map(|(i, level)| {
+                let mark = if self.effort_levels[i] { "x" } else { " " };
+                let cell = format!("[{mark}]{level}");
+                if focused && i == self.effort_level_cursor {
+                    format!("‹{cell}›")
+                } else {
+                    format!(" {cell} ")
+                }
+            })
+            .collect::<String>()
     }
 
     fn effort_label(&self) -> String {
@@ -619,6 +714,7 @@ impl ProviderPanel {
                 ModelField::Account
                 | ModelField::Vision
                 | ModelField::Effort
+                | ModelField::EffortLevels
                 | ModelField::MakeDefault => {}
             },
             Mode::List => {
@@ -1061,6 +1157,7 @@ impl ProviderPanel {
         let model_name = form.model.trim().to_string();
         let supports_vision = form.supports_vision;
         let reasoning_effort = form.reasoning_effort.clone();
+        let reasoning_effort_levels = effort_levels_to_config(form.effort_levels);
         if model_name.is_empty() {
             return false;
         }
@@ -1127,11 +1224,13 @@ impl ProviderPanel {
                         model.model = model_name.clone();
                         model.supports_vision = supports_vision;
                         model.reasoning_effort = reasoning_effort.clone();
+                        model.reasoning_effort_levels = reasoning_effort_levels.clone();
                         model.context_window = context_window;
                     } else if let Some(provider) = persisted.providers.get_mut(id) {
                         provider.model = model_name.clone();
                         provider.supports_vision = supports_vision;
                         provider.reasoning_effort = reasoning_effort.clone();
+                        provider.reasoning_effort_levels = reasoning_effort_levels.clone();
                         provider.context_window = context_window;
                     } else {
                         anyhow::bail!("model {id:?} changed; reopen /provider");
@@ -1167,7 +1266,7 @@ impl ProviderPanel {
                             thinking_keep: None,
                             reasoning_history: None,
                             reasoning_effort: reasoning_effort.clone(),
-                            reasoning_effort_levels: None,
+                            reasoning_effort_levels: reasoning_effort_levels.clone(),
                             thinking_enabled: None,
                             thinking_budget: None,
                         },
@@ -1419,6 +1518,12 @@ impl Modal for ProviderPanel {
                 KeyCode::Right if form.focus == ModelField::Vision => form.cycle_vision(true),
                 KeyCode::Left if form.focus == ModelField::Effort => form.cycle_effort(false),
                 KeyCode::Right if form.focus == ModelField::Effort => form.cycle_effort(true),
+                KeyCode::Left if form.focus == ModelField::EffortLevels => {
+                    form.move_effort_cursor(false)
+                }
+                KeyCode::Right if form.focus == ModelField::EffortLevels => {
+                    form.move_effort_cursor(true)
+                }
                 KeyCode::Left => {
                     if let Some(text) = form.focused_text() {
                         form.cursor_byte = previous_grapheme_boundary(text, form.cursor_byte);
@@ -1438,6 +1543,9 @@ impl Modal for ProviderPanel {
                 }
                 KeyCode::Char(' ') if form.focus == ModelField::Effort => {
                     form.cycle_effort(true);
+                }
+                KeyCode::Char(' ') if form.focus == ModelField::EffortLevels => {
+                    form.toggle_effort_level();
                 }
                 KeyCode::Char(' ') if form.focus == ModelField::MakeDefault => {
                     form.make_default = !form.make_default;
@@ -1962,6 +2070,11 @@ impl Modal for ProviderPanel {
                     format!("‹ {} ›", form.effort_label()),
                     form.focus == ModelField::Effort,
                 ));
+                items.push(field_row(
+                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldEffortLevels),
+                    form.effort_levels_label(form.focus == ModelField::EffortLevels),
+                    form.focus == ModelField::EffortLevels,
+                ));
                 let win = if form.window.is_empty() {
                     format!(
                         "({})",
@@ -2356,6 +2469,61 @@ mod tests {
         let edit = ModelForm::new_edit(&cfg, "acc/custom").unwrap();
         assert_eq!(edit.reasoning_effort.as_deref(), Some("high"));
         assert!(edit.fields().contains(&ModelField::Effort));
+    }
+
+    #[test]
+    fn model_form_effort_levels_toggle_persist_and_couple_default() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "acc": { "provider": "openai-compatible" } },
+            "models": {
+                "acc/sub": {
+                    "account": "acc",
+                    "model": "vendor-model",
+                    "reasoning_effort_levels": ["low", "high", "max"],
+                    "context_window": 131072
+                }
+            }
+        }))
+        .unwrap();
+
+        // Pure config↔toggles round-trip (index = low/medium/high/max).
+        assert_eq!(effort_levels_from_config(None), [true; 4], "None ⇒ all levels");
+        assert_eq!(effort_levels_to_config([true; 4]), None, "all ⇒ unrestricted");
+        assert_eq!(
+            effort_levels_to_config([false; 4]),
+            None,
+            "none ⇒ unrestricted (no zero-levels state)"
+        );
+        assert_eq!(
+            effort_levels_to_config([true, false, true, true]).as_deref(),
+            Some(["low".to_string(), "high".to_string(), "max".to_string()].as_slice())
+        );
+
+        // new_add starts unrestricted and exposes the EffortLevels field.
+        let mut add = ModelForm::new_add(&cfg, Some("acc")).unwrap();
+        assert_eq!(add.effort_levels, [true; 4]);
+        assert!(add.fields().contains(&ModelField::EffortLevels));
+        // Toggle "medium" (cursor index 1) off.
+        add.effort_level_cursor = 1;
+        add.toggle_effort_level();
+        assert_eq!(add.effort_levels, [true, false, true, true]);
+        // The DEFAULT cycle now skips medium: None → auto → low → high.
+        add.reasoning_effort = None;
+        add.cycle_effort(true);
+        add.cycle_effort(true);
+        add.cycle_effort(true);
+        assert_eq!(add.reasoning_effort.as_deref(), Some("high"));
+
+        // Disabling the level that IS the current default resets it to auto.
+        let mut f = ModelForm::new_add(&cfg, Some("acc")).unwrap();
+        f.reasoning_effort = Some("medium".to_string());
+        f.effort_level_cursor = 1;
+        f.toggle_effort_level();
+        assert_eq!(f.reasoning_effort.as_deref(), Some("auto"));
+
+        // new_edit loads the persisted subset (medium off).
+        let edit = ModelForm::new_edit(&cfg, "acc/sub").unwrap();
+        assert_eq!(edit.effort_levels, [true, false, true, true]);
     }
 
     #[test]

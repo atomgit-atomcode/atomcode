@@ -350,6 +350,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelVisionEnabled => "启用".into(),
         Msg::ProviderPanelVisionDisabled => "禁用".into(),
         Msg::ProviderPanelFieldEffort => "默认思考强度".into(),
+        Msg::ProviderPanelFieldEffortLevels => "支持档位".into(),
         Msg::ProviderPanelFieldWindow => "上下文窗口".into(),
         Msg::ProviderPanelFieldMakeDefault => "设为默认".into(),
         Msg::ProviderPanelSwitchHint => "←→ 切换".into(),

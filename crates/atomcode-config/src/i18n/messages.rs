@@ -390,6 +390,7 @@ pub enum Msg<'a> {
     ProviderPanelVisionEnabled,
     ProviderPanelVisionDisabled,
     ProviderPanelFieldEffort,
+    ProviderPanelFieldEffortLevels,
     ProviderPanelFieldWindow,
     ProviderPanelFieldMakeDefault,
     ProviderPanelSwitchHint,
