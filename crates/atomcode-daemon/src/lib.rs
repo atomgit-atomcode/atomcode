@@ -2880,6 +2880,10 @@ pub struct ModelInfo {
     /// or `null` (the model's own default). Lets the webui reflect the active
     /// effort in the selector.
     pub reasoning_effort: Option<String>,
+    /// The reasoning-effort LEVELS this endpoint exposes (subset of
+    /// low/medium/high/max, canonical order). Lets the webui restrict its
+    /// selector; an unrestricted endpoint lists all four (never empty).
+    pub effort_levels: Vec<String>,
 }
 
 /// Build the `/models` list from the UNIFIED model catalog (`logical_models`)
@@ -2905,6 +2909,12 @@ fn models_from_config(config: &Config) -> Vec<ModelInfo> {
                     .reasoning_effort
                     .clone()
                     .filter(|effort| !effort.eq_ignore_ascii_case("auto")),
+                effort_levels: atomcode_config::config::allowed_effort_levels(
+                    p.reasoning_effort_levels.as_deref(),
+                )
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             })
         })
         .collect()

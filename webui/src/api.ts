@@ -54,6 +54,10 @@ export interface ModelInfo {
   effort_applicable: boolean;
   /** Current effort: 'low' | 'medium' | 'high' | 'max' | null (model default). */
   reasoning_effort: string | null;
+  /** The effort LEVELS this endpoint exposes (subset of low/medium/high/max,
+   *  canonical order). The selector shows only these; an unrestricted endpoint
+   *  lists all four (never empty). */
+  effort_levels: string[];
 }
 
 export async function getModels(): Promise<ModelInfo[]> {

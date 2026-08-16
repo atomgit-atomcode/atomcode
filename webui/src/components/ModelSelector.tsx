@@ -23,7 +23,8 @@ function areModelsEqual(a: ModelInfo[], b: ModelInfo[]): boolean {
       ma.model !== mb.model ||
       ma.is_default !== mb.is_default ||
       ma.effort_applicable !== mb.effort_applicable ||
-      ma.reasoning_effort !== mb.reasoning_effort
+      ma.reasoning_effort !== mb.reasoning_effort ||
+      (ma.effort_levels ?? []).join(',') !== (mb.effort_levels ?? []).join(',')
     ) {
       return false;
     }
@@ -143,7 +144,12 @@ export function ModelSelector({
           </button>
           {effortOpen && (
             <div class="model-dropdown">
-              {EFFORT_OPTIONS.map((o) => (
+              {EFFORT_OPTIONS.filter(
+                (o) =>
+                  o.val === null ||
+                  !current?.effort_levels?.length ||
+                  current.effort_levels.includes(o.val),
+              ).map((o) => (
                 <button
                   key={o.key}
                   class={'model-item' + (o.val === effort ? ' active' : '')}
