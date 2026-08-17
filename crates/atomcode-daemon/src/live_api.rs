@@ -1254,9 +1254,7 @@ pub(crate) async fn live_stream(
         live_current_provider(),
         native_runtime_mode(live_current_approval_mode()),
         sid,
-    )
-    .await
-    {
+    ).await {
         Ok(join) => join,
         Err(error) => {
             return (
@@ -1397,10 +1395,10 @@ pub(crate) struct LiveMessageReq {
 
 /// Apply the shared daemon image-preprocessing policy to one user caption.
 ///
-/// The caller keeps the original images in its persisted/display conversation. A changed
-/// return value means the runtime input must clear those images because the returned text
-/// already contains either the VL description or an explicit failure marker.
-pub(crate) async fn preprocess_image_caption(
+/// Build the runtime input for a pasted image and report the matching UI notice.
+/// Native vision and unconfigured VL paths preserve the original image bytes; successful
+/// preprocessing and explicit VL failures return text-only input for text models.
+pub(crate) async fn preprocess_image_input(
     config: &Config,
     supports_vision: bool,
     working_dir: &std::path::Path,
@@ -1408,13 +1406,22 @@ pub(crate) async fn preprocess_image_caption(
     session_id: Option<&str>,
     message: &str,
     images: &[ImageContent],
-) -> String {
+) -> (
+    atomcode_coding::UserInput,
+    Option<atomcode_coding::VisionNotice>,
+) {
     use atomcode_coding::vision::{
         run_vl_caption, should_skip, vl_model_display, PreprocessOutcome,
     };
     // Short-circuit: no images, or the main model already accepts images.
     if should_skip(supports_vision, !images.is_empty()) {
-        return message.to_string();
+        return (
+            atomcode_coding::UserInput {
+                text: message.to_string(),
+                images: images.to_vec(),
+            },
+            None,
+        );
     }
     // Nothing configured (None or empty) ⇒ pass through unchanged (Skipped).
     let Some(vl_name) = config
@@ -1422,13 +1429,26 @@ pub(crate) async fn preprocess_image_caption(
         .clone()
         .filter(|s| !s.is_empty())
     else {
-        return message.to_string();
+        return (
+            atomcode_coding::UserInput {
+                text: message.to_string(),
+                images: images.to_vec(),
+            },
+            None,
+        );
     };
     // Configured but absent from `config.providers` ⇒ Failed (mirror the retired
     // core `maybe_preprocess`): fold the failure marker so the caller strips the
     // images — otherwise raw image bytes reach a text-only model (HTTP 400).
     let Some(vl_pc) = config.provider_config_for_selection(&vl_name) else {
-        return fold_vl_failure(message);
+        let reason = format!("VL provider '{vl_name}' not found in config");
+        return (
+            atomcode_coding::UserInput {
+                text: fold_vl_failure(message),
+                images: Vec::new(),
+            },
+            Some(atomcode_coding::VisionNotice::Failed { reason }),
+        );
     };
     let vl_model = vl_model_display(&vl_pc.model).to_string();
     // Build the one-off VL provider via the daemon's native chain (the SAME
@@ -1448,19 +1468,74 @@ pub(crate) async fn preprocess_image_caption(
         match tokio::task::spawn_blocking(move || factory.build(&coding_cfg, sid.as_deref())).await
         {
             Ok(Ok(p)) => p,
-            _ => return fold_vl_failure(message),
+            _ => {
+                let reason = format!("VL provider '{vl_name}' build failed");
+                return (
+                    atomcode_coding::UserInput {
+                        text: fold_vl_failure(message),
+                        images: Vec::new(),
+                    },
+                    Some(atomcode_coding::VisionNotice::Failed { reason }),
+                );
+            }
         };
     match run_vl_caption(provider, vl_model, message, images).await {
-        PreprocessOutcome::Skipped => message.to_string(),
+        PreprocessOutcome::Skipped => (
+            atomcode_coding::UserInput {
+                text: message.to_string(),
+                images: images.to_vec(),
+            },
+            None,
+        ),
         PreprocessOutcome::Replaced { text, vl_model } => {
-            if message.trim().is_empty() {
+            let char_count = text.chars().count();
+            let merged = if message.trim().is_empty() {
                 format!("[图片内容（由 {vl_model} 识别）]\n{text}")
             } else {
                 format!("{message}\n\n[图片内容（由 {vl_model} 识别）]\n{text}")
-            }
+            };
+            (
+                atomcode_coding::UserInput {
+                    text: merged,
+                    images: Vec::new(),
+                },
+                Some(atomcode_coding::VisionNotice::Recognised {
+                    vl_model,
+                    char_count,
+                }),
+            )
         }
-        PreprocessOutcome::Failed { .. } => fold_vl_failure(message),
+        PreprocessOutcome::Failed { reason } => (
+            atomcode_coding::UserInput {
+                text: fold_vl_failure(message),
+                images: Vec::new(),
+            },
+            Some(atomcode_coding::VisionNotice::Failed { reason }),
+        ),
     }
+}
+
+pub(crate) async fn preprocess_image_caption(
+    config: &Config,
+    supports_vision: bool,
+    working_dir: &std::path::Path,
+    telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
+    session_id: Option<&str>,
+    message: &str,
+    images: &[ImageContent],
+) -> String {
+    preprocess_image_input(
+        config,
+        supports_vision,
+        working_dir,
+        telemetry,
+        session_id,
+        message,
+        images,
+    )
+    .await
+    .0
+    .text
 }
 
 /// Fold the `[图片识别失败]` marker into a caption (VL build/stream failure). The
@@ -2284,7 +2359,9 @@ pub(crate) async fn live_goal_start(
         live_current_provider(),
         native_runtime_mode(live_current_approval_mode()),
         sid,
-    ).await {
+    )
+    .await
+    {
         return Json(serde_json::json!({"accepted": false, "error": error}));
     }
     let accepted = crate::native_live::dispatch(atomcode_coding::DriverCommand::StartGoal(condition)).is_ok();

@@ -17,6 +17,9 @@ use atomcode_capabilities::session::{
 };
 #[cfg(test)]
 use atomcode_capabilities::session::{PresentationFile, SessionMeta, StorageOwner};
+use atomcode_capabilities::tools::request_user_input::{
+    UserInputResponse, REQUEST_USER_INPUT_KIND,
+};
 use atomcode_capabilities::tools::{ApprovalResponse, APPROVAL_KIND};
 use atomcode_kernel::agent::AgentHandle;
 use atomcode_kernel::checkpoint::CompactionCheckpointError;
@@ -2720,7 +2723,9 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut next_turn_id = 0u64;
         let mut conversation_revision = 0u64;
         let mut active_turn = None;
-        let mut pending_requests = BTreeSet::new();
+        // Keep each request kind until its correlated response is delivered.
+        // `request_user_input` image answers need runtime-owned preprocessing.
+        let mut pending_requests = BTreeMap::new();
         let mut pending_policy_intervention: Option<PolicyIntervention> = None;
         let mut snapshot_waiters: Vec<RuntimeSnapshotWaiter> = Vec::new();
         let mut snapshot_in_flight = false;
@@ -3564,23 +3569,35 @@ fn spawn_runtime_owner_with_optional_agent(
                     }) => {
                         if !native_protocol || request_generation != generation || !agent_available {
                             let _ = done.send(Err(RuntimeError::Unavailable));
-                        } else if !pending_requests.remove(&id) {
+                        } else if !pending_requests.contains_key(&id) {
                             let _ = done.send(Err(RuntimeError::StaleRequest { id }));
-                        } else if !send_agent_command(&agent, AgentCommand::Respond { id, value }) {
-                            agent_available = false;
-                            controls.state.store(
-                                runtime_phase_state(generation, RuntimePhase::Failed),
-                                Ordering::Release,
-                            );
-                            let _ = done.send(Err(RuntimeError::DeliveryFailed));
                         } else {
-                            if pending_requests.is_empty() {
+                            let kind = pending_requests
+                                .remove(&id)
+                                .expect("pending request checked above");
+                            let value = preprocess_request_response(
+                                &kind,
+                                value,
+                                resources.as_ref(),
+                                &runtime_event_tx,
+                            )
+                            .await;
+                            if !send_agent_command(&agent, AgentCommand::Respond { id, value }) {
+                                agent_available = false;
                                 controls.state.store(
-                                    runtime_phase_state(generation, RuntimePhase::InTurn),
+                                    runtime_phase_state(generation, RuntimePhase::Failed),
                                     Ordering::Release,
                                 );
+                                let _ = done.send(Err(RuntimeError::DeliveryFailed));
+                            } else {
+                                if pending_requests.is_empty() {
+                                    controls.state.store(
+                                        runtime_phase_state(generation, RuntimePhase::InTurn),
+                                        Ordering::Release,
+                                    );
+                                }
+                                let _ = done.send(Ok(()));
                             }
-                            let _ = done.send(Ok(()));
                         }
                     }
                     Some(CodingRuntimeControl::ResolvePolicyIntervention {
@@ -3949,7 +3966,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 runtime.loop_active.store(false, Ordering::Release);
                             }
                             pending_wakeup = None;
-                            for id in pending_requests.iter().copied() {
+                            for id in pending_requests.keys().copied() {
                                 let _ = send_agent_command(&agent, AgentCommand::Respond {
                                     id,
                                     value: serde_json::Value::Null,
@@ -4015,7 +4032,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             cancel_pending = false;
                             let _ = done.send(Ok(()));
                         } else {
-                            for id in pending_requests.iter().copied() {
+                            for id in pending_requests.keys().copied() {
                                 let _ = send_agent_command(&agent, AgentCommand::Respond {
                                     id,
                                     value: serde_json::Value::Null,
@@ -5767,7 +5784,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     // teardown will fail it closed; never claim success for a
                                     // response that did not reach the kernel.
                                 }
-                                pending_requests.insert(id);
+                                pending_requests.insert(id, kind.clone());
                                 controls.state.store(
                                     runtime_phase_state(
                                         generation,
@@ -6538,13 +6555,111 @@ fn reject_runtime_control(
     }
 }
 
+/// Apply normal turn vision preprocessing to images attached while answering
+/// `request_user_input`; tool responses otherwise bypass the submit boundary.
+async fn preprocess_request_response(
+    kind: &str,
+    mut value: serde_json::Value,
+    resources: Option<&RuntimeResources>,
+    runtime_event_tx: &RuntimeEventEmitter,
+) -> serde_json::Value {
+    if kind != REQUEST_USER_INPUT_KIND {
+        return value;
+    }
+    let Some(runtime) = resources else {
+        return value;
+    };
+    // Native multimodal models must receive the original image bytes.
+    if runtime.config.supports_vision {
+        return value;
+    }
+    let Some(preprocessor) = runtime.image_preprocessor.clone() else {
+        return value;
+    };
+    let session_id = runtime
+        .parts
+        .session
+        .as_ref()
+        .map(|binding| binding.id.clone());
+
+    if let Some(responses) = value
+        .get_mut("responses")
+        .and_then(|item| item.as_array_mut())
+    {
+        let pending = std::mem::take(responses);
+        *responses = futures::future::join_all(pending.into_iter().map(|response| {
+            preprocess_one_user_input_response(
+                response,
+                preprocessor.as_ref(),
+                session_id.clone(),
+                runtime_event_tx,
+            )
+        }))
+        .await;
+    } else {
+        value = preprocess_one_user_input_response(
+            value,
+            preprocessor.as_ref(),
+            session_id,
+            runtime_event_tx,
+        )
+        .await;
+    }
+    value
+}
+
+async fn preprocess_one_user_input_response(
+    value: serde_json::Value,
+    preprocessor: &dyn ImagePreprocessor,
+    session_id: Option<String>,
+    runtime_event_tx: &RuntimeEventEmitter,
+) -> serde_json::Value {
+    let Ok(mut response) = serde_json::from_value::<UserInputResponse>(value.clone()) else {
+        return value;
+    };
+    if response.images.is_empty() {
+        return value;
+    }
+
+    // Choice-mode answers keep their selected labels in `selected`; using them
+    // as the VL caption would duplicate those labels in the formatted tool
+    // result. Only free-form text belongs in the recognition prompt.
+    let prompt = response.text.clone().unwrap_or_default();
+    let (processed, notice) = preprocessor
+        .preprocess(
+            prompt,
+            std::mem::take(&mut response.images),
+            false,
+            session_id,
+        )
+        .await;
+    response.text = (!processed.text.is_empty()).then_some(processed.text);
+    response.images = processed.images;
+    match notice {
+        Some(VisionNotice::Recognised {
+            vl_model,
+            char_count,
+        }) => {
+            let _ = runtime_event_tx.send(CodingRuntimeEvent::VisionPreprocessSuccess {
+                vl_model,
+                char_count,
+            });
+        }
+        Some(VisionNotice::Failed { reason }) => {
+            let _ = runtime_event_tx.send(CodingRuntimeEvent::VisionPreprocessFailed { reason });
+        }
+        None => {}
+    }
+    serde_json::to_value(response).unwrap_or(value)
+}
+
 fn fail_close_pending_requests(
     agent: &Option<AgentHandle>,
-    pending_requests: &mut BTreeSet<RequestId>,
+    pending_requests: &mut BTreeMap<RequestId, String>,
     cancel_turn: bool,
 ) {
     if let Some(agent) = agent.as_ref() {
-        for id in pending_requests.iter().copied() {
+        for id in pending_requests.keys().copied() {
             let _ = agent.commands.send(AgentCommand::Respond {
                 id,
                 value: serde_json::Value::Null,
@@ -11887,8 +12002,37 @@ mod tests {
         }
     }
 
+    struct ConcurrentPreprocessor {
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        max_active: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ImagePreprocessor for ConcurrentPreprocessor {
+        async fn preprocess(
+            &self,
+            text: String,
+            _images: Vec<ImageContent>,
+            _supports_vision: bool,
+            _session_id: Option<String>,
+        ) -> (UserInput, Option<VisionNotice>) {
+            let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+            self.max_active.fetch_max(active, Ordering::AcqRel);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            (
+                UserInput {
+                    text: format!("VL[{text}]"),
+                    images: Vec::new(),
+                },
+                None,
+            )
+        }
+    }
+
     async fn spawn_with_preprocessor(
         pp: Option<Arc<dyn ImagePreprocessor>>,
+        supports_vision: bool,
     ) -> (
         CodingRuntimeHandle,
         mpsc::UnboundedReceiver<AgentCommand>,
@@ -11901,12 +12045,13 @@ mod tests {
         let (runtime_tx, runtime_events) = mpsc::unbounded_channel();
         let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
         let CodingRuntimeStart {
-            agent: config,
+            agent: mut config,
             prepare,
             provider_factory,
             plugin_hooks,
             ..
         } = native_start(false);
+        config.supports_vision = supports_vision;
         let parts =
             prepare_with_plugin_hook_source(&config, prepare.clone(), plugin_hooks.as_ref())
                 .await
@@ -11947,9 +12092,12 @@ mod tests {
     async fn image_submit_runs_installed_preprocessor_before_kernel() {
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (handle, mut kernel_commands, _kernel_events, mut runtime_events, _adapter) =
-            spawn_with_preprocessor(Some(Arc::new(RecordingPreprocessor {
-                called: called.clone(),
-            })))
+            spawn_with_preprocessor(
+                Some(Arc::new(RecordingPreprocessor {
+                    called: called.clone(),
+                })),
+                false,
+            )
             .await;
 
         handle
@@ -11994,12 +12142,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_user_input_image_response_runs_preprocessor_for_text_model() {
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (handle, mut kernel_commands, kernel_events, mut runtime_events, _adapter) =
+            spawn_with_preprocessor(
+                Some(Arc::new(RecordingPreprocessor {
+                    called: called.clone(),
+                })),
+                false,
+            )
+            .await;
+
+        kernel_events
+            .send(AgentEvent::Request {
+                id: 7,
+                kind: REQUEST_USER_INPUT_KIND.into(),
+                payload: serde_json::json!({"question": "show me"}),
+            })
+            .unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::Request(RuntimeRequest { id: 7, .. }))
+        ));
+
+        let response = UserInputResponse {
+            declined: false,
+            selected: vec!["[Image #1]".into()],
+            text: None,
+            images: vec![test_image("raw-image")],
+        };
+        handle
+            .respond(7, serde_json::to_value(response).unwrap())
+            .await
+            .unwrap();
+
+        match kernel_commands.recv().await {
+            Some(AgentCommand::Respond { id: 7, value }) => {
+                let response: UserInputResponse = serde_json::from_value(value).unwrap();
+                assert_eq!(response.selected, vec!["[Image #1]"]);
+                assert_eq!(response.text.as_deref(), Some("VL[]"));
+                assert!(response.images.is_empty());
+            }
+            other => panic!("expected preprocessed Respond, got {other:?}"),
+        }
+        assert!(called.load(Ordering::Acquire));
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::VisionPreprocessSuccess { char_count: 3, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_user_input_batch_images_preprocess_concurrently_in_original_order() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (handle, mut kernel_commands, kernel_events, mut runtime_events, _adapter) =
+            spawn_with_preprocessor(
+                Some(Arc::new(ConcurrentPreprocessor {
+                    active: active.clone(),
+                    max_active: max_active.clone(),
+                })),
+                false,
+            )
+            .await;
+
+        kernel_events
+            .send(AgentEvent::Request {
+                id: 9,
+                kind: REQUEST_USER_INPUT_KIND.into(),
+                payload: serde_json::json!({"question": "show me"}),
+            })
+            .unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::Request(RuntimeRequest { id: 9, .. }))
+        ));
+
+        let responses = vec![
+            UserInputResponse {
+                declined: false,
+                selected: Vec::new(),
+                text: Some("first".into()),
+                images: vec![test_image("first-image")],
+            },
+            UserInputResponse {
+                declined: false,
+                selected: Vec::new(),
+                text: Some("second".into()),
+                images: vec![test_image("second-image")],
+            },
+        ];
+        handle
+            .respond(9, serde_json::json!({ "responses": responses }))
+            .await
+            .unwrap();
+
+        match kernel_commands.recv().await {
+            Some(AgentCommand::Respond { id: 9, value }) => {
+                let responses = value["responses"].as_array().unwrap();
+                assert_eq!(responses[0]["text"], "VL[first]");
+                assert_eq!(responses[1]["text"], "VL[second]");
+            }
+            other => panic!("expected preprocessed batch Respond, got {other:?}"),
+        }
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert!(
+            max_active.load(Ordering::Acquire) >= 2,
+            "batch image preprocessing should overlap"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_user_input_image_response_preserves_native_vision_images() {
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (handle, mut kernel_commands, kernel_events, mut runtime_events, _adapter) =
+            spawn_with_preprocessor(
+                Some(Arc::new(RecordingPreprocessor {
+                    called: called.clone(),
+                })),
+                true,
+            )
+            .await;
+        kernel_events
+            .send(AgentEvent::Request {
+                id: 8,
+                kind: REQUEST_USER_INPUT_KIND.into(),
+                payload: serde_json::json!({"question": "show me"}),
+            })
+            .unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::Request(RuntimeRequest { id: 8, .. }))
+        ));
+
+        let response = UserInputResponse {
+            declined: false,
+            selected: vec!["[Image #1]".into()],
+            text: None,
+            images: vec![test_image("raw-image")],
+        };
+        handle
+            .respond(8, serde_json::to_value(&response).unwrap())
+            .await
+            .unwrap();
+        match kernel_commands.recv().await {
+            Some(AgentCommand::Respond { id: 8, value }) => {
+                assert_eq!(
+                    serde_json::from_value::<UserInputResponse>(value).unwrap(),
+                    response
+                );
+            }
+            other => panic!("expected untouched Respond, got {other:?}"),
+        }
+        assert!(!called.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
     async fn image_steer_acknowledges_the_driver_original_after_preprocessing() {
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (handle, mut kernel_commands, kernel_events, mut runtime_events, _adapter) =
-            spawn_with_preprocessor(Some(Arc::new(RecordingPreprocessor {
-                called: called.clone(),
-            })))
+            spawn_with_preprocessor(
+                Some(Arc::new(RecordingPreprocessor {
+                    called: called.clone(),
+                })),
+                false,
+            )
             .await;
 
         handle.submit(UserInput::from("first")).await.unwrap();
@@ -12072,9 +12379,12 @@ mod tests {
     async fn text_only_submit_skips_preprocessor() {
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (handle, mut kernel_commands, _kernel_events, _runtime_events, _adapter) =
-            spawn_with_preprocessor(Some(Arc::new(RecordingPreprocessor {
-                called: called.clone(),
-            })))
+            spawn_with_preprocessor(
+                Some(Arc::new(RecordingPreprocessor {
+                    called: called.clone(),
+                })),
+                false,
+            )
             .await;
 
         handle
@@ -12100,7 +12410,7 @@ mod tests {
     #[tokio::test]
     async fn image_submit_failure_emits_failed_event_and_text_only_turn() {
         let (handle, mut kernel_commands, _kernel_events, mut runtime_events, _adapter) =
-            spawn_with_preprocessor(Some(Arc::new(FailingPreprocessor))).await;
+            spawn_with_preprocessor(Some(Arc::new(FailingPreprocessor)), false).await;
 
         handle
             .submit(UserInput {

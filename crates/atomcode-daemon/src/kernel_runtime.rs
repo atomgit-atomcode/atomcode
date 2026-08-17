@@ -6,6 +6,56 @@ use atomcode_coding::runtime::CodingRuntimeEvent;
 use atomcode_coding::CodingRuntimeConfig;
 use tokio::sync::{mpsc, watch};
 
+struct DaemonVlImagePreprocessor {
+    working_dir: std::path::PathBuf,
+    telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
+}
+
+#[async_trait::async_trait]
+impl atomcode_coding::ImagePreprocessor for DaemonVlImagePreprocessor {
+    async fn preprocess(
+        &self,
+        text: String,
+        images: Vec<atomcode_coding::ImageContent>,
+        supports_vision: bool,
+        session_id: Option<String>,
+    ) -> (
+        atomcode_coding::UserInput,
+        Option<atomcode_coding::VisionNotice>,
+    ) {
+        let config = match atomcode_config::config::Config::load(
+            &atomcode_config::config::Config::default_path(),
+        ) {
+            Ok(config) => config,
+            Err(_) => return (atomcode_coding::UserInput { text, images }, None),
+        };
+        crate::live_api::preprocess_image_input(
+            &config,
+            supports_vision,
+            &self.working_dir,
+            self.telemetry.clone(),
+            session_id.as_deref(),
+            &text,
+            &images,
+        )
+        .await
+    }
+}
+
+fn daemon_image_preprocessor(
+    cfg: &CodingRuntimeConfig,
+    injected: Option<std::sync::Arc<dyn atomcode_coding::ImagePreprocessor>>,
+) -> Option<std::sync::Arc<dyn atomcode_coding::ImagePreprocessor>> {
+    injected.or_else(|| {
+        cfg.telemetry.clone().map(|telemetry| {
+            std::sync::Arc::new(DaemonVlImagePreprocessor {
+                working_dir: cfg.working_dir.clone(),
+                telemetry,
+            }) as std::sync::Arc<dyn atomcode_coding::ImagePreprocessor>
+        })
+    })
+}
+
 /// Convert the shared runtime configuration into the native coding-agent config.
 pub fn coding_config_from_runtime(cfg: &CodingRuntimeConfig) -> CodingAgentConfig {
     cfg.agent_config()
@@ -39,6 +89,7 @@ async fn start_native_runtime_with_session_bootstrap(
     image_preprocessor: Option<std::sync::Arc<dyn atomcode_coding::ImagePreprocessor>>,
 ) -> Result<(atomcode_coding::CodingRuntime, CodingAgentConfig), atomcode_coding::RuntimeStartError>
 {
+    let image_preprocessor = daemon_image_preprocessor(&cfg, image_preprocessor);
     let coding_cfg = coding_config_from_runtime(&cfg);
     let (session, imported_lease) = match session {
         SessionMode::Resume(id) => {
@@ -122,9 +173,10 @@ async fn start_native_runtime_with_session_bootstrap(
         prepare,
         provider_factory: crate::coding_provider_factory(),
         plugin_hooks: crate::installed_plugin_hook_source(),
-        // Daemon callers keep this `None` because live_api preprocesses upstream.
-        // The TUI session-switch path injects the same preprocessor as its initial
-        // runtime, so `/resume` does not silently lose image recognition.
+        // Normal daemon submits may preprocess in live_api before reaching the
+        // runtime, while request_user_input responses enter through Respond.
+        // Installing the same adapter here covers both without double-processing
+        // inputs whose images were already stripped upstream.
         image_preprocessor,
     };
     let runtime = match imported_lease {
@@ -387,6 +439,30 @@ mod tests {
                 None => std::env::remove_var("ATOMCODE_HOME"),
             }
         }
+    }
+
+    #[test]
+    fn daemon_runtime_installs_default_image_preprocessor() {
+        let home = ScopedHome::new();
+        let config = atomcode_config::config::Config::default();
+        let telemetry = atomcode_telemetry::Telemetry::init(
+            atomcode_telemetry::ResolvedConfig {
+                state: atomcode_telemetry::TelemetryState::Disabled("test"),
+                endpoint: String::new(),
+                atomcode_dir: home._dir.path().to_path_buf(),
+            },
+            "test".into(),
+        );
+        let cfg = CodingRuntimeConfig::from_config(
+            &config,
+            home._dir.path(),
+            None,
+            Some(telemetry),
+            false,
+            true,
+        );
+
+        assert!(daemon_image_preprocessor(&cfg, None).is_some());
     }
 
     #[tokio::test]
