@@ -185,6 +185,11 @@ const zh = {
   // Settings panel
   'settings.title': '设置',
   'settings.theme': '主题',
+  'settings.fontScale': '字号',
+  'settings.fontScale.small': '紧凑',
+  'settings.fontScale.normal': '标准',
+  'settings.fontScale.large': '较大',
+  'settings.fontScale.xlarge': '最大',
   'settings.theme.light': '浅色',
   'settings.theme.dark': '深色',
   'settings.theme.system': '跟随系统',
@@ -538,6 +543,11 @@ const en: Record<MsgKey, string> = {
 
   'settings.title': 'Settings',
   'settings.theme': 'Theme',
+  'settings.fontScale': 'Text size',
+  'settings.fontScale.small': 'Compact',
+  'settings.fontScale.normal': 'Default',
+  'settings.fontScale.large': 'Large',
+  'settings.fontScale.xlarge': 'Largest',
   'settings.theme.light': 'Light',
   'settings.theme.dark': 'Dark',
   'settings.theme.system': 'System',

@@ -6,6 +6,22 @@
    Accent is Claude "clay/book-cloth" orange (#d97757). Both themes use warm
    neutrals (claude.ai's warm-ivory light + warm-charcoal dark); radii are
    softened; fonts add a sans body + a serif display stack (greeting). */
+/* Root type scale. Every `font-size` in this stylesheet is a `rem`, so this
+   one declaration sets the size of all text at once; `SettingsProvider`
+   writes `--app-font-scale` from the user's choice.
+
+   16px is the base the rem values were computed against, so the default
+   (scale 1) renders byte-identical to the fixed px sizes this replaced.
+   Deliberately type-only: spacing, radii and container widths stay in px, so
+   larger text grows inside a stable layout rather than zooming the whole
+   page. */
+html {
+  /* The fallback must equal `FONT_SCALE_FACTORS.normal` in settings.tsx —
+     `SettingsProvider` writes the property after first paint, so a mismatch
+     shows up as the whole UI resizing one frame in. */
+  font-size: calc(16px * var(--app-font-scale, 1));
+}
+
 :root {
   color-scheme: dark;
   --app-brand:#d97757; --app-brand-button:#c2613f; --app-brand-ivory:#faf9f5; --app-brand-slate:#141413;
@@ -34,7 +50,7 @@
   --app-sans-font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;
   --app-serif-font-family:'Tiempos Text','Source Serif 4','Songti SC',ui-serif,Georgia,Cambria,'Times New Roman',serif;
   --app-monospace-font-family:ui-monospace,'SFMono-Regular','Menlo','Monaco','Courier New',monospace;
-  --app-monospace-font-size:13px; --app-monospace-font-size-small:12px;
+  --app-monospace-font-size:0.875rem; --app-monospace-font-size-small:12px;
 }
 /* Light palette — claude.ai warm ivory paper. Shared by the explicit-light
    and system-light selectors. Accent (clay) is inherited from :root. */
