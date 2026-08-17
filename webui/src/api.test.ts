@@ -210,6 +210,103 @@ test('postChatUserInput correlates the answer by session and native request id',
   }
 });
 
+test('scoped live user input answers stay on the live endpoint even with a session id', async () => {
+  const calls: string[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: RequestInfo | URL) => {
+    calls.push(String(url));
+    return new Response('{"accepted":true}', { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const { postUserInputAnswer } = await import('./api.ts');
+    await postUserInputAnswer({
+      type: 'user_input_request',
+      request_id: 42,
+      session_id: 'session-live',
+      response_transport: 'live',
+      header: 'Confirm',
+      question: 'Continue?',
+      mode: 'text',
+      options: [],
+    }, {
+      request_id: 42,
+      declined: true,
+      selected: [],
+      text: null,
+    });
+
+    assert.deepEqual(calls, ['/live/user-input']);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('chat user input answers use the session-correlated chat endpoint', async () => {
+  const calls: string[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: RequestInfo | URL) => {
+    calls.push(String(url));
+    return new Response('{"accepted":true}', { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const { postUserInputAnswer } = await import('./api.ts');
+    await postUserInputAnswer({
+      type: 'user_input_request',
+      request_id: 43,
+      session_id: 'session-chat',
+      response_transport: 'chat',
+      header: 'Confirm',
+      question: 'Continue?',
+      mode: 'text',
+      options: [],
+    }, {
+      request_id: 43,
+      declined: false,
+      selected: [],
+      text: 'continue',
+    });
+
+    assert.deepEqual(calls, ['/chat/user-input']);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('chat user input without a session id fails closed before fetch', async () => {
+  let fetchCalled = false;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    fetchCalled = true;
+    return new Response('{"accepted":true}', { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const { postUserInputAnswer } = await import('./api.ts');
+    await assert.rejects(
+      () => postUserInputAnswer({
+        type: 'user_input_request',
+        request_id: 44,
+        response_transport: 'chat',
+        header: 'Confirm',
+        question: 'Continue?',
+        mode: 'text',
+        options: [],
+      }, {
+        request_id: 44,
+        declined: true,
+        selected: [],
+        text: null,
+      }),
+      /missing session_id/,
+    );
+    assert.equal(fetchCalled, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('a one-question questions payload still uses the batch response protocol', async () => {
   const { isUserInputBatch } = await import('./api.ts');
   assert.equal(isUserInputBatch({

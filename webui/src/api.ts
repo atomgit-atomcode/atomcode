@@ -1015,7 +1015,7 @@ export interface UserInputResponseBody {
 export interface UserInputRequestEvent {
   type: 'user_input_request';
   request_id: number;
-  /** Present on the `/chat` path; `/live` is already bound to one session. */
+  /** Session correlation. Session-scoped `/live` events may also carry this field. */
   session_id?: string;
   header: string;
   question: string;
@@ -1027,6 +1027,11 @@ export interface UserInputRequestEvent {
   /// Offer the "type your own answer" row for a single question. Absent ⇒ true.
   custom?: boolean;
 }
+
+/** A structured-input wire event after Chat records which transport emitted it. */
+export type RoutedUserInputRequest = UserInputRequestEvent & {
+  response_transport: 'chat' | 'live';
+};
 
 export function isUserInputBatch(req: UserInputRequestEvent): boolean {
   return Array.isArray(req.questions) && req.questions.length > 0;
@@ -1084,4 +1089,22 @@ export async function postChatUserInput(
     throw new Error(result.error ?? 'chat runtime did not accept the user input answer');
   }
   return result;
+}
+
+/**
+ * Answer a structured-input request through the transport that emitted it.
+ * A scoped `/live` event also has a `session_id`, so endpoint selection must
+ * use the explicit client-side transport marker rather than field presence.
+ */
+export function postUserInputAnswer(
+  req: RoutedUserInputRequest,
+  body: UserInputAnswer,
+): Promise<{ accepted: boolean }> {
+  if (req.response_transport === 'chat') {
+    if (!req.session_id) {
+      return Promise.reject(new Error('chat user input request is missing session_id'));
+    }
+    return postChatUserInput(req.session_id, body);
+  }
+  return postLiveUserInput(body);
 }

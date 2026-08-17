@@ -27,7 +27,7 @@
 
 import { VNode } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, postLiveCompact, postLiveUserInput, postChatUserInput, postLivePolicyInterventionResolution, type CommandResult, UserInputRequestEvent, type PolicyInterventionEvent, type TurnStats } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -588,7 +588,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const [livePending, setLivePending] = useState<{ tool_name: string; reason: string; call_id: string; arguments: string } | null>(null);
   // Pending structured input from either transport. The event's optional session_id
   // selects `/chat/user-input`; live requests answer the bound `/live` runtime.
-  const [userInputReq, setUserInputReq] = useState<UserInputRequestEvent | null>(null);
+  const [userInputReq, setUserInputReq] = useState<RoutedUserInputRequest | null>(null);
   const [policyIntervention, setPolicyIntervention] = useState<PolicyInterventionEvent | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef<string | null>(null);
@@ -1448,7 +1448,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       }
       case 'user_input_request': {
         // Show the UserInputCard for the bound live runtime.
-        setUserInputReq(e);
+        setUserInputReq({ ...e, response_transport: 'live' });
         break;
       }
       case 'user_input_resolved': {
@@ -1973,7 +1973,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         break;
 
       case 'user_input_request':
-        setUserInputReq(event);
+        setUserInputReq({ ...event, response_transport: 'chat' });
         break;
 
       case 'policy_intervention':
@@ -3037,9 +3037,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     <UserInputCard
       req={userInputReq}
       onDone={() => setUserInputReq(null)}
-      submitAnswer={(body) => userInputReq.session_id
-        ? postChatUserInput(userInputReq.session_id, body)
-        : postLiveUserInput(body)}
+      submitAnswer={(body) => postUserInputAnswer(userInputReq, body)}
     />
   );
 
