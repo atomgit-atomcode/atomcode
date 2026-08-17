@@ -27,12 +27,18 @@ html {
   --app-brand:#d97757; --app-brand-button:#c2613f; --app-brand-ivory:#faf9f5; --app-brand-slate:#141413;
   --app-primary-foreground:#e8e6df; --app-primary-background:#262624; --app-brand-text:#f5f4ee;
   --app-secondary-foreground:#b0ada4; --app-secondary-background:#1f1e1d;
-  --app-input-foreground:#e8e6df; --app-input-background:#30302e; --app-input-border:#413f3b;
-  --app-input-active-border:#d97757; --app-input-placeholder-foreground:#8f8c83; --app-input-secondary-background:#2a2927;
+  /* Four text rungs keep metadata, hints, and timestamps from competing with
+     conversation content. Layer/border aliases give components the same
+     hierarchy in both themes without baking palette values into app.css. */
+  --app-tertiary-foreground:#a09d94; --app-caption-foreground:#918e85;
+  --app-layer-1-background:#2a2927; --app-layer-2-background:#30302e;
+  --app-border-subtle:#393633; --app-border-strong:#57534d;
+  --app-input-foreground:#e8e6df; --app-input-background:var(--app-layer-2-background); --app-input-border:#413f3b;
+  --app-input-active-border:#d97757; --app-input-placeholder-foreground:#8f8c83; --app-input-secondary-background:var(--app-layer-1-background);
   --app-button-foreground:#ffffff; --app-button-background:#c2613f; --app-button-hover-background:#d97757; --app-ghost-button-hover-background:#ffffff14;
-  --app-tool-background:#1f1e1d; --app-header-background:#262624; --app-primary-border-color:#393633; --app-accent-color:#d97757;
+  --app-tool-background:#1f1e1d; --app-header-background:#262624; --app-primary-border-color:var(--app-border-subtle); --app-accent-color:#d97757;
   /* Table cell border — brighter than the primary border so GFM tables read on the dark canvas. */
-  --app-table-border:#57534d;
+  --app-table-border:var(--app-border-strong);
   /* DeepSeek-Harness-style reading measure: transcript stays compact while the
      composer is 32px wider (16px of breathing room on each side). Both remain
      responsive inside their already-padded containers. */
@@ -47,9 +53,12 @@ html {
   --app-diff-deletion-foreground:#f14c4c; --app-diff-addition-foreground:#74c991;
   --app-spacing-small:4px; --app-spacing-medium:8px; --app-spacing-large:12px; --app-spacing-xlarge:16px;
   --corner-radius-small:6px; --corner-radius-medium:10px; --corner-radius-large:14px;
-  --app-sans-font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;
+  --app-sans-font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei','Helvetica Neue',Helvetica,Arial,sans-serif;
   --app-serif-font-family:'Tiempos Text','Source Serif 4','Songti SC',ui-serif,Georgia,Cambria,'Times New Roman',serif;
-  --app-monospace-font-family:ui-monospace,'SFMono-Regular','Menlo','Monaco','Courier New',monospace;
+  /* Prefer explicit Latin and CJK faces so mixed paths remain stable on
+     Windows, while retaining the generic family for minimal Linux/NAS and
+     mobile environments where none of the named fonts may be installed. */
+  --app-monospace-font-family:'SF Mono','SFMono-Regular','JetBrains Mono','Fira Code',Consolas,'Liberation Mono',Menlo,'Courier New','PingFang SC','Microsoft YaHei',monospace;
   --app-monospace-font-size:0.875rem; --app-monospace-font-size-small:12px;
 }
 /* Light palette — claude.ai warm ivory paper. Shared by the explicit-light
@@ -58,11 +67,14 @@ html {
   color-scheme: light;
   --app-primary-foreground:#1f1e1d; --app-primary-background:#faf9f5; --app-brand-text:#29261f;
   --app-secondary-foreground:#6b6a63; --app-secondary-background:#f0eee6;
-  --app-input-foreground:#1f1e1d; --app-input-background:#ffffff; --app-input-border:#e6e2d6;
+  --app-tertiary-foreground:#6f6c65; --app-caption-foreground:#747169;
+  --app-layer-1-background:#f5f2ea; --app-layer-2-background:#ffffff;
+  --app-border-subtle:#eae6db; --app-border-strong:#d8d3c6;
+  --app-input-foreground:#1f1e1d; --app-input-background:var(--app-layer-2-background); --app-input-border:#e6e2d6;
   --app-input-placeholder-foreground:#9b988e; --app-input-secondary-background:#f0eee6;
   --app-ghost-button-hover-background:#0000000d; --app-tool-background:#f0eee6; --app-header-background:#faf9f5;
-  --app-primary-border-color:#eae6db; --app-list-hover-background:#efece3; --app-list-active-background:#e6e1d4;
-  --app-table-border:#d8d3c6;
+  --app-primary-border-color:var(--app-border-subtle); --app-list-hover-background:#efece3; --app-list-active-background:#e6e1d4;
+  --app-table-border:var(--app-border-strong);
   --app-menu-background:#ffffff; --app-menu-border:#e6e2d6; --app-menu-foreground:#1f1e1d; --app-menu-selection-background:#f3e7df;
   --app-command-menu-hover-background:color-mix(in srgb,var(--app-brand) 10%,var(--app-menu-background)); --app-command-menu-active-background:color-mix(in srgb,var(--app-brand) 22%,var(--app-menu-background)); --app-command-menu-active-accent:var(--app-brand);
   --app-link-color:#0969da; --app-transparent-inner-border:#00000012;
@@ -74,11 +86,14 @@ html {
     color-scheme: light;
     --app-primary-foreground:#1f1e1d; --app-primary-background:#faf9f5; --app-brand-text:#29261f;
     --app-secondary-foreground:#6b6a63; --app-secondary-background:#f0eee6;
-    --app-input-foreground:#1f1e1d; --app-input-background:#ffffff; --app-input-border:#e6e2d6;
+    --app-tertiary-foreground:#6f6c65; --app-caption-foreground:#747169;
+    --app-layer-1-background:#f5f2ea; --app-layer-2-background:#ffffff;
+    --app-border-subtle:#eae6db; --app-border-strong:#d8d3c6;
+    --app-input-foreground:#1f1e1d; --app-input-background:var(--app-layer-2-background); --app-input-border:#e6e2d6;
     --app-input-placeholder-foreground:#9b988e; --app-input-secondary-background:#f0eee6;
     --app-ghost-button-hover-background:#0000000d; --app-tool-background:#f0eee6; --app-header-background:#faf9f5;
-    --app-primary-border-color:#eae6db; --app-list-hover-background:#efece3; --app-list-active-background:#e6e1d4;
-    --app-table-border:#d8d3c6;
+    --app-primary-border-color:var(--app-border-subtle); --app-list-hover-background:#efece3; --app-list-active-background:#e6e1d4;
+    --app-table-border:var(--app-border-strong);
     --app-menu-background:#ffffff; --app-menu-border:#e6e2d6; --app-menu-foreground:#1f1e1d; --app-menu-selection-background:#f3e7df;
     --app-command-menu-hover-background:color-mix(in srgb,var(--app-brand) 10%,var(--app-menu-background)); --app-command-menu-active-background:color-mix(in srgb,var(--app-brand) 22%,var(--app-menu-background)); --app-command-menu-active-accent:var(--app-brand);
     --app-link-color:#0969da; --app-transparent-inner-border:#00000012;

@@ -281,7 +281,7 @@ body {
   color: var(--app-secondary-foreground);
   font-size: 0.875rem;
 }
-.messages-empty .sub { color: var(--app-secondary-foreground); opacity: 0.7; font-size: 0.8125rem; margin-top: 4px; }
+.messages-empty .sub { color: var(--app-tertiary-foreground); font-size: 0.8125rem; margin-top: 4px; }
 
 /* === Timeline Message === */
 /* No left rail: the dot (::before) + connecting line / end-dot (::after) were
@@ -323,7 +323,7 @@ body {
   max-width: 85%;
   width: auto;
   user-select: text;
-  font-size: 1.125rem;
+  font-size: 1rem;
   line-height: 1.5;
   font-weight: 400;
 }
@@ -364,7 +364,7 @@ body {
   border: none;
   border-radius: 4px;
   background: transparent;
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
   cursor: pointer;
   font-size: 0.8125rem;
   transition: color 0.15s, background 0.15s;
@@ -415,7 +415,7 @@ body {
 .msg-search-count {
   flex: 0 0 auto;
   font-size: 0.8125rem;
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
   white-space: nowrap;
   padding: 0 8px;
   user-select: none;
@@ -431,7 +431,7 @@ body {
   border: none;
   border-radius: 6px;
   background: transparent;
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
   cursor: pointer;
   padding: 0;
   transition: background 0.12s, color 0.12s;
@@ -460,7 +460,7 @@ body {
   border: 1px solid var(--app-input-border, rgba(0, 0, 0, 0.08));
   border-radius: 8px;
   background: transparent;
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
   cursor: pointer;
   padding: 0;
   transition: background 0.12s, border-color 0.12s, color 0.12s;
@@ -500,8 +500,7 @@ body {
   margin-top: 4px;
   font-size: 0.75rem;
   line-height: 1.4;
-  color: var(--app-secondary-foreground);
-  opacity: 0.7;
+  color: var(--app-caption-foreground);
   user-select: none;
 }
 .msg-time-user {
@@ -533,7 +532,7 @@ body {
   margin-left: auto;
   border: none;
   background: transparent;
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
   cursor: pointer;
   font-size: 1rem;
   line-height: 1;
@@ -542,7 +541,7 @@ body {
 .steer-pending-status {
   align-self: flex-end;
   margin: 2px 4px 8px;
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
   font-size: 0.75rem;
 }
 /* A steer message stays visibly "pending" on its own bubble until the runtime
@@ -616,8 +615,8 @@ body {
 
 /* === Assistant Message === */
 .assistant-message-content {
-  font-size: 1.125rem;
-  line-height: 1.6;
+  font-size: 1rem;
+  line-height: 1.75;
   width: 100%;
   min-width: 0;
   white-space: pre-wrap;
@@ -627,7 +626,7 @@ body {
 
 .error-message-content {
   color: var(--app-error-foreground);
-  font-size: 1.125rem;
+  font-size: 1rem;
   line-height: 1.5;
   white-space: pre-wrap;
 }
@@ -676,7 +675,7 @@ body {
 /* The `todo` tool renders as a live checklist panel (☑/▸/☐) instead of a plain
    tool row — mirrors the TUI / Claude Code task-progress widget. */
 .todo-panel {
-  border: 1px solid var(--app-primary-border-color);
+  border: 1px solid var(--app-border-subtle);
   border-radius: var(--corner-radius-small);
   background: var(--app-tool-background, var(--app-secondary-background));
   padding: 8px 10px;
@@ -778,7 +777,7 @@ body {
 
 .tool-progress {
   margin: -1px 8px 4px 28px;
-  color: var(--app-secondary-foreground);
+  color: var(--app-caption-foreground);
   font-family: var(--app-monospace-font-family);
   font-size: 0.75rem;
   overflow: hidden;
@@ -790,7 +789,7 @@ body {
 .tool-type-icon {
   flex-shrink: 0;
   display: inline-flex;
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
 }
 
 .tool-name {
@@ -807,7 +806,7 @@ body {
      preview uses the available width (no big blank gap) and shows as much as
      fits; CSS ellipsis trims the rest. Full args are available on expand. */
   flex: 1 1 auto;
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
   font-size: 0.8125rem;
   font-family: var(--app-monospace-font-family);
   min-width: 0;
@@ -834,7 +833,7 @@ body {
 .tool-annotation.success { color: var(--app-success-foreground); }
 .tool-annotation.error { color: var(--app-error-foreground); }
 .tool-annotation.warning { color: var(--app-warning-accent); }
-.tool-annotation.pending { color: var(--app-secondary-foreground); }
+.tool-annotation.pending { color: var(--app-tertiary-foreground); }
 .tool-annotation.waiting { color: var(--app-warning-accent); }
 
 /* === Code Block (markdown / mono) === */
@@ -898,7 +897,7 @@ body {
 .markdown-root ul { list-style: disc; padding-inline-start: 1.5em; margin: 0.3em 0 0.5em; }
 .markdown-root ol { list-style: decimal; padding-inline-start: 1.5em; margin: 0.3em 0 0.5em; }
 .markdown-root li { margin-bottom: 3px; }
-.markdown-root li::marker { color: var(--app-secondary-foreground); }
+.markdown-root li::marker { color: var(--app-tertiary-foreground); }
 .markdown-root h1, .markdown-root h2, .markdown-root h3, .markdown-root h4 { margin: 0.8em 0 0.3em; font-weight: 600; line-height: 1.3; }
 .markdown-root h1 { font-size: 1.3em; }
 .markdown-root h2 { font-size: 1.15em; }
@@ -907,7 +906,7 @@ body {
 .markdown-root a { color: var(--app-link-color); text-decoration: none; }
 .markdown-root a:hover { text-decoration: underline; }
 .markdown-root blockquote { border-left: 3px solid var(--app-primary-border-color); padding-left: 12px; margin: 0.3em 0; color: var(--app-secondary-foreground); }
-.markdown-root hr { border: none; border-top: 1px solid var(--app-primary-border-color); margin: 0.6em 0; }
+.markdown-root hr { border: none; border-top: 1px solid var(--app-border-subtle); margin: 0.6em 0; }
 .markdown-root code {
   font-family: var(--app-monospace-font-family);
   word-break: break-word;
@@ -999,7 +998,7 @@ body {
   min-width: 0;
 }
 .input-hint {
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
   font-size: 0.75rem;
   white-space: nowrap;
   overflow: hidden;
@@ -1012,7 +1011,7 @@ body {
   min-width: 0;
   padding: 0 4px;
   overflow: hidden;
-  color: var(--app-secondary-foreground);
+  color: var(--app-caption-foreground);
   font-size: 0.75rem;
   line-height: 1.5;
   white-space: nowrap;
@@ -1031,7 +1030,7 @@ body {
   border: none;
   border-radius: var(--corner-radius-small);
   background: transparent;
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
   cursor: pointer;
   font-size: 0.8125rem;
   font-family: var(--app-monospace-font-family);
@@ -1068,7 +1067,7 @@ body {
   resize: none;
   color: var(--app-input-foreground);
   font-family: inherit;
-  font-size: 1.125rem;
+  font-size: 1rem;
   line-height: 1.5;
   min-height: 3em;
   max-height: 200px;
@@ -1087,7 +1086,7 @@ body {
   gap: 6px;
   min-width: 0;
   padding: 0;
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
   font-size: 0.75rem;
 }
 
@@ -1421,7 +1420,7 @@ body {
 .sidebar-project-caret {
   display: flex;
   align-items: center;
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
   flex-shrink: 0;
 }
 .sidebar-project-menu {
@@ -1445,7 +1444,7 @@ body {
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.4px;
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
 }
 .sidebar-project-item {
   display: flex;
@@ -1482,7 +1481,7 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 0.75rem;
-  color: var(--app-secondary-foreground);
+  color: var(--app-caption-foreground);
 }
 .sidebar-project-item-count {
   flex-shrink: 0;
@@ -1491,7 +1490,7 @@ body {
   padding: 1px 7px;
   border-radius: 999px;
   background: var(--app-command-menu-hover-background);
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
   font-size: 0.75rem;
 }
 /* "Open another directory…" — separated action row below the project list. */
@@ -1508,7 +1507,7 @@ body {
   justify-content: center;
   width: 16px;
   height: 16px;
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
 }
 .sidebar-project-item-icon svg { width: 14px; height: 14px; }
 
@@ -1516,7 +1515,7 @@ body {
   letter-spacing: 0.5px;
   font-size: 0.75rem;
   font-weight: 600;
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
 }
 
 .group-by-control { position: relative; flex-shrink: 0; }
@@ -1530,7 +1529,7 @@ body {
   border: none;
   border-radius: var(--corner-radius-small);
   background: transparent;
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
   cursor: pointer;
 }
 .group-by-btn:hover {
@@ -1558,7 +1557,7 @@ body {
 .group-by-menu-title {
   padding: 6px 10px 4px;
   font-size: 0.75rem;
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
 }
 .group-by-item {
   display: flex;
@@ -1582,7 +1581,7 @@ body {
   padding: 10px 8px 3px;
   font-size: 0.8125rem;
   font-weight: 500;
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
 }
 .session-date-group:first-child .session-date-label { padding-top: 2px; }
 
@@ -1622,7 +1621,7 @@ body {
 
 .session-item-name { width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 1rem; }
 .session-item.active .session-item-name { font-weight: 600; }
-.session-item-meta { font-size: 0.75rem; color: var(--app-secondary-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%; }
+.session-item-meta { font-size: 0.75rem; color: var(--app-caption-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%; }
 
 /* Kebab (⋮) button — appears on hover or while its menu is open. */
 .session-item-kebab {
@@ -1636,7 +1635,7 @@ body {
   border: none;
   border-radius: var(--corner-radius-small);
   background: transparent;
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
   cursor: pointer;
   opacity: 0;
 }
@@ -2039,7 +2038,7 @@ body {
   flex-shrink: 0;
 }
 .modal-header h3 { font-size: 1rem; font-weight: 700; color: var(--app-primary-foreground); margin: 0; }
-.modal-header .modal-sub { color: var(--app-secondary-foreground); font-size: 0.75rem; }
+.modal-header .modal-sub { color: var(--app-tertiary-foreground); font-size: 0.75rem; }
 .modal-header .modal-tag {
   margin-left: auto;
   font-family: var(--app-monospace-font-family);
@@ -2075,7 +2074,7 @@ body {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: var(--app-secondary-foreground);
+  color: var(--app-tertiary-foreground);
 }
 
 /* === Turn-blocking interaction dock ===
@@ -2112,10 +2111,9 @@ body {
   overscroll-behavior: contain;
 }
 
-/* === Permission card (tool approval) — matches landing/home brand style ===
-   The generic modal is reused, but the approval popup adopts the home page's
-   warm clay accent, diamond brand mark and serif title so it feels of-a-piece
-   with the landing hero instead of a system warning dialog. */
+/* === Permission card (tool approval) ===
+   Keep the clay brand mark, but use the application sans face for operational
+   decisions. Display serif remains reserved for the brand and empty hero. */
 /* No divider lines: the header/body/footer read as one calm surface rather
    than three boxed-off sections, matching the borderless landing hero. */
 .permission-card .permission-header {
@@ -2136,8 +2134,8 @@ body {
   flex-shrink: 0;
 }
 .permission-title {
-  font-family: var(--app-serif-font-family);
-  font-size: 1.25rem !important;
+  font-family: var(--app-sans-font-family);
+  font-size: 1.125rem !important;
   font-weight: 600 !important;
   letter-spacing: -0.01em;
   color: var(--app-brand-text) !important;
@@ -2146,9 +2144,9 @@ body {
   background: color-mix(in srgb, var(--app-brand), transparent 84%);
   color: var(--app-brand);
 }
-/* Brief, friendly lead-in line under the header, echoing the landing tagline. */
+/* Brief lead-in line under the header. */
 .permission-lead {
-  font-family: var(--app-serif-font-family);
+  font-family: var(--app-sans-font-family);
   font-size: 1rem;
   color: var(--app-secondary-foreground);
   margin: 0;
