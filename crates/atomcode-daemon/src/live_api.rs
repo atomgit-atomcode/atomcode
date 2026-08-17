@@ -330,6 +330,7 @@ pub(crate) fn chat_runtime_config(
         ),
         user_agent: p.and_then(|p| p.user_agent.clone()),
         skip_tls_verify: p.map(|p| p.skip_tls_verify).unwrap_or(false),
+        retry_max_attempts: p.and_then(|p| p.retry_max_attempts),
         loop_max_rounds: atomcode_coding::resolve_loop_max_rounds(
             config.loop_config.max_rounds,
             std::env::var("ATOMCODE_LOOP_MAX_ROUNDS").ok().as_deref(),

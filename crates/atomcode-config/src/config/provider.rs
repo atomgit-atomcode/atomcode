@@ -90,6 +90,11 @@ pub struct ProviderConfig {
     /// tier; fewer than 2 (or a non-participating host) ⇒ the subagent uses the current model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capable_model: Option<i64>,
+    /// Max attempts (including the first request) for transient HTTP 429 / 5xx /
+    /// timeout retries on the provider OPEN call. `None` ⇒ the adapter default
+    /// (3 attempts). Set `1` to disable automatic retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_max_attempts: Option<u32>,
 }
 
 /// A provider *account*: a reusable connection + credential identity (new schema,
@@ -164,6 +169,10 @@ pub struct ModelProfileConfig {
     pub thinking_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_budget: Option<u32>,
+    /// Max attempts (including the first request) for transient HTTP 429 / 5xx /
+    /// timeout retries on the provider OPEN call. `None` ⇒ adapter default (3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_max_attempts: Option<u32>,
 }
 
 /// One flattened, immutable resolution of a model selection (design §3.4). This
@@ -198,6 +207,9 @@ pub struct ResolvedModelConfig {
     pub thinking_enabled: Option<bool>,
     pub thinking_budget: Option<u32>,
     pub capable_model: Option<i64>,
+    /// Max attempts (including the first request) for transient HTTP 429 / 5xx /
+    /// timeout retries on the provider OPEN call. `None` ⇒ adapter default (3).
+    pub retry_max_attempts: Option<u32>,
 }
 
 impl std::fmt::Debug for ResolvedModelConfig {
@@ -243,6 +255,7 @@ impl ResolvedModelConfig {
             skip_tls_verify: self.skip_tls_verify,
             ephemeral: false,
             capable_model: self.capable_model,
+            retry_max_attempts: self.retry_max_attempts,
         }
     }
 }
@@ -527,6 +540,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            retry_max_attempts: None,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
@@ -557,6 +571,7 @@ mod tests {
             skip_tls_verify: true,
             ephemeral: false,
             capable_model: None,
+            retry_max_attempts: None,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
@@ -582,6 +597,7 @@ mod tests {
         assert!(s.contains("capable_model = 1"), "set rank must serialize");
         let none_cfg = ProviderConfig {
             capable_model: None,
+            retry_max_attempts: None,
             ..cfg
         };
         let s2 = toml::to_string(&none_cfg).expect("serialize");
@@ -634,6 +650,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            retry_max_attempts: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-from-env-var".to_string()));
@@ -663,6 +680,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            retry_max_attempts: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-custom-123".to_string()));
@@ -692,6 +710,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            retry_max_attempts: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-openai-std".to_string()));

@@ -166,6 +166,7 @@ pub(crate) async fn create_provider(Json(req): Json<CreateProviderRequest>) -> i
         skip_tls_verify: req.skip_tls_verify,
         ephemeral: false,
         capable_model: None,
+            retry_max_attempts: None,
     };
 
     let mut is_new = false;

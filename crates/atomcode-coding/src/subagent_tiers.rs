@@ -68,6 +68,7 @@ mod tests {
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: capable,
+            retry_max_attempts: None,
         }
     }
 
