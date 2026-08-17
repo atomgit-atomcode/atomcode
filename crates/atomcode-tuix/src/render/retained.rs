@@ -6241,11 +6241,33 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .iter()
             .map(|index| self.body_lines[*index].clone())
             .collect();
-        for run in &self.body_copy_runs {
-            let Some(row) = visible_indices
-                .iter()
-                .position(|body_index| *body_index == run.body_index)
-            else {
+        // Copy-run hit regions only matter for VISIBLE rows. Map each visible body index
+        // to its painted row (O(viewport)) and restrict the scan to the runs whose
+        // body_index falls in the visible span — `body_copy_runs` is sorted ascending by
+        // body_index, so a `partition_point` bounds it. This keeps the two loops below
+        // O(visible runs) instead of O(entire scrollback × viewport) per frame, which was
+        // the dominant per-keystroke cost with a long transcript (up to ~5000 runs × the
+        // viewport, every 5ms frame while typing).
+        let visible_row_of: std::collections::HashMap<usize, usize> = visible_indices
+            .iter()
+            .enumerate()
+            .map(|(row, body_index)| (*body_index, row))
+            .collect();
+        debug_assert!(
+            self.body_copy_runs
+                .windows(2)
+                .all(|w| w[0].body_index <= w[1].body_index),
+            "body_copy_runs must stay sorted by body_index for partition_point"
+        );
+        let visible_run_slice = {
+            let lo = visible_indices.iter().copied().min().unwrap_or(0);
+            let hi = visible_indices.iter().copied().max().unwrap_or(0);
+            let start = self.body_copy_runs.partition_point(|run| run.body_index < lo);
+            let end = self.body_copy_runs.partition_point(|run| run.body_index <= hi);
+            start..end
+        };
+        for run in &self.body_copy_runs[visible_run_slice.clone()] {
+            let Some(&row) = visible_row_of.get(&run.body_index) else {
                 continue;
             };
             let width = crate::width::display_width(&run.text).max(1);
@@ -6267,11 +6289,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let transcript_selection = self
             .interaction_publisher
             .projected_transcript_selection(&self.pending_copy_runs);
-        for run in &self.body_copy_runs {
-            let Some(row) = visible_indices
-                .iter()
-                .position(|body_index| *body_index == run.body_index)
-            else {
+        for run in &self.body_copy_runs[visible_run_slice.clone()] {
+            let Some(&row) = visible_row_of.get(&run.body_index) else {
                 continue;
             };
             let mut col = run.col;
