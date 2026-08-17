@@ -111,6 +111,7 @@ context_window = 64000</code></pre>
           <tr><td><code>default_workdir</code></td><td>string?</td><td>Default working directory. <code>/cd</code> writes back here; restored next launch</td></tr>
           <tr><td><code>providers</code></td><td>table</td><td>Map of provider name to <a href="#provider-config">ProviderConfig</a></td></tr>
           <tr><td><code>vision_preprocessor_provider</code></td><td>string?</td><td>When the main provider can't see images but the user attaches one, forward it to this provider for OCR / description; the result is spliced back into the prompt as text. See <a href="#vision-preprocessor">Vision preprocessor</a></td></tr>
+          <tr><td><code>init_prompt_file</code></td><td>string?</td><td>UTF-8 file whose requirements are appended to the built-in <code>/init</code> prompt. Relative paths resolve from <code>$ATOMCODE_HOME</code>; maximum size is 64 KiB. This can also be edited in <code>/config</code>.</td></tr>
         </tbody>
       </table>
 

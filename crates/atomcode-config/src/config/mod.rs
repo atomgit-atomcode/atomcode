@@ -273,6 +273,10 @@ pub struct Config {
     /// short key defined by `Locale`'s serde rename (e.g. `"zh_CN"`).
     #[serde(default)]
     pub language: Option<crate::locale::Locale>,
+    /// Optional UTF-8 file whose content is appended to the built-in `/init`
+    /// instructions. Relative paths resolve from the AtomCode config directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_prompt_file: Option<std::path::PathBuf>,
     /// UI rendering preferences. Currently exposes the light/dark theme
     /// switch driving the TUIX colour palette (markdown headings, code
     /// block syntax highlight, session-name pill). Missing from older
@@ -586,6 +590,7 @@ impl Default for Config {
             tools: ToolsConfig::default(),
             vision_preprocessor_provider: None,
             language: None,
+            init_prompt_file: None,
             ui: UiConfig::default(),
             plugin: PluginConfig::default(),
             web_search: WebSearchConfig::default(),
@@ -2742,6 +2747,7 @@ model = "missing-type"
             },
             vision_preprocessor_provider: None,
             language: None,
+            init_prompt_file: None,
             ui: Default::default(),
             plugin: Default::default(),
             web_search: Default::default(),
@@ -3025,6 +3031,24 @@ model = "missing-type"
         std::fs::write(tmp.path(), "default_provider = \"foo\"\n[providers]\n").unwrap();
         let loaded = Config::load(tmp.path()).unwrap();
         assert_eq!(loaded.language, None);
+    }
+
+    #[test]
+    fn init_prompt_file_round_trips_and_defaults_to_none() {
+        let missing: Config = toml::from_str("default_provider = \"foo\"\n[providers]\n").unwrap();
+        assert_eq!(missing.init_prompt_file, None);
+
+        let configured: Config = toml::from_str(
+            "default_provider = \"foo\"\ninit_prompt_file = \"prompts/init-zh.md\"\n[providers]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            configured.init_prompt_file.as_deref(),
+            Some(std::path::Path::new("prompts/init-zh.md"))
+        );
+        assert!(toml::to_string(&configured)
+            .unwrap()
+            .contains("init_prompt_file = \"prompts/init-zh.md\""));
     }
 
     #[test]

@@ -111,6 +111,7 @@ context_window = 64000</code></pre>
           <tr><td><code>default_workdir</code></td><td>string?</td><td>默认工作目录。用 <code>/cd</code> 切换目录时自动写回这里,下次启动恢复</td></tr>
           <tr><td><code>providers</code></td><td>table</td><td>provider 名到 <a href="#provider-config">ProviderConfig</a> 的映射</td></tr>
           <tr><td><code>vision_preprocessor_provider</code></td><td>string?</td><td>当主 provider 不支持图片但用户 attach 了图时,把图片转交给这里指定的 provider 做 OCR / 描述,结果以文本形式 splice 给主模型。详见 <a href="#vision-preprocessor">视觉预处理器</a></td></tr>
+          <tr><td><code>init_prompt_file</code></td><td>string?</td><td>追加到内置 <code>/init</code> 提示词后的 UTF-8 文件。相对路径基于 <code>$ATOMCODE_HOME</code> 解析，最大 64 KiB；也可以在 <code>/config</code> 中编辑。</td></tr>
         </tbody>
       </table>
 

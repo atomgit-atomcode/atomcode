@@ -15,6 +15,7 @@ pub enum SettingKind {
     OptionalBoolean,
     Integer { min: i64, max: i64 },
     Choice(&'static [&'static str]),
+    Text,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,6 +228,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         kind: SettingKind::Choice(LANGUAGES),
         apply: ApplyPolicy::ImmediateUi,
     },
+    SettingSpec {
+        id: "init_prompt_file",
+        path: &["init_prompt_file"],
+        label_en: "Custom /init prompt file",
+        label_zh: "自定义 /init 提示词文件",
+        aliases: &["agents", "AGENTS.md", "初始化"],
+        kind: SettingKind::Text,
+        apply: ApplyPolicy::NextTurn,
+    },
 ];
 
 const fn bool_setting(
@@ -296,6 +306,11 @@ impl SettingSpec {
                 .language
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "auto".into()),
+            "init_prompt_file" => config
+                .init_prompt_file
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
             _ => String::new(),
         }
     }
@@ -343,6 +358,14 @@ impl SettingSpec {
                     bail!("expected one of: {}", values.join(", "));
                 }
                 if self.id == "language" && input == "auto" {
+                    self.reset(document);
+                    return Ok(());
+                }
+                value(input)
+            }
+            SettingKind::Text => {
+                let input = input.trim();
+                if input.is_empty() {
                     self.reset(document);
                     return Ok(());
                 }
@@ -567,6 +590,21 @@ mod tests {
             .find(|setting| setting.id == "coding.shell_guard_policy")
             .unwrap();
         assert_eq!(setting.value(&configured), "prompt");
+    }
+
+    #[test]
+    fn init_prompt_file_is_editable_and_empty_input_resets_it() {
+        let setting = SETTINGS
+            .iter()
+            .find(|setting| setting.id == "init_prompt_file")
+            .unwrap();
+        let mut document = DocumentMut::new();
+        setting.patch(&mut document, "prompts/init-zh.md").unwrap();
+        let configured: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(setting.value(&configured), "prompts/init-zh.md");
+
+        setting.patch(&mut document, "  ").unwrap();
+        assert!(!document.to_string().contains("init_prompt_file"));
     }
 
     #[test]

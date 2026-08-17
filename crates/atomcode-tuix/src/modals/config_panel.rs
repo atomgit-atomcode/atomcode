@@ -134,7 +134,7 @@ impl ConfigPanel {
                     renderer,
                 )
             }
-            SettingKind::Integer { .. } => {
+            SettingKind::Integer { .. } | SettingKind::Text => {
                 self.editing = Some(setting);
                 self.edit_value = current;
                 self.edit_cursor_byte = self.edit_value.len();

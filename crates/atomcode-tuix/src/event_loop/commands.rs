@@ -2873,7 +2873,15 @@ fn execute_slash_command_impl(
             // LLM-driven: submit the init prompt as a normal user turn; the agent explores the
             // repo with its tools and writes/improves AGENTS.md via write_file. Replaces the old
             // static .atomcode.md generator.
-            submit_agent_turn(ctx, state, atomcode_coding::INIT_PROMPT.to_string());
+            let prompt = match build_init_prompt_from_config(&ctx.config) {
+                Ok(prompt) => prompt,
+                Err(error) => {
+                    renderer.render(UiLine::Error(error.to_string()));
+                    renderer.flush();
+                    return Ok(());
+                }
+            };
+            submit_agent_turn(ctx, state, prompt);
             renderer.render(UiLine::CommandOutput(t(Msg::InitKickoff).into_owned()));
             renderer.flush();
         }
@@ -3883,6 +3891,13 @@ fn execute_slash_command_impl(
         }
     }
     Ok(())
+}
+
+fn build_init_prompt_from_config(config: &atomcode_config::Config) -> Result<String, String> {
+    let locale = config
+        .language
+        .unwrap_or_else(atomcode_config::i18n::current_locale);
+    atomcode_coding::build_init_prompt(locale, config.init_prompt_file.as_deref())
 }
 
 /// Reload the current-project session picker after a cancelled resume without
@@ -8389,7 +8404,8 @@ mod memory_command_tests {
 #[cfg(test)]
 mod todo_command_tests {
     use super::{
-        decide_custom_command, format_todo_command, render_custom_command_error, CustomDispatch,
+        build_init_prompt_from_config, decide_custom_command, format_todo_command,
+        render_custom_command_error, CustomDispatch,
     };
     use crate::custom_commands::ArgsRequirement;
     use crate::render::{Renderer, UiLine};
@@ -8909,9 +8925,20 @@ mod todo_command_tests {
     }
 
     #[test]
-    fn init_submits_the_coding_init_prompt() {
-        // handler 用 atomcode_coding::INIT_PROMPT 作为提交文本;这里锁定接线源。
-        assert!(atomcode_coding::INIT_PROMPT.contains("AGENTS.md"));
+    fn init_prompt_uses_the_language_from_the_live_config() {
+        let mut config = atomcode_config::Config::default();
+        config.language = Some(atomcode_config::locale::Locale::ZhCn);
+        let prompt = build_init_prompt_from_config(&config).unwrap();
+        assert!(prompt.contains("最终文件使用简体中文编写"));
+    }
+
+    #[test]
+    fn init_prompt_config_error_prevents_a_submit_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = atomcode_config::Config::default();
+        config.init_prompt_file = Some(dir.path().join("missing.md"));
+        let error = build_init_prompt_from_config(&config).unwrap_err();
+        assert!(error.contains("failed to read custom /init prompt"));
     }
 
     #[test]

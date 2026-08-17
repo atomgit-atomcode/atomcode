@@ -72,7 +72,7 @@ pub use config::{
 };
 pub use controllers::{GoalPhase, GoalProgress, GoalTerminal, LoopProgress};
 pub use discipline::VerifyCadenceHook;
-pub use init_prompt::INIT_PROMPT;
+pub use init_prompt::{build_init_prompt, INIT_PROMPT, INIT_PROMPT_ZH_CN};
 pub use parts::{
     assemble, prepare, prepare_with_plugin_hook_source, prepare_with_plugin_hooks,
     subagent_enabled_from_env, CodingParts, PrepareOptions, SessionBinding, SessionMode,
