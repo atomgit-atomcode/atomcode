@@ -7,11 +7,12 @@
 //! buckets (working dirs that are throwaway `tempfile` paths).
 //!
 //! [`isolate_home`] redirects `ATOMCODE_HOME` to a throwaway temp dir the FIRST
-//! time it runs, only when the var isn't already set. It's idempotent (guarded by
-//! a `Once`), so calling it from a `#[ctor]` in each test binary sets one stable
-//! value before libtest spawns any thread — no `set_var` race (unlike per-test
-//! `set_var`, which races under the parallel harness). Tests that set their own
-//! `ATOMCODE_HOME` still win.
+//! time it runs, replacing any value inherited from the developer's shell. It's
+//! idempotent (guarded by a `Once`), so calling it from a `#[ctor]` in each test
+//! binary sets one stable value before libtest spawns any thread — no `set_var`
+//! race (unlike per-test `set_var`, which races under the parallel harness).
+//! Tests that need a dedicated home may still replace the isolated value inside
+//! their test, using the crate's process-global environment lock where required.
 //!
 //! Gated behind the `test-support` cargo feature so the env-mutating helper never
 //! enters a normal (non-test) build. Consuming crates enable it via a
@@ -40,15 +41,46 @@ use std::sync::Once;
 
 static INIT: Once = Once::new();
 
-/// Redirect `ATOMCODE_HOME` to a per-process temp dir if unset. Idempotent and
-/// race-free (runs once). Call from a `#[ctor]` so it lands before any test.
+/// Redirect `ATOMCODE_HOME` to a per-process temp dir. Any inherited value is
+/// deliberately replaced: a test process must never interpret a developer's
+/// real configured data directory as disposable fixture state.
+///
+/// Idempotent and race-free (runs once). Call from a `#[ctor]` so it lands before
+/// any test.
 pub fn isolate_home() {
     INIT.call_once(|| {
-        if std::env::var_os("ATOMCODE_HOME").is_some() {
-            return; // explicit override (real run, or a test that set its own) wins
-        }
-        let dir = std::env::temp_dir().join(format!("atomcode-test-home-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("atomcode-test-home-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|error| {
+            panic!(
+                "failed to create isolated ATOMCODE_HOME at {}: {error}",
+                dir.display()
+            )
+        });
         std::env::set_var("ATOMCODE_HOME", &dir);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inherited_atomcode_home_is_never_reused_as_test_storage() {
+        let inherited = std::env::temp_dir().join(format!(
+            "atomcode-real-home-sentinel-{}",
+            std::process::id()
+        ));
+        std::env::set_var("ATOMCODE_HOME", &inherited);
+
+        isolate_home();
+
+        let isolated = std::env::var_os("ATOMCODE_HOME").unwrap();
+        assert_ne!(std::path::PathBuf::from(&isolated), inherited);
+        assert!(std::path::Path::new(&isolated).is_dir());
+    }
 }

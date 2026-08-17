@@ -15,7 +15,7 @@ use atomcode_capabilities::memory::{MemoryHook, MemoryStore};
 
 // Redirect ATOMCODE_HOME to a throwaway temp dir before any test in this binary runs,
 // so any memory persistence that resolves the global store without an explicit path
-// never writes into the developer's real home. Tests that set ATOMCODE_HOME still win.
+// never writes into the developer's real home. Inherited shell values are replaced.
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
     atomcode_kernel::test_support::isolate_home();

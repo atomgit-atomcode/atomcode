@@ -2,8 +2,9 @@
 
 // Redirect ATOMCODE_HOME to a throwaway temp dir before any test in this binary
 // runs, so the crate's own unit tests never persist commands/plugins/config into
-// the developer's real `~/.atomcode`. Tests that set their own ATOMCODE_HOME still
-// win (isolate_home is a no-op when the var is already set).
+// the developer's real `~/.atomcode`. Individual tests can install their own
+// temporary home after the ctor; inherited shell values are never reused as
+// disposable test state.
 #[cfg(test)]
 #[ctor::ctor]
 fn _isolate_atomcode_home() {

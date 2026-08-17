@@ -1364,12 +1364,28 @@ pub fn logout() -> Result<()> {
 /// Get stored auth info
 pub fn get_stored_auth() -> Option<AuthInfo> {
     let auth_path = auth_file_path();
-    if !auth_path.exists() {
-        return None;
-    }
+    read_stored_auth_at(&auth_path).ok().flatten()
+}
 
-    let content = std::fs::read_to_string(&auth_path).ok()?;
-    toml::from_str(&content).ok()
+/// Read credentials without collapsing transient I/O or parse failures into a
+/// confirmed logout. Credential writers replace the file atomically, so this
+/// remains non-blocking even while a refresh request holds the writer lock.
+pub fn get_stored_auth_checked() -> Result<Option<AuthInfo>> {
+    read_stored_auth_at(&auth_file_path())
+}
+
+fn read_stored_auth_at(auth_path: &std::path::Path) -> Result<Option<AuthInfo>> {
+    let content = match std::fs::read_to_string(auth_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to read auth file at {}", auth_path.display()));
+        }
+    };
+    toml::from_str(&content)
+        .map(Some)
+        .with_context(|| format!("Failed to parse auth file at {}", auth_path.display()))
 }
 
 /// Save auth info to file
@@ -1603,6 +1619,17 @@ mod tests {
             worker.join().unwrap();
         }
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn checked_auth_read_distinguishes_invalid_data_from_logout() {
+        let temp = tempfile::tempdir().unwrap();
+        let auth_path = temp.path().join("auth.toml");
+        assert!(read_stored_auth_at(&auth_path).unwrap().is_none());
+
+        std::fs::write(&auth_path, "").unwrap();
+        assert!(read_stored_auth_at(&auth_path).is_err());
+        assert!(read_stored_auth_at(&auth_path).ok().flatten().is_none());
     }
 
     #[test]

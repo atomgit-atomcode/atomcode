@@ -3803,6 +3803,12 @@ impl AuthObservation {
         }
     }
 
+    fn read_checked() -> anyhow::Result<Self> {
+        Ok(Self {
+            user_id: atomcode_auth::get_stored_auth_checked()?.map(|auth| auth.user.id),
+        })
+    }
+
     fn is_available(&self) -> bool {
         self.user_id.is_some()
     }
@@ -11713,7 +11719,18 @@ fn commit_auth_observation(
 /// the cross-process protocol. Token refreshes for the same account therefore do
 /// not cause provider reassembly, while logout/login transitions do.
 fn poll_external_auth(ctx: &mut LoopCtx) -> bool {
-    let current = AuthObservation::read();
+    let current = match AuthObservation::read_checked() {
+        Ok(current) => current,
+        Err(error) => {
+            // A transient read/parse failure is not proof of logout. Preserve
+            // the live provider and retry instead of cancelling an active turn.
+            crate::tuix_trace!(
+                "AUTH",
+                "credential observation failed; preserving current provider: {error:#}"
+            );
+            return false;
+        }
+    };
     let changed = ctx.observed_auth.as_ref() != Some(&current);
     if !changed || provider_transition_pending(ctx) {
         return false;
