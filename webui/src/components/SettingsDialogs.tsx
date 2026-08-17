@@ -14,7 +14,7 @@ import {
   getTunnelStatus,
   TunnelStatus,
 } from '../api';
-import { useSettings, Theme } from '../settings';
+import { useSettings, Theme, FontScale } from '../settings';
 import { Lang } from '../i18n';
 import { ConfirmDialog } from './ConfirmDialog';
 import { Select } from './Select';
@@ -75,11 +75,19 @@ function SettingsModal({
 }
 
 export function ThemeDialog({ onClose }: { onClose: () => void }) {
-  const { theme, setTheme, t } = useSettings();
+  const { theme, setTheme, fontScale, setFontScale, t } = useSettings();
   const options: { value: Theme; label: string }[] = [
     { value: 'light', label: t('settings.theme.light') },
     { value: 'dark', label: t('settings.theme.dark') },
     { value: 'system', label: t('settings.theme.system') },
+  ];
+  // Grouped with the theme rather than given a menu entry of its own: both
+  // answer "how should this look", and one dialog keeps the sidebar short.
+  const scales: { value: FontScale; label: string }[] = [
+    { value: 'small', label: t('settings.fontScale.small') },
+    { value: 'normal', label: t('settings.fontScale.normal') },
+    { value: 'large', label: t('settings.fontScale.large') },
+    { value: 'xlarge', label: t('settings.fontScale.xlarge') },
   ];
   return (
     <SettingsModal title={t('settings.menuTheme')} onClose={onClose}>
@@ -91,6 +99,21 @@ export function ThemeDialog({ onClose }: { onClose: () => void }) {
               key={o.value}
               class={'segmented-btn' + (theme === o.value ? ' active' : '')}
               onClick={() => setTheme(o.value)}
+              type="button"
+            >
+              {o.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div class="field-group">
+        <span class="modal-label">{t('settings.fontScale')}</span>
+        <div class="segmented">
+          {scales.map((o) => (
+            <button
+              key={o.value}
+              class={'segmented-btn' + (fontScale === o.value ? ' active' : '')}
+              onClick={() => setFontScale(o.value)}
               type="button"
             >
               {o.label}

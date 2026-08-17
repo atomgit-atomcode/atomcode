@@ -255,7 +255,7 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
                     <button
                       type="button"
                       title="移除此项目"
-                      style="background:none;border:none;cursor:pointer;padding:2px 4px;opacity:0.6;font-size:12px;margin-left:auto;color:inherit;"
+                      style="background:none;border:none;cursor:pointer;padding:2px 4px;opacity:0.6;font-size:0.75rem;margin-left:auto;color:inherit;"
                       onClick={(e) => handleDeleteProject(p.hash, e)}
                     >
                       ✕
