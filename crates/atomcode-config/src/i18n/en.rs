@@ -965,11 +965,11 @@ Msg::PluginMgrInstallingLabel => "Installing…".into(),
             ).into(),
         Msg::PluginMarketplaceUpdated { name, commit } =>
             format!("✓ marketplace `{name}` updated to {commit}").into(),
-        Msg::PluginInstallDone { plugin, marketplace: _, loaded: _, skipped: _, show_details_hint: _ } => {
-            format!("  ⎿  ✓ Installed {plugin}. Run /reload-plugins to apply.").into()
+        Msg::PluginInstallDone { plugin, marketplace: _, loaded, skipped, show_details_hint } => {
+            format!("  ⎿  ✓ Installed {plugin} — {}", plugin_reload_summary(loaded, skipped, show_details_hint)).into()
         }
-        Msg::PluginUpdateDone { plugin, marketplace: _, loaded: _, skipped: _, show_details_hint: _ } => {
-            format!("  ⎿  ✓ Updated {plugin}. Run /reload-plugins to apply.").into()
+        Msg::PluginUpdateDone { plugin, marketplace: _, loaded, skipped, show_details_hint } => {
+            format!("  ⎿  ✓ Updated {plugin} — {}", plugin_reload_summary(loaded, skipped, show_details_hint)).into()
         }
         Msg::SetupAutoReloaded { skills, warnings } =>
             format!("✓ Setup complete, auto-reloaded: {skills} skill(s), {warnings} warning(s)").into(),
@@ -1474,4 +1474,20 @@ mod codingplan_crypto_tests {
         assert!(s.contains("Windows Terminal"));
         assert!(s.to_lowercase().contains("scroll"));
     }
+}
+
+/// Render the outcome the caller already measured: `reload_plugins` runs
+/// immediately before this toast, so the skills ARE loaded by the time it
+/// prints. The previous text ("Run /reload-plugins to apply") was wrong twice
+/// over — it named a slash command that does not exist, to ask for work that
+/// had already happened — and it threw away all three counts it was handed.
+fn plugin_reload_summary(loaded: usize, skipped: usize, show_details_hint: bool) -> String {
+    let mut out = format!("{loaded} skill(s) loaded");
+    if skipped > 0 {
+        out.push_str(&format!(", {skipped} skipped"));
+    }
+    if show_details_hint {
+        out.push_str(" (Ctrl+O for details)");
+    }
+    out
 }

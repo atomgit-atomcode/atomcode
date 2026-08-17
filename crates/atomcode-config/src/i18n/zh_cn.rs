@@ -939,11 +939,11 @@ Msg::PluginActionBackDesc => "返回已安装插件列表".into(),
             ).into(),
         Msg::PluginMarketplaceUpdated { name, commit } =>
             format!("✓ marketplace `{name}` 已更新至 {commit}").into(),
-        Msg::PluginInstallDone { plugin, marketplace: _, loaded: _, skipped: _, show_details_hint: _ } => {
-            format!("  ⎿  ✓ Installed {plugin}. Run /reload-plugins to apply.").into()
+        Msg::PluginInstallDone { plugin, marketplace: _, loaded, skipped, show_details_hint } => {
+            format!("  ⎿  ✓ 已安装 {plugin} —— {}", plugin_reload_summary(loaded, skipped, show_details_hint)).into()
         }
-        Msg::PluginUpdateDone { plugin, marketplace: _, loaded: _, skipped: _, show_details_hint: _ } => {
-            format!("  ⎿  ✓ Updated {plugin}. Run /reload-plugins to apply.").into()
+        Msg::PluginUpdateDone { plugin, marketplace: _, loaded, skipped, show_details_hint } => {
+            format!("  ⎿  ✓ 已更新 {plugin} —— {}", plugin_reload_summary(loaded, skipped, show_details_hint)).into()
         }
         Msg::SetupAutoReloaded { skills, warnings } =>
             format!("✓ Setup 完成，已自动刷新：{skills} 个 skill，{warnings} 个警告").into(),
@@ -1436,4 +1436,16 @@ mod codingplan_crypto_tests {
         assert!(s.contains("Windows Terminal"));
         assert!(s.contains("滚"));
     }
+}
+
+/// 同 `en.rs` 的对应函数：重载在这条提示打印之前就已经做完，这里报的是结果。
+fn plugin_reload_summary(loaded: usize, skipped: usize, show_details_hint: bool) -> String {
+    let mut out = format!("已加载 {loaded} 个技能");
+    if skipped > 0 {
+        out.push_str(&format!("，跳过 {skipped} 个"));
+    }
+    if show_details_hint {
+        out.push_str("（Ctrl+O 查看详情）");
+    }
+    out
 }
