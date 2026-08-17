@@ -90,9 +90,9 @@ pub struct ProviderConfig {
     /// tier; fewer than 2 (or a non-participating host) ⇒ the subagent uses the current model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capable_model: Option<i64>,
-    /// Max attempts (including the first request) for transient HTTP 429 / 5xx /
-    /// timeout retries on the provider OPEN call. `None` ⇒ the adapter default
-    /// (3 attempts). Set `1` to disable automatic retries.
+    /// Max attempts (including the first request) for provider OPEN retries;
+    /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
+    /// each layer's default. Set `1` to disable adapter-level and 429 retries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_max_attempts: Option<u32>,
 }
@@ -169,8 +169,9 @@ pub struct ModelProfileConfig {
     pub thinking_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_budget: Option<u32>,
-    /// Max attempts (including the first request) for transient HTTP 429 / 5xx /
-    /// timeout retries on the provider OPEN call. `None` ⇒ adapter default (3).
+    /// Max attempts (including the first request) for provider OPEN retries;
+    /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
+    /// each layer's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_max_attempts: Option<u32>,
 }
@@ -207,8 +208,9 @@ pub struct ResolvedModelConfig {
     pub thinking_enabled: Option<bool>,
     pub thinking_budget: Option<u32>,
     pub capable_model: Option<i64>,
-    /// Max attempts (including the first request) for transient HTTP 429 / 5xx /
-    /// timeout retries on the provider OPEN call. `None` ⇒ adapter default (3).
+    /// Max attempts (including the first request) for provider OPEN retries;
+    /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
+    /// each layer's default.
     pub retry_max_attempts: Option<u32>,
 }
 

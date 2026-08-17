@@ -11026,6 +11026,24 @@ mod external_config_tests {
     }
 
     #[test]
+    fn explicit_current_model_edit_is_adopted_by_a_pinned_session() {
+        let current = config("pinned-model", false);
+        let mut persisted = current.clone();
+        persisted.providers.get_mut("main").unwrap().retry_max_attempts = Some(7);
+
+        let desired = desired_config_from_snapshot_parts(
+            &current,
+            crate::ProviderSelectionMode::Pinned,
+            persisted,
+            true,
+        );
+
+        assert_eq!(desired.default_provider, "main");
+        assert_eq!(desired.providers["main"].model, "pinned-model");
+        assert_eq!(desired.providers["main"].retry_max_attempts, Some(7));
+    }
+
+    #[test]
     fn proxy_runtime_config_retains_an_ephemeral_provider_missing_from_disk() {
         let current = config("oauth-model", true);
         let mut persisted = Config::default();
@@ -11690,6 +11708,7 @@ pub(crate) fn apply_config_panel_commit(
     previous_document: String,
     force_agent_reassemble: bool,
     force_capability_reprepare: bool,
+    adopt_active_provider_edit: bool,
     success_message: String,
 ) -> Result<PersistedConfigReload, anyhow::Error> {
     if provider_transition_pending(ctx) {
@@ -11701,7 +11720,18 @@ pub(crate) fn apply_config_panel_commit(
         }
         anyhow::bail!("a runtime configuration transition is already in progress");
     }
-    let desired = desired_config_from_snapshot(ctx, commit.snapshot.config, false);
+    // Most panel settings are provider-neutral, so a pinned session keeps its
+    // opened model just like it does for external config changes. A dynamic
+    // setting that explicitly edits the current model (currently retry count)
+    // must adopt that model profile from the committed snapshot; otherwise the
+    // pinned merge would put the stale runtime copy back and report false
+    // success even though only the on-disk value changed.
+    let desired = desired_config_from_snapshot_parts(
+        &ctx.config,
+        ctx.provider_selection_mode,
+        commit.snapshot.config,
+        adopt_active_provider_edit,
+    );
     let auth_available = AuthObservation::read().is_available();
     let wants_reload = force_agent_reassemble
         || force_capability_reprepare

@@ -1,8 +1,11 @@
-//! UI-neutral catalog for safely editable non-provider settings.
+//! UI-neutral catalog for safely editable settings.
 //!
 //! The catalog deliberately contains no model, provider, account, endpoint, or
 //! credential fields. Drivers can render it without learning the full `Config`
 //! schema, while writes remain document-level patches through `ConfigStore`.
+//! The one current-model setting exposed by `/config` uses the explicit helper
+//! below instead of entering the static catalog, because its TOML path depends
+//! on whether the active selection uses the legacy or account/model schema.
 
 use anyhow::{bail, Result};
 use toml_edit::{value, DocumentMut, Item, Table};
@@ -438,6 +441,61 @@ fn integer_at_path(document: &DocumentMut, path: &[&str]) -> Option<i64> {
     table.get(leaf)?.as_integer()
 }
 
+/// Read the retry override for one concrete model selection. New-schema model
+/// profiles win on an id collision, matching `Config::resolve_model`.
+pub fn selection_retry_max_attempts(config: &Config, selection: &str) -> Option<u32> {
+    if let Some(model) = config.models.get(selection) {
+        return model.retry_max_attempts;
+    }
+    config
+        .providers
+        .get(selection)
+        .and_then(|provider| provider.retry_max_attempts)
+}
+
+/// Patch/reset the active selection's retry override without exposing provider
+/// credentials to the generic `/config` catalog. An empty value resets to the
+/// per-layer defaults; explicit values must fit the runtime's `u32` contract.
+pub fn patch_selection_retry_max_attempts(
+    document: &mut DocumentMut,
+    selection: &str,
+    input: Option<&str>,
+) -> Result<()> {
+    // The document is authoritative here, not the runtime Config. Runtime-only
+    // OAuth/CLI providers intentionally exist in memory but are filtered from
+    // disk; using Config membership would materialize an incomplete provider or
+    // model table containing only retry_max_attempts. Looking at the document
+    // also makes this atomic update safe when another process migrated schemas
+    // after the panel opened.
+    let contains = |parent: &str| {
+        document
+            .as_table()
+            .get(parent)
+            .and_then(Item::as_table)
+            .is_some_and(|table| table.contains_key(selection))
+    };
+    let parent = if contains("models") {
+        "models"
+    } else if contains("providers") {
+        "providers"
+    } else {
+        bail!("active model selection `{selection}` is temporary or not persisted in config.toml");
+    };
+    let path = [parent, selection, "retry_max_attempts"];
+    let Some(input) = input.map(str::trim).filter(|input| !input.is_empty()) else {
+        remove_path(document, &path);
+        return Ok(());
+    };
+    let attempts = input
+        .parse::<u32>()
+        .map_err(|_| anyhow::anyhow!("expected an integer between 1 and {}", u32::MAX))?;
+    if attempts == 0 {
+        bail!("value must be at least 1; use 1 to disable automatic retries");
+    }
+    set_path(document, &path, value(i64::from(attempts)));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,6 +663,65 @@ mod tests {
 
         setting.patch(&mut document, "  ").unwrap();
         assert!(!document.to_string().contains("init_prompt_file"));
+    }
+
+    #[test]
+    fn retry_attempts_patch_the_selected_legacy_provider_and_reset_cleanly() {
+        let source = r#"
+default_provider = "legacy"
+[providers.legacy]
+type = "openai"
+model = "model-a"
+base_url = "https://example.invalid/v1"
+"#;
+        let mut document = source.parse::<DocumentMut>().unwrap();
+
+        patch_selection_retry_max_attempts(&mut document, "legacy", Some("5")).unwrap();
+        let configured: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(selection_retry_max_attempts(&configured, "legacy"), Some(5));
+
+        patch_selection_retry_max_attempts(&mut document, "legacy", None).unwrap();
+        let reset: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(selection_retry_max_attempts(&reset, "legacy"), None);
+    }
+
+    #[test]
+    fn retry_attempts_patch_quoted_new_schema_model_and_reject_zero() {
+        let source = r#"
+default_model = "account/model"
+[provider_accounts.account]
+provider = "openai"
+[models."account/model"]
+account = "account"
+model = "model-a"
+"#;
+        let mut document = source.parse::<DocumentMut>().unwrap();
+
+        patch_selection_retry_max_attempts(&mut document, "account/model", Some("9")).unwrap();
+        let configured: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(
+            selection_retry_max_attempts(&configured, "account/model"),
+            Some(9)
+        );
+        assert!(
+            patch_selection_retry_max_attempts(&mut document, "account/model", Some("0")).is_err()
+        );
+    }
+
+    #[test]
+    fn retry_attempts_never_materialize_runtime_only_selections() {
+        let mut document = "default_provider = \"persisted\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+
+        let error =
+            patch_selection_retry_max_attempts(&mut document, "oauth-runtime-only", Some("5"))
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("temporary or not persisted"), "{error}");
+        assert!(!document.to_string().contains("oauth-runtime-only"));
+        assert!(!document.to_string().contains("retry_max_attempts"));
     }
 
     #[test]

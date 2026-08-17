@@ -1,7 +1,11 @@
-//! Searchable half-screen `/config` editor for non-provider settings.
+//! Searchable half-screen `/config` editor.
 
 use anyhow::Result;
-use atomcode_config::settings::{ApplyPolicy, SettingKind, SettingSpec, SETTINGS};
+use atomcode_config::settings::{
+    patch_selection_retry_max_attempts, selection_retry_max_attempts, ApplyPolicy, SettingKind,
+    SettingSpec, SETTINGS,
+};
+use atomcode_config::Config;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{
@@ -14,12 +18,81 @@ use crate::event_loop::{
 use crate::render::{MenuKind, MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
 
+const RETRY_SETTING_ID: &str = "model.retry_max_attempts";
+
+#[derive(Clone, Copy)]
+enum PanelSetting {
+    Static(&'static SettingSpec),
+    RetryMaxAttempts,
+}
+
+impl PanelSetting {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Static(setting) => setting.id,
+            Self::RetryMaxAttempts => RETRY_SETTING_ID,
+        }
+    }
+
+    fn kind(self) -> SettingKind {
+        match self {
+            Self::Static(setting) => setting.kind,
+            Self::RetryMaxAttempts => SettingKind::Integer {
+                min: 1,
+                max: u32::MAX as i64,
+            },
+        }
+    }
+
+    fn apply(self) -> ApplyPolicy {
+        match self {
+            Self::Static(setting) => setting.apply,
+            Self::RetryMaxAttempts => ApplyPolicy::AgentReassemble,
+        }
+    }
+
+    fn matches(self, query: &str) -> bool {
+        match self {
+            Self::Static(setting) => setting.matches(query),
+            Self::RetryMaxAttempts => {
+                let query = query.trim().to_lowercase();
+                query.is_empty()
+                    || RETRY_SETTING_ID.contains(&query)
+                    || "retry attempts current model".contains(&query)
+                    || "重试次数当前模型".contains(&query)
+            }
+        }
+    }
+
+    fn label(self, zh: bool, selection: &str) -> String {
+        match self {
+            Self::Static(setting) => if zh {
+                setting.label_zh
+            } else {
+                setting.label_en
+            }
+            .to_string(),
+            Self::RetryMaxAttempts if zh => format!("最大重试次数（当前模型：{selection}）"),
+            Self::RetryMaxAttempts => format!("Retry attempts (current model: {selection})"),
+        }
+    }
+
+    fn value(self, config: &Config, selection: &str) -> String {
+        match self {
+            Self::Static(setting) => setting.value(config),
+            Self::RetryMaxAttempts => selection_retry_max_attempts(config, selection)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "auto".into()),
+        }
+    }
+}
+
 pub struct ConfigPanel {
     query: String,
     query_cursor_byte: usize,
     search_focused: bool,
     selected: usize,
-    editing: Option<&'static SettingSpec>,
+    editing: Option<PanelSetting>,
     edit_value: String,
     edit_cursor_byte: usize,
     replace_edit_value_on_input: bool,
@@ -41,9 +114,11 @@ impl ConfigPanel {
         }
     }
 
-    fn filtered(&self) -> Vec<&'static SettingSpec> {
+    fn filtered(&self) -> Vec<PanelSetting> {
         SETTINGS
             .iter()
+            .map(PanelSetting::Static)
+            .chain(std::iter::once(PanelSetting::RetryMaxAttempts))
             .filter(|setting| setting.matches(&self.query))
             .collect()
     }
@@ -59,35 +134,41 @@ impl ConfigPanel {
         }
     }
 
-    fn selected_setting(&self) -> Option<&'static SettingSpec> {
+    fn selected_setting(&self) -> Option<PanelSetting> {
         self.filtered().get(self.selected).copied()
     }
 
     fn save(
         &mut self,
-        setting: &'static SettingSpec,
+        setting: PanelSetting,
         next: Option<&str>,
         ctx: &mut LoopCtx,
         renderer: &mut dyn Renderer,
     ) -> Result<()> {
         let mut previous_document = None;
+        let selection = ctx.provider_selection.clone();
         let commit = ctx.config_store.update_document(|document| {
             previous_document = Some(document.to_string());
-            if let Some(next) = next {
-                setting.patch(document, next)
-            } else {
-                setting.reset(document);
-                Ok(())
+            match (setting, next) {
+                (PanelSetting::Static(setting), Some(next)) => setting.patch(document, next),
+                (PanelSetting::Static(setting), None) => {
+                    setting.reset(document);
+                    Ok(())
+                }
+                (PanelSetting::RetryMaxAttempts, next) => {
+                    patch_selection_retry_max_attempts(document, &selection, next)
+                }
             }
         })?;
-        let committed_value = setting.value(&commit.snapshot.config);
-        let success_message = format!("✓ {} = {}", setting.id, committed_value);
+        let committed_value = setting.value(&commit.snapshot.config, &selection);
+        let success_message = format!("✓ {} = {}", setting.id(), committed_value);
         let outcome = apply_config_panel_commit(
             ctx,
             commit,
             previous_document.unwrap_or_default(),
-            setting.apply == ApplyPolicy::AgentReassemble,
-            setting.apply == ApplyPolicy::CapabilityReprepare,
+            setting.apply() == ApplyPolicy::AgentReassemble,
+            setting.apply() == ApplyPolicy::CapabilityReprepare,
+            matches!(setting, PanelSetting::RetryMaxAttempts),
             success_message.clone(),
         )?;
         if matches!(outcome, PersistedConfigReload::Applied { .. }) {
@@ -101,8 +182,8 @@ impl ConfigPanel {
         let Some(setting) = self.selected_setting() else {
             return Ok(());
         };
-        let current = setting.value(&ctx.config);
-        match setting.kind {
+        let current = setting.value(&ctx.config, &ctx.provider_selection);
+        match setting.kind() {
             SettingKind::Boolean => self.save(
                 setting,
                 Some(if current == "true" { "false" } else { "true" }),
@@ -148,12 +229,12 @@ impl ConfigPanel {
         let filtered = self.filtered();
         let zh = matches!(crate::i18n::current_locale(), crate::i18n::Locale::ZhCn);
         let title = if zh {
-            format!("配置 ({} / {})", filtered.len(), SETTINGS.len())
+            format!("配置 ({} / {})", filtered.len(), SETTINGS.len() + 1)
         } else {
-            format!("Config ({} / {})", filtered.len(), SETTINGS.len())
+            format!("Config ({} / {})", filtered.len(), SETTINGS.len() + 1)
         };
         let search = if let Some(setting) = self.editing {
-            format!("{} = {}", setting.id, self.edit_value)
+            format!("{} = {}", setting.id(), self.edit_value)
         } else {
             self.query.clone()
         };
@@ -175,12 +256,7 @@ impl ConfigPanel {
             (String::new(), String::new()),
         ];
         items.extend(filtered.iter().map(|setting| {
-            let label = if zh {
-                setting.label_zh
-            } else {
-                setting.label_en
-            };
-            let policy = match setting.apply {
+            let policy = match setting.apply() {
                 ApplyPolicy::ImmediateUi => {
                     if zh {
                         "立即"
@@ -218,8 +294,11 @@ impl ConfigPanel {
                 }
             };
             (
-                label.to_string(),
-                format!("{} · {policy}", setting.value(&ctx.config)),
+                setting.label(zh, &ctx.provider_selection),
+                format!(
+                    "{} · {policy}",
+                    setting.value(&ctx.config, &ctx.provider_selection)
+                ),
             )
         }));
         items.push((format!("— {hint} —"), String::new()));
@@ -338,13 +417,13 @@ impl Modal for ConfigPanel {
             }
             KeyCode::Delete => {
                 if let Some(setting) = self.selected_setting() {
-                    if self.pending_reset == Some(setting.id) {
+                    if self.pending_reset == Some(setting.id()) {
                         if let Err(error) = self.save(setting, None, ctx, renderer) {
                             renderer.render(UiLine::Error(error.to_string()));
                         }
                         self.pending_reset = None;
                     } else {
-                        self.pending_reset = Some(setting.id);
+                        self.pending_reset = Some(setting.id());
                     }
                 }
             }
@@ -445,9 +524,9 @@ mod tests {
         assert!(panel
             .filtered()
             .iter()
-            .all(|setting| setting.id.contains("todo")));
+            .all(|setting| setting.id().contains("todo")));
         panel.query = "主题".into();
-        assert_eq!(panel.filtered()[0].id, "ui.theme");
+        assert_eq!(panel.filtered()[0].id(), "ui.theme");
     }
 
     #[test]
@@ -471,6 +550,16 @@ mod tests {
         assert!(panel
             .filtered()
             .iter()
-            .all(|setting| setting.id.starts_with("lsp.")));
+            .all(|setting| setting.id().starts_with("lsp.")));
+    }
+
+    #[test]
+    fn retry_setting_is_searchable_in_both_languages() {
+        let mut panel = ConfigPanel::open();
+        panel.query = "retry".into();
+        assert_eq!(panel.filtered()[0].id(), RETRY_SETTING_ID);
+
+        panel.query = "重试".into();
+        assert_eq!(panel.filtered()[0].id(), RETRY_SETTING_ID);
     }
 }

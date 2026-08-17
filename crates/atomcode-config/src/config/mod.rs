@@ -2780,7 +2780,7 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
-            retry_max_attempts: None,
+                retry_max_attempts: None,
             },
         );
         cfg.save(&tmp).unwrap();
@@ -2998,7 +2998,7 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
-            retry_max_attempts: None,
+                retry_max_attempts: None,
             },
         );
         cfg.save(tmp.path()).unwrap();
@@ -3098,7 +3098,7 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
-            retry_max_attempts: None,
+                retry_max_attempts: None,
             },
         );
         Config {
@@ -3233,7 +3233,7 @@ model = "missing-type"
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
-            retry_max_attempts: None,
+                retry_max_attempts: None,
             },
         );
         assert!(cfg.can_handle_attached_images());
@@ -3442,7 +3442,7 @@ capable_model = 5
                 context_window: 128_000,
                 max_tokens: None,
                 capable_model: None,
-            retry_max_attempts: None,
+                retry_max_attempts: None,
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
@@ -3492,7 +3492,7 @@ capable_model = 5
                 context_window: 0, // zero window → error
                 max_tokens: None,
                 capable_model: None,
-            retry_max_attempts: None,
+                retry_max_attempts: None,
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,

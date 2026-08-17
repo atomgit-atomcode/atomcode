@@ -57,6 +57,8 @@ api_key = "sk-..."
 model = "deepseek-chat"
 base_url = "https://api.deepseek.com/v1"
 context_window = 64000
+# Total attempts including the first request. Default: 3; set 1 to disable retries.
+# retry_max_attempts = 5
 
 # DeepSeek V4 专属：推理历史回显策略
 # (unset = auto-detect: deepseek-v4* → include, deepseek-reasoner/r1 → exclude)

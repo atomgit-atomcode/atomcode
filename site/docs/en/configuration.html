@@ -128,6 +128,7 @@ context_window = 64000</code></pre>
           <tr><td><code>base_url</code></td><td>string</td><td>yes</td><td>API base URL, pointing at the actual endpoint. e.g. <code>https://api.deepseek.com/v1</code>, <code>http://localhost:11434</code></td></tr>
           <tr><td><code>context_window</code></td><td>integer</td><td>no</td><td>Model context window (tokens), default 64000. Default 8000 for <code>ollama</code></td></tr>
           <tr><td><code>max_tokens</code></td><td>integer?</td><td>no</td><td>Max output tokens per response. Defaults to <code>context_window / 4</code> when unset</td></tr>
+          <tr><td><code>retry_max_attempts</code></td><td>integer?</td><td>no</td><td>Total attempts in the provider OPEN retry loop; when set, it also caps kernel-owned HTTP 429 recovery (both include the first request). Unset preserves the existing defaults (3 adapter attempts and the kernel's rate-limit safety policy). Set to 1 to disable adapter-level and 429 retries. Must be at least 1. In the account/model schema, set this on the <code>[models."..."]</code> profile because retry behavior is model-specific.</td></tr>
           <tr><td><code>system_prompt</code></td><td>string?</td><td>no</td><td>Override the default system prompt. Rarely needed</td></tr>
           <tr><td><code>user_agent</code></td><td>string?</td><td>no</td><td>Override the HTTP User-Agent — useful when the upstream blocks the default UA</td></tr>
         </tbody>
@@ -305,7 +306,7 @@ base_url = "https://api.siliconflow.cn/v1"</code></pre>
       <h2>Three ways to edit the config</h2>
       <ul>
         <li><strong>Hand-edit</strong> — open <code>~/.atomcode/config.toml</code> in your favourite editor.</li>
-        <li><strong><code>/config</code> in the TUI</strong> — atomcode opens the config in your default editor.</li>
+        <li><strong><code>/config</code> in the TUI</strong> — search and edit safe settings in place. The dynamic <em>Retry attempts (current model)</em> row writes <code>retry_max_attempts</code> to the active model; press Delete twice to restore the default.</li>
         <li><strong><code>/provider</code> in the TUI</strong> — interactively manage provider accounts and their models; changes are written back to disk.</li>
       </ul>
 

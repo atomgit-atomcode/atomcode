@@ -118,11 +118,11 @@ const MAX_OVERFLOW_ATTEMPTS: u8 = 3;
 /// waits) so the user perceives a retry is happening AND a fresh connection gets
 /// a real chance to recover (the stale keep-alive class). NON-retryable errors
 /// (auth / 400 / balance) never enter this path — they fail fast.
-const MAX_PROVIDER_RETRIES: u32 = 3;
+const DEFAULT_MAX_PROVIDER_RETRIES: u32 = 3;
 /// Max mid-stream RECONNECTS after a stream idle-timeout before failing the turn
 /// (codex parity: 5). Each reconnect re-issues the SAME round from history
 /// (partial output discarded), with exponential backoff. Distinct from
-/// `MAX_PROVIDER_RETRIES` (which covers failures at OPEN, before any token).
+/// `max_provider_retries` (which covers failures at OPEN, before any token).
 const MAX_STREAM_RETRIES: u32 = 5;
 const MAX_PARTIAL_STREAM_RECOVERIES: u32 = 1;
 const PARTIAL_STREAM_RESUME_NUDGE: &str = "[The previous assistant stream timed out after partial output. The preserved assistant message and any interrupted tool results above are authoritative. Continue from that saved progress. Do not repeat completed tool calls or restart the task.]";
@@ -136,7 +136,7 @@ const PARTIAL_STREAM_RESUME_NUDGE: &str = "[The previous assistant stream timed 
 ///
 /// Worst-case in-turn blocking = `MAX_RATE_LIMIT_WAITS` × the host's per-wait cap
 /// (`atomcode_kernel::hook::RATE_LIMIT_AUTO_WAIT_SECS`, 120s) = 5 × 120s = 10 min.
-/// Kept on the scale of the other per-turn fuses (`MAX_PROVIDER_RETRIES` = 3,
+/// Kept on the scale of the other per-turn fuses (default provider retries = 3,
 /// `EMPTY_RESPONSE_MAX_RETRIES` = 5) rather than the old 20 (which permitted a
 /// 40-minute hang from a broken hook, far past the 300s `stream_timeout`).
 const MAX_RATE_LIMIT_WAITS: u32 = 5;
@@ -155,8 +155,8 @@ const SILENT_FIRST_RATE_LIMIT_RETRY: std::time::Duration = std::time::Duration::
 
 /// How many times the agent loop re-issues a round after the provider returns a
 /// COMPLETELY EMPTY but otherwise-successful completion (a 200 with no text, no
-/// tool calls, no reasoning). This is a DISTINCT tier from `MAX_PROVIDER_RETRIES`
-/// (which only fires on a `retryable` OPEN/stream `Err`): an empty 200 opens fine
+/// tool calls, no reasoning). This is a DISTINCT tier from the outer provider
+/// retry budget (which only fires on a `retryable` OPEN/stream `Err`): an empty 200 opens fine
 /// and streams a clean `Done`, so it would otherwise be mistaken for the model
 /// choosing to stop. Confirmed transient on the atomgit→DeepSeek path — the SAME
 /// request resent recovers — so it gets MORE attempts and a much SHORTER backoff
@@ -781,6 +781,10 @@ pub struct Agent {
     middlewares: Vec<Arc<dyn ToolMiddleware>>,
     hooks: Arc<dyn LifecycleHooks>,
     max_rounds: Option<u32>,
+    /// Number of outer same-round reopens after a retryable provider OPEN
+    /// failure. The provider adapter may already own an explicit bounded retry
+    /// policy, in which case its host sets this neutral outer budget to zero.
+    max_provider_retries: u32,
     /// Opt-in exact tool-loop policy. `None` keeps the neutral kernel behavior.
     tool_loop_policy: Option<ToolLoopPolicy>,
     /// SAFETY FUSE (FAILURE PERCEPTION): max times a `offer_continuation` hook may CONTINUE a
@@ -915,6 +919,7 @@ impl Agent {
             hooks: self.hooks,
             rt: RequestCtx::new(ev_tx, self.request_timeout),
             max_rounds: self.max_rounds,
+            max_provider_retries: self.max_provider_retries,
             tool_loop_policy: self.tool_loop_policy,
             max_continuations: self.max_continuations,
             resume: self.resume,
@@ -1022,6 +1027,7 @@ struct RunningAgent {
     hooks: Arc<dyn LifecycleHooks>,
     rt: RequestCtx,
     max_rounds: Option<u32>,
+    max_provider_retries: u32,
     /// Opt-in exact tool-loop policy. State derived from this policy is owned by
     /// `session_loop`, not by the immutable runtime configuration.
     tool_loop_policy: Option<ToolLoopPolicy>,
@@ -2283,12 +2289,13 @@ impl RunningAgent {
                 // errors (auth / 400 / balance) skip this and hard-fail below, so we
                 // never spin ~18s on an error that cannot recover. 429 is handled
                 // above by the host hook before reaching this branch.
-                Err(e) if e.retryable && provider_retry < MAX_PROVIDER_RETRIES => {
+                Err(e) if e.retryable && provider_retry < self.max_provider_retries => {
                     provider_retry += 1;
                     let wait = (provider_retry as u64 * 3).min(15); // 3 / 6 / 9s, matching v1
                     self.rt.emit(AgentEvent::Warning(format!(
-                        "API error {}，{wait} 秒后重试({provider_retry}/{MAX_PROVIDER_RETRIES})...",
-                        retry_reason(&e)
+                        "API error {}，{wait} 秒后重试({provider_retry}/{})...",
+                        retry_reason(&e),
+                        self.max_provider_retries
                     )));
                     // Cancellable backoff: Esc during the wait aborts the turn instead
                     // of forcing the user to sit through the full delay.
@@ -3839,6 +3846,7 @@ pub struct AgentBuilder {
     /// an empty Vec yields an empty `HookChain` that behaves exactly like `NoopHooks`.
     hooks: Vec<Arc<dyn LifecycleHooks>>,
     max_rounds: Option<u32>,
+    max_provider_retries: u32,
     tool_loop_policy: Option<ToolLoopPolicy>,
     max_continuations: Option<u32>,
     resume: Option<SessionSnapshot>,
@@ -3881,6 +3889,7 @@ impl Default for AgentBuilder {
             middlewares: Vec::new(),
             hooks: Vec::new(),
             max_rounds: None,
+            max_provider_retries: DEFAULT_MAX_PROVIDER_RETRIES,
             // Neutral default: exact loop detection is product policy and must be
             // enabled explicitly by the runtime assembling this agent.
             tool_loop_policy: None,
@@ -3966,6 +3975,15 @@ impl AgentBuilder {
     /// Hard cap on LLM rounds per turn (safety fuse; None = unlimited).
     pub fn max_rounds(mut self, n: u32) -> Self {
         self.max_rounds = Some(n);
+        self
+    }
+    /// Set the neutral outer retry budget for provider OPEN failures. This is
+    /// independent of retries performed inside a provider adapter; hosts that
+    /// configure an adapter-wide total should set this to zero to avoid
+    /// multiplying that total. The default preserves the historical three
+    /// outer retries.
+    pub fn max_provider_retries(mut self, n: u32) -> Self {
+        self.max_provider_retries = n;
         self
     }
     /// See `AgentBuilder.round_cap_checkpoint`. Default false.
@@ -4186,6 +4204,7 @@ impl AgentBuilder {
             // run-loop call sites are unchanged — they still call one hook object.
             hooks: Arc::new(HookChain::new(self.hooks)),
             max_rounds: self.max_rounds,
+            max_provider_retries: self.max_provider_retries,
             tool_loop_policy: self.tool_loop_policy,
             max_continuations: self.max_continuations,
             resume: self.resume,
@@ -4872,6 +4891,74 @@ mod cap_tests {
             a.content, b.content,
             "same content + same cap must yield byte-identical truncation"
         );
+    }
+}
+
+#[cfg(test)]
+mod provider_retry_budget_tests {
+    use super::*;
+    use crate::stream::ProviderError;
+    use crate::tool::{ToolDef, ToolRegistry};
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct AlwaysRetryable {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for AlwaysRetryable {
+        fn model_name(&self) -> &str {
+            "always-retryable"
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDef],
+            _options: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ProviderError {
+                retryable: true,
+                message: "transient open failure".into(),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_outer_budget_never_replays_an_exhausted_adapter_request() {
+        let provider = Arc::new(AlwaysRetryable {
+            calls: AtomicUsize::new(0),
+        });
+        let mut handle = Agent::builder()
+            .provider(provider.clone())
+            .tools(ToolRegistry::new().mount(&[]))
+            .max_provider_retries(0)
+            .build()
+            .spawn();
+
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "test".into(),
+                images: Vec::new(),
+            })
+            .unwrap();
+        let mut warned = false;
+        while let Some(event) = handle.events.recv().await {
+            warned |= matches!(event, AgentEvent::Warning(_));
+            if matches!(event, AgentEvent::TurnComplete { .. }) {
+                break;
+            }
+        }
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert!(!warned, "a disabled outer retry must not announce a replay");
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
     }
 }
 

@@ -1497,13 +1497,15 @@ pub fn assemble(
         cfg.context_window,
     )
     .map(Arc::new);
-    let rate_limit_hook: Arc<dyn LifecycleHooks> = match &parts.rate_limit_source {
-        Some(source) => Arc::new(crate::rate_limit::RateLimitHook::with_source(
+    let rate_limit_hook = match &parts.rate_limit_source {
+        Some(source) => crate::rate_limit::RateLimitHook::with_source(
             cfg.base_url.clone(),
             source.clone(),
-        )),
-        None => Arc::new(crate::rate_limit::RateLimitHook::new(cfg.base_url.clone())),
-    };
+        ),
+        None => crate::rate_limit::RateLimitHook::new(cfg.base_url.clone()),
+    }
+    .with_max_attempts(cfg.retry_max_attempts);
+    let rate_limit_hook: Arc<dyn LifecycleHooks> = Arc::new(rate_limit_hook);
     let mut builder = builder
         // Hard per-turn user boundary. Register before every middleware that can `Allow`
         // and bypass downstream approval gates.
@@ -1624,6 +1626,12 @@ pub fn assemble(
     // also bounds varying-call runaways. `0` leaves the neutral kernel fuse unwired.
     if cfg.max_rounds != 0 {
         builder = builder.max_rounds(cfg.max_rounds);
+    }
+    // An explicit retry_max_attempts value is the TOTAL adapter OPEN budget.
+    // Do not multiply it by the kernel's historical outer same-round retries;
+    // the neutral kernel default remains unchanged when the setting is absent.
+    if cfg.retry_max_attempts.is_some() {
+        builder = builder.max_provider_retries(0);
     }
     builder = builder.round_cap_checkpoint(cfg.round_cap_checkpoint);
     // Approval liveness: `Some(d)` ⇒ fail-closed after `d` (headless); `None` ⇒ PARK until

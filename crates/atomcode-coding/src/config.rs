@@ -141,8 +141,9 @@ pub struct CodingAgentConfig {
     /// Disable TLS certificate verification (self-signed / internal gateways).
     /// Sourced from `ProviderConfig::skip_tls_verify`; default false.
     pub skip_tls_verify: bool,
-    /// Max attempts (including the first request) for transient HTTP 429 / 5xx /
-    /// timeout retries on the provider OPEN call. `None` ⇒ adapter default (3).
+    /// Max attempts (including the first request) for provider OPEN retries;
+    /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
+    /// each layer's default.
     /// Sourced from `ProviderConfig::retry_max_attempts`.
     pub retry_max_attempts: Option<u32>,
     /// Full provider registry used to resolve task-tool fast/capable tiers.
@@ -188,8 +189,9 @@ pub struct CodingRuntimeConfig {
     pub credential_shell_policy: atomcode_capabilities::tools::CredentialShellPolicy,
     pub user_agent: Option<String>,
     pub skip_tls_verify: bool,
-    /// Max attempts (including the first request) for transient HTTP 429 / 5xx /
-    /// timeout retries on the provider OPEN call. `None` ⇒ adapter default (3).
+    /// Max attempts (including the first request) for provider OPEN retries;
+    /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
+    /// each layer's default.
     pub retry_max_attempts: Option<u32>,
     pub loop_max_rounds: u32,
     pub turn_max_rounds: u32,
