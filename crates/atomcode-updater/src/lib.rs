@@ -1174,28 +1174,41 @@ pub fn run_rollback() -> Result<RollbackSummary> {
 mod tests {
     use super::*;
 
+    /// The three claims `binary_filename` actually makes, minus the vendor name: it is built
+    /// from `ASSET_PREFIX` (which `distribution` owns and a rebuild is meant to change), and it
+    /// carries the version and target the caller asked for. Spelling the whole string out
+    /// pinned one distribution's prefix and turned a supported rename into a red suite.
+    fn assert_artifact_shape(name: &str, version: &str, target: &str) {
+        assert!(
+            name.starts_with(&format!("{ASSET_PREFIX}-")),
+            "{name} must be prefixed with this build's release asset name"
+        );
+        assert!(name.contains(version), "{name} must carry {version}");
+        assert!(name.contains(target), "{name} must carry {target}");
+    }
+
     #[test]
     fn binary_filename_adds_exe_on_windows_targets() {
-        assert_eq!(
-            binary_filename("v4.19.0", "windows-x64"),
-            "atomcode-v4.19.0-windows-x64.exe"
-        );
-        assert_eq!(
-            binary_filename("v4.19.0", "windows-arm64"),
-            "atomcode-v4.19.0-windows-arm64.exe"
-        );
+        for target in ["windows-x64", "windows-arm64"] {
+            let name = binary_filename("v4.19.0", target);
+            assert_artifact_shape(&name, "v4.19.0", target);
+            assert!(
+                name.ends_with(".exe"),
+                "{name} must be executable on Windows"
+            );
+        }
     }
 
     #[test]
     fn binary_filename_plain_on_unix_targets() {
-        assert_eq!(
-            binary_filename("v4.19.0", "darwin-arm64"),
-            "atomcode-v4.19.0-darwin-arm64"
-        );
-        assert_eq!(
-            binary_filename("v4.19.0", "linux-x64"),
-            "atomcode-v4.19.0-linux-x64"
-        );
+        for target in ["darwin-arm64", "darwin-x64", "linux-x64", "linux-arm64"] {
+            let name = binary_filename("v4.19.0", target);
+            assert_artifact_shape(&name, "v4.19.0", target);
+            assert!(
+                !name.ends_with(".exe"),
+                "{name} must not gain a Windows suffix"
+            );
+        }
     }
 
     #[test]
@@ -1618,17 +1631,30 @@ mod tests {
 
     #[test]
     fn staged_binary_path_matches_release_artifact_name() {
+        // The claim in the name: a staged download is filed under exactly the name it was
+        // published as, so `apply_pending_upgrade` and the sweep in `uninstall` can both find
+        // it by deriving the name rather than remembering one. Compare against
+        // `binary_filename` for that reason — a literal here would pin one distribution.
         let p = staged_binary_path("v4.19.1", "darwin-arm64");
-        assert!(p.ends_with("atomcode-v4.19.1-darwin-arm64"), "got: {:?}", p);
+        assert_eq!(
+            p.file_name().and_then(|n| n.to_str()),
+            Some(binary_filename("v4.19.1", "darwin-arm64").as_str()),
+            "got: {p:?}"
+        );
+        assert_eq!(p.parent(), Some(staged_dir().as_path()), "got: {p:?}");
     }
 
     #[test]
     fn staged_binary_path_adds_exe_for_windows() {
         let p = staged_binary_path("v4.19.1", "windows-x64");
+        assert_eq!(
+            p.file_name().and_then(|n| n.to_str()),
+            Some(binary_filename("v4.19.1", "windows-x64").as_str()),
+            "got: {p:?}"
+        );
         assert!(
-            p.ends_with("atomcode-v4.19.1-windows-x64.exe"),
-            "got: {:?}",
-            p
+            p.to_string_lossy().ends_with(".exe"),
+            "a staged Windows binary must stay executable: {p:?}"
         );
     }
 
