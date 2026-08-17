@@ -155,12 +155,27 @@ fn set_env_keys(keys: &[&str], value: &Option<String>) {
     }
 }
 
-fn config_path() -> PathBuf {
-    if let Some(home) = env::var("ATOMCODE_HOME").ok().filter(|s| !s.is_empty()) {
+/// Pure core of [`config_path`], split out so the resolution is testable without mutating
+/// process env — the same shape as `distribution::default_home`.
+fn config_path_from(home_env: Option<String>, real_home: Option<PathBuf>) -> PathBuf {
+    if let Some(home) = home_env.filter(|s| !s.is_empty()) {
         return PathBuf::from(home).join("config.toml");
     }
-    let home = crate::util::real_home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".atomcode").join("config.toml")
+    real_home
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(crate::distribution::HOME_DIR_NAME)
+        .join("config.toml")
+}
+
+/// Mirrors `Config::config_dir()` + `default_path()`, resolved locally so this leaf keeps its
+/// "reqwest-free, config-type-free" shape. Both halves must come from `distribution` — spelling
+/// the env var and the directory out here meant a rebuilt distribution read its proxy policy
+/// out of the *other* build's config file, i.e. silently ignored its own `[network.proxy]`.
+fn config_path() -> PathBuf {
+    config_path_from(
+        env::var(crate::distribution::HOME_ENV).ok(),
+        crate::util::real_home_dir(),
+    )
 }
 
 fn load_proxy_config_from_disk() -> ProxyConfig {
@@ -245,6 +260,37 @@ pub fn apply_process_proxy_config(cfg: &ProxyConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_config_is_read_from_this_distribution_not_a_hardcoded_one() {
+        // This leaf resolves its own path instead of calling Config::default_path(), so it is
+        // the easiest place for a distribution rename to be missed — and a miss is silent: the
+        // build reads the OTHER build's [network.proxy] and quietly ignores its own.
+        let path = config_path_from(None, Some(PathBuf::from("/Users/foo")));
+        assert_eq!(
+            path,
+            PathBuf::from("/Users/foo")
+                .join(crate::distribution::HOME_DIR_NAME)
+                .join("config.toml")
+        );
+        assert!(path.starts_with("/Users/foo"));
+    }
+
+    #[test]
+    fn proxy_config_path_prefers_the_home_env_verbatim() {
+        let path = config_path_from(
+            Some("/tmp/explicit".into()),
+            Some(PathBuf::from("/Users/foo")),
+        );
+        assert_eq!(path, PathBuf::from("/tmp/explicit/config.toml"));
+    }
+
+    #[test]
+    fn proxy_config_path_ignores_an_empty_home_env() {
+        // An exported-but-empty var means "unset", not "root at the filesystem root".
+        let path = config_path_from(Some(String::new()), Some(PathBuf::from("/Users/foo")));
+        assert!(path.starts_with("/Users/foo"));
+    }
 
     #[test]
     fn follow_system_env_prefers_env_then_system() {
