@@ -801,11 +801,15 @@ fn select_config(fc: &FileConfig, provider: Option<&str>) -> ConfigSelection {
 
 /// `~/.atomcode/config.toml` (honors $ATOMCODE_HOME, else $HOME / %USERPROFILE%).
 fn default_config_path() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("ATOMCODE_HOME") {
+    if let Some(home) = std::env::var_os(atomcode_config::distribution::HOME_ENV) {
         return Some(PathBuf::from(home).join("config.toml"));
     }
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(".atomcode").join("config.toml"))
+    Some(
+        PathBuf::from(home)
+            .join(atomcode_config::distribution::HOME_DIR_NAME)
+            .join("config.toml"),
+    )
 }
 
 /// Resolve the effective model context window: explicit `--context-window` flag wins, else the
