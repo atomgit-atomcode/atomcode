@@ -4164,6 +4164,14 @@ impl EditSelection {
     }
 }
 
+#[derive(Debug, Clone)]
+struct RecentFoldedPaste {
+    id: usize,
+    placeholder_start: usize,
+    placeholder: String,
+    inserted_at: std::time::Instant,
+}
+
 pub struct Buffer {
     pub text: String,
     pub cursor: usize,
@@ -4190,6 +4198,9 @@ pub struct Buffer {
     /// that contained a folded paste survives a round-trip through
     /// history navigation. Mirrors `stash` for the paste registry.
     stash_pastes: Vec<String>,
+    /// The most recent folded text paste. A second identical paste may
+    /// expand it in place when no editing happened in between.
+    recent_folded_paste: Option<RecentFoldedPaste>,
     /// True while Ctrl+R reverse-i-search is active. In this state keys
     /// edit `search_query` (not `text`); `history_idx` doubles as the
     /// index of the current match so attachment rehydration and menu
@@ -4204,6 +4215,8 @@ pub struct Buffer {
 /// 3 lines behind a `[Pasted ...]` token.
 const PASTE_FOLD_LINES: usize = 5;
 const PASTE_FOLD_CHARS: usize = 400;
+const DOUBLE_PASTE_EXPAND_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(1);
 
 /// Fold `\r\n` and lone `\r` line endings to `\n`. Bracketed-paste
 /// payloads from macOS Terminal / iTerm2 / Windows clipboard frequently
@@ -4229,6 +4242,7 @@ impl Buffer {
             stash: String::new(),
             pastes: Vec::new(),
             stash_pastes: Vec::new(),
+            recent_folded_paste: None,
             searching: false,
             search_query: String::new(),
         }
@@ -4244,6 +4258,7 @@ impl Buffer {
     /// restored on Esc): cursor at the end, and suppress the slash menu for
     /// one frame so a restored `/command` doesn't immediately re-pop the list.
     pub fn set_restored_text(&mut self, text: String) {
+        self.recent_folded_paste = None;
         self.cursor = text.len();
         self.text = text;
         self.clear_selection();
@@ -4340,12 +4355,14 @@ impl Buffer {
     }
 
     fn replace_all_text(&mut self, text: String) {
+        self.recent_folded_paste = None;
         self.text = text;
         self.cursor = self.text.len();
         self.clear_selection();
     }
 
     fn clear_text(&mut self) {
+        self.recent_folded_paste = None;
         self.text.clear();
         self.cursor = 0;
         self.clear_selection();
@@ -4363,6 +4380,7 @@ impl Buffer {
         {
             return false;
         }
+        self.recent_folded_paste = None;
         self.clear_selection();
         self.text.replace_range(range.clone(), replacement);
         self.cursor = range.start + replacement.len();
@@ -4370,6 +4388,7 @@ impl Buffer {
     }
 
     fn insert_at_cursor(&mut self, text: &str) {
+        self.recent_folded_paste = None;
         self.replace_selection("");
         self.text.insert_str(self.cursor, text);
         self.cursor += text.len();
@@ -4394,6 +4413,7 @@ impl Buffer {
         }
         self.cursor = byte;
         self.history_idx = None;
+        self.recent_folded_paste = None;
         true
     }
 
@@ -4425,7 +4445,15 @@ impl Buffer {
     /// and lone `\r` to `\n` at ingress so both the placeholder summary
     /// and the expanded agent payload are in canonical form.
     pub fn insert_paste(&mut self, text: String) -> String {
+        self.insert_paste_at(text, std::time::Instant::now())
+    }
+
+    fn insert_paste_at(&mut self, text: String, now: std::time::Instant) -> String {
         let text = normalize_newlines(&text);
+        if self.expand_recent_folded_paste(&text, now) {
+            return text;
+        }
+        self.recent_folded_paste = None;
         self.replace_selection("");
         let line_count = text.lines().count().max(1);
         let char_count = text.chars().count();
@@ -4437,8 +4465,15 @@ impl Buffer {
                 format!("[Pasted #{} +{} lines]", id, line_count)
             };
             self.pastes.push(text);
+            let placeholder_start = self.cursor;
             self.text.insert_str(self.cursor, &placeholder);
             self.cursor += placeholder.len();
+            self.recent_folded_paste = Some(RecentFoldedPaste {
+                id,
+                placeholder_start,
+                placeholder: placeholder.clone(),
+                inserted_at: now,
+            });
             placeholder
         } else {
             let n = text.len();
@@ -4446,6 +4481,38 @@ impl Buffer {
             self.cursor += n;
             text
         }
+    }
+
+    fn expand_recent_folded_paste(&mut self, incoming: &str, now: std::time::Instant) -> bool {
+        let Some(recent) = self.recent_folded_paste.clone() else {
+            return false;
+        };
+        let within_window = now
+            .checked_duration_since(recent.inserted_at)
+            .is_some_and(|elapsed| elapsed <= DOUBLE_PASTE_EXPAND_WINDOW);
+        let placeholder_end = recent.placeholder_start + recent.placeholder.len();
+        let placeholder_is_untouched = self.cursor == placeholder_end
+            && self.selected_range().is_none()
+            && self
+                .text
+                .get(recent.placeholder_start..placeholder_end)
+                .is_some_and(|current| current == recent.placeholder);
+        let backing_matches = recent.id == self.pastes.len()
+            && self
+                .pastes
+                .get(recent.id.saturating_sub(1))
+                .is_some_and(|body| body == incoming);
+        if !within_window || !placeholder_is_untouched || !backing_matches {
+            return false;
+        }
+
+        self.text
+            .replace_range(recent.placeholder_start..placeholder_end, incoming);
+        self.cursor = recent.placeholder_start + incoming.len();
+        self.pastes.pop();
+        self.recent_folded_paste = None;
+        self.history_idx = None;
+        true
     }
 
     /// Expand every `[Pasted #N +M lines]` token in `line` back to the
@@ -4490,6 +4557,7 @@ impl Buffer {
     }
 
     fn clear_pastes(&mut self) {
+        self.recent_folded_paste = None;
         self.pastes.clear();
     }
 
@@ -4511,6 +4579,9 @@ impl Buffer {
         // restore, so editing / navigating a restored `/command` reopens the
         // command list as usual.
         self.menu_suppressed = false;
+        // A keyboard action between two paste events means they are separate
+        // edits, not the double-paste gesture used to expand a folded block.
+        self.recent_folded_paste = None;
         // Ctrl+R reverse-i-search owns the keys while active: typing edits
         // the query, Ctrl+R steps to the next older match, Enter accepts the
         // current match into the buffer, Esc restores the pre-search draft.
@@ -5627,6 +5698,75 @@ mod buffer_tests {
         b.insert_paste(big.clone());
         assert!(b.text.contains("[Pasted #1 +10 lines]"));
         assert_eq!(b.pastes, vec![big]);
+    }
+
+    #[test]
+    fn second_identical_long_paste_expands_recent_placeholder_without_duplication() {
+        let mut b = Buffer::new();
+        let big = "line\n".repeat(10);
+        let first = std::time::Instant::now();
+
+        b.insert_paste_at(big.clone(), first);
+        assert_eq!(b.text, "[Pasted #1 +10 lines]");
+
+        b.insert_paste_at(big.clone(), first + std::time::Duration::from_millis(500));
+        assert_eq!(b.text, big);
+        assert!(
+            b.pastes.is_empty(),
+            "expanded paste no longer needs backing storage"
+        );
+    }
+
+    #[test]
+    fn repeated_long_paste_after_timeout_stays_as_two_folded_pastes() {
+        let mut b = Buffer::new();
+        let big = "line\n".repeat(10);
+        let first = std::time::Instant::now();
+
+        b.insert_paste_at(big.clone(), first);
+        b.insert_paste_at(
+            big.clone(),
+            first + DOUBLE_PASTE_EXPAND_WINDOW + std::time::Duration::from_millis(1),
+        );
+
+        assert_eq!(b.text, "[Pasted #1 +10 lines][Pasted #2 +10 lines]");
+        assert_eq!(b.pastes, vec![big.clone(), big]);
+    }
+
+    #[test]
+    fn intervening_input_cancels_double_paste_expansion() {
+        let mut b = Buffer::new();
+        let big = "line\n".repeat(10);
+        let first = std::time::Instant::now();
+        b.insert_paste_at(big.clone(), first);
+
+        let _ = b.apply(
+            Action::Insert('x'),
+            &[],
+            &CommandRegistry::builtin(),
+        );
+        b.insert_paste_at(big.clone(), first + std::time::Duration::from_millis(500));
+
+        assert_eq!(b.text, "[Pasted #1 +10 lines]x[Pasted #2 +10 lines]");
+        assert_eq!(b.pastes, vec![big.clone(), big]);
+    }
+
+    #[test]
+    fn image_marker_cancels_text_double_paste_expansion() {
+        let mut b = Buffer::new();
+        let big = "line\n".repeat(10);
+        let first = std::time::Instant::now();
+        b.insert_paste_at(big.clone(), first);
+
+        // Image paste uses this exact insertion seam after image detection.
+        b.insert_at_cursor("[Image #1]");
+        b.insert_paste_at(big.clone(), first + std::time::Duration::from_millis(500));
+
+        assert_eq!(
+            b.text,
+            "[Pasted #1 +10 lines][Image #1][Pasted #2 +10 lines]"
+        );
+        assert_eq!(b.pastes, vec![big.clone(), big]);
     }
 
     #[test]
