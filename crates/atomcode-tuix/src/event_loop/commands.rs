@@ -3504,6 +3504,26 @@ fn execute_slash_command_impl(
                     state.goal_armed = false;
                     state.goal_round = 0;
                     state.goal_started_at = Some(std::time::Instant::now());
+                    // The runtime emits the authoritative GoalChanged event
+                    // asynchronously.  Publish the controller state immediately
+                    // as well so an already-connected App cannot miss the first
+                    // active update during that hand-off.  This path only updates
+                    // LiveHub's controller snapshot/view and deliberately does
+                    // not consume a runtime sequence number; the later native
+                    // event remains authoritative for replay and ordering.
+                    if let (Some(binding), Some(goal)) = (
+                        ctx.live_binding.as_ref(),
+                        current_live_goal(state),
+                    ) {
+                        if let Err(error) = atomcode_daemon::native_live::seed_goal_progress(
+                            binding, goal,
+                        ) {
+                            renderer.render(UiLine::Error(format!(
+                                "Live Goal synchronization failed: {error:?}"
+                            )));
+                            renderer.flush();
+                        }
+                    }
                     if submit_agent_text(ctx, condition) {
                         state.on_submit();
                     }
