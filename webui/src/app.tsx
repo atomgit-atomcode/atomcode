@@ -4,12 +4,13 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { Chat } from './components/Chat';
 import { Sidebar } from './components/Sidebar';
-import { ThemeDialog, LanguageDialog, ModelConfigDialog, RemoteAccessDialog } from './components/SettingsDialogs';
+import { ThemeDialog, LanguageDialog, ModelConfigDialog, RemoteAccessDialog, NotificationsDialog } from './components/SettingsDialogs';
 import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
 import { getProject, getConfig, changeDir, resolveSession, createSession, getSession, SessionMetaWithProject } from './api';
 import { useT, SettingsSection } from './settings';
+import { applyConfigDefaults } from './lib/notifications';
 import { sessionMessagesToMarkdownLines } from './lib/historyMessages';
 
 // 从 URL (?session=<id>) 读取要打开的会话 id（短 id），用于刷新后恢复。
@@ -141,6 +142,13 @@ export function App() {
 
   // Seed cwd from /project on mount（恢复会话时以会话目录为准，故只在仍为空时填充）
   useEffect(() => {
+    // 用 /config 的 notifications 段种入偏好默认值（localStorage 未显式设置时生效），
+    // 让与 TUI 共享的 enabled/min_duration_secs 对 webui 同样生效。
+    getConfig()
+      .then((cfg) => applyConfigDefaults(cfg.notifications))
+      .catch(() => {
+        /* 配置不可用时用前端默认值 */
+      });
     let cancelled = false;
     getProject()
       .then((p) => {
@@ -492,6 +500,9 @@ export function App() {
       )}
       {settingsSection === 'remote' && (
         <RemoteAccessDialog onClose={() => setSettingsSection(null)} />
+      )}
+      {settingsSection === 'notifications' && (
+        <NotificationsDialog onClose={() => setSettingsSection(null)} />
       )}
       {headerDialog === 'rename' && activeSession && (
         <RenameDialog

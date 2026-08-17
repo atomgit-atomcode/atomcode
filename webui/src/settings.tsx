@@ -23,7 +23,7 @@ const FONT_SCALE_FACTORS: Record<FontScale, number> = {
 };
 
 /** Which settings dialog to open from the sidebar settings menu. */
-export type SettingsSection = 'theme' | 'language' | 'model' | 'remote';
+export type SettingsSection = 'theme' | 'language' | 'model' | 'remote' | 'notifications';
 
 type TParams = Record<string, string | number>;
 

@@ -422,11 +422,19 @@ export interface ProviderInfo {
   context_window?: number;
 }
 
+export interface NotificationConfigInfo {
+  enabled: boolean;
+  min_duration_secs: number;
+  bell: boolean;
+}
+
 export interface ConfigInfo {
   path: string;
   default_provider: string;
   default_workdir?: string;
   providers: ProviderInfo[];
+  /** 完成通知配置；旧 daemon 未暴露时为 undefined，前端回退默认值。 */
+  notifications?: NotificationConfigInfo;
 }
 
 export async function getConfig(): Promise<ConfigInfo> {

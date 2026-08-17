@@ -59,6 +59,11 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
         default_provider: default_selection,
         default_workdir: config.default_workdir.clone(),
         providers,
+        notifications: crate::NotificationConfigInfo {
+            enabled: config.notifications.enabled,
+            min_duration_secs: config.notifications.min_duration_secs,
+            bell: config.notifications.bell,
+        },
     }
 }
 

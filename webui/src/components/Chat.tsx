@@ -84,6 +84,7 @@ import {
 } from '../lib/liveSteer';
 import { hasCoarsePointer, shouldSendComposerOnEnter } from '../lib/composerKeyboard';
 import { formatTurnDuration, formatTurnTokens, turnCacheHit } from '../lib/turnStats';
+import { disposeNotifications, maybeNotifyTurnFinished } from '../lib/notifications';
 
 interface Message {
   role: 'user' | 'assistant' | 'system';
@@ -109,6 +110,24 @@ interface QueuedMessage {
 /** Concatenate all text segments (error-detection, skill-title, etc.). */
 function messageText(m: Message): string {
   return m.parts.reduce((acc, p) => (p.kind === 'text' ? acc + p.text : acc), '');
+}
+
+/** Stable across tabs because every observer receives the same terminal stats. */
+function notificationDedupeKey(
+  sessionId: string | undefined,
+  stopReason: string | undefined,
+  stats: TurnStats | undefined,
+): string | undefined {
+  if (!sessionId || !stats) return undefined;
+  return [
+    sessionId,
+    stopReason ?? 'finished',
+    stats.duration_ms,
+    stats.rounds,
+    stats.tool_calls,
+    stats.prompt_tokens,
+    stats.completion_tokens,
+  ].join(':');
 }
 
 /** Zero-pad a number to 2 digits — shared by formatMsgTime / formatMsgTimeFull. */
@@ -443,6 +462,27 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     busyRef.current = next;
     setBusyState(next);
   }
+  // 回合开始时刻（本 tab 主动 submit 时记录；live 恢复/重放不得重置），
+  // 用于 min_duration 过滤与通知正文时长；终态事件计算后即清空。
+  const turnStartedAtRef = useRef<number | null>(null);
+  // 只有当前 tab 实际提交过回合，或从 /live 观察到 running=true，终态才有
+  // 通知资格。初始/重连时重放的 idle state 不能伪装成一次新完成事件。
+  const notificationTurnActiveRef = useRef(false);
+  function finishTurnNotification(info: {
+    stopReason?: string;
+    sessionId?: string;
+    message?: string;
+    durationMs?: number;
+    dedupeKey?: string;
+  }) {
+    if (!notificationTurnActiveRef.current) return;
+    const durationMs = info.durationMs ?? (
+      turnStartedAtRef.current !== null ? Date.now() - turnStartedAtRef.current : undefined
+    );
+    notificationTurnActiveRef.current = false;
+    turnStartedAtRef.current = null;
+    maybeNotifyTurnFinished({ ...info, durationMs });
+  }
   const [chatRecovery, setChatRecovery] = useState<ChatRecoveryState>('ready');
   const chatRecoveryRef = useRef<ChatRecoveryState>('ready');
   chatRecoveryRef.current = chatRecovery;
@@ -702,6 +742,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         detachedController?.abort();
       }
       liveLifecycleRef.current = createLiveLifecycleState();
+      notificationTurnActiveRef.current = false;
+      turnStartedAtRef.current = null;
+      disposeNotifications();
       setBusy(false);
       setQueued([]);
       setLivePending(null);
@@ -1324,6 +1367,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       }
 
       case 'state': {
+        if (e.running && !notificationTurnActiveRef.current) {
+          notificationTurnActiveRef.current = true;
+          turnStartedAtRef.current = Date.now();
+        }
         const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
           type: 'state',
           running: e.running,
@@ -1358,6 +1405,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           setLivePending(null);
           setUserInputReq(null);
           if (e.stop_reason !== 'policy_denied') setPolicyIntervention(null);
+          // 回合结束：计算通知信息并触发浏览器提醒（若守卫通过）。
+          finishTurnNotification({
+            stopReason: e.stop_reason,
+            sessionId: liveSessionIdRef.current ?? undefined,
+            message: e.message,
+            durationMs: e.stats?.duration_ms,
+            dedupeKey: notificationDedupeKey(
+              liveSessionIdRef.current ?? undefined,
+              e.stop_reason,
+              e.stats,
+            ),
+          });
           // turn 完成后 session 已落盘，通知 App 刷新侧栏列表。
           onLiveTurnDone?.();
         }
@@ -1944,6 +2003,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         onPermissionResolved?.(null); // 回合结束：兜底清掉任何残留审批卡片
         setUserInputReq(null);
         if (event.stop_reason !== 'policy_denied') setPolicyIntervention(null);
+        finishTurnNotification({
+          stopReason: event.stop_reason,
+          sessionId: event.session_id,
+          message: event.message,
+          durationMs: event.stats?.duration_ms,
+          dedupeKey: notificationDedupeKey(
+            event.session_id,
+            event.stop_reason,
+            event.stats,
+          ),
+        });
         break;
       }
 
@@ -1953,6 +2023,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         setQueued([]); // 用户中止：丢弃排队消息（对齐 VSCode 插件）
         onPermissionResolved?.(null);
         setUserInputReq(null);
+        finishTurnNotification({
+          stopReason: 'cancelled',
+          sessionId: activeIdRef.current ?? undefined,
+        });
         break;
 
       case 'error':
@@ -1962,6 +2036,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         setQueued([]); // 出错：丢弃排队消息
         onPermissionResolved?.(null);
         setUserInputReq(null);
+        finishTurnNotification({
+          stopReason: 'error',
+          sessionId: activeIdRef.current ?? undefined,
+          message: event.message,
+        });
         break;
 
       case 'warning':
@@ -2076,6 +2155,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       //    case via `pendingSelfEchoRef`.
       const steering = busyRef.current;
       setBusy(true);
+      // 回合起点只记录一次（steer 不重置）：供终态通知计算 durationMs。
+      if (!steering) {
+        notificationTurnActiveRef.current = true;
+        turnStartedAtRef.current = Date.now();
+      }
       const now = Date.now();
       const pendingSteer: PendingLiveSteer = {
         id: crypto.randomUUID(),
@@ -2150,6 +2234,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           setPendingImages((current) => [...images, ...current]);
         } else {
           setBusy(false);
+          notificationTurnActiveRef.current = false;
+          turnStartedAtRef.current = null;
         }
         setQueued([]);
         setHistoryHint(t('chat.connError', { msg: String(error) }));
@@ -2163,6 +2249,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
 
     // ── Normal path ──
     setBusy(true);
+    // 回合起点只记录一次：供终态通知计算 durationMs。
+    notificationTurnActiveRef.current = true;
+    turnStartedAtRef.current = Date.now();
     // 消息发出后延迟刷新侧栏列表，给后端落盘时间；
     // done 事件中 onSessionId 会再刷一次确保更新。
     setTimeout(() => onLiveTurnDone?.(), 200);
