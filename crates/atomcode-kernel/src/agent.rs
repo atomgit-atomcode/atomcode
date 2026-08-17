@@ -1511,6 +1511,10 @@ impl RunningAgent {
         // = a fresh independent token (prior behavior). Centralized in
         // `new_turn_token` so every site stays consistent.
         let turn_token = self.new_turn_token();
+        // Distinguish lifecycle shutdown/reconfigure from a user-facing cancel.
+        // Both stop the turn through the same terminal funnel, but only the latter
+        // retires user intent (and therefore writes an interruption boundary).
+        let internal_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Drive the turn while STILL servicing commands (Respond/Cancel/Shutdown)
         // so a middleware blocked on approval can be answered out-of-band.
         let steer: SteerBuf =
@@ -1518,6 +1522,7 @@ impl RunningAgent {
         let mut turn = Box::pin(self.run_turn(
             convo,
             turn_token.clone(),
+            internal_cancel.clone(),
             rollback_len,
             steer.clone(),
             tool_loop_state.as_mut(),
@@ -1536,6 +1541,7 @@ impl RunningAgent {
                         // canonical snapshot. Cancel the turn and wait for its normal
                         // terminal funnel instead.
                         shutdown = true;
+                        internal_cancel.store(true, Ordering::Release);
                         turn_token.cancel();
                         self.rt.cancel_pending();
                         steer.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1774,32 +1780,29 @@ impl RunningAgent {
     /// - `keep_interrupted_context = true`: PRESERVE — keep this turn's partial
     ///   assistant/tool work; backfill a `(cancelled)` result for every dangling
     ///   tool_call so the wire stays API-valid. APPEND-ONLY — prefix-cache safe.
-    async fn finish_cancelled(&self, convo: &mut Conversation, rollback_len: usize, ctx: &TurnCtx) {
+    async fn finish_cancelled(
+        &self,
+        convo: &mut Conversation,
+        rollback_len: usize,
+        ctx: &TurnCtx,
+        internal_cancel: bool,
+    ) {
         if self.keep_interrupted_context {
             // PRESERVE: keep this turn's partial assistant/tool work; backfill a
             // `(cancelled)` result for every dangling tool_call so the wire stays
             // API-valid. APPEND-ONLY — prefix-cache safe. Mirrors v1's
             // `Conversation::cancel_current_turn`.
             convo.backfill_cancelled_tool_results();
-            // Inject a SYNTHETIC user-role interruption marker — wire-safe on all
-            // adapters. A system message placed mid-conversation is rejected or silently
-            // dropped by many openai-compat gateways (non-leading system), and the
-            // Anthropic adapter lifts ALL system messages to the top-level `system`
-            // field, detaching this marker from its position. A user-role message merges
-            // cleanly into the next user prompt on Anthropic and is valid consecutive-user
-            // on openai-compat.
-            // `synthetic_user` (not `user`) so the marker is excluded from prompt
-            // counting: `compute_runtime_undo` skips `synthetic = true` messages
-            // when locating the /undo target, and compaction's `active_turn_start`
-            // skip synthetic messages when computing keep-recent-turns boundaries.
-            convo.push(Message::synthetic_user(
-                "[The previous response was interrupted by the user before completing. \
-                 Reconsider the approach in light of this interruption before continuing.]",
-            ));
         } else {
             // CANCEL = UNDO (default): roll back to before the user message so the
             // cancelled prompt + partial work leaves NO trace.
             convo.messages.truncate(rollback_len);
+        }
+        if !internal_cancel {
+            // Persist one common USER-cancellation boundary in both preservation
+            // modes. Internal shutdown/reconfigure terminals deliberately omit it:
+            // they stop execution but do not mean the user abandoned the intent.
+            convo.push(Message::user_interruption());
         }
         self.rt.emit(AgentEvent::Cancelled);
         self.finish_turn(convo, StopReason::Cancelled, ctx).await;
@@ -1825,6 +1828,7 @@ impl RunningAgent {
         &self,
         convo: &mut Conversation,
         cancel: tokio_util::sync::CancellationToken,
+        internal_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
         rollback_len: usize,
         steer: SteerBuf,
         mut tool_loop_state: Option<&mut ToolLoopState>,
@@ -1958,7 +1962,13 @@ impl RunningAgent {
                             // Terminate through the canonical cancel funnel so the
                             // turn ends as Cancelled — matching every other
                             // mid-turn cancel arm — not MaxRounds.
-                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                            self.finish_cancelled(
+                                convo,
+                                rollback_len,
+                                &turn_ctx,
+                                internal_cancel.load(Ordering::Acquire),
+                            )
+                            .await;
                             return;
                         } else {
                             // Explicit stop (Esc / picker) OR fail-closed default
@@ -2127,7 +2137,13 @@ impl RunningAgent {
             let opened = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                    self.finish_cancelled(
+                        convo,
+                        rollback_len,
+                        &turn_ctx,
+                        internal_cancel.load(Ordering::Acquire),
+                    )
+                    .await;
                     return;
                 }
                 opened = self.provider.chat_stream(&messages, &defs, &request_options) => opened,
@@ -2223,7 +2239,13 @@ impl RunningAgent {
                             tokio::select! {
                                 biased;
                                 _ = cancel.cancelled() => {
-                                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                    self.finish_cancelled(
+                                        convo,
+                                        rollback_len,
+                                        &turn_ctx,
+                                        internal_cancel.load(Ordering::Acquire),
+                                    )
+                                    .await;
                                     return;
                                 }
                                 _ = tokio::time::sleep(wait) => {}
@@ -2273,7 +2295,13 @@ impl RunningAgent {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => {
-                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                            self.finish_cancelled(
+                                convo,
+                                rollback_len,
+                                &turn_ctx,
+                                internal_cancel.load(Ordering::Acquire),
+                            )
+                            .await;
                             return;
                         }
                         _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
@@ -2355,7 +2383,13 @@ impl RunningAgent {
                 let ev = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
-                        self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                        self.finish_cancelled(
+                            convo,
+                            rollback_len,
+                            &turn_ctx,
+                            internal_cancel.load(Ordering::Acquire),
+                        )
+                        .await;
                         return;
                     }
                     _ = async { tokio::time::sleep(self.stream_timeout.unwrap()).await }, if self.stream_timeout.is_some() => {
@@ -2385,7 +2419,13 @@ impl RunningAgent {
                             tokio::select! {
                                 biased;
                                 _ = cancel.cancelled() => {
-                                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                    self.finish_cancelled(
+                                        convo,
+                                        rollback_len,
+                                        &turn_ctx,
+                                        internal_cancel.load(Ordering::Acquire),
+                                    )
+                                    .await;
                                     return;
                                 }
                                 _ = tokio::time::sleep(backoff) => {}
@@ -2659,7 +2699,13 @@ impl RunningAgent {
                                 tokio::select! {
                                     biased;
                                     _ = cancel.cancelled() => {
-                                        self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                        self.finish_cancelled(
+                                            convo,
+                                            rollback_len,
+                                            &turn_ctx,
+                                            internal_cancel.load(Ordering::Acquire),
+                                        )
+                                        .await;
                                         return;
                                     }
                                     _ = tokio::time::sleep(wait) => {}
@@ -2791,7 +2837,13 @@ impl RunningAgent {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => {
-                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                            self.finish_cancelled(
+                                convo,
+                                rollback_len,
+                                &turn_ctx,
+                                internal_cancel.load(Ordering::Acquire),
+                            )
+                            .await;
                             return;
                         }
                         _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
@@ -3129,7 +3181,13 @@ impl RunningAgent {
                         elapsed_ms: started_at.elapsed().as_millis() as u64,
                     });
                 }
-                self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                self.finish_cancelled(
+                    convo,
+                    rollback_len,
+                    &turn_ctx,
+                    internal_cancel.load(Ordering::Acquire),
+                )
+                .await;
                 return;
             }
             let mut plans: Vec<CallPlan> = Vec::with_capacity(pending_calls.len());
@@ -3656,7 +3714,13 @@ impl RunningAgent {
                         elapsed_ms: started_at.elapsed().as_millis() as u64,
                     });
                 }
-                self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                self.finish_cancelled(
+                    convo,
+                    rollback_len,
+                    &turn_ctx,
+                    internal_cancel.load(Ordering::Acquire),
+                )
+                .await;
                 return;
             }
             // ── Close batch (if one was opened) ──

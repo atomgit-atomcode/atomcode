@@ -288,13 +288,20 @@ pub fn reduce_todos<'a>(calls: impl IntoIterator<Item = (&'a str, &'a str)>) -> 
 /// The current todo list, folded over the transcript (see [`reduce_todos`]). Returns `vec![]`
 /// if there is no valid `todowrite` and no `todo` events.
 pub fn derive_current_todos(messages: &[Message]) -> Vec<TodoItem> {
-    let failed_call_ids = messages
+    // A user cancel retires the active plan without deleting its history. Fold
+    // only calls after the most recent authoritative interruption boundary; an
+    // explicit later "continue" can create a fresh full-list plan from history.
+    let active_messages = messages
+        .iter()
+        .rposition(Message::is_user_interruption)
+        .map_or(messages, |index| &messages[index + 1..]);
+    let failed_call_ids = active_messages
         .iter()
         .filter(|message| message.is_error)
         .filter_map(|message| message.tool_call_id.as_deref())
         .collect::<std::collections::HashSet<_>>();
     reduce_todos(
-        messages
+        active_messages
             .iter()
             .flat_map(|m| m.tool_calls.iter())
             .filter(|call| !failed_call_ids.contains(call.id.as_str()))
@@ -594,6 +601,43 @@ mod tests {
     #[test]
     fn derive_none_when_no_todowrite() {
         let msgs = vec![Message::user("hi"), Message::assistant("hello", vec![])];
+        assert!(derive_current_todos(&msgs).is_empty());
+    }
+
+    #[test]
+    fn user_interruption_retires_prior_plan_but_allows_a_new_plan() {
+        let mut msgs = vec![todo_call(
+            "old",
+            r#"{"todos":[{"content":"old task","status":"in_progress"}]}"#,
+        )];
+        msgs.push(Message::user_interruption());
+        msgs.push(Message::user("do something unrelated"));
+        assert!(
+            derive_current_todos(&msgs).is_empty(),
+            "a cancelled plan remains historical, not active"
+        );
+
+        msgs.push(todo_call(
+            "new",
+            r#"{"todos":[{"content":"new task","status":"pending"}]}"#,
+        ));
+        let active = derive_current_todos(&msgs);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].content, "new task");
+    }
+
+    #[test]
+    fn legacy_interruption_marker_also_retires_prior_plan() {
+        let marker = Message::synthetic_user(
+            "[The previous response was interrupted by the user before completing. Reconsider.]",
+        );
+        let msgs = vec![
+            todo_call(
+                "old",
+                r#"{"todos":[{"content":"old task","status":"pending"}]}"#,
+            ),
+            marker,
+        ];
         assert!(derive_current_todos(&msgs).is_empty());
     }
 

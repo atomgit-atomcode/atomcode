@@ -1934,13 +1934,16 @@ impl UiState {
         // Streaming-only `/usage` tab panel — drop it on cancel too (mirrors
         // on_turn_complete); the rendered text stays until Esc.
         self.footer_usage = None;
-        // The todo panel is per-session, not per-turn: it survives turn
-        // termination (mirrors on_turn_complete). Clearing it here nuked the
-        // plan, and a "继续" turn only sends incremental todowrite updates that
-        // fold against the existing panel (a no-op on an empty base), so the
-        // panel could never rebuild — it stayed gone while the model kept
-        // executing. Only a session switch / new session / explicit clear drops
-        // `active_todos` + `todo_titles`.
+        // An authoritative user cancellation retires the current plan. The
+        // kernel persists the same boundary in the conversation, so replay and
+        // every other driver derive the same empty active list. Historical todo
+        // calls remain in the transcript and can be explicitly re-planned later.
+        self.active_todos = None;
+        self.todo_titles.clear();
+        self.pending_todo_calls.clear();
+        self.pending_todo_order.clear();
+        self.pending_todo_results.clear();
+        self.pending_todo_base = None;
     }
 
     /// Drop presentation state that belongs to the outgoing session. Unlike a
@@ -3205,17 +3208,7 @@ mod tests {
     }
 
     #[test]
-    fn active_todos_persist_across_cancel_and_error() {
-        // The todo panel is PER-SESSION state (see reset_to_new_session /
-        // native SessionChanged, which drop it), NOT per-turn — it already survives
-        // turn COMPLETE (active_todos_persists_across_turn_end). Cancel and
-        // error are just turn terminations too, so they must preserve it as
-        // well. Regression: clearing on cancel/error nuked the plan, and since
-        // a "继续" turn sends only INCREMENTAL todowrite updates (which fold
-        // against the existing panel via apply_todo_action — a no-op on an
-        // empty base), the panel could never rebuild. It stayed gone on screen
-        // while the model kept executing the plan from its own context. Only an
-        // explicit clear or a session switch may drop the panel.
+    fn active_todos_are_retired_on_cancel_but_survive_error() {
         let mut s = UiState::new();
         s.active_todos = Some(crate::render::TodoProgress {
             current: Some("Task".to_string()),
@@ -3227,12 +3220,17 @@ mod tests {
         s.todo_titles.insert(1, "Todo".to_string());
 
         s.on_turn_cancelled();
-        assert!(s.active_todos.is_some(), "panel must survive cancellation");
-        assert!(
-            !s.todo_titles.is_empty(),
-            "titles must survive cancellation"
-        );
+        assert!(s.active_todos.is_none(), "cancel retires the active plan");
+        assert!(s.todo_titles.is_empty(), "cancel retires todo titles");
 
+        s.active_todos = Some(crate::render::TodoProgress {
+            current: Some("Task".to_string()),
+            completed: 2,
+            in_progress: 1,
+            total: 3,
+            items: vec![],
+        });
+        s.todo_titles.insert(1, "Todo".to_string());
         s.on_error();
         assert!(s.active_todos.is_some(), "panel must survive error");
         assert!(!s.todo_titles.is_empty(), "titles must survive error");
