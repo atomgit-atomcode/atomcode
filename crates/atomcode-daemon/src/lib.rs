@@ -1602,7 +1602,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         service: "atomcode-daemon",
         binary_hash: executable_sha256(),
         instance_id: state.daemon_instance_id.to_string(),
-        capabilities: &["goal"],
+        capabilities: &["goal", "session_scoped_live"],
     })
 }
 
