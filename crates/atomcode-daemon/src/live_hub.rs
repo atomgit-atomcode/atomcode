@@ -812,6 +812,19 @@ impl LiveViewHub {
         state.last_runtime_sequence = Some(envelope.sequence);
 
         let event = envelope.event;
+        // ProviderChanged may be observed both from the runtime event stream and
+        // from the TUI's successful reload acknowledgement.  Treat an identical
+        // projection as idempotent so the explicit acknowledgement path can make
+        // delivery reliable without producing duplicate SSE events.
+        if let CodingRuntimeEvent::ProviderChanged { provider, .. } = &event {
+            if state
+                .binding
+                .as_ref()
+                .is_some_and(|current| current.identity.provider == *provider)
+            {
+                return Ok(());
+            }
+        }
         if let CodingRuntimeEvent::GoalChanged(progress) = &event {
             state.goal_progress = (progress.phase != atomcode_coding::GoalPhase::Ended)
                 .then(|| progress.clone());

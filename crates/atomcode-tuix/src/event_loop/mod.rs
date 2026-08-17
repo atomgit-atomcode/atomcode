@@ -22899,6 +22899,13 @@ fn handle_runtime_event(
                         provider.clone(),
                         model.clone(),
                     );
+                    if let Err(error) = publish_live_provider_reload_success(
+                        ctx,
+                        provider.clone(),
+                        model.clone(),
+                    ) {
+                        renderer.render(UiLine::Error(error));
+                    }
                     if ctx
                         .pending_provider_projection
                         .as_ref()
@@ -23356,6 +23363,30 @@ fn publish_live_runtime_event(
     match result {
         Ok(()) | Err(atomcode_daemon::live_hub::HubError::StaleEvent) => Ok(()),
         Err(error) => Err(format!("Live event synchronization failed: {error:?}")),
+    }
+}
+
+/// Publish the provider selected by a successfully committed `/model` reload.
+///
+/// The runtime emits `ProviderChanged` asynchronously, while the TUI receives
+/// the reload terminal through a separate channel.  Publishing at the terminal
+/// makes the successful state observable even when the asynchronous event is
+/// consumed by a deferred-runtime path.  LiveHub de-duplicates an identical
+/// projection, so this is safe when the runtime event was already forwarded.
+fn publish_live_provider_reload_success(
+    ctx: &LoopCtx,
+    provider: String,
+    model: String,
+) -> Result<(), String> {
+    let Some(binding) = &ctx.live_binding else {
+        return Ok(());
+    };
+    match atomcode_daemon::native_live::publish_unsequenced(
+        binding,
+        CodingRuntimeEvent::ProviderChanged { provider, model },
+    ) {
+        Ok(()) | Err(atomcode_daemon::live_hub::HubError::StaleEvent) => Ok(()),
+        Err(error) => Err(format!("Live provider synchronization failed: {error:?}")),
     }
 }
 

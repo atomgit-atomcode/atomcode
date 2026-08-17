@@ -1192,6 +1192,56 @@ pub(crate) struct LiveStreamQuery {
     pub session_id: Option<String>,
 }
 
+fn serialize_scoped_live_event(session_id: String, event: &LiveWireEvent) -> String {
+    let mut value = match serde_json::to_value(event) {
+        Ok(value) => value,
+        Err(error) => {
+            crate::ctrace!("LIVE", "live event serialization failed: {error}");
+            return serde_json::json!({
+                "type": "error",
+                "session_id": session_id,
+                "message": format!("live event serialization failed: {error}"),
+            })
+            .to_string();
+        }
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert("session_id".into(), serde_json::Value::String(session_id));
+        return serde_json::to_string(&value).unwrap_or_else(|error| {
+            crate::ctrace!("LIVE", "live event JSON serialization failed: {error}");
+            serde_json::json!({
+                "type": "error",
+                "message": format!("live event serialization failed: {error}"),
+            })
+            .to_string()
+        });
+    }
+    serde_json::json!({
+        "type": "error",
+        "session_id": session_id,
+        "message": "live event is not a JSON object",
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+mod scoped_live_event_tests {
+    use super::{serialize_scoped_live_event, LiveWireEvent};
+
+    #[test]
+    fn every_wire_event_gets_session_id() {
+        let json = serialize_scoped_live_event(
+            "session-a".into(),
+            &LiveWireEvent::TextDelta {
+                content: "hello".into(),
+            },
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["type"], "text");
+        assert_eq!(value["session_id"], "session-a");
+    }
+}
+
 pub(crate) async fn live_stream(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<LiveStreamQuery>,
@@ -1236,7 +1286,10 @@ pub(crate) async fn live_stream(
     };
     let project_hash = crate::hash_path(&snapshot_wd);
     let initial_goal = join.goal_progress.clone();
-    let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
+    // Keep the session id alongside the wire event until serialization.  The
+    // projector can update its session after a SessionChanged event, so the id
+    // must be captured at the exact point where each event is projected.
+    let (tx, out_rx) = mpsc::unbounded_channel::<(String, LiveWireEvent)>();
     let mut snapshot_messages: Vec<crate::MessageInfo> = join
         .snapshot
         .messages
@@ -1251,16 +1304,19 @@ pub(crate) async fn live_stream(
         &snapshot_wd,
         &join.binding.session_id,
     );
-    let _ = tx.send(LiveWireEvent::Snapshot {
-        messages: snapshot_messages,
-        session_id: join.binding.session_id.clone(),
-        session_name,
-        project_hash,
-        provider: join.binding.provider.clone(),
-        mode: live_current_mode_wire(),
-        working_dir: snapshot_wd.to_string_lossy().to_string(),
-        goal: initial_goal.as_ref().map(goal_snapshot),
-    });
+    let _ = tx.send((
+        join.binding.session_id.clone(),
+        LiveWireEvent::Snapshot {
+            messages: snapshot_messages,
+            session_id: join.binding.session_id.clone(),
+            session_name,
+            project_hash,
+            provider: join.binding.provider.clone(),
+            mode: live_current_mode_wire(),
+            working_dir: snapshot_wd.to_string_lossy().to_string(),
+            goal: initial_goal.as_ref().map(goal_snapshot),
+        },
+    ));
     let mut projector = NativeLiveWireProjector {
         session_id: join.binding.session_id.clone(),
         ..Default::default()
@@ -1272,12 +1328,12 @@ pub(crate) async fn live_stream(
         if let Some(w) = projector.project(crate::live_hub::LiveViewEvent::Runtime(
             atomcode_coding::CodingRuntimeEvent::GoalChanged(goal),
         )) {
-            let _ = tx.send(w);
+            let _ = tx.send((projector.session_id.clone(), w));
         }
     }
     for observation in join.replay {
         if let Some(w) = projector.project(observation.event) {
-            let _ = tx.send(w);
+            let _ = tx.send((projector.session_id.clone(), w));
         }
     }
     let binding_id = join.binding.id;
@@ -1287,16 +1343,20 @@ pub(crate) async fn live_stream(
             match rx.recv().await {
                 Ok(observation) if observation.binding_id == binding_id => {
                     if let Some(w) = projector.project(observation.event) {
-                        if tx.send(w).is_err() {
+                        let scoped = (projector.session_id.clone(), w);
+                        if tx.send(scoped).is_err() {
                             break;
                         }
                     }
                 }
                 Ok(_) => break,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    let _ = tx.send(LiveWireEvent::Error {
-                        message: format!("live stream lagged by {skipped} events; reconnect"),
-                    });
+                    let _ = tx.send((
+                        projector.session_id.clone(),
+                        LiveWireEvent::Error {
+                            message: format!("live stream lagged by {skipped} events; reconnect"),
+                        },
+                    ));
                     break;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -1304,20 +1364,11 @@ pub(crate) async fn live_stream(
         }
     });
 
-    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|w| {
-        let json = serde_json::to_string(&w).unwrap_or_else(|error| {
-            crate::ctrace!(
-                "LIVE",
-                "live_stream: serde_json serialization failed: {error}"
-            );
-            serde_json::json!({
-                "type": "error",
-                "message": format!("live event serialization failed: {error}"),
-            })
-            .to_string()
+    let stream =
+        tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|(session_id, event)| {
+            let json = serialize_scoped_live_event(session_id, &event);
+            Ok::<_, std::convert::Infallible>(Event::default().data(json))
         });
-        Ok::<_, std::convert::Infallible>(Event::default().data(json))
-    });
     Sse::new(stream)
         .keep_alive(
             KeepAlive::new()
