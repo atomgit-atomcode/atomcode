@@ -419,32 +419,65 @@ fn integer_at_path(document: &DocumentMut, path: &[&str]) -> Option<i64> {
 mod tests {
     use super::*;
 
+    /// Provider config, model selection and credentials have their own deliberate UIs and must
+    /// never be editable through this generic catalog.
+    ///
+    /// That is a claim about what a setting IS — its id and path — not about the words it can
+    /// be found by. The two were checked together against one blob, which made the catalog
+    /// unable to hold a setting that merely *talks about* the forbidden concepts:
+    /// `coding.shell_guard_policy` is the guard that protects credential files, and listing
+    /// "credential" / "凭据" among its aliases is how a user finds it. Under the old blob check
+    /// that alias read as a credential leak and failed the suite.
+    ///
+    /// So: identity is checked against every word, search text only against the ones that name
+    /// a secret's VALUE. No setting needs "api_key" or "token" to be discoverable — those
+    /// appearing in a label means a secret is being edited here, whatever the id says.
     #[test]
     fn catalog_excludes_provider_model_and_credentials() {
+        const SECRET_VALUE_WORDS: &[&str] = &["api_key", "apikey", "token"];
+        const CONCEPT_WORDS: &[&str] = &["provider", "model", "credential"];
+
         for setting in SETTINGS {
-            let searchable = std::iter::once(setting.id)
+            let identity = std::iter::once(setting.id)
                 .chain(setting.path.iter().copied())
-                .chain(std::iter::once(setting.label_en))
+                .collect::<Vec<_>>()
+                .join(".")
+                .to_lowercase();
+            for forbidden in SECRET_VALUE_WORDS.iter().chain(CONCEPT_WORDS) {
+                assert!(
+                    !identity.contains(forbidden),
+                    "{} is a {forbidden} setting; it does not belong in the generic catalog",
+                    setting.id
+                );
+            }
+
+            let search_text = std::iter::once(setting.label_en)
                 .chain(std::iter::once(setting.label_zh))
                 .chain(setting.aliases.iter().copied())
                 .collect::<Vec<_>>()
                 .join(".")
                 .to_lowercase();
-            for forbidden in [
-                "provider",
-                "model",
-                "api_key",
-                "apikey",
-                "token",
-                "credential",
-            ] {
+            for forbidden in SECRET_VALUE_WORDS {
                 assert!(
-                    !searchable.contains(forbidden),
-                    "sensitive catalog surface in {}",
+                    !search_text.contains(forbidden),
+                    "{} surfaces {forbidden} in its label or aliases",
                     setting.id
                 );
             }
         }
+    }
+
+    #[test]
+    fn credential_shell_guard_stays_findable_by_the_word_credential() {
+        // The concession the split above buys, pinned so a future tightening cannot silently
+        // take it back: the setting that decides how hard the shell guard protects credential
+        // files must remain searchable by that word, in both languages.
+        let guard = SETTINGS
+            .iter()
+            .find(|s| s.id == "coding.shell_guard_policy")
+            .expect("the shell guard policy is in the catalog");
+        assert!(guard.aliases.contains(&"credential"));
+        assert!(guard.aliases.contains(&"凭据"));
     }
 
     #[test]
