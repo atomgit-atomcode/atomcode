@@ -2117,9 +2117,15 @@ fn into_tui_native_runtime(
 #[cfg(unix)]
 fn redirect_stderr_to_log_file() {
     use std::os::unix::io::AsRawFd;
-    let Some(home) = std::env::var_os("ATOMCODE_HOME")
+    // Both halves come from `distribution`, which is what `HOME_ENV`'s doc
+    // comment asks of the resolvers it enumerates — this is one of them. The
+    // fallback is rarely taken (`bootstrap_home` has normally set the variable
+    // already), and that is exactly why a literal here is a liability: the one
+    // path that reaches it is the one nobody exercises.
+    let home_env = std::env::var_os(atomcode_config::distribution::HOME_ENV);
+    let Some(home) = home_env
         .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".atomcode")))
+        .or_else(|| dirs::home_dir().map(|h| h.join(atomcode_config::distribution::HOME_DIR_NAME)))
     else {
         return;
     };
