@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { isInternalHistoryUserMessage, sessionMessagesToMarkdownLines } from './historyMessages.ts';
+import {
+  isInternalHistoryUserMessage,
+  isUserInterruptionMessage,
+  sessionMessagesToMarkdownLines,
+} from './historyMessages.ts';
 import type { SessionMessage } from '../api.ts';
 
 test('isInternalHistoryUserMessage hides synthetic and legacy internal users', () => {
@@ -30,6 +34,24 @@ test('sessionMessagesToMarkdownLines skips internal user messages', () => {
   assert.match(markdown, /## Assistant\n\nreply/);
   assert.doesNotMatch(markdown, /not verified/);
   assert.doesNotMatch(markdown, /Auto-read/);
+});
+
+test('isUserInterruptionMessage recognizes provenance and legacy snapshots', () => {
+  assert.equal(isUserInterruptionMessage({
+    role: 'user',
+    content: 'hidden boundary',
+    synthetic: true,
+    internal_origin: 'atomcode.user_interruption',
+  }), true);
+  assert.equal(isUserInterruptionMessage({
+    role: 'user',
+    content: '[The previous response was interrupted by the user before completing. Reconsider.]',
+    synthetic: true,
+  }), true);
+  assert.equal(isUserInterruptionMessage({
+    role: 'user',
+    content: 'I interrupted the task myself',
+  }), false);
 });
 
 test('sessionMessagesToMarkdownLines skips verify cadence assistant messages', () => {

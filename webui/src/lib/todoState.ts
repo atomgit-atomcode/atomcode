@@ -16,6 +16,27 @@ export interface TodoProjection {
   committed: TodoItem[];
   preview: TodoItem[];
   hasUnresolved: boolean;
+  hasApplicable: boolean;
+}
+
+export type TodoPanelEvent =
+  | { type: 'user_input' }
+  | { type: 'todo_call'; success?: boolean }
+  | { type: 'user_cancel' };
+
+/** Visibility is presentation-only: a new instruction hides the prior turn's
+ * card without deleting its todo state; a valid/pending TodoWrite reveals it. */
+export function reduceTodoPanelVisibility(
+  visible: boolean,
+  event: TodoPanelEvent,
+): boolean {
+  switch (event.type) {
+    case 'user_input':
+    case 'user_cancel':
+      return false;
+    case 'todo_call':
+      return event.success === false ? visible : true;
+  }
 }
 
 function parseArgs(argsJson: string): Record<string, unknown> | null {
@@ -65,33 +86,49 @@ export function applyTodoCall(
   name: string,
   argsJson: string,
 ): TodoItem[] {
-  if (!isTodoTool(name)) return [...current];
+  return applyTodoCallResult(current, name, argsJson).items;
+}
+
+function applyTodoCallResult(
+  current: readonly TodoItem[],
+  name: string,
+  argsJson: string,
+): { items: TodoItem[]; applicable: boolean } {
+  if (!isTodoTool(name)) return { items: [...current], applicable: false };
   const args = parseArgs(argsJson);
-  if (!args) return [...current];
+  if (!args) return { items: [...current], applicable: false };
 
   if (Object.prototype.hasOwnProperty.call(args, 'todos')) {
-    return parseFullList(args.todos) ?? [...current];
+    const items = parseFullList(args.todos);
+    return items === null
+      ? { items: [...current], applicable: false }
+      : { items, applicable: true };
   }
 
   if (args.action === 'add') {
     const content = typeof args.content === 'string' ? args.content.trim() : '';
-    return content ? [...current, { content, status: 'pending' }] : [...current];
+    return content
+      ? { items: [...current, { content, status: 'pending' }], applicable: true }
+      : { items: [...current], applicable: false };
   }
 
   if (args.action === 'update') {
     const id = typeof args.id === 'number' && Number.isInteger(args.id) ? args.id : 0;
     const status = parseStatus(args.status);
-    if (id < 1 || id > current.length || status === null) return [...current];
-    return current.map((item, index) => {
+    if (id < 1 || id > current.length || status === null) {
+      return { items: [...current], applicable: false };
+    }
+    const items: TodoItem[] = current.map((item, index) => {
       if (index === id - 1) return { ...item, status };
       if (status === 'in_progress' && item.status === 'in_progress') {
         return { ...item, status: 'pending' };
       }
       return { ...item };
     });
+    return { items, applicable: true };
   }
 
-  return [...current];
+  return { items: [...current], applicable: false };
 }
 
 /**
@@ -106,17 +143,25 @@ export function projectTodoCalls(
   let committed = [...base];
   let preview = [...base];
   let hasUnresolved = false;
+  let hasApplicable = false;
 
   for (const call of calls) {
     if (call.success === false) continue;
     if (call.success === true) {
-      committed = applyTodoCall(committed, call.name, call.args);
-      preview = applyTodoCall(preview, call.name, call.args);
+      const nextCommitted = applyTodoCallResult(committed, call.name, call.args);
+      const nextPreview = applyTodoCallResult(preview, call.name, call.args);
+      if (!nextCommitted.applicable && !nextPreview.applicable) continue;
+      hasApplicable = true;
+      if (nextCommitted.applicable) committed = nextCommitted.items;
+      if (nextPreview.applicable) preview = nextPreview.items;
     } else {
+      const nextPreview = applyTodoCallResult(preview, call.name, call.args);
+      if (!nextPreview.applicable) continue;
+      hasApplicable = true;
       hasUnresolved = true;
-      preview = applyTodoCall(preview, call.name, call.args);
+      preview = nextPreview.items;
     }
   }
 
-  return { committed, preview, hasUnresolved };
+  return { committed, preview, hasUnresolved, hasApplicable };
 }

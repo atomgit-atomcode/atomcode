@@ -844,7 +844,15 @@ impl MessageInfo {
                 .iter()
                 .map(|call| (call.name.as_str(), call.arguments.as_str())),
         );
-        let mut content = msg.text.clone();
+        // A user-interruption message is a lifecycle boundary, not user-facing
+        // copy. Keep its provenance on the wire so clients can retire derived
+        // state, but never expose the internal continuation instruction.
+        let user_interruption = msg.is_user_interruption();
+        let mut content = if user_interruption {
+            String::new()
+        } else {
+            msg.text.clone()
+        };
         let mut images = (!msg.images.is_empty()).then(|| {
             msg.images
                 .iter()
@@ -868,7 +876,11 @@ impl MessageInfo {
             role: role.into(),
             content,
             synthetic: msg.synthetic,
-            internal_origin: msg.internal_origin.clone(),
+            internal_origin: if user_interruption {
+                Some(atomcode_kernel::message::USER_INTERRUPTION_ORIGIN.to_string())
+            } else {
+                msg.internal_origin.clone()
+            },
             tool_calls,
             tool_result,
             artifacts,
@@ -2146,9 +2158,15 @@ fn merge_catalog_session_messages_for_display(
         // PresentationFile anchors and turn_stats are expressed in that coordinate space.
         // Compressing this iterator before applying `index + 1` moves presentation rows to
         // the wrong turn.
+        // Preserve the synthetic user-cancel boundary on the wire. UI clients
+        // still hide its text, but state projections (notably TodoWrite) need
+        // the provenance to retire work before this point. `/live` snapshots
+        // already expose this exact marker through `MessageInfo::from_kernel`;
+        // keeping it here makes HTTP history and live replay equivalent.
+        let user_interruption = message.is_user_interruption();
         let hidden_internal = message.internal_origin.as_deref()
             == Some(atomcode_kernel::message::LEGACY_COLD_SUMMARY_ORIGIN)
-            || message.synthetic
+            || (message.synthetic && !user_interruption)
             || (message.role == atomcode_kernel::message::Role::User
                 && atomcode_capabilities::reminder::is_system_reminder(&message.text));
         if !hidden_internal {
@@ -6283,6 +6301,30 @@ mod tests {
     }
 
     #[test]
+    fn display_projection_preserves_hidden_user_interruption_provenance() {
+        use atomcode_capabilities::session::{PresentationFile, SessionMeta};
+        use atomcode_kernel::message::{Message, SessionSnapshot, USER_INTERRUPTION_ORIGIN};
+
+        let session = crate::legacy_convert::CatalogSessionView {
+            snapshot: SessionSnapshot::new(vec![
+                Message::user("start work"),
+                Message::user_interruption(),
+            ]),
+            meta: SessionMeta::new("cancel-boundary", "/project", 1),
+            presentation: PresentationFile::default(),
+        };
+
+        let displayed = merge_catalog_session_messages_for_display(&session).unwrap();
+        assert_eq!(displayed.len(), 2);
+        assert_eq!(
+            displayed[1].internal_origin.as_deref(),
+            Some(USER_INTERRUPTION_ORIGIN)
+        );
+        assert!(displayed[1].synthetic);
+        assert!(displayed[1].content.is_empty());
+    }
+
+    #[test]
     fn chat_resolves_new_schema_model_selection() {
         let config: Config = serde_json::from_value(serde_json::json!({
             "default_model": "AtomGit-deepseek-v4-flash",
@@ -7939,6 +7981,23 @@ mod tests {
         let info = MessageInfo::from_kernel(&msg);
 
         assert_eq!(info.internal_origin.as_deref(), Some("verify_cadence"));
+    }
+
+    #[test]
+    fn message_info_normalizes_legacy_user_interruption_without_exposing_text() {
+        use atomcode_kernel::message::{Message, USER_INTERRUPTION_ORIGIN};
+
+        let msg = Message::synthetic_user(
+            "[The previous response was interrupted by the user before completing. Reconsider.]",
+        );
+        let info = MessageInfo::from_kernel(&msg);
+
+        assert!(info.content.is_empty());
+        assert!(info.synthetic);
+        assert_eq!(
+            info.internal_origin.as_deref(),
+            Some(USER_INTERRUPTION_ORIGIN)
+        );
     }
 
     #[test]

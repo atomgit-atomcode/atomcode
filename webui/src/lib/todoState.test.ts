@@ -88,4 +88,16 @@ test('failed TodoWrite calls are skipped while later successful calls remain ord
     { content: 'existing', status: 'in_progress' },
     { content: 'verify', status: 'pending' },
   ]);
+  assert.equal(projected.hasApplicable, true);
+});
+
+test('failed and malformed calls do not make a hidden prior plan applicable', () => {
+  const base = [{ content: 'old plan', status: 'completed' as const }];
+
+  assert.equal(projectTodoCalls(base, [
+    { id: 'failed', name: 'todowrite', args: '{"todos":[]}', success: false },
+  ]).hasApplicable, false);
+  assert.equal(projectTodoCalls(base, [
+    { id: 'malformed', name: 'todowrite', args: '{"todos":[{"content":"","status":"pending"}]}' },
+  ]).hasApplicable, false);
 });

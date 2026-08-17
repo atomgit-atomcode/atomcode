@@ -60,10 +60,15 @@ import {
   applyTodoCall,
   isTodoTool,
   projectTodoCalls,
+  reduceTodoPanelVisibility,
   type TodoItem,
   type TodoProjectionCall,
 } from '../lib/todoState';
-import { isInternalHistoryAssistantMessage, isInternalHistoryUserMessage } from '../lib/historyMessages';
+import {
+  isInternalHistoryAssistantMessage,
+  isInternalHistoryUserMessage,
+  isUserInterruptionMessage,
+} from '../lib/historyMessages';
 import {
   activeTurnSubmissionDisposition,
   chatRecoveryPolicy,
@@ -599,11 +604,19 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const [policyIntervention, setPolicyIntervention] = useState<PolicyInterventionEvent | null>(null);
   const [todoItems, setTodoItems] = useState<TodoItem[]>([]);
   const [todoPreview, setTodoPreview] = useState<TodoItem[] | null>(null);
+  const [todoPanelVisible, setTodoPanelVisibleState] = useState(false);
+  const todoPanelVisibleRef = useRef(false);
+  const todoVisibilityCacheRef = useRef<Map<string, boolean>>(new Map());
   const todoItemsRef = useRef<TodoItem[]>([]);
   const todoCacheRef = useRef<Map<string, TodoItem[]>>(new Map());
-  const todoBatchRef = useRef<{ base: TodoItem[]; calls: TodoProjectionCall[] }>({
+  const todoBatchRef = useRef<{
+    base: TodoItem[];
+    calls: TodoProjectionCall[];
+    visibleBase: boolean;
+  }>({
     base: [],
     calls: [],
+    visibleBase: false,
   });
   const abortRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef<string | null>(null);
@@ -683,6 +696,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const todoTitlesRef = useRef<TodoTitles>(new Map());
   const pendingTodoCallsRef = useRef<Map<string, { name: string; args: string }>>(new Map());
 
+  function setTodoPanelVisible(visible: boolean, persist = true) {
+    todoPanelVisibleRef.current = visible;
+    setTodoPanelVisibleState(visible);
+    const activeId = activeIdRef.current;
+    if (persist && activeId) todoVisibilityCacheRef.current.set(activeId, visible);
+  }
+
   function replaceTodoItems(items: readonly TodoItem[], persist = true) {
     const next = items.map((item) => ({ ...item }));
     todoItemsRef.current = next;
@@ -693,20 +713,32 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   }
 
   function resetTodoBatch(clearCommitted: boolean, persistClear = true) {
-    todoBatchRef.current = { base: [], calls: [] };
+    todoBatchRef.current = {
+      base: [],
+      calls: [],
+      visibleBase: clearCommitted ? false : todoPanelVisibleRef.current,
+    };
     pendingTodoCallsRef.current.clear();
     setTodoPreview(null);
-    if (clearCommitted) replaceTodoItems([], persistClear);
+    if (clearCommitted) {
+      replaceTodoItems([], persistClear);
+      setTodoPanelVisible(false, persistClear);
+    }
   }
 
   function stageTodoCall(id: string, name: string, args: string) {
     if (!isTodoTool(name)) return;
     const batch = todoBatchRef.current;
-    if (batch.calls.length === 0) batch.base = todoItemsRef.current.map((item) => ({ ...item }));
+    if (batch.calls.length === 0) {
+      batch.base = todoItemsRef.current.map((item) => ({ ...item }));
+      batch.visibleBase = todoPanelVisibleRef.current;
+    }
     if (!batch.calls.some((call) => call.id === id)) {
       batch.calls.push({ id, name, args });
     }
-    setTodoPreview(projectTodoCalls(batch.base, batch.calls).preview);
+    const projected = projectTodoCalls(batch.base, batch.calls);
+    setTodoPanelVisible(projected.hasApplicable ? true : batch.visibleBase);
+    setTodoPreview(projected.hasUnresolved ? projected.preview : null);
   }
 
   function settleTodoCall(id: string, success: boolean) {
@@ -715,11 +747,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     if (!call) return;
     call.success = success;
     const projected = projectTodoCalls(batch.base, batch.calls);
+    setTodoPanelVisible(projected.hasApplicable ? true : batch.visibleBase);
     replaceTodoItems(projected.committed);
     if (projected.hasUnresolved) {
       setTodoPreview(projected.preview);
     } else {
-      todoBatchRef.current = { base: projected.committed, calls: [] };
+      todoBatchRef.current = {
+        base: projected.committed,
+        calls: [],
+        visibleBase: todoPanelVisibleRef.current,
+      };
       setTodoPreview(null);
     }
   }
@@ -749,6 +786,26 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       }
     }
     replaceTodoItems(restoredItems);
+    let restoredVisible = false;
+    let visibilityItems: TodoItem[] = [];
+    for (const message of messages) {
+      if (message.role === 'user') {
+        restoredVisible = reduceTodoPanelVisibility(restoredVisible, { type: 'user_input' });
+      }
+      for (const part of message.parts) {
+        if (part.kind === 'tool' && part.tool.status === 'done' && isTodoTool(part.tool.name)) {
+          const projected = projectTodoCalls(visibilityItems, [{
+            id: part.tool.id,
+            name: part.tool.name,
+            args: part.tool.args,
+            success: true,
+          }]);
+          visibilityItems = projected.committed;
+          if (projected.hasApplicable) restoredVisible = true;
+        }
+      }
+    }
+    setTodoPanelVisible(restoredVisible);
   }
 
   // 切换/恢复会话时重置画布并加载历史。依赖 project_hash：刷新后 sessionId 先于
@@ -826,8 +883,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       const cached = sessionId ? messageCacheRef.current.get(sessionId) : undefined;
       if (cached && cached.length > 0) {
         const cachedTodos = sessionId ? todoCacheRef.current.get(sessionId) : undefined;
+        const cachedTodoVisibility = sessionId
+          ? todoVisibilityCacheRef.current.get(sessionId)
+          : undefined;
         restoreTodoTitles(cached);
         if (cachedTodos) replaceTodoItems(cachedTodos);
+        if (cachedTodoVisibility !== undefined) setTodoPanelVisible(cachedTodoVisibility);
         setMessages(cached);
       } else {
         setMessages([]);
@@ -902,9 +963,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
 
         let nextHint: string | null = null;
         if (sessionResult.status === 'fulfilled' && sessionResult.value && Array.isArray(sessionResult.value.messages)) {
+          const currentCached = messageCacheRef.current.get(loadId);
+          const cachedTodos = todoCacheRef.current.get(loadId);
+          const cachedTodoVisibility = todoVisibilityCacheRef.current.get(loadId);
           // Convert loaded messages to display format (reuses sessionMessagesToDisplay).
           const loaded = sessionMessagesToDisplay(sessionResult.value.messages);
-          const currentCached = messageCacheRef.current.get(loadId);
 
           if (currentCached && currentCached.length > 0) {
             // If the loaded messages from the backend are shorter than the cached messages,
@@ -913,6 +976,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             if (loaded.length >= currentCached.length) {
               setMessages(loaded);
               messageCacheRef.current.delete(loadId);
+            } else {
+              // `sessionMessagesToDisplay` also projects Todo state. If the
+              // persisted transcript loses to our longer local cache, restore
+              // the matching local Todo projection as well; otherwise the
+              // canvas and task card would represent different revisions.
+              restoreTodoTitles(currentCached);
+              if (cachedTodos) replaceTodoItems(cachedTodos);
+              if (cachedTodoVisibility !== undefined) {
+                setTodoPanelVisible(cachedTodoVisibility);
+              }
             }
           } else if (loaded.length > 0) {
             // A newly loaded session starts at the bottom regardless of prior scroll state.
@@ -1204,9 +1277,19 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     const todoTitles: TodoTitles = new Map();
     const pendingTodoCalls = new Map<string, { name: string; args: string }>();
     const orderedTodoCalls: TodoProjectionCall[] = [];
+    const todoCallEpochs = new Map<string, number>();
+    let inputEpoch = 0;
     for (const msg of msgs) {
       if (msg.role === 'user') {
+        if (isUserInterruptionMessage(msg)) {
+          orderedTodoCalls.length = 0;
+          pendingTodoCalls.clear();
+          todoCallEpochs.clear();
+          inputEpoch += 1;
+          continue;
+        }
         if (isInternalHistoryUserMessage(msg.content ?? '', msg.synthetic)) continue;
+        inputEpoch += 1;
         loaded.push({
           role: 'user',
           parts: [{ kind: 'text', text: stripVisionAnnotation(msg.content ?? '') }],
@@ -1232,7 +1315,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             },
           });
           pendingTodoCalls.set(tc.id, { name: tc.name, args });
-          if (isTodoTool(tc.name)) orderedTodoCalls.push({ id: tc.id, name: tc.name, args });
+          if (isTodoTool(tc.name)) {
+            orderedTodoCalls.push({ id: tc.id, name: tc.name, args });
+            todoCallEpochs.set(tc.id, inputEpoch);
+          }
         }
         loaded.push({ role: 'assistant', parts, ts: msg.created_at });
       } else if (msg.role === 'tool' && msg.tool_result) {
@@ -1247,7 +1333,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
               const pending = pendingTodoCalls.get(result.call_id);
               if (pending && isTodoTool(pending.name)) {
                 const call = orderedTodoCalls.find((candidate) => candidate.id === result.call_id);
-                if (call) call.success = result.success;
+                if (call) {
+                  call.success = result.success;
+                }
                 const projected = projectTodoCalls([], orderedTodoCalls);
                 todoTitles.clear();
                 projected.committed.forEach((item, index) => {
@@ -1264,15 +1352,30 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     }
     const restoredProjection = projectTodoCalls([], orderedTodoCalls);
     const restoredTodoItems = restoredProjection.committed;
+    const priorTodoCalls = orderedTodoCalls.filter(
+      (call) => (todoCallEpochs.get(call.id) ?? 0) < inputEpoch,
+    );
+    const currentTodoCalls = orderedTodoCalls.filter(
+      (call) => todoCallEpochs.get(call.id) === inputEpoch,
+    );
+    const priorTodoItems = projectTodoCalls([], priorTodoCalls).committed;
+    const restoredTodoVisible = projectTodoCalls(
+      priorTodoItems,
+      currentTodoCalls,
+    ).hasApplicable;
     todoTitlesRef.current = new Map(
       restoredTodoItems.map((item, index) => [index + 1, item.content]),
     );
     pendingTodoCallsRef.current = pendingTodoCalls;
     todoBatchRef.current = restoredProjection.hasUnresolved
-      ? { base: [], calls: orderedTodoCalls }
-      : { base: restoredTodoItems, calls: [] };
+      ? { base: [], calls: orderedTodoCalls, visibleBase: false }
+      : { base: restoredTodoItems, calls: [], visibleBase: restoredTodoVisible };
     setTodoPreview(restoredProjection.hasUnresolved ? restoredProjection.preview : null);
     replaceTodoItems(restoredTodoItems);
+    setTodoPanelVisible(
+      restoredTodoVisible
+        && (restoredProjection.preview.length > 0 || restoredTodoItems.length > 0),
+    );
     return loaded;
   }
 
@@ -1431,6 +1534,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
 
     switch (e.type) {
       case 'user': {
+        const wasRunning = liveLifecycleRef.current.running;
+        if (!wasRunning) {
+          setTodoPanelVisible(reduceTodoPanelVisibility(
+            todoPanelVisibleRef.current,
+            { type: 'user_input' },
+          ));
+        }
         const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
           type: 'input_accepted',
         });
@@ -2240,6 +2350,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     // sendMessage, so merely QUEUEING a message while reading history doesn't yank them.
     atBottomRef.current = true;
     setShowJumpBtn(false);
+    const startsNewTurn = !busyRef.current;
+    if (startsNewTurn) {
+      setTodoPanelVisible(reduceTodoPanelVisibility(
+        todoPanelVisibleRef.current,
+        { type: 'user_input' },
+      ));
+    }
     // 本会话首条消息：用消息前 10 字做临时标题，立刻通知 App 乐观插入侧栏，
     // 让会话「一发送就出现在左侧」。回合 done 后列表刷新会换成后端自动命名。
     if (!optimisticFiredRef.current && messages.length === 0) {
@@ -3528,7 +3645,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         </div>
       )}
       <div class="input-container">
-        {busy && (todoPreview ?? todoItems).length > 0 && (
+        {todoPanelVisible && (todoPreview ?? todoItems).length > 0 && (
           <TodoProgressPanel items={todoPreview ?? todoItems} />
         )}
         <div class="input-wrap">
