@@ -635,6 +635,7 @@ pub(crate) fn compute_input_attachments(
 /// notice string for the caller to render.
 ///
 /// Returns the list of notice strings (empty when every attachment hit).
+#[cfg(test)]
 pub(crate) fn hydrate_recalled_attachments(
     state: &mut UiState,
     line: &mut String,
