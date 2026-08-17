@@ -66,6 +66,13 @@ pub enum CodingRuntimeEvent {
     VisionPreprocessFailed {
         reason: String,
     },
+    /// Driver-correlation acknowledgement for inputs accepted as in-turn
+    /// steers. Unlike the kernel `AgentEvent::Steered`, these are the original
+    /// inputs submitted at the runtime boundary, before local-context or vision
+    /// preprocessing rewrites them.
+    SteerAcknowledged {
+        inputs: Vec<UserInput>,
+    },
     /// A potentially slow compaction strategy has started.
     CompactionStarted {
         trigger: CompactTrigger,
@@ -440,6 +447,65 @@ pub struct RuntimeSnapshotError {
 pub struct UserInput {
     pub text: String,
     pub images: Vec<ImageContent>,
+}
+
+/// One accepted in-turn submit, before and after runtime-owned preprocessing.
+///
+/// Kernel `Steered` events necessarily describe the input that reached the
+/// kernel. Drivers, however, correlate those acknowledgements with the input
+/// they submitted. Vision preprocessing and pending local context can rewrite
+/// that payload, so the runtime owner keeps the two projections together until
+/// the kernel confirms the fold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingSteerAcknowledgement {
+    generation: u64,
+    original: UserInput,
+    forwarded: UserInput,
+}
+
+fn acknowledge_steered_inputs(
+    pending: &mut VecDeque<PendingSteerAcknowledgement>,
+    generation: u64,
+    inputs: &[atomcode_kernel::event::SteeredInput],
+) -> Vec<UserInput> {
+    while pending
+        .front()
+        .is_some_and(|entry| entry.generation != generation)
+    {
+        pending.pop_front();
+    }
+
+    inputs
+        .iter()
+        .filter_map(|input| {
+            let matches_front = pending.front().is_some_and(|entry| {
+                entry.forwarded.text == input.text && entry.forwarded.images == input.images
+            });
+            if !matches_front {
+                return None;
+            }
+
+            Some(
+                pending
+                    .pop_front()
+                    .expect("front was checked above")
+                    .original,
+            )
+        })
+        .collect()
+}
+
+fn forwarded_steer_for_acknowledgement(
+    original: Option<&UserInput>,
+    command: &AgentCommand,
+) -> Option<UserInput> {
+    match (original, command) {
+        (Some(_), AgentCommand::SendMessage { text, images }) => Some(UserInput {
+            text: text.clone(),
+            images: images.clone(),
+        }),
+        _ => None,
+    }
 }
 
 /// Ordered, fire-and-forget driver requests. This is the native replacement for
@@ -2666,6 +2732,7 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut cancel_pending = false;
         let mut turn_stats = RuntimeTurnStats::default();
         let mut turn_started_at: Option<std::time::Instant> = None;
+        let mut pending_steer_acknowledgements = VecDeque::new();
         let mut next_prompt_task: Option<tokio::task::JoinHandle<()>> = None;
         let mut pending_local_context = Vec::new();
         let mut next_controller_id = 0u64;
@@ -2720,6 +2787,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         if !compaction_suspended {
                             generation = generation.wrapping_add(1);
                             event_generation.store(generation, Ordering::Release);
+                            pending_steer_acknowledgements.clear();
                             compaction_suspended = true;
                             controls
                                 .state
@@ -2749,6 +2817,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         if !compaction_suspended {
                             generation = generation.wrapping_add(1);
                             event_generation.store(generation, Ordering::Release);
+                            pending_steer_acknowledgements.clear();
                         }
                         compaction_suspended = true;
                         controls
@@ -2817,6 +2886,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         if resume_after_replace {
                             generation = generation.wrapping_add(1);
                             event_generation.store(generation, Ordering::Release);
+                            pending_steer_acknowledgements.clear();
                             compaction_suspended = true;
                             controls
                                 .state
@@ -2894,6 +2964,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         if !compaction_suspended {
                             generation = generation.wrapping_add(1);
                             event_generation.store(generation, Ordering::Release);
+                            pending_steer_acknowledgements.clear();
                         }
                         controls
                             .state
@@ -3379,6 +3450,8 @@ fn spawn_runtime_owner_with_optional_agent(
                                 turn_id: next_turn_id,
                             }
                         };
+                        let original_steer_input = matches!(receipt, SubmitReceipt::Steered { .. })
+                            .then(|| input.clone());
                         if !pending_local_context.is_empty() {
                             let prefix = pending_local_context.drain(..).collect::<Vec<_>>().join("\n\n");
                             input.text = if input.text.is_empty() {
@@ -3450,7 +3523,28 @@ fn spawn_runtime_owner_with_optional_agent(
                                 images: input.images,
                             },
                         };
+                        // Only a plain `SendMessage` can enter the kernel's
+                        // in-turn steer buffer. A context-bearing message is
+                        // deliberately queued by the kernel for the next turn,
+                        // so registering it here would leave an acknowledgement
+                        // at the FIFO head that can never match `Steered` and
+                        // would block every later acknowledgement behind it.
+                        let forwarded_steer_input = forwarded_steer_for_acknowledgement(
+                            original_steer_input.as_ref(),
+                            &command,
+                        );
                         if send_agent_command(&agent, command) {
+                            if let (Some(original), Some(forwarded)) =
+                                (original_steer_input, forwarded_steer_input)
+                            {
+                                pending_steer_acknowledgements.push_back(
+                                    PendingSteerAcknowledgement {
+                                        generation,
+                                        original,
+                                        forwarded,
+                                    },
+                                );
+                            }
                             let _ = done.send(Ok(receipt));
                         } else {
                             agent_available = false;
@@ -4285,6 +4379,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 agent = Some(candidate.spawn());
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
+                                pending_steer_acknowledgements.clear();
                                 // Do NOT begin a new team generation here: a `/model`
                                 // reassemble keeps the session, so in-flight team runs
                                 // (and their events) must survive rather than be cancelled.
@@ -4496,6 +4591,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         generation = generation.wrapping_add(1);
                         event_generation.store(generation, Ordering::Release);
+                        pending_steer_acknowledgements.clear();
                         agent_available = false;
                         provider_unavailable_reason = Some(reason);
                         controls.provider_unavailable_reason.store(
@@ -4801,6 +4897,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         agent = Some(replacement);
                         generation = generation.wrapping_add(1);
                         event_generation.store(generation, Ordering::Release);
+                        pending_steer_acknowledgements.clear();
                         runtime
                             .parts
                             .team_manager
@@ -4960,6 +5057,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 agent = Some(replacement);
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
+                                pending_steer_acknowledgements.clear();
                                 runtime.parts.team_manager.begin_generation(generation);
                                 agent_available = true;
                                 observed_tokens = None;
@@ -5146,6 +5244,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 agent = Some(replacement);
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
+                                pending_steer_acknowledgements.clear();
                                 runtime.parts.team_manager.begin_generation(generation);
                                 agent_available = true;
                                 observed_tokens = None;
@@ -5689,6 +5788,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 ));
                             }
                             AgentEvent::TurnComplete { reason } => {
+                                pending_steer_acknowledgements.clear();
                                 let persistence_status = resources.as_ref().and_then(|runtime| {
                                     runtime.parts.snapshot_persistence_status()
                                 });
@@ -6186,6 +6286,23 @@ fn spawn_runtime_owner_with_optional_agent(
                                 turn_stats.tool_call_count =
                                     turn_stats.tool_call_count.saturating_add(1);
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(event));
+                            }
+                            AgentEvent::Steered { count, inputs } => {
+                                let acknowledged = acknowledge_steered_inputs(
+                                    &mut pending_steer_acknowledgements,
+                                    generation,
+                                    &inputs,
+                                );
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(
+                                    AgentEvent::Steered { count, inputs },
+                                ));
+                                if !acknowledged.is_empty() {
+                                    let _ = runtime_event_tx.send(
+                                        CodingRuntimeEvent::SteerAcknowledged {
+                                            inputs: acknowledged,
+                                        },
+                                    );
+                                }
                             }
                             event => {
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(event));
@@ -7632,6 +7749,121 @@ async fn resolve_goal_round_cap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_image(data: &str) -> ImageContent {
+        ImageContent {
+            media_type: "image/png".into(),
+            data: data.into(),
+        }
+    }
+
+    #[test]
+    fn steered_acknowledgement_restores_preprocessed_original_input() {
+        let original = UserInput {
+            text: "before\n[Image #1]\nafter".into(),
+            images: vec![test_image("raw-image")],
+        };
+        let forwarded = UserInput {
+            text: "before\n[image description]\nafter".into(),
+            images: Vec::new(),
+        };
+        let mut pending = VecDeque::from([PendingSteerAcknowledgement {
+            generation: 7,
+            original: original.clone(),
+            forwarded: forwarded.clone(),
+        }]);
+
+        let acknowledged = acknowledge_steered_inputs(
+            &mut pending,
+            7,
+            &[atomcode_kernel::event::SteeredInput {
+                text: forwarded.text,
+                images: forwarded.images,
+            }],
+        );
+
+        assert_eq!(acknowledged, vec![original]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn steered_acknowledgement_does_not_consume_an_unrelated_client_input() {
+        let original = UserInput::from("local");
+        let mut pending = VecDeque::from([PendingSteerAcknowledgement {
+            generation: 4,
+            original: original.clone(),
+            forwarded: UserInput::from("local-forwarded"),
+        }]);
+        let remote = atomcode_kernel::event::SteeredInput {
+            text: "remote".into(),
+            images: Vec::new(),
+        };
+
+        assert_eq!(
+            acknowledge_steered_inputs(&mut pending, 4, &[remote]),
+            Vec::<UserInput>::new()
+        );
+        assert_eq!(pending.len(), 1);
+
+        let local = acknowledge_steered_inputs(
+            &mut pending,
+            4,
+            &[atomcode_kernel::event::SteeredInput {
+                text: "local-forwarded".into(),
+                images: Vec::new(),
+            }],
+        );
+        assert_eq!(local[0].text, original.text);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn steered_acknowledgement_drops_stale_generation_state() {
+        let mut pending = VecDeque::from([PendingSteerAcknowledgement {
+            generation: 2,
+            original: UserInput::from("old"),
+            forwarded: UserInput::from("same"),
+        }]);
+        let current = atomcode_kernel::event::SteeredInput {
+            text: "same".into(),
+            images: Vec::new(),
+        };
+
+        assert_eq!(
+            acknowledge_steered_inputs(&mut pending, 3, &[current]),
+            Vec::<UserInput>::new()
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn context_bearing_next_turn_is_not_registered_as_a_steer_acknowledgement() {
+        let original = UserInput::from("continue");
+        let command = AgentCommand::SendMessageWithContext {
+            text: "continue".into(),
+            images: Vec::new(),
+            context: "recovery".into(),
+        };
+
+        assert_eq!(
+            forwarded_steer_for_acknowledgement(Some(&original), &command),
+            None
+        );
+    }
+
+    #[test]
+    fn plain_in_turn_message_is_registered_as_a_steer_acknowledgement() {
+        let original = UserInput::from("original");
+        let command = AgentCommand::SendMessage {
+            text: "processed".into(),
+            images: Vec::new(),
+        };
+
+        assert_eq!(
+            forwarded_steer_for_acknowledgement(Some(&original), &command),
+            Some(UserInput::from("processed"))
+        );
+    }
 
     #[test]
     fn runtime_turn_stats_sum_usage_across_rounds() {
@@ -11660,10 +11892,11 @@ mod tests {
     ) -> (
         CodingRuntimeHandle,
         mpsc::UnboundedReceiver<AgentCommand>,
+        mpsc::UnboundedSender<AgentEvent>,
         mpsc::UnboundedReceiver<CodingRuntimeEvent>,
         KernelRuntimeAdapter,
     ) {
-        let (agent, kernel_commands, _kernel_events) = fake_agent();
+        let (agent, kernel_commands, kernel_events) = fake_agent();
         let (handle, controls) = coding_runtime_control_channel();
         let (runtime_tx, runtime_events) = mpsc::unbounded_channel();
         let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
@@ -11698,7 +11931,13 @@ mod tests {
             Some(resources),
             Some(wakeup_rx),
         );
-        (handle, kernel_commands, runtime_events, adapter)
+        (
+            handle,
+            kernel_commands,
+            kernel_events,
+            runtime_events,
+            adapter,
+        )
     }
 
     // The installed preprocessor runs on an image-carrying submit, and its
@@ -11707,7 +11946,7 @@ mod tests {
     #[tokio::test]
     async fn image_submit_runs_installed_preprocessor_before_kernel() {
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (handle, mut kernel_commands, mut runtime_events, _adapter) =
+        let (handle, mut kernel_commands, _kernel_events, mut runtime_events, _adapter) =
             spawn_with_preprocessor(Some(Arc::new(RecordingPreprocessor {
                 called: called.clone(),
             })))
@@ -11754,12 +11993,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn image_steer_acknowledges_the_driver_original_after_preprocessing() {
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (handle, mut kernel_commands, kernel_events, mut runtime_events, _adapter) =
+            spawn_with_preprocessor(Some(Arc::new(RecordingPreprocessor {
+                called: called.clone(),
+            })))
+            .await;
+
+        handle.submit(UserInput::from("first")).await.unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { text, .. }) if text == "first"
+        ));
+
+        let original = UserInput {
+            text: "before\n[Image #1]\nafter".into(),
+            images: vec![test_image("raw-image")],
+        };
+        assert!(matches!(
+            handle.submit(original.clone()).await.unwrap(),
+            SubmitReceipt::Steered { .. }
+        ));
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { text, images })
+                if text == "VL[before\n[Image #1]\nafter]" && images.is_empty()
+        ));
+
+        kernel_events
+            .send(AgentEvent::Steered {
+                count: 1,
+                inputs: vec![atomcode_kernel::event::SteeredInput {
+                    text: "VL[before\n[Image #1]\nafter]".into(),
+                    images: Vec::new(),
+                }],
+            })
+            .unwrap();
+
+        let (authoritative, acknowledged) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut authoritative = None;
+                let mut acknowledged = None;
+                loop {
+                    match runtime_events.recv().await {
+                        Some(CodingRuntimeEvent::Agent(AgentEvent::Steered { inputs, .. })) => {
+                            authoritative = Some(inputs)
+                        }
+                        Some(CodingRuntimeEvent::SteerAcknowledged { inputs }) => {
+                            acknowledged = Some(inputs)
+                        }
+                        Some(_) => {}
+                        None => panic!("runtime event stream closed"),
+                    }
+                    if authoritative.is_some() && acknowledged.is_some() {
+                        break (authoritative.unwrap(), acknowledged.unwrap());
+                    }
+                }
+            })
+            .await
+            .expect("missing steered acknowledgement");
+        assert_eq!(
+            authoritative,
+            vec![atomcode_kernel::event::SteeredInput {
+                text: "VL[before\n[Image #1]\nafter]".into(),
+                images: Vec::new(),
+            }],
+            "kernel Steered must preserve the input actually folded into conversation"
+        );
+        assert_eq!(acknowledged, vec![original]);
+        assert!(called.load(Ordering::Acquire));
+    }
+
     // Guard: a text-only submit skips the preprocessor entirely (no images),
     // so the original text passes through untouched.
     #[tokio::test]
     async fn text_only_submit_skips_preprocessor() {
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (handle, mut kernel_commands, _runtime_events, _adapter) =
+        let (handle, mut kernel_commands, _kernel_events, _runtime_events, _adapter) =
             spawn_with_preprocessor(Some(Arc::new(RecordingPreprocessor {
                 called: called.clone(),
             })))
@@ -11787,7 +12099,7 @@ mod tests {
     // text-only turn.
     #[tokio::test]
     async fn image_submit_failure_emits_failed_event_and_text_only_turn() {
-        let (handle, mut kernel_commands, mut runtime_events, _adapter) =
+        let (handle, mut kernel_commands, _kernel_events, mut runtime_events, _adapter) =
             spawn_with_preprocessor(Some(Arc::new(FailingPreprocessor))).await;
 
         handle

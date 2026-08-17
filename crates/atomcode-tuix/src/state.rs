@@ -1968,20 +1968,25 @@ impl UiState {
 
     /// The kernel confirmed one or more steered prompts. Return locally-owned
     /// payloads whose content matches the authoritative folded inputs.
+    ///
+    /// Usually acknowledgements are FIFO. A context-bearing submit can be
+    /// queued for the next turn ahead of a later real steer, however, and has
+    /// no kernel `Steered` event of its own. Search the pending set so that such
+    /// an entry cannot block acknowledgement of later inputs.
     pub fn on_steered(
         &mut self,
         inputs: &[atomcode_kernel::event::SteeredInput],
     ) -> Vec<PendingSteer> {
         let mut confirmed = Vec::new();
         for input in inputs {
-            let matches_front = self.pending_steers.front().is_some_and(|pending| {
+            let matching = self.pending_steers.iter().position(|pending| {
                 pending.message.text == input.text && pending.message.images == input.images
             });
-            if matches_front {
+            if let Some(index) = matching {
                 confirmed.push(
                     self.pending_steers
-                        .pop_front()
-                        .expect("front was checked above"),
+                        .remove(index)
+                        .expect("matching index was found above"),
                 );
             }
         }
@@ -3471,6 +3476,19 @@ mod tests {
             "two"
         );
         assert!(st.pending_steers.is_empty());
+
+        st.on_steer_sent(pending("queued-next-turn"));
+        st.on_steer_sent(pending("folded-now"));
+        let confirmed = st.on_steered(&[atomcode_kernel::event::SteeredInput {
+            text: "folded-now".into(),
+            images: Vec::new(),
+        }]);
+        assert_eq!(confirmed[0].message.text, "folded-now");
+        assert_eq!(
+            st.pending_steers.front().map(|pending| pending.message.text.as_str()),
+            Some("queued-next-turn"),
+            "a queued context message must not block a later real steer acknowledgement"
+        );
         assert!(
             st.on_steered(&[atomcode_kernel::event::SteeredInput {
                 text: "remote".into(),
@@ -3479,6 +3497,8 @@ mod tests {
             .is_empty(),
             "spurious / cross-client fold cannot fabricate a local echo"
         );
+        assert_eq!(st.pending_steers.len(), 1);
+        st.on_turn_complete();
         assert!(st.pending_steers.is_empty());
         // Every turn-end path clears it, parity with the other per-turn counters.
         st.on_steer_sent(pending("complete"));

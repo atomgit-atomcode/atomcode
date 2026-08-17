@@ -21889,7 +21889,11 @@ fn project_kernel_event(
             auto_resuming,
             server_message,
         }),
-        Kernel::Steered { count, inputs } => Some(AgentEvent::Steered { count, inputs }),
+        // Runtime-owned preprocessing can rewrite an accepted steer before it
+        // reaches the kernel. The raw kernel event remains authoritative for
+        // conversation observers; TUI correlation is driven separately by
+        // `CodingRuntimeEvent::SteerAcknowledged` with the submitted payload.
+        Kernel::Steered { .. } => None,
         Kernel::Cancelled
         | Kernel::Request { .. }
         | Kernel::Snapshot { .. }
@@ -22266,6 +22270,30 @@ fn handle_runtime_event(
                 ctx.pending_runtime_request_id = Some(request.id);
             }
             match event {
+                CodingRuntimeEvent::SteerAcknowledged { inputs } => {
+                    let inputs = inputs
+                        .into_iter()
+                        .map(|input| atomcode_kernel::event::SteeredInput {
+                            text: input.text,
+                            images: input.images,
+                        })
+                        .collect::<Vec<_>>();
+                    handle_agent_event(
+                        AgentEvent::Steered {
+                            count: inputs.len(),
+                            inputs,
+                        },
+                        state,
+                        think,
+                        renderer,
+                        pending_tools,
+                        ctx,
+                        setup_pending,
+                        reasoning_buffer,
+                        buf,
+                    );
+                    return;
+                }
                 CodingRuntimeEvent::Team { generation, event } => {
                     let run_id = event.run_id.to_string();
                     // A new run started THIS turn → the completion banner should say

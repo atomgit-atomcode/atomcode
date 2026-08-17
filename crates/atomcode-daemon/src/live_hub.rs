@@ -154,19 +154,34 @@ fn correlate_web_steers_locked(
     inputs
         .iter()
         .map(|input| {
-            let matches_front = state.pending_web_steers.front().is_some_and(|pending| {
+            let matching = state.pending_web_steers.iter().position(|pending| {
                 pending.runtime_input.text == input.text
                     && pending.runtime_input.images == input.images
             });
-            matches_front.then(|| {
+            matching.map(|index| {
                 state
                     .pending_web_steers
-                    .pop_front()
-                    .expect("front was checked above")
+                    .remove(index)
+                    .expect("matching index was found above")
                     .client_input_id
             })
         })
         .collect()
+}
+
+fn redact_correlated_steer_images(
+    inputs: &mut [atomcode_kernel::event::SteeredInput],
+    client_input_ids: &[Option<String>],
+) {
+    for (input, client_input_id) in inputs.iter_mut().zip(client_input_ids) {
+        // Once transport identity is known, browser reconciliation no longer
+        // needs a byte-for-byte image comparison. Avoid duplicating potentially
+        // large base64 payloads in the live replay buffer. Keep images for the
+        // no-id compatibility path, where payload matching is still required.
+        if client_input_id.is_some() {
+            input.images.clear();
+        }
+    }
 }
 
 pub struct LiveViewHub {
@@ -830,11 +845,19 @@ impl LiveViewHub {
                 .then(|| progress.clone());
         }
         let mapped_steer = match &event {
-            CodingRuntimeEvent::Agent(AgentEvent::Steered { count, inputs }) => Some((
-                *count,
-                inputs.clone(),
-                correlate_web_steers_locked(&mut state, inputs),
-            )),
+            CodingRuntimeEvent::SteerAcknowledged { inputs } => {
+                let mut inputs = inputs
+                    .iter()
+                    .cloned()
+                    .map(|input| atomcode_kernel::event::SteeredInput {
+                        text: input.text,
+                        images: input.images,
+                    })
+                    .collect::<Vec<_>>();
+                let client_input_ids = correlate_web_steers_locked(&mut state, &inputs);
+                redact_correlated_steer_images(&mut inputs, &client_input_ids);
+                Some((inputs.len(), inputs, client_input_ids))
+            }
             _ => None,
         };
         let mut replay = state.turn_active;
@@ -965,7 +988,13 @@ impl LiveViewHub {
             }
             _ => {}
         }
-        self.publish_view_locked(&mut state, LiveViewEvent::Runtime(event), replay);
+        // `SteerAcknowledged` is a driver-correlation event, not conversation
+        // state. Publish only its transport projection below so browser clients
+        // do not receive a duplicate/internal runtime event. Correlated image
+        // bytes were removed above before this projection enters replay.
+        if !matches!(&event, CodingRuntimeEvent::SteerAcknowledged { .. }) {
+            self.publish_view_locked(&mut state, LiveViewEvent::Runtime(event), replay);
+        }
         if let Some((count, inputs, client_input_ids)) = mapped_steer {
             self.publish_view_locked(
                 &mut state,
@@ -1219,9 +1248,9 @@ mod tests {
     use atomcode_kernel::message::{Message, SessionSnapshot};
 
     use super::{
-        correlate_web_steers_locked, map_session_transition_error, session_change_is_noop,
-        HubError, HubState, LiveBinding, LiveRuntimeControl, LiveViewEvent, LiveViewHub,
-        PendingWebSteer,
+        correlate_web_steers_locked, map_session_transition_error,
+        redact_correlated_steer_images, session_change_is_noop, HubError, HubState, LiveBinding,
+        LiveRuntimeControl, LiveViewEvent, LiveViewHub, PendingWebSteer,
     };
 
     #[test]
@@ -1245,6 +1274,51 @@ mod tests {
             vec![Some("web-1".into())]
         );
         assert!(state.pending_web_steers.is_empty());
+    }
+
+    #[test]
+    fn queued_context_input_does_not_block_later_web_steer_correlation() {
+        let mut state = HubState::default();
+        for (text, id) in [("queued-next-turn", "web-1"), ("folded-now", "web-2")] {
+            state.pending_web_steers.push_back(PendingWebSteer {
+                runtime_input: UserInput::from(text),
+                client_input_id: id.into(),
+            });
+        }
+
+        let folded = vec![atomcode_kernel::event::SteeredInput {
+            text: "folded-now".into(),
+            images: Vec::new(),
+        }];
+        assert_eq!(
+            correlate_web_steers_locked(&mut state, &folded),
+            vec![Some("web-2".into())]
+        );
+        assert_eq!(state.pending_web_steers.len(), 1);
+        assert_eq!(state.pending_web_steers[0].client_input_id, "web-1");
+    }
+
+    #[test]
+    fn correlated_web_steer_drops_image_bytes_but_compatibility_input_keeps_them() {
+        let image = atomcode_kernel::message::ImageContent {
+            media_type: "image/png".into(),
+            data: "large-base64".into(),
+        };
+        let mut inputs = vec![
+            atomcode_kernel::event::SteeredInput {
+                text: "owned".into(),
+                images: vec![image.clone()],
+            },
+            atomcode_kernel::event::SteeredInput {
+                text: "legacy".into(),
+                images: vec![image.clone()],
+            },
+        ];
+
+        redact_correlated_steer_images(&mut inputs, &[Some("web-1".into()), None]);
+
+        assert!(inputs[0].images.is_empty());
+        assert_eq!(inputs[1].images, vec![image]);
     }
 
     #[test]
