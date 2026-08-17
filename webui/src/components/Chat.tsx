@@ -56,6 +56,13 @@ import {
 } from '../lib/atMention';
 import { toolResultStatus, updateToolProgress, upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
 import { commitTodoCall, todoToolDetail, type TodoTitles } from '../lib/todoToolDetail';
+import {
+  applyTodoCall,
+  isTodoTool,
+  projectTodoCalls,
+  type TodoItem,
+  type TodoProjectionCall,
+} from '../lib/todoState';
 import { isInternalHistoryAssistantMessage, isInternalHistoryUserMessage } from '../lib/historyMessages';
 import {
   activeTurnSubmissionDisposition,
@@ -590,6 +597,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   // selects `/chat/user-input`; live requests answer the bound `/live` runtime.
   const [userInputReq, setUserInputReq] = useState<RoutedUserInputRequest | null>(null);
   const [policyIntervention, setPolicyIntervention] = useState<PolicyInterventionEvent | null>(null);
+  const [todoItems, setTodoItems] = useState<TodoItem[]>([]);
+  const [todoPreview, setTodoPreview] = useState<TodoItem[] | null>(null);
+  const todoItemsRef = useRef<TodoItem[]>([]);
+  const todoCacheRef = useRef<Map<string, TodoItem[]>>(new Map());
+  const todoBatchRef = useRef<{ base: TodoItem[]; calls: TodoProjectionCall[] }>({
+    base: [],
+    calls: [],
+  });
   const abortRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef<string | null>(null);
   const liveAbortRef = useRef<AbortController | null>(null);
@@ -668,16 +683,72 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const todoTitlesRef = useRef<TodoTitles>(new Map());
   const pendingTodoCallsRef = useRef<Map<string, { name: string; args: string }>>(new Map());
 
+  function replaceTodoItems(items: readonly TodoItem[], persist = true) {
+    const next = items.map((item) => ({ ...item }));
+    todoItemsRef.current = next;
+    setTodoItems(next);
+    const activeId = activeIdRef.current;
+    if (persist && activeId) todoCacheRef.current.set(activeId, next);
+    todoTitlesRef.current = new Map(next.map((item, index) => [index + 1, item.content]));
+  }
+
+  function resetTodoBatch(clearCommitted: boolean, persistClear = true) {
+    todoBatchRef.current = { base: [], calls: [] };
+    pendingTodoCallsRef.current.clear();
+    setTodoPreview(null);
+    if (clearCommitted) replaceTodoItems([], persistClear);
+  }
+
+  function stageTodoCall(id: string, name: string, args: string) {
+    if (!isTodoTool(name)) return;
+    const batch = todoBatchRef.current;
+    if (batch.calls.length === 0) batch.base = todoItemsRef.current.map((item) => ({ ...item }));
+    if (!batch.calls.some((call) => call.id === id)) {
+      batch.calls.push({ id, name, args });
+    }
+    setTodoPreview(projectTodoCalls(batch.base, batch.calls).preview);
+  }
+
+  function settleTodoCall(id: string, success: boolean) {
+    const batch = todoBatchRef.current;
+    const call = batch.calls.find((candidate) => candidate.id === id);
+    if (!call) return;
+    call.success = success;
+    const projected = projectTodoCalls(batch.base, batch.calls);
+    replaceTodoItems(projected.committed);
+    if (projected.hasUnresolved) {
+      setTodoPreview(projected.preview);
+    } else {
+      todoBatchRef.current = { base: projected.committed, calls: [] };
+      setTodoPreview(null);
+    }
+  }
+
+  function finishTodoTurn(cancelled: boolean) {
+    if (cancelled) {
+      resetTodoBatch(true);
+      return;
+    }
+    const batch = todoBatchRef.current;
+    if (batch.calls.length > 0) {
+      replaceTodoItems(projectTodoCalls(batch.base, batch.calls).committed);
+    }
+    resetTodoBatch(false);
+  }
+
   function restoreTodoTitles(messages: Message[]) {
     todoTitlesRef.current.clear();
-    pendingTodoCallsRef.current.clear();
+    resetTodoBatch(false);
+    let restoredItems: TodoItem[] = [];
     for (const message of messages) {
       for (const part of message.parts) {
         if (part.kind === 'tool' && part.tool.status === 'done') {
           commitTodoCall(part.tool.name, part.tool.args, todoTitlesRef.current);
+          restoredItems = applyTodoCall(restoredItems, part.tool.name, part.tool.args);
         }
       }
     }
+    replaceTodoItems(restoredItems);
   }
 
   // 切换/恢复会话时重置画布并加载历史。依赖 project_hash：刷新后 sessionId 先于
@@ -716,7 +787,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
 
       activeIdRef.current = sessionId;
       todoTitlesRef.current.clear();
-      pendingTodoCallsRef.current.clear();
+      resetTodoBatch(true, false);
       providerPinnedRef.current = false;
       loadedForRef.current = null;
       optimisticFiredRef.current = false;
@@ -754,7 +825,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
 
       const cached = sessionId ? messageCacheRef.current.get(sessionId) : undefined;
       if (cached && cached.length > 0) {
+        const cachedTodos = sessionId ? todoCacheRef.current.get(sessionId) : undefined;
         restoreTodoTitles(cached);
+        if (cachedTodos) replaceTodoItems(cachedTodos);
         setMessages(cached);
       } else {
         setMessages([]);
@@ -1130,6 +1203,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     const loaded: Message[] = [];
     const todoTitles: TodoTitles = new Map();
     const pendingTodoCalls = new Map<string, { name: string; args: string }>();
+    const orderedTodoCalls: TodoProjectionCall[] = [];
     for (const msg of msgs) {
       if (msg.role === 'user') {
         if (isInternalHistoryUserMessage(msg.content ?? '', msg.synthetic)) continue;
@@ -1158,6 +1232,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             },
           });
           pendingTodoCalls.set(tc.id, { name: tc.name, args });
+          if (isTodoTool(tc.name)) orderedTodoCalls.push({ id: tc.id, name: tc.name, args });
         }
         loaded.push({ role: 'assistant', parts, ts: msg.created_at });
       } else if (msg.role === 'tool' && msg.tool_result) {
@@ -1170,8 +1245,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
               p.tool.output = result.summary;
               p.tool.status = toolResultStatus(result.success, result.summary);
               const pending = pendingTodoCalls.get(result.call_id);
-              if (result.success && pending) {
-                commitTodoCall(pending.name, pending.args, todoTitles);
+              if (pending && isTodoTool(pending.name)) {
+                const call = orderedTodoCalls.find((candidate) => candidate.id === result.call_id);
+                if (call) call.success = result.success;
+                const projected = projectTodoCalls([], orderedTodoCalls);
+                todoTitles.clear();
+                projected.committed.forEach((item, index) => {
+                  todoTitles.set(index + 1, item.content);
+                });
               }
               pendingTodoCalls.delete(result.call_id);
               break outer;
@@ -1181,8 +1262,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       }
       // system messages: skip
     }
-    todoTitlesRef.current = todoTitles;
+    const restoredProjection = projectTodoCalls([], orderedTodoCalls);
+    const restoredTodoItems = restoredProjection.committed;
+    todoTitlesRef.current = new Map(
+      restoredTodoItems.map((item, index) => [index + 1, item.content]),
+    );
     pendingTodoCallsRef.current = pendingTodoCalls;
+    todoBatchRef.current = restoredProjection.hasUnresolved
+      ? { base: [], calls: orderedTodoCalls }
+      : { base: restoredTodoItems, calls: [] };
+    setTodoPreview(restoredProjection.hasUnresolved ? restoredProjection.preview : null);
+    replaceTodoItems(restoredTodoItems);
     return loaded;
   }
 
@@ -1311,7 +1401,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         sessionGenerationRef.current += 1;
         onSessionId(e.session_id);
         todoTitlesRef.current.clear();
-        pendingTodoCallsRef.current.clear();
+        resetTodoBatch(true, false);
         setMessages([]);
         // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
         setSearch('');
@@ -1383,6 +1473,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         else if (e.stats) setTurnStats(e.stats);
         const terminal = lifecycle.terminal;
         if (terminal) {
+          finishTodoTurn(e.stop_reason === 'cancelled');
           if (terminal.discardQueued) {
             // Abnormal terminal (cancel / error): the kernel CLEARS its steer
             // buffer (agent.rs Cancel/Shutdown), so a leftover steer is NOT
@@ -1911,7 +2002,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
 
       case 'tool_start': {
         const argsStr = formatArgs(event.arguments);
-        pendingTodoCallsRef.current.set(event.id, { name: event.name, args: argsStr });
+        if (isTodoTool(event.name)) {
+          pendingTodoCallsRef.current.set(event.id, { name: event.name, args: argsStr });
+          stageTodoCall(event.id, event.name, argsStr);
+        }
         addToolToLastAssistant({
           id: event.id,
           name: event.name,
@@ -1941,9 +2035,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       case 'tool_result':
         {
           const pending = pendingTodoCallsRef.current.get(event.id);
-          if (event.success && pending) {
-            commitTodoCall(pending.name, pending.args, todoTitlesRef.current);
-          }
+          if (pending) settleTodoCall(event.id, event.success);
           pendingTodoCallsRef.current.delete(event.id);
         }
         updateToolInLastAssistant(event.id, {
@@ -1981,10 +2073,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         break;
 
       case 'done': {
+        // A normal terminal keeps only successful calls; a user cancellation
+        // retires the active plan at the same boundary as kernel/TUI.
+        finishTodoTurn(event.stop_reason === 'cancelled');
         // 标记这是本 Chat 自己产生的会话 id，避免下面的 useEffect 误把当前对话清空，
         // 并标记其历史「已就位」（就是当前画布），防止 project_hash 回填后重新加载覆盖。
         activeIdRef.current = event.session_id;
         loadedForRef.current = event.session_id;
+        if (event.stop_reason === 'cancelled') {
+          todoCacheRef.current.set(event.session_id, []);
+        }
         onSessionId(event.session_id);
         const terminal = classifyChatDone({
           stopReason: event.stop_reason,
@@ -2018,6 +2116,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       }
 
       case 'stopped':
+        // User cancellation is an authoritative interruption boundary: the
+        // previous plan remains historical but is no longer active.
+        resetTodoBatch(true);
         transitionChatRecovery({ type: 'authoritative_terminal' });
         setBusy(false);
         setQueued([]); // 用户中止：丢弃排队消息（对齐 VSCode 插件）
@@ -2030,6 +2131,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         break;
 
       case 'error':
+        resetTodoBatch(false);
         appendToLastAssistant('\n\n' + t('chat.error', { msg: event.message }));
         transitionChatRecovery({ type: 'authoritative_terminal' });
         setBusy(false);
@@ -3426,6 +3528,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         </div>
       )}
       <div class="input-container">
+        {busy && (todoPreview ?? todoItems).length > 0 && (
+          <TodoProgressPanel items={todoPreview ?? todoItems} />
+        )}
         <div class="input-wrap">
           {blockingInteraction ? (
             <div class="interaction-dock-seat">{blockingInteraction}</div>
@@ -3440,6 +3545,60 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       </div>
       {filePickerModal}
     </>
+  );
+}
+
+function TodoProgressPanel({ items }: { items: TodoItem[] }) {
+  const t = useT();
+  const [expanded, setExpanded] = useState(false);
+  const inProgress = items.filter((item) => item.status === 'in_progress').length;
+  const pending = items.filter((item) => item.status === 'pending').length;
+  const completed = items.filter((item) => item.status === 'completed').length;
+  const summary = [
+    inProgress > 0 ? t('todo.panel.inProgress', { n: inProgress }) : '',
+    pending > 0 ? t('todo.panel.pending', { n: pending }) : '',
+    completed > 0 ? t('todo.panel.completed', { n: completed }) : '',
+  ].filter(Boolean).join(' · ');
+
+  return (
+    <section class={'todo-progress-panel' + (expanded ? ' expanded' : '')} aria-label={t('todo.panel.title')}>
+      <button
+        type="button"
+        class="todo-progress-head"
+        aria-expanded={expanded}
+        aria-label={expanded ? t('todo.panel.collapse') : t('todo.panel.expand')}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        <svg class="todo-progress-list-icon" width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+          <circle cx="4" cy="4" r="1.5" stroke="currentColor" stroke-width="1.4" />
+          <path d="m3.2 4 0.6.7L5 3.2M8 4h7M3 9h2M8 9h7M3 14h2M8 14h7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        <span class="todo-progress-title">{t('todo.panel.title')}</span>
+        <span class="todo-progress-summary">{summary}</span>
+        <svg class="todo-progress-chevron" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path d="m4 6 4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      </button>
+      {expanded && (
+        <ol class="todo-progress-list">
+          {items.map((item, index) => (
+            <li class={`todo-progress-item ${item.status}`} key={`${index}-${item.content}`}>
+              <span class="todo-progress-status" role="img" aria-label={t(`todo.panel.status.${item.status}` as MsgKey)}>
+                {item.status === 'completed' ? (
+                  <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+                    <circle cx="9" cy="9" r="7" stroke="currentColor" stroke-width="1.5" />
+                    <path d="m5.7 9.1 2.1 2.1 4.6-4.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                ) : (
+                  <span class="todo-progress-ring" aria-hidden="true" />
+                )}
+              </span>
+              <span class="todo-progress-text">{item.content}</span>
+            </li>
+          ))}
+        </ol>
+      )}
+    </section>
   );
 }
 
@@ -3565,13 +3724,16 @@ function renderAssistantParts(parts: MsgPart[], search: string): VNode[] {
         tools.push(q.tool);
         i++;
       }
-      out.push(
-        <div class="tool-list" key={`tg-${groupKey}`}>
-          {tools.map((tool) => (
-            <ToolRowView key={tool.id} tool={tool} />
-          ))}
-        </div>,
-      );
+      const visibleTools = tools.filter(shouldShowToolRow);
+      if (visibleTools.length > 0) {
+        out.push(
+          <div class="tool-list" key={`tg-${groupKey}`}>
+            {visibleTools.map((tool) => (
+              <ToolRowView key={tool.id} tool={tool} />
+            ))}
+          </div>,
+        );
+      }
     } else if (p.kind === 'notice') {
       out.push(
         <div class="msg-notice" key={`nt-${i}`}>
@@ -3874,10 +4036,16 @@ function ToolStatusIcon({ cls }: { cls: string }) {
   );
 }
 
+function shouldShowToolRow(tool: ToolRow): boolean {
+  return !isTodoTool(tool.name) || tool.status === 'error' || tool.status === 'incomplete';
+}
+
 function ToolRowView({ tool }: { tool: ToolRow }) {
   const t = useT();
   const [expanded, setExpanded] = useState(false);
 
+  // Successful TodoWrite calls are represented by the persistent composer
+  // panel. Keep failures in the transcript so malformed plans remain visible.
   let annotation: { cls: string; label: string } | null = null;
   if (tool.status === 'waiting_approval') {
     annotation = { cls: 'waiting', label: t('tool.waiting') };

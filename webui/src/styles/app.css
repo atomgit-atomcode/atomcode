@@ -671,68 +671,6 @@ body {
   white-space: pre-wrap;
 }
 
-/* === Todo task list === */
-/* The `todo` tool renders as a live checklist panel (☑/▸/☐) instead of a plain
-   tool row — mirrors the TUI / Claude Code task-progress widget. */
-.todo-panel {
-  border: 1px solid var(--app-border-subtle);
-  border-radius: var(--corner-radius-small);
-  background: var(--app-tool-background, var(--app-secondary-background));
-  padding: 8px 10px;
-  margin: 2px 0;
-}
-
-.todo-panel-head {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  font-size: 0.8125rem;
-  font-weight: 600;
-  color: var(--app-secondary-foreground);
-  margin-bottom: 6px;
-}
-
-.todo-panel-title { flex: 1; min-width: 0; }
-
-.todo-panel-count {
-  font-variant-numeric: tabular-nums;
-  font-weight: 500;
-  opacity: 0.8;
-}
-
-.todo-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.todo-item {
-  display: flex;
-  align-items: baseline;
-  gap: 7px;
-  font-size: 1rem;
-  line-height: 1.5;
-  color: var(--app-primary-foreground);
-}
-
-.todo-mark { flex-shrink: 0; font-size: 0.8125rem; }
-
-.todo-text { min-width: 0; word-break: break-word; }
-
-.todo-item.completed .todo-mark { color: var(--app-success-foreground); }
-.todo-item.completed .todo-text {
-  text-decoration: line-through;
-  color: var(--app-secondary-foreground);
-}
-
-.todo-item.in_progress .todo-mark { color: var(--app-accent-color, var(--app-brand)); }
-.todo-item.in_progress .todo-text { font-weight: 600; }
-
-.todo-item.pending .todo-mark { color: var(--app-secondary-foreground); }
-
 .streaming-cursor {
   display: inline-block;
   width: 7px;
@@ -976,6 +914,146 @@ body {
   flex-direction: column;
   padding: 12px 24px 18px;
   background: var(--app-primary-background);
+}
+
+/* Persistent TodoWrite projection. It sits with the composer rather than in
+   transcript history: one stable summary replaces a trail of incremental tool
+   calls, and expands in place when the user needs the execution plan. */
+.todo-progress-panel {
+  width: 100%;
+  max-width: var(--app-composer-max-width);
+  margin: 0 auto 8px;
+  overflow: hidden;
+  border: 1px solid var(--app-border-strong);
+  border-radius: var(--corner-radius-large);
+  background: var(--app-layer-2-background);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--app-primary-foreground), transparent 94%);
+}
+
+.todo-progress-head {
+  display: grid;
+  grid-template-columns: 20px auto minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 54px;
+  padding: 0 16px;
+  border: 0;
+  color: var(--app-primary-foreground);
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.todo-progress-head:hover {
+  background: color-mix(in srgb, var(--app-primary-foreground), transparent 96%);
+}
+
+.todo-progress-head:focus-visible {
+  outline: 2px solid var(--app-input-active-border);
+  outline-offset: -2px;
+}
+
+.todo-progress-list-icon,
+.todo-progress-chevron {
+  color: var(--app-tertiary-foreground);
+}
+
+.todo-progress-title {
+  font-size: 1rem;
+  font-weight: 650;
+}
+
+.todo-progress-summary {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--app-tertiary-foreground);
+  font-size: 0.875rem;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.todo-progress-chevron {
+  transition: transform 160ms ease;
+}
+
+.todo-progress-panel.expanded .todo-progress-chevron {
+  transform: rotate(180deg);
+}
+
+.todo-progress-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: min(38vh, 360px);
+  margin: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 16px 16px;
+  scrollbar-gutter: stable;
+  list-style: none;
+}
+
+.todo-progress-item {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  color: var(--app-secondary-foreground);
+  font-size: 0.9375rem;
+  line-height: 1.45;
+}
+
+.todo-progress-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  color: var(--app-tertiary-foreground);
+}
+
+.todo-progress-ring {
+  display: block;
+  width: 16px;
+  height: 16px;
+  border: 2px dashed currentColor;
+  border-radius: 50%;
+}
+
+.todo-progress-item.in_progress {
+  color: var(--app-primary-foreground);
+}
+
+.todo-progress-item.in_progress .todo-progress-status {
+  color: var(--app-info-accent);
+}
+
+.todo-progress-item.in_progress .todo-progress-ring {
+  border-style: solid;
+  border-right-color: transparent;
+  animation: todo-progress-spin 900ms linear infinite;
+}
+
+.todo-progress-item.completed .todo-progress-status {
+  color: var(--app-success-foreground);
+}
+
+.todo-progress-item.completed .todo-progress-text {
+  color: var(--app-tertiary-foreground);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
+@keyframes todo-progress-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .todo-progress-chevron { transition: none; }
+  .todo-progress-item.in_progress .todo-progress-ring { animation: none; }
 }
 
 /* Centered responsive input column (input box + cwd breadcrumb below it; see --app-content-max-width). */
