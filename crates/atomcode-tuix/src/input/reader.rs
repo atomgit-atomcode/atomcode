@@ -75,6 +75,11 @@ fn paste_candidate_char(ev: &Event) -> Option<char> {
         // modifiers and classify then collapses it to Submit.
         KeyCode::Enter if modifiers.contains(KeyModifiers::SHIFT) => None,
         KeyCode::Enter => Some('\n'),
+        // A few terminals report Shift+Tab as `Tab + SHIFT` instead of
+        // crossterm's usual `BackTab`. Keep that chord out of paste-burst
+        // reconstruction, which intentionally drops modifiers, so the main
+        // composer can use it for execution-mode cycling.
+        KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => None,
         KeyCode::Tab => Some('\t'),
         _ => None,
     }
@@ -1080,6 +1085,16 @@ mod tests {
             paste_candidate_char(&ev),
             None,
             "Shift+Enter is a command (InsertNewline), not paste content"
+        );
+    }
+
+    #[test]
+    fn paste_candidate_rejects_shift_tab() {
+        let ev = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+        assert_eq!(
+            paste_candidate_char(&ev),
+            None,
+            "Shift+Tab must retain its modifier for execution-mode cycling"
         );
     }
 

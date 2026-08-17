@@ -570,7 +570,7 @@ mod tests {
             let body = crate::i18n::t(Msg::KeybindingsHelp);
             for key in [
                 "Enter",
-                "Tab / Shift+Tab",
+                "Shift+Tab",
                 "F2 / Shift+F2",
                 "Ctrl+R",
                 "Ctrl+T",

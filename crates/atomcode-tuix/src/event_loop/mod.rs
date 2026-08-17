@@ -5430,7 +5430,7 @@ mod buffer_tests {
         state.footer_usage = Some(empty_usage_panel());
 
         // buffer_empty = false: the user is typing a queued message. Even the nav
-        // keys must edit the buffer (cursor movement / agent-mode Tab), NOT steer
+        // keys must edit the buffer (cursor movement / completion Tab), NOT steer
         // the report.
         assert!(!handle_footer_usage_tab_key(
             &mut state,
@@ -6149,6 +6149,20 @@ mod menu_tests {
     use super::*;
     use crate::custom_commands::CustomCommand;
     use crate::custom_commands::CustomCommandRegistry;
+
+    #[test]
+    fn main_composer_reserves_plain_tab_for_completion() {
+        use crossterm::event::KeyModifiers;
+
+        assert!(!is_mode_cycle_key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(is_mode_cycle_key(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert!(is_mode_cycle_key(KeyCode::BackTab, KeyModifiers::NONE));
+        assert!(is_mode_cycle_key(KeyCode::Tab, KeyModifiers::SHIFT));
+        assert!(!is_mode_cycle_key(
+            KeyCode::BackTab,
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL
+        ));
+    }
 
     #[test]
     fn pending_transition_routes_enter_through_common_commit_gate() {
@@ -8754,7 +8768,7 @@ fn dismiss_footer_command_output(state: &mut UiState) -> bool {
 ///    start with a digit ("3 retries"), so digit tab-jump stays modal-only and
 ///    the streaming footer owns only pure navigation keys (Tab/BackTab/←/→).
 ///  - `buffer_empty`: while composing a queued (type-ahead) message even those
-///    nav keys belong to the draft (cursor movement, agent-mode Tab), so the
+///    nav keys belong to the draft (cursor movement, completion Tab), so the
 ///    report only owns them when the input box is empty.
 fn handle_footer_usage_tab_key(
     state: &mut UiState,
@@ -14658,6 +14672,20 @@ fn idle_menu_confirmation_allowed(commit_gate_pending: bool) -> bool {
     !commit_gate_pending
 }
 
+/// Main-composer execution-mode shortcut. Crossterm normally reports
+/// Shift+Tab as `BackTab`, while a few terminals preserve it as `Tab + SHIFT`.
+/// Plain Tab is deliberately excluded so it remains dedicated to completion.
+fn is_mode_cycle_key(
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> bool {
+    let shift = crossterm::event::KeyModifiers::SHIFT;
+    let has_no_other_modifiers = modifiers.difference(shift).is_empty();
+    has_no_other_modifiers
+        && (code == KeyCode::BackTab
+            || (code == KeyCode::Tab && modifiers.contains(shift)))
+}
+
 fn streaming_top_level_slash_selection(
     buffer: &str,
     selected_name: &str,
@@ -15197,13 +15225,10 @@ fn handle_idle_key(
         }
     }
 
-    // Tab / Shift+Tab cycle execution mode when no completion menu is up.
-    if (code == KeyCode::Tab || code == KeyCode::BackTab) && menu_items.is_none() {
-        let next = if code == KeyCode::BackTab {
-            app.state.agent_mode.prev()
-        } else {
-            app.state.agent_mode.next()
-        };
+    // Shift+Tab cycles execution mode when no completion menu is up. Plain Tab
+    // is reserved for slash-command, skill, and @file completion.
+    if is_mode_cycle_key(code, modifiers) && menu_items.is_none() {
+        let next = app.state.agent_mode.next();
         set_agent_mode(app, ctx, renderer, next);
         return Ok(());
     }
@@ -16118,7 +16143,7 @@ mod midturn_submit_route_tests {
     }
 }
 
-/// Switch execution mode from a single place. Used by Tab, Shift+Tab, and the
+/// Switch execution mode from a single place. Used by Shift+Tab and the
 /// /build /auto /plan commands. Sends the unified SetMode to the runtime, mirrors
 /// to the daemon LIVE mode (cross-tab / webui sync), prints a feedback line, and
 /// repaints the footer.
@@ -16130,7 +16155,7 @@ pub(crate) fn set_agent_mode(
 ) {
     app.state.agent_mode = mode;
     // Reveal the Build badge when the user explicitly switches to Build
-    // via Tab/Shift+Tab or `/build`. The default startup state stays
+    // via Shift+Tab or `/build`. The default startup state stays
     // badge-less.
     if mode == crate::state::AgentMode::Build {
         app.state.build_badge_visible = true;
@@ -16140,7 +16165,7 @@ pub(crate) fn set_agent_mode(
         .ok();
     atomcode_daemon::live_set_mode(mode); // daemon ApprovalMode == core Mode
     // The footer persistently shows the current mode, so a scrollback feedback line
-    // is redundant in the interactive renderer — and it spams on rapid Tab / Shift+Tab
+    // is redundant in the interactive renderer — and it spams on rapid Shift+Tab
     // cycling. Emit it ONLY in plain mode (pipe / CI), which has no persistent footer.
     if ctx.is_plain_renderer {
         let msg = match mode {
@@ -16163,7 +16188,7 @@ pub(crate) fn set_agent_mode(
     // `redraw_idle_plain` renders `UiLine::InputPrompt`, whose retained handler
     // treats reaching the idle prompt as "the turn is over" and
     // `commit_inflight_tool()` + `clear_live_spinner()`. That is correct at
-    // idle, but this is also reached MID-TURN from the streaming Tab / Shift+Tab
+    // idle, but this is also reached MID-TURN from the streaming Shift+Tab
     // mode-cycle handler — where a tool is still in flight. Committing it early
     // (then re-establishing the strip on the very next `draw_spinner_now`) makes
     // the live spinner/thinking row flash a garbled frame that self-heals on the
@@ -17465,18 +17490,14 @@ fn handle_streaming_key(
     // which emits the "disabled while a turn is running" hint.
     let menu_items = menu_for_display(&app.buf, ctx);
 
-    // Tab / Shift+Tab cycle execution mode MID-TURN (when no completion menu is
+    // Shift+Tab cycles execution mode MID-TURN (when no completion menu is
     // up), mirroring the idle handler. `SetMode` flips atomic flags the agent loop
     // reads on each subsequent tool call, so the switch applies LIVE to the rest of
     // this turn (matching Claude Code's mid-run Shift+Tab). Already-surfaced
     // approvals are not retroactively changed — only later tool calls see the new
     // mode. Repaint the spinner footer so the mode badge updates immediately.
-    if (code == KeyCode::Tab || code == KeyCode::BackTab) && menu_items.is_none() {
-        let next = if code == KeyCode::BackTab {
-            app.state.agent_mode.prev()
-        } else {
-            app.state.agent_mode.next()
-        };
+    if is_mode_cycle_key(code, modifiers) && menu_items.is_none() {
+        let next = app.state.agent_mode.next();
         set_agent_mode(app, ctx, renderer, next);
         draw_spinner_now(
             &mut app.state,
@@ -27025,7 +27046,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         }
         crate::state::AgentMode::Build if state.build_badge_visible => {
             // `⏸ build` — only shown after the user explicitly switches to
-            // Build via Tab/Shift+Tab or `/build`; the default startup stays
+            // Build via Shift+Tab or `/build`; the default startup stays
             // badge-less. Rendered in faint secondary style so it blends
             // into the status row naturally.
             Some(ModeBadge {
@@ -27043,7 +27064,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     // Auto mode badge: a single warning-colored LEFT badge `⏵⏵ auto` (rendered
     // in place of the PLAN badge, since Plan and Auto are mutually exclusive).
     // `--dangerously-skip-permissions` seeds `agent_mode = Auto` at startup, so
-    // keying off the mode covers both the startup flag AND the runtime Tab /
+    // keying off the mode covers both the startup flag AND the runtime Shift+Tab /
     // `/auto` toggle. The `⏵⏵` glyph downgrades to `>>` on non-unicode terminals.
     let bypass_indicator = if matches!(state.agent_mode, crate::state::AgentMode::Auto) {
         Some(if ctx.caps.unicode_symbols {

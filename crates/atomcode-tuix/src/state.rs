@@ -42,7 +42,7 @@ fn delete_at_cursor(text: &mut String, cursor: &mut usize) {
 
 /// Execution mode (unified). Alias of the shared coding runtime enum so TUI, daemon,
 /// webui share one type. Build = interactive approval; Auto = auto-approve all
-/// (bypass); Plan = read-only. Cycled by Tab / Shift+Tab.
+/// (bypass); Plan = read-only. Cycled by Shift+Tab in the main composer.
 pub use atomcode_coding::RuntimeMode as AgentMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1405,7 +1405,7 @@ pub struct UiState {
     /// panel and fail-safe Esc → cancel → submit-as-new-turn behavior.
     pub pending_steers: std::collections::VecDeque<PendingSteer>,
     /// Whether the user has explicitly switched to Build mode via
-    /// Tab/Shift+Tab or `/build`. When `false`, the status bar hides
+    /// Shift+Tab or `/build`. When `false`, the status bar hides
     /// the `⏸ build` badge so the default startup state stays clean.
     pub build_badge_visible: bool,
 }

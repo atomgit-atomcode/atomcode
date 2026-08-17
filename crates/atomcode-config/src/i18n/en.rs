@@ -218,7 +218,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Right                            Accept next-prompt suggestion (does not send)
 
   ── Mode and model ──
-    Tab / Shift+Tab                  Without a menu, cycle next / previous mode
+    Shift+Tab                        Without a menu, cycle to the next mode
     F2 / Shift+F2                    Next / previous model (Mac: Fn+F2 / Fn+Shift+F2)
     Ctrl+T                           Cycle reasoning_effort
 

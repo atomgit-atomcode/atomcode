@@ -204,7 +204,7 @@ atomcode completion fish > ~/.config/fish/completions/atomcode.fish
 
 PowerShell 可运行 `atomcode completion powershell | Out-String |
 Invoke-Expression`。完整 Shell 列表见 `atomcode completion --help`。该能力只作用于
-外部命令行，不会改变 TUI 内 `Tab` 的模式切换行为。
+外部命令行；TUI 内仍由 `Tab` 完成输入补全、`Shift+Tab` 切换执行模式。
 
 ### 依赖
 
@@ -346,7 +346,8 @@ atomcode --prompt-file task.md
 | `Esc` | 清空输入 / 取消流式输出 |
 | `Esc` ×2 | 撤销上一轮 |
 | `Up/Down` | 浏览输入历史 |
-| `Tab / Shift+Tab` | 有菜单时接受补全；无菜单时切换下一个 / 上一个执行模式 |
+| `Tab` | 接受斜杠命令、Skill 或文件补全 |
+| `Shift+Tab` | 无补全菜单时切换到下一个执行模式 |
 | `F2 / Shift+F2` | 切换下一个 / 上一个模型（Mac 通常按 `Fn+F2 / Fn+Shift+F2`） |
 | `Ctrl+R` | 反向搜索输入历史 |
 | `Ctrl+T` | 切换 `reasoning_effort` |
