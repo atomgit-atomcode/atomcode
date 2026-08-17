@@ -631,6 +631,7 @@ dependencies = [
  "crossterm",
  "ctor",
  "dirs",
+ "fs2",
  "futures",
  "ignore",
  "image",

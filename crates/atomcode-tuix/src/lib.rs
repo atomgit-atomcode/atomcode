@@ -58,7 +58,6 @@ use crate::event_loop::{run_loop, LoopCtx};
 pub use crate::event_loop::{
     RuntimeControl, RuntimeEndpoint, RuntimeSpawnOverride, SpawnedRuntime,
 };
-use crate::input::history::History;
 use crate::input::reader;
 use crate::render::{
     plain::PlainRenderer, retained::RetainedRenderer, worker::TaskRenderer, Renderer,
@@ -582,11 +581,9 @@ pub async fn run(
     // with a hardcoded Unix path is gone — Windows used to fall here
     // and then fail to write to `/tmp`.
     let history_start = std::time::Instant::now();
-    let history = {
-        let path = History::default_path().unwrap_or_else(crate::platform::history_path);
-        let cache = crate::platform::image_cache_dir();
-        crate::input::history::History::load_with_cache(path, cache)
-    };
+    let history = crate::input::history::History::load_project(
+        crate::platform::project_history_paths(&working_dir),
+    );
     crate::tuix_trace!(
         "START",
         "stage=history_load elapsed_ms={} total_ms={}",
@@ -840,6 +837,8 @@ pub async fn run(
         previous_dir: None,
         recent_dirs,
         history,
+        deferred_histories: Vec::new(),
+        history_rebound: false,
         input_rx,
         commands: CommandRegistry::builtin(),
         current_session,

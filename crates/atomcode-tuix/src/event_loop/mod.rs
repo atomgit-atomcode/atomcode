@@ -640,14 +640,42 @@ pub(crate) fn hydrate_recalled_attachments(
     line: &mut String,
     cache_dir: &std::path::Path,
 ) -> Vec<String> {
+    hydrate_recalled_attachments_from_caches(state, line, cache_dir, None)
+}
+
+fn hydrate_recalled_attachments_for_history(
+    state: &mut UiState,
+    line: &mut String,
+    history: &crate::input::history::History,
+) -> Vec<String> {
+    hydrate_recalled_attachments_from_caches(
+        state,
+        line,
+        history.cache_dir(),
+        history.legacy_cache_dir(),
+    )
+}
+
+fn hydrate_recalled_attachments_from_caches(
+    state: &mut UiState,
+    line: &mut String,
+    cache_dir: &std::path::Path,
+    legacy_cache_dir: Option<&std::path::Path>,
+) -> Vec<String> {
     use base64::Engine;
     let mut notices = Vec::new();
     if state.pending_recalled_attachments.is_empty() {
         return notices;
     }
     for refed in std::mem::take(&mut state.pending_recalled_attachments) {
-        let cache_path = cache_dir.join(format!("{}.{}", refed.hash, ext_for_mt(&refed.mt)));
-        match std::fs::read(&cache_path) {
+        let cache_name = format!("{}.{}", refed.hash, ext_for_mt(&refed.mt));
+        let raw = std::fs::read(cache_dir.join(&cache_name)).or_else(|primary_error| {
+            let Some(legacy_cache_dir) = legacy_cache_dir else {
+                return Err(primary_error);
+            };
+            std::fs::read(legacy_cache_dir.join(&cache_name))
+        });
+        match raw {
             Ok(raw) => {
                 state.session_image_count += 1;
                 let new_marker = state.session_image_count;
@@ -3866,6 +3894,14 @@ pub struct LoopCtx {
     /// agent tool).
     pub recent_dirs: Vec<PathBuf>,
     pub history: History,
+    /// Project histories whose pending entries could not be persisted during a
+    /// cwd switch. Kept in memory and retried instead of silently dropping the
+    /// old project's unsaved prompts.
+    pub deferred_histories: Vec<History>,
+    /// Set by the single working-directory projection seam. The main loop
+    /// consumes it after event dispatch to detach Buffer navigation/search
+    /// indexes from the previous project's history without discarding a draft.
+    pub history_rebound: bool,
     pub input_rx: mpsc::UnboundedReceiver<InputEvent>,
     pub commands: CommandRegistry,
     /// Session actively being accumulated. Updated on TurnComplete /
@@ -4372,6 +4408,21 @@ impl Buffer {
         self.text.clear();
         self.cursor = 0;
         self.clear_selection();
+    }
+
+    fn reset_history_navigation(&mut self) {
+        if self.history_idx.is_some() || self.searching {
+            self.text = std::mem::take(&mut self.stash);
+            self.pastes = std::mem::take(&mut self.stash_pastes);
+            self.cursor = self.text.len();
+            self.recent_folded_paste = None;
+            self.clear_selection();
+        }
+        self.history_idx = None;
+        self.searching = false;
+        self.search_query.clear();
+        self.stash.clear();
+        self.stash_pastes.clear();
     }
 
     fn replace_text_range(
@@ -7671,6 +7722,62 @@ mod menu_tests {
     }
 
     #[test]
+    fn project_history_hydrates_legacy_image_cache_without_copying_it() {
+        use crate::input::history::{History, HistoryImageRef};
+        use crate::platform::ProjectHistoryPaths;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("history-v2/project");
+        let legacy_cache = dir.path().join("image-cache");
+        std::fs::create_dir_all(&legacy_cache).unwrap();
+        std::fs::write(legacy_cache.join("deadbeef12345678.png"), b"\x89PNG").unwrap();
+        let history = History::load_project(ProjectHistoryPaths {
+            entries: project_dir.join("entries.jsonl"),
+            lock: project_dir.join("write.lock"),
+            image_cache: project_dir.join("images"),
+            legacy_entries: dir.path().join("history"),
+            legacy_image_cache: legacy_cache.clone(),
+        });
+
+        let mut state = UiState::new();
+        state.pending_recalled_attachments.push(HistoryImageRef {
+            hash: "deadbeef12345678".into(),
+            mt: "image/png".into(),
+            n: 1,
+        });
+        let mut line = "legacy [Image #1]".to_owned();
+
+        let notices =
+            super::hydrate_recalled_attachments_for_history(&mut state, &mut line, &history);
+
+        assert!(notices.is_empty());
+        assert_eq!(state.pending_images.len(), 1);
+        assert_eq!(std::fs::read_dir(history.cache_dir()).ok().map(|it| it.count()), None);
+        assert!(legacy_cache.join("deadbeef12345678.png").exists());
+    }
+
+    #[test]
+    fn history_rebind_resets_navigation_without_discarding_the_draft() {
+        let history = vec![crate::input::history::HistoryEntry {
+            text: "old project prompt".into(),
+            images: Vec::new(),
+            pastes: Vec::new(),
+        }];
+        let registry = CommandRegistry::builtin();
+        let mut buffer = Buffer::new();
+        buffer.insert_at_cursor("draft");
+        let _ = buffer.apply(Action::HistoryPrev, &history, &registry);
+        assert!(buffer.history_idx().is_some());
+
+        buffer.reset_history_navigation();
+
+        assert_eq!(buffer.text, "draft");
+        assert_eq!(buffer.cursor, "draft".len());
+        assert_eq!(buffer.history_idx(), None);
+        assert!(!buffer.is_searching());
+    }
+
+    #[test]
     fn paste_submit_recall_submit_rehydrates_image() {
         use crate::input::history::{History, HistoryEntry, HistoryImageRef};
         use base64::Engine;
@@ -10206,6 +10313,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         }
 
         drain_foreground_replay_events(&mut app, &mut ctx, renderer);
+        if std::mem::take(&mut ctx.history_rebound) {
+            app.buf.reset_history_navigation();
+            sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
+        }
         install_pending_session_picker(&mut app, &mut ctx, renderer);
         install_pending_rewind_modal(&mut app, &mut ctx, renderer);
 
@@ -10247,7 +10358,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 "EXIT",
                 "shutdown watchdog fired -> hard exit (teardown wedged)"
             );
-            let _ = ctx.history.save();
+            save_all_histories(&mut ctx);
             renderer.render(UiLine::ClearTransient);
             renderer.shutdown();
             // `process::exit(0)` skips `TerminalGuard` and `ReaderHandle` drops.
@@ -10264,7 +10375,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // is immediate and has no downside — the task holds no resources
     // beyond the interval timer.
     spin_task.abort();
-    let _ = ctx.history.save();
+    save_all_histories(&mut ctx);
 
     // Determine the exit reason. If the upgrade_done flag was set,
     // the loop exited because /upgrade (or /upgrade rollback) succeeded
@@ -11889,7 +12000,7 @@ fn attach_image_to_input(
     app.state.pending_images.push(img.clone());
     app.state.pending_image_hashes.push(hash);
     app.state.pending_image_markers.push(n);
-    cache_write_image(&crate::platform::image_cache_dir(), &img, hash);
+    cache_write_image(ctx.history.cache_dir(), &img, hash);
     let marker = format!("[Image #{}]", n);
     app.buf.insert_at_cursor(&marker);
     if matches!(app.state.phase, UiPhase::Streaming) {
@@ -15498,7 +15609,7 @@ fn handle_idle_key(
             app.state.pending_images.push(img.clone());
             app.state.pending_image_hashes.push(hash);
             app.state.pending_image_markers.push(n);
-            cache_write_image(&crate::platform::image_cache_dir(), &img, hash);
+            cache_write_image(ctx.history.cache_dir(), &img, hash);
             let marker = format!("[Image #{}]", n);
             app.buf.insert_at_cursor(&marker);
             sync_composer_selection(&app.buf, &ctx.interaction_publisher);
@@ -15840,9 +15951,12 @@ fn handle_idle_key(
                 // while the echo + payload carry `[Image #2]` — the
                 // user reasonably reads that as a bug ("two different
                 // numbers for the same image").
-                let cache_dir = crate::platform::image_cache_dir();
                 let mut line = line; // shadow as mutable so hydrate can rewrite it
-                for n in hydrate_recalled_attachments(&mut app.state, &mut line, &cache_dir) {
+                for n in hydrate_recalled_attachments_for_history(
+                    &mut app.state,
+                    &mut line,
+                    &ctx.history,
+                ) {
                     renderer.render(UiLine::Warning(n));
                 }
                 let mut expanded = app.buf.expand_pastes(&line);
@@ -17954,9 +18068,11 @@ fn handle_streaming_key(
             // travel with the queued message instead of being silently
             // dropped on dispatch.
             let mut line = line;
-            let cache_dir_for_hydrate = crate::platform::image_cache_dir();
-            for n in hydrate_recalled_attachments(&mut app.state, &mut line, &cache_dir_for_hydrate)
-            {
+            for n in hydrate_recalled_attachments_for_history(
+                &mut app.state,
+                &mut line,
+                &ctx.history,
+            ) {
                 renderer.render(UiLine::Warning(n));
             }
             let expanded = app.buf.expand_pastes(&line);
@@ -23817,11 +23933,65 @@ pub(crate) fn commit_working_dir_projection(ctx: &mut LoopCtx, working_dir: Path
     let Some(working_dir) = planned_runtime_working_dir(&ctx.working_dir, &working_dir) else {
         return;
     };
+    retry_deferred_history_saves(&mut ctx.deferred_histories);
+    let paths = crate::platform::project_history_paths(&working_dir);
+    let next_history = take_or_load_project_history(&mut ctx.deferred_histories, paths);
+    let previous_history = std::mem::replace(&mut ctx.history, next_history);
+    let history_save_error = save_or_defer_history(previous_history, &mut ctx.deferred_histories);
+    ctx.history_rebound = true;
+    if let Some(error) = history_save_error {
+        crate::tuix_trace!(
+            "HISTORY",
+            "stage=working_dir_rebind old={} new={} save_error={error}",
+            ctx.working_dir.display(),
+            working_dir.display()
+        );
+    }
     ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, working_dir.clone()));
     ctx.file_index.reset(working_dir.clone());
     commands::push_recent_dir(&mut ctx.recent_dirs, working_dir.clone());
     commands::save_recent_dirs(&ctx.recent_dirs);
     atomcode_daemon::live_set_working_dir(working_dir);
+}
+
+fn take_or_load_project_history(
+    deferred: &mut Vec<History>,
+    paths: crate::platform::ProjectHistoryPaths,
+) -> History {
+    if let Some(index) = deferred
+        .iter()
+        .position(|history| history.storage_path() == paths.entries)
+    {
+        deferred.remove(index)
+    } else {
+        History::load_project(paths)
+    }
+}
+
+fn save_or_defer_history(
+    mut history: History,
+    deferred: &mut Vec<History>,
+) -> Option<std::io::Error> {
+    match history.save() {
+        Ok(()) => None,
+        Err(error) => {
+            deferred.push(history);
+            Some(error)
+        }
+    }
+}
+
+fn retry_deferred_history_saves(deferred: &mut Vec<History>) {
+    deferred.retain_mut(|history| history.save().is_err());
+}
+
+fn save_all_histories(ctx: &mut LoopCtx) {
+    let active = std::mem::replace(
+        &mut ctx.history,
+        History::load_project(crate::platform::project_history_paths(&ctx.working_dir)),
+    );
+    let _ = save_or_defer_history(active, &mut ctx.deferred_histories);
+    retry_deferred_history_saves(&mut ctx.deferred_histories);
 }
 
 fn planned_runtime_working_dir(
@@ -23834,7 +24004,9 @@ fn planned_runtime_working_dir(
 
 #[cfg(test)]
 mod working_dir_projection_tests {
-    use super::planned_runtime_working_dir;
+    use super::{planned_runtime_working_dir, retry_deferred_history_saves, save_or_defer_history};
+    use crate::input::history::{History, HistoryEntry};
+    use crate::platform::ProjectHistoryPaths;
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -23847,6 +24019,38 @@ mod working_dir_projection_tests {
             planned_runtime_working_dir(Path::new("/same"), Path::new("/same")),
             None
         );
+    }
+
+    #[test]
+    fn failed_project_history_save_is_retained_and_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, "not a directory").unwrap();
+        let paths = ProjectHistoryPaths {
+            entries: blocked.join("entries.jsonl"),
+            lock: blocked.join("write.lock"),
+            image_cache: blocked.join("images"),
+            legacy_entries: dir.path().join("history"),
+            legacy_image_cache: dir.path().join("image-cache"),
+        };
+        let mut history = History::load_project(paths.clone());
+        history.push(HistoryEntry {
+            text: "must survive".into(),
+            images: Vec::new(),
+            pastes: Vec::new(),
+        });
+        let mut deferred = Vec::new();
+
+        assert!(save_or_defer_history(history, &mut deferred).is_some());
+        assert_eq!(deferred.len(), 1);
+
+        std::fs::remove_file(&blocked).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        retry_deferred_history_saves(&mut deferred);
+
+        assert!(deferred.is_empty());
+        let reloaded = History::load_project(paths);
+        assert_eq!(reloaded.entries().last().unwrap().text, "must survive");
     }
 }
 
@@ -25731,7 +25935,7 @@ fn handle_agent_event(
                 let mut hasher = DefaultHasher::new();
                 img.data.hash(&mut hasher);
                 let h = hasher.finish();
-                cache_write_image(&crate::platform::image_cache_dir(), &img, h);
+                cache_write_image(ctx.history.cache_dir(), &img, h);
                 state.pending_image_hashes.push(h);
                 state.pending_images.push(img);
                 state.pending_image_markers.push(marker);

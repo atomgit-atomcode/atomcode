@@ -59,6 +59,8 @@ urlencoding = "2"
 futures = "0.3"
 sha2 = "0.10"
 rand = "0.8"
+fs2 = "0.4"
+tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # NSPasteboard access for the Ctrl+V → file-URL fallback path. arboard's
@@ -86,7 +88,6 @@ clipboard-win = "5.4"
 # that persist commands/plugins/config never write into the developer's real home.
 atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
 ctor = "0.2"
-tempfile = "3"
 vte = "0.15.0"
 # Serialize env-var-mutating custom_commands tests (moved from atomcode-core).
 serial_test = "3"
