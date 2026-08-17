@@ -171,6 +171,11 @@ impl Screen {
     /// coords) at the end of the next `render_diff`. Typically
     /// pointed at the input prompt's insertion cell.
     pub fn set_cursor(&mut self, row: u16, col: u16) {
+        // A sharp resize can leave a footer widget with coordinates from the
+        // previous geometry for one frame. Never emit CUP outside the physical
+        // screen: some Windows terminals scroll or hide the cursor in response.
+        let row = row.clamp(1, self.height.max(1));
+        let col = col.clamp(1, self.width.max(1));
         self.cursor = Some((row, col));
     }
 
@@ -461,6 +466,16 @@ impl Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_is_clamped_to_the_physical_screen() {
+        let mut screen = Screen::new(40, 8);
+        screen.set_cursor(99, 99);
+        assert_eq!(screen.peek_cursor(), Some((8, 40)));
+
+        screen.set_cursor(0, 0);
+        assert_eq!(screen.peek_cursor(), Some((1, 1)));
+    }
     use crate::render::cell::{push_str_cells, CellStyle};
 
     #[test]

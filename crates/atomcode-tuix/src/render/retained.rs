@@ -252,6 +252,81 @@ struct UserInputRows {
     active: std::ops::Range<usize>,
 }
 
+/// Final physical-row budget for the retained footer. Individual widgets cap
+/// themselves, but their independent caps can still overflow a short terminal
+/// when several widgets are visible at once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FooterRows {
+    approval_active: bool,
+    middle: usize,
+    command_output: usize,
+    attachment: usize,
+    menu: usize,
+    goal: usize,
+    pending: usize,
+    subtask: usize,
+    todo: usize,
+    approval: usize,
+    status: usize,
+}
+
+impl FooterRows {
+    fn top_panel(self) -> usize {
+        self.pending + self.subtask + self.todo
+    }
+
+    fn total(self, hide_input_box: bool) -> usize {
+        1 + if self.approval_active || hide_input_box {
+            0
+        } else {
+            self.middle + 1 + self.command_output
+        } + self.attachment
+            + self.menu
+            + self.goal
+            + self.top_panel()
+            + self.approval
+            + if self.approval_active || hide_input_box {
+                0
+            } else {
+                self.status
+            }
+    }
+
+    fn fit(mut self, height: usize, hide_input_box: bool) -> Self {
+        let trim = |rows: &mut usize, overflow: &mut usize| {
+            let removed = (*rows).min(*overflow);
+            *rows -= removed;
+            *overflow -= removed;
+        };
+        let mut overflow = self.total(hide_input_box).saturating_sub(height);
+
+        // Preserve the active composer/menu/modal. These auxiliary rows are
+        // transient and are reconstructed automatically when the window grows.
+        if !self.approval_active && !hide_input_box {
+            trim(&mut self.command_output, &mut overflow);
+        }
+        trim(&mut self.pending, &mut overflow);
+        trim(&mut self.todo, &mut overflow);
+        trim(&mut self.subtask, &mut overflow);
+        if !self.approval_active && !hide_input_box {
+            trim(&mut self.status, &mut overflow);
+        }
+        trim(&mut self.goal, &mut overflow);
+        trim(&mut self.attachment, &mut overflow);
+        trim(&mut self.menu, &mut overflow);
+
+        if !hide_input_box && !self.approval_active {
+            let removed = self.middle.saturating_sub(1).min(overflow);
+            self.middle -= removed;
+            overflow -= removed;
+        }
+        if self.approval_active {
+            trim(&mut self.approval, &mut overflow);
+        }
+        self
+    }
+}
+
 impl std::ops::Deref for UserInputRows {
     type Target = [Vec<Cell>];
 
@@ -4680,7 +4755,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // backed by real bytes survive), so we trust it directly here
         // and don't re-validate against `input_buf`.
         let attachment_rows = self.input_attachments.len();
-        let command_output_cells = self.build_command_output_rows();
+        let mut command_output_cells = self.build_command_output_rows();
         let command_output_rows = command_output_cells.len();
         let has_status = !self.status.model.is_empty()
             || !self.status.cwd.is_empty()
@@ -4716,31 +4791,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             0
         };
-        let pending_message_cells = self.build_pending_message_rows();
+        let mut pending_message_cells = self.build_pending_message_rows();
         let pending_message_rows = pending_message_cells.len();
-        let top_panel_rows = pending_message_rows + subtask_rows + todo_rows;
-        // Cap the input-box height so a long paste / typed text can't grow the
-        // footer past the screen (overflow). The full text stays in input_buf;
-        // we render a scrolling window that keeps the cursor row visible. The
-        // `[Pasted #N]` folding (insert_paste) already shrinks most big pastes;
-        // this is the backstop for the rest (unfolded single-line pastes,
-        // sub-threshold pastes, typed text). The goal/loop + todo rows are folded
-        // into the status-rows reservation so the input box height accounts for them.
-        let max_input_rows = Self::max_input_rows(
-            h,
-            attachment_rows,
-            menu_rows,
-            status_rows + goal_rows + top_panel_rows + approval_rows + command_output_rows,
-        );
-        let input_view_start = if lines.len() > max_input_rows {
-            cursor_row_in_middle
-                .saturating_sub(max_input_rows.saturating_sub(1))
-                .min(lines.len() - max_input_rows)
-        } else {
-            0
-        };
-        let middle_rows = (lines.len() - input_view_start).min(max_input_rows);
-        let cursor_row_in_middle = cursor_row_in_middle.saturating_sub(input_view_start);
         // When an approval panel is active, we replace the input box with the
         // approval panel (saves 2+ rows) and hide the status row.
         let approval_active = self.approval_active();
@@ -4760,17 +4812,45 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 .and_then(|m| m.items.get(2))
                 .map(|(name, _)| name == "Add Marketplace")
                 .unwrap_or(false);
-        let total_rows = self.footer_total_rows(
-            middle_rows,
-            command_output_rows,
-            attachment_rows,
-            menu_rows,
-            goal_rows,
-            top_panel_rows,
-            approval_rows,
-            status_rows,
-            hide_input_box,
-        );
+        let layout = FooterRows {
+            approval_active,
+            // Start with the useful composer height. `FooterRows::fit` removes
+            // transient chrome first, then scrolls the composer only if the
+            // physical terminal is still too short.
+            middle: lines.len().min(MAX_INPUT_ROWS),
+            command_output: command_output_rows,
+            attachment: attachment_rows,
+            menu: menu_rows,
+            goal: goal_rows,
+            pending: pending_message_rows,
+            subtask: subtask_rows,
+            todo: todo_rows,
+            approval: approval_rows,
+            status: status_rows,
+        }
+        .fit(h, hide_input_box);
+        let middle_rows = layout.middle;
+        let input_view_start = if lines.len() > middle_rows {
+            cursor_row_in_middle
+                .saturating_sub(middle_rows.saturating_sub(1))
+                .min(lines.len() - middle_rows)
+        } else {
+            0
+        };
+        let cursor_row_in_middle = cursor_row_in_middle.saturating_sub(input_view_start);
+        let command_output_rows = layout.command_output;
+        let attachment_rows = layout.attachment;
+        let menu_rows = layout.menu;
+        let goal_rows = layout.goal;
+        let pending_message_rows = layout.pending;
+        let subtask_rows = layout.subtask;
+        let todo_rows = layout.todo;
+        let top_panel_rows = layout.top_panel();
+        let approval_rows = layout.approval;
+        let status_rows = layout.status;
+        let total_rows = layout.total(hide_input_box);
+        command_output_cells.truncate(command_output_rows);
+        pending_message_cells.truncate(pending_message_rows);
         let pad_style = CellStyle::default();
         // Append-only: footer sits directly below the last body row,
         // not pinned to the screen bottom. The VISIBLE body count is
@@ -4842,27 +4922,30 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let hidden_rows = lines.len() - middle_rows;
         let bot_rule = self.build_input_bot_rule(input_rule_width, hidden_rows, shell);
         let status_clone = self.status.clone();
-        let status_cells = if has_status && !hide_input_box {
+        let status_cells = if status_rows > 0 && !hide_input_box {
             Some(self.build_status_row(&status_clone, rule_width, shell))
         } else {
             None
         };
         // Goal and loop rows occupy the same slot (at most one is shown at a
         // time).  Goal takes priority if somehow both are set.
-        let goal_cells: Option<Vec<Cell>> = if let Some(g) = status_clone.goal.as_ref() {
+        let goal_cells: Option<Vec<Cell>> = if goal_rows == 0 {
+            None
+        } else if let Some(g) = status_clone.goal.as_ref() {
             Some(self.build_goal_row(g, rule_width))
         } else if let Some(ls) = status_clone.loop_status.as_ref() {
             Some(self.build_loop_row(ls, rule_width))
         } else {
             None
         };
-        let todo_cells: Vec<Vec<Cell>> = status_clone
+        let mut todo_cells: Vec<Vec<Cell>> = status_clone
             .todo
             .as_ref()
             .filter(|_| status_clone.subtasks.is_none())
             .map(|t| self.build_todo_rows(t, rule_width))
             .unwrap_or_default();
-        let subtask_cells: Vec<Vec<Cell>> = if approval_rows == 0 {
+        todo_cells.truncate(todo_rows);
+        let mut subtask_cells: Vec<Vec<Cell>> = if approval_rows == 0 {
             status_clone
                 .subtasks
                 .as_ref()
@@ -4871,10 +4954,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             Vec::new()
         };
+        subtask_cells.truncate(subtask_rows);
         // Modal panel cells: approval OR user_input OR round_cap_panel (mutually
         // exclusive; approval wins, then user_input, then round_cap_panel).
         // Drawn in the shared `approval_active` slot below.
-        let approval_cells: Vec<Vec<Cell>> = if let Some(p) = status_clone.approval.as_ref() {
+        let mut approval_cells: Vec<Vec<Cell>> = if let Some(p) = status_clone.approval.as_ref() {
             self.build_approval_rows(p, rule_width, w)
         } else if let Some(p) = status_clone.user_input.as_ref() {
             self.build_user_input_panel_view(p, rule_width, w, h)
@@ -4883,6 +4967,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             Vec::new()
         };
+        approval_cells.truncate(approval_rows);
         let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
         // `/resume` and `/cd` share the plugin manager's chrome/layout.
         let plugin_like = matches!(
@@ -4892,6 +4977,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let mut menu_cells: Vec<Vec<Cell>> = Vec::new();
         let mut menu_hit_rows: Vec<(usize, usize, crate::render::interaction::HitTarget)> =
             Vec::new();
+        let mut selected_menu_rows: Option<std::ops::Range<usize>> = None;
         let final_len = self.menu.as_ref().map(|m| m.items.len()).unwrap_or(0);
         let is_sticky = matches!(
             menu_kind,
@@ -5196,6 +5282,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
             } else {
                 cells_before_item
             };
+            if selected && item_end > item_start {
+                selected_menu_rows = Some(item_start..item_end);
+            }
             let target = match menu_kind {
                 super::MenuKind::SlashCommand
                     if self.input_buf.starts_with('/')
@@ -5228,6 +5317,36 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 }
             }
         }
+        let menu_window_start = selected_menu_rows
+            .as_ref()
+            .filter(|_| menu_rows > 0 && menu_cells.len() > menu_rows)
+            .map(|selected| {
+                if selected.end <= menu_rows {
+                    0
+                } else {
+                    selected
+                        .start
+                        .min(menu_cells.len().saturating_sub(menu_rows))
+                }
+            })
+            .unwrap_or(0);
+        menu_cells = menu_cells
+            .into_iter()
+            .skip(menu_window_start)
+            .take(menu_rows)
+            .collect();
+        menu_hit_rows.retain_mut(|(start, height, _)| {
+            let end = start.saturating_add(*height);
+            let window_end = menu_window_start.saturating_add(menu_rows);
+            let clipped_start = (*start).max(menu_window_start);
+            let clipped_end = end.min(window_end);
+            if clipped_start >= clipped_end {
+                return false;
+            }
+            *start = clipped_start - menu_window_start;
+            *height = clipped_end - clipped_start;
+            true
+        });
         // Attachment rows: `  └ [Image #N]` in muted gray, identical
         // visual treatment to the post-submit `UiLine::ImageAttachment`
         // echo. PAD_COL is the leading 2-space indent every body /
@@ -5236,6 +5355,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let attachment_cells: Vec<Vec<Cell>> = self
             .input_attachments
             .iter()
+            .take(attachment_rows)
             .map(|n| {
                 let mut row = Vec::new();
                 let pad = CellStyle::default();
@@ -5520,56 +5640,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
-    /// Single source of truth for the footer height formula so
-    /// `paint_footer`'s `total_rows` and `current_footer_rows` can never
-    /// drift.  Applies the approval-active suppression (input middle line +
-    /// bottom rule + status row are hidden while an approval panel is up)
-    /// then sums all the components.
-    fn footer_total_rows(
-        &self,
-        middle: usize,
-        command_output: usize,
-        attachment: usize,
-        menu: usize,
-        goal: usize,
-        todo: usize,
-        approval: usize,
-        status: usize,
-        hide_input_box: bool,
-    ) -> usize {
-        let approval_active = approval > 0;
-        let eff_middle = if approval_active || hide_input_box {
-            0
-        } else {
-            middle
-        };
-        let eff_bot_rule = if approval_active || hide_input_box {
-            0
-        } else {
-            1
-        };
-        let eff_status = if approval_active || hide_input_box {
-            0
-        } else {
-            status
-        };
-        let eff_top_rule = 1;
-        eff_top_rule
-            + eff_middle
-            + eff_bot_rule
-            + if approval_active || hide_input_box {
-                0
-            } else {
-                command_output
-            }
-            + attachment
-            + menu
-            + goal
-            + todo
-            + approval
-            + eff_status
-    }
-
     /// Footer total height — mirrors the computation inside
     /// `paint_footer` so `paint_body` knows where body_bottom lands.
     fn current_footer_rows(&self) -> usize {
@@ -5632,17 +5702,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
             0
         };
         let pending_message_rows = self.build_pending_message_rows().len();
-        let top_panel_rows = pending_message_rows + subtask_rows + todo_rows;
         let attachment_rows = self.input_attachments.len();
         let command_output_rows = self.build_command_output_rows().len();
-        // Cap the input height (mirrors paint_footer) so a long paste / typed
-        // input can't make the footer exceed the screen.
-        let capped_middle = middle_rows.min(Self::max_input_rows(
-            h,
-            attachment_rows,
-            menu_rows,
-            status_rows + goal_rows + top_panel_rows + approval_rows + command_output_rows,
-        ));
+        let approval_active = self.approval_active();
         // 1 top rule + middle + 1 bot rule + attachments + menu + goal/loop + todo + approval + status.
         // (Spinner used to reserve a row here but now lives in body as
         // a live paragraph — see `push_or_update_live_spinner`.)
@@ -5656,33 +5718,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 | super::MenuKind::SessionList
                 | super::MenuKind::DirectoryList
         );
-        self.footer_total_rows(
-            capped_middle,
-            command_output_rows,
-            attachment_rows,
-            menu_rows,
-            goal_rows,
-            top_panel_rows,
-            approval_rows,
-            status_rows,
-            hide_input_box,
-        )
-    }
-
-    /// Max rows the input box may DISPLAY before scrolling internally. Bounds
-    /// the footer to leave the rule rows, any attachment/menu/status chrome,
-    /// and at least one body row — so the footer never exceeds the screen no
-    /// matter how long the input is. Also capped to `MAX_INPUT_ROWS` so a huge
-    /// paste can't take the whole screen on tall terminals.
-    fn max_input_rows(
-        h: usize,
-        attachment_rows: usize,
-        menu_rows: usize,
-        status_rows: usize,
-    ) -> usize {
-        // top rule + bot rule + chrome, plus one reserved body row.
-        let reserved = 2 + attachment_rows + menu_rows + status_rows + 1;
-        h.saturating_sub(reserved).min(MAX_INPUT_ROWS).max(1)
+        FooterRows {
+            approval_active,
+            middle: middle_rows.min(MAX_INPUT_ROWS),
+            command_output: command_output_rows,
+            attachment: attachment_rows,
+            menu: menu_rows,
+            goal: goal_rows,
+            pending: pending_message_rows,
+            subtask: subtask_rows,
+            todo: todo_rows,
+            approval: approval_rows,
+            status: status_rows,
+        }
+        .fit(h, hide_input_box)
+        .total(hide_input_box)
     }
 
     /// Build the transient Codex-style pending-message panel shown above the
@@ -10091,6 +10141,108 @@ fn spinner_meta_suffix(label: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combined_footer_widgets_fit_short_terminal() {
+        let rows = FooterRows {
+            approval_active: false,
+            middle: 4,
+            command_output: 2,
+            attachment: 2,
+            menu: 4,
+            goal: 1,
+            pending: 3,
+            subtask: 7,
+            todo: 0,
+            approval: 0,
+            status: 1,
+        }
+        .fit(8, false);
+
+        assert!(rows.total(false) <= 8);
+        assert_eq!(rows.middle, 4, "composer rows are preserved first");
+        assert_eq!(rows.command_output, 0);
+        assert_eq!(rows.pending, 0);
+        assert_eq!(rows.subtask, 0);
+    }
+
+    #[test]
+    fn footer_budget_keeps_one_composer_row_at_minimum() {
+        let rows = FooterRows {
+            middle: 6,
+            menu: 10,
+            status: 1,
+            ..FooterRows::default()
+        }
+        .fit(3, false);
+
+        assert_eq!(rows.total(false), 3);
+        assert_eq!(rows.middle, 1);
+        assert_eq!(rows.menu, 0);
+    }
+
+    #[test]
+    fn approval_state_survives_when_tiny_screen_hides_all_modal_rows() {
+        let rows = FooterRows {
+            approval_active: true,
+            middle: 6,
+            approval: 3,
+            status: 1,
+            ..FooterRows::default()
+        }
+        .fit(1, false);
+
+        assert!(rows.approval_active);
+        assert_eq!(rows.approval, 0);
+        assert_eq!(rows.total(false), 1);
+    }
+
+    #[test]
+    fn combined_footer_paint_keeps_input_and_cursor_on_short_screen() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut renderer, _buf) = new_capturing(120, 40);
+        let mut status = status_basic();
+        status.pending_messages = (0..4).map(|i| format!("pending-{i}")).collect();
+        status.command_output = Some("usage one\nusage two".into());
+        status.subtasks = Some(SubtaskProgress {
+            call_id: "resize-run".into(),
+            completed: 0,
+            total: 4,
+            items: (0..4)
+                .map(|i| SubtaskItem {
+                    label: format!("worker#{i}"),
+                    description: "inspect the resized layout".into(),
+                    model: "test-model".into(),
+                    activity: "running".into(),
+                    started_at: None,
+                    output_tokens: 0,
+                    status: SubtaskStatus::Running,
+                })
+                .collect(),
+        });
+        let menu = MenuPayload {
+            items: (0..8)
+                .map(|i| (format!("/command-{i}"), "description".into()))
+                .collect(),
+            selected: 0,
+            kind: crate::render::MenuKind::SlashCommand,
+        };
+        renderer.render(UiLine::InputPrompt {
+            buf: "visible input".into(),
+            cursor_byte: "visible input".len(),
+            menu: Some(menu),
+            status,
+            attachments: vec![1, 2],
+        });
+        renderer.flush_deferred();
+        renderer.on_resize(50, 8);
+
+        assert!(renderer.current_footer_rows() <= 8);
+        let (row, col) = renderer.screen.peek_cursor().expect("composer cursor");
+        assert!((1..=8).contains(&row));
+        assert!((1..=50).contains(&col));
+    }
     use crate::render::{BadgeColour, ModeBadge};
     use crate::terminal::{EnvView, TerminalCaps};
     use std::sync::{
