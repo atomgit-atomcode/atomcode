@@ -2579,16 +2579,28 @@ model = "missing-type"
         assert_eq!(result, PathBuf::from("/tmp/custom-atomcode-home"));
     }
 
+    /// The directory NAME belongs to `distribution::HOME_DIR_NAME` — a build that renames it
+    /// is doing the supported thing. What `resolve_config_dir` owns is where that name gets
+    /// ROOTED, so assert the rooting and read the name from the constant rather than
+    /// re-deriving the whole path, which would just mirror the implementation.
+    fn assert_rooted_at(result: &Path, expected_parent: &str) {
+        assert_eq!(result.parent(), Some(Path::new(expected_parent)));
+        assert_eq!(
+            result.file_name(),
+            Some(std::ffi::OsStr::new(crate::distribution::HOME_DIR_NAME))
+        );
+    }
+
     #[test]
     fn test_resolve_config_dir_falls_back_to_home() {
         let result = Config::resolve_config_dir(None, Some(PathBuf::from("/Users/foo")));
-        assert_eq!(result, PathBuf::from("/Users/foo/.atomcode"));
+        assert_rooted_at(&result, "/Users/foo");
     }
 
     #[test]
     fn test_resolve_config_dir_falls_back_to_dot_when_no_home() {
         let result = Config::resolve_config_dir(None, None);
-        assert_eq!(result, PathBuf::from("./.atomcode"));
+        assert_rooted_at(&result, ".");
     }
 
     #[test]
