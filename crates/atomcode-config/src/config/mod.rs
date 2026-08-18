@@ -58,6 +58,22 @@ pub fn platform_rules() -> &'static str {
 #[serde(default)]
 pub struct CodingConfig {
     pub max_rounds: u32,
+    pub shell_guard_policy: ShellGuardPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShellGuardPolicy {
+    /// No extra credential detection — ordinary tool-approval rules apply.
+    Off,
+    /// Prompt for approval on detected credential access; never terminate the turn.
+    /// The retired `recover` value maps here. Default.
+    #[default]
+    #[serde(alias = "recover")]
+    Prompt,
+    /// Block credentials in the generic shell; terminate the turn where a retry
+    /// through another spelling would be unsafe.
+    Strict,
 }
 
 /// How aggressively the coding agent should start a structured todo list.
@@ -98,7 +114,10 @@ pub struct ToolsConfig {
 }
 impl Default for CodingConfig {
     fn default() -> Self {
-        Self { max_rounds: 200 }
+        Self {
+            max_rounds: 0,
+            shell_guard_policy: ShellGuardPolicy::Prompt,
+        }
     }
 }
 
@@ -233,7 +252,7 @@ pub struct Config {
     /// TOML section is `[loop_config]` (bare `loop` is a Rust keyword).
     #[serde(default)]
     pub loop_config: LoopConfig,
-    /// `[coding]` turn-level policy. Missing from older configs → max_rounds=200.
+    /// `[coding]` turn-level policy. Missing from older configs → max_rounds=0 (unbounded).
     #[serde(default)]
     pub coding: CodingConfig,
     /// Tool-specific behavior. Missing from older configs keeps todo enabled with
@@ -254,6 +273,10 @@ pub struct Config {
     /// short key defined by `Locale`'s serde rename (e.g. `"zh_CN"`).
     #[serde(default)]
     pub language: Option<crate::locale::Locale>,
+    /// Optional UTF-8 file whose content is appended to the built-in `/init`
+    /// instructions. Relative paths resolve from the AtomCode config directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_prompt_file: Option<std::path::PathBuf>,
     /// UI rendering preferences. Currently exposes the light/dark theme
     /// switch driving the TUIX colour palette (markdown headings, code
     /// block syntax highlight, session-name pill). Missing from older
@@ -567,6 +590,7 @@ impl Default for Config {
             tools: ToolsConfig::default(),
             vision_preprocessor_provider: None,
             language: None,
+            init_prompt_file: None,
             ui: UiConfig::default(),
             plugin: PluginConfig::default(),
             web_search: WebSearchConfig::default(),
@@ -671,6 +695,43 @@ impl Config {
         out
     }
 
+    /// Whether an account is owned by the CodingPlan login flow and therefore
+    /// read-only in manual provider management.
+    pub fn account_is_codingplan_managed(&self, account_id: &str) -> bool {
+        if is_codingplan_provider_name(account_id) {
+            return true;
+        }
+        let Some(account) = self.provider_accounts.get(account_id) else {
+            return self.providers.get(account_id).is_some_and(|provider| {
+                provider
+                    .base_url
+                    .as_deref()
+                    .is_some_and(crate::endpoints::is_codingplan_llm_gateway)
+            });
+        };
+        let preset = provider_preset::preset_or_compatible(&account.provider);
+        account
+            .base_url
+            .as_deref()
+            .or(preset.default_base_url)
+            .is_some_and(crate::endpoints::is_codingplan_llm_gateway)
+    }
+
+    /// Managed status for a concrete model selection, following its owning
+    /// account rather than assuming model ids use the `AtomGit-*` convention.
+    pub fn selection_is_codingplan_managed(&self, selection_id: &str) -> bool {
+        if let Some(model) = self.models.get(selection_id) {
+            return self.account_is_codingplan_managed(&model.account);
+        }
+        is_codingplan_provider_name(selection_id)
+            || self.providers.get(selection_id).is_some_and(|provider| {
+                provider
+                    .base_url
+                    .as_deref()
+                    .is_some_and(crate::endpoints::is_codingplan_llm_gateway)
+            })
+    }
+
     /// The unified model catalog: real `models` plus one synthetic model
     /// projected from each legacy `[providers.*]` (keyed by the legacy provider
     /// name, so `default_provider` maps to the same selection id). New-schema
@@ -685,10 +746,22 @@ impl Config {
             } else {
                 name.clone()
             };
-            out.insert(name.clone(), project_legacy_model(&account, p));
+            let mut model = project_legacy_model(&account, p);
+            model.reasoning_effort_levels = effective_reasoning_effort_levels(
+                self.selection_is_codingplan_managed(name),
+                &model.model,
+                model.reasoning_effort_levels.as_deref(),
+            );
+            out.insert(name.clone(), model);
         }
         for (id, m) in &self.models {
-            out.insert(id.clone(), m.clone());
+            let mut model = m.clone();
+            model.reasoning_effort_levels = effective_reasoning_effort_levels(
+                self.account_is_codingplan_managed(&model.account),
+                &model.model,
+                model.reasoning_effort_levels.as_deref(),
+            );
+            out.insert(id.clone(), model);
         }
         out
     }
@@ -793,9 +866,9 @@ impl Config {
             base_url,
             api_key,
             model: model.model.clone(),
-            supports_vision: model.supports_vision.unwrap_or_else(|| {
-                crate::util::model_name_suggests_vision(&model.model)
-            }),
+            supports_vision: model
+                .supports_vision
+                .unwrap_or_else(|| crate::util::model_name_suggests_vision(&model.model)),
             context_window: model.context_window,
             max_tokens: model.max_tokens,
             system_prompt: model.system_prompt.clone(),
@@ -804,10 +877,18 @@ impl Config {
             thinking_type: model.thinking_type.clone(),
             thinking_keep: model.thinking_keep.clone(),
             reasoning_history: model.reasoning_history.clone(),
-            reasoning_effort: model.reasoning_effort.clone(),
+            // Clamp the resolved effort to the endpoint's allowed levels so the
+            // wire never sends a level the model declares unsupported (covers a
+            // hand-edited config, or a stale value left after the level set shrank).
+            reasoning_effort: clamp_effort_to_levels(
+                model.reasoning_effort.as_deref(),
+                model.reasoning_effort_levels.as_deref(),
+            ),
+            reasoning_effort_levels: model.reasoning_effort_levels.clone(),
             thinking_enabled: model.thinking_enabled,
             thinking_budget: model.thinking_budget,
             capable_model: model.capable_model,
+            retry_max_attempts: model.retry_max_attempts,
         })
     }
 
@@ -830,7 +911,17 @@ impl Config {
                 .map(|r| r.to_provider_config());
         }
         if let Some(p) = self.providers.get(selection_id) {
-            return Some(p.clone());
+            let mut provider = p.clone();
+            provider.reasoning_effort_levels = effective_reasoning_effort_levels(
+                self.selection_is_codingplan_managed(selection_id),
+                &provider.model,
+                provider.reasoning_effort_levels.as_deref(),
+            );
+            provider.reasoning_effort = clamp_effort_to_levels(
+                provider.reasoning_effort.as_deref(),
+                provider.reasoning_effort_levels.as_deref(),
+            );
+            return Some(provider);
         }
         self.resolve_model(Some(selection_id))
             .ok()
@@ -1049,6 +1140,88 @@ pub fn codingplan_group_account_id(provider_type: &str) -> &'static str {
     }
 }
 
+/// The canonical reasoning-effort levels, in the order UIs cycle through them.
+/// The single source of truth for the level SET, so the TUI cycle, the
+/// `/provider` panel, `/effort`, the daemon, and the webui can never disagree
+/// about which levels exist. (`"auto"`/`None` are capability states handled
+/// separately, not levels.)
+pub const REASONING_EFFORT_LEVELS: [&str; 4] = ["low", "medium", "high", "max"];
+
+/// Built-in reasoning levels advertised by an official CodingPlan model.
+/// `None` means the model has no product-owned restriction and should use its
+/// persisted declaration. The API-default state is represented separately by
+/// `reasoning_effort = None`, so it does not appear in this level list.
+pub fn codingplan_builtin_effort_levels(model: &str) -> Option<Vec<String>> {
+    model
+        .eq_ignore_ascii_case("deepseek-v4-flash")
+        .then(|| vec!["high".to_string(), "max".to_string()])
+}
+
+/// Resolve a model's effective level declaration. Official CodingPlan
+/// capabilities are authoritative; custom providers retain their configured
+/// list (or unrestricted `None`).
+pub fn effective_reasoning_effort_levels(
+    codingplan_managed: bool,
+    model: &str,
+    declared: Option<&[String]>,
+) -> Option<Vec<String>> {
+    if codingplan_managed {
+        if let Some(levels) = codingplan_builtin_effort_levels(model) {
+            return Some(levels);
+        }
+    }
+    declared.map(<[String]>::to_vec)
+}
+
+/// The ordered subset of reasoning-effort levels an endpoint exposes.
+///
+/// `declared` is the per-endpoint `reasoning_effort_levels` list (from config).
+/// `None` or an EMPTY list means "unrestricted" ⇒ every [`REASONING_EFFORT_LEVELS`]
+/// level. A non-empty list restricts to exactly the canonical levels it names,
+/// matched case-insensitively, always returned in canonical order (not the
+/// config's order) and with unknown tokens dropped. So an endpoint that supports
+/// `low`/`high`/`max` but not `medium` yields `["low", "high", "max"]`.
+pub fn allowed_effort_levels(declared: Option<&[String]>) -> Vec<&'static str> {
+    let Some(list) = declared.filter(|l| !l.is_empty()) else {
+        return REASONING_EFFORT_LEVELS.to_vec();
+    };
+    let restricted: Vec<&'static str> = REASONING_EFFORT_LEVELS
+        .iter()
+        .copied()
+        .filter(|level| list.iter().any(|d| d.trim().eq_ignore_ascii_case(level)))
+        .collect();
+    // A list naming ONLY unknown tokens filters to nothing — treat that as
+    // unrestricted (same as an empty list), NOT "zero levels". Otherwise a typo
+    // silently hides every level, and the panel's `effort_levels_from_config`
+    // (which derives from this) would round-trip the restriction away.
+    if restricted.is_empty() {
+        REASONING_EFFORT_LEVELS.to_vec()
+    } else {
+        restricted
+    }
+}
+
+/// Clamp a persisted `reasoning_effort` VALUE to an endpoint's allowed levels, so
+/// the wire (and every display) can never carry a level the endpoint declares
+/// unsupported. A concrete level (`low`/`medium`/`high`/`max`) outside
+/// [`allowed_effort_levels`] becomes `None` (the API default); `"auto"` and
+/// `None` are capability states, not levels, and pass through unchanged. A valid
+/// value is returned verbatim (no normalization).
+pub fn clamp_effort_to_levels(effort: Option<&str>, declared: Option<&[String]>) -> Option<String> {
+    let value = effort?;
+    if value.trim().eq_ignore_ascii_case("auto") {
+        return Some(value.to_string());
+    }
+    if allowed_effort_levels(declared)
+        .iter()
+        .any(|level| level.eq_ignore_ascii_case(value.trim()))
+    {
+        Some(value.to_string())
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod codingplan_prefix_tests {
     use super::*;
@@ -1148,8 +1321,10 @@ fn project_legacy_model(account_id: &str, p: &ProviderConfig) -> ModelProfileCon
         thinking_keep: p.thinking_keep.clone(),
         reasoning_history: p.reasoning_history.clone(),
         reasoning_effort: p.reasoning_effort.clone(),
+        reasoning_effort_levels: p.reasoning_effort_levels.clone(),
         thinking_enabled: p.thinking_enabled,
         thinking_budget: p.thinking_budget,
+        retry_max_attempts: p.retry_max_attempts,
     }
 }
 
@@ -1282,6 +1457,22 @@ fn migrate_legacy_lsp_default(cfg: &mut Config) {
     }
 }
 
+/// Compatibility migration for configs written while the ordinary coding-turn
+/// default was 200 rounds. Setup/config persistence serialized that default,
+/// so changing [`CodingConfig::default`] alone would leave existing installs on
+/// the retired cap forever. Treat the exact former default as auto-written and
+/// move it to the new unbounded default. Other explicit budgets remain intact.
+///
+/// As with the LSP default migration above, intent cannot be distinguished
+/// without a historical schema-version marker: a user who deliberately chose
+/// exactly 200 must set it again after upgrading. `ATOMCODE_TURN_MAX_ROUNDS=200`
+/// remains an unambiguous opt-in and is applied after this migration.
+fn migrate_legacy_coding_round_default(cfg: &mut Config) {
+    if cfg.coding.max_rounds == 200 {
+        cfg.coding.max_rounds = 0;
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1377,8 +1568,12 @@ fn render_datalog_section(cfg: &DatalogConfig) -> String {
     let mut out = String::new();
     out.push_str("\n# Per-turn datalog. Each turn writes a markdown summary; each LLM\n");
     out.push_str("# round appends its final request to the paired JSONL file.\n");
-    out.push_str("# Logs contain raw prompts, responses, tool inputs and tool outputs; protect them\n");
-    out.push_str("# as sensitive data. AtomCode creates project directories/files as 0700/0600 on Unix.\n");
+    out.push_str(
+        "# Logs contain raw prompts, responses, tool inputs and tool outputs; protect them\n",
+    );
+    out.push_str(
+        "# as sensitive data. AtomCode creates project directories/files as 0700/0600 on Unix.\n",
+    );
     out.push_str("# A per-project subdirectory is always appended under `dir` so multiple\n");
     out.push_str("# projects never share a bucket.\n");
     out.push_str("# - enabled = false        -> disable logging entirely\n");
@@ -1616,6 +1811,7 @@ impl Config {
         let mut config: Config = toml::from_str(content)
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
         migrate_legacy_lsp_default(&mut config);
+        migrate_legacy_coding_round_default(&mut config);
         Ok(config)
     }
 
@@ -1653,6 +1849,7 @@ impl Config {
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
         config.quarantined_providers = quarantined;
         migrate_legacy_lsp_default(&mut config);
+        migrate_legacy_coding_round_default(&mut config);
         if config
             .quarantined_providers
             .contains_key(&config.default_provider)
@@ -1847,6 +2044,200 @@ pub enum SeedOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allowed_effort_levels_defaults_to_all_and_filters_a_subset() {
+        // No declared subset ⇒ the full canonical set, in cycle order.
+        assert_eq!(
+            allowed_effort_levels(None),
+            vec!["low", "medium", "high", "max"]
+        );
+        // An empty list is treated as "unrestricted", not "no levels".
+        assert_eq!(
+            allowed_effort_levels(Some(&[])),
+            vec!["low", "medium", "high", "max"]
+        );
+        // A declared subset keeps CANONICAL order (not the config's order),
+        // is case-insensitive, and drops unknown tokens.
+        let declared = [
+            "MAX".to_string(),
+            "low".to_string(),
+            "bogus".to_string(),
+            "high".to_string(),
+        ];
+        assert_eq!(
+            allowed_effort_levels(Some(&declared)),
+            vec!["low", "high", "max"]
+        );
+        // The motivating case: an endpoint that supports low/high/max but NOT medium.
+        let no_medium = ["low".to_string(), "high".to_string(), "max".to_string()];
+        assert_eq!(
+            allowed_effort_levels(Some(&no_medium)),
+            vec!["low", "high", "max"]
+        );
+        // A list naming ONLY unknown tokens is unrestricted, NOT "no levels" — a
+        // typo must not silently hide every level (and diverge from the panel's
+        // toggles, which read this).
+        let only_unknown = ["none".to_string(), "bogus".to_string()];
+        assert_eq!(
+            allowed_effort_levels(Some(&only_unknown)),
+            vec!["low", "medium", "high", "max"]
+        );
+    }
+
+    #[test]
+    fn clamp_effort_to_levels_drops_out_of_set_values() {
+        let low_high = ["low".to_string(), "high".to_string()];
+        // A concrete level not in the allowed set ⇒ None (API default), so the wire
+        // never sends a level the endpoint declares unsupported.
+        assert_eq!(
+            clamp_effort_to_levels(Some("medium"), Some(&low_high)),
+            None
+        );
+        // An allowed level passes through (case/space-insensitive membership).
+        assert_eq!(
+            clamp_effort_to_levels(Some(" High "), Some(&low_high)).as_deref(),
+            Some(" High ")
+        );
+        // `auto` and None are capability states, not levels — always pass through.
+        assert_eq!(
+            clamp_effort_to_levels(Some("auto"), Some(&low_high)).as_deref(),
+            Some("auto")
+        );
+        assert_eq!(clamp_effort_to_levels(None, Some(&low_high)), None);
+        // An unrestricted endpoint keeps any level.
+        assert_eq!(
+            clamp_effort_to_levels(Some("medium"), None).as_deref(),
+            Some("medium")
+        );
+    }
+
+    #[test]
+    fn resolve_model_clamps_effort_outside_declared_levels() {
+        // A (hand-edited or stale) config whose default effort names a level the
+        // endpoint no longer exposes must NOT reach the wire: resolution drops it
+        // to the API default so `openai_compat` never sends the forbidden level.
+        let catalog: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "custom": { "provider": "openai-compatible", "base_url": "https://example.invalid/v1" }
+            },
+            "models": {
+                "custom/model": {
+                    "account": "custom",
+                    "model": "vendor-model",
+                    "reasoning_effort": "medium",
+                    "reasoning_effort_levels": ["low", "high", "max"]
+                }
+            },
+            "default_model": "custom/model"
+        }))
+        .unwrap();
+        let resolved = catalog.resolve_model(Some("custom/model")).unwrap();
+        assert_eq!(
+            resolved.reasoning_effort, None,
+            "medium is not in [low,high,max] ⇒ dropped to API default at resolution"
+        );
+        // The declared levels themselves still flow through.
+        assert_eq!(
+            resolved.reasoning_effort_levels.as_deref(),
+            Some(["low".to_string(), "high".to_string(), "max".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn official_deepseek_flash_exposes_only_high_and_max() {
+        let expected = ["high".to_string(), "max".to_string()];
+        assert_eq!(
+            codingplan_builtin_effort_levels("deepseek-v4-flash").as_deref(),
+            Some(expected.as_slice())
+        );
+        assert_eq!(codingplan_builtin_effort_levels("GLM-5.2"), None);
+    }
+
+    #[test]
+    fn stale_official_deepseek_effort_falls_back_to_api_default() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "AtomGit-deepseek-v4-flash": {
+                    "type": "openai",
+                    "base_url": "https://llm-api.atomgit.com/v1",
+                    "model": "deepseek-v4-flash",
+                    "context_window": 1000000,
+                    "reasoning_effort": "medium"
+                }
+            }
+        }))
+        .unwrap();
+
+        let provider = cfg
+            .provider_config_for_selection("AtomGit-deepseek-v4-flash")
+            .unwrap();
+        assert_eq!(provider.reasoning_effort, None);
+        assert_eq!(
+            provider.reasoning_effort_levels.as_deref(),
+            Some(["high".to_string(), "max".to_string()].as_slice())
+        );
+        assert_eq!(
+            allowed_effort_levels(provider.reasoning_effort_levels.as_deref()),
+            vec!["high", "max"]
+        );
+
+        let catalog: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "official": {
+                    "provider": "openai",
+                    "base_url": "https://llm-api.atomgit.com/v1"
+                }
+            },
+            "models": {
+                "flash-primary": {
+                    "account": "official",
+                    "model": "deepseek-v4-flash",
+                    "reasoning_effort": "low",
+                    "context_window": 1000000
+                }
+            }
+        }))
+        .unwrap();
+        let resolved = catalog.resolve_model(Some("flash-primary")).unwrap();
+        assert_eq!(resolved.reasoning_effort, None);
+        assert_eq!(
+            resolved.reasoning_effort_levels.as_deref(),
+            Some(["high".to_string(), "max".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_levels_survive_deser_and_resolution() {
+        // A per-model `reasoning_effort_levels` must deserialize and flow through
+        // `resolve_model` to the flattened `ResolvedModelConfig` unchanged, so every
+        // downstream consumer can restrict the offered levels.
+        let catalog: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "custom": { "provider": "openai-compatible", "base_url": "https://example.invalid/v1" }
+            },
+            "models": {
+                "custom/model": {
+                    "account": "custom",
+                    "model": "vendor-model",
+                    "reasoning_effort_levels": ["low", "high", "max"]
+                }
+            },
+            "default_model": "custom/model"
+        }))
+        .unwrap();
+        let resolved = catalog.resolve_model(Some("custom/model")).unwrap();
+        assert_eq!(
+            resolved.reasoning_effort_levels.as_deref(),
+            Some(["low".to_string(), "high".to_string(), "max".to_string()].as_slice()),
+            "declared levels must survive resolution"
+        );
+        // …and the single source of truth restricts to exactly that subset.
+        assert_eq!(
+            allowed_effort_levels(resolved.reasoning_effort_levels.as_deref()),
+            vec!["low", "high", "max"]
+        );
+    }
 
     // NOTE: the provider-type key in TOML is `type` (ProviderConfig uses
     // #[serde(rename = "type")]), NOT `provider_type`.
@@ -2334,6 +2725,24 @@ model = "missing-type"
         assert!(!cfg.lsp.auto_detect);
     }
 
+    #[test]
+    fn migrate_auto_written_coding_round_cap_to_unbounded() {
+        let mut cfg = Config::with_default_provider("x");
+        cfg.coding.max_rounds = 200;
+        migrate_legacy_coding_round_default(&mut cfg);
+        assert_eq!(cfg.coding.max_rounds, 0);
+    }
+
+    #[test]
+    fn migrate_keeps_custom_coding_round_caps() {
+        for expected in [0, 199, 500] {
+            let mut cfg = Config::with_default_provider("x");
+            cfg.coding.max_rounds = expected;
+            migrate_legacy_coding_round_default(&mut cfg);
+            assert_eq!(cfg.coding.max_rounds, expected);
+        }
+    }
+
     fn blank_config_with_lsp(lsp: LspConfig) -> Config {
         Config {
             lsp,
@@ -2368,16 +2777,28 @@ model = "missing-type"
         assert_eq!(result, PathBuf::from("/tmp/custom-atomcode-home"));
     }
 
+    /// The directory NAME belongs to `distribution::HOME_DIR_NAME` — a build that renames it
+    /// is doing the supported thing. What `resolve_config_dir` owns is where that name gets
+    /// ROOTED, so assert the rooting and read the name from the constant rather than
+    /// re-deriving the whole path, which would just mirror the implementation.
+    fn assert_rooted_at(result: &Path, expected_parent: &str) {
+        assert_eq!(result.parent(), Some(Path::new(expected_parent)));
+        assert_eq!(
+            result.file_name(),
+            Some(std::ffi::OsStr::new(crate::distribution::HOME_DIR_NAME))
+        );
+    }
+
     #[test]
     fn test_resolve_config_dir_falls_back_to_home() {
         let result = Config::resolve_config_dir(None, Some(PathBuf::from("/Users/foo")));
-        assert_eq!(result, PathBuf::from("/Users/foo/.atomcode"));
+        assert_rooted_at(&result, "/Users/foo");
     }
 
     #[test]
     fn test_resolve_config_dir_falls_back_to_dot_when_no_home() {
         let result = Config::resolve_config_dir(None, None);
-        assert_eq!(result, PathBuf::from("./.atomcode"));
+        assert_rooted_at(&result, ".");
     }
 
     #[test]
@@ -2519,6 +2940,7 @@ model = "missing-type"
             },
             vision_preprocessor_provider: None,
             language: None,
+            init_prompt_file: None,
             ui: Default::default(),
             plugin: Default::default(),
             web_search: Default::default(),
@@ -2543,11 +2965,13 @@ model = "missing-type"
                 thinking_keep: None,
                 reasoning_history: None,
                 reasoning_effort: None,
+                reasoning_effort_levels: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
+                retry_max_attempts: None,
             },
         );
         cfg.save(&tmp).unwrap();
@@ -2759,11 +3183,13 @@ model = "missing-type"
                 thinking_keep: None,
                 reasoning_history: None,
                 reasoning_effort: None,
+                reasoning_effort_levels: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
+                retry_max_attempts: None,
             },
         );
         cfg.save(tmp.path()).unwrap();
@@ -2803,6 +3229,24 @@ model = "missing-type"
     }
 
     #[test]
+    fn init_prompt_file_round_trips_and_defaults_to_none() {
+        let missing: Config = toml::from_str("default_provider = \"foo\"\n[providers]\n").unwrap();
+        assert_eq!(missing.init_prompt_file, None);
+
+        let configured: Config = toml::from_str(
+            "default_provider = \"foo\"\ninit_prompt_file = \"prompts/init-zh.md\"\n[providers]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            configured.init_prompt_file.as_deref(),
+            Some(std::path::Path::new("prompts/init-zh.md"))
+        );
+        assert!(toml::to_string(&configured)
+            .unwrap()
+            .contains("init_prompt_file = \"prompts/init-zh.md\""));
+    }
+
+    #[test]
     fn vision_preprocessor_provider_round_trips_through_toml() {
         let toml_str = r#"
             default_provider = "claude"
@@ -2839,11 +3283,13 @@ model = "missing-type"
                 thinking_keep: None,
                 reasoning_history: None,
                 reasoning_effort: None,
+                reasoning_effort_levels: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
+                retry_max_attempts: None,
             },
         );
         Config {
@@ -2972,11 +3418,13 @@ model = "missing-type"
                 thinking_keep: None,
                 reasoning_history: None,
                 reasoning_effort: None,
+                reasoning_effort_levels: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
+                retry_max_attempts: None,
             },
         );
         assert!(cfg.can_handle_attached_images());
@@ -3185,10 +3633,12 @@ capable_model = 5
                 context_window: 128_000,
                 max_tokens: None,
                 capable_model: None,
+                retry_max_attempts: None,
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
                 reasoning_effort: None,
+                reasoning_effort_levels: None,
                 thinking_enabled: None,
                 thinking_budget: None,
             },
@@ -3233,10 +3683,12 @@ capable_model = 5
                 context_window: 0, // zero window → error
                 max_tokens: None,
                 capable_model: None,
+                retry_max_attempts: None,
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
                 reasoning_effort: None,
+                reasoning_effort_levels: None,
                 thinking_enabled: None,
                 thinking_budget: None,
             },

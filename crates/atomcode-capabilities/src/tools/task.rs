@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use atomcode_kernel::agent::{Agent, AutoRespond, Outcome, ToolLoopPolicy};
-use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
+use atomcode_kernel::event::{AgentCommand, AgentEvent, PolicyIntervention, StopReason};
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::Message;
 use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const DEFAULT_MAX_CONCURRENT: usize = 3;
+const CHILD_POLICY_INTERVENTION_MARKER: &str = "\u{1e}atomcode:child-policy-intervention\u{1e}";
 static TASK_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn task_run_id(progress: &ProgressSink) -> crate::team::TeamRunId {
@@ -389,12 +390,29 @@ pub fn subagent_child_middlewares(
     working_dir: &Path,
     inherited_worker_middlewares: &[Arc<dyn ToolMiddleware>],
 ) -> Vec<Arc<dyn ToolMiddleware>> {
+    subagent_child_middlewares_for_policy(
+        is_worker,
+        scope,
+        working_dir,
+        inherited_worker_middlewares,
+        Default::default(),
+    )
+}
+
+pub fn subagent_child_middlewares_for_policy(
+    is_worker: bool,
+    scope: &[String],
+    working_dir: &Path,
+    inherited_worker_middlewares: &[Arc<dyn ToolMiddleware>],
+    credential_shell_policy: super::CredentialShellPolicy,
+) -> Vec<Arc<dyn ToolMiddleware>> {
     subagent_child_middlewares_with_policy(
         is_worker,
         scope,
         working_dir,
         inherited_worker_middlewares,
         false,
+        credential_shell_policy,
     )
 }
 
@@ -404,9 +422,14 @@ fn subagent_child_middlewares_with_policy(
     working_dir: &Path,
     inherited_worker_middlewares: &[Arc<dyn ToolMiddleware>],
     confine_reads: bool,
+    credential_shell_policy: super::CredentialShellPolicy,
 ) -> Vec<Arc<dyn ToolMiddleware>> {
     let mut mw: Vec<Arc<dyn ToolMiddleware>> = vec![
-        Arc::new(super::CredentialBashGate::new()),
+        // Children run `AutoRespond::AllowAll`, so a prompt would auto-approve itself —
+        // the non-interactive gate fails `Prompt` closed to a call-only deny instead.
+        Arc::new(super::CredentialBashGate::non_interactive(
+            credential_shell_policy,
+        )),
         Arc::new(DenySensitivePaths),
     ];
     if is_worker {
@@ -434,12 +457,29 @@ pub fn team_child_middlewares(
     working_dir: &Path,
     inherited_worker_middlewares: &[Arc<dyn ToolMiddleware>],
 ) -> Vec<Arc<dyn ToolMiddleware>> {
+    team_child_middlewares_for_policy(
+        is_worker,
+        scope,
+        working_dir,
+        inherited_worker_middlewares,
+        Default::default(),
+    )
+}
+
+pub fn team_child_middlewares_for_policy(
+    is_worker: bool,
+    scope: &[String],
+    working_dir: &Path,
+    inherited_worker_middlewares: &[Arc<dyn ToolMiddleware>],
+    credential_shell_policy: super::CredentialShellPolicy,
+) -> Vec<Arc<dyn ToolMiddleware>> {
     subagent_child_middlewares_with_policy(
         is_worker,
         scope,
         working_dir,
         inherited_worker_middlewares,
         true,
+        credential_shell_policy,
     )
 }
 
@@ -464,6 +504,10 @@ struct SubTask {
     subagent_type: String,
     #[serde(default)]
     difficulty: String,
+    /// Optional configured model selection id. When present it overrides the
+    /// simple/fast and hard/capable tier for this subtask only.
+    #[serde(default)]
+    model: Option<String>,
     /// Optional specialized profile. Defaults to explorer/implementer according
     /// to `subagent_type`; the profile's permission must match that type.
     #[serde(default)]
@@ -482,6 +526,9 @@ struct Args {
 pub struct TaskTool {
     make_fast_provider: Box<dyn Fn() -> Arc<dyn LlmProvider> + Send + Sync>,
     make_capable_provider: Box<dyn Fn() -> Arc<dyn LlmProvider> + Send + Sync>,
+    make_host_provider: Option<Box<dyn Fn() -> Arc<dyn LlmProvider> + Send + Sync>>,
+    make_named_provider:
+        Option<Box<dyn Fn(&str) -> Result<Option<Arc<dyn LlmProvider>>, String> + Send + Sync>>,
     make_explore_tools: Box<dyn Fn() -> MountedTools + Send + Sync>,
     make_worker_tools: Box<dyn Fn() -> MountedTools + Send + Sync>,
     max_concurrent: usize,
@@ -489,6 +536,7 @@ pub struct TaskTool {
     tool_loop_policy: Option<ToolLoopPolicy>,
     inherited_worker_middlewares: Vec<Arc<dyn ToolMiddleware>>,
     team_event_sink: Option<Arc<dyn Fn(crate::team::TeamEvent) + Send + Sync>>,
+    credential_shell_policy: super::CredentialShellPolicy,
 }
 
 impl TaskTool {
@@ -501,6 +549,8 @@ impl TaskTool {
         Self {
             make_fast_provider: Box::new(make_fast_provider),
             make_capable_provider: Box::new(make_capable_provider),
+            make_host_provider: None,
+            make_named_provider: None,
             make_explore_tools: Box::new(make_explore_tools),
             make_worker_tools: Box::new(make_worker_tools),
             max_concurrent: DEFAULT_MAX_CONCURRENT,
@@ -508,7 +558,31 @@ impl TaskTool {
             tool_loop_policy: Some(ToolLoopPolicy::default()),
             inherited_worker_middlewares: Vec::new(),
             team_event_sink: None,
+            credential_shell_policy: Default::default(),
         }
+    }
+
+    /// Install the current host provider as the safe fallback target for a
+    /// content-free, retryable hard/explore failure.
+    pub fn with_host_provider(
+        mut self,
+        make_provider: impl Fn() -> Arc<dyn LlmProvider> + Send + Sync + 'static,
+    ) -> Self {
+        self.make_host_provider = Some(Box::new(make_provider));
+        self
+    }
+
+    /// Resolve a configured model selection id for a single task. `Ok(None)`
+    /// means that selection is the current host model and should reuse its slot.
+    pub fn with_named_provider(
+        mut self,
+        make_provider: impl Fn(&str) -> Result<Option<Arc<dyn LlmProvider>>, String>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.make_named_provider = Some(Box::new(make_provider));
+        self
     }
 
     pub fn with_max_concurrent(mut self, n: usize) -> Self {
@@ -527,6 +601,14 @@ impl TaskTool {
     /// for intentional repeated operations; the independent round cap remains.
     pub fn with_tool_loop_policy(mut self, policy: Option<ToolLoopPolicy>) -> Self {
         self.tool_loop_policy = policy;
+        self
+    }
+
+    pub fn with_credential_shell_policy(
+        mut self,
+        policy: super::CredentialShellPolicy,
+    ) -> Self {
+        self.credential_shell_policy = policy;
         self
     }
 
@@ -556,7 +638,7 @@ impl Tool for TaskTool {
 
     fn description(&self) -> &str {
         "Dispatch one or more subtasks to isolated subagents. Each task: {description, \
-prompt, subagent_type: 'explore'|'worker', difficulty: 'simple'|'hard', role?: profile}. 'explore' = \
+prompt, subagent_type: 'explore'|'worker', difficulty: 'simple'|'hard', model?: configured_model_id, role?: profile}. 'explore' = \
 read-only investigation returning findings; 'worker' = edits files then stops (you review \
 the diff afterward). Optional roles include architect, reviewer, tester, rust, and tui_ux; \
 the role permission must match subagent_type. 'simple' runs on the fast model, 'hard' on the capable model. Give \
@@ -567,6 +649,23 @@ emitted as ONE JSON payload, so keep each `prompt` concise and dispatch in small
 rejected as invalid JSON — prefer several smaller calls over one huge one. Each `worker` \
 MUST declare a `scope` (working-dir-relative globs) listing the files it may write; give \
 parallel workers NON-OVERLAPPING scopes."
+    }
+
+    fn take_policy_intervention(&self, result: &mut ToolResult) -> Option<PolicyIntervention> {
+        let Some(rest) = result
+            .content
+            .strip_prefix(CHILD_POLICY_INTERVENTION_MARKER)
+        else {
+            return None;
+        };
+        // The blocked child's block was already sanitized at render time (fixed
+        // notice, no child-derived data), so just strip the internal signal marker
+        // — never expose it — and KEEP the surviving siblings' output. Lift the
+        // structured recovery contract so every driver follows its existing
+        // policy-recovery presentation.
+        result.content = rest.to_string();
+        result.is_error = true;
+        Some(PolicyIntervention::credential_shell_blocked())
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -582,6 +681,10 @@ parallel workers NON-OVERLAPPING scopes."
                             "prompt": {"type": "string", "description": "The full subtask for the subagent"},
                             "subagent_type": {"type": "string", "enum": ["explore", "worker"]},
                             "difficulty": {"type": "string", "enum": ["simple", "hard"]},
+                            "model": {
+                                "type": "string",
+                                "description": "Optional configured model selection id for this subtask; overrides difficulty tier routing"
+                            },
                             "role": {
                                 "type": "string",
                                 "enum": ["planner", "architect", "explorer", "implementer", "rust", "tui_ux", "reviewer", "tester", "debugger", "security", "performance", "docs_writer", "release_manager", "migration_compat"]
@@ -674,6 +777,70 @@ parallel workers NON-OVERLAPPING scopes."
             };
         }
 
+        // Resolve every provider before starting the batch. A misspelled explicit
+        // model must fail atomically instead of launching some siblings first.
+        let mut prepared = Vec::with_capacity(specs.len());
+        for (spec, raw) in specs.into_iter().zip(parsed.tasks.iter()) {
+            let requested_model = raw
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let provider = if let Some(selection) = requested_model {
+                let Some(resolve) = self.make_named_provider.as_ref() else {
+                    return ToolResult {
+                        call_id: String::new(),
+                        content: "this runtime does not support per-task model selection".into(),
+                        is_error: true,
+                        images: vec![],
+                    };
+                };
+                match resolve(selection) {
+                    Ok(Some(provider)) => provider,
+                    Ok(None) => match self.make_host_provider.as_ref() {
+                        Some(make_host) => make_host(),
+                        None => {
+                            return ToolResult {
+                                call_id: String::new(),
+                                content: format!(
+                                    "model `{selection}` resolves to the host model, but the host provider is unavailable"
+                                ),
+                                is_error: true,
+                                images: vec![],
+                            }
+                        }
+                    },
+                    Err(error) => {
+                        return ToolResult {
+                            call_id: String::new(),
+                            content: format!("invalid task model `{selection}`: {error}"),
+                            is_error: true,
+                            images: vec![],
+                        }
+                    }
+                }
+            } else if spec.difficulty == crate::team::TeamDifficulty::Hard {
+                (self.make_capable_provider)()
+            } else {
+                (self.make_fast_provider)()
+            };
+            let fallback = (requested_model.is_none()
+                && spec.permission == crate::team::TeamPermission::Explore
+                && spec.difficulty == crate::team::TeamDifficulty::Hard)
+                .then(|| {
+                    self.make_host_provider
+                        .as_ref()
+                        .map(|make_host| make_host())
+                })
+                .flatten()
+                // A different configured provider may legitimately expose the
+                // same raw model name (for example two gateways serving GLM).
+                // Provider identity, not display text, determines whether this
+                // is a real fallback target.
+                .filter(|host| !Arc::ptr_eq(host, &provider));
+            prepared.push((spec, provider, fallback));
+        }
+
         let sem = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent));
         let max_rounds = self.max_rounds;
         let tool_loop_policy = self.tool_loop_policy;
@@ -691,23 +858,18 @@ parallel workers NON-OVERLAPPING scopes."
             emit_lock: Arc::new(Mutex::new(())),
         });
         if let Some(events) = &event_emitter {
-            events.emit(crate::team::TeamEventPayload::RunStarted { total: specs.len() });
+            events.emit(crate::team::TeamEventPayload::RunStarted {
+                total: prepared.len(),
+            });
         }
         // Live progress: the whole batch would otherwise be a black box until every subtask
         // finishes. Emit a header + per-subtask start/done so the driver renders them live.
         ctx.progress
-            .emit(format!("dispatching {} subtask(s)…", specs.len()));
+            .emit(format!("dispatching {} subtask(s)…", prepared.len()));
 
-        for (idx, t) in specs.into_iter().enumerate() {
+        for (idx, (t, provider, fallback_provider)) in prepared.into_iter().enumerate() {
             let is_worker = t.permission == crate::team::TeamPermission::Worker;
             let scope = t.scope.clone();
-            let is_hard = t.difficulty == crate::team::TeamDifficulty::Hard;
-            // Fresh provider + fresh tools per child (a session consumes its provider).
-            let provider = if is_hard {
-                (self.make_capable_provider)()
-            } else {
-                (self.make_fast_provider)()
-            };
             // Capture the actual model this subtask runs on (for display + routing proof)
             // BEFORE the provider is moved into the child builder.
             let model = provider.model_name().to_string();
@@ -748,6 +910,7 @@ parallel workers NON-OVERLAPPING scopes."
                 subtask_progress_line(&format!("\u{25cb} queued \u{b7} {label}"), &model, &desc,)
             ));
 
+            let credential_shell_policy = self.credential_shell_policy;
             set.spawn(async move {
                 let _permit = sem.acquire_owned().await.expect("semaphore not closed");
                 if let Some(events) = &member_events {
@@ -773,31 +936,27 @@ parallel workers NON-OVERLAPPING scopes."
                     member_events.clone(),
                     member_id.clone(),
                 ));
-                let mut builder = Agent::builder()
-                    .provider(provider)
-                    .tools(tools)
-                    .persona(persona)
-                    .working_dir(wd.clone())
-                    .cancel_token(child_cancel)
-                    .hook(progress_hook.clone());
-                if let Some(policy) = tool_loop_policy {
-                    builder = builder.tool_loop_policy(policy);
-                }
-                if let Some(max_rounds) = max_rounds {
-                    builder = builder.max_rounds(max_rounds);
-                }
                 // The child runs AutoRespond::AllowAll (no human in its loop), so the parent's
                 // prompting gates wouldn't protect it. Hard-deny sensitive-path ops for every
                 // child (#1); additionally confine a `worker`'s WRITES to its declared scope.
-                for mw in subagent_child_middlewares(
+                let child_middlewares = subagent_child_middlewares_for_policy(
                     is_worker,
                     &scope,
                     &wd,
                     &inherited_worker_middlewares,
-                ) {
-                    builder = builder.middleware(mw);
-                }
-                let child = builder.build();
+                    credential_shell_policy,
+                );
+                let child = build_task_child(
+                    provider,
+                    tools.clone(),
+                    persona.clone(),
+                    wd.clone(),
+                    child_cancel.clone(),
+                    progress_hook.clone(),
+                    tool_loop_policy,
+                    max_rounds,
+                    child_middlewares.clone(),
+                );
                 // DETACH: inner spawn lets the child run independent of this future;
                 // cancel propagates only via the child_token.
                 //
@@ -806,14 +965,14 @@ parallel workers NON-OVERLAPPING scopes."
                 // below cannot fire from a panic. Defensive parity with parallel_edit.rs.
                 let handle = tokio::spawn(run_child_to_completion(
                     child,
-                    prompt,
+                    prompt.clone(),
                     AutoRespond::AllowAll,
-                    progress_hook,
+                    progress_hook.clone(),
                 ));
                 // There is deliberately no total wall-clock timeout here. Long-running
                 // research may make steady progress for many minutes; liveness is bounded by
                 // provider idle timeouts, the child round cap, and explicit parent/user cancel.
-                let outcome = match handle.await {
+                let mut outcome = match handle.await {
                     Ok(o) => o,
                     Err(join_err) => Outcome {
                         stop: StopReason::ProviderError,
@@ -821,6 +980,51 @@ parallel workers NON-OVERLAPPING scopes."
                         ..Default::default()
                     },
                 };
+                let mut final_model = model.clone();
+                if fallback_provider.is_some()
+                    && retryable_content_free_failure(&outcome)
+                    && !child_cancel.is_cancelled()
+                {
+                    let fallback = fallback_provider.expect("checked above");
+                    let fallback_model = fallback.model_name().to_string();
+                    // `MemberStarted` is attempt-scoped: publishing the retry
+                    // keeps typed Team projections aligned with the provider
+                    // that is actually running. Existing consumers already
+                    // update an existing member in place on repeated starts.
+                    if let Some(events) = &member_events {
+                        events.emit(crate::team::TeamEventPayload::MemberStarted {
+                            member_id: member_id.clone(),
+                            role: t.role,
+                            model: fallback_model.clone(),
+                            description: desc.clone(),
+                        });
+                    }
+                    progress_hook.publish(
+                        Some(format!(
+                            "{model} failed before producing output; retrying with {fallback_model}"
+                        )),
+                        true,
+                    );
+                    let fallback_child = build_task_child(
+                        fallback,
+                        tools,
+                        persona,
+                        wd,
+                        child_cancel,
+                        progress_hook.clone(),
+                        tool_loop_policy,
+                        max_rounds,
+                        child_middlewares,
+                    );
+                    outcome = run_child_to_completion(
+                        fallback_child,
+                        prompt,
+                        AutoRespond::AllowAll,
+                        progress_hook,
+                    )
+                    .await;
+                    final_model = fallback_model;
+                }
                 // Include the failure reason on the terminal ✗ line. Retained UIs
                 // commit terminal child events to scrollback while keeping only
                 // running children in the fixed panel.
@@ -829,7 +1033,7 @@ parallel workers NON-OVERLAPPING scopes."
                 } else {
                     format!("\u{2717} failed ({:?}) \u{b7} {label}", outcome.stop)
                 };
-                progress.emit(subtask_progress_line(&head, &model, &desc));
+                progress.emit(subtask_progress_line(&head, &final_model, &desc));
                 if let Some(events) = &member_events {
                     events.emit(crate::team::TeamEventPayload::MemberFinished {
                         member_id,
@@ -844,7 +1048,7 @@ parallel workers NON-OVERLAPPING scopes."
                         output_tokens: (outcome.text.chars().count() / 4) as u64,
                     });
                 }
-                (label, desc, model, outcome)
+                (label, desc, final_model, outcome)
             });
         }
 
@@ -868,55 +1072,7 @@ parallel workers NON-OVERLAPPING scopes."
                 failed,
             });
         }
-        // Sort by label for deterministic output regardless of scheduling order.
-        collected.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let n_total = collected.len();
-        let mut n_error = 0usize;
-        let mut blocks: Vec<String> = Vec::new();
-        for (label, desc, model, outcome) in collected {
-            let is_err = outcome.stop != StopReason::Stopped;
-            if is_err {
-                n_error += 1;
-            }
-            // Collect any output the child produced (assistant text, else tool results).
-            let produced = if !outcome.text.is_empty() {
-                outcome.text
-            } else {
-                outcome
-                    .tool_results
-                    .iter()
-                    .map(|r| r.content.clone())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            let (state, tag, body) = if is_err {
-                // Preserve partial output on a bounded/failed stop (MaxRounds,
-                // ProviderError, Cancelled, …) —
-                // a worker that did real work before hitting a limit is not a total loss (#2).
-                let mut b = format!("subagent stopped early ({:?})", outcome.stop);
-                if let Some(e) = &outcome.error {
-                    b.push_str(&format!(": {e}"));
-                }
-                if !produced.is_empty() {
-                    b.push_str(&format!("\n--- partial output ---\n{produced}"));
-                }
-                ("error", "task_error", b)
-            } else {
-                ("completed", "task_result", produced)
-            };
-            blocks.push(render_task_block(&label, &desc, &model, state, tag, &body));
-        }
-
-        ToolResult {
-            call_id: String::new(),
-            content: blocks.join("\n"),
-            // Fail the whole tool call only when EVERY subtask failed. A partial failure is
-            // conveyed per-block (<task_error>/<task_result>), so the parent can act on the
-            // survivors instead of re-dispatching — and double-applying — the whole batch (#5).
-            is_error: n_total > 0 && n_error == n_total,
-            images: vec![],
-        }
+        aggregate_task_result(collected)
     }
 }
 
@@ -950,7 +1106,13 @@ fn parse_task_args(args: &str) -> Result<Args, serde_json::Error> {
 }
 
 fn validate_task_specs(args: &Args) -> Result<Vec<crate::team::TeamTaskSpec>, String> {
-    args.tasks.iter().map(resolve_subtask_spec).collect()
+    let specs: Vec<_> = args
+        .tasks
+        .iter()
+        .map(resolve_subtask_spec)
+        .collect::<Result<_, _>>()?;
+    crate::team::validate_non_overlapping_worker_scopes(&specs)?;
+    Ok(specs)
 }
 
 fn resolve_subtask_spec(t: &SubTask) -> Result<crate::team::TeamTaskSpec, String> {
@@ -1321,6 +1483,57 @@ fn readable_progress_tail(text: &str) -> Option<String> {
     (!clean.is_empty()).then(|| first_line_capped(&clean, 88))
 }
 
+fn build_task_child(
+    provider: Arc<dyn LlmProvider>,
+    tools: MountedTools,
+    persona: String,
+    working_dir: PathBuf,
+    cancel: tokio_util::sync::CancellationToken,
+    progress: Arc<SubtaskProgressHook>,
+    tool_loop_policy: Option<ToolLoopPolicy>,
+    max_rounds: Option<u32>,
+    middlewares: Vec<Arc<dyn ToolMiddleware>>,
+) -> Agent {
+    let mut builder = Agent::builder()
+        .provider(provider)
+        .tools(tools)
+        .persona(persona)
+        .working_dir(working_dir)
+        .cancel_token(cancel)
+        .hook(progress);
+    if let Some(policy) = tool_loop_policy {
+        builder = builder.tool_loop_policy(policy);
+    }
+    if let Some(max_rounds) = max_rounds {
+        builder = builder.max_rounds(max_rounds);
+    }
+    for middleware in middlewares {
+        builder = builder.middleware(middleware);
+    }
+    builder.build()
+}
+
+/// A hard/explore retry is safe only before the child produced any semantic
+/// output or tool result. Restrict provider failures to structured transient
+/// HTTP classes; an unclassified error may be auth/config and must not silently
+/// switch models. A stream idle timeout is intrinsically transient.
+fn retryable_content_free_failure(outcome: &Outcome) -> bool {
+    if !outcome.text.is_empty() || !outcome.tool_results.is_empty() {
+        return false;
+    }
+    match outcome.stop {
+        StopReason::Timeout | StopReason::RateLimited => true,
+        StopReason::ProviderError => match outcome.provider_retryable {
+            // A provider's structured classification is authoritative. In
+            // particular, do not replay a terminal failure merely because a
+            // compatible endpoint attached a nominally transient status.
+            Some(retryable) => retryable,
+            None => matches!(outcome.http_status, Some(408 | 425 | 429) | Some(500..=599)),
+        },
+        _ => false,
+    }
+}
+
 /// One-shot child driver with the same aggregation/failure semantics as
 /// `Agent::run_to_completion`, plus truthful execution-boundary progress. Tool
 /// middleware `before` is a classification seam and may run for a whole batch
@@ -1360,10 +1573,15 @@ async fn run_child_to_completion(
                 message,
                 http_status,
                 code,
+                retryable,
             } => {
                 outcome.error = Some(message);
                 outcome.http_status = http_status;
                 outcome.error_code = code;
+                outcome.provider_retryable = retryable;
+            }
+            AgentEvent::PolicyIntervention { intervention } => {
+                outcome.policy_intervention = Some(intervention);
             }
             AgentEvent::TurnComplete { reason } => {
                 outcome.stop = reason;
@@ -1391,6 +1609,90 @@ fn subtask_progress_line(head: &str, model: &str, desc: &str) -> String {
     }
 }
 
+/// Fixed body shown for a child that hit a HARD policy terminal. Carries no
+/// child-derived data (transcript, rejected op, partial output), so nothing the
+/// blocked subagent produced can reach the parent model.
+const SANITIZED_POLICY_BLOCK_BODY: &str = "blocked by a hard security policy; the subagent's output was withheld. Choose a recovery option or take a different, policy-safe approach.";
+
+/// Assemble the per-subtask blocks into the tool result.
+///
+/// A hard policy terminal (`StopReason::PolicyDenied` — credential-shell AND
+/// sensitive-path both end here; the latter denies with a plain `deny_turn` and
+/// carries NO structured intervention) has its block replaced with a fixed
+/// sanitized notice so the child's transcript / rejected op / partial output
+/// never reaches the parent model, and prepends an internal marker so the kernel
+/// lifts the structured recovery contract. Only the blocked child's block is
+/// sanitized — successful siblings are preserved (not wiped).
+fn aggregate_task_result(mut collected: Vec<(String, String, String, Outcome)>) -> ToolResult {
+    // Sort by label for deterministic output regardless of scheduling order.
+    collected.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let n_total = collected.len();
+    let mut n_error = 0usize;
+    let mut any_policy_blocked = false;
+    let mut blocks: Vec<String> = Vec::new();
+    for (label, desc, model, outcome) in collected {
+        let is_err = outcome.stop != StopReason::Stopped;
+        if is_err {
+            n_error += 1;
+        }
+        if outcome.stop == StopReason::PolicyDenied {
+            any_policy_blocked = true;
+            blocks.push(render_task_block(
+                &label,
+                &desc,
+                &model,
+                "blocked",
+                "task_error",
+                SANITIZED_POLICY_BLOCK_BODY,
+            ));
+            continue;
+        }
+        // Collect any output the child produced (assistant text, else tool results).
+        let produced = if !outcome.text.is_empty() {
+            outcome.text
+        } else {
+            outcome
+                .tool_results
+                .iter()
+                .map(|r| r.content.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let (state, tag, body) = if is_err {
+            // Preserve partial output on a bounded/failed stop (MaxRounds,
+            // ProviderError, Cancelled, …) — a worker that did real work before
+            // hitting a limit is not a total loss (#2).
+            let mut b = format!("subagent stopped early ({:?})", outcome.stop);
+            if let Some(e) = &outcome.error {
+                b.push_str(&format!(": {e}"));
+            }
+            if !produced.is_empty() {
+                b.push_str(&format!("\n--- partial output ---\n{produced}"));
+            }
+            ("error", "task_error", b)
+        } else {
+            ("completed", "task_result", produced)
+        };
+        blocks.push(render_task_block(&label, &desc, &model, state, tag, &body));
+    }
+
+    let mut content = blocks.join("\n");
+    if any_policy_blocked {
+        content.insert_str(0, CHILD_POLICY_INTERVENTION_MARKER);
+    }
+
+    ToolResult {
+        call_id: String::new(),
+        content,
+        // Fail the whole tool call only when EVERY subtask failed. A partial failure is
+        // conveyed per-block (<task_error>/<task_result>), so the parent can act on the
+        // survivors instead of re-dispatching — and double-applying — the whole batch (#5).
+        is_error: n_total > 0 && n_error == n_total,
+        images: vec![],
+    }
+}
+
 /// Wrap a child-agent result in an opencode-style `<task>` block. `model` is the
 /// model the subagent actually ran on (surfaced so the user can see which tier/model
 /// executed — the strong/weak routing proof).
@@ -1410,9 +1712,12 @@ fn render_task_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atomcode_kernel::event::PolicyInterventionCode;
     use atomcode_kernel::message::Message;
+    use atomcode_kernel::middleware::BeforeOutcome;
     use atomcode_kernel::provider::ChatOptions;
     use atomcode_kernel::stream::{ProviderError, StreamEvent};
+    use atomcode_kernel::testkit::{EchoTool, ScriptedProvider};
     use atomcode_kernel::tool::{ProgressSink, ToolDef, ToolRegistry};
     use futures::stream::{self, BoxStream};
     use futures::StreamExt;
@@ -1476,9 +1781,144 @@ mod tests {
         )
     }
 
+    struct ChildPolicyGate;
+
+    #[async_trait]
+    impl ToolMiddleware for ChildPolicyGate {
+        async fn before(
+            &self,
+            _call: &mut ToolCall,
+            _tool: &Arc<dyn Tool>,
+            _ctx: &atomcode_kernel::request::RequestCtx,
+        ) -> BeforeOutcome {
+            BeforeOutcome::deny_turn_with_intervention(
+                super::super::credential_bash_gate::CREDENTIAL_BASH_DENIAL_REASON,
+                PolicyIntervention::credential_shell_blocked(),
+            )
+        }
+    }
+
     #[test]
     fn name_is_task() {
         assert_eq!(dummy().name(), "task");
+    }
+
+    #[test]
+    fn take_policy_intervention_strips_marker_and_preserves_siblings() {
+        // Sanitization happens at render time (the blocked child's block carries
+        // no transcript). take_policy_intervention only strips the internal signal
+        // marker and lifts the recovery contract — surviving siblings are kept.
+        let tool = dummy();
+        let mut result = ToolResult {
+            content: format!(
+                "{}<task id=\"a\">SIBLING FINDINGS</task>\n<task id=\"b\">blocked</task>",
+                CHILD_POLICY_INTERVENTION_MARKER
+            ),
+            ..Default::default()
+        };
+
+        let intervention = tool
+            .take_policy_intervention(&mut result)
+            .expect("child policy marker must be lifted");
+
+        assert_eq!(intervention.code, PolicyInterventionCode::CredentialShellBlocked);
+        assert!(result.is_error);
+        assert!(
+            !result.content.contains(CHILD_POLICY_INTERVENTION_MARKER),
+            "the internal marker must never be exposed"
+        );
+        assert!(
+            result.content.contains("SIBLING FINDINGS"),
+            "a successful sibling's output must survive a policy block"
+        );
+    }
+
+    #[test]
+    fn take_policy_intervention_ignores_unmarked_result() {
+        assert!(dummy()
+            .take_policy_intervention(&mut ToolResult {
+                content: "ordinary result".into(),
+                ..Default::default()
+            })
+            .is_none());
+    }
+
+    #[test]
+    fn aggregate_withholds_blocked_child_transcript_and_keeps_siblings() {
+        // A sensitive-path block ends PolicyDenied with NO structured intervention
+        // (plain deny_turn). It must STILL be detected (marker prepended so the
+        // kernel lifts it), its transcript withheld, while a successful sibling's
+        // output survives.
+        let blocked = Outcome {
+            stop: StopReason::PolicyDenied,
+            text: "SECRET id_rsa bytes the child tried to exfiltrate".into(),
+            ..Default::default()
+        };
+        let ok = Outcome {
+            stop: StopReason::Stopped,
+            text: "SIBLING FINDINGS".into(),
+            ..Default::default()
+        };
+        let result = aggregate_task_result(vec![
+            ("a-blocked".into(), "d".into(), "m".into(), blocked),
+            ("b-ok".into(), "d".into(), "m".into(), ok),
+        ]);
+
+        assert!(
+            result.content.starts_with(CHILD_POLICY_INTERVENTION_MARKER),
+            "a PolicyDenied child must be signalled even without a structured intervention"
+        );
+        assert!(
+            !result.content.contains("SECRET"),
+            "the blocked child's transcript must never reach the parent"
+        );
+        assert!(
+            result.content.contains("SIBLING FINDINGS"),
+            "the successful sibling's output must be preserved, not wiped"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_runner_preserves_structured_policy_intervention() {
+        let provider = Arc::new(ScriptedProvider::events(vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: "child-call".into(),
+                name: "echo".into(),
+                arguments: r#"{"text":"secret"}"#.into(),
+            }),
+            StreamEvent::Done { truncated: false },
+        ]));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        let cancel = CancellationToken::new();
+        let progress = Arc::new(SubtaskProgressHook::new(
+            ProgressSink::noop(),
+            "worker#1".into(),
+            false,
+            cancel.clone(),
+            None,
+            crate::team::TeamMemberId::new("worker#1"),
+        ));
+        let child = Agent::builder()
+            .provider(provider)
+            .tools(registry.mount(&["echo"]))
+            .cancel_token(cancel)
+            .middleware(Arc::new(ChildPolicyGate))
+            .build();
+
+        let outcome = run_child_to_completion(
+            child,
+            "go".into(),
+            AutoRespond::AllowAll,
+            progress,
+        )
+        .await;
+
+        assert_eq!(outcome.stop, StopReason::PolicyDenied);
+        assert_eq!(
+            outcome.policy_intervention.map(|value| value.code),
+            Some(PolicyInterventionCode::CredentialShellBlocked)
+        );
     }
 
     #[test]
@@ -1783,6 +2223,230 @@ mod tests {
             "missing state: {}",
             out.content
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_model_selection_overrides_the_difficulty_tier() {
+        let reg = Arc::new(ToolRegistry::new());
+        let r1 = reg.clone();
+        let r2 = reg.clone();
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        let captured = requested.clone();
+        let tool = TaskTool::new(
+            || Arc::new(MockProvider { reply: Some("FAST".into()) }) as Arc<dyn LlmProvider>,
+            || Arc::new(MockProvider { reply: Some("CAPABLE".into()) }) as Arc<dyn LlmProvider>,
+            move || r1.mount(&[]),
+            move || r2.mount(&[]),
+        )
+        .with_host_provider(|| {
+            Arc::new(MockProvider { reply: Some("HOST".into()) }) as Arc<dyn LlmProvider>
+        })
+        .with_named_provider(move |selection| {
+            captured.lock().unwrap().push(selection.to_string());
+            Ok(Some(Arc::new(MockProvider {
+                reply: Some("NAMED".into()),
+            }) as Arc<dyn LlmProvider>))
+        });
+
+        let out = tool
+            .execute(
+                r#"{"tasks":[{"description":"find","prompt":"where","subagent_type":"explore","difficulty":"hard","model":"custom/fast"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("NAMED"), "{}", out.content);
+        assert_eq!(*requested.lock().unwrap(), vec!["custom/fast"]);
+    }
+
+    #[tokio::test]
+    async fn invalid_explicit_model_rejects_the_batch_before_any_child_runs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingProvider(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl LlmProvider for CountingProvider {
+            fn model_name(&self) -> &str {
+                "counting"
+            }
+
+            async fn chat_stream(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolDef],
+                _options: &ChatOptions,
+            ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::pin(futures::stream::empty()))
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fast_calls = calls.clone();
+        let capable_calls = calls.clone();
+        let reg = Arc::new(ToolRegistry::new());
+        let r1 = reg.clone();
+        let r2 = reg.clone();
+        let tool = TaskTool::new(
+            move || Arc::new(CountingProvider(fast_calls.clone())) as Arc<dyn LlmProvider>,
+            move || Arc::new(CountingProvider(capable_calls.clone())) as Arc<dyn LlmProvider>,
+            move || r1.mount(&[]),
+            move || r2.mount(&[]),
+        )
+        .with_host_provider(|| {
+            Arc::new(MockProvider {
+                reply: Some("HOST".into()),
+            }) as Arc<dyn LlmProvider>
+        })
+        .with_named_provider(|selection| Err(format!("unknown model selection `{selection}`")));
+
+        let out = tool
+            .execute(
+                r#"{"tasks":[{"description":"normal","prompt":"run","subagent_type":"explore","difficulty":"simple"},{"description":"bad","prompt":"run","subagent_type":"explore","difficulty":"hard","model":"missing"}]}"#,
+                &ctx(),
+            )
+            .await;
+
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("invalid task model `missing`"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "model validation must finish before any sibling starts"
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_explore_transient_failure_retries_once_with_host_model() {
+        struct NamedProvider {
+            model: &'static str,
+            reply: Option<&'static str>,
+        }
+        #[async_trait::async_trait]
+        impl LlmProvider for NamedProvider {
+            fn model_name(&self) -> &str {
+                self.model
+            }
+
+            async fn chat_stream(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolDef],
+                _options: &ChatOptions,
+            ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+                if let Some(reply) = self.reply {
+                    return Ok(stream::iter(vec![
+                        StreamEvent::TextDelta(reply.to_string()),
+                        StreamEvent::Done { truncated: false },
+                    ])
+                    .boxed());
+                }
+                Err(ProviderError {
+                    retryable: true,
+                    http_status: Some(503),
+                    message: "capable model unavailable".into(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let reg = Arc::new(ToolRegistry::new());
+        let r1 = reg.clone();
+        let r2 = reg.clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured_events = events.clone();
+        let tool = TaskTool::new(
+            || {
+                Arc::new(NamedProvider {
+                    model: "fast",
+                    reply: Some("FAST"),
+                }) as Arc<dyn LlmProvider>
+            },
+            || {
+                Arc::new(NamedProvider {
+                    model: "shared-model",
+                    reply: None,
+                }) as Arc<dyn LlmProvider>
+            },
+            move || r1.mount(&[]),
+            move || r2.mount(&[]),
+        )
+        .with_host_provider(|| {
+            Arc::new(NamedProvider {
+                model: "shared-model",
+                reply: Some("HOST RECOVERED"),
+            }) as Arc<dyn LlmProvider>
+        })
+        .with_team_event_sink(Arc::new(move |event| {
+            captured_events.lock().unwrap().push(event);
+        }));
+
+        let out = tool
+            .execute(
+                r#"{"tasks":[{"description":"recover","prompt":"run","subagent_type":"explore","difficulty":"hard"}]}"#,
+                &ctx(),
+            )
+            .await;
+
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("HOST RECOVERED"), "{}", out.content);
+        assert!(
+            out.content.contains("model=\"shared-model\""),
+            "{}",
+            out.content
+        );
+        let started_models = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match &event.payload {
+                crate::team::TeamEventPayload::MemberStarted { model, .. } => Some(model.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            started_models,
+            vec!["shared-model".to_string(), "shared-model".to_string()],
+            "the typed Team projection must observe both provider attempts even when their raw model names match"
+        );
+    }
+
+    #[test]
+    fn fallback_requires_a_content_free_structured_transient_failure() {
+        assert!(retryable_content_free_failure(&Outcome {
+            stop: StopReason::Timeout,
+            ..Default::default()
+        }));
+        assert!(retryable_content_free_failure(&Outcome {
+            stop: StopReason::RateLimited,
+            ..Default::default()
+        }));
+        assert!(retryable_content_free_failure(&Outcome {
+            stop: StopReason::ProviderError,
+            http_status: Some(503),
+            ..Default::default()
+        }));
+        assert!(retryable_content_free_failure(&Outcome {
+            stop: StopReason::ProviderError,
+            provider_retryable: Some(true),
+            ..Default::default()
+        }));
+        assert!(!retryable_content_free_failure(&Outcome {
+            stop: StopReason::ProviderError,
+            provider_retryable: Some(false),
+            http_status: Some(503),
+            ..Default::default()
+        }));
+        assert!(!retryable_content_free_failure(&Outcome {
+            stop: StopReason::ProviderError,
+            http_status: Some(401),
+            ..Default::default()
+        }));
+        assert!(!retryable_content_free_failure(&Outcome {
+            stop: StopReason::Timeout,
+            text: "partial".into(),
+            ..Default::default()
+        }));
     }
 
     #[tokio::test]
@@ -2248,6 +2912,7 @@ mod tests {
             prompt: "p".into(),
             subagent_type: ty.into(),
             difficulty: String::new(),
+            model: None,
             role: None,
             scope: scope.into_iter().map(String::from).collect(),
         };
@@ -2259,6 +2924,19 @@ mod tests {
         ]};
         let specs = validate_task_specs(&args).unwrap();
         assert_eq!(workers_missing_scope(&specs), vec![3, 4]);
+    }
+
+    #[test]
+    fn synchronous_task_rejects_provably_overlapping_worker_scopes() {
+        let args = parse_task_args(
+            r#"{"tasks":[
+                {"description":"a","prompt":"p","subagent_type":"worker","scope":["tests/**"]},
+                {"description":"b","prompt":"p","subagent_type":"worker","scope":["tests/rate_limit.py"]}
+            ]}"#,
+        )
+        .unwrap();
+        let error = validate_task_specs(&args).unwrap_err();
+        assert!(error.contains("worker scopes overlap"), "{error}");
     }
 
     #[test]

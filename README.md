@@ -206,8 +206,8 @@ atomcode completion fish > ~/.config/fish/completions/atomcode.fish
 
 For PowerShell, run `atomcode completion powershell | Out-String |
 Invoke-Expression`. Run `atomcode completion --help` for the complete shell
-list. This affects command-line completion only and does not change the TUI's
-`Tab` mode switching.
+list. This affects command-line completion only; inside the TUI, `Tab` completes
+input and `Shift+Tab` cycles execution mode.
 
 ### Requirements
 
@@ -353,7 +353,8 @@ Then just type what you want:
 | `Esc` | Clear input / Cancel stream |
 | `Esc` ×2 | Undo the previous turn |
 | `Up/Down` | Browse input history |
-| `Tab / Shift+Tab` | Accept completion when a menu is open; otherwise cycle next / previous mode |
+| `Tab` | Accept slash-command, skill, or file completion |
+| `Shift+Tab` | Cycle to the next execution mode when no completion menu is open |
 | `F2 / Shift+F2` | Switch to next / previous model (usually `Fn+F2 / Fn+Shift+F2` on Mac) |
 | `Ctrl+R` | Reverse-search input history |
 | `Ctrl+T` | Cycle `reasoning_effort` |
@@ -462,7 +463,7 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 
 | Command | Action |
 |---------|--------|
-| `/init` | Generate `.atomcode.md` project instructions from the working directory |
+| `/init` | Create or improve the active project instruction file, following the current language and optional custom prompt |
 | `/config` | Show config path |
 | `/reload` | Reload `~/.atomcode/config.toml` from disk |
 | `/upgrade` | Upgrade atomcode to latest (subcommand: `rollback`) |
@@ -595,6 +596,8 @@ This is a Vue 3 + TypeScript project using Pinia for state management.
 ```
 
 AtomCode reads this file automatically and includes it in the system prompt. AtomCode also supports `AGENTS.md` (the [open standard](https://agents.md/) for AI coding agents) as an alternative — if both files exist, `.atomcode.md` takes priority.
+
+Run `/init` to analyze the repository and create or improve the active instruction file. Its output follows the current `/language`. To append organization-specific requirements, set **Custom /init prompt file** in `/config`, or add `init_prompt_file = "prompts/init.md"` to `$ATOMCODE_HOME/config.toml`; relative paths resolve from `$ATOMCODE_HOME`.
 
 ## Development
 

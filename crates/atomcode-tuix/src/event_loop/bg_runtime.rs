@@ -42,6 +42,7 @@ pub enum DriverEvent {
         result: Result<atomcode_coding::SessionChanged, atomcode_coding::RuntimeError>,
     },
     SessionResumePrepared {
+        operation_id: u64,
         project_bucket: String,
         session_id: String,
         working_dir: PathBuf,
@@ -64,6 +65,55 @@ pub enum DriverEvent {
         working_dir: PathBuf,
         result: Result<Vec<crate::session::SessionMeta>, String>,
     },
+    SessionPreviewLoaded {
+        selection: crate::session::SessionPreviewSelection,
+        result: Result<
+            Option<atomcode_daemon::legacy_convert::CatalogSessionPreview>,
+            atomcode_daemon::legacy_convert::CatalogSessionPreviewError,
+        >,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionPreviewRequest {
+    pub runtime_id: RuntimeId,
+    pub selection: crate::session::SessionPreviewSelection,
+}
+
+/// One sequential worker consumes only the latest watched selection. A move
+/// invalidates the old generation immediately; no second blocking read runs in
+/// parallel with the current one.
+pub fn spawn_session_preview_loader(
+    mut requests: tokio::sync::watch::Receiver<Option<SessionPreviewRequest>>,
+    event_tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+) {
+    tokio::spawn(async move {
+        while requests.changed().await.is_ok() {
+            let Some(request) = requests.borrow_and_update().clone() else {
+                continue;
+            };
+            let selection = request.selection.clone();
+            let project_bucket = selection.project_bucket.clone();
+            let session_id = selection.session_id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                atomcode_daemon::legacy_convert::preview_catalog_session_in_project(
+                    &project_bucket,
+                    &session_id,
+                )
+            })
+            .await
+            .unwrap_or(Err(
+                atomcode_daemon::legacy_convert::CatalogSessionPreviewError::Unavailable,
+            ));
+            let _ = event_tx.send(RuntimeEvent {
+                runtime_id: request.runtime_id,
+                event: RuntimeEventPayload::Driver(DriverEvent::SessionPreviewLoaded {
+                    selection,
+                    result,
+                }),
+            });
+        }
+    });
 }
 
 pub fn spawn_event_forwarder(
@@ -117,6 +167,9 @@ pub struct ForegroundRuntime {
     /// Runtime-owned project directory. `Session::working_dir` is persisted
     /// display metadata and can be stale after legacy migrations.
     pub working_dir: PathBuf,
+    /// Context window owned by this runtime's active model. This projection
+    /// travels with the endpoint across foreground/background swaps.
+    pub context_window: usize,
 }
 
 pub struct BackgroundSlot {
@@ -125,6 +178,8 @@ pub struct BackgroundSlot {
     pub session: Session,
     /// Physical project bucket owned by this runtime.
     pub working_dir: PathBuf,
+    /// Context window owned by this slot's runtime/model.
+    pub context_window: usize,
     pub state: RuntimeState,
     pub created_at: u64,
     pub summary: String,
@@ -149,6 +204,7 @@ impl BackgroundSlot {
             endpoint: self.endpoint,
             session: self.session,
             working_dir: self.working_dir,
+            context_window: self.context_window,
         }
     }
 }
@@ -332,6 +388,7 @@ impl BackgroundSlots {
             endpoint: None,
             summary: session.name.clone(),
             working_dir: session.working_dir.clone(),
+            context_window: 0,
             session,
             state,
             created_at: 0,
@@ -345,6 +402,7 @@ impl BackgroundSlots {
 pub struct ResumeOutcome {
     pub resumed_session: Session,
     pub resumed_working_dir: PathBuf,
+    pub resumed_context_window: usize,
     pub resumed_runtime_id: RuntimeId,
     pub resumed_endpoint: RuntimeEndpoint,
     pub resumed_state: RuntimeState,
@@ -428,6 +486,7 @@ impl BgRuntimeManager {
                 endpoint: Some(endpoint),
                 session,
                 working_dir,
+                context_window: 0,
             },
             backgrounds: BackgroundSlots::new(MAX_BACKGROUND_SLOTS),
             next_runtime_id: runtime_id.0,
@@ -458,12 +517,14 @@ impl BgRuntimeManager {
         endpoint: RuntimeEndpoint,
         session: Session,
         working_dir: PathBuf,
+        context_window: usize,
     ) {
         self.foreground = ForegroundRuntime {
             runtime_id,
             endpoint: Some(endpoint),
             session,
             working_dir,
+            context_window,
         };
     }
 
@@ -499,6 +560,7 @@ impl BgRuntimeManager {
                 max: self.backgrounds.max_slots,
             });
         }
+        let replacement_context_window = self.foreground.context_window;
         let old = std::mem::replace(
             &mut self.foreground,
             ForegroundRuntime {
@@ -506,6 +568,7 @@ impl BgRuntimeManager {
                 endpoint: Some(new_endpoint),
                 session: new_session,
                 working_dir: new_working_dir,
+                context_window: replacement_context_window,
             },
         );
         let summary = session_summary(&old.session);
@@ -514,6 +577,7 @@ impl BgRuntimeManager {
             endpoint: old.endpoint,
             session: old.session,
             working_dir: old.working_dir,
+            context_window: old.context_window,
             state: current_state,
             created_at: current_timestamp(),
             summary,
@@ -529,6 +593,7 @@ impl BgRuntimeManager {
         endpoint: RuntimeEndpoint,
         session: Session,
         working_dir: PathBuf,
+        context_window: usize,
         state: RuntimeState,
     ) -> Result<usize, BgError> {
         let summary = session_summary(&session);
@@ -537,6 +602,7 @@ impl BgRuntimeManager {
             endpoint: Some(endpoint),
             session,
             working_dir,
+            context_window,
             state,
             created_at: current_timestamp(),
             summary,
@@ -600,6 +666,7 @@ impl BgRuntimeManager {
                 endpoint: old_foreground.endpoint,
                 session: old_foreground.session,
                 working_dir: old_foreground.working_dir,
+                context_window: old_foreground.context_window,
                 state: current_state,
                 created_at: current_timestamp(),
                 summary,
@@ -615,6 +682,7 @@ impl BgRuntimeManager {
         Ok(ResumeOutcome {
             resumed_session: self.foreground.session.clone(),
             resumed_working_dir: self.foreground.working_dir.clone(),
+            resumed_context_window: self.foreground.context_window,
             resumed_runtime_id: self.foreground.runtime_id,
             resumed_endpoint,
             resumed_state,
@@ -858,6 +926,7 @@ impl BgRuntimeManager {
                                         message: error.message,
                                         http_status: None,
                                         code: None,
+                                        retryable: None,
                                     },
                                 ),
                             ));
@@ -931,6 +1000,7 @@ impl BgRuntimeManager {
                 endpoint: Some(test_endpoint()),
                 session,
                 working_dir,
+                context_window: 0,
             },
             backgrounds: BackgroundSlots::new(MAX_BACKGROUND_SLOTS),
             next_runtime_id: 1,
@@ -966,6 +1036,7 @@ impl BgRuntimeManager {
             endpoint: Some(test_endpoint()),
             session,
             working_dir,
+            context_window: 0,
             state,
             created_at: 0,
             summary,
@@ -1116,6 +1187,45 @@ mod tests {
         s
     }
 
+    #[tokio::test]
+    async fn preview_worker_coalesces_pending_moves_to_the_latest_generation() {
+        let (request_tx, request_rx) = tokio::sync::watch::channel(None);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let request = |generation| SessionPreviewRequest {
+            runtime_id: RuntimeId::new(1),
+            selection: crate::session::SessionPreviewSelection {
+                project_bucket: "invalid-bucket".into(),
+                session_id: "session".into(),
+                generation,
+            },
+        };
+        request_tx.send_replace(Some(request(1)));
+        request_tx.send_replace(Some(request(2)));
+        spawn_session_preview_loader(request_rx, event_tx);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("latest preview terminal")
+            .expect("worker event");
+        let RuntimeEventPayload::Driver(DriverEvent::SessionPreviewLoaded { selection, result }) =
+            event.event
+        else {
+            panic!("unexpected preview worker event");
+        };
+        assert_eq!(selection.generation, 2);
+        assert_eq!(
+            result.unwrap_err(),
+            atomcode_daemon::legacy_convert::CatalogSessionPreviewError::InvalidLocation,
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), event_rx.recv())
+                .await
+                .is_err(),
+            "coalesced generation 1 must not produce a terminal",
+        );
+        drop(request_tx);
+    }
+
     #[test]
     fn slot_limit_rejects_seventeenth_slot() {
         let mut slots = BackgroundSlots::new(16);
@@ -1197,6 +1307,28 @@ mod tests {
         assert_eq!(manager.backgrounds().len(), 1);
         assert_eq!(manager.backgrounds().list_rows()[0].summary, "active task");
         assert_eq!(manager.foreground_session().name, "default");
+    }
+
+    #[test]
+    fn resume_returns_the_selected_runtime_context_window() {
+        let mut manager = BgRuntimeManager::new_for_test(Session::default_session(PathBuf::from(
+            "/tmp/project",
+        )));
+        manager.foreground.context_window = 1_000_000;
+        manager.foreground_session_mut().messages =
+            vec![atomcode_kernel::message::Message::user("old model")];
+        let slot = manager.background_current_for_test().unwrap();
+
+        // The replacement foreground can move to a different model while the
+        // original runtime remains in the background.
+        manager.foreground.context_window = 200_000;
+        manager.foreground_session_mut().messages =
+            vec![atomcode_kernel::message::Message::user("new model")];
+        let resumed = manager.resume_slot(slot, RuntimeState::Idle).unwrap();
+
+        assert_eq!(resumed.resumed_context_window, 1_000_000);
+        assert_eq!(manager.foreground.context_window, 1_000_000);
+        assert_eq!(manager.backgrounds.slots[0].context_window, 200_000);
     }
 
     #[test]
@@ -1599,6 +1731,7 @@ mod tests {
                     message: "provider could not start".into(),
                     http_status: None,
                     code: None,
+                    retryable: None,
                 },
             )),
         );

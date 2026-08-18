@@ -37,7 +37,7 @@ enum OpenStrategy {
     MacOpen,
     /// `xdg-open <path>` — freedesktop default opener.
     XdgOpen,
-    /// `cmd /c start "" <path>` — Windows (the empty `""` is the required window title).
+    /// `explorer.exe <path>` — Windows ShellExecute without a command interpreter.
     WindowsStart,
     /// `wslview <path>` — wslu's WSL→Windows bridge.
     Wslview,
@@ -125,7 +125,7 @@ fn strategy_command_name(s: &OpenStrategy) -> &'static str {
     match s {
         OpenStrategy::MacOpen => "open",
         OpenStrategy::XdgOpen => "xdg-open",
-        OpenStrategy::WindowsStart => "cmd /c start",
+        OpenStrategy::WindowsStart => "explorer.exe",
         OpenStrategy::Wslview => "wslview",
         OpenStrategy::Headless(_) => "(headless)",
     }
@@ -179,68 +179,81 @@ impl Tool for OpenFileTool {
         }
 
         let target = resolve_path(fp, &ctx.working_dir);
-        // Strip the Windows `\\?\` verbatim prefix: `cmd /c start` / Explorer don't
+        // Strip the Windows `\\?\` verbatim prefix: Explorer doesn't
         // accept extended-length paths, and it would leak into the messages below.
         let target = crate::pathnorm::canonicalize(&target).unwrap_or(target);
-        if !target.exists() {
-            return err(format!(
-                "open_file: file not found: {}",
+        match open_local_path(&target).await {
+            Ok(message) => ok(message),
+            Err(message) => err(message),
+        }
+    }
+}
+
+/// Open an already-resolved local path with the same cross-platform behavior as
+/// [`OpenFileTool`]. Driver-local UI actions may call this only after applying
+/// their own workspace boundary policy.
+pub async fn open_local_path(target: &Path) -> Result<String, String> {
+    if !target.exists() {
+        return Err(format!(
+            "open_file: file not found: {}",
+            crate::pathnorm::to_display(target)
+        ));
+    }
+
+    let strategy = pick_open_strategy();
+    let target_str = target.to_string_lossy().to_string();
+    let mut cmd = match &strategy {
+        OpenStrategy::MacOpen => {
+            let mut c = Command::new("open");
+            c.arg(&target_str);
+            c
+        }
+        OpenStrategy::XdgOpen => {
+            let mut c = Command::new("xdg-open");
+            c.arg(&target_str);
+            c
+        }
+        OpenStrategy::WindowsStart => {
+            // Do not route a workspace-controlled filename through cmd.exe:
+            // `&`, `|`, `%` and `^` would be interpreted as shell syntax.
+            // Explorer delegates files to their registered default application.
+            let mut c = Command::new("explorer.exe");
+            c.arg(&target_str);
+            c
+        }
+        OpenStrategy::Wslview => {
+            let mut c = Command::new("wslview");
+            c.arg(&target_str);
+            c
+        }
+        OpenStrategy::Headless(reason) => {
+            return Err(format!(
+                "open_file: cannot open in GUI: {reason}.\n\nFile path for manual viewing:\n  {}",
                 crate::pathnorm::to_display(&target)
             ));
         }
+    };
 
-        let strategy = pick_open_strategy();
-        let target_str = target.to_string_lossy().to_string();
-        let mut cmd = match &strategy {
-            OpenStrategy::MacOpen => {
-                let mut c = Command::new("open");
-                c.arg(&target_str);
-                c
-            }
-            OpenStrategy::XdgOpen => {
-                let mut c = Command::new("xdg-open");
-                c.arg(&target_str);
-                c
-            }
-            OpenStrategy::WindowsStart => {
-                let mut c = Command::new("cmd");
-                c.args(["/c", "start", "", &target_str]);
-                c
-            }
-            OpenStrategy::Wslview => {
-                let mut c = Command::new("wslview");
-                c.arg(&target_str);
-                c
-            }
-            OpenStrategy::Headless(reason) => {
-                return err(format!(
-                    "open_file: cannot open in GUI: {reason}.\n\nFile path for manual viewing:\n  {}",
-                    crate::pathnorm::to_display(&target)
-                ));
-            }
-        };
-
-        // Detached spawn: the opener hands off to the real GUI app and exits immediately,
-        // so we don't block on the app's lifetime. Stdio null'd so a chatty launcher can't
-        // spew into the terminal.
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        // Suppress the launcher's own console-window flash (e.g. `cmd /c start`) when
-        // spawned from a console-less daemon; the GUI app it hands off to is unaffected.
-        crate::process_utils::suppress_console_window_sync(&mut cmd);
-        match cmd.spawn() {
-            Ok(_child) => ok(format!(
-                "Opened {} via `{}`.",
-                crate::pathnorm::to_display(&target),
-                strategy_command_name(&strategy)
-            )),
-            Err(e) => err(format!(
-                "open_file: failed to launch `{}`: {e}.\n\nFile path for manual viewing:\n  {}",
-                strategy_command_name(&strategy),
-                crate::pathnorm::to_display(&target)
-            )),
-        }
+    // Detached spawn: the opener hands off to the real GUI app and exits immediately,
+    // so we don't block on the app's lifetime. Stdio null'd so a chatty launcher can't
+    // spew into the terminal.
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // Suppress the launcher's own console-window flash (e.g. `explorer.exe`) when
+    // spawned from a console-less daemon; the GUI app it hands off to is unaffected.
+    crate::process_utils::suppress_console_window_sync(&mut cmd);
+    match cmd.spawn() {
+        Ok(_child) => Ok(format!(
+            "Opened {} via `{}`.",
+            crate::pathnorm::to_display(&target),
+            strategy_command_name(&strategy)
+        )),
+        Err(e) => Err(format!(
+            "open_file: failed to launch `{}`: {e}.\n\nFile path for manual viewing:\n  {}",
+            strategy_command_name(&strategy),
+            crate::pathnorm::to_display(&target)
+        )),
     }
 }
 

@@ -1,6 +1,7 @@
 // crates/atomcode-tuix/src/render/mod.rs
 pub mod cell;
 pub(crate) mod diff;
+pub mod interaction;
 pub mod mascot;
 pub mod plain;
 pub mod qr;
@@ -393,6 +394,19 @@ pub trait Renderer: Send {
     /// treat this as a flush.
     fn flush_deferred(&mut self);
 
+    /// Force the currently retained projection to be emitted again even when
+    /// its logical state has not changed. Terminal hosts may discard or defer
+    /// visible updates while their window is unfocused; a normal diff would
+    /// then produce no bytes after focus returns because the renderer's cache
+    /// still matches the authoritative UI state.
+    ///
+    /// Default to the ordinary deferred flush for renderers without a retained
+    /// screen cache. The retained backend invalidates its physical projection
+    /// and performs an immediate full-frame repaint.
+    fn force_repaint(&mut self) {
+        self.flush_deferred();
+    }
+
     /// Returns (and clears) whether a body overflow scrolled the whole
     /// viewport — footer included — up one row since the last call. The
     /// render worker calls this after each command and, when true, repaints
@@ -497,9 +511,7 @@ impl MenuKind {
             // Leave one row for the surrounding footer rule/status chrome so
             // the complete `/cd` surface, not just its menu payload, stays at
             // roughly half of the terminal.
-            MenuKind::DirectoryList => {
-                item_count.min((screen_height / 2).saturating_sub(1).max(1))
-            }
+            MenuKind::DirectoryList => item_count.min((screen_height / 2).saturating_sub(1).max(1)),
             MenuKind::Plugin | MenuKind::SessionList => {
                 let plugin_count = item_count.saturating_sub(3);
                 let max_plugins = (screen_height / 4).max(2);
@@ -696,6 +708,8 @@ pub struct ApprovalPanelView {
     pub detail: String,
     pub options: Vec<String>,
     pub selected: usize,
+    /// Optional advisory line rendered under the header (e.g. a credential warning).
+    pub note: Option<String>,
 }
 
 /// Renderer-facing snapshot of the `request_user_input` panel (mirrors
@@ -721,8 +735,10 @@ pub struct UserInputPanelView {
     pub checked: Vec<bool>,
     /// Standalone text-mode input buffer.
     pub text: String,
+    pub text_cursor_byte: usize,
     /// "Other" free-text row buffer for single/multiple mode.
     pub custom_text: String,
+    pub custom_text_cursor_byte: usize,
     /// Whether to render the "Other" free-text row (mirrors `UserInputPanel.custom`).
     pub custom: bool,
     /// Signed PageUp/PageDown displacement from the automatically selected
@@ -788,7 +804,9 @@ pub fn round_cap_view(cap: u32, base: u32, cursor: usize, stats: &str) -> UserIn
         cursor,
         checked: vec![],
         text: String::new(),
+        text_cursor_byte: 0,
         custom_text: String::new(),
+        custom_text_cursor_byte: 0,
         custom: false,
         scroll_offset: 0,
         batch: None,

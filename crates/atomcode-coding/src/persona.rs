@@ -630,6 +630,7 @@ Use the code-intelligence tools (list_symbols / read_symbol / find_references / 
 Read the error output carefully. Identify the root cause. Fix it.
 Do NOT retry the same command hoping for a different result.
 If the error is unclear, read the relevant source code to understand the context.
+A command's exit status is reported to you in-band: a non-zero `[exit code N]` marker means the command itself failed — read the output and fix the root cause before moving on. A run that was interrupted, timed out, or cancelled comes back with its own message instead (for example `bash: timed out after Ns` or `bash: cancelled before completion.`) — that is not a defect in the command, so do not \"fix\" the command for an interruption.
 
 ## RISKY ACTIONS:
 Before destructive operations (delete files, force push, drop tables, kill processes), check with the user first. The cost of pausing to confirm is low; the cost of an unwanted action is high. In particular, NEVER run git commands that DISCARD uncommitted work — `git checkout <file>` / `git checkout .` / `git checkout -- …`, `git restore <file>`, `git reset --hard`, `git clean -f` — unless the user explicitly asked for that exact operation; those changes are unrecoverable and are not yours to throw away.
@@ -801,6 +802,33 @@ mod tests {
         assert_eq!(
             date_anchor_line("2099-01-02 (Friday)"),
             "\n\n## ENVIRONMENT:\nToday's date: 2099-01-02 (Friday)"
+        );
+    }
+
+    #[test]
+    fn commands_fail_block_distinguishes_interruption_from_command_failure() {
+        // The `bash` tool reports a genuine non-zero exit as an `[exit code N]` marker
+        // (bash.rs:1275), but an interruption/timeout/cancel returns EARLY with its own
+        // prose message ("bash: timed out after Ns" / "bash: cancelled before completion.")
+        // — NEVER a bare exit code (bash.rs:247/258). The persona said nothing, so a weak
+        // model conflated the two. The guidance must name the marker as the FAILURE signal
+        // and the prose messages as the INTERRUPTION signal — crucially it must NOT tell the
+        // model that a bare `[exit code 1]` is an interruption (1 is the most common REAL
+        // failure code), which an earlier draft wrongly imported from another harness.
+        let p = coding_persona("m", false, false);
+        assert!(
+            p.contains("[exit code N]"),
+            "persona must name the exit-code marker the bash tool emits: {p}"
+        );
+        assert!(
+            p.contains("interrupted, timed out, or cancelled"),
+            "persona must route interruption/timeout/cancel to their own message, not exit code: {p}"
+        );
+        // Guard against re-importing the false claim: exit code 1 must NOT be branded a
+        // termination-to-ignore anywhere in the persona.
+        assert!(
+            !p.contains("[exit code 1]"),
+            "persona must NOT teach that a bare exit 1 is an interruption (1 is a real failure): {p}"
         );
     }
 

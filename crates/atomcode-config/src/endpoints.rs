@@ -166,12 +166,41 @@ pub fn codingplan_api_base() -> &'static str {
 /// `models-v2` payload may override this per model.
 pub fn codingplan_llm_base_url() -> &'static str {
     static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| {
-        resolve(
-            CODINGPLAN_LLM_BASE_URL_ENV,
-            HOSTED_CODINGPLAN_LLM_BASE_URL,
-        )
-    })
+    URL.get_or_init(|| resolve(CODINGPLAN_LLM_BASE_URL_ENV, HOSTED_CODINGPLAN_LLM_BASE_URL))
+}
+
+/// Whether `base_url` is one of the authenticated CodingPlan LLM gateways.
+///
+/// Keep this classification in the leaf config crate so config projection,
+/// TUI management and the auth signer cannot disagree about which accounts are
+/// product-managed. Only HTTPS is accepted because these hosts carry OAuth
+/// credentials and request signatures.
+pub fn is_codingplan_llm_gateway(base_url: &str) -> bool {
+    let Ok(url) = url::Url::parse(base_url) else {
+        return false;
+    };
+    if url.scheme() != "https" {
+        return false;
+    }
+    if matches!(
+        url.host_str(),
+        Some("llm-api.atomgit.com")
+            | Some("pre-llm-api-cce.atomgit.com")
+            | Some("api-ai.gitcode.com")
+    ) {
+        return true;
+    }
+
+    // A distribution may retarget the official gateway through the endpoint
+    // override. Match its HTTPS origin too, without widening trust to sibling
+    // hosts or a plaintext variant.
+    url::Url::parse(codingplan_llm_base_url())
+        .ok()
+        .filter(|configured| configured.scheme() == "https")
+        .is_some_and(|configured| {
+            url.host_str() == configured.host_str()
+                && url.port_or_known_default() == configured.port_or_known_default()
+        })
 }
 
 /// Version manifest (`latest.json`) for self-update.
@@ -352,9 +381,31 @@ mod tests {
     }
 
     #[test]
+    fn codingplan_gateway_matching_is_https_host_based() {
+        for url in [
+            "https://llm-api.atomgit.com/v1",
+            "https://pre-llm-api-cce.atomgit.com/v1/chat/completions",
+            "https://api-ai.gitcode.com/v1",
+        ] {
+            assert!(is_codingplan_llm_gateway(url), "expected gateway: {url}");
+        }
+        for url in [
+            "http://llm-api.atomgit.com/v1",
+            "https://llm-api.atomgit.com.evil.example/v1",
+            "https://api.openai.com/v1",
+            "not a url",
+        ] {
+            assert!(!is_codingplan_llm_gateway(url), "expected external: {url}");
+        }
+    }
+
+    #[test]
     fn an_override_is_taken_whole_not_derived() {
         // A deployment need not mirror the hosted subdomain layout.
-        std::env::set_var("ATOMCODE_TEST_EP_WHOLE", "https://sso.corp.example:8443/auth");
+        std::env::set_var(
+            "ATOMCODE_TEST_EP_WHOLE",
+            "https://sso.corp.example:8443/auth",
+        );
         assert_eq!(
             resolve("ATOMCODE_TEST_EP_WHOLE", "https://hosted.test"),
             "https://sso.corp.example:8443/auth"
@@ -430,7 +481,10 @@ mod tests {
             normalize_codingplan_prefix("  Longyuan  ").as_deref(),
             Some("Longyuan")
         );
-        assert_eq!(normalize_codingplan_prefix("ly_gw-1").as_deref(), Some("ly_gw-1"));
+        assert_eq!(
+            normalize_codingplan_prefix("ly_gw-1").as_deref(),
+            Some("ly_gw-1")
+        );
     }
 
     #[test]
@@ -482,7 +536,9 @@ mod tests {
         assert!(!is_managed_https_url(&format!("http://{domain}")));
         // Lookalikes on either side of the host are rejected.
         assert!(!is_managed_https_url(&format!("https://evil{domain}")));
-        assert!(!is_managed_https_url(&format!("https://{domain}.attacker.test")));
+        assert!(!is_managed_https_url(&format!(
+            "https://{domain}.attacker.test"
+        )));
     }
 
     #[test]

@@ -18,6 +18,61 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use crate::event_loop::{Buffer, LoopCtx};
 use crate::render::Renderer;
 use crate::state::UiState;
+use unicode_segmentation::UnicodeSegmentation;
+
+/// Move a byte cursor to the previous user-perceived character boundary.
+pub(crate) fn previous_grapheme_boundary(text: &str, cursor: usize) -> usize {
+    let mut cursor = cursor.min(text.len());
+    while !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    text[..cursor]
+        .grapheme_indices(true)
+        .next_back()
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+/// Move a byte cursor to the next user-perceived character boundary.
+pub(crate) fn next_grapheme_boundary(text: &str, cursor: usize) -> usize {
+    let mut cursor = cursor.min(text.len());
+    while !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    text[cursor..]
+        .grapheme_indices(true)
+        .nth(1)
+        .map(|(index, _)| cursor + index)
+        .unwrap_or(text.len())
+}
+
+pub(crate) fn insert_at_cursor(text: &mut String, cursor: &mut usize, inserted: &str) {
+    *cursor = (*cursor).min(text.len());
+    if !text.is_char_boundary(*cursor) {
+        *cursor = previous_grapheme_boundary(text, *cursor);
+    }
+    text.insert_str(*cursor, inserted);
+    *cursor += inserted.len();
+}
+
+pub(crate) fn backspace_at_cursor(text: &mut String, cursor: &mut usize) {
+    let mut end = (*cursor).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let start = previous_grapheme_boundary(text, end);
+    text.replace_range(start..end, "");
+    *cursor = start;
+}
+
+pub(crate) fn delete_at_cursor(text: &mut String, cursor: &mut usize) {
+    *cursor = (*cursor).min(text.len());
+    while !text.is_char_boundary(*cursor) {
+        *cursor -= 1;
+    }
+    let end = next_grapheme_boundary(text, *cursor);
+    text.replace_range(*cursor..end, "");
+}
 
 pub mod config_panel;
 pub mod diff_viewer;
@@ -108,6 +163,13 @@ pub enum ModalAction {
     Close,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalPointerAction {
+    Select(usize),
+    Confirm(usize),
+    Cancel,
+}
+
 /// A modal overlay: takes over key handling until it returns
 /// `ModalAction::Close`. The implementation owns its own state (the
 /// selected index, the wizard step, the filter query, etc.) and is
@@ -115,6 +177,12 @@ pub enum ModalAction {
 /// — the event loop only calls `draw` once at open time and once more
 /// after `Close` to restore the idle prompt.
 pub trait Modal: Send {
+    /// True only for the existing `/resume` picker, whose selected-card
+    /// preview can be completed by a runtime event while the modal is open.
+    fn accepts_session_preview(&self) -> bool {
+        false
+    }
+
     /// Process one keystroke. Must either fully handle it (including
     /// any re-paint the modal wants) or report that the modal is now
     /// done so the caller can tear it down.
@@ -132,6 +200,17 @@ pub trait Modal: Send {
     /// when the modal is installed into `active_modal`; `handle_key`
     /// is expected to handle subsequent repaints after each key.
     fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer);
+
+    fn handle_pointer(
+        &mut self,
+        _action: ModalPointerAction,
+        _buf: &mut Buffer,
+        _state: &mut UiState,
+        _ctx: &mut LoopCtx,
+        _renderer: &mut dyn Renderer,
+    ) -> Result<ModalAction> {
+        Ok(ModalAction::Continue)
+    }
 
     /// Handle a bracketed-paste payload while the modal is active.
     /// Default: append the text to `buf` (so text-input wizard steps
@@ -178,5 +257,35 @@ pub trait Modal: Send {
     /// to clean up the modal asynchronously.
     fn close_requested(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod text_edit_tests {
+    use super::*;
+
+    #[test]
+    fn shared_editor_inserts_and_deletes_in_the_middle() {
+        let mut text = "前后".to_string();
+        let mut cursor = "前".len();
+        insert_at_cursor(&mut text, &mut cursor, "中");
+        assert_eq!(text, "前中后");
+        assert_eq!(cursor, "前中".len());
+
+        backspace_at_cursor(&mut text, &mut cursor);
+        assert_eq!(text, "前后");
+        assert_eq!(cursor, "前".len());
+
+        delete_at_cursor(&mut text, &mut cursor);
+        assert_eq!(text, "前");
+    }
+
+    #[test]
+    fn shared_editor_moves_by_grapheme_cluster() {
+        let text = "a👩‍💻你";
+        let emoji_end = "a👩‍💻".len();
+        assert_eq!(previous_grapheme_boundary(text, emoji_end), 1);
+        assert_eq!(next_grapheme_boundary(text, 1), emoji_end);
+        assert_eq!(next_grapheme_boundary(text, emoji_end), text.len());
     }
 }

@@ -22,6 +22,7 @@ use serde::{de::IgnoredAny, Deserialize, Serialize};
 use super::presentation::{
     DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole, MAX_PRESENTATION_BYTES,
 };
+use super::transcript::{TurnTimestamp, RECORD_VERSION};
 
 /// Fast-listing metadata for ONE session — read to populate a `/resume` picker WITHOUT
 /// parsing the (large) snapshot / transcript files. Persisted as `<id>.meta`.
@@ -748,8 +749,7 @@ impl DetachedUsageRecorder {
 
 fn merge_model_usage(records: &mut Vec<ModelUsageStat>, usage: ModelUsageStat) {
     if let Some(existing) = records.iter_mut().find(|existing| {
-        existing.provider_id == usage.provider_id
-            && existing.model_id == usage.model_id
+        existing.provider_id == usage.provider_id && existing.model_id == usage.model_id
     }) {
         existing.tokens.add_assign(usage.tokens);
     } else {
@@ -759,8 +759,7 @@ fn merge_model_usage(records: &mut Vec<ModelUsageStat>, usage: ModelUsageStat) {
 
 fn subtract_model_usage(records: &mut Vec<ModelUsageStat>, usage: &ModelUsageStat) {
     if let Some(existing) = records.iter_mut().find(|existing| {
-        existing.provider_id == usage.provider_id
-            && existing.model_id == usage.model_id
+        existing.provider_id == usage.provider_id && existing.model_id == usage.model_id
     }) {
         existing.tokens.sub_assign(usage.tokens);
     }
@@ -809,15 +808,11 @@ pub fn aggregate_session_cost(meta: &SessionMeta) -> SessionCostReport {
 
     let models: Vec<_> = grouped
         .into_iter()
-        .map(
-            |((provider_id, model_id), tokens)| {
-                ModelCostSummary {
-                    provider_id,
-                    model_id,
-                    tokens,
-                }
-            },
-        )
+        .map(|((provider_id, model_id), tokens)| ModelCostSummary {
+            provider_id,
+            model_id,
+            tokens,
+        })
         .collect();
     let attributed_total = models.iter().fold(0_u64, |total, model| {
         total.saturating_add(model.tokens.total())
@@ -1309,7 +1304,7 @@ impl SessionManager {
         fs::create_dir_all(&self.root).map_err(|error| io_at(&self.root, error))?;
         let path = self.lease_path(id)?;
         reject_existing_non_regular(&path)?;
-        let file = open_lock_file(&path)?;
+        let file = open_session_lock_file(id, &path)?;
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => Ok(SessionLease {
                 inner: Arc::new(SessionLeaseInner {
@@ -1318,12 +1313,10 @@ impl SessionManager {
                     file,
                 }),
             }),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                Err(SessionStoreError::SessionInUse {
-                    id: id.to_string(),
-                    path,
-                })
-            }
+            Err(error) if is_file_lock_contention(&error) => Err(SessionStoreError::SessionInUse {
+                id: id.to_string(),
+                path,
+            }),
             Err(error) => Err(io_at(&path, error)),
         }
     }
@@ -1443,8 +1436,17 @@ impl SessionManager {
         fs::create_dir_all(&self.root).map_err(|e| io_at(&self.root, e))?;
         let lock_path = self.meta_lock_path(id)?;
         reject_existing_non_regular(&lock_path)?;
-        let lock = open_lock_file(&lock_path)?;
-        fs2::FileExt::lock_exclusive(&lock).map_err(|e| io_at(&lock_path, e))?;
+        let lock = open_session_lock_file(id, &lock_path)?;
+        acquire_file_lock_until(&lock, META_LOCK_WAIT_TIMEOUT).map_err(|error| {
+            if is_file_lock_contention(&error) {
+                SessionStoreError::SessionInUse {
+                    id: id.to_string(),
+                    path: lock_path.clone(),
+                }
+            } else {
+                io_at(&lock_path, error)
+            }
+        })?;
         operation()
     }
 
@@ -2851,6 +2853,57 @@ impl SessionManager {
         file.write_all(line).map_err(|e| io_at(&path, e))
     }
 
+    /// Load only `(turn_id, timestamp_ms)` from this session's bounded transcript.
+    /// Message bodies are streamed past instead of retained, so opening a large WebUI
+    /// history does not duplicate the full append-only transcript in memory. A missing
+    /// transcript is valid for imported or older sessions.
+    pub fn load_transcript_timestamps(
+        &self,
+        id: &str,
+    ) -> SessionResult<BTreeMap<u64, TurnTimestamp>> {
+        #[derive(Deserialize)]
+        struct TimestampRecord {
+            #[serde(default)]
+            v: u32,
+            turn_id: u64,
+            #[serde(default)]
+            started_at: Option<i64>,
+            ts: i64,
+        }
+
+        let path = self.jsonl_path(id)?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+            Err(error) => return Err(io_at(&path, error)),
+        }
+
+        let mut timestamps = BTreeMap::new();
+        for_each_jsonl_line(&path, |line| {
+            let record: TimestampRecord =
+                serde_json::from_slice(line).map_err(|error| SessionStoreError::Corrupt {
+                    kind: "transcript record",
+                    message: format!("{}: {error}", path.display()),
+                })?;
+            if record.v > RECORD_VERSION {
+                return Err(SessionStoreError::FutureSchema {
+                    kind: "transcript record",
+                    found: record.v,
+                    supported: RECORD_VERSION,
+                });
+            }
+            timestamps.insert(
+                record.turn_id,
+                TurnTimestamp {
+                    started_at: record.started_at,
+                    completed_at: record.ts,
+                },
+            );
+            Ok(())
+        })?;
+        Ok(timestamps)
+    }
+
     fn ensure_native_writable(&self, id: &str, operation: &'static str) -> SessionResult<()> {
         match self.read_meta(id) {
             Ok(meta) if meta.owner == StorageOwner::Legacy => {
@@ -3753,6 +3806,35 @@ fn open_append_file(path: &Path) -> SessionResult<File> {
 }
 
 const TRANSIENT_FILE_ACCESS_RETRY_DELAYS_MS: [u64; 3] = [10, 30, 60];
+const META_LOCK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const META_LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+fn is_file_lock_contention(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock
+        // Windows reports sharing/lock violations as raw OS errors instead of
+        // consistently mapping them to WouldBlock (ERROR_SHARING_VIOLATION=32,
+        // ERROR_LOCK_VIOLATION=33).
+        || cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))
+}
+
+fn acquire_file_lock_until(file: &File, timeout: std::time::Duration) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(file) {
+            Ok(()) => return Ok(()),
+            Err(error) if is_file_lock_contention(&error) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(error);
+                }
+                std::thread::sleep(
+                    META_LOCK_RETRY_DELAY.min(deadline.saturating_duration_since(now)),
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 fn retry_transient_file_access<T>(
     mut operation: impl FnMut() -> SessionResult<T>,
@@ -3785,6 +3867,18 @@ fn open_lock_file(path: &Path) -> SessionResult<File> {
     ensure_opened_regular(path, &file)?;
     ensure_private_file_permissions(path, &file)?;
     Ok(file)
+}
+
+fn open_session_lock_file(id: &str, path: &Path) -> SessionResult<File> {
+    open_lock_file(path).map_err(|error| match error {
+        SessionStoreError::Io { source, .. } if is_file_lock_contention(&source) => {
+            SessionStoreError::SessionInUse {
+                id: id.to_string(),
+                path: path.to_path_buf(),
+            }
+        }
+        error => error,
+    })
 }
 
 fn set_private_create_mode(options: &mut OpenOptions) {
@@ -4009,7 +4103,9 @@ mod tests {
         let mut meta = SessionMeta::new("reminder-session", "/project", 1);
 
         meta.auto_name_from_messages(&[
-            Message::user(crate::reminder::system_reminder("我就在任务1上！继续任务2！")),
+            Message::user(crate::reminder::system_reminder(
+                "我就在任务1上！继续任务2！",
+            )),
             Message::user("修复登录错误"),
         ]);
 
@@ -4136,6 +4232,56 @@ mod tests {
         // 内容确实被追加写入
         let written = std::fs::read(mgr.jsonl_path(id).unwrap()).unwrap();
         assert_eq!(written, payload);
+    }
+
+    #[test]
+    fn transcript_timestamps_load_without_message_bodies_and_missing_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        assert!(mgr
+            .load_transcript_timestamps("missing")
+            .unwrap()
+            .is_empty());
+
+        let line = serde_json::json!({
+            "v": 1,
+            "started_at": 1_700_000_000_000_i64,
+            "ts": 1_700_000_000_123_i64,
+            "iso": "2023-11-14T22:13:20.123Z",
+            "session_id": "s1",
+            "turn_id": 7,
+            "undone": false,
+            "user": "question",
+            "assistant": "answer",
+            "tools": [],
+            "usage": { "prompt": 1, "completion": 2, "cached": 0 }
+        });
+        let mut bytes = serde_json::to_vec(&line).unwrap();
+        bytes.push(b'\n');
+        mgr.append_jsonl_line("s1", &bytes).unwrap();
+
+        let legacy_line = serde_json::json!({
+            "v": 1,
+            "ts": 1_700_000_001_123_i64,
+            "iso": "2023-11-14T22:13:21.123Z",
+            "session_id": "s1",
+            "turn_id": 8,
+            "undone": false,
+            "user": "legacy question",
+            "assistant": "legacy answer",
+            "tools": [],
+            "usage": { "prompt": 1, "completion": 2, "cached": 0 }
+        });
+        let mut legacy_bytes = serde_json::to_vec(&legacy_line).unwrap();
+        legacy_bytes.push(b'\n');
+        mgr.append_jsonl_line("s1", &legacy_bytes).unwrap();
+
+        let timestamps = mgr.load_transcript_timestamps("s1").unwrap();
+        assert_eq!(timestamps.len(), 2);
+        assert_eq!(timestamps[&7].started_at, Some(1_700_000_000_000));
+        assert_eq!(timestamps[&7].completed_at, 1_700_000_000_123);
+        assert_eq!(timestamps[&8].started_at, None);
+        assert_eq!(timestamps[&8].completed_at, 1_700_000_001_123);
     }
 
     fn presentation_entry(anchor: DisplayAnchor, text: &str) -> PresentationEntry {
@@ -5956,6 +6102,23 @@ mod tests {
         load_done_rx.recv().unwrap().unwrap();
         save_thread.join().unwrap();
         load_thread.join().unwrap();
+    }
+
+    #[test]
+    fn bounded_meta_lock_wait_returns_contention() {
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s1.meta.lock");
+        let held = super::open_lock_file(&path).unwrap();
+        fs2::FileExt::try_lock_exclusive(&held).unwrap();
+        let contender = super::open_lock_file(&path).unwrap();
+
+        let started = Instant::now();
+        let error = super::acquire_file_lock_until(&contender, Duration::from_millis(40))
+            .expect_err("contended lock must stop at its deadline");
+        assert!(super::is_file_lock_contention(&error));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

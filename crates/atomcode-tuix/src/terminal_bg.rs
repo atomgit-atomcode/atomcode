@@ -11,6 +11,17 @@
 
 use std::time::Duration;
 
+/// Whether startup may safely probe the terminal background with OSC 11.
+///
+/// Orca 1.4.180 has been observed delivering the OSC 11 reply after the
+/// following DA1 reply. That violates the ordering used by our startup drain
+/// anchor and lets the delayed reply enter crossterm as ordinary input. Prefer
+/// the dark Auto fallback on this terminal; explicit Light/Dark themes remain
+/// unaffected.
+pub(crate) fn should_query_background(term_program: Option<&str>) -> bool {
+    !term_program.is_some_and(|program| program.eq_ignore_ascii_case("orca"))
+}
+
 /// Query the terminal for its background colour and decide light vs.
 /// dark. Returns `Some(true)` for light, `Some(false)` for dark,
 /// `None` when the terminal didn't respond within `timeout`.
@@ -236,6 +247,14 @@ fn parse_hex_component(s: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orca_skips_background_query_case_insensitively() {
+        assert!(!should_query_background(Some("Orca")));
+        assert!(!should_query_background(Some("orca")));
+        assert!(should_query_background(Some("iTerm.app")));
+        assert!(should_query_background(None));
+    }
 
     #[test]
     fn parses_pure_white_as_light() {

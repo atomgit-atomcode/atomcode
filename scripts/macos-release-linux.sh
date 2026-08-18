@@ -64,11 +64,26 @@ echo "=== AtomCode Linux Release ${VERSION} (cross-compile from macOS) ==="
 echo ""
 
 # Build the embedded webui frontend so the binary embeds the latest UI.
-if [ -d "$ROOT/webui" ] && command -v npm >/dev/null 2>&1; then
-  echo "Building webui frontend..."
-  (cd "$ROOT/webui" && npm ci && npm run build)
-else
-  echo "warning: skipping webui build (npm not found or webui/ missing); using committed webui/dist" >&2
+#
+# Fatal, not a warning: webui/dist is gitignored, so there is no committed
+# copy to fall back on. Skipping this step produces a binary whose /webui
+# serves 404 — a defect nobody sees until the release is installed.
+if [ ! -d "$ROOT/webui" ]; then
+  echo "error: "$ROOT/webui"/ is missing; cannot build the embedded UI" >&2
+  exit 1
+fi
+if ! command -v npm >/dev/null 2>&1; then
+  echo "error: npm not found, and webui/dist is gitignored — there is nothing" >&2
+  echo "       to fall back on. A release built now would serve 404 for /webui." >&2
+  exit 1
+fi
+echo "Building webui frontend..."
+(cd "$ROOT/webui" && npm ci && npm run build)
+# `rust-embed` accepts a missing/empty folder silently (allow_missing), so a
+# half-failed frontend build would otherwise ship as an empty UI.
+if [ ! -f "$ROOT/webui"/dist/index.html ]; then
+  echo "error: webui build produced no dist/index.html" >&2
+  exit 1
 fi
 echo ""
 

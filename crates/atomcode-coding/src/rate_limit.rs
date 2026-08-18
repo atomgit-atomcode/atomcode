@@ -132,6 +132,10 @@ pub struct RateLimitHook {
     base_url: String,
     source: Option<Arc<dyn RateLimitWindowSource>>,
     cache: Mutex<Option<(Instant, Vec<RateLimitWindow>)>>,
+    /// Optional user-configured total number of 429 attempts for one incident.
+    /// The kernel owns 429 retries so this bound belongs on its lifecycle hook,
+    /// not in the provider adapter's OPEN retry loop.
+    max_attempts: Option<u32>,
 }
 
 impl RateLimitHook {
@@ -140,6 +144,7 @@ impl RateLimitHook {
             base_url,
             source: None,
             cache: Mutex::new(None),
+            max_attempts: None,
         }
     }
 
@@ -148,7 +153,13 @@ impl RateLimitHook {
             base_url,
             source: Some(source),
             cache: Mutex::new(None),
+            max_attempts: None,
         }
+    }
+
+    pub fn with_max_attempts(mut self, max_attempts: Option<u32>) -> Self {
+        self.max_attempts = max_attempts;
+        self
     }
 
     /// Return aged cached windows if the cache is younger than `ttl`, else None.
@@ -183,6 +194,20 @@ fn decide_or_none(windows: &[RateLimitWindow], hint: &RateLimitHint) -> Option<R
 #[async_trait]
 impl LifecycleHooks for RateLimitHook {
     async fn on_rate_limit(&self, hint: &RateLimitHint) -> Option<RateLimitDecision> {
+        // `hint.attempt` is one-based and names the request that just received
+        // 429. Stop before issuing attempt N+1 once the configured total has
+        // been spent. This also makes `retry_max_attempts = 1` mean no 429
+        // retry, matching the config contract.
+        if self
+            .max_attempts
+            .is_some_and(|max_attempts| hint.attempt >= max_attempts)
+        {
+            return Some(RateLimitDecision::Pause {
+                reset_at_display: String::new(),
+                reset_label: String::new(),
+                secs_until_reset: hint.retry_after_secs,
+            });
+        }
         // Only a 429 FROM the CodingPlan gateway carries a CodingPlan quota meaning.
         // A 429 from a user's own external model/endpoint must NOT be dressed up as a
         // CodingPlan window exhaustion — bail before any status_v2 fetch so the kernel
@@ -254,6 +279,32 @@ mod tests {
             attempt: 1,
         };
         assert_eq!(hook.on_rate_limit(&hint).await, None);
+    }
+
+    #[tokio::test]
+    async fn configured_attempt_limit_bounds_kernel_owned_429_retries() {
+        let hook = RateLimitHook::new("https://api.openai.com/v1".to_string())
+            .with_max_attempts(Some(2));
+        let first = RateLimitHint {
+            http_status: Some(429),
+            retry_after_secs: Some(30),
+            terminal: false,
+            attempt: 1,
+        };
+        assert_eq!(hook.on_rate_limit(&first).await, None);
+
+        let second = RateLimitHint {
+            attempt: 2,
+            ..first
+        };
+        assert_eq!(
+            hook.on_rate_limit(&second).await,
+            Some(RateLimitDecision::Pause {
+                reset_at_display: String::new(),
+                reset_label: String::new(),
+                secs_until_reset: Some(30),
+            })
+        );
     }
 
     #[tokio::test]

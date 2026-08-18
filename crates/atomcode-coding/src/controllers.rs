@@ -367,6 +367,10 @@ impl LoopState {
 pub(crate) enum GoalResult {
     Met(String),
     NotMet(String),
+    /// The evaluator returned no usable verdict (e.g. an empty stream). This is
+    /// NOT a failure of the agent's work: the evaluator itself produced nothing
+    /// to judge, so the runtime must not mark the goal `Failed` or spam the UI.
+    Inconclusive(String),
     Error(String),
 }
 
@@ -622,6 +626,16 @@ fn parse_evaluator_response(text: &str) -> GoalResult {
         .filter(|line| !line.is_empty())
         .last()
         .unwrap_or("");
+    if line.is_empty() {
+        // Empty / whitespace-only evaluator output means the model returned no
+        // verdict at all. Treat it as "could not determine" rather than a hard
+        // Error: the agent's work is not necessarily failed, and repeatedly
+        // surfacing `malformed verdict line: ""` as a warning just spams the
+        // transcript and makes the agent spin in unnecessary retries.
+        return GoalResult::Inconclusive(
+            "evaluator returned an empty response (no verdict line)".into(),
+        );
+    }
     let lower = line.to_ascii_lowercase();
     for (prefix, met) in [("verdict: yes", true), ("verdict: no", false)] {
         if lower.starts_with(prefix) {
@@ -895,6 +909,17 @@ mod tests {
         assert!(matches!(
             parse_evaluator_response("YES"),
             GoalResult::Error(_)
+        ));
+        // An empty / whitespace-only evaluator response is "could not determine",
+        // NOT a hard error — issue #17: the agent's completed work must not be
+        // marked failed and the UI must not spam `malformed verdict line: ""`.
+        assert!(matches!(
+            parse_evaluator_response(""),
+            GoalResult::Inconclusive(_)
+        ));
+        assert!(matches!(
+            parse_evaluator_response("   \n \n"),
+            GoalResult::Inconclusive(_)
         ));
     }
 

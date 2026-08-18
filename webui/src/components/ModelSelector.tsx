@@ -3,10 +3,12 @@ import { getModels, ModelInfo, postLiveReasoningEffort } from '../api';
 import { useT } from '../settings';
 import { MsgKey } from '../i18n';
 
-// DeepSeek V4 reasoning effort levels. `null` clears the field → the model's
-// own default. Order is the cycle order shown in the dropdown.
+// Endpoint-declared reasoning effort levels. `null` returns to the model's
+// own default while retaining its configured capability.
 const EFFORT_OPTIONS: { val: string | null; key: MsgKey }[] = [
   { val: null, key: 'effort.default' },
+  { val: 'low', key: 'effort.low' },
+  { val: 'medium', key: 'effort.medium' },
   { val: 'high', key: 'effort.high' },
   { val: 'max', key: 'effort.max' },
 ];
@@ -21,7 +23,8 @@ function areModelsEqual(a: ModelInfo[], b: ModelInfo[]): boolean {
       ma.model !== mb.model ||
       ma.is_default !== mb.is_default ||
       ma.effort_applicable !== mb.effort_applicable ||
-      ma.reasoning_effort !== mb.reasoning_effort
+      ma.reasoning_effort !== mb.reasoning_effort ||
+      (ma.effort_levels ?? []).join(',') !== (mb.effort_levels ?? []).join(',')
     ) {
       return false;
     }
@@ -31,10 +34,12 @@ function areModelsEqual(a: ModelInfo[], b: ModelInfo[]): boolean {
 
 export function ModelSelector({
   value,
+  liveEffort,
   onChange,
   onDefaultChange,
 }: {
   value: string | null;
+  liveEffort?: string | null;
   onChange: (p: string) => void;
   onDefaultChange?: (p: string) => void;
 }) {
@@ -95,6 +100,9 @@ export function ModelSelector({
   // Switching models resets the effort display back to the new model's
   // persisted value (and hides the selector entirely for non-V4 models).
   useEffect(() => { setEffortOverride(undefined); }, [current?.provider]);
+  useEffect(() => {
+    if (liveEffort !== undefined) setEffortOverride(liveEffort);
+  }, [liveEffort]);
   const effort = effortOverride !== undefined ? effortOverride : (current?.reasoning_effort ?? null);
   const effortLabel = (v: string | null): string => {
     const o = EFFORT_OPTIONS.find((x) => x.val === v) ?? EFFORT_OPTIONS[0];
@@ -141,7 +149,12 @@ export function ModelSelector({
           </button>
           {effortOpen && (
             <div class="model-dropdown">
-              {EFFORT_OPTIONS.map((o) => (
+              {EFFORT_OPTIONS.filter(
+                (o) =>
+                  o.val === null ||
+                  !current?.effort_levels?.length ||
+                  current.effort_levels.includes(o.val),
+              ).map((o) => (
                 <button
                   key={o.key}
                   class={'model-item' + (o.val === effort ? ' active' : '')}

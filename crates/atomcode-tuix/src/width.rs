@@ -380,11 +380,7 @@ pub(crate) fn cluster_width(g: &str) -> usize {
             max_w = w;
         }
     }
-    if has_emoji_marker {
-        2
-    } else {
-        max_w
-    }
+    if has_emoji_marker { 2 } else { max_w }
 }
 
 /// Terminal column width of a string, CJK- and emoji-cluster-aware.
@@ -395,6 +391,45 @@ pub(crate) fn cluster_width(g: &str) -> usize {
 /// [`cluster_width`] for the per-cluster rule.
 pub fn display_width(s: &str) -> usize {
     s.graphemes(true).map(cluster_width).sum()
+}
+
+/// Width available to the composer's editable text after its prompt prefix.
+///
+/// JediTerm needs one additional empty trailing column because writing a glyph
+/// into its last column can trigger a terminal-side wrap on top of our explicit
+/// wrapping. Keep this calculation shared by the event loop's visual navigation
+/// and the retained renderer so resize can never leave them one column apart.
+pub(crate) fn composer_text_width(terminal_cols: usize, jediterm: bool) -> usize {
+    terminal_cols.saturating_sub(if jediterm { 3 } else { 2 })
+}
+
+/// Terminal column width of a string, using the **renderer's** width model
+/// that treats `\t` as [`SOFT_TAB_WIDTH`] display columns. Use this for
+/// line-width comparisons in visual navigation ([`cursor_visual_up`] /
+/// [`cursor_visual_down`]) so tabs don't cause misalignment between the
+/// cursor column and the clamp target.
+///
+/// See [`cluster_display_width`] for the per-cluster rule.
+pub(crate) fn display_width_with_tabs(s: &str) -> usize {
+    s.graphemes(true).map(cluster_display_width).sum()
+}
+
+/// Display width of a single grapheme cluster, using the **same** width
+/// model the renderer's cell painter uses. A `\t` is drawn by
+/// `push_str_cells` as [`SOFT_TAB_WIDTH`] spaces, so it must be measured
+/// as that many columns — otherwise the input caret renders
+/// SOFT_TAB_WIDTH cols left of the real insertion point on every
+/// tab-indented line.
+///
+/// This is the single source of truth that both [`wrap_with_spans`] and
+/// [`byte_offset_at_col`] should use to stay consistent with the
+/// renderer's paint model.
+pub(crate) fn cluster_display_width(g: &str) -> usize {
+    if g == "\t" {
+        crate::render::cell::SOFT_TAB_WIDTH
+    } else {
+        cluster_width(g)
+    }
 }
 
 /// Split a line (possibly containing SGR escape sequences) into chunks
@@ -555,6 +590,82 @@ pub fn wrap_with_cursor(
     (lines, cursor_row, cursor_col)
 }
 
+/// Lightweight alternative to [`wrap_with_cursor`] that returns byte-offset
+/// spans for each visual (wrapped) line instead of allocating new strings.
+///
+/// `spans[i] = (byte_start, byte_end)` where `byte_end` is **exclusive**.
+/// The 2nd and 3rd return values `(cursor_visual_row, cursor_visual_col)` are
+/// the same semantics as [`wrap_with_cursor`]'s cursor position.
+///
+/// Designed for consumer code that only needs to map between byte positions
+/// and visual rows — cursor-line-up/down by visual line, mouse-hit-test in
+/// the input box — without paying for string copies or allocation of the
+/// line contents.
+pub fn wrap_with_spans(
+    text: &str,
+    max_cols: usize,
+    cursor_byte: usize,
+) -> (Vec<(usize, usize)>, usize, usize) {
+    if max_cols == 0 {
+        return (vec![(0, 0)], 0, 0);
+    }
+
+    let mut spans: Vec<(usize, usize)> = vec![(0, 0)];
+    let mut col = 0usize;
+    let mut cursor_row = 0usize;
+    let mut cursor_col = 0usize;
+    let mut cursor_set = false;
+
+    for (byte_pos, g) in text.grapheme_indices(true) {
+        let is_newline = g == "\n";
+        let g_end = byte_pos + g.len();
+        // Compute width once and reuse — same value for both the wrap check
+        // and the column update below.
+        let w = cluster_display_width(g);
+
+        // Wrap check BEFORE recording the span end, so a cursor at the
+        // wrap boundary lands on the new row at col 0.
+        if !is_newline {
+            if col + w > max_cols && spans.last().unwrap().0 < byte_pos {
+                spans.last_mut().unwrap().1 = byte_pos;
+                spans.push((byte_pos, g_end));
+                col = 0;
+            } else {
+                spans.last_mut().unwrap().1 = g_end;
+            }
+        }
+
+        if !cursor_set && byte_pos == cursor_byte {
+            cursor_row = spans.len() - 1;
+            cursor_col = col;
+            cursor_set = true;
+        }
+
+        if is_newline {
+            spans.last_mut().unwrap().1 = byte_pos;
+            spans.push((g_end, g_end));
+            col = 0;
+        } else {
+            col += w;
+        }
+    }
+
+    // Cursor at end-of-buffer falls through — mirror wrap_with_cursor.
+    if !cursor_set {
+        if col >= max_cols {
+            let end = text.len();
+            spans.push((end, end));
+            cursor_row = spans.len() - 1;
+            cursor_col = 0;
+        } else {
+            cursor_row = spans.len() - 1;
+            cursor_col = col;
+        }
+    }
+
+    (spans, cursor_row, cursor_col)
+}
+
 /// Slice `s` starting at display column `start_col`, taking up to `max_cols`
 /// columns. Characters that straddle the start boundary are skipped. Used to
 /// implement horizontal scroll in the input prompt — keeps the cursor visible
@@ -622,6 +733,79 @@ pub fn truncate_with_ellipsis(s: &str, max_cols: usize) -> String {
     let mut acc = truncate_to_width(s, budget);
     acc.push('…');
     acc
+}
+
+/// Project a single-line editable value into `max_cols`, keeping a visible
+/// caret at `cursor_byte` and adding ellipses on either hidden side. The cursor
+/// must be on a UTF-8 boundary; callers that edit by grapheme naturally satisfy
+/// that invariant.
+pub fn editable_value_projection(value: &str, cursor_byte: usize, max_cols: usize) -> String {
+    const CARET: &str = "│";
+    const ELLIPSIS: &str = "…";
+
+    if max_cols == 0 {
+        return String::new();
+    }
+    if max_cols == 1 {
+        return CARET.to_string();
+    }
+
+    // The caller's byte offset may not land on a char boundary of `value` — e.g.
+    // it was derived from a raw buffer while `value` was scrubbed (shortened)
+    // before this call. Snap down to the nearest boundary so slicing never panics.
+    let mut cursor = cursor_byte.min(value.len());
+    while cursor > 0 && !value.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    let before = &value[..cursor];
+    let after = &value[cursor..];
+    let before_width = display_width(before);
+    let after_width = display_width(after);
+    let text_budget = max_cols - 1;
+    if before_width + after_width <= text_budget {
+        return format!("{before}{CARET}{after}");
+    }
+
+    let mut left_budget = text_budget / 2;
+    let mut right_budget = text_budget - left_budget;
+    if after_width < right_budget {
+        left_budget += right_budget - after_width;
+        right_budget = after_width;
+    }
+    if before_width < left_budget {
+        right_budget += left_budget - before_width;
+        left_budget = before_width;
+    }
+
+    let left_hidden = before_width > left_budget;
+    let right_hidden = after_width > right_budget;
+    if left_hidden {
+        left_budget = left_budget.saturating_sub(1);
+    }
+    if right_hidden {
+        right_budget = right_budget.saturating_sub(1);
+    }
+
+    let mut left_width = 0usize;
+    let mut left_parts = Vec::new();
+    for grapheme in before.graphemes(true).rev() {
+        let width = display_width(grapheme);
+        if left_width + width > left_budget {
+            break;
+        }
+        left_parts.push(grapheme);
+        left_width += width;
+    }
+    let left = left_parts.into_iter().rev().collect::<String>();
+    let right = truncate_to_width(after, right_budget);
+    format!(
+        "{}{}{}{}{}",
+        if left_hidden { ELLIPSIS } else { "" },
+        left,
+        CARET,
+        right,
+        if right_hidden { ELLIPSIS } else { "" }
+    )
 }
 
 /// Truncate a file-system path to `max_cols` display columns, using a
@@ -704,8 +888,8 @@ mod tests {
         assert!(is_wide_emoji_symbol('❄')); // U+2744 snowflake
         assert!(is_wide_emoji_symbol('⭐')); // U+2B50 star
         assert!(is_wide_emoji_symbol('⚡')); // U+26A1 high voltage
-                                             // NOT emoji — must stay narrow, or we'd regress ordinary ambiguous
-                                             // text symbols (the whole point of scoping to the Emoji set).
+        // NOT emoji — must stay narrow, or we'd regress ordinary ambiguous
+        // text symbols (the whole point of scoping to the Emoji set).
         assert!(!is_wide_emoji_symbol('✓')); // U+2713 check mark (Emoji=No)
         assert!(!is_wide_emoji_symbol('°')); // U+00B0 degree sign
         assert!(!is_wide_emoji_symbol('◆')); // U+25C6 black diamond
@@ -723,7 +907,7 @@ mod tests {
         let sun = if emoji_wide_enabled() { 2 } else { 1 };
         assert_eq!(display_width("☀"), sun);
         assert_eq!(display_width("☀ 晴"), sun + 1 + 2); // sun + space + CJK
-                                                        // Ambiguous-but-not-emoji content is never widened by this path.
+        // Ambiguous-but-not-emoji content is never widened by this path.
         assert_eq!(display_width("✓"), 1);
         assert_eq!(display_width("20°C"), 4);
     }
@@ -736,13 +920,13 @@ mod tests {
         assert!(is_narrow_emoji_1f000('\u{1F396}')); // 🎖 military medal
         assert!(is_narrow_emoji_1f000('\u{1F5FA}')); // 🗺 world map
         assert!(is_narrow_emoji_1f000('\u{1F700}')); // 🜀 alchemical symbol
-                                                     // U+1F1E6..=U+1F1FF (Regional Indicator) are excluded.
+        // U+1F1E6..=U+1F1FF (Regional Indicator) are excluded.
         assert!(!is_narrow_emoji_1f000('\u{1F1E6}')); // 🇦 Regional Indicator A
         assert!(!is_narrow_emoji_1f000('\u{1F1FF}')); // 🇿 Regional Indicator Z
-                                                      // Wide emoji (EA=W) are NOT in this set — they're already width 2.
+        // Wide emoji (EA=W) are NOT in this set — they're already width 2.
         assert!(!is_narrow_emoji_1f000('\u{1F4C5}')); // 📅 calendar (EA=W)
         assert!(!is_narrow_emoji_1f000('\u{1F4A7}')); // 💧 droplet (EA=W)
-                                                      // Outside range.
+        // Outside range.
         assert!(!is_narrow_emoji_1f000('a'));
         assert!(!is_narrow_emoji_1f000('你'));
     }
@@ -785,6 +969,27 @@ mod tests {
     #[test]
     fn truncate_to_width_preserves_under_limit() {
         assert_eq!(truncate_to_width("hi", 10), "hi");
+    }
+
+    #[test]
+    fn editable_projection_tracks_middle_cursor_without_splitting_graphemes() {
+        assert_eq!(editable_value_projection("abcdefghij", 5, 8), "…de│fgh…");
+        let text = "a👨‍👩‍👧‍👦好z";
+        let cursor = "a👨‍👩‍👧‍👦".len();
+        let shown = editable_value_projection(text, cursor, 8);
+        assert!(shown.contains("👨‍👩‍👧‍👦│好"), "{shown}");
+    }
+
+    #[test]
+    fn editable_projection_snaps_cursor_off_a_char_boundary_without_panicking() {
+        // A raw-buffer cursor byte can land inside a multibyte char once the value
+        // it indexes was shortened (e.g. scrub_controls stripped a control byte
+        // before it). The projection must snap down to a boundary, never panic.
+        let out = editable_value_projection("好z", 1, 10); // byte 1 is inside 好 (3 bytes)
+        assert!(out.contains('好'), "{out}");
+        assert!(out.contains('│'), "{out}");
+        // An overshooting raw offset must also be safe.
+        let _ = editable_value_projection("好", 99, 10);
     }
 
     #[test]
@@ -898,6 +1103,74 @@ mod tests {
         assert_eq!(row, 1, "cursor on the 2nd line");
         // end-of-line column = 2 tabs * tab_w + width("cd")
         assert_eq!(col, tab_w * 2 + 2);
+    }
+
+    // --- wrap_with_spans tests (parallel to wrap_with_cursor) ---
+
+    #[test]
+    fn wrap_with_spans_short_text_single_row() {
+        let (spans, r, c) = wrap_with_spans("hi", 10, 2);
+        assert_eq!(spans, vec![(0, 2)]);
+        assert_eq!((r, c), (0, 2));
+    }
+
+    #[test]
+    fn wrap_with_spans_overflow_moves_to_next_row() {
+        let (spans, r, c) = wrap_with_spans("abcdef", 3, 3);
+        assert_eq!(spans, vec![(0, 3), (3, 6)]);
+        assert_eq!((r, c), (1, 0));
+    }
+
+    #[test]
+    fn wrap_with_spans_honours_explicit_newline() {
+        let (spans, r, c) = wrap_with_spans("ab\ncd", 10, 4);
+        assert_eq!(spans, vec![(0, 2), (3, 5)]);
+        assert_eq!((r, c), (1, 1));
+    }
+
+    #[test]
+    fn wrap_with_spans_end_of_buffer() {
+        let (spans, r, c) = wrap_with_spans("hello", 10, 5);
+        assert_eq!(spans, vec![(0, 5)]);
+        assert_eq!((r, c), (0, 5));
+    }
+
+    #[test]
+    fn wrap_with_spans_end_of_buffer_full_line_wraps_to_next_row() {
+        let (spans, r, c) = wrap_with_spans("abc", 3, 3);
+        assert_eq!(spans, vec![(0, 3), (3, 3)]);
+        assert_eq!((r, c), (1, 0));
+    }
+
+    #[test]
+    fn wrap_with_spans_end_of_buffer_cjk() {
+        let (spans, r, c) = wrap_with_spans("ab你", 4, 5);
+        assert_eq!(spans, vec![(0, 5), (5, 5)]);
+        assert_eq!((r, c), (1, 0));
+    }
+
+    #[test]
+    fn wrap_with_spans_cjk_widths() {
+        let (spans, _, _) = wrap_with_spans("你好", 3, 0);
+        assert_eq!(spans, vec![(0, 3), (3, 6)]);
+    }
+
+    #[test]
+    fn wrap_with_spans_tab_counts_as_soft_tab_width() {
+        let tab_w = crate::render::cell::SOFT_TAB_WIDTH;
+        let text = "ab\n\t\tcd";
+        let (spans, row, col) = wrap_with_spans(text, 80, text.len());
+        assert_eq!(spans.len(), 2);
+        assert_eq!(row, 1);
+        assert_eq!(col, tab_w * 2 + 2);
+    }
+
+    #[test]
+    fn composer_text_width_matches_terminal_reserve() {
+        assert_eq!(composer_text_width(80, false), 78);
+        assert_eq!(composer_text_width(80, true), 77);
+        assert_eq!(composer_text_width(1, false), 0);
+        assert_eq!(composer_text_width(2, true), 0);
     }
 
     // --- truncate_path tests ---

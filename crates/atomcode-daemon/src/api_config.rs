@@ -3,7 +3,7 @@ use atomcode_config::config::Config;
 use atomcode_config::ConfigStore;
 use axum::{response::IntoResponse, Json};
 
-use crate::{json_error, ConfigResponse, ProviderInfo};
+use crate::{json_error, ConfigResponse, ProviderAccountInfo, ProviderInfo, ProviderPresetInfo};
 
 /// Load config from disk.
 pub(crate) fn load_config() -> Result<Config, String> {
@@ -37,21 +37,15 @@ fn empty_config() -> Config {
 /// `ProviderConfig` view via the resolution boundary.
 pub(crate) fn config_response(config: &Config) -> ConfigResponse {
     let default_selection = config.effective_model_selection().unwrap_or_default();
-    let mut ids: Vec<String> = config.logical_models().into_keys().collect();
+    let logical_models = config.logical_models();
+    let mut ids: Vec<String> = logical_models.keys().cloned().collect();
     ids.sort();
     let providers = ids
         .iter()
         .filter_map(|id| {
-            config
-                .provider_config_for_selection(id)
-                .map(|p| {
-                    provider_info(
-                        id,
-                        &p,
-                        config.model_vision_override(id),
-                        &default_selection,
-                    )
-                })
+            config.provider_config_for_selection(id).map(|p| {
+                provider_info(id, &p, config.model_vision_override(id), &default_selection)
+            })
         })
         .collect();
     ConfigResponse {
@@ -59,6 +53,88 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
         default_provider: default_selection,
         default_workdir: config.default_workdir.clone(),
         providers,
+        provider_accounts: {
+            let mut accounts: Vec<_> = config
+                .logical_accounts()
+                .into_iter()
+                .map(|(id, account)| {
+                    let preset = atomcode_config::config::provider_preset::preset_or_compatible(
+                        &account.provider,
+                    );
+                    let mut model_ids: Vec<_> = logical_models
+                        .iter()
+                        .filter(|(_, model)| model.account == id)
+                        .map(|(selection, _)| selection.clone())
+                        .collect();
+                    model_ids.sort();
+                    let resolved: Vec<_> = model_ids
+                        .iter()
+                        .filter_map(|selection| config.resolve_model(Some(selection)).ok())
+                        .collect();
+                    let base_url = account
+                        .base_url
+                        .clone()
+                        .or_else(|| preset.default_base_url.map(str::to_string));
+                    let has_saved_api_key = account
+                        .api_key
+                        .as_deref()
+                        .is_some_and(|key| !key.trim().is_empty());
+                    let managed = base_url
+                        .as_deref()
+                        .is_some_and(atomcode_auth::gateway_crypto::is_atomgit_gateway);
+                    ProviderAccountInfo {
+                        id: id.clone(),
+                        provider: account.provider,
+                        display_name: account.display_name,
+                        provider_type: preset.provider_type.wire().to_string(),
+                        base_url,
+                        has_api_key: has_saved_api_key
+                            || resolved.iter().any(|model| model.api_key.is_some()),
+                        managed,
+                        model_ids,
+                        legacy: config.providers.contains_key(&id),
+                    }
+                })
+                .collect();
+            accounts.sort_by(|a, b| a.id.cmp(&b.id));
+            accounts
+        },
+        provider_presets: atomcode_config::config::provider_preset::PRESETS
+            .iter()
+            // AtomGit/CodingPlan is provisioned by `/login`; presenting it as a
+            // manually configurable API-key provider would create a broken,
+            // user-owned lookalike. Existing CodingPlan models are still listed
+            // above through the unified model catalog.
+            .filter(|preset| {
+                !matches!(
+                    preset.id,
+                    "atomgit" | "openai-compatible" | "anthropic-compatible"
+                )
+            })
+            .map(|preset| ProviderPresetInfo {
+                id: preset.id.to_string(),
+                display_name: preset.display_name.to_string(),
+                provider_type: preset.provider_type.wire().to_string(),
+                default_base_url: preset.default_base_url.map(str::to_string),
+                requires_api_key: !matches!(
+                    preset.auth_kind,
+                    atomcode_config::config::provider_preset::AuthKind::None
+                ),
+                model_source: match preset.model_source {
+                    atomcode_config::config::provider_preset::ModelSource::Embedded => "embedded",
+                    atomcode_config::config::provider_preset::ModelSource::DiscoveryApi => {
+                        "discovery_api"
+                    }
+                    atomcode_config::config::provider_preset::ModelSource::Manual => "manual",
+                }
+                .to_string(),
+            })
+            .collect(),
+        notifications: crate::NotificationConfigInfo {
+            enabled: config.notifications.enabled,
+            min_duration_secs: config.notifications.min_duration_secs,
+            bell: config.notifications.bell,
+        },
     }
 }
 
@@ -175,11 +251,13 @@ mod tests {
             thinking_keep: None,
             reasoning_history: None,
             reasoning_effort: None,
+            reasoning_effort_levels: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            retry_max_attempts: None,
         }
     }
 
@@ -212,6 +290,85 @@ mod tests {
         assert!(glm.is_default);
         assert!(glm.requires_login, "gateway base_url ⇒ requires login");
         assert_eq!(glm.model, "GLM-5.2");
+        assert!(resp
+            .provider_presets
+            .iter()
+            .any(|preset| preset.id == "deepseek"));
+        assert!(!resp
+            .provider_presets
+            .iter()
+            .any(|preset| preset.id == "atomgit"));
+        let atomgit = resp
+            .provider_accounts
+            .iter()
+            .find(|account| account.id == "AtomGit")
+            .unwrap();
+        assert_eq!(atomgit.model_ids.len(), 2);
+        assert!(atomgit.managed);
+    }
+
+    #[test]
+    fn config_response_exposes_only_credential_presence_for_accounts() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "taotoken": {
+                    "provider": "openai",
+                    "base_url": "https://taotoken.net/api/v1",
+                    "api_key": "must-not-leave-daemon"
+                }
+            },
+            "models": {
+                "taotoken/model-a": { "account": "taotoken", "model": "model-a" }
+            }
+        }))
+        .unwrap();
+
+        let response = config_response(&config);
+        let account = response
+            .provider_accounts
+            .iter()
+            .find(|account| account.id == "taotoken")
+            .unwrap();
+        assert!(account.has_api_key);
+        assert_eq!(account.model_ids, ["taotoken/model-a"]);
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("must-not-leave-daemon"));
+    }
+
+    #[test]
+    fn config_response_reports_saved_credential_before_first_model_is_added() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "taotoken": {
+                    "provider": "openai",
+                    "base_url": "https://taotoken.net/api/v1",
+                    "api_key": "account-only-secret"
+                },
+                "AtomGit": {
+                    "provider": "openai",
+                    "base_url": "https://llm-api.atomgit.com/v1"
+                }
+            }
+        }))
+        .unwrap();
+
+        let response = config_response(&config);
+        let taotoken = response
+            .provider_accounts
+            .iter()
+            .find(|account| account.id == "taotoken")
+            .unwrap();
+        assert!(taotoken.has_api_key);
+        assert!(taotoken.model_ids.is_empty());
+        let atomgit = response
+            .provider_accounts
+            .iter()
+            .find(|account| account.id == "AtomGit")
+            .unwrap();
+        assert!(atomgit.managed);
+        assert!(atomgit.model_ids.is_empty());
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("account-only-secret"));
     }
 
     #[test]

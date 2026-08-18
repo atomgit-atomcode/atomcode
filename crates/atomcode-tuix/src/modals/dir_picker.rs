@@ -10,7 +10,10 @@ use std::path::PathBuf;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use super::{Modal, ModalAction};
+use super::{
+    backspace_at_cursor, delete_at_cursor, insert_at_cursor, next_grapheme_boundary,
+    previous_grapheme_boundary, Modal, ModalAction, ModalPointerAction,
+};
 use crate::event_loop::commands::apply_cd;
 use crate::event_loop::{build_status, Buffer, LoopCtx};
 use crate::render::{MenuPayload, Renderer, UiLine};
@@ -28,8 +31,15 @@ pub struct DirPicker {
     /// Search text or a new path. Enter opens the selected match when one exists;
     /// only a zero-match query is resolved as a literal `/cd <path>` target.
     pub query: String,
+    pub query_cursor_byte: usize,
     tab_matches: Vec<String>,
     tab_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DirConfirmFailure {
+    Redraw(String),
+    FlushOnly(String),
 }
 
 impl DirPicker {
@@ -39,6 +49,7 @@ impl DirPicker {
             current,
             selected: 0,
             query: String::new(),
+            query_cursor_byte: 0,
             tab_matches: Vec::new(),
             tab_index: 0,
         }
@@ -64,17 +75,21 @@ impl DirPicker {
             .collect()
     }
 
-    /// Append a typed character to the path query and reset the highlight to the
+    /// Insert a typed character into the path query and reset the highlight to the
     /// top of the (re-filtered) list.
     fn on_char(&mut self, c: char) {
-        self.query.push(c);
+        insert_at_cursor(
+            &mut self.query,
+            &mut self.query_cursor_byte,
+            c.encode_utf8(&mut [0; 4]),
+        );
         self.selected = 0;
         self.reset_tab_completion();
     }
 
-    /// Delete the last character of the path query and reset the highlight.
+    /// Delete the grapheme before the query cursor and reset the highlight.
     fn on_backspace(&mut self) {
-        self.query.pop();
+        backspace_at_cursor(&mut self.query, &mut self.query_cursor_byte);
         self.selected = 0;
         self.reset_tab_completion();
     }
@@ -89,8 +104,121 @@ impl DirPicker {
             self.selected = 0;
             return;
         }
-        if self.selected + 1 < n {
-            self.selected += 1;
+        self.select_index(self.selected.saturating_add(1));
+    }
+
+    fn select_index(&mut self, index: usize) -> bool {
+        let len = self.filtered().len();
+        let selected = if len == 0 { 0 } else { index.min(len - 1) };
+        let changed = self.selected != selected;
+        self.selected = selected;
+        changed
+    }
+
+    fn pointer_select_with(&mut self, index: usize, redraw: impl FnOnce(&Self)) {
+        if self.select_index(index) {
+            redraw(self);
+        }
+    }
+
+    #[cfg(test)]
+    fn selected_path(&self) -> Option<PathBuf> {
+        self.filtered().get(self.selected).cloned()
+    }
+
+    fn confirm_selected_with(
+        &self,
+        cwd: &std::path::Path,
+        previous_dir: Option<&std::path::Path>,
+        mut apply: impl FnMut(&std::path::Path) -> Result<(), String>,
+    ) -> Result<ModalAction, DirConfirmFailure> {
+        let filtered = self.filtered();
+        let Some(path) =
+            resolve_enter_target(&filtered, self.selected, &self.query, cwd, previous_dir)
+                .map_err(DirConfirmFailure::Redraw)?
+        else {
+            return Ok(ModalAction::Continue);
+        };
+        if crate::event_loop::commands::paths_same(&path, cwd) {
+            return Ok(ModalAction::Close);
+        }
+        if !path.is_dir() {
+            let display = path.display().to_string();
+            return Err(DirConfirmFailure::FlushOnly(
+                crate::i18n::t(crate::i18n::Msg::DirNotExists { path: &display }).into_owned(),
+            ));
+        }
+        apply(&path).map_err(DirConfirmFailure::Redraw)?;
+        Ok(ModalAction::Close)
+    }
+
+    fn confirm_selected(
+        &mut self,
+        buf: &mut Buffer,
+        state: &mut UiState,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<ModalAction> {
+        let cwd = ctx.working_dir.clone();
+        let previous_dir = ctx.previous_dir.clone();
+        let mut applied = false;
+        let result = self.confirm_selected_with(&cwd, previous_dir.as_deref(), |path| {
+            apply_cd(ctx, path.to_path_buf()).map(|_| {
+                applied = true;
+            })
+        });
+        self.finish_confirmation(result, applied, buf, state, ctx, renderer)
+    }
+
+    fn finish_confirmation(
+        &self,
+        result: Result<ModalAction, DirConfirmFailure>,
+        applied: bool,
+        buf: &Buffer,
+        state: &UiState,
+        ctx: &LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<ModalAction> {
+        match result {
+            Ok(action) => {
+                if applied {
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned(),
+                    ));
+                    renderer.flush();
+                }
+                Ok(action)
+            }
+            Err(DirConfirmFailure::Redraw(error)) => {
+                renderer.render(UiLine::Error(error));
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            Err(DirConfirmFailure::FlushOnly(error)) => {
+                renderer.render(UiLine::Error(error));
+                renderer.flush();
+                Ok(ModalAction::Continue)
+            }
+        }
+    }
+
+    fn apply_pointer_semantic_with(
+        &mut self,
+        action: ModalPointerAction,
+        cwd: &std::path::Path,
+        previous_dir: Option<&std::path::Path>,
+        apply: impl FnMut(&std::path::Path) -> Result<(), String>,
+    ) -> Result<ModalAction, DirConfirmFailure> {
+        match action {
+            ModalPointerAction::Select(index) => {
+                self.select_index(index);
+                Ok(ModalAction::Continue)
+            }
+            ModalPointerAction::Confirm(index) => {
+                self.select_index(index);
+                self.confirm_selected_with(cwd, previous_dir, apply)
+            }
+            ModalPointerAction::Cancel => Ok(ModalAction::Close),
         }
     }
 
@@ -104,18 +232,21 @@ impl DirPicker {
             {
                 self.tab_index = (self.tab_index + 1) % self.tab_matches.len();
                 self.query = self.tab_matches[self.tab_index].clone();
+                self.query_cursor_byte = self.query.len();
                 self.selected = 0;
                 return;
             }
             let completions = directory_completions(&self.query, cwd);
             if let Some(completion) = best_completion(&self.query, &completions) {
                 self.query = completion;
+                self.query_cursor_byte = self.query.len();
                 self.selected = 0;
                 self.reset_tab_completion();
             } else if !completions.is_empty() {
                 self.tab_matches = completions;
                 self.tab_index = 0;
                 self.query = self.tab_matches[0].clone();
+                self.query_cursor_byte = self.query.len();
                 self.selected = 0;
             }
             return;
@@ -123,6 +254,7 @@ impl DirPicker {
 
         if let Some(path) = self.filtered().get(self.selected) {
             self.query = crate::platform::collapse_home(&path.to_string_lossy());
+            self.query_cursor_byte = self.query.len();
             self.selected = 0;
             self.reset_tab_completion();
         }
@@ -174,48 +306,40 @@ impl Modal for DirPicker {
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
-            KeyCode::Enter => {
-                let filt = self.filtered();
-                let path = match resolve_enter_target(
-                    &filt,
-                    self.selected,
-                    &self.query,
-                    &ctx.working_dir,
-                    ctx.previous_dir.as_deref(),
-                ) {
-                    Ok(Some(path)) => path,
-                    Ok(None) => return Ok(ModalAction::Continue),
-                    Err(error) => {
-                        // Invalid ad-hoc paths stay editable in the modal.
-                        renderer.render(UiLine::Error(error));
-                        self.draw(buf, state, ctx, renderer);
-                        return Ok(ModalAction::Continue);
-                    }
-                };
-                if crate::event_loop::commands::paths_same(&path, &ctx.working_dir) {
-                    return Ok(ModalAction::Close);
-                }
-                if !path.is_dir() {
-                    let p = path.display().to_string();
-                    renderer.render(UiLine::Error(
-                        crate::i18n::t(crate::i18n::Msg::DirNotExists { path: &p }).into_owned(),
-                    ));
-                    renderer.flush();
-                    return Ok(ModalAction::Continue);
-                }
-                match apply_cd(ctx, path) {
-                    Ok(_) => renderer.render(UiLine::CommandOutput(
-                        crate::i18n::t(crate::i18n::Msg::CmdSessionTransitionPending).into_owned(),
-                    )),
-                    Err(error) => {
-                        renderer.render(UiLine::Error(error));
-                        self.draw(buf, state, ctx, renderer);
-                        return Ok(ModalAction::Continue);
-                    }
-                }
-                renderer.flush();
-                Ok(ModalAction::Close)
+            KeyCode::Left => {
+                self.query_cursor_byte =
+                    previous_grapheme_boundary(&self.query, self.query_cursor_byte);
+                self.reset_tab_completion();
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
             }
+            KeyCode::Right => {
+                self.query_cursor_byte =
+                    next_grapheme_boundary(&self.query, self.query_cursor_byte);
+                self.reset_tab_completion();
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::Home => {
+                self.query_cursor_byte = 0;
+                self.reset_tab_completion();
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::End => {
+                self.query_cursor_byte = self.query.len();
+                self.reset_tab_completion();
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::Delete => {
+                delete_at_cursor(&mut self.query, &mut self.query_cursor_byte);
+                self.selected = 0;
+                self.reset_tab_completion();
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::Enter => self.confirm_selected(buf, state, ctx, renderer),
             KeyCode::Esc => Ok(ModalAction::Close),
             _ => Ok(ModalAction::Continue),
         }
@@ -230,16 +354,45 @@ impl Modal for DirPicker {
         renderer: &mut dyn Renderer,
     ) -> Result<ModalAction> {
         // Paste goes into the query, not the main buffer
-        for c in text.chars() {
-            if c.is_control() {
-                continue; // skip newlines/control characters
-            }
-            self.query.push(c);
-        }
+        let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+        insert_at_cursor(&mut self.query, &mut self.query_cursor_byte, &clean);
         self.selected = 0;
         self.reset_tab_completion();
         self.draw(buf, state, ctx, renderer);
         Ok(ModalAction::Continue)
+    }
+
+    fn handle_pointer(
+        &mut self,
+        action: ModalPointerAction,
+        buf: &mut Buffer,
+        state: &mut UiState,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<ModalAction> {
+        match action {
+            ModalPointerAction::Select(index) => {
+                self.pointer_select_with(index, |picker| picker.draw(buf, state, ctx, renderer));
+                Ok(ModalAction::Continue)
+            }
+            ModalPointerAction::Confirm(index) => {
+                let cwd = ctx.working_dir.clone();
+                let previous_dir = ctx.previous_dir.clone();
+                let mut applied = false;
+                let result = self.apply_pointer_semantic_with(
+                    ModalPointerAction::Confirm(index),
+                    &cwd,
+                    previous_dir.as_deref(),
+                    |path| {
+                        apply_cd(ctx, path.to_path_buf()).map(|_| {
+                            applied = true;
+                        })
+                    },
+                );
+                self.finish_confirmation(result, applied, buf, state, ctx, renderer)
+            }
+            ModalPointerAction::Cancel => Ok(ModalAction::Close),
+        }
     }
 
     fn draw(&self, _buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
@@ -248,7 +401,7 @@ impl Modal for DirPicker {
         // buffer, which stays untouched while the modal is open).
         renderer.render(UiLine::InputPrompt {
             buf: self.query.clone(),
-            cursor_byte: self.query.len(),
+            cursor_byte: self.query_cursor_byte,
             menu: Some(payload),
             status: build_status(state, ctx),
             attachments: Vec::new(),
@@ -290,8 +443,7 @@ fn build_menu_payload(p: &DirPicker) -> MenuPayload {
         let mut current_labeled = false;
         items.extend(filtered.iter().map(|d| {
             let name = crate::platform::collapse_home(&d.to_string_lossy());
-            let desc = if !current_labeled
-                && crate::event_loop::commands::paths_same(d, &p.current)
+            let desc = if !current_labeled && crate::event_loop::commands::paths_same(d, &p.current)
             {
                 current_labeled = true;
                 crate::i18n::t(crate::i18n::Msg::DirCurrent).into_owned()
@@ -446,9 +598,148 @@ fn best_completion(query: &str, matches: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modals::ModalPointerAction;
 
     fn pb(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    #[test]
+    fn keyboard_and_pointer_share_directory_selection_and_confirmation_semantics() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("current");
+        let target = root.path().join("target");
+        std::fs::create_dir(&current).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let dirs = vec![current.clone(), target.clone()];
+        let mut keyboard = DirPicker::open(dirs.clone(), current.clone());
+        let mut pointer = DirPicker::open(dirs, current.clone());
+
+        keyboard.down();
+        pointer
+            .apply_pointer_semantic_with(ModalPointerAction::Select(1), &current, None, |_| {
+                unreachable!("selection must not dispatch a runtime command")
+            })
+            .unwrap();
+
+        let mut keyboard_runtime_command = None;
+        let keyboard_result = keyboard.confirm_selected_with(&current, None, |path| {
+            keyboard_runtime_command = Some(path.to_path_buf());
+            Ok(())
+        });
+        let mut pointer_runtime_command = None;
+        let pointer_result = pointer.apply_pointer_semantic_with(
+            ModalPointerAction::Confirm(1),
+            &current,
+            None,
+            |path| {
+                pointer_runtime_command = Some(path.to_path_buf());
+                Ok(())
+            },
+        );
+
+        assert_eq!(keyboard.selected, pointer.selected);
+        assert_eq!(keyboard.selected_path(), pointer.selected_path());
+        assert_eq!(keyboard_runtime_command, pointer_runtime_command);
+        assert_eq!(keyboard_result, pointer_result);
+
+        let mut keyboard_failed =
+            DirPicker::open(vec![current.clone(), target.clone()], current.clone());
+        let mut pointer_failed = DirPicker::open(vec![current.clone(), target], current.clone());
+        keyboard_failed.down();
+        pointer_failed
+            .apply_pointer_semantic_with(ModalPointerAction::Select(1), &current, None, |_| {
+                unreachable!("selection must not dispatch a runtime command")
+            })
+            .unwrap();
+        let keyboard_failure = keyboard_failed
+            .confirm_selected_with(&current, None, |_| Err("runtime rejected cd".to_string()));
+        let pointer_failure = pointer_failed.apply_pointer_semantic_with(
+            ModalPointerAction::Confirm(1),
+            &current,
+            None,
+            |_| Err("runtime rejected cd".to_string()),
+        );
+
+        assert_eq!(keyboard_failure, pointer_failure);
+        assert!(matches!(
+            pointer_failure,
+            Err(DirConfirmFailure::Redraw(ref error)) if error == "runtime rejected cd"
+        ));
+        assert_eq!(keyboard_failed.selected, pointer_failed.selected);
+        assert_eq!(
+            keyboard_failed.selected_path(),
+            pointer_failed.selected_path()
+        );
+    }
+
+    #[test]
+    fn real_directory_payload_keeps_surface_identity_across_selection_chrome() {
+        let mut picker = DirPicker::open(
+            vec![pb("/workspace/alpha"), pb("/workspace/beta")],
+            pb("/workspace/alpha"),
+        );
+        let before = UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: Some(build_menu_payload(&picker)),
+            status: Default::default(),
+            attachments: Vec::new(),
+        };
+        picker.down();
+        let after = UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: Some(build_menu_payload(&picker)),
+            status: Default::default(),
+            attachments: Vec::new(),
+        };
+
+        assert_eq!(
+            crate::render::worker::interaction_surface_for_line(&before),
+            crate::render::worker::interaction_surface_for_line(&after),
+            "title position and selected chrome are not selectable identity"
+        );
+    }
+
+    #[test]
+    fn pointer_selection_redraws_only_when_directory_index_changes() {
+        let mut picker = DirPicker::open(
+            vec![pb("/workspace/alpha"), pb("/workspace/beta")],
+            pb("/workspace/alpha"),
+        );
+        let mut redraws = 0;
+
+        picker.pointer_select_with(0, |_| redraws += 1);
+        picker.pointer_select_with(1, |_| redraws += 1);
+        picker.pointer_select_with(1, |_| redraws += 1);
+
+        assert_eq!(redraws, 1);
+        assert_eq!(picker.selected, 1);
+    }
+
+    #[test]
+    fn confirmation_preserves_redraw_vs_flush_only_failure_semantics() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("current");
+        std::fs::create_dir(&current).unwrap();
+        let file = root.path().join("not-a-directory");
+        std::fs::write(&file, "x").unwrap();
+
+        let invalid = DirPicker {
+            query: "./missing".into(),
+            ..DirPicker::open(Vec::new(), current.clone())
+        };
+        assert!(matches!(
+            invalid.confirm_selected_with(&current, None, |_| Ok(())),
+            Err(DirConfirmFailure::Redraw(_))
+        ));
+
+        let not_directory = DirPicker::open(vec![file], current.clone());
+        assert!(matches!(
+            not_directory.confirm_selected_with(&current, None, |_| Ok(())),
+            Err(DirConfirmFailure::FlushOnly(_))
+        ));
     }
 
     #[test]
@@ -624,7 +915,10 @@ mod tests {
         // carry the "current" label — two "current" markers is a bug.
         let p = DirPicker::open(vec![pb("/proj"), pb("/proj")], pb("/proj"));
         let payload = build_menu_payload(&p);
-        assert_eq!(payload.items[DIR_HEADER_ROWS].1, "current", "first match labeled");
+        assert_eq!(
+            payload.items[DIR_HEADER_ROWS].1, "current",
+            "first match labeled"
+        );
         assert_eq!(
             payload.items[DIR_HEADER_ROWS + 1].1,
             "",

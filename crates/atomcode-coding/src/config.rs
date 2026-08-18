@@ -21,6 +21,10 @@ pub struct CodingAgentConfig {
     /// Final image-input capability resolved from the model profile override or
     /// the backwards-compatible Auto heuristic.
     pub supports_vision: bool,
+    /// Whether this concrete endpoint accepts a reasoning-effort control.
+    /// Kept separate from `chat_options.reasoning_effort`: API-default effort is
+    /// still a supported endpoint with no per-call value.
+    pub supports_reasoning_effort: bool,
     /// Preferred language for natural-language commit subjects and bodies.
     /// `None` means follow the current conversation language.
     pub preferred_language: Option<Locale>,
@@ -49,10 +53,10 @@ pub struct CodingAgentConfig {
     pub request_timeout: Option<Duration>,
     /// Safety fuse: max edit-then-verify continuations per turn (kernel default is 50).
     pub max_continuations: u32,
-    /// Coarse safety fuse for LLM/tool rounds in one turn (`0` = unbounded).
-    /// This bounds varying-call runaways that the kernel's repetition guards cannot catch.
-    /// It is deliberately generous, produces an explicit incomplete terminal, and may be
-    /// overridden with `ATOMCODE_TURN_MAX_ROUNDS`.
+    /// Optional coarse safety fuse for LLM/tool rounds in one turn (`0` = unbounded).
+    /// Deployments that need an additional varying-call runaway budget can opt in through
+    /// `[coding].max_rounds` or `ATOMCODE_TURN_MAX_ROUNDS`; exact repetition guards remain
+    /// active independently.
     pub max_rounds: u32,
     /// When true, the kernel turns the `max_rounds` cap into an interactive
     /// checkpoint (see AgentBuilder). Default false; only the TUI driver sets it.
@@ -128,6 +132,7 @@ pub struct CodingAgentConfig {
     /// an interruption marker, forwarded to the kernel `Agent` builder
     /// (`keep_interrupted_context`). Sourced from `Config::keep_interrupted_context`.
     pub keep_interrupted_context: bool,
+    pub credential_shell_policy: atomcode_capabilities::tools::CredentialShellPolicy,
     /// Per-provider User-Agent override (`ProviderConfig::user_agent`). `None` ⇒
     /// `build_provider` falls back to the product `atomcode/<version>` so the gateway
     /// can attribute/slice traffic by version. Restores parity with v1's
@@ -136,6 +141,11 @@ pub struct CodingAgentConfig {
     /// Disable TLS certificate verification (self-signed / internal gateways).
     /// Sourced from `ProviderConfig::skip_tls_verify`; default false.
     pub skip_tls_verify: bool,
+    /// Max attempts (including the first request) for provider OPEN retries;
+    /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
+    /// each layer's default.
+    /// Sourced from `ProviderConfig::retry_max_attempts`.
+    pub retry_max_attempts: Option<u32>,
     /// Full provider registry used to resolve task-tool fast/capable tiers.
     pub subagent_config: Option<Arc<atomcode_config::config::Config>>,
     /// Swap-aware, lazily-built FAST-tier provider for the `task` tool. `None` ⇒ the fast
@@ -147,6 +157,8 @@ pub struct CodingAgentConfig {
     pub subagent_fast_provider: Option<Arc<TierProvider>>,
     /// Swap-aware, lazily-built CAPABLE-tier provider (same contract as above).
     pub subagent_capable_provider: Option<Arc<TierProvider>>,
+    /// Swap-aware resolver for an explicit `task.tasks[].model` selection id.
+    pub subagent_model_providers: Option<Arc<SubagentModelProviders>>,
 }
 
 /// Host-resolved inputs shared by CLI and daemon runtime construction.
@@ -174,8 +186,13 @@ pub struct CodingRuntimeConfig {
     pub dangerously_skip_permissions: bool,
     pub interactive: bool,
     pub keep_interrupted_context: bool,
+    pub credential_shell_policy: atomcode_capabilities::tools::CredentialShellPolicy,
     pub user_agent: Option<String>,
     pub skip_tls_verify: bool,
+    /// Max attempts (including the first request) for provider OPEN retries;
+    /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
+    /// each layer's default.
+    pub retry_max_attempts: Option<u32>,
     pub loop_max_rounds: u32,
     pub turn_max_rounds: u32,
     pub subagent_config: Option<Arc<atomcode_config::config::Config>>,
@@ -213,6 +230,22 @@ pub fn lsp_settings_from_config(
                 )
             })
             .collect(),
+    }
+}
+
+pub fn credential_shell_policy_from_config(
+    policy: atomcode_config::config::ShellGuardPolicy,
+) -> atomcode_capabilities::tools::CredentialShellPolicy {
+    match policy {
+        atomcode_config::config::ShellGuardPolicy::Off => {
+            atomcode_capabilities::tools::CredentialShellPolicy::Off
+        }
+        atomcode_config::config::ShellGuardPolicy::Prompt => {
+            atomcode_capabilities::tools::CredentialShellPolicy::Prompt
+        }
+        atomcode_config::config::ShellGuardPolicy::Strict => {
+            atomcode_capabilities::tools::CredentialShellPolicy::Strict
+        }
     }
 }
 
@@ -272,8 +305,12 @@ impl CodingRuntimeConfig {
             dangerously_skip_permissions,
             interactive,
             keep_interrupted_context: config.keep_interrupted_context,
+            credential_shell_policy: credential_shell_policy_from_config(
+                config.coding.shell_guard_policy,
+            ),
             user_agent: r.and_then(|r| r.user_agent.clone()),
             skip_tls_verify: r.map(|r| r.skip_tls_verify).unwrap_or(false),
+            retry_max_attempts: r.and_then(|r| r.retry_max_attempts),
             loop_max_rounds: resolve_loop_max_rounds(
                 config.loop_config.max_rounds,
                 std::env::var("ATOMCODE_LOOP_MAX_ROUNDS").ok().as_deref(),
@@ -300,6 +337,9 @@ impl CodingRuntimeConfig {
         );
         config.context_window = self.context_window;
         config.supports_vision = self.supports_vision;
+        config.supports_reasoning_effort = self.reasoning_effort.is_some()
+            || (atomcode_config::config::is_codingplan_provider_name(&self.provider_name)
+                && self.model.eq_ignore_ascii_case("deepseek-v4-flash"));
         config.preferred_language = self.preferred_language;
         config.todo = self.todo.clone();
         config.provider_name = self.provider_name.clone();
@@ -317,6 +357,7 @@ impl CodingRuntimeConfig {
         config.thinking_keep = self.thinking_keep.clone();
         config.user_agent = self.user_agent.clone();
         config.skip_tls_verify = self.skip_tls_verify;
+        config.retry_max_attempts = self.retry_max_attempts;
         config.loop_max_rounds = self.loop_max_rounds;
         config.max_rounds = self.turn_max_rounds;
         config.subagent_config = self.subagent_config.clone();
@@ -324,6 +365,7 @@ impl CodingRuntimeConfig {
             config.request_timeout = None;
         }
         config.keep_interrupted_context = self.keep_interrupted_context;
+        config.credential_shell_policy = self.credential_shell_policy;
         config.round_cap_checkpoint = self.round_cap_checkpoint;
         config.next_prompt_suggestions = self.next_prompt_suggestions;
         config.lsp = self.lsp.clone();
@@ -348,6 +390,7 @@ pub fn apply_provider_config(
     config.chat_options.reasoning_effort = atomcode_kernel::provider::ReasoningEffort::from_config(
         provider.reasoning_effort.as_deref(),
     );
+    config.supports_reasoning_effort = provider.reasoning_effort.is_some();
     config.provider_type = provider.provider_type.clone();
     config.reasoning_history = provider.reasoning_history.clone();
     config.thinking_enabled = provider.thinking_enabled;
@@ -355,12 +398,120 @@ pub fn apply_provider_config(
     config.thinking_keep = provider.thinking_keep.clone();
     config.user_agent = provider.user_agent.clone();
     config.skip_tls_verify = provider.skip_tls_verify;
+    config.retry_max_attempts = provider.retry_max_attempts;
 }
 
 /// A thunk the runtime supplies that constructs a (gateway-signed) tier provider. `Some` on
 /// success, `None` if construction failed (⇒ the tier falls back to the host provider).
 pub type SubagentProvider =
     Arc<dyn Fn() -> Option<Arc<dyn atomcode_kernel::provider::LlmProvider>> + Send + Sync>;
+
+pub type SubagentModelResolver = Arc<
+    dyn Fn(&str) -> Result<Option<Arc<dyn atomcode_kernel::provider::LlmProvider>>, String>
+        + Send
+        + Sync,
+>;
+
+pub(crate) type SubagentUsageRecorderFactory =
+    Arc<dyn Fn(&str, &str) -> atomcode_capabilities::session::DetachedUsageRecorder + Send + Sync>;
+pub(crate) type SubagentTelemetryProviderFactory = Arc<
+    dyn Fn(
+            &str,
+            Arc<dyn atomcode_kernel::provider::LlmProvider>,
+        ) -> Result<Arc<dyn atomcode_kernel::provider::LlmProvider>, String>
+        + Send
+        + Sync,
+>;
+
+/// Swap-aware resolver for an explicit per-task model selection. Unlike a tier
+/// cell it intentionally does not cache: every isolated child gets a fresh
+/// provider, while `/model` reload atomically replaces the resolver.
+pub struct SubagentModelProviders {
+    resolver: std::sync::RwLock<SubagentModelResolver>,
+    session_id: std::sync::RwLock<Option<String>>,
+    usage_recorder_factory: std::sync::RwLock<Option<SubagentUsageRecorderFactory>>,
+    telemetry_provider_factory: std::sync::RwLock<Option<SubagentTelemetryProviderFactory>>,
+}
+
+impl SubagentModelProviders {
+    pub fn new(resolver: SubagentModelResolver) -> Arc<Self> {
+        Arc::new(Self {
+            resolver: std::sync::RwLock::new(resolver),
+            session_id: std::sync::RwLock::new(None),
+            usage_recorder_factory: std::sync::RwLock::new(None),
+            telemetry_provider_factory: std::sync::RwLock::new(None),
+        })
+    }
+
+    pub fn get(
+        &self,
+        selection: &str,
+    ) -> Result<Option<Arc<dyn atomcode_kernel::provider::LlmProvider>>, String> {
+        let resolver = self
+            .resolver
+            .read()
+            .map_err(|_| "subagent model resolver is unavailable".to_string())?
+            .clone();
+        let mut provider = resolver(selection)?;
+        if let Some(inner) = provider.take() {
+            let model = inner.model_name().to_string();
+            let factory = self
+                .usage_recorder_factory
+                .read()
+                .ok()
+                .and_then(|value| value.clone());
+            let mut wrapped: Arc<dyn atomcode_kernel::provider::LlmProvider> = match factory {
+                Some(factory) => {
+                    Arc::new(atomcode_capabilities::session::UsageRecordingProvider::new(
+                        inner,
+                        factory(selection, &model),
+                    ))
+                }
+                None => inner,
+            };
+            let telemetry_factory = self
+                .telemetry_provider_factory
+                .read()
+                .map_err(|_| "subagent telemetry provider factory is unavailable".to_string())?
+                .clone();
+            if let Some(factory) = telemetry_factory {
+                wrapped = factory(selection, wrapped)?;
+            }
+            if let Some(session_id) = self.session_id.read().ok().and_then(|value| value.clone()) {
+                wrapped.bind_session_id(&session_id);
+            }
+            provider = Some(wrapped);
+        }
+        Ok(provider)
+    }
+
+    pub fn reset(&self, resolver: SubagentModelResolver) {
+        if let Ok(mut current) = self.resolver.write() {
+            *current = resolver;
+        }
+    }
+
+    pub fn set_session_id(&self, session_id: &str) {
+        if let Ok(mut current) = self.session_id.write() {
+            *current = Some(session_id.to_string());
+        }
+    }
+
+    pub(crate) fn set_usage_recorder_factory(&self, factory: SubagentUsageRecorderFactory) {
+        if let Ok(mut current) = self.usage_recorder_factory.write() {
+            *current = Some(factory);
+        }
+    }
+
+    pub(crate) fn set_telemetry_provider_factory(
+        &self,
+        factory: Option<SubagentTelemetryProviderFactory>,
+    ) {
+        if let Ok(mut current) = self.telemetry_provider_factory.write() {
+            *current = factory;
+        }
+    }
+}
 
 /// A `task`-tier provider cell: lazily built and SWAP-AWARE. Holds a `thunk` (re-resolvable
 /// on a `/model` swap) plus a lazily-populated build `cache`. `get()` builds on first use and
@@ -514,7 +665,7 @@ fn default_turn_max_rounds() -> u32 {
     std::env::var("ATOMCODE_TURN_MAX_ROUNDS")
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(200)
+        .unwrap_or(0)
 }
 
 fn default_tool_loop_policy() -> Option<ToolLoopPolicy> {
@@ -603,6 +754,7 @@ impl CodingAgentConfig {
             base_url: base_url.into(),
             provider_name: model.clone(),
             supports_vision: atomcode_capabilities::provider::model_suggests_vision(&model),
+            supports_reasoning_effort: false,
             model,
             preferred_language: None,
             todo: Default::default(),
@@ -630,11 +782,14 @@ impl CodingAgentConfig {
             web_search_provider: None,
             lsp: Default::default(),
             keep_interrupted_context: false,
+            credential_shell_policy: Default::default(),
             user_agent: None,
             skip_tls_verify: false,
+            retry_max_attempts: None,
             subagent_config: None,
             subagent_fast_provider: None,
             subagent_capable_provider: None,
+            subagent_model_providers: None,
         }
     }
 }
@@ -644,9 +799,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_caps_have_generous_defaults() {
+    fn shell_guard_policy_maps_at_the_coding_boundary() {
+        assert_eq!(
+            credential_shell_policy_from_config(atomcode_config::config::ShellGuardPolicy::Off),
+            atomcode_capabilities::tools::CredentialShellPolicy::Off
+        );
+        assert_eq!(
+            credential_shell_policy_from_config(atomcode_config::config::ShellGuardPolicy::Prompt),
+            atomcode_capabilities::tools::CredentialShellPolicy::Prompt
+        );
+        assert_eq!(
+            credential_shell_policy_from_config(atomcode_config::config::ShellGuardPolicy::Strict),
+            atomcode_capabilities::tools::CredentialShellPolicy::Strict
+        );
+    }
+
+    #[test]
+    fn ordinary_turns_are_unbounded_by_default() {
         let c = CodingAgentConfig::new("k", "https://x/v1", "m", "/tmp");
-        assert_eq!(c.max_rounds, 200);
+        assert_eq!(c.max_rounds, 0);
         // No CodingPlan info at construction → the non-CodingPlan fallback.
         assert_eq!(c.goal_max_rounds, 300);
         // The wall-clock cap is OFF by default (0 = disabled); the goal is bounded
@@ -939,6 +1110,118 @@ mod tests {
         let c = CodingAgentConfig::new("k", "https://api.example.com/v1", "m", "/tmp");
         assert!(c.subagent_fast_provider.is_none());
         assert!(c.subagent_capable_provider.is_none());
+        assert!(c.subagent_model_providers.is_none());
+    }
+
+    #[test]
+    fn explicit_subagent_model_resolver_refreshes_and_binds_parent_session() {
+        use std::sync::Mutex;
+
+        struct RecP {
+            model: &'static str,
+            bound: Arc<Mutex<Option<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl atomcode_kernel::provider::LlmProvider for RecP {
+            fn model_name(&self) -> &str {
+                self.model
+            }
+
+            fn bind_session_id(&self, id: &str) {
+                *self.bound.lock().unwrap() = Some(id.to_string());
+            }
+
+            async fn chat_stream(
+                &self,
+                _messages: &[atomcode_kernel::message::Message],
+                _tools: &[atomcode_kernel::tool::ToolDef],
+                _options: &atomcode_kernel::provider::ChatOptions,
+            ) -> Result<
+                futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+                atomcode_kernel::stream::ProviderError,
+            > {
+                unreachable!("not called in this test")
+            }
+        }
+
+        let first_bound = Arc::new(Mutex::new(None));
+        let first_capture = first_bound.clone();
+        let resolver: SubagentModelResolver = Arc::new(move |selection| {
+            assert_eq!(selection, "chosen");
+            Ok(Some(Arc::new(RecP {
+                model: "first",
+                bound: first_capture.clone(),
+            })))
+        });
+        let cell = SubagentModelProviders::new(resolver);
+        cell.set_session_id("parent-session");
+        let usage_calls = Arc::new(Mutex::new(Vec::new()));
+        let usage_capture = usage_calls.clone();
+        let usage_dir = tempfile::tempdir().unwrap();
+        let usage_manager = Arc::new(atomcode_capabilities::session::SessionManager::with_root(
+            usage_dir.path(),
+        ));
+        cell.set_usage_recorder_factory(Arc::new(move |selection, model| {
+            usage_capture
+                .lock()
+                .unwrap()
+                .push((selection.to_string(), model.to_string()));
+            atomcode_capabilities::session::DetachedUsageRecorder::new(
+                usage_manager.clone(),
+                "parent-session",
+                selection,
+                model,
+            )
+        }));
+        let telemetry_calls = Arc::new(Mutex::new(Vec::new()));
+        let telemetry_capture = telemetry_calls.clone();
+        cell.set_telemetry_provider_factory(Some(Arc::new(move |selection, provider| {
+            telemetry_capture
+                .lock()
+                .unwrap()
+                .push((selection.to_string(), provider.model_name().to_string()));
+            Ok(provider)
+        })));
+
+        let first = cell.get("chosen").unwrap().unwrap();
+        assert_eq!(first.model_name(), "first");
+        assert_eq!(
+            first_bound.lock().unwrap().as_deref(),
+            Some("parent-session")
+        );
+
+        let second_bound = Arc::new(Mutex::new(None));
+        let second_capture = second_bound.clone();
+        cell.reset(Arc::new(move |_| {
+            Ok(Some(Arc::new(RecP {
+                model: "second",
+                bound: second_capture.clone(),
+            })))
+        }));
+
+        let second = cell.get("chosen").unwrap().unwrap();
+        assert_eq!(second.model_name(), "second");
+        assert_eq!(
+            second_bound.lock().unwrap().as_deref(),
+            Some("parent-session"),
+            "resolver refresh must preserve the conversation identity"
+        );
+        assert_eq!(
+            *usage_calls.lock().unwrap(),
+            vec![
+                ("chosen".to_string(), "first".to_string()),
+                ("chosen".to_string(), "second".to_string()),
+            ],
+            "every explicit model child must receive fresh cost attribution"
+        );
+        assert_eq!(
+            *telemetry_calls.lock().unwrap(),
+            vec![
+                ("chosen".to_string(), "first".to_string()),
+                ("chosen".to_string(), "second".to_string()),
+            ],
+            "every explicit model child must pass through the telemetry decorator"
+        );
     }
 
     #[test]

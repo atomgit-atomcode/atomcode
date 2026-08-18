@@ -2,8 +2,9 @@
 
 // Redirect ATOMCODE_HOME to a throwaway temp dir before any test in this binary
 // runs, so the crate's own unit tests never persist commands/plugins/config into
-// the developer's real `~/.atomcode`. Tests that set their own ATOMCODE_HOME still
-// win (isolate_home is a no-op when the var is already set).
+// the developer's real `~/.atomcode`. Individual tests can install their own
+// temporary home after the ctor; inherited shell values are never reused as
+// disposable test state.
 #[cfg(test)]
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
@@ -57,7 +58,6 @@ use crate::event_loop::{run_loop, LoopCtx};
 pub use crate::event_loop::{
     RuntimeControl, RuntimeEndpoint, RuntimeSpawnOverride, SpawnedRuntime,
 };
-use crate::input::history::History;
 use crate::input::reader;
 use crate::render::{
     plain::PlainRenderer, retained::RetainedRenderer, worker::TaskRenderer, Renderer,
@@ -449,7 +449,12 @@ pub async fn run(
         atomcode_config::config::UiTheme::Light => true,
         atomcode_config::config::UiTheme::Dark => false,
         atomcode_config::config::UiTheme::Auto => {
-            if caps.colors && !force_plain {
+            if caps.colors
+                && !force_plain
+                && crate::terminal_bg::should_query_background(
+                    std::env::var("TERM_PROGRAM").ok().as_deref(),
+                )
+            {
                 crate::terminal_bg::detect_light(std::time::Duration::from_millis(60))
                     .unwrap_or(false)
             } else {
@@ -492,8 +497,12 @@ pub async fn run(
     // auto-trigger; the modal would otherwise try to draw a
     // Cyan-bordered box into a stdout that no human is watching.
     let is_plain_renderer = !caps.tty;
+    let interaction_publisher = crate::render::interaction::InteractionPublisher::default();
     let mut inner: Box<dyn Renderer> = if caps.tty {
-        Box::new(RetainedRenderer::new(caps))
+        Box::new(RetainedRenderer::new_with_interactions(
+            caps,
+            interaction_publisher.clone(),
+        ))
     } else {
         // Pass caps + the ORIGINAL tty value so PlainRenderer can:
         // (a) gate colours / unicode / spinner on caps.{colors,
@@ -521,7 +530,14 @@ pub async fn run(
     inner.set_auto_copy_enabled(auto_copy);
     let history_replay_max_rows = resolve_history_replay_max_rows(&config, &caps);
     inner.set_history_replay_max_rows(history_replay_max_rows);
-    let mut renderer: Box<dyn Renderer> = Box::new(TaskRenderer::new(inner));
+    let mut renderer: Box<dyn Renderer> = if caps.tty {
+        Box::new(TaskRenderer::new_with_interactions(
+            inner,
+            interaction_publisher.clone(),
+        ))
+    } else {
+        Box::new(TaskRenderer::new(inner))
+    };
 
     // Input thread (only spawn when raw-mode/TTY available; pipe mode
     // reads stdin directly). `reader_handle` exposes Pause / Resume so
@@ -565,11 +581,9 @@ pub async fn run(
     // with a hardcoded Unix path is gone — Windows used to fall here
     // and then fail to write to `/tmp`.
     let history_start = std::time::Instant::now();
-    let history = {
-        let path = History::default_path().unwrap_or_else(crate::platform::history_path);
-        let cache = crate::platform::image_cache_dir();
-        crate::input::history::History::load_with_cache(path, cache)
-    };
+    let history = crate::input::history::History::load_project(
+        crate::platform::project_history_paths(&working_dir),
+    );
     crate::tuix_trace!(
         "START",
         "stage=history_load elapsed_ms={} total_ms={}",
@@ -726,6 +740,12 @@ pub async fn run(
         event_rx,
         runtime_event_tx.clone(),
     );
+    let (session_preview_request_tx, session_preview_request_rx) =
+        tokio::sync::watch::channel(None);
+    event_loop::bg_runtime::spawn_session_preview_loader(
+        session_preview_request_rx,
+        runtime_event_tx.clone(),
+    );
     let bg_manager = event_loop::bg_runtime::BgRuntimeManager::new(
         current_session.clone(),
         working_dir.clone(),
@@ -782,6 +802,7 @@ pub async fn run(
 
     let file_index_root = working_dir.clone();
     let ctx = LoopCtx {
+        interaction_publisher,
         config,
         provider_selection,
         model_name,
@@ -816,6 +837,8 @@ pub async fn run(
         previous_dir: None,
         recent_dirs,
         history,
+        deferred_histories: Vec::new(),
+        history_rebound: false,
         input_rx,
         commands: CommandRegistry::builtin(),
         current_session,
@@ -852,7 +875,12 @@ pub async fn run(
         current_session_project_bucket: None,
         pending_session_resume: None,
         pending_session_resume_preparation: None,
+        next_session_resume_operation_id: 1,
         pending_session_picker: None,
+        session_preview_request_tx,
+        next_session_preview_generation: 1,
+        session_preview_selection: None,
+        session_preview_result: None,
         pending_rewind_catalog: None,
         pending_session_transition: None,
         pending_external_session_projection: None,
@@ -957,6 +985,9 @@ mod panic_restore_tests {
             jediterm: false,
             modern_emulator: true,
             kitty_keyboard: true,
+            mouse_sgr: true,
+            osc52_clipboard: true,
+            tmux_passthrough: false,
         }
     }
 

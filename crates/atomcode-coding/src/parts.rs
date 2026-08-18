@@ -257,6 +257,10 @@ pub struct CodingParts {
     pub write_approval_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
     pub bash_workspace_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
     pub sensitive_path_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+    /// "Always allow" grants for the credential shell gate. Shared so an approved
+    /// credential command survives a model swap / capability re-prepare (mirrors the
+    /// sibling gates above); otherwise the user re-approves it every time.
+    pub credential_shell_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
     /// Provider slot for the `code_review` sub-agent tool, FILLED by [`assemble`] (the tool
     /// is built in `prepare` before the provider exists). Shared so a respawn/model-swap
     /// updates the reviewer's provider too. `None` when `opts.review` was false.
@@ -471,6 +475,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             let cap_cell = cfg.subagent_capable_provider.clone();
             let slot_fast = slot.clone();
             let slot_cap = slot.clone();
+            let slot_host = slot.clone();
             let make_fast = move || {
                 fast_cell.as_ref().and_then(|c| c.get()).unwrap_or_else(|| {
                     slot_fast
@@ -489,25 +494,36 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                         .expect("subagent provider slot filled at assemble before any turn")
                 })
             };
+            let make_host = move || {
+                slot_host
+                    .read()
+                    .ok()
+                    .and_then(|provider| provider.clone())
+                    .expect("subagent provider slot filled at assemble before any turn")
+            };
 
             // `[subagent]` live knobs. `timeout_secs` remains parse-only compatibility:
             // a productive child is never cancelled for total wall-clock age.
             let task_team_manager = team_manager.clone();
-            registry.register(Arc::new(
-                TaskTool::new(
-                    make_fast,
-                    make_capable,
-                    make_explore_tools,
-                    make_worker_tools,
-                )
+            let mut task_tool = TaskTool::new(
+                make_fast,
+                make_capable,
+                make_explore_tools,
+                make_worker_tools,
+            )
+                .with_host_provider(make_host)
                 .with_max_concurrent(subagent_max_concurrent)
                 .with_max_rounds(subagent_max_rounds)
                 .with_tool_loop_policy(cfg.tool_loop_policy)
+                .with_credential_shell_policy(cfg.credential_shell_policy)
                 .with_worker_middleware(turn_execution_policy.clone())
                 .with_team_event_sink(Arc::new(move |event| {
                     task_team_manager.publish_external(event);
-                })),
-            ));
+                }));
+            if let Some(models) = cfg.subagent_model_providers.clone() {
+                task_tool = task_tool.with_named_provider(move |selection| models.get(selection));
+            }
+            registry.register(Arc::new(task_tool));
             names.push("task".to_string());
             Some(slot)
         } else {
@@ -561,6 +577,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 Some(cfg.stream_timeout),
                 cfg.request_timeout,
             )
+            .with_credential_shell_policy(cfg.credential_shell_policy)
             .with_worker_middleware(turn_execution_policy.clone());
         registry.register(Arc::new(crate::team::TeamTool::new(
             team_manager.clone(),
@@ -759,11 +776,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 .with_persistence_status(snapshot_hook.persistence_status()),
         ));
     }
-    // Status awareness is UNCONDITIONAL (production parity): a per-turn <system-reminder>
-    // with date + round budget (NO context-usage gauge — pressure is handled silently by
-    // auto-compaction, never pushed to the model). Serves recall's relative-date resolution and
-    // lets the model pace itself. Injected from round 2 of each turn (round 1 is skipped — see
-    // StatusReminderHook — to avoid a user-after-user wire pair).
+    // Date awareness is UNCONDITIONAL (production parity): a per-turn <system-reminder> serves
+    // recall's relative-date resolution. Runtime pressure (context usage and round counters) is
+    // deliberately kept internal; projecting it made weak models invent urgency and rush work.
+    // Injected from round 2 of each turn (round 1 is skipped — see StatusReminderHook — to avoid
+    // a user-after-user wire pair).
     hooks.push(Arc::new(StatusReminderHook::new()));
     // Pin the workspace root the cadence uses to gate out-of-workspace edits (e.g. a throwaway
     // /tmp write must not arm the "run cargo check" nudge). INVARIANT: this must equal the dir
@@ -855,6 +872,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             atomcode_capabilities::tools::InMemoryPermissionStore::new(),
         ),
         sensitive_path_grants: std::sync::Arc::new(
+            atomcode_capabilities::tools::InMemoryPermissionStore::new(),
+        ),
+        credential_shell_grants: std::sync::Arc::new(
             atomcode_capabilities::tools::InMemoryPermissionStore::new(),
         ),
         registry,
@@ -995,6 +1015,7 @@ impl CodingParts {
         self.write_approval_grants = Arc::clone(&previous.write_approval_grants);
         self.bash_workspace_grants = Arc::clone(&previous.bash_workspace_grants);
         self.sensitive_path_grants = Arc::clone(&previous.sensitive_path_grants);
+        self.credential_shell_grants = Arc::clone(&previous.credential_shell_grants);
     }
 
     /// Preserve the exact current conversation across a sessionless provider reassembly.
@@ -1476,13 +1497,15 @@ pub fn assemble(
         cfg.context_window,
     )
     .map(Arc::new);
-    let rate_limit_hook: Arc<dyn LifecycleHooks> = match &parts.rate_limit_source {
-        Some(source) => Arc::new(crate::rate_limit::RateLimitHook::with_source(
+    let rate_limit_hook = match &parts.rate_limit_source {
+        Some(source) => crate::rate_limit::RateLimitHook::with_source(
             cfg.base_url.clone(),
             source.clone(),
-        )),
-        None => Arc::new(crate::rate_limit::RateLimitHook::new(cfg.base_url.clone())),
-    };
+        ),
+        None => crate::rate_limit::RateLimitHook::new(cfg.base_url.clone()),
+    }
+    .with_max_attempts(cfg.retry_max_attempts);
+    let rate_limit_hook: Arc<dyn LifecycleHooks> = Arc::new(rate_limit_hook);
     let mut builder = builder
         // Hard per-turn user boundary. Register before every middleware that can `Allow`
         // and bypass downstream approval gates.
@@ -1511,7 +1534,10 @@ pub fn assemble(
         // approval-oriented SensitivePathGate so an explicit extraction cannot be
         // downgraded from terminal denial into a retryable approval denial.
         .middleware(Arc::new(
-            atomcode_capabilities::tools::CredentialBashGate::new(),
+            atomcode_capabilities::tools::CredentialBashGate::with_store(
+                cfg.credential_shell_policy,
+                parts.credential_shell_grants.clone(),
+            ),
         ))
         // Sensitive-path read gate: read tools are Safe (skip approval), so without this an
         // agent could silently read ~/.ssh / .env / creds and leak them to the provider.
@@ -1601,6 +1627,12 @@ pub fn assemble(
     if cfg.max_rounds != 0 {
         builder = builder.max_rounds(cfg.max_rounds);
     }
+    // An explicit retry_max_attempts value is the TOTAL adapter OPEN budget.
+    // Do not multiply it by the kernel's historical outer same-round retries;
+    // the neutral kernel default remains unchanged when the setting is absent.
+    if cfg.retry_max_attempts.is_some() {
+        builder = builder.max_provider_retries(0);
+    }
     builder = builder.round_cap_checkpoint(cfg.round_cap_checkpoint);
     // Approval liveness: `Some(d)` ⇒ fail-closed after `d` (headless); `None` ⇒ PARK until
     // answered (interactive — a present human must not be auto-denied). The kernel defaults
@@ -1646,6 +1678,25 @@ pub fn assemble(
         if let Some(cell) = &cfg.subagent_capable_provider {
             cell.set_session_id(&b.id);
         }
+        if let Some(models) = &cfg.subagent_model_providers {
+            models.set_session_id(&b.id);
+            let manager = b.manager.clone();
+            let session_id = b.id.clone();
+            let persistence_status = parts.snapshot_persistence_status();
+            models.set_usage_recorder_factory(Arc::new(move |selection, model| {
+                let mut recorder =
+                    atomcode_capabilities::session::DetachedUsageRecorder::new(
+                        manager.clone(),
+                        &session_id,
+                        selection,
+                        model,
+                    );
+                if let Some(status) = persistence_status.clone() {
+                    recorder = recorder.with_persistence_status(status);
+                }
+                recorder
+            }));
+        }
         if let Some(registry) = cfg.subagent_config.as_deref() {
             if let Some((fast_key, capable_key)) =
                 crate::subagent_tiers::resolve_tier_keys(registry, &cfg.model)
@@ -1690,6 +1741,45 @@ pub fn assemble(
         );
         builder = builder.resume(snapshot);
     }
+    if let Some(models) = cfg.subagent_model_providers.as_ref() {
+        let telemetry_factory = match (cfg.telemetry.as_ref(), cfg.subagent_config.as_ref()) {
+            (Some(telemetry), Some(model_config)) => {
+                let telemetry = telemetry.clone();
+                let model_config = model_config.clone();
+                let mut base_config = cfg.clone();
+                // The decorator is stored inside `subagent_model_providers`; do not
+                // capture that same Arc through the cloned runtime config.
+                base_config.subagent_fast_provider = None;
+                base_config.subagent_capable_provider = None;
+                base_config.subagent_model_providers = None;
+                base_config.subagent_config = None;
+                let session_id = parts.session.as_ref().map(|binding| binding.id.clone());
+                Some(Arc::new(move |selection: &str, provider| {
+                    let resolved = model_config
+                        .resolve_model(Some(selection))
+                        .map_err(|error| error.to_string())?;
+                    let tier = crate::provider_factory::derive_tier_config_from_resolved(
+                        &base_config,
+                        &resolved,
+                    );
+                    Ok(Arc::new(
+                        crate::telemetry::MeteredProvider::new(
+                            provider,
+                            telemetry.clone(),
+                            tier.provider_type.as_str(),
+                            &tier.base_url,
+                            &tier.model,
+                            session_id.as_deref(),
+                        )
+                        .with_surface("subagent"),
+                    ) as Arc<dyn LlmProvider>)
+                })
+                    as crate::config::SubagentTelemetryProviderFactory)
+            }
+            _ => None,
+        };
+        models.set_telemetry_provider_factory(telemetry_factory);
+    }
     // Ensure the repo's `atomcode` project label after a successful `git push` to a
     // gitcode/atomgit remote. THIS is the production mount: the terminal TUI, daemon, and
     // webui all build their agent here via `parts::assemble`. (`assemble.rs::build_coding_agent`
@@ -1722,11 +1812,6 @@ const ATOMCODE_PERSONA_PREFIX: &str =
     "You are AtomCode, an AI coding agent by AtomGit running the ";
 const MODEL_CHANGE_CONTEXT_PREFIX: &str = "=== MODEL CHANGE ===";
 
-fn persona_model(text: &str) -> Option<&str> {
-    text.strip_prefix(ATOMCODE_PERSONA_PREFIX)
-        .and_then(|rest| rest.split_once(" model.").map(|(model, _)| model))
-}
-
 /// Legacy drivers persist conversation history without the separately supplied
 /// system prompt. A v2 resume must restore that prompt, while a model switch must
 /// replace the old model identity instead of retaining or duplicating it.
@@ -1752,22 +1837,6 @@ fn reconcile_coding_persona(
     let is_model_change = |message: &Message| {
         message.role == Role::System && message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX)
     };
-    let previous_model = snapshot
-        .messages
-        .iter()
-        .find(|message| is_persona(message))
-        .and_then(|message| persona_model(&message.text))
-        .map(str::to_owned);
-    let retained_model_change = if previous_model.as_deref() == Some(cfg.model.as_str()) {
-        snapshot
-            .messages
-            .iter()
-            .rev()
-            .find(|message| is_model_change(message))
-            .cloned()
-    } else {
-        None
-    };
     let already_current = snapshot
         .messages
         .first()
@@ -1782,7 +1851,7 @@ fn reconcile_coding_persona(
             .iter()
             .filter(|message| is_model_change(message))
             .count()
-            <= 1;
+            == 0;
     if already_current {
         return;
     }
@@ -1791,14 +1860,6 @@ fn reconcile_coding_persona(
         .messages
         .retain(|message| !is_persona(message) && !is_model_change(message));
     snapshot.messages.insert(0, Message::system(persona));
-    if let Some(previous_model) = previous_model.filter(|previous| previous != &cfg.model) {
-        snapshot.messages.push(Message::system(format!(
-            "{MODEL_CHANGE_CONTEXT_PREFIX}\nThe active model changed from {previous_model} to {model}. From this point onward, {model} is the current model. Treat any earlier assistant claim about its model identity as historical context, not the current runtime identity.",
-            model = cfg.model
-        )));
-    } else if let Some(model_change) = retained_model_change {
-        snapshot.messages.push(model_change);
-    }
     snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
 }
 
@@ -1883,7 +1944,6 @@ mod tests {
             }
         }
     }
-
     #[test]
     fn subagent_env_gate() {
         use super::subagent_enabled_from_env as g;
@@ -2018,25 +2078,16 @@ mod tests {
             .text
             .contains("running the deepseek-v4-flash model"));
         assert!(!snapshot.messages[0].text.contains("old-model"));
-        let transitions: Vec<_> = snapshot
+        assert!(!snapshot
             .messages
             .iter()
-            .filter(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX))
-            .collect();
-        assert_eq!(transitions.len(), 1);
-        assert!(transitions[0].text.contains("old-model"));
-        assert!(transitions[0].text.contains("deepseek-v4-flash"));
-        assert_eq!(
-            snapshot.messages.last(),
-            transitions.first().copied(),
-            "the model-change boundary must be the most recent system context"
-        );
+            .any(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX)));
         assert_eq!(snapshot.cache_epoch, 1);
     }
 
     #[test]
     #[serial_test::serial(offline_verdict)]
-    fn repeated_model_switch_keeps_one_current_transition_boundary() {
+    fn repeated_model_switch_keeps_system_context_leading() {
         atomcode_config::config::offline::reset_offline_verdict_for_test();
         let _rui_guard = std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
         let mut snapshot = SessionSnapshot::new(vec![
@@ -2045,6 +2096,7 @@ mod tests {
                 crate::persona::todo_switch_enabled(),
                 crate::persona::request_user_input_switch_enabled(),
             )),
+            Message::system("=== SESSION CONTEXT ===\nworkspace state"),
             Message::user("what model are you?"),
             Message::assistant("I am model-a", vec![]),
         ]);
@@ -2052,16 +2104,28 @@ mod tests {
         reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true, true);
         reconcile_coding_persona(&mut snapshot, &agent_config("model-c"), true, true, true, true);
 
-        let transitions: Vec<_> = snapshot
+        assert!(snapshot.messages[0]
+            .text
+            .contains("running the model-c model"));
+        assert_eq!(
+            snapshot.messages[1].text,
+            "=== SESSION CONTEXT ===\nworkspace state"
+        );
+        let first_non_system = snapshot
             .messages
             .iter()
-            .filter(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX))
-            .collect();
-        assert_eq!(transitions.len(), 1);
-        assert!(transitions[0].text.contains("model-b"));
-        assert!(transitions[0].text.contains("model-c"));
-        assert!(!transitions[0].text.contains("model-a"));
-        assert_eq!(snapshot.messages.last(), transitions.first().copied());
+            .position(|message| message.role != Role::System)
+            .expect("user history remains after the leading system block");
+        assert_eq!(first_non_system, 2);
+        assert!(snapshot.messages[first_non_system..]
+            .iter()
+            .all(|message| message.role != Role::System));
+        assert_eq!(snapshot.messages[first_non_system].text, "what model are you?");
+        assert_eq!(snapshot.messages[first_non_system + 1].text, "I am model-a");
+        assert!(!snapshot
+            .messages
+            .iter()
+            .any(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX)));
     }
 
     #[test]
@@ -2127,7 +2191,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial(offline_verdict)]
-    fn language_switch_preserves_existing_model_change_boundary() {
+    fn language_switch_removes_legacy_model_change_boundary() {
         use atomcode_config::locale::Locale;
 
         atomcode_config::config::offline::reset_offline_verdict_for_test();
@@ -2141,21 +2205,18 @@ mod tests {
             Message::assistant("I am model-a", vec![]),
         ]);
         reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true, true);
-        let transition = snapshot.messages.last().cloned().unwrap();
+        snapshot.messages.push(Message::system(format!(
+            "{MODEL_CHANGE_CONTEXT_PREFIX}\nlegacy transition"
+        )));
         let mut cfg = agent_config("model-b");
         cfg.preferred_language = Some(Locale::ZhCn);
 
         reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, true);
 
-        assert_eq!(snapshot.messages.last(), Some(&transition));
-        assert_eq!(
-            snapshot
-                .messages
-                .iter()
-                .filter(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX))
-                .count(),
-            1
-        );
+        assert!(!snapshot
+            .messages
+            .iter()
+            .any(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX)));
     }
 
     #[tokio::test]
@@ -2564,6 +2625,10 @@ mod tests {
         assert!(Arc::ptr_eq(
             &candidate.sensitive_path_grants,
             &previous.sensitive_path_grants,
+        ));
+        assert!(Arc::ptr_eq(
+            &candidate.credential_shell_grants,
+            &previous.credential_shell_grants,
         ));
         assert!(candidate
             .plan_mode

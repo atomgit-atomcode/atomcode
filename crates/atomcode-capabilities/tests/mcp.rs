@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 // Redirect ATOMCODE_HOME to a throwaway temp dir before any test in this binary runs,
 // so a test that resolves the user mcp.json without setting its own ATOMCODE_HOME never
-// touches the developer's real home. Tests that set their own ATOMCODE_HOME still win.
+// touches the developer's real home. Inherited shell values are replaced.
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
     atomcode_kernel::test_support::isolate_home();

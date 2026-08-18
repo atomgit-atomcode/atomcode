@@ -325,8 +325,12 @@ pub(crate) fn chat_runtime_config(
         // Keep the fail-closed approval timeout for the daemon (current behavior).
         interactive: false,
         keep_interrupted_context: config.keep_interrupted_context,
+        credential_shell_policy: atomcode_coding::config::credential_shell_policy_from_config(
+            config.coding.shell_guard_policy,
+        ),
         user_agent: p.and_then(|p| p.user_agent.clone()),
         skip_tls_verify: p.map(|p| p.skip_tls_verify).unwrap_or(false),
+        retry_max_attempts: p.and_then(|p| p.retry_max_attempts),
         loop_max_rounds: atomcode_coding::resolve_loop_max_rounds(
             config.loop_config.max_rounds,
             std::env::var("ATOMCODE_LOOP_MAX_ROUNDS").ok().as_deref(),
@@ -369,6 +373,7 @@ fn send_chat_runtime_error(
             message: message.into(),
             http_status: None,
             code: None,
+            retryable: None,
         },
     ));
 }
@@ -655,6 +660,12 @@ pub(crate) enum LiveWireEvent {
     },
     #[serde(rename = "provider")]
     Provider { provider: String },
+    #[serde(rename = "reasoning_effort")]
+    ReasoningEffort {
+        provider: String,
+        effort: Option<String>,
+        applicable: bool,
+    },
     /// 审批模式切换（build / accept_edits / bypass / plan）——
     /// webui 各 tab 的「模式」pill 据此同步。
     #[serde(rename = "mode")]
@@ -715,6 +726,8 @@ pub(crate) enum LiveWireEvent {
         stop_reason: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stats: Option<crate::TurnStatsWire>,
     },
     #[serde(rename = "error")]
     Error { message: String },
@@ -856,6 +869,7 @@ impl NativeLiveWireProjector {
                     running: true,
                     stop_reason: None,
                     message: None,
+                    stats: None,
                 },
                 Kernel::TextDelta(content) => LiveWireEvent::TextDelta { content },
                 Kernel::Reasoning(content) => LiveWireEvent::ReasoningDelta { content },
@@ -899,6 +913,19 @@ impl NativeLiveWireProjector {
                 },
                 Kernel::Error { message, .. } => LiveWireEvent::Error { message },
                 Kernel::Warning(message) => LiveWireEvent::Warning { message },
+                Kernel::StreamRecovery {
+                    attempt,
+                    max_attempts,
+                    recovered,
+                } => LiveWireEvent::Warning {
+                    message: if recovered {
+                        "recovered from the interrupted stream".to_string()
+                    } else {
+                        format!(
+                            "stream timed out; safely continuing from saved progress ({attempt}/{max_attempts})"
+                        )
+                    },
+                },
                 Kernel::RateLimited {
                     reset_at_display,
                     reset_label,
@@ -979,20 +1006,22 @@ impl NativeLiveWireProjector {
             crate::live_hub::LiveViewEvent::Runtime(Runtime::TurnFinished(completion)) => {
                 self.tools.clear();
                 match completion {
-                    atomcode_coding::TurnCompletion::Completed { reason, .. } => {
+                    atomcode_coding::TurnCompletion::Completed { reason, stats, .. } => {
                         LiveWireEvent::State {
                             running: false,
                             stop_reason: Some(crate::stop_reason_wire(reason).to_string()),
                             message: None,
+                            stats: Some(stats.into()),
                         }
                     }
-                    atomcode_coding::TurnCompletion::SnapshotUnavailable { error, .. } => {
-                        LiveWireEvent::State {
-                            running: false,
-                            stop_reason: Some("snapshot_unavailable".into()),
-                            message: Some(error.message),
-                        }
-                    }
+                    atomcode_coding::TurnCompletion::SnapshotUnavailable {
+                        error, stats, ..
+                    } => LiveWireEvent::State {
+                        running: false,
+                        stop_reason: Some("snapshot_unavailable".into()),
+                        message: Some(error.message),
+                        stats: Some(stats.into()),
+                    },
                 }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ModeChanged { mode }) => {
@@ -1007,25 +1036,38 @@ impl NativeLiveWireProjector {
                     round: progress.round,
                     elapsed_secs: progress.elapsed_secs,
                     condition: progress.condition,
-                    terminal: progress.terminal.map(|terminal| match terminal {
-                        GoalTerminal::Met => "met",
-                        GoalTerminal::Stopped => "stopped",
-                        GoalTerminal::Failed => "failed",
-                        GoalTerminal::Cancelled => "cancelled",
-                    }.into()),
+                    terminal: progress.terminal.map(|terminal| {
+                        match terminal {
+                            GoalTerminal::Met => "met",
+                            GoalTerminal::Stopped => "stopped",
+                            GoalTerminal::Failed => "failed",
+                            GoalTerminal::Cancelled => "cancelled",
+                        }
+                        .into()
+                    }),
                     phase: match progress.phase {
                         GoalPhase::Pursuing => "pursuing",
                         GoalPhase::Paused => "paused",
                         GoalPhase::PausedAtCap => "paused_at_cap",
                         GoalPhase::Satisfied => "satisfied",
                         GoalPhase::Ended => "ended",
-                    }.into(),
+                    }
+                    .into(),
                     last_reason: progress.last_reason,
                 }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ProviderChanged {
                 provider, ..
             }) => LiveWireEvent::Provider { provider },
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::ReasoningEffortChanged {
+                provider,
+                effort,
+                applicable,
+            }) => LiveWireEvent::ReasoningEffort {
+                provider,
+                effort: effort.map(|value| value.as_str().to_string()),
+                applicable,
+            },
             crate::live_hub::LiveViewEvent::Runtime(Runtime::SessionNameSuggested { name }) => {
                 LiveWireEvent::SessionRenamed {
                     session_id: self.session_id.clone(),
@@ -1068,6 +1110,7 @@ impl NativeLiveWireProjector {
                         exit.reason,
                         if exit.forced { " (forced)" } else { "" }
                     )),
+                    stats: None,
                 }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
@@ -1123,19 +1166,23 @@ fn goal_snapshot(progress: &atomcode_coding::GoalProgress) -> LiveGoalSnapshot {
         round: progress.round,
         elapsed_secs: progress.elapsed_secs,
         condition: progress.condition.clone(),
-        terminal: progress.terminal.map(|terminal| match terminal {
-            GoalTerminal::Met => "met",
-            GoalTerminal::Stopped => "stopped",
-            GoalTerminal::Failed => "failed",
-            GoalTerminal::Cancelled => "cancelled",
-        }.into()),
+        terminal: progress.terminal.map(|terminal| {
+            match terminal {
+                GoalTerminal::Met => "met",
+                GoalTerminal::Stopped => "stopped",
+                GoalTerminal::Failed => "failed",
+                GoalTerminal::Cancelled => "cancelled",
+            }
+            .into()
+        }),
         phase: match progress.phase {
             GoalPhase::Pursuing => "pursuing",
             GoalPhase::Paused => "paused",
             GoalPhase::PausedAtCap => "paused_at_cap",
             GoalPhase::Satisfied => "satisfied",
             GoalPhase::Ended => "ended",
-        }.into(),
+        }
+        .into(),
         last_reason: progress.last_reason.clone(),
     }
 }
@@ -1169,6 +1216,56 @@ pub(crate) struct LiveStreamQuery {
     pub session_id: Option<String>,
 }
 
+fn serialize_scoped_live_event(session_id: String, event: &LiveWireEvent) -> String {
+    let mut value = match serde_json::to_value(event) {
+        Ok(value) => value,
+        Err(error) => {
+            crate::ctrace!("LIVE", "live event serialization failed: {error}");
+            return serde_json::json!({
+                "type": "error",
+                "session_id": session_id,
+                "message": format!("live event serialization failed: {error}"),
+            })
+            .to_string();
+        }
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert("session_id".into(), serde_json::Value::String(session_id));
+        return serde_json::to_string(&value).unwrap_or_else(|error| {
+            crate::ctrace!("LIVE", "live event JSON serialization failed: {error}");
+            serde_json::json!({
+                "type": "error",
+                "message": format!("live event serialization failed: {error}"),
+            })
+            .to_string()
+        });
+    }
+    serde_json::json!({
+        "type": "error",
+        "session_id": session_id,
+        "message": "live event is not a JSON object",
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+mod scoped_live_event_tests {
+    use super::{serialize_scoped_live_event, LiveWireEvent};
+
+    #[test]
+    fn every_wire_event_gets_session_id() {
+        let json = serialize_scoped_live_event(
+            "session-a".into(),
+            &LiveWireEvent::TextDelta {
+                content: "hello".into(),
+            },
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["type"], "text");
+        assert_eq!(value["session_id"], "session-a");
+    }
+}
+
 pub(crate) async fn live_stream(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<LiveStreamQuery>,
@@ -1194,14 +1291,18 @@ pub(crate) async fn live_stream(
         }
     };
     let snapshot_wd = join.binding.working_dir.clone();
-    let session_name = {
-        let bucket = atomcode_capabilities::session::SessionManager::project_hash(&snapshot_wd);
+    let project_hash = atomcode_capabilities::session::SessionManager::project_hash(&snapshot_wd);
+    let (session_name, session_meta, turn_timestamps) = {
         match crate::legacy_convert::load_catalog_session_view_in_project(
-            &bucket,
+            &project_hash,
             &join.binding.session_id,
         ) {
-            Ok(Some(session)) => session.meta.name,
-            Ok(None) => String::new(),
+            Ok(Some(session)) => {
+                let timestamps =
+                    crate::load_turn_timestamps(&project_hash, &join.binding.session_id).await;
+                (session.meta.name.clone(), Some(session.meta), timestamps)
+            }
+            Ok(None) => (String::new(), None, crate::TurnTimestamps::new()),
             Err(error) => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -1211,15 +1312,25 @@ pub(crate) async fn live_stream(
             }
         }
     };
-    let project_hash = crate::hash_path(&snapshot_wd);
     let initial_goal = join.goal_progress.clone();
-    let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
+    // Keep the session id alongside the wire event until serialization.  The
+    // projector can update its session after a SessionChanged event, so the id
+    // must be captured at the exact point where each event is projected.
+    let (tx, out_rx) = mpsc::unbounded_channel::<(String, LiveWireEvent)>();
     let mut snapshot_messages: Vec<crate::MessageInfo> = join
         .snapshot
         .messages
         .iter()
         .map(crate::MessageInfo::from_kernel)
         .collect();
+    if let Some(meta) = session_meta.as_ref() {
+        crate::attach_snapshot_message_timestamps(
+            &mut snapshot_messages,
+            &join.snapshot,
+            meta,
+            &turn_timestamps,
+        );
+    }
     // Re-attach display-only images (VL-preprocessed originals) so a refresh — which
     // rebuilds from the kernel snapshot (image stripped) — shows the thumbnail, not the
     // "missing image" placeholder. Same sidecar the HTTP session-load path reads.
@@ -1228,16 +1339,19 @@ pub(crate) async fn live_stream(
         &snapshot_wd,
         &join.binding.session_id,
     );
-    let _ = tx.send(LiveWireEvent::Snapshot {
-        messages: snapshot_messages,
-        session_id: join.binding.session_id.clone(),
-        session_name,
-        project_hash,
-        provider: join.binding.provider.clone(),
-        mode: live_current_mode_wire(),
-        working_dir: snapshot_wd.to_string_lossy().to_string(),
-        goal: initial_goal.as_ref().map(goal_snapshot),
-    });
+    let _ = tx.send((
+        join.binding.session_id.clone(),
+        LiveWireEvent::Snapshot {
+            messages: snapshot_messages,
+            session_id: join.binding.session_id.clone(),
+            session_name,
+            project_hash,
+            provider: join.binding.provider.clone(),
+            mode: live_current_mode_wire(),
+            working_dir: snapshot_wd.to_string_lossy().to_string(),
+            goal: initial_goal.as_ref().map(goal_snapshot),
+        },
+    ));
     let mut projector = NativeLiveWireProjector {
         session_id: join.binding.session_id.clone(),
         ..Default::default()
@@ -1249,12 +1363,12 @@ pub(crate) async fn live_stream(
         if let Some(w) = projector.project(crate::live_hub::LiveViewEvent::Runtime(
             atomcode_coding::CodingRuntimeEvent::GoalChanged(goal),
         )) {
-            let _ = tx.send(w);
+            let _ = tx.send((projector.session_id.clone(), w));
         }
     }
     for observation in join.replay {
         if let Some(w) = projector.project(observation.event) {
-            let _ = tx.send(w);
+            let _ = tx.send((projector.session_id.clone(), w));
         }
     }
     let binding_id = join.binding.id;
@@ -1264,16 +1378,20 @@ pub(crate) async fn live_stream(
             match rx.recv().await {
                 Ok(observation) if observation.binding_id == binding_id => {
                     if let Some(w) = projector.project(observation.event) {
-                        if tx.send(w).is_err() {
+                        let scoped = (projector.session_id.clone(), w);
+                        if tx.send(scoped).is_err() {
                             break;
                         }
                     }
                 }
                 Ok(_) => break,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    let _ = tx.send(LiveWireEvent::Error {
-                        message: format!("live stream lagged by {skipped} events; reconnect"),
-                    });
+                    let _ = tx.send((
+                        projector.session_id.clone(),
+                        LiveWireEvent::Error {
+                            message: format!("live stream lagged by {skipped} events; reconnect"),
+                        },
+                    ));
                     break;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -1281,20 +1399,11 @@ pub(crate) async fn live_stream(
         }
     });
 
-    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|w| {
-        let json = serde_json::to_string(&w).unwrap_or_else(|error| {
-            crate::ctrace!(
-                "LIVE",
-                "live_stream: serde_json serialization failed: {error}"
-            );
-            serde_json::json!({
-                "type": "error",
-                "message": format!("live event serialization failed: {error}"),
-            })
-            .to_string()
+    let stream =
+        tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|(session_id, event)| {
+            let json = serialize_scoped_live_event(session_id, &event);
+            Ok::<_, std::convert::Infallible>(Event::default().data(json))
         });
-        Ok::<_, std::convert::Infallible>(Event::default().data(json))
-    });
     Sse::new(stream)
         .keep_alive(
             KeepAlive::new()
@@ -1323,10 +1432,10 @@ pub(crate) struct LiveMessageReq {
 
 /// Apply the shared daemon image-preprocessing policy to one user caption.
 ///
-/// The caller keeps the original images in its persisted/display conversation. A changed
-/// return value means the runtime input must clear those images because the returned text
-/// already contains either the VL description or an explicit failure marker.
-pub(crate) async fn preprocess_image_caption(
+/// Build the runtime input for a pasted image and report the matching UI notice.
+/// Native vision and unconfigured VL paths preserve the original image bytes; successful
+/// preprocessing and explicit VL failures return text-only input for text models.
+pub(crate) async fn preprocess_image_input(
     config: &Config,
     supports_vision: bool,
     working_dir: &std::path::Path,
@@ -1334,13 +1443,22 @@ pub(crate) async fn preprocess_image_caption(
     session_id: Option<&str>,
     message: &str,
     images: &[ImageContent],
-) -> String {
+) -> (
+    atomcode_coding::UserInput,
+    Option<atomcode_coding::VisionNotice>,
+) {
     use atomcode_coding::vision::{
         run_vl_caption, should_skip, vl_model_display, PreprocessOutcome,
     };
     // Short-circuit: no images, or the main model already accepts images.
     if should_skip(supports_vision, !images.is_empty()) {
-        return message.to_string();
+        return (
+            atomcode_coding::UserInput {
+                text: message.to_string(),
+                images: images.to_vec(),
+            },
+            None,
+        );
     }
     // Nothing configured (None or empty) ⇒ pass through unchanged (Skipped).
     let Some(vl_name) = config
@@ -1348,13 +1466,26 @@ pub(crate) async fn preprocess_image_caption(
         .clone()
         .filter(|s| !s.is_empty())
     else {
-        return message.to_string();
+        return (
+            atomcode_coding::UserInput {
+                text: message.to_string(),
+                images: images.to_vec(),
+            },
+            None,
+        );
     };
     // Configured but absent from `config.providers` ⇒ Failed (mirror the retired
     // core `maybe_preprocess`): fold the failure marker so the caller strips the
     // images — otherwise raw image bytes reach a text-only model (HTTP 400).
     let Some(vl_pc) = config.provider_config_for_selection(&vl_name) else {
-        return fold_vl_failure(message);
+        let reason = format!("VL provider '{vl_name}' not found in config");
+        return (
+            atomcode_coding::UserInput {
+                text: fold_vl_failure(message),
+                images: Vec::new(),
+            },
+            Some(atomcode_coding::VisionNotice::Failed { reason }),
+        );
     };
     let vl_model = vl_model_display(&vl_pc.model).to_string();
     // Build the one-off VL provider via the daemon's native chain (the SAME
@@ -1374,19 +1505,74 @@ pub(crate) async fn preprocess_image_caption(
         match tokio::task::spawn_blocking(move || factory.build(&coding_cfg, sid.as_deref())).await
         {
             Ok(Ok(p)) => p,
-            _ => return fold_vl_failure(message),
+            _ => {
+                let reason = format!("VL provider '{vl_name}' build failed");
+                return (
+                    atomcode_coding::UserInput {
+                        text: fold_vl_failure(message),
+                        images: Vec::new(),
+                    },
+                    Some(atomcode_coding::VisionNotice::Failed { reason }),
+                );
+            }
         };
     match run_vl_caption(provider, vl_model, message, images).await {
-        PreprocessOutcome::Skipped => message.to_string(),
+        PreprocessOutcome::Skipped => (
+            atomcode_coding::UserInput {
+                text: message.to_string(),
+                images: images.to_vec(),
+            },
+            None,
+        ),
         PreprocessOutcome::Replaced { text, vl_model } => {
-            if message.trim().is_empty() {
+            let char_count = text.chars().count();
+            let merged = if message.trim().is_empty() {
                 format!("[图片内容（由 {vl_model} 识别）]\n{text}")
             } else {
                 format!("{message}\n\n[图片内容（由 {vl_model} 识别）]\n{text}")
-            }
+            };
+            (
+                atomcode_coding::UserInput {
+                    text: merged,
+                    images: Vec::new(),
+                },
+                Some(atomcode_coding::VisionNotice::Recognised {
+                    vl_model,
+                    char_count,
+                }),
+            )
         }
-        PreprocessOutcome::Failed { .. } => fold_vl_failure(message),
+        PreprocessOutcome::Failed { reason } => (
+            atomcode_coding::UserInput {
+                text: fold_vl_failure(message),
+                images: Vec::new(),
+            },
+            Some(atomcode_coding::VisionNotice::Failed { reason }),
+        ),
     }
+}
+
+pub(crate) async fn preprocess_image_caption(
+    config: &Config,
+    supports_vision: bool,
+    working_dir: &std::path::Path,
+    telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
+    session_id: Option<&str>,
+    message: &str,
+    images: &[ImageContent],
+) -> String {
+    preprocess_image_input(
+        config,
+        supports_vision,
+        working_dir,
+        telemetry,
+        session_id,
+        message,
+        images,
+    )
+    .await
+    .0
+    .text
 }
 
 /// Fold the `[图片识别失败]` marker into a caption (VL build/stream failure). The
@@ -1865,24 +2051,25 @@ pub(crate) struct LiveReasoningEffortReq {
     /// 目标 provider；None 时取当前默认 provider。
     #[serde(default)]
     pub provider: Option<String>,
-    /// "high" | "max" | null（清除 → 用模型自身默认）。其他取值拒绝。
+    /// "low" | "medium" | "high" | "max" | null（API 默认）。
     #[serde(default)]
     pub reasoning_effort: Option<String>,
 }
 
-/// POST /live/reasoning_effort — webui 设置 DeepSeek V4 的 reasoning_effort。
+/// POST /live/reasoning_effort — webui 设置当前模型实例的 reasoning_effort。
 ///
 /// 与 /live/provider 同源：持久化进目标 provider 的 `config.reasoning_effort`，
 /// 下一轮 turn 经 `build_turn_parts` → `create_provider` 自动生效——live 与
-/// /chat 两条路径都现读 config，故两端都会跟随。只有 deepseek-v4 系模型真正
-/// 消费该字段（见 OpenAiProvider::reason_effort_applicable），webui 已据此门控
-/// UI；服务端仅校验取值合法。
+/// /chat 两条路径都现读 config，故两端都会跟随。模型实例必须由配置或内置
+/// CodingPlan 能力声明支持；服务端同时校验取值。
 pub(crate) async fn live_reasoning_effort(
     State(state): State<AppState>,
     Json(req): Json<LiveReasoningEffortReq>,
 ) -> impl IntoResponse {
     let effort = match req.reasoning_effort.as_deref().map(str::trim) {
         None | Some("") => None,
+        Some(v) if v.eq_ignore_ascii_case("low") => Some("low".to_string()),
+        Some(v) if v.eq_ignore_ascii_case("medium") => Some("medium".to_string()),
         Some(v) if v.eq_ignore_ascii_case("high") => Some("high".to_string()),
         Some(v) if v.eq_ignore_ascii_case("max") => Some("max".to_string()),
         Some(other) => {
@@ -1901,16 +2088,38 @@ pub(crate) async fn live_reasoning_effort(
     let mut target = String::new();
     let mut previous_effort = None;
     let mut provider_missing = false;
+    let mut level_disallowed = false;
     let commit = match store.update(|config| {
         target = requested
             .clone()
             .or_else(|| config.effective_model_selection())
             .unwrap_or_default();
+        let builtin_effort = atomcode_config::config::is_codingplan_provider_name(&target)
+            && config
+                .provider_config_for_selection(&target)
+                .is_some_and(|p| p.model.eq_ignore_ascii_case("deepseek-v4-flash"));
+        // Reject a concrete level the endpoint does not expose. The webui filters
+        // its dropdown, but a stale/rogue client could still POST a hidden level;
+        // without this it would persist and reach the wire.
+        if let Some(level) = effort.as_deref() {
+            let levels = config
+                .provider_config_for_selection(&target)
+                .and_then(|p| p.reasoning_effort_levels);
+            if atomcode_config::config::clamp_effort_to_levels(Some(level), levels.as_deref())
+                .is_none()
+            {
+                level_disallowed = true;
+                anyhow::bail!("reasoning_effort {level:?} not supported by {target:?}");
+            }
+        }
         // Schema-aware write: new-schema models live in `[models.*]`, legacy in
         // `[providers.*]`.
         let found = config.update_selection_reasoning(&target, |r| {
             previous_effort = r.reasoning_effort.clone();
-            *r.reasoning_effort = effort.clone();
+            let keep_capability = previous_effort.is_some() || builtin_effort;
+            *r.reasoning_effort = effort
+                .clone()
+                .or_else(|| keep_capability.then(|| "auto".to_string()));
         });
         if !found {
             provider_missing = true;
@@ -1925,6 +2134,16 @@ pub(crate) async fn live_reasoning_effort(
                 Json(serde_json::json!({
                     "ok": false,
                     "error": format!("provider {target:?} not found"),
+                })),
+            )
+                .into_response();
+        }
+        Err(_) if level_disallowed => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("reasoning_effort not supported by {target:?}"),
                 })),
             )
                 .into_response();
@@ -2177,10 +2396,13 @@ pub(crate) async fn live_goal_start(
         live_current_provider(),
         native_runtime_mode(live_current_approval_mode()),
         sid,
-    ).await {
+    )
+    .await
+    {
         return Json(serde_json::json!({"accepted": false, "error": error}));
     }
-    let accepted = crate::native_live::dispatch(atomcode_coding::DriverCommand::StartGoal(condition)).is_ok();
+    let accepted =
+        crate::native_live::dispatch(atomcode_coding::DriverCommand::StartGoal(condition)).is_ok();
     Json(serde_json::json!({"accepted": accepted}))
 }
 

@@ -347,6 +347,10 @@ async fn review(args: ReviewArgs) -> Result<()> {
     cfg.max_rounds = args.max_rounds;
     cfg.max_turn_duration = args.max_duration.map(std::time::Duration::from_secs);
     cfg.no_web = args.no_web;
+    // Diff-mode: pin tools to the changed-file set so the model cannot read_file
+    // siblings already dropped from scope (notes.md / manifest after ignore).
+    // Task/custom mode leaves this empty → root-only confinement (legacy).
+    cfg.review_paths = changed_files.clone();
     // Omit ⇒ keep the config default (usize::MAX = never degrade). A bound enables auto-degrade.
     if let Some(n) = args.graph_max_files {
         cfg.graph_max_indexed_files = n as usize;
@@ -630,6 +634,19 @@ impl ReviewRun {
                 self.error = Some(message);
             }
             AgentEvent::Warning(w) => eprintln!("    [warn] {w}"),
+            AgentEvent::StreamRecovery {
+                attempt,
+                max_attempts,
+                recovered,
+            } => {
+                if recovered {
+                    eprintln!("    [ok] recovered from the interrupted stream");
+                } else {
+                    eprintln!(
+                        "    [retry] safely continuing from saved progress ({attempt}/{max_attempts})"
+                    );
+                }
+            }
             AgentEvent::TurnComplete { reason } => {
                 self.stop = reason;
                 return false;
@@ -784,11 +801,15 @@ fn select_config(fc: &FileConfig, provider: Option<&str>) -> ConfigSelection {
 
 /// `~/.atomcode/config.toml` (honors $ATOMCODE_HOME, else $HOME / %USERPROFILE%).
 fn default_config_path() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("ATOMCODE_HOME") {
+    if let Some(home) = std::env::var_os(atomcode_config::distribution::HOME_ENV) {
         return Some(PathBuf::from(home).join("config.toml"));
     }
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(".atomcode").join("config.toml"))
+    Some(
+        PathBuf::from(home)
+            .join(atomcode_config::distribution::HOME_DIR_NAME)
+            .join("config.toml"),
+    )
 }
 
 /// Resolve the effective model context window: explicit `--context-window` flag wins, else the
@@ -1027,14 +1048,13 @@ fn drop_out_of_scope(findings: &mut Vec<Finding>, changed_files: &[String]) -> u
 /// every file and roughly double wall-clock. High-signal paths (source / build recipes) first.
 const MAX_COVERAGE_REREVIEW_FILES: usize = 8;
 
-/// Priority for coverage re-review (higher first). Scaffold scores low so a capped second pass
-/// still spends budget on real code when the first pass already found issues.
+/// Priority for coverage re-review (higher first), deciding which files survive the
+/// [`MAX_COVERAGE_REREVIEW_FILES`] cap. Its only caller is the sort in [`uncovered_files`], so
+/// it is only ever handed files that already cleared `is_low_signal_file` — it never sees a
+/// lockfile, a doc, or recipe scaffold, and so has no branch for them.
 fn coverage_priority(path: &str) -> i32 {
     let lower = path.to_ascii_lowercase();
     let base = lower.rsplit('/').next().unwrap_or(&lower);
-    if is_coverage_scaffold_file(path) {
-        return 10;
-    }
     const SRC: &[&str] = &[
         ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".go", ".rs", ".py", ".java", ".kt",
         ".swift", ".ts", ".tsx", ".js", ".jsx", ".m", ".mm", ".cs", ".rb", ".php", ".scala",
@@ -1079,44 +1099,31 @@ fn coverage_priority(path: &str) -> i32 {
     50
 }
 
-/// Recipe bookkeeping that rarely needs a second pass once the first pass already reported
-/// on real recipe code (conanfile / patches / tests).
-fn is_coverage_scaffold_file(path: &str) -> bool {
-    let base = path
-        .rsplit('/')
-        .next()
-        .unwrap_or(path)
-        .to_ascii_lowercase();
-    matches!(
-        base.as_str(),
-        "notes.md"
-            | "commands.json"
-            | "manifest.yml"
-            | "manifest.yaml"
-            | "readme.md"
-            | "changelog.md"
-    )
-}
-
 /// Changed files that received ZERO findings and are worth a focused second look. Drives the
 /// coverage backstop: on a wide diff the reviewer sometimes declares "done" having only
 /// reported on some files (observed: umi-ocr left 3/10 files unreviewed). Re-reviewing just
 /// these recovers the gap.
 ///
 /// Filters:
-/// - lockfiles / low-signal (`is_low_signal_file`)
-/// - when first pass already has findings: drop scaffold (notes/commands/manifest)
+/// - lockfiles / docs / recipe scaffold (`is_low_signal_file`)
+/// - files the first pass already reported on
 /// - cap to [`MAX_COVERAGE_REREVIEW_FILES`] by priority (source / recipe first)
+///
+/// Scaffold (notes.md / commands.json / manifest.y{a,}ml / readme.md / changelog.md) used to
+/// get a conditional third filter here — dropped only when the first pass had findings, kept
+/// otherwise. That filter never fired: `is_low_signal_file` covers every one of those names
+/// (`.md` by suffix, the rest by basename) and runs first, so the conditional could only ever
+/// re-drop what was already gone. It was dead twenty minutes after it was written — 886d9c24
+/// added it, 47cd17c7 folded markdown and recipe scaffold into `is_low_signal_file` — and the
+/// test asserting the "kept" half has been failing ever since.
 ///
 /// Expects `findings` already scope-filtered to `changed_files` (see [`drop_out_of_scope`]).
 /// Empty `changed_files` (task mode) yields none.
 fn uncovered_files(changed_files: &[String], findings: &[Finding]) -> Vec<String> {
-    let first_pass_had_findings = !findings.is_empty();
     let mut files: Vec<String> = changed_files
         .iter()
         .filter(|c| !atomcode_review::is_low_signal_file(c))
         .filter(|c| !findings.iter().any(|f| &f.file_path == *c))
-        .filter(|c| !(first_pass_had_findings && is_coverage_scaffold_file(c)))
         .cloned()
         .collect();
     if files.is_empty() {
@@ -1365,8 +1372,9 @@ mod tests {
     }
 
     #[test]
-    fn uncovered_drops_scaffold_when_first_pass_already_found_issues() {
-        // First pass found something on conanfile → don't re-review notes/commands.
+    fn uncovered_drops_scaffold_and_files_the_first_pass_reported_on() {
+        // conanfile.py is real code but already has a finding; notes/commands are scaffold.
+        // Only util.c is both reviewable and unreported.
         let changed = vec![
             "pkg/conanfile.py".to_string(),
             "pkg/notes.md".to_string(),
@@ -1380,19 +1388,35 @@ mod tests {
     }
 
     #[test]
-    fn uncovered_keeps_scaffold_when_first_pass_found_nothing() {
-        // 0 findings overall: still allow scaffold into the pool (may be filtered by cap).
+    fn uncovered_drops_scaffold_even_when_first_pass_found_nothing() {
+        // Scaffold exclusion is unconditional — it comes from `is_low_signal_file`, which does
+        // not know or care how the first pass went. A zero-finding pass is exactly when a
+        // conditional rule would have let notes.md back in; it must not.
         let changed = vec!["pkg/notes.md".to_string(), "pkg/conanfile.py".to_string()];
         let fs: Vec<Finding> = vec![];
         let mut got = uncovered_files(&changed, &fs);
         got.sort();
-        assert_eq!(
-            got,
-            vec![
-                "pkg/conanfile.py".to_string(),
-                "pkg/notes.md".to_string()
-            ]
-        );
+        assert_eq!(got, vec!["pkg/conanfile.py".to_string()]);
+    }
+
+    #[test]
+    fn every_scaffold_name_is_already_low_signal() {
+        // The invariant that made the removed conditional filter dead. If a scaffold name is
+        // ever added that `is_low_signal_file` does not cover, this fails and the coverage
+        // backstop starts re-reviewing bookkeeping files — catch it here, not in a review run.
+        for name in [
+            "notes.md",
+            "commands.json",
+            "manifest.yml",
+            "manifest.yaml",
+            "readme.md",
+            "changelog.md",
+        ] {
+            assert!(
+                atomcode_review::is_low_signal_file(&format!("pkg/{name}")),
+                "{name} must be low-signal"
+            );
+        }
     }
 
     #[test]

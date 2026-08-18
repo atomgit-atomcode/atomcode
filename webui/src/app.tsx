@@ -4,13 +4,13 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { Chat } from './components/Chat';
 import { Sidebar } from './components/Sidebar';
-import { ThemeDialog, LanguageDialog, ModelConfigDialog, RemoteAccessDialog } from './components/SettingsDialogs';
+import { ThemeDialog, LanguageDialog, ModelConfigDialog, RemoteAccessDialog, NotificationsDialog } from './components/SettingsDialogs';
 import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
-import { PermissionCard } from './components/PermissionCard';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
 import { getProject, getConfig, changeDir, resolveSession, createSession, getSession, SessionMetaWithProject } from './api';
 import { useT, SettingsSection } from './settings';
+import { applyConfigDefaults, initNotificationPermissionPrompt } from './lib/notifications';
 import { sessionMessagesToMarkdownLines } from './lib/historyMessages';
 
 // 从 URL (?session=<id>) 读取要打开的会话 id（短 id），用于刷新后恢复。
@@ -143,6 +143,19 @@ export function App() {
   // Seed cwd from /project on mount（恢复会话时以会话目录为准，故只在仍为空时填充）
   useEffect(() => {
     let cancelled = false;
+    // 立即注册首次交互监听，不能依赖 /config 返回；否则慢请求或悬挂会让
+    // 用户交互永久错过授权引导。处理事件时会再次读取最新偏好。
+    const disposeNotificationPrompt = initNotificationPermissionPrompt();
+    // 用 /config 的 notifications 段种入偏好默认值（localStorage 未显式设置时生效），
+    // 让与 TUI 共享的 enabled/min_duration_secs 对 webui 同样生效。
+    getConfig()
+      .then((cfg) => {
+        if (cancelled) return;
+        applyConfigDefaults(cfg.notifications);
+      })
+      .catch(() => {
+        /* 配置不可用时继续使用前端默认值 */
+      });
     getProject()
       .then((p) => {
         if (cancelled) return;
@@ -152,7 +165,10 @@ export function App() {
       .catch(() => {
         // Ignore; cwd stays empty
       });
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      disposeNotificationPrompt();
+    };
   }, []);
 
   // 把当前 session id（取前 8 位）同步进 URL，刷新后可恢复。
@@ -362,7 +378,6 @@ export function App() {
         onPickSkill={(name) => setSkillInsert({ name, seq: Date.now() })}
         onOpenRemote={() => setSettingsSection('remote')}
         onOpenCwd={() => setShowCwd(true)}
-        onSwitchProject={handlePickCwd}
       />
       <div
         class={'sidebar-backdrop' + (sidebarOpen ? ' show' : '')}
@@ -456,6 +471,7 @@ export function App() {
             onSessionId={handleSessionAssigned}
             cwd={cwd}
             onPermission={setPending}
+            pendingPermission={pending}
             onPermissionResolved={(callId) =>
               setPending((cur: any) =>
                 callId === null ? null : resolvePendingAfterDecision(cur, callId),
@@ -493,7 +509,9 @@ export function App() {
       {settingsSection === 'remote' && (
         <RemoteAccessDialog onClose={() => setSettingsSection(null)} />
       )}
-      {pending && <PermissionCard req={pending} onDone={() => setPending((cur: any) => resolvePendingAfterDecision(cur, pending.call_id))} />}
+      {settingsSection === 'notifications' && (
+        <NotificationsDialog onClose={() => setSettingsSection(null)} />
+      )}
       {headerDialog === 'rename' && activeSession && (
         <RenameDialog
           session={activeSession}

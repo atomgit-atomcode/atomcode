@@ -17,8 +17,8 @@
 
 // Redirect ATOMCODE_HOME to a throwaway temp dir before any test in this binary
 // runs, so the crate's own unit tests never persist sessions/config into the
-// developer's real `~/.atomcode`. Tests that set their own ATOMCODE_HOME still
-// win (isolate_home is a no-op when the var is already set).
+// developer's real `~/.atomcode`. An inherited shell ATOMCODE_HOME is replaced;
+// individual tests may install their own temporary home after this ctor runs.
 #[cfg(test)]
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
@@ -133,6 +133,60 @@ pub(crate) struct ConfigResponse {
     pub default_provider: String,
     pub default_workdir: Option<String>,
     pub providers: Vec<ProviderInfo>,
+    /// Sanitized reusable provider accounts. Credentials never cross this API;
+    /// `has_api_key` is the only credential-related field exposed to the UI.
+    pub provider_accounts: Vec<ProviderAccountInfo>,
+    /// Compiled provider presets used by the TUI and WebUI add-provider flows.
+    /// This contains connection metadata only; no credentials are exposed.
+    pub provider_presets: Vec<ProviderPresetInfo>,
+    /// Sanitized completion-notification config (webui reads it for defaults).
+    pub notifications: NotificationConfigInfo,
+}
+
+/// Sanitized view of one reusable provider account and its model profiles.
+#[derive(Debug, Serialize)]
+pub(crate) struct ProviderAccountInfo {
+    pub id: String,
+    pub provider: String,
+    pub display_name: Option<String>,
+    #[serde(rename = "type")]
+    pub provider_type: String,
+    pub base_url: Option<String>,
+    pub has_api_key: bool,
+    pub model_ids: Vec<String>,
+    pub legacy: bool,
+    pub managed: bool,
+}
+
+/// Sanitized view of one compiled provider preset.
+#[derive(Debug, Serialize)]
+pub(crate) struct ProviderPresetInfo {
+    pub id: String,
+    pub display_name: String,
+    #[serde(rename = "type")]
+    pub provider_type: String,
+    pub default_base_url: Option<String>,
+    pub requires_api_key: bool,
+    pub model_source: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DiscoveredModelInfo {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
+}
+
+/// Sanitized notification config view (subset of `NotificationConfig`).
+#[derive(Debug, Serialize)]
+pub(crate) struct NotificationConfigInfo {
+    pub enabled: bool,
+    pub min_duration_secs: u64,
+    pub bell: bool,
 }
 
 /// Sanitized provider view (no api_key).
@@ -753,14 +807,10 @@ pub struct MessageInfo {
     /// re-render thumbnails when loading history.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<ImageData>>,
-    /// Epoch MILLISECONDS this message was authored/received. lets the webui
-    /// stamp each bubble with a send time (PR #562). The kernel's `Message`
-    /// has no per-message clock, so for replayed history we approximate with
-    /// the owning `Session::updated_at` (epoch SECONDS → ms); for live/snapshot
-    /// turns the webui injects `Date.now()` client-side. `#[serde(default)]`
-    /// keeps old daemons/clients interoperating when the field is absent.
-    /// 注意单位: 毫秒 —— 与 `SessionDetail.created_at`/`updated_at` 一致
-    /// (kernel 内部 `Session.created_at` 为秒, API 响应边界乘 1000 转换, bot review P2)。
+    /// Epoch milliseconds for the owning completed turn, projected from the native
+    /// append-only transcript. Sessions predating transcript persistence leave this
+    /// absent rather than fabricating a reconnect timestamp. `#[serde(default)]` keeps
+    /// old daemons/clients interoperating when the field is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<u64>,
 }
@@ -834,7 +884,15 @@ impl MessageInfo {
                 .iter()
                 .map(|call| (call.name.as_str(), call.arguments.as_str())),
         );
-        let mut content = msg.text.clone();
+        // A user-interruption message is a lifecycle boundary, not user-facing
+        // copy. Keep its provenance on the wire so clients can retire derived
+        // state, but never expose the internal continuation instruction.
+        let user_interruption = msg.is_user_interruption();
+        let mut content = if user_interruption {
+            String::new()
+        } else {
+            msg.text.clone()
+        };
         let mut images = (!msg.images.is_empty()).then(|| {
             msg.images
                 .iter()
@@ -858,7 +916,11 @@ impl MessageInfo {
             role: role.into(),
             content,
             synthetic: msg.synthetic,
-            internal_origin: msg.internal_origin.clone(),
+            internal_origin: if user_interruption {
+                Some(atomcode_kernel::message::USER_INTERRUPTION_ORIGIN.to_string())
+            } else {
+                msg.internal_origin.clone()
+            },
             tool_calls,
             tool_result,
             artifacts,
@@ -1602,7 +1664,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         service: "atomcode-daemon",
         binary_hash: executable_sha256(),
         instance_id: state.daemon_instance_id.to_string(),
-        capabilities: &["goal"],
+        capabilities: &["goal", "session_scoped_live"],
     })
 }
 
@@ -1973,13 +2035,15 @@ async fn get_sessions_by_working_dir(
 async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
     match crate::legacy_convert::load_catalog_session_view_in_project(&hash, &id) {
         Ok(Some(session)) => {
-            let messages = match merge_catalog_session_messages_for_display(&session) {
-                Ok(messages) => messages,
-                Err(error) => {
-                    let msg = format!("Failed to load session: {error}");
-                    return (StatusCode::NOT_FOUND, Json(msg)).into_response();
-                }
-            };
+            let turn_timestamps = load_turn_timestamps(&hash, &id).await;
+            let messages =
+                match merge_catalog_session_messages_for_display(&session, &turn_timestamps) {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        let msg = format!("Failed to load session: {error}");
+                        return (StatusCode::NOT_FOUND, Json(msg)).into_response();
+                    }
+                };
             let detail = SessionDetail {
                 id: session.meta.id,
                 name: session.meta.name,
@@ -2082,8 +2146,116 @@ fn attach_image_sets(messages: &mut [MessageInfo], sets: Vec<Vec<ImageData>>) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TurnTimestamp {
+    started_at: Option<u64>,
+    completed_at: u64,
+}
+
+pub(crate) type TurnTimestamps = std::collections::BTreeMap<u64, TurnTimestamp>;
+
+fn load_turn_timestamps_blocking(project_hash: &str, session_id: &str) -> TurnTimestamps {
+    let manager =
+        NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(project_hash));
+    match manager.load_transcript_timestamps(session_id) {
+        Ok(timestamps) => timestamps
+            .into_iter()
+            .filter_map(|(turn_id, timestamp)| {
+                let completed_at = u64::try_from(timestamp.completed_at)
+                    .ok()
+                    .filter(|timestamp| *timestamp > 0)?;
+                let started_at = timestamp
+                    .started_at
+                    .and_then(|value| u64::try_from(value).ok())
+                    .filter(|value| *value > 0);
+                Some((
+                    turn_id,
+                    TurnTimestamp {
+                        started_at,
+                        completed_at,
+                    },
+                ))
+            })
+            .collect(),
+        Err(error) => {
+            // Transcript is auxiliary. A damaged/missing timestamp source must not make
+            // the authoritative native snapshot unavailable; omit the label instead.
+            eprintln!(
+                "[session-display] transcript timestamps unavailable for {session_id}: {error}"
+            );
+            TurnTimestamps::new()
+        }
+    }
+}
+
+pub(crate) async fn load_turn_timestamps(project_hash: &str, session_id: &str) -> TurnTimestamps {
+    let project_hash = project_hash.to_owned();
+    let session_id = session_id.to_owned();
+    let task_session_id = session_id.clone();
+    match tokio::task::spawn_blocking(move || {
+        load_turn_timestamps_blocking(&project_hash, &task_session_id)
+    })
+    .await
+    {
+        Ok(timestamps) => timestamps,
+        Err(error) => {
+            // Timestamps are display-only. A cancelled or panicked blocking task must
+            // not make the authoritative native session unavailable.
+            eprintln!(
+                "[session-display] transcript timestamp task failed for {session_id}: {error}"
+            );
+            TurnTimestamps::new()
+        }
+    }
+}
+
+fn snapshot_message_timestamp(
+    meta: &atomcode_capabilities::session::SessionMeta,
+    message: &atomcode_kernel::message::Message,
+    index: usize,
+    turn_timestamps: &TurnTimestamps,
+) -> Option<u64> {
+    let direct_turn_id = message
+        .meta
+        .as_ref()
+        .map(|message_meta| message_meta.turn_id)
+        .filter(|turn_id| *turn_id != 0);
+    let positional_turn_id = meta
+        .turn_stats
+        .iter()
+        .find(|stat| stat.position_valid && index < stat.after_message)
+        .map(|stat| stat.turn_id)
+        .filter(|turn_id| *turn_id != 0);
+    let timestamp = direct_turn_id
+        .or(positional_turn_id)
+        .and_then(|turn_id| turn_timestamps.get(&turn_id).copied())?;
+    Some(match message.role {
+        atomcode_kernel::message::Role::User => timestamp.started_at?,
+        atomcode_kernel::message::Role::Assistant | atomcode_kernel::message::Role::Tool => {
+            timestamp.completed_at
+        }
+        atomcode_kernel::message::Role::System => return None,
+    })
+}
+
+pub(crate) fn attach_snapshot_message_timestamps(
+    messages: &mut [MessageInfo],
+    snapshot: &atomcode_kernel::message::SessionSnapshot,
+    meta: &atomcode_capabilities::session::SessionMeta,
+    turn_timestamps: &TurnTimestamps,
+) {
+    for (index, (info, message)) in messages
+        .iter_mut()
+        .zip(snapshot.messages.iter())
+        .enumerate()
+    {
+        info.created_at = snapshot_message_timestamp(meta, message, index, turn_timestamps);
+    }
+}
+
 fn merge_catalog_session_messages_for_display(
     session: &crate::legacy_convert::CatalogSessionView,
+    turn_timestamps: &TurnTimestamps,
 ) -> anyhow::Result<Vec<MessageInfo>> {
     use atomcode_capabilities::session::{DisplayAnchor, PresentationRole};
 
@@ -2103,7 +2275,6 @@ fn merge_catalog_session_messages_for_display(
         };
         presentation.entry(after_message).or_default().push(entry);
     }
-    let timestamp = Some(u64::try_from(session.meta.updated_at.max(0)).unwrap_or(0));
     let mut messages =
         Vec::with_capacity(session.snapshot.messages.len() + session.presentation.entries.len());
     let mut append_presentation = |position: usize, messages: &mut Vec<MessageInfo>| {
@@ -2126,7 +2297,12 @@ fn merge_catalog_session_messages_for_display(
                 tool_result: None,
                 artifacts: None,
                 images: None,
-                created_at: timestamp,
+                created_at: match entry.anchor {
+                    DisplayAnchor::AtStart => None,
+                    DisplayAnchor::AfterTurn { turn_id } => turn_timestamps
+                        .get(&turn_id)
+                        .map(|timestamp| timestamp.completed_at),
+                },
             });
         }
     };
@@ -2136,14 +2312,21 @@ fn merge_catalog_session_messages_for_display(
         // PresentationFile anchors and turn_stats are expressed in that coordinate space.
         // Compressing this iterator before applying `index + 1` moves presentation rows to
         // the wrong turn.
+        // Preserve the synthetic user-cancel boundary on the wire. UI clients
+        // still hide its text, but state projections (notably TodoWrite) need
+        // the provenance to retire work before this point. `/live` snapshots
+        // already expose this exact marker through `MessageInfo::from_kernel`;
+        // keeping it here makes HTTP history and live replay equivalent.
+        let user_interruption = message.is_user_interruption();
         let hidden_internal = message.internal_origin.as_deref()
             == Some(atomcode_kernel::message::LEGACY_COLD_SUMMARY_ORIGIN)
-            || message.synthetic
+            || (message.synthetic && !user_interruption)
             || (message.role == atomcode_kernel::message::Role::User
                 && atomcode_capabilities::reminder::is_system_reminder(&message.text));
         if !hidden_internal {
             let mut info = MessageInfo::from_kernel(message);
-            info.created_at = timestamp;
+            info.created_at =
+                snapshot_message_timestamp(&session.meta, message, index, turn_timestamps);
             messages.push(info);
         }
         append_presentation(index + 1, &mut messages);
@@ -2168,7 +2351,12 @@ fn merge_catalog_session_messages_for_display(
                 tool_result: None,
                 artifacts: None,
                 images: None,
-                created_at: timestamp,
+                created_at: match entry.anchor {
+                    DisplayAnchor::AtStart => None,
+                    DisplayAnchor::AfterTurn { turn_id } => turn_timestamps
+                        .get(&turn_id)
+                        .map(|timestamp| timestamp.completed_at),
+                },
             });
         }
     }
@@ -2874,14 +3062,16 @@ pub struct ModelInfo {
     pub provider_type: String,
     /// Whether this is the default provider
     pub is_default: bool,
-    /// Whether this model accepts the DeepSeek `reasoning_effort` control
-    /// (the deepseek-v4 family). The webui shows the effort selector only
-    /// for models where this is true.
+    /// Whether this concrete model endpoint accepts `reasoning_effort`.
     pub effort_applicable: bool,
-    /// Current `reasoning_effort` for this provider: `"high"`, `"max"`, or
-    /// `null` (the model's own default). Lets the webui reflect the active
+    /// Current `reasoning_effort`: `"low"`, `"medium"`, `"high"`, `"max"`,
+    /// or `null` (the model's own default). Lets the webui reflect the active
     /// effort in the selector.
     pub reasoning_effort: Option<String>,
+    /// The reasoning-effort LEVELS this endpoint exposes (subset of
+    /// low/medium/high/max, canonical order). Lets the webui restrict its
+    /// selector; an unrestricted endpoint lists all four (never empty).
+    pub effort_levels: Vec<String>,
 }
 
 /// Build the `/models` list from the UNIFIED model catalog (`logical_models`)
@@ -2900,10 +3090,22 @@ fn models_from_config(config: &Config) -> Vec<ModelInfo> {
                 model: p.model.clone(),
                 provider_type: p.provider_type.clone(),
                 is_default: id == &default_selection,
-                effort_applicable: atomcode_capabilities::provider::reason_effort_applicable(
-                    &p.model,
-                ),
-                reasoning_effort: p.reasoning_effort.clone(),
+                effort_applicable: p.reasoning_effort.is_some()
+                    || (atomcode_config::config::is_codingplan_provider_name(id)
+                        && p.model.eq_ignore_ascii_case("deepseek-v4-flash")),
+                // Clamp to the allowed levels so the webui trigger never shows a
+                // level the dropdown hides (then drop the `auto` sentinel).
+                reasoning_effort: atomcode_config::config::clamp_effort_to_levels(
+                    p.reasoning_effort.as_deref(),
+                    p.reasoning_effort_levels.as_deref(),
+                )
+                .filter(|effort| !effort.eq_ignore_ascii_case("auto")),
+                effort_levels: atomcode_config::config::allowed_effort_levels(
+                    p.reasoning_effort_levels.as_deref(),
+                )
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             })
         })
         .collect()
@@ -3057,6 +3259,8 @@ pub enum ChatEvent {
         tokens: usize,
         tool_calls: usize,
         session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stats: Option<TurnStatsWire>,
         /// Native runtime terminal reason. Additive so older clients can keep
         /// treating `done` as before while newer clients distinguish success,
         /// cancellation, safety fuses, provider failure, and timeouts.
@@ -3123,6 +3327,29 @@ pub enum ChatEvent {
         #[serde(default)]
         server_message: Option<String>,
     },
+}
+
+#[derive(Debug, Serialize)]
+pub struct TurnStatsWire {
+    duration_ms: u64,
+    rounds: usize,
+    tool_calls: usize,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    cached_tokens: usize,
+}
+
+impl From<atomcode_coding::RuntimeTurnStats> for TurnStatsWire {
+    fn from(stats: atomcode_coding::RuntimeTurnStats) -> Self {
+        Self {
+            duration_ms: stats.duration.as_millis().min(u128::from(u64::MAX)) as u64,
+            rounds: stats.turn_count,
+            tool_calls: stats.tool_call_count,
+            prompt_tokens: stats.prompt_tokens,
+            completion_tokens: stats.completion_tokens,
+            cached_tokens: stats.cached_tokens,
+        }
+    }
 }
 
 pub(crate) fn stop_reason_wire(reason: atomcode_kernel::event::StopReason) -> &'static str {
@@ -3230,6 +3457,27 @@ mod chat_event_type_tests {
             }]
         ));
         assert_eq!(projector.total_tokens, 12);
+    }
+
+    #[test]
+    fn turn_stats_wire_keeps_runtime_totals() {
+        let stats = atomcode_coding::RuntimeTurnStats {
+            duration: std::time::Duration::from_millis(10_700),
+            turn_count: 2,
+            tool_call_count: 3,
+            prompt_tokens: 120,
+            completion_tokens: 30,
+            cached_tokens: 90,
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(super::TurnStatsWire::from(stats)).unwrap();
+        assert_eq!(json["duration_ms"], 10_700);
+        assert_eq!(json["rounds"], 2);
+        assert_eq!(json["tool_calls"], 3);
+        assert_eq!(json["prompt_tokens"], 120);
+        assert_eq!(json["completion_tokens"], 30);
+        assert_eq!(json["cached_tokens"], 90);
     }
 
     #[test]
@@ -3354,6 +3602,7 @@ mod chat_event_type_tests {
                 message: "provider failed".into(),
                 http_status: Some(500),
                 code: None,
+                retryable: Some(true),
             }),
             "session-1",
         );
@@ -3792,10 +4041,11 @@ impl ChatRuntimeProjector {
                 }
                 self.terminal_seen = true;
                 self.terminal_reason = Some(reason);
-                if let Some(usage) = stats.last_usage {
+                if let Some(usage) = stats.last_usage.as_ref() {
                     self.total_tokens = (usage.tokens.prompt + usage.tokens.completion) as usize;
                 }
                 self.tool_call_count = self.tool_call_count.max(stats.tool_call_count);
+                let stats = TurnStatsWire::from(stats);
 
                 let mut events = Vec::new();
                 if let Some(event) = self.finish() {
@@ -3805,6 +4055,7 @@ impl ChatRuntimeProjector {
                     tokens: self.total_tokens,
                     tool_calls: self.tool_call_count,
                     session_id: permission_session_id.to_string(),
+                    stats: Some(stats),
                     stop_reason: Some(stop_reason_wire(reason).to_string()),
                     message: self.last_error.clone(),
                 });
@@ -4185,6 +4436,7 @@ async fn finalize_chat_task(
                     tokens: 0,
                     tool_calls: 0,
                     session_id,
+                    stats: None,
                     stop_reason: Some("internal_error".into()),
                     message: Some("chat task failed".into()),
                 });
@@ -4236,14 +4488,15 @@ fn resolve_chat_session(
     )? {
         Some(session) => session,
         None => {
-            let resolved = resolve_session_by_id(session_id_str).map_err(|error| {
-                anyhow::anyhow!("session {session_id_str:?} could not be resolved: {error}")
-            })?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "session {session_id_str:?} not found in project bucket {project_bucket}"
-                )
-            })?;
+            let resolved = resolve_session_by_id(session_id_str)
+                .map_err(|error| {
+                    anyhow::anyhow!("session {session_id_str:?} could not be resolved: {error}")
+                })?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "session {session_id_str:?} not found in project bucket {project_bucket}"
+                    )
+                })?;
             let session = crate::legacy_convert::load_catalog_session_view_in_project(
                 &resolved.project_hash,
                 &resolved.meta.id,
@@ -5627,6 +5880,117 @@ pub struct FsMkdirRequest {
     pub path: String,
 }
 
+#[derive(serde::Deserialize)]
+pub struct FsOpenRequest {
+    pub path: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+fn resolve_workspace_file(root: &std::path::Path, requested: &str) -> std::io::Result<PathBuf> {
+    let requested = PathBuf::from(requested.trim());
+    if requested.as_os_str().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file path is empty",
+        ));
+    }
+    let root = std::fs::canonicalize(root)?;
+    let unresolved = if requested.is_absolute() {
+        requested
+    } else {
+        root.join(requested)
+    };
+    let target = std::fs::canonicalize(unresolved)?;
+    if !target.starts_with(&root) || !target.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "only regular files inside the current working directory can be opened",
+        ));
+    }
+    Ok(target)
+}
+
+fn resolve_session_workspace_file(
+    sessions_root: &std::path::Path,
+    current_root: &std::path::Path,
+    requested: &str,
+    session_id: Option<&str>,
+    active_binding: Option<(&str, &std::path::Path)>,
+) -> std::io::Result<PathBuf> {
+    let root = match session_id.filter(|id| !id.trim().is_empty()) {
+        Some(session_id) => match active_binding {
+            Some((id, working_dir)) if id == session_id.trim() => working_dir.to_path_buf(),
+            _ => {
+                resolve_session_in_root(sessions_root, session_id.trim())
+                    .map_err(|error| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("cannot resolve session working directory: {error}"),
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::NotFound, "session not found")
+                    })?
+                    .meta
+                    .working_dir
+            }
+        },
+        None => current_root.to_path_buf(),
+    };
+    resolve_workspace_file(&root, requested)
+}
+
+/// Open a generated file from the WebUI. This is deliberately narrower than
+/// the agent's `open_file` tool: HTTP callers may open only an existing regular
+/// file under the daemon's current workspace, after symlinks and `..` are
+/// resolved. The endpoint never accepts URLs or directories.
+async fn fs_open(
+    State(state): State<AppState>,
+    Json(req): Json<FsOpenRequest>,
+) -> impl IntoResponse {
+    let current_root = state.project.read().await.working_dir.clone();
+    let requested = req.path;
+    let session_id = req.session_id.filter(|id| !id.trim().is_empty());
+    let active_binding = crate::native_live::binding().ok();
+    let resolved = tokio::task::spawn_blocking(move || {
+        resolve_session_workspace_file(
+            &NativeSessionManager::sessions_root(),
+            &current_root,
+            &requested,
+            session_id.as_deref(),
+            active_binding
+                .as_ref()
+                .map(|binding| (binding.session_id.as_str(), binding.working_dir.as_path())),
+        )
+    })
+    .await;
+    let target = match resolved {
+        Ok(Ok(target)) => target,
+        Ok(Err(error)) => {
+            let status = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return json_error(status, format!("cannot open file: {error}")).into_response();
+        }
+        Err(error) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("file resolution task failed: {error}"),
+            )
+            .into_response();
+        }
+    };
+    match atomcode_capabilities::tools::open_local_path(&target).await {
+        Ok(message) => {
+            Json(serde_json::json!({ "success": true, "message": message })).into_response()
+        }
+        Err(message) => json_error(StatusCode::BAD_REQUEST, message).into_response(),
+    }
+}
+
 async fn fs_mkdir(
     State(_state): State<AppState>,
     Json(req): Json<FsMkdirRequest>,
@@ -5893,6 +6257,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         // Filesystem API
         .route("/fs/list", get(fs_list))
         .route("/fs/mkdir", post(fs_mkdir))
+        .route("/fs/open", post(fs_open))
         // MCP API
         .route("/mcp/status", get(mcp_status))
         .route("/mcp/reload", post(mcp_reload))
@@ -5903,6 +6268,14 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route(
             "/providers",
             get(api_provider::get_providers).post(api_provider::create_provider),
+        )
+        .route(
+            "/providers/discover-models",
+            post(api_provider::discover_models).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/provider-accounts/:account/models",
+            post(api_provider::create_account_models).layer(DefaultBodyLimit::max(256 * 1024)),
         )
         .route(
             "/providers/:name",
@@ -6129,6 +6502,110 @@ mod fs_list_tests {
     fn errors_on_missing_dir() {
         assert!(list_subdirs(std::path::Path::new("/no/such/dir/xyz123")).is_err());
     }
+
+    #[test]
+    fn workspace_file_resolution_accepts_files_and_rejects_escape_or_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("artifact.md"), "ok").unwrap();
+        std::fs::write(temp.path().join("outside.md"), "no").unwrap();
+
+        assert_eq!(
+            resolve_workspace_file(&workspace, "artifact.md").unwrap(),
+            std::fs::canonicalize(workspace.join("artifact.md")).unwrap()
+        );
+        assert_eq!(
+            resolve_workspace_file(&workspace, "../outside.md")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            resolve_workspace_file(&workspace, ".").unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_file_resolution_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let outside = temp.path().join("outside.md");
+        std::fs::write(&outside, "no").unwrap();
+        symlink(&outside, workspace.join("link.md")).unwrap();
+
+        assert_eq!(
+            resolve_workspace_file(&workspace, "link.md")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn workspace_file_resolution_uses_the_owning_sessions_working_directory() {
+        use atomcode_capabilities::session::{
+            PresentationFile, SessionManager, SessionMeta, StorageOwner,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_root = temp.path().join("sessions");
+        let current = temp.path().join("current");
+        let session_workspace = temp.path().join("session-workspace");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::create_dir_all(&session_workspace).unwrap();
+        std::fs::write(session_workspace.join("artifact.md"), "ok").unwrap();
+
+        let manager = SessionManager::with_root(sessions_root.join("0000000000000000"));
+        let lease = manager.acquire_lease("session-1").unwrap();
+        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+            atomcode_kernel::message::Message::user("fixture"),
+        ]);
+        let mut meta = SessionMeta::new("session-1", session_workspace.to_string_lossy(), 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 1;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+
+        // The live runtime still owns the lease here, so disk catalog discovery
+        // may be unavailable (especially under mandatory Windows locks). Its
+        // authoritative binding must still make the produced file openable.
+        assert_eq!(
+            resolve_session_workspace_file(
+                &sessions_root,
+                &current,
+                "artifact.md",
+                Some("session-1"),
+                Some(("session-1", &session_workspace)),
+            )
+            .unwrap(),
+            std::fs::canonicalize(session_workspace.join("artifact.md")).unwrap()
+        );
+        drop(lease);
+
+        assert_eq!(
+            resolve_session_workspace_file(
+                &sessions_root,
+                &current,
+                "artifact.md",
+                Some("session-1"),
+                None,
+            )
+            .unwrap(),
+            std::fs::canonicalize(session_workspace.join("artifact.md")).unwrap()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6174,12 +6651,84 @@ mod tests {
             },
         };
 
-        let displayed = merge_catalog_session_messages_for_display(&session).unwrap();
+        let displayed =
+            merge_catalog_session_messages_for_display(&session, &TurnTimestamps::new()).unwrap();
         let text = displayed
             .iter()
             .map(|message| message.content.as_str())
             .collect::<Vec<_>>();
         assert_eq!(text, ["real user", "anchored display", "real assistant"]);
+    }
+
+    #[test]
+    fn display_projection_uses_persisted_turn_timestamps() {
+        use atomcode_capabilities::session::{PresentationFile, SessionMeta, TurnStat};
+        use atomcode_kernel::message::{Message, SessionSnapshot};
+
+        let mut meta = SessionMeta::new("timestamp-test", "/project", 1);
+        let stat = |turn_id, after_message| TurnStat {
+            after_message,
+            position_valid: true,
+            turn_id,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 1,
+            errored: false,
+            used_tokens: 1,
+            ctx_window: 1_000,
+            model_usage: Vec::new(),
+        };
+        meta.turn_stats = vec![stat(1, 2), stat(2, 4)];
+        let session = crate::legacy_convert::CatalogSessionView {
+            snapshot: SessionSnapshot::new(vec![
+                Message::user("first"),
+                Message::assistant("one", vec![]),
+                Message::user("second"),
+                Message::assistant("two", vec![]),
+            ]),
+            meta,
+            presentation: PresentationFile::default(),
+        };
+        let timestamps = TurnTimestamps::from([
+            (
+                1,
+                TurnTimestamp {
+                    started_at: Some(1_699_999_990_000),
+                    completed_at: 1_700_000_000_000,
+                },
+            ),
+            (
+                2,
+                TurnTimestamp {
+                    started_at: Some(1_700_000_090_000),
+                    completed_at: 1_700_000_100_000,
+                },
+            ),
+        ]);
+
+        let mut live_messages: Vec<_> = session
+            .snapshot
+            .messages
+            .iter()
+            .map(MessageInfo::from_kernel)
+            .collect();
+        attach_snapshot_message_timestamps(
+            &mut live_messages,
+            &session.snapshot,
+            &session.meta,
+            &timestamps,
+        );
+        assert_eq!(live_messages[0].created_at, Some(1_699_999_990_000));
+        assert_eq!(live_messages[1].created_at, Some(1_700_000_000_000));
+        assert_eq!(live_messages[2].created_at, Some(1_700_000_090_000));
+        assert_eq!(live_messages[3].created_at, Some(1_700_000_100_000));
+
+        let displayed = merge_catalog_session_messages_for_display(&session, &timestamps).unwrap();
+        assert_eq!(displayed[0].created_at, Some(1_699_999_990_000));
+        assert_eq!(displayed[1].created_at, Some(1_700_000_000_000));
+        assert_eq!(displayed[2].created_at, Some(1_700_000_090_000));
+        assert_eq!(displayed[3].created_at, Some(1_700_000_100_000));
     }
 
     #[test]
@@ -6203,9 +6752,35 @@ mod tests {
             },
         };
 
-        let displayed = merge_catalog_session_messages_for_display(&session).unwrap();
+        let displayed =
+            merge_catalog_session_messages_for_display(&session, &TurnTimestamps::new()).unwrap();
         assert_eq!(displayed.len(), 2);
         assert!(displayed.iter().all(|message| message.content == wrapped));
+    }
+
+    #[test]
+    fn display_projection_preserves_hidden_user_interruption_provenance() {
+        use atomcode_capabilities::session::{PresentationFile, SessionMeta};
+        use atomcode_kernel::message::{Message, SessionSnapshot, USER_INTERRUPTION_ORIGIN};
+
+        let session = crate::legacy_convert::CatalogSessionView {
+            snapshot: SessionSnapshot::new(vec![
+                Message::user("start work"),
+                Message::user_interruption(),
+            ]),
+            meta: SessionMeta::new("cancel-boundary", "/project", 1),
+            presentation: PresentationFile::default(),
+        };
+
+        let displayed =
+            merge_catalog_session_messages_for_display(&session, &TurnTimestamps::new()).unwrap();
+        assert_eq!(displayed.len(), 2);
+        assert_eq!(
+            displayed[1].internal_origin.as_deref(),
+            Some(USER_INTERRUPTION_ORIGIN)
+        );
+        assert!(displayed[1].synthetic);
+        assert!(displayed[1].content.is_empty());
     }
 
     #[test]
@@ -7096,11 +7671,13 @@ mod tests {
             thinking_keep: None,
             reasoning_history: None,
             reasoning_effort: None,
+            reasoning_effort_levels: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            retry_max_attempts: None,
         }
     }
 
@@ -7645,7 +8222,7 @@ mod tests {
     // 当前工作区 A 的桶造成同 ID 双份。
     #[test]
     fn chat_continuation_loads_session_from_other_bucket_and_redirects_working_dir() {
-        let home = ScopedChatHome::new();
+        let _home = ScopedChatHome::new();
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
         let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -7863,6 +8440,23 @@ mod tests {
         let info = MessageInfo::from_kernel(&msg);
 
         assert_eq!(info.internal_origin.as_deref(), Some("verify_cadence"));
+    }
+
+    #[test]
+    fn message_info_normalizes_legacy_user_interruption_without_exposing_text() {
+        use atomcode_kernel::message::{Message, USER_INTERRUPTION_ORIGIN};
+
+        let msg = Message::synthetic_user(
+            "[The previous response was interrupted by the user before completing. Reconsider.]",
+        );
+        let info = MessageInfo::from_kernel(&msg);
+
+        assert!(info.content.is_empty());
+        assert!(info.synthetic);
+        assert_eq!(
+            info.internal_origin.as_deref(),
+            Some(USER_INTERRUPTION_ORIGIN)
+        );
     }
 
     #[test]

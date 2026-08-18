@@ -5,6 +5,8 @@ use async_trait::async_trait;
 use atomcode_capabilities::team::{
     role_by_id, TeamDifficulty, TeamPermission, TeamRoleProfile, TeamTaskSpec,
 };
+use atomcode_capabilities::tools::team_child_middlewares_for_policy;
+#[cfg(test)]
 use atomcode_capabilities::tools::team_child_middlewares;
 use atomcode_kernel::agent::{Agent, AutoRespond, ToolLoopPolicy};
 use atomcode_kernel::event::StopReason;
@@ -31,6 +33,7 @@ pub struct TeamRunnerFactory {
     stream_timeout: Option<Duration>,
     request_timeout: Option<Duration>,
     inherited_worker_middlewares: Vec<Arc<dyn ToolMiddleware>>,
+    credential_shell_policy: atomcode_capabilities::tools::CredentialShellPolicy,
 }
 
 impl TeamRunnerFactory {
@@ -48,6 +51,7 @@ impl TeamRunnerFactory {
             stream_timeout: None,
             request_timeout: None,
             inherited_worker_middlewares: Vec::new(),
+            credential_shell_policy: Default::default(),
         }
     }
 
@@ -67,6 +71,14 @@ impl TeamRunnerFactory {
 
     pub fn with_worker_middleware(mut self, middleware: Arc<dyn ToolMiddleware>) -> Self {
         self.inherited_worker_middlewares.push(middleware);
+        self
+    }
+
+    pub fn with_credential_shell_policy(
+        mut self,
+        policy: atomcode_capabilities::tools::CredentialShellPolicy,
+    ) -> Self {
+        self.credential_shell_policy = policy;
         self
     }
 
@@ -103,11 +115,12 @@ impl TeamRunnerFactory {
             .cancel_token(cancel)
             .hook(progress.clone())
             .middleware(Arc::new(DenyTeamBash));
-        for middleware in team_child_middlewares(
+        for middleware in team_child_middlewares_for_policy(
             task.permission == TeamPermission::Worker,
             &task.scope,
             &self.working_dir,
             &self.inherited_worker_middlewares,
+            self.credential_shell_policy,
         ) {
             builder = builder.middleware(middleware);
         }

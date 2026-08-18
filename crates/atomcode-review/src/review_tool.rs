@@ -454,6 +454,8 @@ impl Tool for ReviewTool {
         cfg.max_turn_duration = self.max_turn_duration;
         cfg.tool_loop_policy = self.tool_loop_policy;
         cfg.progress = Some(ctx.progress.clone());
+        // Pin tools to the changed-file set of this scoped review (same as clix).
+        cfg.review_paths = files.clone();
         let (agent, report) = build_review_agent_with(&cfg, provider);
 
         // 4. Run the reviewer to completion, honoring the host turn's cancellation. Dropping

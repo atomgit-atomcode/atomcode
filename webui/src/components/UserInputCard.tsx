@@ -9,6 +9,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { isUserInputBatch, UserInputAnswer, UserInputQuestion, UserInputRequestEvent, UserInputResponseBody } from '../api';
 import { useT } from '../settings';
+import { InteractionDock } from './InteractionDock';
 
 interface UserInputCardProps {
   req: UserInputRequestEvent;
@@ -223,6 +224,8 @@ function QuestionBody({
       {q.mode === 'text' && (
         <div class="field-group">
           <textarea
+            data-interaction-autofocus
+            autoFocus
             class="user-input-textarea"
             rows={4}
             value={state.freeText}
@@ -236,7 +239,7 @@ function QuestionBody({
   );
 }
 
-/** Modal chrome shared by the single card and the batch stepper. */
+/** Composer-dock chrome shared by the single card and the batch stepper. */
 function CardShell({
   title,
   children,
@@ -252,39 +255,24 @@ function CardShell({
 }) {
   const t = useT();
   return (
-    <div
-      class="modal-overlay"
-      onPointerDown={(event) => {
-        if (event.target === event.currentTarget) event.preventDefault();
-        event.stopPropagation();
+    <InteractionDock
+      title={title}
+      icon={
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+          <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8" />
+          <line x1="12" y1="8" x2="12" y2="13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+          <circle cx="12" cy="16" r="0.9" fill="currentColor" />
+        </svg>
+      }
+      close={{
+        disabled: closing,
+        onClick: onClose,
+        label: t('userInput.close'),
       }}
-      onClick={(event) => event.stopPropagation()}
+      footer={footer}
     >
-      <div class="modal-card permission-card">
-        <div class="modal-header permission-header">
-          <span class="permission-logo" aria-hidden="true">
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
-              <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8" />
-              <line x1="12" y1="8" x2="12" y2="13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
-              <circle cx="12" cy="16" r="0.9" fill="currentColor" />
-            </svg>
-          </span>
-          <h3 class="permission-title">{title}</h3>
-          <button
-            type="button"
-            class="ghost-btn modal-close"
-            disabled={closing}
-            onClick={onClose}
-            aria-label={t('userInput.close')}
-            title={t('userInput.close')}
-          >
-            ×
-          </button>
-        </div>
-        <div class="modal-body">{children}</div>
-        <div class="modal-footer permission-footer">{footer}</div>
-      </div>
-    </div>
+      {children}
+    </InteractionDock>
   );
 }
 

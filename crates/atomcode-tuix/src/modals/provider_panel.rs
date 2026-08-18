@@ -289,79 +289,9 @@ fn delete_at_cursor(text: &mut String, cursor: &mut usize) {
     }
 }
 
-fn tail_graphemes_to_width(text: &str, max_cols: usize) -> String {
-    let mut kept = Vec::new();
-    let mut width = 0;
-    for grapheme in text.graphemes(true).rev() {
-        let grapheme_width = crate::width::display_width(grapheme);
-        if width + grapheme_width > max_cols {
-            break;
-        }
-        kept.push(grapheme);
-        width += grapheme_width;
-    }
-    kept.into_iter().rev().collect()
-}
-
 /// Build the transient value projection for a focused form field. The source
 /// value is never changed: the visible caret and ellipses exist only in the
 /// `PluginInfo` row sent to the renderer.
-fn editable_value_projection(value: &str, cursor_byte: usize, max_cols: usize) -> String {
-    const CARET: &str = "│";
-    const ELLIPSIS: &str = "…";
-
-    if max_cols == 0 {
-        return String::new();
-    }
-    if max_cols == 1 {
-        return CARET.to_string();
-    }
-
-    let cursor = cursor_byte.min(value.len());
-    let before = &value[..cursor];
-    let after = &value[cursor..];
-    let before_width = crate::width::display_width(before);
-    let after_width = crate::width::display_width(after);
-    let text_budget = max_cols - 1; // reserve the visible caret
-
-    if before_width + after_width <= text_budget {
-        return format!("{before}{CARET}{after}");
-    }
-
-    // Keep the caret near the centre while editing in the middle. At either
-    // endpoint, donate the unused half to the side that still has content.
-    let mut left_budget = text_budget / 2;
-    let mut right_budget = text_budget - left_budget;
-    if after_width < right_budget {
-        left_budget += right_budget - after_width;
-        right_budget = after_width;
-    }
-    if before_width < left_budget {
-        right_budget += left_budget - before_width;
-        left_budget = before_width;
-    }
-
-    let left_hidden = before_width > left_budget;
-    let right_hidden = after_width > right_budget;
-    if left_hidden {
-        left_budget = left_budget.saturating_sub(1);
-    }
-    if right_hidden {
-        right_budget = right_budget.saturating_sub(1);
-    }
-
-    let left = tail_graphemes_to_width(before, left_budget);
-    let right = crate::width::truncate_to_width(after, right_budget);
-    format!(
-        "{}{}{}{}{}",
-        if left_hidden { ELLIPSIS } else { "" },
-        left,
-        CARET,
-        right,
-        if right_hidden { ELLIPSIS } else { "" }
-    )
-}
-
 fn editable_field_row(
     label: &str,
     value: &str,
@@ -373,11 +303,42 @@ fn editable_field_row(
     let prefix = format!("{marker}{label}: ");
     let value_cols = max_cols.saturating_sub(crate::width::display_width(&prefix));
     let displayed = if focused {
-        editable_value_projection(value, cursor_byte, value_cols)
+        crate::width::editable_value_projection(value, cursor_byte, value_cols)
     } else {
         crate::width::truncate_with_ellipsis(value, value_cols)
     };
     (format!("{prefix}{displayed}"), String::new())
+}
+
+/// Provider forms are also used in classic Windows conhost, where the active
+/// font commonly lacks the geometric symbols used as focus/caret chrome. Keep
+/// user content intact while applying the shared decorative-glyph fallback to
+/// both columns before the payload reaches the renderer.
+fn downgrade_panel_items(items: &mut [(String, String)], unicode_symbols: bool) {
+    if unicode_symbols {
+        return;
+    }
+
+    fn provider_chrome_ascii(text: &str) -> String {
+        crate::glyph::downgrade_glyphs(text, false)
+            .chars()
+            .map(|ch| match ch {
+                '‹' => '<',
+                '›' => '>',
+                '–' | '—' => '-',
+                // Form projections allocate one display cell for an ellipsis;
+                // keep the fallback one cell wide as well.
+                '…' => '.',
+                '＋' => '+',
+                other => other,
+            })
+            .collect()
+    }
+
+    for (label, detail) in items {
+        *label = provider_chrome_ascii(label);
+        *detail = provider_chrome_ascii(detail);
+    }
 }
 
 /// Which model-form field has focus.
@@ -387,6 +348,8 @@ enum ModelField {
     ApiKey,
     Model,
     Vision,
+    Effort,
+    EffortLevels,
     Window,
     MakeDefault,
 }
@@ -395,7 +358,7 @@ enum ModelField {
 /// api_key: a non-CodingPlan account (CodingPlan uses the gateway signer) that
 /// has no explicit api_key yet. Filled once, stored on the account.
 fn account_needs_key(config: &Config, account_id: &str) -> bool {
-    if atomcode_config::config::is_codingplan_provider_name(account_id) {
+    if config.account_is_codingplan_managed(account_id) {
         return false;
     }
     match config.provider_accounts.get(account_id) {
@@ -421,16 +384,61 @@ struct ModelForm {
     model: String,
     /// `None` = Auto, `Some(true)` = Enabled, `Some(false)` = Disabled.
     supports_vision: Option<bool>,
+    /// `None` = unsupported, `Some("auto")` = supported with API default.
+    reasoning_effort: Option<String>,
+    /// Per-level toggles for `reasoning_effort_levels` (index = canonical
+    /// low/medium/high/max order). All-true ⇒ unrestricted (persisted as None).
+    effort_levels: [bool; 4],
+    /// Sub-cursor for the EffortLevels multi-select (which level Space toggles).
+    effort_level_cursor: usize,
     window: String,
     make_default: bool,
     focus: ModelField,
+    /// UTF-8 byte cursor for the currently focused text field.
+    cursor_byte: usize,
     /// When set, this is an edit of an existing model id (account locked).
     edit_id: Option<String>,
 }
 
+/// Convert a persisted `reasoning_effort_levels` list into per-level toggles
+/// (canonical low/medium/high/max order). `None`/empty ⇒ all levels enabled.
+fn effort_levels_from_config(declared: Option<&[String]>) -> [bool; 4] {
+    // Derive from the single source of truth so the toggles agree with what every
+    // other surface offers (incl. the "unknown-only list ⇒ all levels" rule).
+    let allowed = atomcode_config::config::allowed_effort_levels(declared);
+    let mut bits = [false; 4];
+    for (i, level) in atomcode_config::config::REASONING_EFFORT_LEVELS
+        .iter()
+        .enumerate()
+    {
+        bits[i] = allowed.contains(level);
+    }
+    bits
+}
+
+/// Convert per-level toggles back to a persisted `reasoning_effort_levels`.
+/// All-enabled (or, degenerately, all-disabled) ⇒ `None` = unrestricted; there is
+/// no "zero levels" state, since `allowed_effort_levels` treats empty as all.
+fn effort_levels_to_config(bits: [bool; 4]) -> Option<Vec<String>> {
+    if bits.iter().all(|b| *b) || bits.iter().all(|b| !*b) {
+        return None;
+    }
+    Some(
+        atomcode_config::config::REASONING_EFFORT_LEVELS
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| bits[*i])
+            .map(|(_, level)| level.to_string())
+            .collect(),
+    )
+}
+
 impl ModelForm {
     fn new_add(config: &Config, preferred: Option<&str>) -> Option<Self> {
-        let account_ids = ProviderPanel::account_ids(config);
+        let account_ids: Vec<String> = ProviderPanel::account_ids(config)
+            .into_iter()
+            .filter(|id| !ProviderPanel::managed_account(config, id))
+            .collect();
         if account_ids.is_empty() {
             return None;
         }
@@ -450,9 +458,13 @@ impl ModelForm {
             api_key: String::new(),
             model: String::new(),
             supports_vision: None,
+            reasoning_effort: None,
+            effort_levels: [true; 4],
+            effort_level_cursor: 0,
             window: String::new(),
             make_default: true,
             focus: ModelField::Account,
+            cursor_byte: 0,
             edit_id: None,
         })
     }
@@ -466,9 +478,13 @@ impl ModelForm {
             api_key: String::new(),
             model: m.model.clone(),
             supports_vision: m.supports_vision,
+            reasoning_effort: m.reasoning_effort.clone(),
+            effort_levels: effort_levels_from_config(m.reasoning_effort_levels.as_deref()),
+            effort_level_cursor: 0,
             window: m.context_window.to_string(),
             make_default: config.effective_model_selection().as_deref() == Some(id),
             focus: ModelField::Model,
+            cursor_byte: m.model.len(),
             edit_id: Some(id.to_string()),
         })
     }
@@ -495,6 +511,8 @@ impl ModelForm {
         }
         v.push(ModelField::Model);
         v.push(ModelField::Vision);
+        v.push(ModelField::Effort);
+        v.push(ModelField::EffortLevels);
         v.push(ModelField::Window);
         v.push(ModelField::MakeDefault);
         v
@@ -509,6 +527,20 @@ impl ModelForm {
             (cur + fields.len() - 1) % fields.len()
         };
         self.focus = fields[next];
+        self.cursor_byte = self.focused_text().map(str::len).unwrap_or(0);
+    }
+
+    fn focused_text(&self) -> Option<&str> {
+        match self.focus {
+            ModelField::ApiKey => Some(&self.api_key),
+            ModelField::Model => Some(&self.model),
+            ModelField::Window => Some(&self.window),
+            ModelField::Account
+            | ModelField::Vision
+            | ModelField::Effort
+            | ModelField::EffortLevels
+            | ModelField::MakeDefault => None,
+        }
     }
 
     fn cycle_account(&mut self, forward: bool) {
@@ -547,6 +579,90 @@ impl ModelForm {
             }
         }
     }
+
+    fn cycle_effort(&mut self, forward: bool) {
+        // Cycle the DEFAULT value through None, "auto", then only the ENABLED
+        // levels — so a model that dropped `medium` can't take `medium` as its
+        // default.
+        let mut values: Vec<Option<&str>> = vec![None, Some("auto")];
+        for (i, level) in atomcode_config::config::REASONING_EFFORT_LEVELS
+            .iter()
+            .enumerate()
+        {
+            if self.effort_levels[i] {
+                values.push(Some(level));
+            }
+        }
+        let current = values
+            .iter()
+            .position(|value| *value == self.reasoning_effort.as_deref())
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % values.len()
+        } else {
+            (current + values.len() - 1) % values.len()
+        };
+        self.reasoning_effort = values[next].map(str::to_string);
+    }
+
+    fn move_effort_cursor(&mut self, forward: bool) {
+        let n = self.effort_levels.len();
+        self.effort_level_cursor = if forward {
+            (self.effort_level_cursor + 1) % n
+        } else {
+            (self.effort_level_cursor + n - 1) % n
+        };
+    }
+
+    fn toggle_effort_level(&mut self) {
+        let i = self.effort_level_cursor.min(self.effort_levels.len() - 1);
+        self.effort_levels[i] = !self.effort_levels[i];
+        // Keep the default value valid: if it now names a disabled level, drop it
+        // back to the API default.
+        if let Some(current) = self.reasoning_effort.clone() {
+            let still_valid = current.eq_ignore_ascii_case("auto")
+                || atomcode_config::config::REASONING_EFFORT_LEVELS
+                    .iter()
+                    .enumerate()
+                    .any(|(idx, level)| {
+                        self.effort_levels[idx] && level.eq_ignore_ascii_case(&current)
+                    });
+            if !still_valid {
+                self.reasoning_effort = Some("auto".to_string());
+            }
+        }
+    }
+
+    /// Render the level toggles with the sub-cursor marked, e.g.
+    /// ` ● low  ‹○ medium›  ● high  ● max ` (focused level in guillemets).
+    ///
+    /// Use text glyphs rather than emoji so each marker stays monochrome and
+    /// occupies one terminal cell on the terminals supported by the TUI.
+    fn effort_levels_label(&self, focused: bool) -> String {
+        atomcode_config::config::REASONING_EFFORT_LEVELS
+            .iter()
+            .enumerate()
+            .map(|(i, level)| {
+                let mark = if self.effort_levels[i] { '●' } else { '○' };
+                let cell = format!("{mark} {level}");
+                if focused && i == self.effort_level_cursor {
+                    format!("‹{cell}›")
+                } else {
+                    format!(" {cell} ")
+                }
+            })
+            .collect::<String>()
+    }
+
+    fn effort_label(&self) -> String {
+        match self.reasoning_effort.as_deref() {
+            None => crate::i18n::t(crate::i18n::Msg::ProviderPanelVisionDisabled).into_owned(),
+            Some("auto") => {
+                crate::i18n::t(crate::i18n::Msg::ProviderPanelDefaultValue).into_owned()
+            }
+            Some(value) => value.to_string(),
+        }
+    }
 }
 
 enum Mode {
@@ -562,6 +678,10 @@ pub struct ProviderPanel {
     mode: Mode,
     /// Search/filter query for the list (the plugin-style search box).
     query: String,
+    /// UTF-8 byte cursor for the list search query.
+    query_cursor_byte: usize,
+    /// Whether Left/Right edit the query instead of switching list tabs.
+    search_focused: bool,
     /// When set (via drilling into an account with ↵), the Models tab shows only
     /// this account's models. Cleared by Tab / Esc.
     account_filter: Option<String>,
@@ -590,6 +710,32 @@ fn is_add_shortcut(code: &KeyCode, mods: KeyModifiers) -> bool {
 }
 
 impl ProviderPanel {
+    fn managed_account(config: &Config, account_id: &str) -> bool {
+        config.account_is_codingplan_managed(account_id)
+    }
+
+    fn managed_model(config: &Config, model_id: &str) -> bool {
+        config
+            .logical_models()
+            .get(model_id)
+            .is_some_and(|model| Self::managed_account(config, &model.account))
+    }
+
+    fn can_add_model(&self, config: &Config) -> bool {
+        self.account_filter.as_deref().map_or_else(
+            || {
+                Self::account_ids(config)
+                    .iter()
+                    .any(|id| !Self::managed_account(config, id))
+            },
+            |account| !Self::managed_account(config, account),
+        )
+    }
+
+    fn has_add_row(&self, config: &Config) -> bool {
+        self.tab == Tab::Accounts || self.can_add_model(config)
+    }
+
     /// Apply a single-line paste to the field currently being edited.
     ///
     /// Provider form values are all single-line. Normalize terminal line
@@ -618,15 +764,25 @@ impl ProviderPanel {
                 FormField::Name | FormField::Preset => {}
             },
             Mode::Model(form) => match form.focus {
-                ModelField::ApiKey => form.api_key.push_str(clean),
-                ModelField::Model => form.model.push_str(clean),
-                ModelField::Window => form
-                    .window
-                    .extend(clean.chars().filter(char::is_ascii_digit)),
-                ModelField::Account | ModelField::Vision | ModelField::MakeDefault => {}
+                ModelField::ApiKey => {
+                    insert_at_cursor(&mut form.api_key, &mut form.cursor_byte, clean)
+                }
+                ModelField::Model => {
+                    insert_at_cursor(&mut form.model, &mut form.cursor_byte, clean)
+                }
+                ModelField::Window => {
+                    let digits: String = clean.chars().filter(char::is_ascii_digit).collect();
+                    insert_at_cursor(&mut form.window, &mut form.cursor_byte, &digits)
+                }
+                ModelField::Account
+                | ModelField::Vision
+                | ModelField::Effort
+                | ModelField::EffortLevels
+                | ModelField::MakeDefault => {}
             },
             Mode::List => {
-                self.query.push_str(clean);
+                insert_at_cursor(&mut self.query, &mut self.query_cursor_byte, clean);
+                self.search_focused = true;
                 self.selected = 0;
                 self.pending_delete = None;
             }
@@ -639,6 +795,8 @@ impl ProviderPanel {
             selected: 0,
             mode: Mode::List,
             query: String::new(),
+            query_cursor_byte: 0,
+            search_focused: false,
             account_filter: None,
             pending_delete: None,
         }
@@ -772,6 +930,8 @@ impl ProviderPanel {
         self.tab = tab;
         self.selected = 0;
         self.query.clear();
+        self.query_cursor_byte = 0;
+        self.search_focused = false;
         self.account_filter = None;
         self.pending_delete = None;
     }
@@ -783,6 +943,8 @@ impl ProviderPanel {
         self.selected = 0;
         self.mode = Mode::List;
         self.query.clear();
+        self.query_cursor_byte = 0;
+        self.search_focused = false;
         self.account_filter = Some(account_id.to_string());
         self.pending_delete = None;
     }
@@ -802,13 +964,13 @@ impl ProviderPanel {
 
     /// Selectable row count, including the trailing add row on both tabs.
     fn current_len(&self, config: &Config) -> usize {
-        self.filtered_ids(config).len() + 1
+        self.filtered_ids(config).len() + usize::from(self.has_add_row(config))
     }
 
     fn selected_id(&self, config: &Config) -> Option<String> {
         let ids = self.filtered_ids(config);
         // The virtual add row sits just past the real rows on either tab.
-        if self.selected == ids.len() {
+        if self.selected == ids.len() && self.has_add_row(config) {
             return Some(
                 match self.tab {
                     Tab::Accounts => ADD_PROVIDER_ROW,
@@ -822,6 +984,9 @@ impl ProviderPanel {
 
     fn begin_add_for_current_tab(&mut self, config: &Config) {
         self.pending_delete = None;
+        if self.tab == Tab::Models && !self.can_add_model(config) {
+            return;
+        }
         self.mode = match self.tab {
             Tab::Accounts => Mode::Add(AddForm::new()),
             Tab::Models => ModelForm::new_add(config, self.account_filter.as_deref())
@@ -929,7 +1094,7 @@ impl ProviderPanel {
             provider_preset::ProviderType::Anthropic
         );
         let preset_idx = compat_preset_idx(anthropic);
-        let vendor_locked = atomcode_config::config::is_codingplan_provider_name(id);
+        let vendor_locked = config.account_is_codingplan_managed(id);
         EditForm {
             id: id.to_string(),
             is_legacy,
@@ -956,6 +1121,9 @@ impl ProviderPanel {
 
     /// Apply an account edit in place (blank fields keep the current value), save.
     fn save_edit(&self, form: &EditForm, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> bool {
+        if Self::managed_account(&ctx.config, &form.id) {
+            return false;
+        }
         let form = form.clone();
         let account_id = form.id.clone();
         update_config_and_reload(
@@ -1055,8 +1223,32 @@ impl ProviderPanel {
     /// + window in place (preserving its other fields), then save.
     fn save_model(&self, form: &ModelForm, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> bool {
         let account_id = form.account_id().to_string();
+        if Self::managed_account(&ctx.config, &account_id)
+            || form
+                .edit_id
+                .as_deref()
+                .is_some_and(|id| Self::managed_model(&ctx.config, id))
+        {
+            return false;
+        }
         let model_name = form.model.trim().to_string();
         let supports_vision = form.supports_vision;
+        let reasoning_effort_levels = effort_levels_to_config(form.effort_levels);
+        // Keep the persisted default within the enabled levels. The interactive
+        // toggle already self-heals, but a value LOADED from a hand-edited config
+        // (medium selected while medium is off) would otherwise be saved verbatim.
+        let reasoning_effort = if form.reasoning_effort.as_deref().is_some_and(|v| {
+            !v.eq_ignore_ascii_case("auto")
+                && atomcode_config::config::clamp_effort_to_levels(
+                    Some(v),
+                    reasoning_effort_levels.as_deref(),
+                )
+                .is_none()
+        }) {
+            Some("auto".to_string())
+        } else {
+            form.reasoning_effort.clone()
+        };
         if model_name.is_empty() {
             return false;
         }
@@ -1122,10 +1314,14 @@ impl ProviderPanel {
                     if let Some(model) = persisted.models.get_mut(id) {
                         model.model = model_name.clone();
                         model.supports_vision = supports_vision;
+                        model.reasoning_effort = reasoning_effort.clone();
+                        model.reasoning_effort_levels = reasoning_effort_levels.clone();
                         model.context_window = context_window;
                     } else if let Some(provider) = persisted.providers.get_mut(id) {
                         provider.model = model_name.clone();
                         provider.supports_vision = supports_vision;
+                        provider.reasoning_effort = reasoning_effort.clone();
+                        provider.reasoning_effort_levels = reasoning_effort_levels.clone();
                         provider.context_window = context_window;
                     } else {
                         anyhow::bail!("model {id:?} changed; reopen /provider");
@@ -1157,10 +1353,12 @@ impl ProviderPanel {
                             context_window,
                             max_tokens: None,
                             capable_model: None,
+                            retry_max_attempts: None,
                             thinking_type: None,
                             thinking_keep: None,
                             reasoning_history: None,
-                            reasoning_effort: None,
+                            reasoning_effort: reasoning_effort.clone(),
+                            reasoning_effort_levels: reasoning_effort_levels.clone(),
                             thinking_enabled: None,
                             thinking_budget: None,
                         },
@@ -1196,6 +1394,11 @@ impl ProviderPanel {
         ctx: &mut LoopCtx,
         renderer: &mut dyn Renderer,
     ) -> bool {
+        if (is_account && Self::managed_account(&ctx.config, id))
+            || (!is_account && Self::managed_model(&ctx.config, id))
+        {
+            return false;
+        }
         let active_selection = ctx.config.effective_model_selection();
         let deletes_active = if is_account {
             active_selection.as_deref().is_some_and(|selection| {
@@ -1410,28 +1613,76 @@ impl Modal for ProviderPanel {
                 KeyCode::Right if form.focus == ModelField::Account => form.cycle_account(true),
                 KeyCode::Left if form.focus == ModelField::Vision => form.cycle_vision(false),
                 KeyCode::Right if form.focus == ModelField::Vision => form.cycle_vision(true),
+                KeyCode::Left if form.focus == ModelField::Effort => form.cycle_effort(false),
+                KeyCode::Right if form.focus == ModelField::Effort => form.cycle_effort(true),
+                KeyCode::Left if form.focus == ModelField::EffortLevels => {
+                    form.move_effort_cursor(false)
+                }
+                KeyCode::Right if form.focus == ModelField::EffortLevels => {
+                    form.move_effort_cursor(true)
+                }
+                KeyCode::Left => {
+                    if let Some(text) = form.focused_text() {
+                        form.cursor_byte = previous_grapheme_boundary(text, form.cursor_byte);
+                    }
+                }
+                KeyCode::Right => {
+                    if let Some(text) = form.focused_text() {
+                        form.cursor_byte = next_grapheme_boundary(text, form.cursor_byte);
+                    }
+                }
+                KeyCode::Home => form.cursor_byte = 0,
+                KeyCode::End => {
+                    form.cursor_byte = form.focused_text().map(str::len).unwrap_or(0);
+                }
                 KeyCode::Char(' ') if form.focus == ModelField::Vision => {
                     form.cycle_vision(true);
+                }
+                KeyCode::Char(' ') if form.focus == ModelField::Effort => {
+                    form.cycle_effort(true);
+                }
+                KeyCode::Char(' ') if form.focus == ModelField::EffortLevels => {
+                    form.toggle_effort_level();
                 }
                 KeyCode::Char(' ') if form.focus == ModelField::MakeDefault => {
                     form.make_default = !form.make_default;
                 }
                 KeyCode::Char(c) => match form.focus {
-                    ModelField::ApiKey => form.api_key.push(c),
-                    ModelField::Model => form.model.push(c),
-                    ModelField::Window if c.is_ascii_digit() => form.window.push(c),
+                    ModelField::ApiKey => insert_at_cursor(
+                        &mut form.api_key,
+                        &mut form.cursor_byte,
+                        c.encode_utf8(&mut [0; 4]),
+                    ),
+                    ModelField::Model => insert_at_cursor(
+                        &mut form.model,
+                        &mut form.cursor_byte,
+                        c.encode_utf8(&mut [0; 4]),
+                    ),
+                    ModelField::Window if c.is_ascii_digit() => insert_at_cursor(
+                        &mut form.window,
+                        &mut form.cursor_byte,
+                        c.encode_utf8(&mut [0; 4]),
+                    ),
                     _ => {}
                 },
                 KeyCode::Backspace => match form.focus {
                     ModelField::ApiKey => {
-                        form.api_key.pop();
+                        backspace_at_cursor(&mut form.api_key, &mut form.cursor_byte)
                     }
                     ModelField::Model => {
-                        form.model.pop();
+                        backspace_at_cursor(&mut form.model, &mut form.cursor_byte)
                     }
                     ModelField::Window => {
-                        form.window.pop();
+                        backspace_at_cursor(&mut form.window, &mut form.cursor_byte)
                     }
+                    _ => {}
+                },
+                KeyCode::Delete => match form.focus {
+                    ModelField::ApiKey => {
+                        delete_at_cursor(&mut form.api_key, &mut form.cursor_byte)
+                    }
+                    ModelField::Model => delete_at_cursor(&mut form.model, &mut form.cursor_byte),
+                    ModelField::Window => delete_at_cursor(&mut form.window, &mut form.cursor_byte),
                     _ => {}
                 },
                 KeyCode::Enter => {
@@ -1451,14 +1702,9 @@ impl Modal for ProviderPanel {
         let len = self.current_len(&ctx.config);
         let ctrl = mods.contains(KeyModifiers::CONTROL);
         match code {
-            // Esc closes the panel outright. Clearing a filter is done with
-            // ←→ / Tab (which also switch tabs and reset both filters).
+            // Esc closes the panel outright. Tab / Shift-Tab switch tabs and
+            // reset both filters; arrows edit the search query.
             KeyCode::Esc => return Ok(ModalAction::Close),
-            // ← / → jump to that tab; Tab / Shift-Tab toggle (cycle) so you're
-            // never stuck. A manual tab switch drops the account drill-in filter
-            // (show all) — the search box has no cursor, so arrows are free here.
-            KeyCode::Left => self.switch_tab(Tab::Accounts),
-            KeyCode::Right => self.switch_tab(Tab::Models),
             KeyCode::Tab | KeyCode::BackTab => {
                 let next = match self.tab {
                     Tab::Accounts => Tab::Models,
@@ -1467,10 +1713,12 @@ impl Modal for ProviderPanel {
                 self.switch_tab(next);
             }
             KeyCode::Up => {
+                self.search_focused = false;
                 self.selected = self.selected.saturating_sub(1);
                 self.pending_delete = None;
             }
             KeyCode::Down => {
+                self.search_focused = false;
                 if self.selected + 1 < len {
                     self.selected += 1;
                 }
@@ -1487,6 +1735,14 @@ impl Modal for ProviderPanel {
                     .selected_id(&ctx.config)
                     .filter(|i| i != ADD_PROVIDER_ROW && i != ADD_MODEL_ROW)
                 {
+                    let managed = match self.tab {
+                        Tab::Accounts => Self::managed_account(&ctx.config, &id),
+                        Tab::Models => Self::managed_model(&ctx.config, &id),
+                    };
+                    if managed {
+                        self.draw(buf, state, ctx, renderer);
+                        return Ok(ModalAction::Continue);
+                    }
                     self.mode = match self.tab {
                         Tab::Accounts => Mode::EditAccount(Self::open_edit(&ctx.config, &id)),
                         Tab::Models => match ModelForm::new_edit(&ctx.config, &id) {
@@ -1509,9 +1765,12 @@ impl Modal for ProviderPanel {
                     // The CodingPlan (AtomGit) provider is managed by /login and
                     // can't be deleted here. Unconfigured preset rows likewise
                     // have no persisted object to delete.
-                    if is_virtual_preset
-                        || (is_account && atomcode_config::config::is_codingplan_provider_name(&id))
-                    {
+                    let is_managed = if is_account {
+                        Self::managed_account(&ctx.config, &id)
+                    } else {
+                        Self::managed_model(&ctx.config, &id)
+                    };
+                    if is_virtual_preset || is_managed {
                         self.pending_delete = None;
                     } else if self.confirm_double_delete(&id, is_account)
                         && self.commit_delete(&id, is_account, ctx, renderer)
@@ -1524,12 +1783,35 @@ impl Modal for ProviderPanel {
             }
             // Type to filter.
             KeyCode::Char(c) if !ctrl => {
-                self.query.push(c);
+                insert_at_cursor(
+                    &mut self.query,
+                    &mut self.query_cursor_byte,
+                    c.encode_utf8(&mut [0; 4]),
+                );
+                self.search_focused = true;
                 self.selected = 0;
                 self.pending_delete = None;
             }
             KeyCode::Backspace => {
-                self.query.pop();
+                backspace_at_cursor(&mut self.query, &mut self.query_cursor_byte);
+                self.search_focused = true;
+                self.selected = 0;
+                self.pending_delete = None;
+            }
+            KeyCode::Left if self.search_focused => {
+                self.query_cursor_byte =
+                    previous_grapheme_boundary(&self.query, self.query_cursor_byte);
+            }
+            KeyCode::Right if self.search_focused => {
+                self.query_cursor_byte =
+                    next_grapheme_boundary(&self.query, self.query_cursor_byte);
+            }
+            KeyCode::Left => self.switch_tab(Tab::Accounts),
+            KeyCode::Right => self.switch_tab(Tab::Models),
+            KeyCode::Home if self.search_focused => self.query_cursor_byte = 0,
+            KeyCode::End if self.search_focused => self.query_cursor_byte = self.query.len(),
+            KeyCode::Delete if self.search_focused => {
+                delete_at_cursor(&mut self.query, &mut self.query_cursor_byte);
                 self.selected = 0;
                 self.pending_delete = None;
             }
@@ -1556,6 +1838,8 @@ impl Modal for ProviderPanel {
                             self.tab = Tab::Models;
                             self.account_filter = Some(id);
                             self.query.clear();
+                            self.query_cursor_byte = 0;
+                            self.search_focused = false;
                             self.selected = 0;
                         }
                     }
@@ -1638,8 +1922,16 @@ impl Modal for ProviderPanel {
                         }
                         // Trailing "+ 添加自定义 provider" affordance (also Ctrl+A).
                         items.push(("＋ 添加自定义 provider".to_string(), String::new()));
-                        hint = crate::i18n::t(crate::i18n::Msg::ProviderPanelAccountsHint)
-                            .into_owned();
+                        let selected_managed = self
+                            .selected_id(&ctx.config)
+                            .filter(|id| id != ADD_PROVIDER_ROW)
+                            .is_some_and(|id| Self::managed_account(&ctx.config, &id));
+                        hint = crate::i18n::t(if selected_managed {
+                            crate::i18n::Msg::ProviderPanelManagedAccountHint
+                        } else {
+                            crate::i18n::Msg::ProviderPanelAccountsHint
+                        })
+                        .into_owned();
                     }
                     Tab::Models => {
                         let ids = self.filtered_ids(&ctx.config);
@@ -1671,11 +1963,21 @@ impl Modal for ProviderPanel {
                                 .unwrap_or_default();
                             items.push((id.clone(), desc));
                         }
-                        items.push((
-                            crate::i18n::t(crate::i18n::Msg::ProviderPanelAddModelRow).into_owned(),
-                            empty_description,
-                        ));
-                        hint = if let Some(acct) = &self.account_filter {
+                        if self.can_add_model(&ctx.config) {
+                            items.push((
+                                crate::i18n::t(crate::i18n::Msg::ProviderPanelAddModelRow)
+                                    .into_owned(),
+                                empty_description,
+                            ));
+                        }
+                        hint = if self
+                            .account_filter
+                            .as_deref()
+                            .is_some_and(|account| Self::managed_account(&ctx.config, account))
+                        {
+                            crate::i18n::t(crate::i18n::Msg::ProviderPanelManagedModelsHint)
+                                .into_owned()
+                        } else if let Some(acct) = &self.account_filter {
                             crate::i18n::t(crate::i18n::Msg::ProviderPanelFilteredModelsHint {
                                 account: acct,
                             })
@@ -1863,22 +2165,41 @@ impl Modal for ProviderPanel {
                     // This provider has no api_key yet — collect it once here.
                     if form.account_needs_key() {
                         let masked = "•".repeat(form.api_key.chars().count());
-                        items.push(field_row(
+                        let masked_cursor = form.api_key
+                            [..form.cursor_byte.min(form.api_key.len())]
+                            .chars()
+                            .count()
+                            * '•'.len_utf8();
+                        items.push(editable_field_row(
                             "api_key",
-                            format!("{masked}   (该 provider 尚未配置)"),
+                            &format!("{masked}   (该 provider 尚未配置)"),
                             form.focus == ModelField::ApiKey,
+                            masked_cursor,
+                            form_cols,
                         ));
                     }
                 }
-                items.push(field_row(
+                items.push(editable_field_row(
                     &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldModel),
-                    form.model.clone(),
+                    &form.model,
                     form.focus == ModelField::Model,
+                    form.cursor_byte,
+                    form_cols,
                 ));
                 items.push(field_row(
                     &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldVision),
                     format!("‹ {} ›", form.vision_label()),
                     form.focus == ModelField::Vision,
+                ));
+                items.push(field_row(
+                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldEffort),
+                    format!("‹ {} ›", form.effort_label()),
+                    form.focus == ModelField::Effort,
+                ));
+                items.push(field_row(
+                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldEffortLevels),
+                    form.effort_levels_label(form.focus == ModelField::EffortLevels),
+                    form.focus == ModelField::EffortLevels,
                 ));
                 let win = if form.window.is_empty() {
                     format!(
@@ -1888,10 +2209,12 @@ impl Modal for ProviderPanel {
                 } else {
                     form.window.clone()
                 };
-                items.push(field_row(
+                items.push(editable_field_row(
                     &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldWindow),
-                    win,
+                    &win,
                     form.focus == ModelField::Window,
+                    form.cursor_byte,
+                    form_cols,
                 ));
                 items.push(field_row(
                     &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldMakeDefault),
@@ -1904,12 +2227,18 @@ impl Modal for ProviderPanel {
 
         items.push((format!("— {hint} —"), String::new()));
 
+        downgrade_panel_items(&mut items, ctx.caps.unicode_symbols);
+
         let payload = MenuPayload {
             items,
             selected,
             kind,
         };
-        let cursor_byte = buf.len();
+        let cursor_byte = if matches!(self.mode, Mode::List) {
+            self.query_cursor_byte
+        } else {
+            buf.len()
+        };
         renderer.render(UiLine::InputPrompt {
             buf,
             cursor_byte,
@@ -1937,6 +2266,33 @@ impl Modal for ProviderPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_panel_chrome_downgrades_for_legacy_conhost() {
+        let mut items = vec![
+            ("▸ Model: │vendor/model…".to_string(), String::new()),
+            ("  Image input: ‹ Auto ›".to_string(), "[✓]".to_string()),
+            ("＋ Add model".to_string(), "— hint —".to_string()),
+        ];
+
+        downgrade_panel_items(&mut items, false);
+
+        assert_eq!(items[0].0, "> Model: |vendor/model.");
+        assert_eq!(items[1].0, "  Image input: < Auto >");
+        assert_eq!(items[1].1, "[v]");
+        assert_eq!(items[2].0, "+ Add model");
+        assert_eq!(items[2].1, "- hint -");
+    }
+
+    #[test]
+    fn provider_panel_chrome_is_unchanged_on_unicode_terminals() {
+        let mut items = vec![("▸ Model: │…".to_string(), "[✓]".to_string())];
+        let original = items.clone();
+
+        downgrade_panel_items(&mut items, true);
+
+        assert_eq!(items, original);
+    }
 
     #[test]
     fn add_shortcut_accepts_terminal_ctrl_a_variants() {
@@ -2056,7 +2412,7 @@ mod tests {
     #[test]
     fn editable_projection_keeps_the_url_tail_visible_at_end() {
         let url = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1";
-        let shown = editable_value_projection(url, url.len(), 28);
+        let shown = crate::width::editable_value_projection(url, url.len(), 28);
         assert!(
             shown.starts_with('…'),
             "expected hidden-left marker: {shown}"
@@ -2073,7 +2429,7 @@ mod tests {
     fn editable_projection_marks_both_hidden_sides_around_middle_cursor() {
         let url = "https://example.test/a/very/long/provider/path/v1";
         let cursor = url.find("provider").expect("provider segment");
-        let shown = editable_value_projection(url, cursor, 20);
+        let shown = crate::width::editable_value_projection(url, cursor, 20);
         assert!(shown.starts_with('…'), "left marker missing: {shown}");
         assert!(shown.ends_with('…'), "right marker missing: {shown}");
         assert!(shown.contains('│'), "caret missing: {shown}");
@@ -2083,7 +2439,7 @@ mod tests {
     #[test]
     fn editable_projection_keeps_complete_value_when_it_fits() {
         assert_eq!(
-            editable_value_projection("https://x/v1", "https://".len(), 40),
+            crate::width::editable_value_projection("https://x/v1", "https://".len(), 40),
             "https://│x/v1"
         );
     }
@@ -2237,6 +2593,108 @@ mod tests {
         let edit = ModelForm::new_edit(&cfg, "acc/qwen").unwrap();
         assert_eq!(edit.supports_vision, Some(true));
         assert!(edit.fields().contains(&ModelField::Vision));
+    }
+
+    #[test]
+    fn model_form_effort_defaults_off_cycles_and_restores_edit_value() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "acc": { "provider": "openai-compatible" } },
+            "models": {
+                "acc/custom": {
+                    "account": "acc",
+                    "model": "vendor-model",
+                    "reasoning_effort": "high",
+                    "context_window": 131072
+                }
+            }
+        }))
+        .unwrap();
+
+        let mut add = ModelForm::new_add(&cfg, Some("acc")).unwrap();
+        assert_eq!(add.reasoning_effort, None);
+        add.cycle_effort(true);
+        assert_eq!(add.reasoning_effort.as_deref(), Some("auto"));
+        add.cycle_effort(true);
+        assert_eq!(add.reasoning_effort.as_deref(), Some("low"));
+        add.cycle_effort(false);
+        assert_eq!(add.reasoning_effort.as_deref(), Some("auto"));
+        add.cycle_effort(false);
+        assert_eq!(add.reasoning_effort, None);
+
+        let edit = ModelForm::new_edit(&cfg, "acc/custom").unwrap();
+        assert_eq!(edit.reasoning_effort.as_deref(), Some("high"));
+        assert!(edit.fields().contains(&ModelField::Effort));
+    }
+
+    #[test]
+    fn model_form_effort_levels_toggle_persist_and_couple_default() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "acc": { "provider": "openai-compatible" } },
+            "models": {
+                "acc/sub": {
+                    "account": "acc",
+                    "model": "vendor-model",
+                    "reasoning_effort_levels": ["low", "high", "max"],
+                    "context_window": 131072
+                }
+            }
+        }))
+        .unwrap();
+
+        // Pure config↔toggles round-trip (index = low/medium/high/max).
+        assert_eq!(
+            effort_levels_from_config(None),
+            [true; 4],
+            "None ⇒ all levels"
+        );
+        assert_eq!(
+            effort_levels_to_config([true; 4]),
+            None,
+            "all ⇒ unrestricted"
+        );
+        assert_eq!(
+            effort_levels_to_config([false; 4]),
+            None,
+            "none ⇒ unrestricted (no zero-levels state)"
+        );
+        assert_eq!(
+            effort_levels_to_config([true, false, true, true]).as_deref(),
+            Some(["low".to_string(), "high".to_string(), "max".to_string()].as_slice())
+        );
+
+        // new_add starts unrestricted and exposes the EffortLevels field.
+        let mut add = ModelForm::new_add(&cfg, Some("acc")).unwrap();
+        assert_eq!(add.effort_levels, [true; 4]);
+        assert!(add.fields().contains(&ModelField::EffortLevels));
+        // Toggle "medium" (cursor index 1) off.
+        add.effort_level_cursor = 1;
+        add.toggle_effort_level();
+        assert_eq!(add.effort_levels, [true, false, true, true]);
+        assert_eq!(
+            add.effort_levels_label(true),
+            " ● low ‹○ medium› ● high  ● max "
+        );
+        assert_eq!(
+            add.effort_levels_label(false),
+            " ● low  ○ medium  ● high  ● max "
+        );
+        // The DEFAULT cycle now skips medium: None → auto → low → high.
+        add.reasoning_effort = None;
+        add.cycle_effort(true);
+        add.cycle_effort(true);
+        add.cycle_effort(true);
+        assert_eq!(add.reasoning_effort.as_deref(), Some("high"));
+
+        // Disabling the level that IS the current default resets it to auto.
+        let mut f = ModelForm::new_add(&cfg, Some("acc")).unwrap();
+        f.reasoning_effort = Some("medium".to_string());
+        f.effort_level_cursor = 1;
+        f.toggle_effort_level();
+        assert_eq!(f.reasoning_effort.as_deref(), Some("auto"));
+
+        // new_edit loads the persisted subset (medium off).
+        let edit = ModelForm::new_edit(&cfg, "acc/sub").unwrap();
+        assert_eq!(edit.effort_levels, [true, false, true, true]);
     }
 
     #[test]
@@ -2476,6 +2934,56 @@ mod tests {
         p.tab = Tab::Accounts;
         let acc = p.filtered_ids(&cfg);
         assert!(acc.contains(&"AtomGit".to_string()) && acc.contains(&"other".to_string()));
+    }
+
+    #[test]
+    fn codingplan_models_are_read_only_in_the_panel() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "AtomGit": { "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1" },
+                "official-alias": { "provider": "openai", "base_url": "https://api-ai.gitcode.com/v1" },
+                "other": { "provider": "openai-compatible", "base_url": "https://example.invalid/v1" }
+            },
+            "models": {
+                "AtomGit-deepseek-v4-flash": {
+                    "account": "AtomGit",
+                    "model": "deepseek-v4-flash",
+                    "context_window": 1000000
+                },
+                "flash-primary": {
+                    "account": "official-alias",
+                    "model": "deepseek-v4-flash",
+                    "context_window": 1000000
+                },
+                "other/model": { "account": "other", "model": "model", "context_window": 8000 }
+            }
+        }))
+        .unwrap();
+
+        assert!(ProviderPanel::managed_account(&cfg, "AtomGit"));
+        assert!(ProviderPanel::managed_account(&cfg, "official-alias"));
+        assert!(ProviderPanel::managed_model(
+            &cfg,
+            "AtomGit-deepseek-v4-flash"
+        ));
+        assert!(!ProviderPanel::managed_model(&cfg, "other/model"));
+        assert!(ProviderPanel::managed_model(&cfg, "flash-primary"));
+
+        let add = ModelForm::new_add(&cfg, Some("AtomGit")).unwrap();
+        assert_ne!(add.account_id(), "AtomGit");
+        assert!(!add.account_ids.iter().any(|id| id == "AtomGit"));
+        assert!(!add.account_ids.iter().any(|id| id == "official-alias"));
+
+        let mut panel = ProviderPanel::open();
+        panel.tab = Tab::Models;
+        panel.account_filter = Some("AtomGit".into());
+        let visible = panel.filtered_ids(&cfg);
+        assert_eq!(visible, vec!["AtomGit-deepseek-v4-flash".to_string()]);
+        assert!(!panel.can_add_model(&cfg));
+        assert!(!panel.has_add_row(&cfg));
+        assert_eq!(panel.current_len(&cfg), visible.len());
+        panel.selected = visible.len();
+        assert_eq!(panel.selected_id(&cfg), None);
     }
 
     #[test]

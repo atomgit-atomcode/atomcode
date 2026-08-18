@@ -43,6 +43,11 @@ pub struct OpenAiCompatConfig {
     pub context_window: u32,
     /// Fallback output cap when `ChatOptions::max_tokens` is `None`.
     pub max_tokens: Option<u32>,
+    /// Whether this concrete model endpoint accepts the top-level
+    /// `reasoning_effort` request field. This is endpoint capability, not a
+    /// model-name property: compatible gateways serving the same wire model can
+    /// expose different controls.
+    pub supports_reasoning_effort: bool,
     /// Explicit reasoning round-trip policy; `None` ⇒ derived from the model name.
     pub reasoning_policy: Option<ReasoningPolicy>,
     /// Kimi-family thinking control: `thinking.type` in the request body
@@ -130,6 +135,7 @@ impl OpenAiCompatConfig {
             model,
             context_window: 128_000,
             max_tokens: None,
+            supports_reasoning_effort: false,
             reasoning_policy: None,
             thinking_type: None,
             thinking_keep: None,
@@ -875,11 +881,16 @@ fn format_messages(
     supports_vision: bool,
 ) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
+    // Strict OpenAI-compatible chat templates (including Qwen/vLLM) require
+    // system instructions to precede the conversation and often accept only
+    // one system entry. Old snapshots can still contain late system context,
+    // so lift and coalesce it before preserving the remaining message order.
+    for m in messages.iter().filter(|m| m.role == Role::System) {
+        super::push_system_coalesced(&mut out, &m.text);
+    }
     for m in messages {
         match m.role {
-            // Coalesce consecutive system messages into ONE wire entry — many
-            // OpenAI-compatible models accept only a single system message.
-            Role::System => super::push_system_coalesced(&mut out, &m.text),
+            Role::System => continue,
             Role::User => {
                 if m.images.is_empty() || !supports_vision {
                     // Text-only (no images), OR a vision-incapable target: `content`
@@ -1035,7 +1046,7 @@ fn build_request_body(
         }
     }
     if let Some(effort) = options.reasoning_effort {
-        if reason_effort_applicable(model) {
+        if cfg.supports_reasoning_effort {
             body.insert("reasoning_effort".into(), json!(effort_str(effort)));
         }
     }
@@ -1050,12 +1061,13 @@ fn build_request_body(
         let t: Vec<Value> = tools
             .iter()
             .map(|td| {
+                let parameters = normalize_openai_tool_schema(&td.parameters);
                 json!({
                     "type": "function",
                     "function": {
                         "name": td.name,
                         "description": td.description,
-                        "parameters": td.parameters,
+                        "parameters": parameters,
                     }
                 })
             })
@@ -1063,6 +1075,71 @@ fn build_request_body(
         body.insert("tools".into(), json!(t));
     }
     Value::Object(body)
+}
+
+/// Normalize tool parameter schemas for strict OpenAI-compatible gateways.
+///
+/// JSON Schema permits an object schema to omit `properties`, but LM Studio's
+/// chat-completions validator requires it to be an object. Keep the neutral
+/// kernel schema untouched and add the empty map only at this wire boundary.
+/// Recurse so externally supplied MCP/plugin schemas with nested object fields
+/// receive the same compatibility treatment as built-in tools.
+fn normalize_openai_tool_schema(schema: &Value) -> Value {
+    let mut normalized = schema.clone();
+    normalize_openai_tool_schema_in_place(&mut normalized);
+    normalized
+}
+
+fn normalize_openai_tool_schema_in_place(schema: &mut Value) {
+    let Value::Object(map) = schema else {
+        return;
+    };
+
+    let allows_object = match map.get("type") {
+        Some(Value::String(kind)) => kind == "object",
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "object"),
+        _ => false,
+    };
+    if allows_object && !map.contains_key("properties") {
+        map.insert("properties".into(), Value::Object(Map::new()));
+    }
+
+    // Traverse only values that are themselves JSON Schemas. Literal-bearing
+    // keywords such as `const`, `enum`, `default`, and `examples` must remain
+    // byte-for-byte unchanged even when their data resembles a schema.
+    if let Some(Value::Object(properties)) = map.get_mut("properties") {
+        for child in properties.values_mut() {
+            normalize_openai_tool_schema_in_place(child);
+        }
+    }
+    for key in ["items", "prefixItems", "anyOf", "oneOf", "allOf"] {
+        if let Some(child) = map.get_mut(key) {
+            normalize_openai_tool_schema_children(child);
+        }
+    }
+    if let Some(child) = map.get_mut("additionalProperties") {
+        if !child.is_boolean() {
+            normalize_openai_tool_schema_in_place(child);
+        }
+    }
+    for key in ["$defs", "definitions"] {
+        if let Some(Value::Object(definitions)) = map.get_mut(key) {
+            for child in definitions.values_mut() {
+                normalize_openai_tool_schema_in_place(child);
+            }
+        }
+    }
+}
+
+fn normalize_openai_tool_schema_children(children: &mut Value) {
+    match children {
+        Value::Array(items) => {
+            for child in items {
+                normalize_openai_tool_schema_in_place(child);
+            }
+        }
+        child => normalize_openai_tool_schema_in_place(child),
+    }
 }
 
 /// DeepSeek V4 thinking models reject the `tool_choice` control parameter while
@@ -1073,8 +1150,9 @@ fn supports_tool_choice(model: &str) -> bool {
     !model.contains("deepseek-v4")
 }
 
-/// Whether a model accepts a top-level `reasoning_effort` control. Exposed so a UI
-/// (the TUI effort hint) and the request-body gate can never diverge.
+/// Legacy model-name hint for DeepSeek V4. New runtime construction must prefer
+/// the concrete endpoint capability carried by [`OpenAiCompatConfig`]; identical
+/// model ids can expose different controls behind different gateways.
 pub fn reason_effort_applicable(model: &str) -> bool {
     // Only DeepSeek-V4 takes a top-level `reasoning_effort`; others reject/ignore it.
     model.to_ascii_lowercase().contains("deepseek-v4")
@@ -1941,6 +2019,28 @@ mod tests {
     }
 
     #[test]
+    fn lifts_and_coalesces_late_system_messages_for_strict_templates() {
+        let msgs = vec![
+            Message::system("persona"),
+            Message::user("hi"),
+            Message::assistant("answer", vec![]),
+            Message::system("legacy model change"),
+            Message::user("continue"),
+        ];
+
+        let out = format_messages(&msgs, ReasoningPolicy::Exclude, true);
+
+        assert_eq!(
+            out[0],
+            json!({"role":"system","content":"persona\n\nlegacy model change"})
+        );
+        assert_eq!(out.iter().filter(|v| v["role"] == "system").count(), 1);
+        assert!(out.iter().skip(1).all(|v| v["role"] != "system"));
+        assert_eq!(out[1], json!({"role":"user","content":"hi"}));
+        assert_eq!(out[3], json!({"role":"user","content":"continue"}));
+    }
+
+    #[test]
     fn user_without_images_stays_a_content_string() {
         // Byte-identical to the pre-multimodal path → a no-image conversation's prefix
         // cache is unperturbed.
@@ -2261,6 +2361,7 @@ mod tests {
     fn body_options_mapped() {
         let mut cfg = OpenAiCompatConfig::new("k", "https://x", "deepseek-v4-flash");
         cfg.max_tokens = Some(100);
+        cfg.supports_reasoning_effort = true;
         let opts = ChatOptions {
             reasoning_effort: Some(ReasoningEffort::High),
             max_tokens: None,
@@ -2292,9 +2393,99 @@ mod tests {
     }
 
     #[test]
+    fn object_tool_schemas_gain_properties_for_strict_compatible_gateways() {
+        let cfg = OpenAiCompatConfig::new("k", "http://127.0.0.1:1234/v1", "local-model");
+        let tools = vec![
+            ToolDef {
+                name: "empty".into(),
+                description: "no arguments".into(),
+                parameters: json!({"type":"object"}),
+            },
+            ToolDef {
+                name: "nested".into(),
+                description: "nested object".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "options": {"type": ["object", "null"]},
+                        "query": {"type": "string"}
+                    }
+                }),
+            },
+            ToolDef {
+                name: "external".into(),
+                description: "external schema".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "fixed": {"const": {"type": "object"}},
+                        "choice": {"enum": [{"type": "object"}]},
+                        "fallback": {"default": {"type": "object"}},
+                        "labels": {
+                            "type": "object",
+                            "additionalProperties": {"type": "object"}
+                        }
+                    },
+                    "$defs": {
+                        "record": {"type": "object"}
+                    }
+                }),
+            },
+        ];
+
+        let body = build_request_body(
+            "local-model",
+            &[Message::user("hi")],
+            &tools,
+            &ChatOptions::default(),
+            &cfg,
+            ReasoningPolicy::Exclude,
+        );
+
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"],
+            json!({"type":"object","properties":{}})
+        );
+        assert_eq!(
+            body["tools"][1]["function"]["parameters"]["properties"]["options"],
+            json!({"type":["object","null"],"properties":{}})
+        );
+        assert_eq!(
+            body["tools"][1]["function"]["parameters"]["properties"]["query"],
+            json!({"type":"string"}),
+            "existing non-object property schemas must remain unchanged"
+        );
+        let external = &body["tools"][2]["function"]["parameters"];
+        assert_eq!(
+            external["properties"]["fixed"]["const"],
+            json!({"type":"object"}),
+            "const data must not be normalized as a schema"
+        );
+        assert_eq!(
+            external["properties"]["choice"]["enum"],
+            json!([{"type":"object"}]),
+            "enum data must not be normalized as schemas"
+        );
+        assert_eq!(
+            external["properties"]["fallback"]["default"],
+            json!({"type":"object"}),
+            "default data must not be normalized as a schema"
+        );
+        assert_eq!(
+            external["properties"]["labels"]["additionalProperties"],
+            json!({"type":"object","properties":{}})
+        );
+        assert_eq!(
+            external["$defs"]["record"],
+            json!({"type":"object","properties":{}})
+        );
+    }
+
+    #[test]
     fn reasoning_effort_max_reaches_wire() {
         // DeepSeek V4 accepts "max" beyond low/medium/high — the `/effort max` path.
-        let cfg = OpenAiCompatConfig::new("k", "https://x", "deepseek-v4-flash");
+        let mut cfg = OpenAiCompatConfig::new("k", "https://x", "deepseek-v4-flash");
+        cfg.supports_reasoning_effort = true;
         let opts = ChatOptions {
             reasoning_effort: Some(ReasoningEffort::Max),
             ..Default::default()
@@ -2311,7 +2502,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_only_for_v4() {
+    fn unknown_endpoint_omits_reasoning_effort() {
         let cfg = OpenAiCompatConfig::new("k", "https://x", "glm-5.1");
         let opts = ChatOptions {
             reasoning_effort: Some(ReasoningEffort::High),
@@ -2327,8 +2518,27 @@ mod tests {
         );
         assert!(
             body.get("reasoning_effort").is_none(),
-            "non-v4 omits reasoning_effort"
+            "an endpoint without an explicit capability omits reasoning_effort"
         );
+    }
+
+    #[test]
+    fn explicit_custom_model_capability_reaches_wire() {
+        let mut cfg = OpenAiCompatConfig::new("k", "https://custom", "vendor-model");
+        cfg.supports_reasoning_effort = true;
+        let opts = ChatOptions {
+            reasoning_effort: Some(ReasoningEffort::Medium),
+            ..Default::default()
+        };
+        let body = build_request_body(
+            "vendor-model",
+            &[Message::user("hi")],
+            &[],
+            &opts,
+            &cfg,
+            ReasoningPolicy::Exclude,
+        );
+        assert_eq!(body["reasoning_effort"], "medium");
     }
 
     #[test]
@@ -3194,11 +3404,7 @@ mod tests {
             fresh.flush().unwrap();
         });
 
-        let mut cfg = OpenAiCompatConfig::new(
-            "k",
-            format!("http://127.0.0.1:{port}"),
-            "glm-test",
-        );
+        let mut cfg = OpenAiCompatConfig::new("k", format!("http://127.0.0.1:{port}"), "glm-test");
         cfg.retry.base_delay = std::time::Duration::from_millis(1);
         cfg.retry.max_delay = std::time::Duration::from_millis(2);
         let provider = OpenAiCompatProvider::new(cfg).unwrap();
@@ -3225,7 +3431,9 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["resp_fresh"]);
         assert_eq!(models, vec!["model-fresh"]);
-        assert!(!events.iter().any(|event| matches!(event, StreamEvent::Error(_))));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Error(_))));
 
         let _ = handle.join();
     }
@@ -3576,8 +3784,9 @@ mod tests {
             drop(s2);
         });
 
-        let cfg =
+        let mut cfg =
             OpenAiCompatConfig::new("k", format!("http://127.0.0.1:{port}"), "deepseek-v4-flash");
+        cfg.supports_reasoning_effort = true;
         let provider = OpenAiCompatProvider::new(cfg).unwrap();
         let opts = ChatOptions {
             reasoning_effort: Some(ReasoningEffort::Max),

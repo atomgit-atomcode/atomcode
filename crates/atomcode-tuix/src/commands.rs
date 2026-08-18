@@ -177,11 +177,12 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "auto",    desc: "Switch to Auto mode (auto-approve all tools)", needs_args: false, hidden: false },
     Command { name: "review",  desc: "Code review the current changes (/review · /review staged · /review <base>)", needs_args: false, hidden: false },
     Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false, hidden: false },
-    // Gateway entry: opens a second-level palette (high / max / off).
+    // Gateway entry: opens a second-level palette (low / medium / high / max / default).
     // needs_args=true so Enter rewrites the buffer to `/effort ` and the
-    // sub-mode menu renders the three choices. Selecting one commits as
-    // `/effort <choice>` → dispatched by the `effort` arm.
-    Command { name: "effort",  desc: "DeepSeek reasoning effort control (high / max / off)", needs_args: true, hidden: false },
+    // sub-mode menu renders the choices. Selecting one commits as
+    // `/effort <choice>` → dispatched by the `effort` arm. Runtime label comes
+    // from `Msg::CmdDescEffort`; this static `desc` is only a fallback.
+    Command { name: "effort",  desc: "Model reasoning effort control (low / medium / high / max / default)", needs_args: true, hidden: false },
     // needs_args=true so selecting `/goal` from the palette only completes to
     // `/goal ` and waits for the user to type the goal — it must NOT execute
     // immediately (a bare `/goal` would just print status). Setting a goal
@@ -569,7 +570,7 @@ mod tests {
             let body = crate::i18n::t(Msg::KeybindingsHelp);
             for key in [
                 "Enter",
-                "Tab / Shift+Tab",
+                "Shift+Tab",
                 "F2 / Shift+F2",
                 "Ctrl+R",
                 "Ctrl+T",

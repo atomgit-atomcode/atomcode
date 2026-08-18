@@ -204,7 +204,7 @@ atomcode completion fish > ~/.config/fish/completions/atomcode.fish
 
 PowerShell 可运行 `atomcode completion powershell | Out-String |
 Invoke-Expression`。完整 Shell 列表见 `atomcode completion --help`。该能力只作用于
-外部命令行，不会改变 TUI 内 `Tab` 的模式切换行为。
+外部命令行；TUI 内仍由 `Tab` 完成输入补全、`Shift+Tab` 切换执行模式。
 
 ### 依赖
 
@@ -346,7 +346,8 @@ atomcode --prompt-file task.md
 | `Esc` | 清空输入 / 取消流式输出 |
 | `Esc` ×2 | 撤销上一轮 |
 | `Up/Down` | 浏览输入历史 |
-| `Tab / Shift+Tab` | 有菜单时接受补全；无菜单时切换下一个 / 上一个执行模式 |
+| `Tab` | 接受斜杠命令、Skill 或文件补全 |
+| `Shift+Tab` | 无补全菜单时切换到下一个执行模式 |
 | `F2 / Shift+F2` | 切换下一个 / 上一个模型（Mac 通常按 `Fn+F2 / Fn+Shift+F2`） |
 | `Ctrl+R` | 反向搜索输入历史 |
 | `Ctrl+T` | 切换 `reasoning_effort` |
@@ -455,7 +456,7 @@ atomcode --prompt-file task.md
 
 | 命令 | 动作 |
 |---------|--------|
-| `/init` | 根据工作目录生成 `.atomcode.md` 项目指令 |
+| `/init` | 按当前语言及可选自定义提示词，创建或完善当前生效的项目指令文件 |
 | `/config` | 显示配置文件路径 |
 | `/reload` | 从磁盘重新加载 `~/.atomcode/config.toml` |
 | `/upgrade` | 升级 atomcode 到最新版（子命令：`rollback`） |
@@ -585,6 +586,8 @@ coding 主调用链是 `CLI/TUI/daemon → CodingRuntime → kernel`。已经退
 ```
 
 AtomCode 会自动读取这个文件并注入到系统提示中。AtomCode 也支持 `AGENTS.md`（AI 编程代理的[开放标准](https://agents.md/)）作为替代——如果两个文件同时存在，`.atomcode.md` 优先。
+
+运行 `/init` 可分析仓库并创建或完善当前生效的项目指令文件，生成语言跟随当前 `/language`。如需追加团队自定义要求，可在 `/config` 中设置“自定义 /init 提示词文件”，或在 `$ATOMCODE_HOME/config.toml` 中添加 `init_prompt_file = "prompts/init.md"`；相对路径基于 `$ATOMCODE_HOME` 解析。
 
 ## 开发
 

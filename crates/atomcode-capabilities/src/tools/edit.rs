@@ -9,8 +9,31 @@ use async_trait::async_trait;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use tokio::sync::Mutex as AsyncMutex;
 
 pub struct EditFileTool;
+
+type PathLock = AsyncMutex<()>;
+
+fn edit_path_locks() -> &'static Mutex<HashMap<PathBuf, Weak<PathLock>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<PathLock>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn edit_path_lock(path: &Path) -> Arc<PathLock> {
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut locks = edit_path_locks().lock().unwrap_or_else(|p| p.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(AsyncMutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
 
 #[derive(Deserialize)]
 struct Args {
@@ -76,6 +99,10 @@ impl Tool for EditFileTool {
             );
         }
         let path = resolve_path(&a.file_path, &ctx.working_dir);
+        // Serialize AtomCode edits to the same canonical file. The byte-for-byte
+        // pre-commit check also catches external changes that happen before the check.
+        let path_lock = edit_path_lock(&path);
+        let _path_guard = path_lock.lock().await;
         let raw = match tokio::fs::read(&path).await {
             Ok(b) => b,
             Err(e) => {
@@ -141,7 +168,9 @@ impl Tool for EditFileTool {
                             .to_string(),
                     );
                 }
-                if let Err(msg) = write_encoded(&path, &fuzzy_result, file_encoding).await {
+                if let Err(msg) =
+                    write_encoded_if_unchanged(&path, &raw, &fuzzy_result, file_encoding).await
+                {
                     return err(msg);
                 }
                 let diff = build_compact_diff(&content, &fuzzy_result);
@@ -159,7 +188,9 @@ impl Tool for EditFileTool {
                 try_block_anchor_replace(&content, &a.old_string, &a.new_string)
             {
                 if anchor_result != content {
-                    if let Err(msg) = write_encoded(&path, &anchor_result, file_encoding).await {
+                    if let Err(msg) =
+                        write_encoded_if_unchanged(&path, &raw, &anchor_result, file_encoding).await
+                    {
                         return err(msg);
                     }
                     let diff = build_compact_diff(&content, &anchor_result);
@@ -171,9 +202,9 @@ impl Tool for EditFileTool {
                 }
             }
             return err(format!(
-                "edit_file: old_string not found in {}. The file was NOT modified. Re-read \
-                 the file and copy the exact text (including whitespace).",
-                crate::pathnorm::to_display(&path)
+                "edit_file: old_string not found in {}. The file was NOT modified. {}",
+                crate::pathnorm::to_display(&path),
+                closest_match_hint(&content, &a.old_string)
             ));
         }
         if count > 1 && !a.replace_all {
@@ -199,7 +230,7 @@ impl Tool for EditFileTool {
         } else {
             content.replacen(&old_match, &new_match, 1)
         };
-        if let Err(msg) = write_encoded(&path, &updated, file_encoding).await {
+        if let Err(msg) = write_encoded_if_unchanged(&path, &raw, &updated, file_encoding).await {
             return err(msg);
         }
         let replaced = if a.replace_all { count } else { 1 };
@@ -234,6 +265,75 @@ async fn write_encoded(
             crate::pathnorm::to_display(path)
         )
     })
+}
+
+/// Commit an edit only while the file still contains the bytes read at the start of
+/// this tool invocation. This is a process-local locked compare-and-write: other
+/// AtomCode workers serialize on the same canonical path. The comparison is an additional
+/// best-effort guard for external writers; because ordinary filesystems do not provide a
+/// portable compare-and-swap write, an unrelated process can still race after the check.
+async fn write_encoded_if_unchanged(
+    path: &Path,
+    expected: &[u8],
+    text: &str,
+    encoding: crate::tools::encoding::FileEncoding,
+) -> Result<(), String> {
+    let current = tokio::fs::read(path).await.map_err(|e| {
+        format!(
+            "edit_file: cannot re-read {} before commit: {e}. The file was NOT modified.",
+            crate::pathnorm::to_display(path)
+        )
+    })?;
+    if current != expected {
+        return Err(format!(
+            "edit_file: {} changed after it was read. The file was NOT modified. Re-read it \
+             and retry the edit against the current content.",
+            crate::pathnorm::to_display(path)
+        ));
+    }
+    write_encoded(path, text, encoding).await
+}
+
+fn closest_match_hint(content: &str, old_string: &str) -> String {
+    let wanted = old_string
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("");
+    if wanted.chars().count() < 4 {
+        return "Re-read the file and copy the exact current text (including whitespace)."
+            .to_string();
+    }
+
+    let wanted_lower = wanted.to_lowercase();
+    let mut best: Option<(usize, &str, usize)> = None;
+    for (index, line) in content.lines().take(20_000).enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let score = common_prefix_chars(&wanted_lower, &trimmed.to_lowercase());
+        if best
+            .as_ref()
+            .map_or(true, |(_, _, current)| score > *current)
+        {
+            best = Some((index + 1, line, score));
+        }
+    }
+    match best.filter(|(_, _, score)| *score >= 4) {
+        Some((line_no, line, _)) => format!(
+            "The closest current line starts at line {line_no}: {:?}. Re-read the surrounding \
+             block and retry with its exact current text.",
+            line.trim().chars().take(160).collect::<String>()
+        ),
+        None => {
+            "Re-read the file and copy the exact current text (including whitespace).".to_string()
+        }
+    }
+}
+
+fn common_prefix_chars(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
 
 /// A compact GIT UNIFIED DIFF (`@@` hunks, 3 lines of context) between the OLD
@@ -486,6 +586,53 @@ mod tests {
             progress: atomcode_kernel::tool::ProgressSink::noop(),
             requester: None,
         }
+    }
+
+    #[tokio::test]
+    async fn conditional_commit_rejects_stale_source_bytes() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("stale.txt");
+        std::fs::write(&path, "original\n").unwrap();
+        let expected = std::fs::read(&path).unwrap();
+        std::fs::write(&path, "changed elsewhere\n").unwrap();
+
+        let error = write_encoded_if_unchanged(
+            &path,
+            &expected,
+            "our replacement\n",
+            crate::tools::encoding::FileEncoding::Utf8,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("changed after it was read"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "changed elsewhere\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_old_string_reports_closest_current_line() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("sample.py"),
+            "def test_rate_limit():\n    assert response.status == 429\n",
+        )
+        .unwrap();
+
+        let result = EditFileTool
+            .execute(
+                r#"{"file_path":"sample.py","old_string":"def test_rate_limit_old():\n    assert response.status == 429","new_string":"replacement"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert!(result
+            .content
+            .contains("closest current line starts at line 1"));
+        assert!(result.content.contains("def test_rate_limit()"));
     }
 
     #[tokio::test]

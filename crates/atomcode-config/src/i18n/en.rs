@@ -218,7 +218,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Right                            Accept next-prompt suggestion (does not send)
 
   ── Mode and model ──
-    Tab / Shift+Tab                  Without a menu, cycle next / previous mode
+    Shift+Tab                        Without a menu, cycle to the next mode
     F2 / Shift+F2                    Next / previous model (Mac: Fn+F2 / Fn+Shift+F2)
     Ctrl+T                           Cycle reasoning_effort
 
@@ -348,8 +348,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelAddModelRow => "+ Add model".into(),
         Msg::ProviderPanelAccountsHint =>
             "Filter · ↑↓ select · ↵ models · Ctrl+A add · Ctrl+E edit · Ctrl+Dx2 delete · Tab switch · Esc close".into(),
+        Msg::ProviderPanelManagedAccountHint =>
+            "Official CodingPlan account · view only · ↵ models · Tab switch · Esc close".into(),
         Msg::ProviderPanelModelsHint =>
             "Filter · ↑↓ select · ↵ default/add · Ctrl+A add · Ctrl+E edit · Ctrl+Dx2 delete · Tab switch · Esc close".into(),
+        Msg::ProviderPanelManagedModelsHint =>
+            "CodingPlan models are managed by /login · ↑↓ select · ↵ default · Tab all · Esc close".into(),
         Msg::ProviderPanelFilteredModelsHint { account } =>
             format!("[{account}] · ↑↓ select · ↵ default/add · Ctrl+A add model · Ctrl+E edit · Ctrl+Dx2 delete · Tab all · Esc close").into(),
         Msg::ProviderPanelModelSaved { model } => format!("Saved model \"{model}\".").into(),
@@ -367,6 +371,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelVisionAuto => "Auto".into(),
         Msg::ProviderPanelVisionEnabled => "Enabled".into(),
         Msg::ProviderPanelVisionDisabled => "Disabled".into(),
+        Msg::ProviderPanelFieldEffort => "Default reasoning effort".into(),
+        Msg::ProviderPanelFieldEffortLevels => "Supported levels".into(),
         Msg::ProviderPanelFieldWindow => "Context window".into(),
         Msg::ProviderPanelFieldMakeDefault => "Set as default".into(),
         Msg::ProviderPanelSwitchHint => "←→ to switch".into(),
@@ -415,6 +421,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             } else {
                 format!("Allow {tool}({detail})?").into()
             }
+        }
+        Msg::CredentialApprovalNote => {
+            "⚠ May send credentials or sensitive content to the model provider".into()
         }
         Msg::ToolDenied => "denied".into(),
         Msg::ToolBlockedBySecurityPolicy =>
@@ -960,11 +969,11 @@ Msg::PluginMgrInstallingLabel => "Installing…".into(),
             ).into(),
         Msg::PluginMarketplaceUpdated { name, commit } =>
             format!("✓ marketplace `{name}` updated to {commit}").into(),
-        Msg::PluginInstallDone { plugin, marketplace: _, loaded: _, skipped: _, show_details_hint: _ } => {
-            format!("  ⎿  ✓ Installed {plugin}. Run /reload-plugins to apply.").into()
+        Msg::PluginInstallDone { plugin, marketplace: _, loaded, skipped, show_details_hint } => {
+            format!("  ⎿  ✓ Installed {plugin} — {}", plugin_reload_summary(loaded, skipped, show_details_hint)).into()
         }
-        Msg::PluginUpdateDone { plugin, marketplace: _, loaded: _, skipped: _, show_details_hint: _ } => {
-            format!("  ⎿  ✓ Updated {plugin}. Run /reload-plugins to apply.").into()
+        Msg::PluginUpdateDone { plugin, marketplace: _, loaded, skipped, show_details_hint } => {
+            format!("  ⎿  ✓ Updated {plugin} — {}", plugin_reload_summary(loaded, skipped, show_details_hint)).into()
         }
         Msg::SetupAutoReloaded { skills, warnings } =>
             format!("✓ Setup complete, auto-reloaded: {skills} skill(s), {warnings} warning(s)").into(),
@@ -1008,7 +1017,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescBuild => "Switch to Build mode (full execution)".into(),
         Msg::CmdDescAuto => "Switch to Auto mode (auto-approve all tools)".into(),
         Msg::CmdDescThink => "Extended thinking control (on/off/budget N)".into(),
-        Msg::CmdDescEffort => "DeepSeek reasoning effort control (high / max / off)".into(),
+        Msg::CmdDescEffort => "Model reasoning effort control (low / medium / high / max / auto)".into(),
         Msg::CmdDescHelp => "Show this help".into(),
         Msg::CmdDescKeys => "Show keyboard shortcuts".into(),
         Msg::CmdDescLanguage => "Switch display language".into(),
@@ -1081,7 +1090,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         }
 
         // ── reasoning effort ──
-        Msg::ReasoningEffortNoEffect => "reasoning_effort has no effect on the current model (only DeepSeek V4)".into(),
+        Msg::ReasoningEffortNoEffect => "The current model is not configured to support reasoning_effort; enable it in /provider".into(),
 
         // ── config save failed ──
         Msg::ConfigSaveFailed { error } =>
@@ -1415,6 +1424,11 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
                  plain OpenAI-compatible endpoint with an api_key."
             ).into(),
         Msg::StreamStalled => "esc to cancel".into(),
+        Msg::StreamRecoveryRunning { attempt, max_attempts } => format!(
+            "stream timed out; safely continuing from saved progress ({attempt}/{max_attempts})…"
+        )
+        .into(),
+        Msg::StreamRecoverySucceeded => "✓ recovered from the interrupted stream".into(),
         Msg::ConhostScrollHint =>
             "Tip: the classic Windows console is limited — no scroll-back while a task runs, \
              and glyphs/the mascot render degraded. \x1b[1;96mWindows Terminal\x1b[0m gives the full experience."
@@ -1464,4 +1478,20 @@ mod codingplan_crypto_tests {
         assert!(s.contains("Windows Terminal"));
         assert!(s.to_lowercase().contains("scroll"));
     }
+}
+
+/// Render the outcome the caller already measured: `reload_plugins` runs
+/// immediately before this toast, so the skills ARE loaded by the time it
+/// prints. The previous text ("Run /reload-plugins to apply") was wrong twice
+/// over — it named a slash command that does not exist, to ask for work that
+/// had already happened — and it threw away all three counts it was handed.
+fn plugin_reload_summary(loaded: usize, skipped: usize, show_details_hint: bool) -> String {
+    let mut out = format!("{loaded} skill(s) loaded");
+    if skipped > 0 {
+        out.push_str(&format!(", {skipped} skipped"));
+    }
+    if show_details_hint {
+        out.push_str(" (Ctrl+O for details)");
+    }
+    out
 }

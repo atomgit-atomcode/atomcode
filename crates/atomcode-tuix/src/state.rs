@@ -1,8 +1,48 @@
 // crates/atomcode-tuix/src/state.rs
 
+use unicode_segmentation::UnicodeSegmentation;
+
+fn previous_grapheme_boundary(text: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(text.len());
+    text.grapheme_indices(true)
+        .map(|(index, _)| index)
+        .filter(|index| *index < cursor)
+        .next_back()
+        .unwrap_or(0)
+}
+
+fn next_grapheme_boundary(text: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(text.len());
+    text.grapheme_indices(true)
+        .map(|(index, _)| index)
+        .find(|index| *index > cursor)
+        .unwrap_or(text.len())
+}
+
+fn insert_at_cursor(text: &mut String, cursor: &mut usize, inserted: &str) {
+    *cursor = (*cursor).min(text.len());
+    text.insert_str(*cursor, inserted);
+    *cursor += inserted.len();
+}
+
+fn backspace_at_cursor(text: &mut String, cursor: &mut usize) {
+    let start = previous_grapheme_boundary(text, *cursor);
+    if start < *cursor {
+        text.drain(start..*cursor);
+        *cursor = start;
+    }
+}
+
+fn delete_at_cursor(text: &mut String, cursor: &mut usize) {
+    let end = next_grapheme_boundary(text, *cursor);
+    if *cursor < end {
+        text.drain(*cursor..end);
+    }
+}
+
 /// Execution mode (unified). Alias of the shared coding runtime enum so TUI, daemon,
 /// webui share one type. Build = interactive approval; Auto = auto-approve all
-/// (bypass); Plan = read-only. Cycled by Tab / Shift+Tab.
+/// (bypass); Plan = read-only. Cycled by Shift+Tab in the main composer.
 pub use atomcode_coding::RuntimeMode as AgentMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +85,9 @@ pub struct ApprovalPanel {
     pub options: Vec<ApprovalOption>,
     pub selected: usize,
     pub cache_key: String,
+    /// Optional advisory line rendered under the header (e.g. a credential-exposure
+    /// warning). `None` for ordinary approvals.
+    pub note: Option<String>,
 }
 
 impl ApprovalPanel {
@@ -110,9 +153,15 @@ pub struct UserInputPanel {
     pub checked: Vec<bool>,
     /// Free-form buffer (text mode only) — the standalone `text` mode's input.
     pub text: String,
+    /// UTF-8 byte cursor for `text`, always kept on a grapheme boundary.
+    pub text_cursor_byte: usize,
     /// Free-text buffer for the always-appended "Other" row in single/multiple
     /// mode. Distinct from `text` (which is the standalone text-mode input).
     pub custom_text: String,
+    /// UTF-8 byte cursor for `custom_text`, always kept on a grapheme boundary.
+    pub custom_text_cursor_byte: usize,
+    /// Images attached while answering this question.
+    pub images: Vec<atomcode_kernel::message::ImageContent>,
     /// Whether the "Other" free-text row is offered. Human-authored choice
     /// questions always set this; internal fixed checkpoints may disable it.
     pub custom: bool,
@@ -151,7 +200,10 @@ impl UserInputPanel {
             cursor: 0,
             checked,
             text: String::new(),
+            text_cursor_byte: 0,
             custom_text: String::new(),
+            custom_text_cursor_byte: 0,
+            images: Vec::new(),
             custom,
             scroll_offset: 0,
         }
@@ -228,6 +280,7 @@ impl UserInputPanel {
                 // concrete option supersedes any typed custom text.
                 if self.cursor < self.options.len() {
                     self.custom_text.clear();
+                    self.custom_text_cursor_byte = 0;
                 }
             }
             Multiple => {
@@ -256,11 +309,69 @@ impl UserInputPanel {
     /// already be on the "Other" row). Inclusion of the custom answer is derived
     /// from `custom_text.trim()` being non-empty — no separate checkbox state.
     pub fn push_custom(&mut self, c: char) {
-        self.custom_text.push(c);
+        insert_at_cursor(
+            &mut self.custom_text,
+            &mut self.custom_text_cursor_byte,
+            c.encode_utf8(&mut [0; 4]),
+        );
     }
     /// Backspace on the "Other" row.
     pub fn pop_custom(&mut self) {
-        self.custom_text.pop();
+        backspace_at_cursor(&mut self.custom_text, &mut self.custom_text_cursor_byte);
+    }
+    pub fn insert_text_char(&mut self, c: char) {
+        insert_at_cursor(
+            &mut self.text,
+            &mut self.text_cursor_byte,
+            c.encode_utf8(&mut [0; 4]),
+        );
+    }
+    pub fn backspace_text(&mut self) {
+        backspace_at_cursor(&mut self.text, &mut self.text_cursor_byte);
+    }
+    pub fn move_text_cursor_left(&mut self) {
+        self.text_cursor_byte = previous_grapheme_boundary(&self.text, self.text_cursor_byte);
+    }
+    pub fn move_text_cursor_right(&mut self) {
+        self.text_cursor_byte = next_grapheme_boundary(&self.text, self.text_cursor_byte);
+    }
+    pub fn move_custom_cursor_left(&mut self) {
+        self.custom_text_cursor_byte =
+            previous_grapheme_boundary(&self.custom_text, self.custom_text_cursor_byte);
+    }
+    pub fn move_custom_cursor_right(&mut self) {
+        self.custom_text_cursor_byte =
+            next_grapheme_boundary(&self.custom_text, self.custom_text_cursor_byte);
+    }
+    pub fn move_active_cursor_home(&mut self) {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        match self.mode {
+            UserInputMode::Text => self.text_cursor_byte = 0,
+            UserInputMode::Single | UserInputMode::Multiple if self.is_other_row() => {
+                self.custom_text_cursor_byte = 0;
+            }
+            _ => {}
+        }
+    }
+    pub fn move_active_cursor_end(&mut self) {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        match self.mode {
+            UserInputMode::Text => self.text_cursor_byte = self.text.len(),
+            UserInputMode::Single | UserInputMode::Multiple if self.is_other_row() => {
+                self.custom_text_cursor_byte = self.custom_text.len();
+            }
+            _ => {}
+        }
+    }
+    pub fn delete_active_cursor(&mut self) {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        match self.mode {
+            UserInputMode::Text => delete_at_cursor(&mut self.text, &mut self.text_cursor_byte),
+            UserInputMode::Single | UserInputMode::Multiple if self.is_other_row() => {
+                delete_at_cursor(&mut self.custom_text, &mut self.custom_text_cursor_byte);
+            }
+            _ => {}
+        }
     }
     /// Insert pasted text into whichever free-text buffer the keyboard would
     /// currently edit: the standalone `text` buffer (Text mode) or the "Other"
@@ -279,10 +390,16 @@ impl UserInputPanel {
             return;
         }
         match self.mode {
-            UserInputMode::Text => self.text.push_str(&flattened),
+            UserInputMode::Text => {
+                insert_at_cursor(&mut self.text, &mut self.text_cursor_byte, &flattened)
+            }
             UserInputMode::Single | UserInputMode::Multiple => {
                 if self.is_other_row() {
-                    self.custom_text.push_str(&flattened);
+                    insert_at_cursor(
+                        &mut self.custom_text,
+                        &mut self.custom_text_cursor_byte,
+                        &flattened,
+                    );
                 }
             }
         }
@@ -330,15 +447,16 @@ impl UserInputPanel {
                     vec![self.options[self.cursor].0.clone()]
                 } else {
                     let custom = self.custom_text.trim();
-                    if custom.is_empty() {
+                    if custom.is_empty() && self.images.is_empty() {
                         return None; // cursor on "Other" with no text → no-op
                     }
-                    vec![custom.to_string()]
+                    (!custom.is_empty()).then(|| custom.to_string()).into_iter().collect()
                 };
                 Some(UserInputResponse {
                     declined: false,
                     selected,
                     text: None,
+                    images: self.images.clone(),
                 })
             }
             Multiple => {
@@ -350,19 +468,21 @@ impl UserInputPanel {
                 if !custom.is_empty() {
                     selected.push(custom.to_string());
                 }
-                if selected.is_empty() {
+                if selected.is_empty() && self.images.is_empty() {
                     return None; // nothing chosen → Submit is a no-op
                 }
                 Some(UserInputResponse {
                     declined: false,
                     selected,
                     text: None,
+                    images: self.images.clone(),
                 })
             }
             Text => Some(UserInputResponse {
                 declined: false,
                 selected: vec![],
                 text: Some(self.text.clone()),
+                images: self.images.clone(),
             }),
         }
     }
@@ -562,9 +682,25 @@ mod user_input_custom_tests {
     #[test]
     fn paste_appends_to_text_mode_buffer() {
         let mut p = UserInputPanel::new(1, &req(UserInputMode::Text, false));
-        p.text.push_str("ab");
+        p.insert_paste("ab");
         p.insert_paste("cd");
         assert_eq!(p.text, "abcd", "paste appends to the text-mode buffer");
+        assert_eq!(p.text_cursor_byte, 4);
+    }
+
+    #[test]
+    fn free_text_cursor_edits_on_grapheme_boundaries() {
+        let mut p = UserInputPanel::new(1, &req(UserInputMode::Text, false));
+        p.insert_paste("a👨‍👩‍👧‍👦好");
+        p.move_text_cursor_left();
+        p.insert_text_char('!');
+        assert_eq!(p.text, "a👨‍👩‍👧‍👦!好");
+        p.move_text_cursor_left();
+        p.backspace_text();
+        assert_eq!(p.text, "a!好", "backspace removes the whole family emoji");
+        p.move_active_cursor_home();
+        p.delete_active_cursor();
+        assert_eq!(p.text, "!好");
     }
 
     #[test]
@@ -702,10 +838,7 @@ mod user_input_batch_tests {
 
     #[test]
     fn answer_summary_formats_selected_text_and_unanswered_questions() {
-        let mut b = UserInputBatch::new(
-            1,
-            &[single_q("choice"), text_q("text"), text_q("empty")],
-        );
+        let mut b = UserInputBatch::new(1, &[single_q("choice"), text_q("text"), text_q("empty")]);
         b.questions[0].select_current_option();
         b.questions[1].text.push_str("  atomcode  ");
 
@@ -1272,7 +1405,7 @@ pub struct UiState {
     /// panel and fail-safe Esc → cancel → submit-as-new-turn behavior.
     pub pending_steers: std::collections::VecDeque<PendingSteer>,
     /// Whether the user has explicitly switched to Build mode via
-    /// Tab/Shift+Tab or `/build`. When `false`, the status bar hides
+    /// Shift+Tab or `/build`. When `false`, the status bar hides
     /// the `⏸ build` badge so the default startup state stays clean.
     pub build_badge_visible: bool,
 }
@@ -1459,11 +1592,7 @@ impl UiState {
     /// is available, three ASCII dots (`...`) otherwise. Used by the
     /// spinner label and any other "still working…" suffix.
     pub fn ellipsis(&self) -> &'static str {
-        if self.unicode_symbols {
-            "…"
-        } else {
-            "..."
-        }
+        if self.unicode_symbols { "…" } else { "..." }
     }
 
     /// Merge one `AgentEvent::ContextStats` emission into the cached
@@ -1662,7 +1791,7 @@ impl UiState {
         )
     }
 
-    fn current_thinking(&self) -> &'static str {
+    pub(crate) fn current_thinking(&self) -> &'static str {
         THINKING_LABELS[self.thinking_idx % THINKING_LABELS.len()]
     }
 
@@ -1805,13 +1934,16 @@ impl UiState {
         // Streaming-only `/usage` tab panel — drop it on cancel too (mirrors
         // on_turn_complete); the rendered text stays until Esc.
         self.footer_usage = None;
-        // The todo panel is per-session, not per-turn: it survives turn
-        // termination (mirrors on_turn_complete). Clearing it here nuked the
-        // plan, and a "继续" turn only sends incremental todowrite updates that
-        // fold against the existing panel (a no-op on an empty base), so the
-        // panel could never rebuild — it stayed gone while the model kept
-        // executing. Only a session switch / new session / explicit clear drops
-        // `active_todos` + `todo_titles`.
+        // An authoritative user cancellation retires the current plan. The
+        // kernel persists the same boundary in the conversation, so replay and
+        // every other driver derive the same empty active list. Historical todo
+        // calls remain in the transcript and can be explicitly re-planned later.
+        self.active_todos = None;
+        self.todo_titles.clear();
+        self.pending_todo_calls.clear();
+        self.pending_todo_order.clear();
+        self.pending_todo_results.clear();
+        self.pending_todo_base = None;
     }
 
     /// Drop presentation state that belongs to the outgoing session. Unlike a
@@ -1839,20 +1971,25 @@ impl UiState {
 
     /// The kernel confirmed one or more steered prompts. Return locally-owned
     /// payloads whose content matches the authoritative folded inputs.
+    ///
+    /// Usually acknowledgements are FIFO. A context-bearing submit can be
+    /// queued for the next turn ahead of a later real steer, however, and has
+    /// no kernel `Steered` event of its own. Search the pending set so that such
+    /// an entry cannot block acknowledgement of later inputs.
     pub fn on_steered(
         &mut self,
         inputs: &[atomcode_kernel::event::SteeredInput],
     ) -> Vec<PendingSteer> {
         let mut confirmed = Vec::new();
         for input in inputs {
-            let matches_front = self.pending_steers.front().is_some_and(|pending| {
+            let matching = self.pending_steers.iter().position(|pending| {
                 pending.message.text == input.text && pending.message.images == input.images
             });
-            if matches_front {
+            if let Some(index) = matching {
                 confirmed.push(
                     self.pending_steers
-                        .pop_front()
-                        .expect("front was checked above"),
+                        .remove(index)
+                        .expect("matching index was found above"),
                 );
             }
         }
@@ -2099,16 +2236,55 @@ impl UiState {
         self.toggle_tool_output();
     }
 
-    /// Cycle through reasoning_effort values: None → "high" → "max" → None.
+    /// Cycle through reasoning_effort values:
+    /// None → "low" → "medium" → "high" → "max" → None.
     /// Returns the new value (None = use API default).
     pub fn cycle_reasoning_effort(&mut self) -> Option<&'static str> {
         let next: Option<&'static str> = match self.reasoning_effort.as_deref() {
-            None => Some("high"),
+            None => Some("low"),
+            Some("low") => Some("medium"),
+            Some("medium") => Some("high"),
             Some("high") => Some("max"),
             Some("max") => None,
-            _ => Some("high"),
+            _ => Some("low"),
         };
         self.reasoning_effort = next.map(|s| s.to_string());
+        next
+    }
+
+    /// Cycle to the next reasoning-effort value WITHIN the allowed set, seeding
+    /// from the authoritative `current` value first (`self.reasoning_effort` is
+    /// otherwise only ever written here and starts `None`, so cycling without
+    /// seeding would downgrade a persisted level on the first press). The sequence
+    /// is `None` (API default) then each `allowed` level in order, wrapping back to
+    /// `None`. `allowed` comes from
+    /// [`atomcode_config::config::allowed_effort_levels`], so an endpoint that
+    /// exposes only `low`/`high`/`max` never cycles onto `medium`. A `current`
+    /// value no longer in `allowed` (e.g. a level the endpoint dropped) restarts at
+    /// the first allowed level rather than sticking.
+    pub fn cycle_reasoning_effort_within(
+        &mut self,
+        current: Option<&str>,
+        allowed: &[&str],
+    ) -> Option<String> {
+        // No allowed levels ⇒ nothing to cycle; keep the current value rather than
+        // silently clearing it (defensive — `allowed_effort_levels` never returns
+        // empty in practice).
+        if allowed.is_empty() {
+            self.reasoning_effort = current.map(str::to_string);
+            return self.reasoning_effort.clone();
+        }
+        let cur_slot = match current {
+            Some(c) => allowed
+                .iter()
+                .position(|level| level.eq_ignore_ascii_case(c.trim()))
+                .map(|i| i + 1)
+                .unwrap_or(0),
+            None => 0,
+        };
+        let next_slot = (cur_slot + 1) % (allowed.len() + 1);
+        let next = (next_slot != 0).then(|| allowed[next_slot - 1].to_string());
+        self.reasoning_effort = next.clone();
         next
     }
 
@@ -2744,14 +2920,13 @@ mod tests {
         s.on_submit();
         s.on_tool_batch_started();
         let anchor = s.phase_started_at.unwrap();
-        s.active_tool_batches
-            .insert(
-                "b1".into(),
-                ActiveToolBatch {
-                    call_ids: vec![],
-                    edit_displays: std::collections::HashMap::new(),
-                },
-            );
+        s.active_tool_batches.insert(
+            "b1".into(),
+            ActiveToolBatch {
+                call_ids: vec![],
+                edit_displays: std::collections::HashMap::new(),
+            },
+        );
         std::thread::sleep(std::time::Duration::from_millis(15));
         s.on_tool_call_streaming("Bash(a)");
         assert_eq!(
@@ -2791,14 +2966,13 @@ mod tests {
         s.on_submit();
         s.on_tool_batch_started();
         let anchor = s.phase_started_at.unwrap();
-        s.active_tool_batches
-            .insert(
-                "b1".into(),
-                ActiveToolBatch {
-                    call_ids: vec![],
-                    edit_displays: std::collections::HashMap::new(),
-                },
-            );
+        s.active_tool_batches.insert(
+            "b1".into(),
+            ActiveToolBatch {
+                call_ids: vec![],
+                edit_displays: std::collections::HashMap::new(),
+            },
+        );
         std::thread::sleep(std::time::Duration::from_millis(15));
         s.on_thinking();
         assert_eq!(
@@ -3034,17 +3208,7 @@ mod tests {
     }
 
     #[test]
-    fn active_todos_persist_across_cancel_and_error() {
-        // The todo panel is PER-SESSION state (see reset_to_new_session /
-        // native SessionChanged, which drop it), NOT per-turn — it already survives
-        // turn COMPLETE (active_todos_persists_across_turn_end). Cancel and
-        // error are just turn terminations too, so they must preserve it as
-        // well. Regression: clearing on cancel/error nuked the plan, and since
-        // a "继续" turn sends only INCREMENTAL todowrite updates (which fold
-        // against the existing panel via apply_todo_action — a no-op on an
-        // empty base), the panel could never rebuild. It stayed gone on screen
-        // while the model kept executing the plan from its own context. Only an
-        // explicit clear or a session switch may drop the panel.
+    fn active_todos_are_retired_on_cancel_but_survive_error() {
         let mut s = UiState::new();
         s.active_todos = Some(crate::render::TodoProgress {
             current: Some("Task".to_string()),
@@ -3056,12 +3220,17 @@ mod tests {
         s.todo_titles.insert(1, "Todo".to_string());
 
         s.on_turn_cancelled();
-        assert!(s.active_todos.is_some(), "panel must survive cancellation");
-        assert!(
-            !s.todo_titles.is_empty(),
-            "titles must survive cancellation"
-        );
+        assert!(s.active_todos.is_none(), "cancel retires the active plan");
+        assert!(s.todo_titles.is_empty(), "cancel retires todo titles");
 
+        s.active_todos = Some(crate::render::TodoProgress {
+            current: Some("Task".to_string()),
+            completed: 2,
+            in_progress: 1,
+            total: 3,
+            items: vec![],
+        });
+        s.todo_titles.insert(1, "Todo".to_string());
         s.on_error();
         assert!(s.active_todos.is_some(), "panel must survive error");
         assert!(!s.todo_titles.is_empty(), "titles must survive error");
@@ -3092,6 +3261,7 @@ mod tests {
             ],
             selected: 0,
             cache_key: String::new(),
+            note: None,
         };
         p.move_up();
         assert_eq!(p.selected, 2, "up from 0 wraps to last");
@@ -3304,6 +3474,19 @@ mod tests {
             "two"
         );
         assert!(st.pending_steers.is_empty());
+
+        st.on_steer_sent(pending("queued-next-turn"));
+        st.on_steer_sent(pending("folded-now"));
+        let confirmed = st.on_steered(&[atomcode_kernel::event::SteeredInput {
+            text: "folded-now".into(),
+            images: Vec::new(),
+        }]);
+        assert_eq!(confirmed[0].message.text, "folded-now");
+        assert_eq!(
+            st.pending_steers.front().map(|pending| pending.message.text.as_str()),
+            Some("queued-next-turn"),
+            "a queued context message must not block a later real steer acknowledgement"
+        );
         assert!(
             st.on_steered(&[atomcode_kernel::event::SteeredInput {
                 text: "remote".into(),
@@ -3312,6 +3495,8 @@ mod tests {
             .is_empty(),
             "spurious / cross-client fold cannot fabricate a local echo"
         );
+        assert_eq!(st.pending_steers.len(), 1);
+        st.on_turn_complete();
         assert!(st.pending_steers.is_empty());
         // Every turn-end path clears it, parity with the other per-turn counters.
         st.on_steer_sent(pending("complete"));
@@ -3343,6 +3528,95 @@ mod tests {
 
         assert_eq!(st.phase, UiPhase::Idle);
         assert!(st.last_submitted_message.is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_cycles_all_supported_levels() {
+        let mut state = UiState::new();
+        assert_eq!(state.cycle_reasoning_effort(), Some("low"));
+        assert_eq!(state.cycle_reasoning_effort(), Some("medium"));
+        assert_eq!(state.cycle_reasoning_effort(), Some("high"));
+        assert_eq!(state.cycle_reasoning_effort(), Some("max"));
+        assert_eq!(state.cycle_reasoning_effort(), None);
+    }
+
+    #[test]
+    fn cycle_within_seeds_authoritative_value_before_advancing() {
+        // Regression: `reasoning_effort` starts None and is only ever written by
+        // the cycle itself, so cycling a fresh UiState whose provider persisted
+        // "high" would return "low" (chain head) and silently downgrade the user's
+        // level. Cycling FROM the authoritative value must advance from it.
+        let all = ["low", "medium", "high", "max"];
+        let mut state = UiState::new();
+        assert_eq!(state.reasoning_effort, None, "stale field starts empty");
+        assert_eq!(
+            state.cycle_reasoning_effort_within(Some("high"), &all).as_deref(),
+            Some("max")
+        );
+        // And the now-seeded state continues correctly (max → None).
+        assert_eq!(state.cycle_reasoning_effort_within(Some("max"), &all), None);
+        // A synced None (API default) still starts the chain.
+        assert_eq!(
+            state.cycle_reasoning_effort_within(None, &all).as_deref(),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn cycle_within_allowed_skips_unsupported_levels() {
+        // The motivating case: an endpoint exposing low/high/max but NOT medium.
+        let allowed = ["low", "high", "max"];
+        let mut st = UiState::new();
+        assert_eq!(st.cycle_reasoning_effort_within(None, &allowed).as_deref(), Some("low"));
+        // low → high: medium is skipped because it is not allowed.
+        assert_eq!(
+            st.cycle_reasoning_effort_within(Some("low"), &allowed).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            st.cycle_reasoning_effort_within(Some("high"), &allowed).as_deref(),
+            Some("max")
+        );
+        assert_eq!(st.cycle_reasoning_effort_within(Some("max"), &allowed), None);
+        // A value no longer in the allowed set restarts at the first allowed level.
+        assert_eq!(
+            st.cycle_reasoning_effort_within(Some("medium"), &allowed).as_deref(),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn cycle_within_empty_allowed_keeps_current_value() {
+        // Regression (c814bb51): an empty allowed list must be a no-op that
+        // preserves the current value, not a value-clobbering chain start.
+        // `allowed_effort_levels` never returns empty in practice, but the cycle
+        // must defend against it so a degenerate restriction cannot silently
+        // clear the active effort.
+        let empty: &[&str] = &[];
+        let mut st = UiState::new();
+
+        // A synced concrete value is kept verbatim.
+        assert_eq!(
+            st.cycle_reasoning_effort_within(Some("high"), empty).as_deref(),
+            Some("high")
+        );
+        assert_eq!(st.reasoning_effort.as_deref(), Some("high"));
+
+        // A synced None stays None (API default), not downgraded to "low".
+        assert_eq!(st.cycle_reasoning_effort_within(None, empty), None);
+        assert_eq!(st.reasoning_effort, None);
+    }
+
+    #[test]
+    fn cycle_within_trims_whitespace_on_current_value() {
+        // c814bb51: the current value is trimmed before membership lookup, so
+        // a padded authoritative value still advances from its own slot.
+        let all = ["low", "medium", "high", "max"];
+        let mut st = UiState::new();
+        assert_eq!(
+            st.cycle_reasoning_effort_within(Some("  high  "), &all).as_deref(),
+            Some("max")
+        );
     }
 
     #[test]

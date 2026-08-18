@@ -33,13 +33,22 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tower-http = { version = "0.5", features = ["cors"] }
 futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# WebUI static embedding
-rust-embed = { version = "8", features = ["mime-guess"] }
+# WebUI static embedding.
+#
+# `debug-embed` makes debug builds embed too. Without it rust-embed reads
+# `webui/dist/` off disk at runtime in debug, using the absolute path recorded
+# at compile time — so a debug binary is bound to the machine and checkout it
+# was built in, serves 404 the moment the tree moves, and cannot be handed to
+# anyone. Embedding always costs ~700 KB in the debug binary and means a
+# frontend change needs a Rust rebuild; `ATOMCODE_WEBUI_DEV=http://localhost:5173`
+# (see `webui.rs`) is the intended fast loop for frontend work and is unaffected.
+rust-embed = { version = "8", features = ["mime-guess", "debug-embed"] }
 mime_guess = "2"
 
 # Async trait support
@@ -56,7 +65,6 @@ sha2 = "0.10"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] }
 # Redirect ATOMCODE_HOME to a throwaway temp dir before any test runs (via a
 # #[ctor] in the lib's #[cfg(test)] module) so tests never persist into the

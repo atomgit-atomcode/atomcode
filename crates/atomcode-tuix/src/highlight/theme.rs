@@ -138,8 +138,24 @@ pub const MD_ITALIC_CLOSE: &str = "\x1b[23m";
 /// (SGR 90). Adequate as a small accent glyph next to bright text on
 /// either background. NOTE: NOT adequate for large structures like table
 /// grids on dark themes — those use the theme-aware [`md_border_open`].
+/// List markers use the theme-aware [`md_marker_open`] for the same reason.
 pub const MD_MUTED_OPEN: &str = "\x1b[90m";
 pub const MD_MUTED_CLOSE: &str = "\x1b[39m";
+
+/// List-marker (• / `1.`) colour — theme-aware, unlike the fixed
+/// [`MD_MUTED_OPEN`]. Light themes keep SGR 90 (readable mid-gray on
+/// white, ~4.5:1); dark themes switch to SGR 37 (soft light-gray) because
+/// a fixed SGR 90 collapses to ~`#3F3F3F` (~3:1) against dark backgrounds —
+/// the same "invisible until selected" contrast bug table borders had
+/// (see [`md_border_open`]), and the reported cause of ordered-list
+/// numbers being unreadable until the text was selected (Issue #1426).
+pub fn md_marker_open() -> &'static str {
+    if is_light() {
+        "\x1b[90m"
+    } else {
+        "\x1b[37m"
+    }
+}
 
 /// Table-border / structural-rule colour — theme-aware, unlike the fixed
 /// [`MD_MUTED_OPEN`]. Light themes: SGR 90 (bright-black → mid-gray,
@@ -212,6 +228,22 @@ mod tests {
         // On light themes SGR 90 is a readable mid-gray (~4.5:1 on white);
         // SGR 37 would be near-invisible there, so light keeps SGR 90.
         with_light(|| assert_eq!(md_border_open(), "\x1b[90m"));
+    }
+
+    #[test]
+    fn dark_md_marker_is_visible_gray_not_swallowed_darkgrey() {
+        // Regression (Issue #1426): on dark themes a fixed SGR 90 (DarkGrey)
+        // collapsed to ~3:1 against the bg and ordered-list numbers went
+        // invisible until selected. Dark mode must emit SGR 37 (soft
+        // light-gray), mirroring md_border_open's fix for table borders.
+        with_dark(|| assert_eq!(md_marker_open(), "\x1b[37m"));
+    }
+
+    #[test]
+    fn light_md_marker_is_darkgrey() {
+        // On light themes SGR 90 is a readable mid-gray (~4.5:1 on white);
+        // keep it, same as md_border_open.
+        with_light(|| assert_eq!(md_marker_open(), "\x1b[90m"));
     }
 
     #[test]

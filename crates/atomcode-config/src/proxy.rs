@@ -155,12 +155,27 @@ fn set_env_keys(keys: &[&str], value: &Option<String>) {
     }
 }
 
-fn config_path() -> PathBuf {
-    if let Some(home) = env::var("ATOMCODE_HOME").ok().filter(|s| !s.is_empty()) {
+/// Pure core of [`config_path`], split out so the resolution is testable without mutating
+/// process env — the same shape as `distribution::default_home`.
+fn config_path_from(home_env: Option<String>, real_home: Option<PathBuf>) -> PathBuf {
+    if let Some(home) = home_env.filter(|s| !s.is_empty()) {
         return PathBuf::from(home).join("config.toml");
     }
-    let home = crate::util::real_home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".atomcode").join("config.toml")
+    real_home
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(crate::distribution::HOME_DIR_NAME)
+        .join("config.toml")
+}
+
+/// Mirrors `Config::config_dir()` + `default_path()`, resolved locally so this leaf keeps its
+/// "reqwest-free, config-type-free" shape. Both halves must come from `distribution` — spelling
+/// the env var and the directory out here meant a rebuilt distribution read its proxy policy
+/// out of the *other* build's config file, i.e. silently ignored its own `[network.proxy]`.
+fn config_path() -> PathBuf {
+    config_path_from(
+        env::var(crate::distribution::HOME_ENV).ok(),
+        crate::util::real_home_dir(),
+    )
 }
 
 fn load_proxy_config_from_disk() -> ProxyConfig {
@@ -213,6 +228,48 @@ fn follow_system_env(
     }
 }
 
+/// Hosts that must never be reached through a proxy, whatever the user or the OS asked for.
+///
+/// A proxy resolves `127.0.0.1` against ITSELF, so proxying loopback either fails outright or —
+/// worse — silently reaches a different machine's service on that port. Every other HTTP stack
+/// special-cases this (curl, Go's `httpproxy`, Docker); reqwest does not, and macOS's own
+/// exception list does not include loopback unless the user adds it. Without this, anyone with
+/// a system proxy switched on cannot reach a local model server (Ollama, LM Studio, vLLM) at
+/// all — the request goes to the proxy and comes back 403.
+const LOOPBACK_BYPASS: &[&str] = &["localhost", "127.0.0.1", "::1"];
+
+/// Add [`LOOPBACK_BYPASS`] to whatever bypass list the user or the OS supplied, keeping their
+/// entries and not repeating one they already listed.
+fn with_loopback_bypass(no_proxy: &Option<String>) -> Option<String> {
+    let mut entries: Vec<String> = no_proxy
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect();
+    for host in LOOPBACK_BYPASS {
+        if !entries.iter().any(|e| e.eq_ignore_ascii_case(host)) {
+            entries.push((*host).to_owned());
+        }
+    }
+    Some(entries.join(","))
+}
+
+/// The bypass list to install for a resolved snapshot: the loopback hosts folded in when some
+/// proxy is actually in play, and the caller's list untouched when none is — with no proxy
+/// there is nothing to bypass, and conjuring a `NO_PROXY` out of nothing would only confuse
+/// anyone reading the process environment.
+fn bypass_for(resolved: &ProxyEnvSnapshot) -> Option<String> {
+    let any_proxy = resolved.http.is_some() || resolved.https.is_some() || resolved.all.is_some();
+    if any_proxy {
+        with_loopback_bypass(&resolved.no_proxy)
+    } else {
+        resolved.no_proxy.clone()
+    }
+}
+
 pub fn apply_process_proxy_config(cfg: &ProxyConfig) {
     let _ = startup_env();
     env::set_var(MODE_ENV, cfg.mode.as_str());
@@ -225,13 +282,19 @@ pub fn apply_process_proxy_config(cfg: &ProxyConfig) {
             set_env_keys(ENV_HTTP_PROXY, &resolved.http);
             set_env_keys(ENV_HTTPS_PROXY, &resolved.https);
             set_env_keys(ENV_ALL_PROXY, &resolved.all);
-            set_env_keys(ENV_NO_PROXY, &resolved.no_proxy);
+            set_env_keys(ENV_NO_PROXY, &bypass_for(&resolved));
         }
         ProxyMode::DefaultProxy => {
+            let pinned = ProxyEnvSnapshot {
+                http: cfg.http.clone(),
+                https: cfg.https.clone(),
+                all: cfg.all.clone(),
+                no_proxy: cfg.no_proxy.clone(),
+            };
             set_env_keys(ENV_HTTP_PROXY, &cfg.http);
             set_env_keys(ENV_HTTPS_PROXY, &cfg.https);
             set_env_keys(ENV_ALL_PROXY, &cfg.all);
-            set_env_keys(ENV_NO_PROXY, &cfg.no_proxy);
+            set_env_keys(ENV_NO_PROXY, &bypass_for(&pinned));
         }
         ProxyMode::NoProxy => {
             set_env_keys(ENV_HTTP_PROXY, &None);
@@ -245,6 +308,37 @@ pub fn apply_process_proxy_config(cfg: &ProxyConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_config_is_read_from_this_distribution_not_a_hardcoded_one() {
+        // This leaf resolves its own path instead of calling Config::default_path(), so it is
+        // the easiest place for a distribution rename to be missed — and a miss is silent: the
+        // build reads the OTHER build's [network.proxy] and quietly ignores its own.
+        let path = config_path_from(None, Some(PathBuf::from("/Users/foo")));
+        assert_eq!(
+            path,
+            PathBuf::from("/Users/foo")
+                .join(crate::distribution::HOME_DIR_NAME)
+                .join("config.toml")
+        );
+        assert!(path.starts_with("/Users/foo"));
+    }
+
+    #[test]
+    fn proxy_config_path_prefers_the_home_env_verbatim() {
+        let path = config_path_from(
+            Some("/tmp/explicit".into()),
+            Some(PathBuf::from("/Users/foo")),
+        );
+        assert_eq!(path, PathBuf::from("/tmp/explicit/config.toml"));
+    }
+
+    #[test]
+    fn proxy_config_path_ignores_an_empty_home_env() {
+        // An exported-but-empty var means "unset", not "root at the filesystem root".
+        let path = config_path_from(Some(String::new()), Some(PathBuf::from("/Users/foo")));
+        assert!(path.starts_with("/Users/foo"));
+    }
 
     #[test]
     fn follow_system_env_prefers_env_then_system() {
@@ -329,5 +423,62 @@ mod tests {
     fn proxy_file_config_defaults_to_follow_system() {
         let parsed: ProxyFileConfig = toml::from_str("").expect("parse");
         assert_eq!(parsed.network.proxy.mode, ProxyMode::FollowSystem);
+    }
+
+    fn snapshot_with_proxy(no_proxy: Option<&str>) -> ProxyEnvSnapshot {
+        ProxyEnvSnapshot {
+            http: Some("http://corp:8080".into()),
+            https: Some("http://corp:8080".into()),
+            all: None,
+            no_proxy: no_proxy.map(str::to_owned),
+        }
+    }
+
+    fn entries(value: &Option<String>) -> Vec<String> {
+        value
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn loopback_is_bypassed_whenever_a_proxy_is_in_play() {
+        // The whole point: a proxy resolves 127.0.0.1 against itself, so a local model server
+        // is unreachable unless loopback is exempted. macOS's exception list does not include
+        // it and reqwest does not special-case it, so nobody else will do this for us.
+        let out = entries(&bypass_for(&snapshot_with_proxy(None)));
+        for host in LOOPBACK_BYPASS {
+            assert!(out.iter().any(|e| e == host), "{host} must be bypassed");
+        }
+    }
+
+    #[test]
+    fn loopback_bypass_keeps_what_the_user_already_listed() {
+        let out = entries(&bypass_for(&snapshot_with_proxy(Some(
+            "*.corp, internal.example",
+        ))));
+        assert!(out.iter().any(|e| e == "*.corp"));
+        assert!(out.iter().any(|e| e == "internal.example"));
+        assert!(out.iter().any(|e| e == "127.0.0.1"));
+    }
+
+    #[test]
+    fn loopback_bypass_does_not_repeat_an_entry_the_user_supplied() {
+        let out = entries(&bypass_for(&snapshot_with_proxy(Some("localhost,*.corp"))));
+        assert_eq!(
+            out.iter().filter(|e| e.as_str() == "localhost").count(),
+            1,
+            "got {out:?}"
+        );
+    }
+
+    #[test]
+    fn no_bypass_is_invented_when_there_is_no_proxy_to_bypass() {
+        // With nothing proxied, a NO_PROXY appearing from nowhere would just mislead anyone
+        // reading the process environment.
+        let none = ProxyEnvSnapshot::default();
+        assert_eq!(bypass_for(&none), None);
     }
 }

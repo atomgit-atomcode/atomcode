@@ -2839,8 +2839,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
       for (const [sid, panel] of this._panels) {
         const label = nameById.get(sid);
-        if (label && panel.title !== label) {
-          panel.title = label;
+        if (label) {
+          const next = truncateTabTitle(label);
+          if (panel.title !== next) {
+            panel.title = next;
+          }
         }
       }
     } catch {}
@@ -3093,6 +3096,44 @@ function getNonce(): string {
     text += possible.charAt(Math.floor(Math.random() * possible.length));
   }
   return text;
+}
+
+/** 视觉宽度上限（约等于半角字符数），给图标、关闭按钮和 padding 留出空间。 */
+const MAX_TAB_TITLE_WIDTH = 30;
+
+/**
+ * 将会话名截断为适合 VSCode editor tab 显示的标题。
+ *
+ * - 按视觉宽度计算（CJK、全角标点、谚文等占 2 个宽度单位，其余占 1）；
+ * - 清理换行符和制表符，避免破坏标签布局；
+ * - 超出宽度时追加单字符省略号 …；
+ * - 按 Unicode 码点切割，不破坏 surrogate pair（如 emoji）。
+ */
+export function truncateTabTitle(name: string): string {
+  const cleaned = name.replace(/[\r\n\t]+/g, ' ').trim();
+  const chars = Array.from(cleaned);
+  let width = 0;
+  let end = 0;
+
+  for (; end < chars.length; end++) {
+    const code = chars[end].codePointAt(0)!;
+    const isWide =
+      (code >= 0x1100 && code <= 0x115f) || // Hangul Jamo
+      code === 0x2329 || code === 0x232a ||
+      (code >= 0x2e80 && code <= 0x9fff) || // CJK radicals ~ CJK Unified Ideographs
+      (code >= 0xac00 && code <= 0xd7a3) || // Hangul Syllables
+      (code >= 0xf900 && code <= 0xfaff) || // CJK Compatibility Ideographs
+      (code >= 0xfe30 && code <= 0xfe4f) || // CJK Compatibility Forms
+      (code >= 0xff00 && code <= 0xff60) || // Fullwidth Forms
+      (code >= 0xffe0 && code <= 0xffe6);    // Fullwidth Signs
+
+    const charWidth = isWide ? 2 : 1;
+    if (width + charWidth > MAX_TAB_TITLE_WIDTH) break;
+    width += charWidth;
+  }
+
+  if (end >= chars.length) return cleaned;
+  return chars.slice(0, end).join('') + '\u2026';
 }
 
 function delay(ms: number): Promise<void> {

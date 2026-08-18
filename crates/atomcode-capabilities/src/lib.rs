@@ -62,12 +62,13 @@ pub mod compaction;
 /// Shared `$ATOMCODE_HOME` path resolution for the persisting capabilities — one
 /// home for the rule (and for documenting its single known `sudo` divergence from
 /// production). Internal; compiled only when a feature that persists needs it.
-/// `provider` also needs it: the byte-level wire dump lands under `config_dir()/wire-dump`.
+/// `provider` also needs it for wire dumps; `tools` needs it for the credential-path gate.
 #[cfg(any(
     feature = "mcp",
     feature = "session",
     feature = "memory",
-    feature = "provider"
+    feature = "provider",
+    feature = "tools"
 ))]
 pub(crate) mod paths;
 

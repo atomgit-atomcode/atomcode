@@ -144,6 +144,191 @@ pub struct TeamTaskSpec {
     pub scope: Vec<String>,
 }
 
+/// Reject worker scope conflicts that can be established from literal paths, recursive
+/// lanes, and the common glob forms accepted by the task tool. For two genuinely complex
+/// glob expressions we fail conservatively when their literal directory prefixes overlap:
+/// assigning a little less parallel work is preferable to allowing two workers to write
+/// the same file.
+pub fn validate_non_overlapping_worker_scopes(tasks: &[TeamTaskSpec]) -> Result<(), String> {
+    let workers: Vec<(usize, Vec<String>)> = tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, task)| task.permission == TeamPermission::Worker)
+        .map(|(index, task)| {
+            (
+                index,
+                task.scope
+                    .iter()
+                    .map(|scope| normalize_scope(scope))
+                    .filter(|scope| !scope.is_empty())
+                    .collect(),
+            )
+        })
+        .collect();
+
+    for left in 0..workers.len() {
+        for right in left + 1..workers.len() {
+            for a in &workers[left].1 {
+                for b in &workers[right].1 {
+                    if scopes_provably_overlap(a, b) {
+                        return Err(format!(
+                            "team worker scopes overlap: task {} scope {:?} conflicts with task {} \
+                             scope {:?}. Assign non-overlapping files/directories before dispatch.",
+                            workers[left].0 + 1,
+                            a,
+                            workers[right].0 + 1,
+                            b
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_scope(scope: &str) -> String {
+    scope
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn recursive_scope_root(scope: &str) -> Option<&str> {
+    if scope == "**" {
+        Some("")
+    } else {
+        scope
+            .strip_suffix("/**")
+            .map(|root| root.trim_end_matches('/'))
+    }
+}
+
+fn has_glob_meta(scope: &str) -> bool {
+    scope
+        .chars()
+        .any(|ch| matches!(ch, '*' | '?' | '[' | ']' | '{' | '}'))
+}
+
+fn literal_prefix(scope: &str) -> &str {
+    let end = scope
+        .char_indices()
+        .find_map(|(index, ch)| matches!(ch, '*' | '?' | '[' | ']' | '{' | '}').then_some(index))
+        .unwrap_or(scope.len());
+    scope[..end].trim_end_matches('/')
+}
+
+fn wildcard_segment_matches(pattern: &str, value: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let value: Vec<char> = value.chars().collect();
+    let mut reachable = vec![false; value.len() + 1];
+    reachable[0] = true;
+    for token in pattern {
+        let mut next = vec![false; value.len() + 1];
+        match token {
+            '*' => {
+                let mut seen = false;
+                for index in 0..=value.len() {
+                    seen |= reachable[index];
+                    next[index] = seen;
+                }
+            }
+            '?' => {
+                for index in 0..value.len() {
+                    next[index + 1] |= reachable[index];
+                }
+            }
+            literal => {
+                for index in 0..value.len() {
+                    next[index + 1] |= reachable[index] && value[index] == literal;
+                }
+            }
+        }
+        reachable = next;
+    }
+    reachable[value.len()]
+}
+
+fn glob_matches_literal(pattern: &str, path: &str) -> bool {
+    let pattern: Vec<&str> = pattern.split('/').collect();
+    let path: Vec<&str> = path.split('/').collect();
+    let mut reachable = vec![false; path.len() + 1];
+    reachable[0] = true;
+    for segment in pattern {
+        let mut next = vec![false; path.len() + 1];
+        if segment == "**" {
+            let mut seen = false;
+            for index in 0..=path.len() {
+                seen |= reachable[index];
+                next[index] = seen;
+            }
+        } else if !segment.contains(['[', ']', '{', '}']) {
+            for index in 0..path.len() {
+                next[index + 1] |=
+                    reachable[index] && wildcard_segment_matches(segment, path[index]);
+            }
+        }
+        reachable = next;
+    }
+    reachable[path.len()]
+}
+
+fn glob_may_match_literal(pattern: &str, path: &str) -> bool {
+    if pattern.contains(['[', ']', '{', '}']) {
+        let prefix = literal_prefix(pattern);
+        return path_is_under(path, prefix) || path_is_under(prefix, path);
+    }
+    glob_matches_literal(pattern, path)
+}
+
+fn glob_prefix_may_enter_root(pattern: &str, root: &str) -> bool {
+    let prefix = literal_prefix(pattern);
+    path_is_under(prefix, root) || path_is_under(root, prefix)
+}
+
+fn path_is_under(path: &str, root: &str) -> bool {
+    root.is_empty()
+        || path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn scopes_provably_overlap(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    if let Some(root) = recursive_scope_root(a) {
+        if let Some(other_root) = recursive_scope_root(b) {
+            return path_is_under(other_root, root) || path_is_under(root, other_root);
+        }
+        return if has_glob_meta(b) {
+            glob_prefix_may_enter_root(b, root)
+        } else {
+            path_is_under(b, root)
+        };
+    }
+    if let Some(root) = recursive_scope_root(b) {
+        return if has_glob_meta(a) {
+            glob_prefix_may_enter_root(a, root)
+        } else {
+            path_is_under(a, root)
+        };
+    }
+    match (has_glob_meta(a), has_glob_meta(b)) {
+        (true, false) => glob_may_match_literal(a, b),
+        (false, true) => glob_may_match_literal(b, a),
+        (true, true) => {
+            let a_prefix = literal_prefix(a);
+            let b_prefix = literal_prefix(b);
+            path_is_under(a_prefix, b_prefix) || path_is_under(b_prefix, a_prefix)
+        }
+        (false, false) => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TeamEventPayload {
@@ -400,5 +585,33 @@ mod tests {
         assert_eq!(decode_team_event("ordinary tool progress"), None);
         assert_eq!(decode_team_event("\u{1f}{not-json}"), None);
         assert_eq!(decode_team_event("\u{1f}{\"run_id\":\"x\"}"), None);
+    }
+
+    fn worker(scope: &str) -> TeamTaskSpec {
+        TeamTaskSpec {
+            description: "test".into(),
+            prompt: "test".into(),
+            role: TeamRoleId::Implementer,
+            permission: TeamPermission::Worker,
+            difficulty: TeamDifficulty::Hard,
+            scope: vec![scope.into()],
+        }
+    }
+
+    #[test]
+    fn worker_scope_validation_matches_common_glob_against_literal_file() {
+        let error =
+            validate_non_overlapping_worker_scopes(&[worker("src/*.rs"), worker("src/lib.rs")])
+                .unwrap_err();
+        assert!(error.contains("worker scopes overlap"), "{error}");
+    }
+
+    #[test]
+    fn worker_scope_validation_allows_disjoint_literal_directories() {
+        validate_non_overlapping_worker_scopes(&[
+            worker("src/frontend/*.rs"),
+            worker("src/backend/*.rs"),
+        ])
+        .unwrap();
     }
 }

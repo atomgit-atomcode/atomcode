@@ -1,7 +1,7 @@
 // crates/atomcode-tuix/src/input/history.rs
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 /// One row in the input history file. Replaces the prior plain `String`
@@ -29,9 +29,9 @@ pub struct HistoryEntry {
     pub pastes: Vec<String>,
 }
 
-/// Reference to a single image cached on disk under
-/// `~/.atomcode/image-cache/<hash>.<ext>`. Recorded on submit; consumed
-/// on up-arrow recall to rehydrate `pending_images`.
+/// Reference to a single image cached in the project history's `images/`
+/// directory. Legacy global entries continue to resolve against the old
+/// `~/.atomcode/image-cache` directory, which remains read-only.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HistoryImageRef {
     /// u64 content hash, lowercase hex, 16 chars. Same value that's
@@ -48,56 +48,67 @@ pub struct HistoryImageRef {
     pub n: usize,
 }
 
+/// Capacity of the old global file when this type is used in standalone/back-
+/// compatibility mode. New project histories use [`PROJECT_HISTORY_MAX`].
 pub const HISTORY_MAX: usize = 1000;
+pub const PROJECT_HISTORY_MAX: usize = 200;
 
 pub struct History {
     path: PathBuf,
+    lock_path: PathBuf,
     entries: Vec<HistoryEntry>,
+    project_entries: Vec<HistoryEntry>,
+    legacy_entries: Vec<HistoryEntry>,
+    pending: Vec<HistoryEntry>,
     cache_dir: PathBuf,
+    legacy_cache_dir: Option<PathBuf>,
+    max_entries: usize,
 }
 
 impl History {
-    /// Load history from `path` and configure `cache_dir` for GC + the
-    /// future `image_cache_dir` consumers in the event loop. The
-    /// cache_dir argument is wired through from
-    /// `crate::platform::image_cache_dir()` at startup.
+    /// Load history from `path` and configure `cache_dir` for GC. This is the
+    /// standalone/back-compat constructor; production TUI startup uses
+    /// [`Self::load_project`].
     pub fn load_with_cache<P: Into<PathBuf>>(path: P, cache_dir: PathBuf) -> Self {
         let path = path.into();
-        // Each physical line is one entry. Per-line fallback chain so we
-        // never reject a row written by an older build:
-        //   1. parse as `HistoryEntry` (current format, JSON object)
-        //   2. parse as `String` (older JSON-encoded string lines)
-        //   3. treat the line as raw plain text (pre-JSON format)
-        let entries: Vec<HistoryEntry> = fs::read_to_string(&path)
-            .ok()
-            .map(|s| {
-                s.lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .map(|l| {
-                        if let Ok(e) = serde_json::from_str::<HistoryEntry>(l) {
-                            return e;
-                        }
-                        if let Ok(t) = serde_json::from_str::<String>(l) {
-                            return HistoryEntry {
-                                text: t,
-                                images: Vec::new(),
-                                pastes: Vec::new(),
-                            };
-                        }
-                        HistoryEntry {
-                            text: l.to_string(),
-                            images: Vec::new(),
-                            pastes: Vec::new(),
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let entries = read_entries(&path);
         Self {
+            lock_path: sibling_lock_path(&path),
             path,
-            entries,
+            entries: entries.clone(),
+            project_entries: entries,
+            legacy_entries: Vec::new(),
+            pending: Vec::new(),
             cache_dir,
+            legacy_cache_dir: None,
+            max_entries: HISTORY_MAX,
         }
+    }
+
+    /// Load a project-scoped history. The legacy global history is read only
+    /// when the project has fewer than 200 entries and only fills the unused
+    /// capacity; it is never migrated or written.
+    pub fn load_project(paths: crate::platform::ProjectHistoryPaths) -> Self {
+        let mut project_entries = read_entries(&paths.entries);
+        retain_newest(&mut project_entries, PROJECT_HISTORY_MAX);
+        let legacy_entries = if project_entries.len() < PROJECT_HISTORY_MAX {
+            read_entries(&paths.legacy_entries)
+        } else {
+            Vec::new()
+        };
+        let mut history = Self {
+            path: paths.entries,
+            lock_path: paths.lock,
+            entries: Vec::new(),
+            project_entries,
+            legacy_entries,
+            pending: Vec::new(),
+            cache_dir: paths.image_cache,
+            legacy_cache_dir: Some(paths.legacy_image_cache),
+            max_entries: PROJECT_HISTORY_MAX,
+        };
+        history.rebuild_view();
+        history
     }
 
     /// Back-compat constructor used by tests and any caller that doesn't
@@ -124,6 +135,18 @@ impl History {
         &self.entries
     }
 
+    pub fn cache_dir(&self) -> &std::path::Path {
+        &self.cache_dir
+    }
+
+    pub fn legacy_cache_dir(&self) -> Option<&std::path::Path> {
+        self.legacy_cache_dir.as_deref()
+    }
+
+    pub(crate) fn storage_path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     pub fn push(&mut self, entry: HistoryEntry) {
         if entry.text.trim().is_empty() {
             return;
@@ -131,34 +154,58 @@ impl History {
         if self.entries.last().map(|e| &e.text) == Some(&entry.text) {
             return;
         }
-        self.entries.push(entry);
-        if self.entries.len() > HISTORY_MAX {
-            let drop = self.entries.len() - HISTORY_MAX;
-            self.entries.drain(..drop);
-        }
+        self.project_entries.push(entry.clone());
+        self.pending.push(entry);
+        retain_newest(&mut self.project_entries, self.max_entries);
+        retain_newest(&mut self.pending, self.max_entries);
+        self.rebuild_view();
     }
 
-    pub fn save(&self) -> io::Result<()> {
+    pub fn save(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let contents: String = self
-            .entries
-            .iter()
-            .map(|e| {
-                serde_json::to_string(e).unwrap_or_else(|_| {
-                    // Defensive fallback — HistoryEntry should always serialize
-                    // cleanly via serde, but if a future field broke that,
-                    // emit a JSON-string of the text so a malformed entry
-                    // doesn't poison the rest of the file.
-                    serde_json::to_string(&e.text).unwrap_or_else(|_| e.text.clone())
-                })
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        fs::write(&self.path, contents)?;
+        let lock = open_lock(&self.lock_path)?;
+        fs2::FileExt::lock_exclusive(&lock)?;
+
+        let mut merged = read_entries(&self.path);
+        for entry in &self.pending {
+            // A concurrently saved identical entry is already represented.
+            // Move it to the newest position so arrow-up order stays intuitive.
+            merged.retain(|candidate| candidate != entry);
+            merged.push(entry.clone());
+        }
+        retain_newest(&mut merged, self.max_entries);
+        atomic_write_entries(&self.path, &merged)?;
+
+        self.project_entries = merged;
+        self.pending.clear();
+        self.rebuild_view();
         let _ = self.gc(); // best-effort; never fails the save
         Ok(())
+    }
+
+    fn rebuild_view(&mut self) {
+        retain_newest(&mut self.project_entries, self.max_entries);
+        let legacy_budget = self.max_entries.saturating_sub(self.project_entries.len());
+        let mut legacy = Vec::new();
+        if legacy_budget > 0 {
+            for entry in self.legacy_entries.iter().rev() {
+                if self.project_entries.contains(entry) || legacy.contains(entry) {
+                    continue;
+                }
+                legacy.push(entry.clone());
+                if legacy.len() == legacy_budget {
+                    break;
+                }
+            }
+            legacy.reverse();
+        }
+        legacy.extend(self.project_entries.iter().cloned());
+        self.entries = legacy;
     }
 
     /// Best-effort garbage collection: remove any file in `cache_dir`
@@ -190,10 +237,97 @@ impl History {
     }
 }
 
+fn read_entries(path: &std::path::Path) -> Vec<HistoryEntry> {
+    // Each physical line is one entry. Per-line fallback chain keeps all prior
+    // on-disk formats readable without rewriting them.
+    fs::read_to_string(path)
+        .ok()
+        .map(|contents| {
+            contents
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| {
+                    serde_json::from_str::<HistoryEntry>(line)
+                        .or_else(|_| {
+                            serde_json::from_str::<String>(line).map(|text| HistoryEntry {
+                                text,
+                                images: Vec::new(),
+                                pastes: Vec::new(),
+                            })
+                        })
+                        .unwrap_or_else(|_| HistoryEntry {
+                            text: line.to_string(),
+                            images: Vec::new(),
+                            pastes: Vec::new(),
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn retain_newest(entries: &mut Vec<HistoryEntry>, max: usize) {
+    if entries.len() > max {
+        entries.drain(..entries.len() - max);
+    }
+}
+
+fn sibling_lock_path(path: &std::path::Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("history"))
+        .to_os_string();
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
+fn open_lock(path: &std::path::Path) -> io::Result<fs::File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)
+}
+
+fn atomic_write_entries(path: &std::path::Path, entries: &[HistoryEntry]) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 {
+            temp.write_all(b"\n")?;
+        }
+        serde_json::to_writer(&mut temp, entry).map_err(io::Error::other)?;
+    }
+    temp.as_file().sync_all()?;
+    temp.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn text_entry(text: impl Into<String>) -> HistoryEntry {
+        HistoryEntry {
+            text: text.into(),
+            images: Vec::new(),
+            pastes: Vec::new(),
+        }
+    }
+
+    fn project_paths(root: &std::path::Path) -> crate::platform::ProjectHistoryPaths {
+        crate::platform::ProjectHistoryPaths {
+            entries: root.join("history-v2/project/entries.jsonl"),
+            lock: root.join("history-v2/project/write.lock"),
+            image_cache: root.join("history-v2/project/images"),
+            legacy_entries: root.join("history"),
+            legacy_image_cache: root.join("image-cache"),
+        }
+    }
 
     #[test]
     fn load_nonexistent_returns_empty() {
@@ -438,7 +572,7 @@ mod tests {
         fs::create_dir(&cache).unwrap();
         fs::write(cache.join("garbage.txt"), b"not a hash").unwrap();
         fs::write(cache.join("short.png"), b"too short hex prefix").unwrap();
-        let h = History::load_with_cache(dir.path().join("hist"), cache.clone());
+        let mut h = History::load_with_cache(dir.path().join("hist"), cache.clone());
         h.save().unwrap();
         assert!(cache.join("garbage.txt").exists());
         assert!(cache.join("short.png").exists());
@@ -456,5 +590,115 @@ mod tests {
         });
         // Must not error.
         h.save().unwrap();
+    }
+
+    #[test]
+    fn project_history_uses_legacy_only_to_fill_two_hundred_rows() {
+        let dir = tempdir().unwrap();
+        let paths = project_paths(dir.path());
+        let legacy = (0..250)
+            .map(|index| serde_json::to_string(&text_entry(format!("legacy-{index}"))).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&paths.legacy_entries, legacy).unwrap();
+        fs::create_dir_all(paths.entries.parent().unwrap()).unwrap();
+        let project = (0..20)
+            .map(|index| serde_json::to_string(&text_entry(format!("project-{index}"))).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&paths.entries, project).unwrap();
+
+        let history = History::load_project(paths);
+
+        assert_eq!(history.entries().len(), PROJECT_HISTORY_MAX);
+        assert_eq!(history.entries().first().unwrap().text, "legacy-70");
+        assert_eq!(history.entries().last().unwrap().text, "project-19");
+    }
+
+    #[test]
+    fn full_project_history_excludes_legacy_rows() {
+        let dir = tempdir().unwrap();
+        let paths = project_paths(dir.path());
+        fs::write(&paths.legacy_entries, "secret from another project").unwrap();
+        fs::create_dir_all(paths.entries.parent().unwrap()).unwrap();
+        let project = (0..PROJECT_HISTORY_MAX)
+            .map(|index| serde_json::to_string(&text_entry(format!("project-{index}"))).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&paths.entries, project).unwrap();
+
+        let history = History::load_project(paths);
+
+        assert_eq!(history.entries().len(), PROJECT_HISTORY_MAX);
+        assert!(history
+            .entries()
+            .iter()
+            .all(|entry| entry.text.starts_with("project-")));
+    }
+
+    #[test]
+    fn project_save_never_modifies_legacy_file_and_caps_on_disk() {
+        let dir = tempdir().unwrap();
+        let paths = project_paths(dir.path());
+        let legacy = "legacy must remain byte-for-byte unchanged\n";
+        fs::write(&paths.legacy_entries, legacy).unwrap();
+        let mut history = History::load_project(paths.clone());
+        for index in 0..250 {
+            history.push(text_entry(format!("project-{index}")));
+        }
+
+        history.save().unwrap();
+
+        assert_eq!(fs::read_to_string(&paths.legacy_entries).unwrap(), legacy);
+        let persisted = read_entries(&paths.entries);
+        assert_eq!(persisted.len(), PROJECT_HISTORY_MAX);
+        assert_eq!(persisted.first().unwrap().text, "project-50");
+        assert_eq!(persisted.last().unwrap().text, "project-249");
+    }
+
+    #[test]
+    fn stale_project_writers_merge_without_lost_updates() {
+        let dir = tempdir().unwrap();
+        let paths = project_paths(dir.path());
+        let mut first = History::load_project(paths.clone());
+        let mut second = History::load_project(paths.clone());
+        first.push(text_entry("from first window"));
+        second.push(text_entry("from second window"));
+
+        first.save().unwrap();
+        second.save().unwrap();
+
+        let reloaded = History::load_project(paths);
+        let texts = reloaded
+            .entries()
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["from first window", "from second window"]);
+    }
+
+    #[test]
+    fn project_entry_wins_over_duplicate_legacy_entry() {
+        let dir = tempdir().unwrap();
+        let paths = project_paths(dir.path());
+        fs::write(&paths.legacy_entries, "duplicate\nlegacy-only").unwrap();
+        fs::create_dir_all(paths.entries.parent().unwrap()).unwrap();
+        fs::write(
+            &paths.entries,
+            serde_json::to_string(&text_entry("duplicate")).unwrap(),
+        )
+        .unwrap();
+
+        let history = History::load_project(paths);
+
+        assert_eq!(
+            history
+                .entries()
+                .iter()
+                .filter(|entry| entry.text == "duplicate")
+                .count(),
+            1
+        );
+        assert_eq!(history.entries().last().unwrap().text, "duplicate");
     }
 }

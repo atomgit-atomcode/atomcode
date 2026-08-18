@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use atomcode_capabilities::team::{
-    role_by_id, TeamEvent, TeamEventPayload, TeamMemberId, TeamPermission, TeamRunId, TeamTaskSpec,
+    role_by_id, validate_non_overlapping_worker_scopes, TeamEvent, TeamEventPayload, TeamMemberId,
+    TeamPermission, TeamRunId, TeamTaskSpec,
 };
 use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
@@ -690,7 +691,7 @@ fn validate_tasks(tasks: &[TeamTaskSpec]) -> Result<(), String> {
             ));
         }
     }
-    Ok(())
+    validate_non_overlapping_worker_scopes(tasks)
 }
 
 fn truncate_chars(value: &str, max: usize) -> String {
@@ -893,6 +894,59 @@ mod tests {
 
     fn models() -> TeamModelFactory {
         Arc::new(|_| "test-model".to_string())
+    }
+
+    #[test]
+    fn worker_scopes_reject_identical_file_lane() {
+        let tasks = vec![
+            task(
+                TeamRoleId::Implementer,
+                TeamPermission::Worker,
+                vec!["src/lib.rs".into()],
+            ),
+            task(
+                TeamRoleId::Implementer,
+                TeamPermission::Worker,
+                vec!["./src/lib.rs".into()],
+            ),
+        ];
+        let error = validate_tasks(&tasks).unwrap_err();
+        assert!(error.contains("worker scopes overlap"), "{error}");
+    }
+
+    #[test]
+    fn worker_scopes_reject_recursive_parent_lane() {
+        let tasks = vec![
+            task(
+                TeamRoleId::Implementer,
+                TeamPermission::Worker,
+                vec!["src/**".into()],
+            ),
+            task(
+                TeamRoleId::Implementer,
+                TeamPermission::Worker,
+                vec!["src/auth/login.rs".into()],
+            ),
+        ];
+        let error = validate_tasks(&tasks).unwrap_err();
+        assert!(error.contains("worker scopes overlap"), "{error}");
+    }
+
+    #[test]
+    fn worker_scopes_allow_disjoint_file_lanes() {
+        let tasks = vec![
+            task(
+                TeamRoleId::Implementer,
+                TeamPermission::Worker,
+                vec!["src/a.rs".into()],
+            ),
+            task(
+                TeamRoleId::Implementer,
+                TeamPermission::Worker,
+                vec!["src/b.rs".into()],
+            ),
+        ];
+        validate_tasks(&tasks).unwrap();
     }
 
     #[tokio::test]
