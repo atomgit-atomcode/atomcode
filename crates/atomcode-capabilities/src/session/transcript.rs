@@ -28,6 +28,10 @@ pub struct TurnRecord {
     /// (`serde(default)`); additive fields keep the `v`, breaking changes bump it.
     #[serde(default)]
     pub v: u32,
+    /// Epoch milliseconds when the user prompt was accepted. Added after v1;
+    /// older records leave it absent instead of fabricating a send time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
     /// epoch MILLISECONDS, UTC — stamped by L1 at flush.
     pub ts: i64,
     /// Human-readable RFC-3339 mirror of `ts` (display / debug).
@@ -55,6 +59,14 @@ pub struct TurnRecord {
     pub usage: UsageRecord,
 }
 
+/// Display clocks retained for one completed turn. `started_at` is optional for
+/// transcripts written before per-turn start timestamps were introduced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnTimestamp {
+    pub started_at: Option<i64>,
+    pub completed_at: i64,
+}
+
 /// One tool call + its paired result within a turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolRecord {
@@ -77,6 +89,7 @@ pub struct UsageRecord {
 /// In-progress accumulation for the current turn (None between turns).
 #[derive(Default)]
 struct TurnBuffer {
+    started_at: Option<i64>,
     user: String,
     assistant: String,
     reasoning: String,
@@ -160,6 +173,7 @@ impl TranscriptHook {
         let ts = now_ms();
         let record = TurnRecord {
             v: RECORD_VERSION,
+            started_at: b.started_at,
             ts,
             iso: chrono::DateTime::from_timestamp_millis(ts)
                 .map(|d| d.to_rfc3339())
@@ -207,6 +221,7 @@ impl LifecycleHooks for TranscriptHook {
     async fn user_prompt_submit(&self, text: &mut String) -> Result<(), String> {
         let mut g = self.lock();
         *g = Some(TurnBuffer {
+            started_at: Some(now_ms()),
             user: text.clone(),
             ..TurnBuffer::default()
         });
@@ -328,6 +343,8 @@ mod tests {
         assert_eq!(r.tools[0].result, "a.txt\nb.txt");
         assert!(!r.tools[0].is_error);
         assert_eq!(r.usage.prompt, 100);
+        assert!(r.started_at.is_some());
+        assert!(r.started_at.unwrap() <= r.ts);
         assert!(!r.iso.is_empty());
     }
 

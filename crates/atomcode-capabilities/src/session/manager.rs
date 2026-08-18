@@ -22,7 +22,7 @@ use serde::{de::IgnoredAny, Deserialize, Serialize};
 use super::presentation::{
     DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole, MAX_PRESENTATION_BYTES,
 };
-use super::transcript::RECORD_VERSION;
+use super::transcript::{TurnTimestamp, RECORD_VERSION};
 
 /// Fast-listing metadata for ONE session — read to populate a `/resume` picker WITHOUT
 /// parsing the (large) snapshot / transcript files. Persisted as `<id>.meta`.
@@ -2857,12 +2857,17 @@ impl SessionManager {
     /// Message bodies are streamed past instead of retained, so opening a large WebUI
     /// history does not duplicate the full append-only transcript in memory. A missing
     /// transcript is valid for imported or older sessions.
-    pub fn load_transcript_timestamps(&self, id: &str) -> SessionResult<BTreeMap<u64, i64>> {
+    pub fn load_transcript_timestamps(
+        &self,
+        id: &str,
+    ) -> SessionResult<BTreeMap<u64, TurnTimestamp>> {
         #[derive(Deserialize)]
         struct TimestampRecord {
             #[serde(default)]
             v: u32,
             turn_id: u64,
+            #[serde(default)]
+            started_at: Option<i64>,
             ts: i64,
         }
 
@@ -2887,7 +2892,13 @@ impl SessionManager {
                     supported: RECORD_VERSION,
                 });
             }
-            timestamps.insert(record.turn_id, record.ts);
+            timestamps.insert(
+                record.turn_id,
+                TurnTimestamp {
+                    started_at: record.started_at,
+                    completed_at: record.ts,
+                },
+            );
             Ok(())
         })?;
         Ok(timestamps)
@@ -4234,6 +4245,7 @@ mod tests {
 
         let line = serde_json::json!({
             "v": 1,
+            "started_at": 1_700_000_000_000_i64,
             "ts": 1_700_000_000_123_i64,
             "iso": "2023-11-14T22:13:20.123Z",
             "session_id": "s1",
@@ -4248,9 +4260,28 @@ mod tests {
         bytes.push(b'\n');
         mgr.append_jsonl_line("s1", &bytes).unwrap();
 
+        let legacy_line = serde_json::json!({
+            "v": 1,
+            "ts": 1_700_000_001_123_i64,
+            "iso": "2023-11-14T22:13:21.123Z",
+            "session_id": "s1",
+            "turn_id": 8,
+            "undone": false,
+            "user": "legacy question",
+            "assistant": "legacy answer",
+            "tools": [],
+            "usage": { "prompt": 1, "completion": 2, "cached": 0 }
+        });
+        let mut legacy_bytes = serde_json::to_vec(&legacy_line).unwrap();
+        legacy_bytes.push(b'\n');
+        mgr.append_jsonl_line("s1", &legacy_bytes).unwrap();
+
         let timestamps = mgr.load_transcript_timestamps("s1").unwrap();
-        assert_eq!(timestamps.len(), 1);
-        assert_eq!(timestamps[&7], 1_700_000_000_123);
+        assert_eq!(timestamps.len(), 2);
+        assert_eq!(timestamps[&7].started_at, Some(1_700_000_000_000));
+        assert_eq!(timestamps[&7].completed_at, 1_700_000_000_123);
+        assert_eq!(timestamps[&8].started_at, None);
+        assert_eq!(timestamps[&8].completed_at, 1_700_000_001_123);
     }
 
     fn presentation_entry(anchor: DisplayAnchor, text: &str) -> PresentationEntry {

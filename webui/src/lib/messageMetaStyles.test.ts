@@ -22,3 +22,12 @@ test('message times use a full local date with seconds', () => {
   assert.match(chat, /d\.getFullYear\(\).*pad2\(d\.getMonth\(\) \+ 1\).*pad2\(d\.getDate\(\)\).*pad2\(d\.getHours\(\)\).*pad2\(d\.getMinutes\(\)\).*pad2\(d\.getSeconds\(\)\)/s);
   assert.doesNotMatch(chat, /function formatMsgTimeFull/);
 });
+
+test('live assistant timestamps are assigned at the terminal boundary', () => {
+  const chat = readFileSync(join(root, 'src/components/Chat.tsx'), 'utf8');
+
+  assert.doesNotMatch(chat, /role: 'assistant', parts: \[\], ts: now/);
+  assert.match(chat, /function stampLastAssistantCompletion\(ts = Date\.now\(\)\)/);
+  assert.match(chat, /case 'done': \{[\s\S]*?stampLastAssistantCompletion\(\)/);
+  assert.match(chat, /if \(terminal\) \{[\s\S]*?stampLastAssistantCompletion\(\)/);
+});

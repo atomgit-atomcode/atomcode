@@ -2146,7 +2146,13 @@ fn attach_image_sets(messages: &mut [MessageInfo], sets: Vec<Vec<ImageData>>) {
     }
 }
 
-pub(crate) type TurnTimestamps = std::collections::BTreeMap<u64, u64>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TurnTimestamp {
+    started_at: Option<u64>,
+    completed_at: u64,
+}
+
+pub(crate) type TurnTimestamps = std::collections::BTreeMap<u64, TurnTimestamp>;
 
 fn load_turn_timestamps_blocking(project_hash: &str, session_id: &str) -> TurnTimestamps {
     let manager =
@@ -2155,10 +2161,20 @@ fn load_turn_timestamps_blocking(project_hash: &str, session_id: &str) -> TurnTi
         Ok(timestamps) => timestamps
             .into_iter()
             .filter_map(|(turn_id, timestamp)| {
-                u64::try_from(timestamp)
+                let completed_at = u64::try_from(timestamp.completed_at)
                     .ok()
-                    .filter(|timestamp| *timestamp > 0)
-                    .map(|timestamp| (turn_id, timestamp))
+                    .filter(|timestamp| *timestamp > 0)?;
+                let started_at = timestamp
+                    .started_at
+                    .and_then(|value| u64::try_from(value).ok())
+                    .filter(|value| *value > 0);
+                Some((
+                    turn_id,
+                    TurnTimestamp {
+                        started_at,
+                        completed_at,
+                    },
+                ))
             })
             .collect(),
         Err(error) => {
@@ -2210,9 +2226,16 @@ fn snapshot_message_timestamp(
         .find(|stat| stat.position_valid && index < stat.after_message)
         .map(|stat| stat.turn_id)
         .filter(|turn_id| *turn_id != 0);
-    direct_turn_id
+    let timestamp = direct_turn_id
         .or(positional_turn_id)
-        .and_then(|turn_id| turn_timestamps.get(&turn_id).copied())
+        .and_then(|turn_id| turn_timestamps.get(&turn_id).copied())?;
+    Some(match message.role {
+        atomcode_kernel::message::Role::User => timestamp.started_at?,
+        atomcode_kernel::message::Role::Assistant | atomcode_kernel::message::Role::Tool => {
+            timestamp.completed_at
+        }
+        atomcode_kernel::message::Role::System => return None,
+    })
 }
 
 pub(crate) fn attach_snapshot_message_timestamps(
@@ -2276,7 +2299,9 @@ fn merge_catalog_session_messages_for_display(
                 images: None,
                 created_at: match entry.anchor {
                     DisplayAnchor::AtStart => None,
-                    DisplayAnchor::AfterTurn { turn_id } => turn_timestamps.get(&turn_id).copied(),
+                    DisplayAnchor::AfterTurn { turn_id } => turn_timestamps
+                        .get(&turn_id)
+                        .map(|timestamp| timestamp.completed_at),
                 },
             });
         }
@@ -2328,7 +2353,9 @@ fn merge_catalog_session_messages_for_display(
                 images: None,
                 created_at: match entry.anchor {
                     DisplayAnchor::AtStart => None,
-                    DisplayAnchor::AfterTurn { turn_id } => turn_timestamps.get(&turn_id).copied(),
+                    DisplayAnchor::AfterTurn { turn_id } => turn_timestamps
+                        .get(&turn_id)
+                        .map(|timestamp| timestamp.completed_at),
                 },
             });
         }
@@ -6663,7 +6690,22 @@ mod tests {
             meta,
             presentation: PresentationFile::default(),
         };
-        let timestamps = TurnTimestamps::from([(1, 1_700_000_000_000), (2, 1_700_000_100_000)]);
+        let timestamps = TurnTimestamps::from([
+            (
+                1,
+                TurnTimestamp {
+                    started_at: Some(1_699_999_990_000),
+                    completed_at: 1_700_000_000_000,
+                },
+            ),
+            (
+                2,
+                TurnTimestamp {
+                    started_at: Some(1_700_000_090_000),
+                    completed_at: 1_700_000_100_000,
+                },
+            ),
+        ]);
 
         let mut live_messages: Vec<_> = session
             .snapshot
@@ -6677,13 +6719,15 @@ mod tests {
             &session.meta,
             &timestamps,
         );
-        assert_eq!(live_messages[0].created_at, Some(1_700_000_000_000));
-        assert_eq!(live_messages[2].created_at, Some(1_700_000_100_000));
+        assert_eq!(live_messages[0].created_at, Some(1_699_999_990_000));
+        assert_eq!(live_messages[1].created_at, Some(1_700_000_000_000));
+        assert_eq!(live_messages[2].created_at, Some(1_700_000_090_000));
+        assert_eq!(live_messages[3].created_at, Some(1_700_000_100_000));
 
         let displayed = merge_catalog_session_messages_for_display(&session, &timestamps).unwrap();
-        assert_eq!(displayed[0].created_at, Some(1_700_000_000_000));
+        assert_eq!(displayed[0].created_at, Some(1_699_999_990_000));
         assert_eq!(displayed[1].created_at, Some(1_700_000_000_000));
-        assert_eq!(displayed[2].created_at, Some(1_700_000_100_000));
+        assert_eq!(displayed[2].created_at, Some(1_700_000_090_000));
         assert_eq!(displayed[3].created_at, Some(1_700_000_100_000));
     }
 

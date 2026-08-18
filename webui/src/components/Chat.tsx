@@ -106,8 +106,9 @@ interface Message {
   parts: MsgPart[];
   images?: ImageData[];
   /** Epoch ms this message was sent/received (PR #562 send-time labels).
-   *  Live + freshly-typed turns stamp `Date.now()`; persisted history carries
-   *  its completed turn's transcript timestamp. Optional so the
+   *  Live user messages use submission time and assistant messages receive a
+   *  timestamp only at the terminal boundary. Persisted history carries the
+   *  corresponding start/completion timestamp from the transcript. Optional so the
    *  type stays backward-compatible with the few code paths that build a
    *  Message literal without a clock (e.g. the queued-placeholder). */
   ts?: number;
@@ -1556,7 +1557,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         setMessages((prev) => [
           ...prev,
           { role: 'user', parts: [{ kind: 'text', text: e.text }], images: e.images && e.images.length ? e.images : undefined, ts: now },
-          { role: 'assistant', parts: [], ts: now },
+          { role: 'assistant', parts: [] },
         ]);
         break;
       }
@@ -1578,6 +1579,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         if (e.running) setTurnStats(null);
         else if (terminal) setTurnStats(completedTurnStats(e.stats, e.stop_reason));
         if (terminal) {
+          stampLastAssistantCompletion();
           finishTodoTurn(e.stop_reason === 'cancelled');
           if (terminal.discardQueued) {
             // Abnormal terminal (cancel / error): the kernel CLEARS its steer
@@ -1740,6 +1742,21 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         parts.push({ kind: 'text', text: content });
       }
       return [...prev.slice(0, -1), { ...last, parts }];
+    });
+  }
+
+  /** Stamp the assistant when the turn actually finishes. The optimistic
+   *  placeholder intentionally has no clock, keeping reply completion distinct
+   *  from the user's submission time. */
+  function stampLastAssistantCompletion(ts = Date.now()) {
+    setMessages((prev) => {
+      for (let index = prev.length - 1; index >= 0; index -= 1) {
+        if (prev[index].role !== 'assistant') continue;
+        const next = prev.slice();
+        next[index] = { ...next[index], ts };
+        return next;
+      }
+      return prev;
     });
   }
 
@@ -2191,6 +2208,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       case 'done': {
         // A normal terminal keeps only successful calls; a user cancellation
         // retires the active plan at the same boundary as kernel/TUI.
+        stampLastAssistantCompletion();
         finishTodoTurn(event.stop_reason === 'cancelled');
         // 标记这是本 Chat 自己产生的会话 id，避免下面的 useEffect 误把当前对话清空，
         // 并标记其历史「已就位」（就是当前画布），防止 project_hash 回填后重新加载覆盖。
@@ -2234,6 +2252,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       case 'stopped':
         // User cancellation is an authoritative interruption boundary: the
         // previous plan remains historical but is no longer active.
+        stampLastAssistantCompletion();
         resetTodoBatch(true);
         transitionChatRecovery({ type: 'authoritative_terminal' });
         setBusy(false);
@@ -2247,6 +2266,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         break;
 
       case 'error':
+        stampLastAssistantCompletion();
         resetTodoBatch(false);
         appendToLastAssistant('\n\n' + t('chat.error', { msg: event.message }));
         transitionChatRecovery({ type: 'authoritative_terminal' });
@@ -2402,7 +2422,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           ts: now,
           pendingSteerId: pendingSteer.id,
         },
-        { role: 'assistant', parts: [], ts: now, pendingSteerId: pendingSteer.id },
+        { role: 'assistant', parts: [], pendingSteerId: pendingSteer.id },
       ]);
       // Register before the HTTP round-trip. A very fast round boundary can
       // emit `steered` on SSE before the submit response reaches this tab.
@@ -2486,7 +2506,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     setMessages((prev) => [
       ...prev,
       { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined, ts: now },
-      { role: 'assistant', parts: [], ts: now },
+      { role: 'assistant', parts: [] },
     ]);
 
     const controller = new AbortController();
