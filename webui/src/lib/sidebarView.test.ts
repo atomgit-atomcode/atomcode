@@ -1,6 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { loadSidebarViewMode, saveSidebarViewMode, sidebarProjectScopes } from './sidebarView.ts';
+import {
+  decrementProjectSessionCount,
+  loadSidebarViewMode,
+  saveSidebarViewMode,
+  sidebarProjectScopes,
+} from './sidebarView.ts';
 
 test('sidebar view defaults to workspace and accepts only the flat preference', () => {
   assert.equal(loadSidebarViewMode(null), 'workspace');
@@ -30,4 +35,24 @@ test('workspace view loads requested expanded buckets while flat view uses the g
   ]);
   assert.deepEqual(sidebarProjectScopes('workspace', ['', 'project-2', 'project-2']), ['project-2']);
   assert.deepEqual(sidebarProjectScopes('flat', ['project-1']), []);
+});
+
+test('successful deletion decrements only the matching project summary', () => {
+  const projects = [
+    { hash: 'project-1', session_count: 2, name: 'one' },
+    { hash: 'project-2', session_count: 4, name: 'two' },
+  ];
+
+  assert.deepEqual(decrementProjectSessionCount(projects, 'project-1'), [
+    { hash: 'project-1', session_count: 1, name: 'one' },
+    { hash: 'project-2', session_count: 4, name: 'two' },
+  ]);
+  assert.equal(projects[0].session_count, 2);
+});
+
+test('project session count never becomes negative', () => {
+  const projects = [{ hash: 'project-1', session_count: 0 }];
+  assert.deepEqual(decrementProjectSessionCount(projects, 'project-1'), [
+    { hash: 'project-1', session_count: 0 },
+  ]);
 });

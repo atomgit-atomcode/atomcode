@@ -34,3 +34,14 @@ export function sidebarProjectScopes(
 ): string[] {
   return mode === 'workspace' ? [...new Set(projectHashes.filter(Boolean))] : [];
 }
+
+/** Apply a successful session deletion to the cached project summaries. */
+export function decrementProjectSessionCount<T extends { hash: string; session_count: number }>(
+  projects: T[],
+  projectHash: string,
+): T[] {
+  if (!projectHash) return projects;
+  return projects.map((project) => project.hash === projectHash
+    ? { ...project, session_count: Math.max(0, project.session_count - 1) }
+    : project);
+}

@@ -16,6 +16,7 @@ import {
   loadSidebarViewMode,
   saveSidebarViewMode,
   sidebarProjectScopes,
+  decrementProjectSessionCount,
   SidebarViewMode,
 } from '../lib/sidebarView';
 
@@ -605,7 +606,7 @@ export function Sidebar({
     onSessionRenamed?.(id, name);
   }
 
-  function handleDeleted(id: string) {
+  function handleDeleted(session: SessionMetaWithProject) {
     // The DELETE response is authoritative for this row. Removing it locally
     // avoids an O(N) catalog reload after every deletion, which made clearing a
     // large history progressively slow. Invalidate any older in-flight list
@@ -613,8 +614,10 @@ export function Sidebar({
     // still reconcile the complete list later.
     loadEpochRef.current += 1;
     setLoading(false);
-    setSessions((current) => current.filter((session) => session.id !== id));
-    onSessionDeleted?.(id);
+    setSessions((current) => current.filter((item) => item.id !== session.id));
+    setSearchResults((current) => current.filter((item) => item.id !== session.id));
+    setProjects((current) => decrementProjectSessionCount(current, session.project_hash));
+    onSessionDeleted?.(session.id);
   }
 
   /** Export a session's conversation as a Markdown file and trigger a browser download. */
@@ -1584,7 +1587,7 @@ export function Sidebar({
         <DeleteDialog
           session={deleteTarget}
           onClose={() => setDeleteTarget(null)}
-          onDone={() => handleDeleted(deleteTarget.id)}
+          onDone={() => handleDeleted(deleteTarget)}
         />,
         document.body,
       )}
