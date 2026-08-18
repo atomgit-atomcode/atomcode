@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  assistantTurnEndFlags,
   isInternalHistoryUserMessage,
   isUserInterruptionMessage,
   sessionMessagesToMarkdownLines,
+  shouldShowAssistantTimestamp,
 } from './historyMessages.ts';
 import type { SessionMessage } from '../api.ts';
 
@@ -52,6 +54,29 @@ test('isUserInterruptionMessage recognizes provenance and legacy snapshots', () 
     role: 'user',
     content: 'I interrupted the task myself',
   }), false);
+});
+
+test('assistant timestamps render only once at the end of a turn', () => {
+  assert.equal(shouldShowAssistantTimestamp(false, false, 'intermediate tool note', false), false);
+  assert.equal(shouldShowAssistantTimestamp(true, false, 'final reply', false), true);
+  assert.equal(shouldShowAssistantTimestamp(true, true, 'streaming reply', false), false);
+  assert.equal(shouldShowAssistantTimestamp(true, false, '', false), false);
+  assert.equal(shouldShowAssistantTimestamp(true, false, 'failed reply', true), false);
+});
+
+test('assistant turn boundaries ignore intermediate rounds and system notices', () => {
+  assert.deepEqual(
+    assistantTurnEndFlags([
+      'user',
+      'assistant',
+      'assistant',
+      'system',
+      'user',
+      'assistant',
+      'system',
+    ]),
+    [false, false, true, false, false, true, false],
+  );
 });
 
 test('sessionMessagesToMarkdownLines skips verify cadence assistant messages', () => {

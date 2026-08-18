@@ -22,7 +22,7 @@ use serde::{de::IgnoredAny, Deserialize, Serialize};
 use super::presentation::{
     DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole, MAX_PRESENTATION_BYTES,
 };
-use super::transcript::{TurnRecord, RECORD_VERSION};
+use super::transcript::RECORD_VERSION;
 
 /// Fast-listing metadata for ONE session — read to populate a `/resume` picker WITHOUT
 /// parsing the (large) snapshot / transcript files. Persisted as `<id>.meta`.
@@ -808,15 +808,11 @@ pub fn aggregate_session_cost(meta: &SessionMeta) -> SessionCostReport {
 
     let models: Vec<_> = grouped
         .into_iter()
-        .map(
-            |((provider_id, model_id), tokens)| {
-                ModelCostSummary {
-                    provider_id,
-                    model_id,
-                    tokens,
-                }
-            },
-        )
+        .map(|((provider_id, model_id), tokens)| ModelCostSummary {
+            provider_id,
+            model_id,
+            tokens,
+        })
         .collect();
     let attributed_total = models.iter().fold(0_u64, |total, model| {
         total.saturating_add(model.tokens.total())
@@ -1317,12 +1313,10 @@ impl SessionManager {
                     file,
                 }),
             }),
-            Err(error) if is_file_lock_contention(&error) => {
-                Err(SessionStoreError::SessionInUse {
-                    id: id.to_string(),
-                    path,
-                })
-            }
+            Err(error) if is_file_lock_contention(&error) => Err(SessionStoreError::SessionInUse {
+                id: id.to_string(),
+                path,
+            }),
             Err(error) => Err(io_at(&path, error)),
         }
     }
@@ -1724,7 +1718,6 @@ impl SessionManager {
         presentation.validate()?;
         Ok(presentation)
     }
-
 
     /// Load the complete authoritative native state. A legacy/unconfirmed owner or
     /// any missing artifact is an explicit error; callers must cut over through the
@@ -2860,19 +2853,29 @@ impl SessionManager {
         file.write_all(line).map_err(|e| io_at(&path, e))
     }
 
-    /// Load this session's bounded, append-only turn transcript for display/recall
-    /// projection. A missing transcript is valid for imported or older sessions.
-    pub fn load_transcript_records(&self, id: &str) -> SessionResult<Vec<TurnRecord>> {
+    /// Load only `(turn_id, timestamp_ms)` from this session's bounded transcript.
+    /// Message bodies are streamed past instead of retained, so opening a large WebUI
+    /// history does not duplicate the full append-only transcript in memory. A missing
+    /// transcript is valid for imported or older sessions.
+    pub fn load_transcript_timestamps(&self, id: &str) -> SessionResult<BTreeMap<u64, i64>> {
+        #[derive(Deserialize)]
+        struct TimestampRecord {
+            #[serde(default)]
+            v: u32,
+            turn_id: u64,
+            ts: i64,
+        }
+
         let path = self.jsonl_path(id)?;
         match fs::symlink_metadata(&path) {
             Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
             Err(error) => return Err(io_at(&path, error)),
         }
 
-        let mut records = Vec::new();
+        let mut timestamps = BTreeMap::new();
         for_each_jsonl_line(&path, |line| {
-            let record: TurnRecord =
+            let record: TimestampRecord =
                 serde_json::from_slice(line).map_err(|error| SessionStoreError::Corrupt {
                     kind: "transcript record",
                     message: format!("{}: {error}", path.display()),
@@ -2884,10 +2887,10 @@ impl SessionManager {
                     supported: RECORD_VERSION,
                 });
             }
-            records.push(record);
+            timestamps.insert(record.turn_id, record.ts);
             Ok(())
         })?;
-        Ok(records)
+        Ok(timestamps)
     }
 
     fn ensure_native_writable(&self, id: &str, operation: &'static str) -> SessionResult<()> {
@@ -4221,10 +4224,13 @@ mod tests {
     }
 
     #[test]
-    fn transcript_records_load_with_turn_timestamps_and_missing_is_empty() {
+    fn transcript_timestamps_load_without_message_bodies_and_missing_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let mgr = SessionManager::with_root(dir.path());
-        assert!(mgr.load_transcript_records("missing").unwrap().is_empty());
+        assert!(mgr
+            .load_transcript_timestamps("missing")
+            .unwrap()
+            .is_empty());
 
         let line = serde_json::json!({
             "v": 1,
@@ -4242,10 +4248,9 @@ mod tests {
         bytes.push(b'\n');
         mgr.append_jsonl_line("s1", &bytes).unwrap();
 
-        let records = mgr.load_transcript_records("s1").unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].turn_id, 7);
-        assert_eq!(records[0].ts, 1_700_000_000_123);
+        let timestamps = mgr.load_transcript_timestamps("s1").unwrap();
+        assert_eq!(timestamps.len(), 1);
+        assert_eq!(timestamps[&7], 1_700_000_000_123);
     }
 
     fn presentation_entry(anchor: DisplayAnchor, text: &str) -> PresentationEntry {

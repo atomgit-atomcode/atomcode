@@ -65,9 +65,11 @@ import {
   type TodoProjectionCall,
 } from '../lib/todoState';
 import {
+  assistantTurnEndFlags,
   isInternalHistoryAssistantMessage,
   isInternalHistoryUserMessage,
   isUserInterruptionMessage,
+  shouldShowAssistantTimestamp,
 } from '../lib/historyMessages';
 import {
   activeTurnSubmissionDisposition,
@@ -103,8 +105,8 @@ interface Message {
   parts: MsgPart[];
   images?: ImageData[];
   /** Epoch ms this message was sent/received (PR #562 send-time labels).
-   *  Live + freshly-typed turns stamp `Date.now()`; history loaded from the
-   *  daemon carries the session's `updated_at` (also ms). Optional so the
+   *  Live + freshly-typed turns stamp `Date.now()`; persisted history carries
+   *  its completed turn's transcript timestamp. Optional so the
    *  type stays backward-compatible with the few code paths that build a
    *  Message literal without a clock (e.g. the queued-placeholder). */
   ts?: number;
@@ -3420,15 +3422,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             }
           }
 
-          // Helper: skip system messages when looking for the "next role".
-          // Needed so a trailing system notice doesn't hide the copy button
-          // on the real last AI reply of the turn.
-          function nextNonSystemRole(from: number): string | undefined {
-            for (let k = from; k < messages.length; k++) {
-              if (messages[k].role !== 'system') return messages[k].role;
-            }
-            return undefined;
-          }
+          const assistantTurnEnds = assistantTurnEndFlags(messages.map((message) => message.role));
 
           return visibleMessages.map(({ msg, origIdx }, idx) => {
             const isLast = idx === lastVisibleIdx;
@@ -3464,14 +3458,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
               );
             }
 
-            // Determine if this assistant message is the last one in the current
-            // turn (i.e. the next NON-SYSTEM message is a user message, or there
-            // are no more non-system messages). Only the last assistant message in
-            // a turn gets the copy button, so one user turn → one copy button.
-            // 用 origIdx(原数组索引)查 turnTexts 与判断 isLastInTurn,
-            // 因为这两者是基于完整 messages 序列算的。
-            const nextRole = nextNonSystemRole(origIdx + 1);
-            const isLastInTurn = nextRole === 'user' || nextRole === undefined;
+            // One user turn → one terminal assistant row. Compute this once over
+            // the complete message sequence so intermediate rounds cannot each render
+            // copy/time controls and system notices remain transparent.
+            const isLastInTurn = assistantTurnEnds[origIdx] === true;
 
             return (
               <AssistantMessageView
@@ -3816,10 +3806,9 @@ function AssistantMessageView({
         </>
       )}
       {copyBtn}
-      {/* PR #562 send-time label — under the reply, dimmed; full timestamp in
-          the tooltip. Suppressed while streaming (turn isn't done yet), on
-          error turns, and on tool-only turns with no text. */}
-      {timeLabel && !streaming && text && !isError && (
+      {/* One timestamp per user turn: intermediate assistant/tool rounds share
+          the turn's persisted timestamp but must not repeat it in the timeline. */}
+      {timeLabel && shouldShowAssistantTimestamp(isLastInTurn, streaming, text, isError) && (
         <div class="msg-time" title={timeFull}>{timeLabel}</div>
       )}
     </div>

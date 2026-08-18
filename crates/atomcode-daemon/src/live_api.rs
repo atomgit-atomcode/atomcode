@@ -1276,8 +1276,7 @@ pub(crate) async fn live_stream(
         }
     };
     let snapshot_wd = join.binding.working_dir.clone();
-    let project_hash =
-        atomcode_capabilities::session::SessionManager::project_hash(&snapshot_wd);
+    let project_hash = atomcode_capabilities::session::SessionManager::project_hash(&snapshot_wd);
     let (session_name, session_meta, turn_timestamps) = {
         match crate::legacy_convert::load_catalog_session_view_in_project(
             &project_hash,
@@ -1285,7 +1284,7 @@ pub(crate) async fn live_stream(
         ) {
             Ok(Some(session)) => {
                 let timestamps =
-                    crate::load_turn_timestamps(&project_hash, &join.binding.session_id);
+                    crate::load_turn_timestamps(&project_hash, &join.binding.session_id).await;
                 (session.meta.name.clone(), Some(session.meta), timestamps)
             }
             Ok(None) => (String::new(), None, crate::TurnTimestamps::new()),

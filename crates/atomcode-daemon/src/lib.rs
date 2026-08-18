@@ -807,14 +807,10 @@ pub struct MessageInfo {
     /// re-render thumbnails when loading history.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<ImageData>>,
-    /// Epoch MILLISECONDS this message was authored/received. lets the webui
-    /// stamp each bubble with a send time (PR #562). The kernel's `Message`
-    /// has no per-message clock, so for replayed history we approximate with
-    /// the owning `Session::updated_at` (epoch SECONDS → ms); for live/snapshot
-    /// turns the webui injects `Date.now()` client-side. `#[serde(default)]`
-    /// keeps old daemons/clients interoperating when the field is absent.
-    /// 注意单位: 毫秒 —— 与 `SessionDetail.created_at`/`updated_at` 一致
-    /// (kernel 内部 `Session.created_at` 为秒, API 响应边界乘 1000 转换, bot review P2)。
+    /// Epoch milliseconds for the owning completed turn, projected from the native
+    /// append-only transcript. Sessions predating transcript persistence leave this
+    /// absent rather than fabricating a reconnect timestamp. `#[serde(default)]` keeps
+    /// old daemons/clients interoperating when the field is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<u64>,
 }
@@ -2039,17 +2035,15 @@ async fn get_sessions_by_working_dir(
 async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
     match crate::legacy_convert::load_catalog_session_view_in_project(&hash, &id) {
         Ok(Some(session)) => {
-            let turn_timestamps = load_turn_timestamps(&hash, &id);
-            let messages = match merge_catalog_session_messages_for_display(
-                &session,
-                &turn_timestamps,
-            ) {
-                Ok(messages) => messages,
-                Err(error) => {
-                    let msg = format!("Failed to load session: {error}");
-                    return (StatusCode::NOT_FOUND, Json(msg)).into_response();
-                }
-            };
+            let turn_timestamps = load_turn_timestamps(&hash, &id).await;
+            let messages =
+                match merge_catalog_session_messages_for_display(&session, &turn_timestamps) {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        let msg = format!("Failed to load session: {error}");
+                        return (StatusCode::NOT_FOUND, Json(msg)).into_response();
+                    }
+                };
             let detail = SessionDetail {
                 id: session.meta.id,
                 name: session.meta.name,
@@ -2154,18 +2148,17 @@ fn attach_image_sets(messages: &mut [MessageInfo], sets: Vec<Vec<ImageData>>) {
 
 pub(crate) type TurnTimestamps = std::collections::BTreeMap<u64, u64>;
 
-pub(crate) fn load_turn_timestamps(project_hash: &str, session_id: &str) -> TurnTimestamps {
-    let manager = NativeSessionManager::with_root(
-        NativeSessionManager::sessions_root().join(project_hash),
-    );
-    match manager.load_transcript_records(session_id) {
-        Ok(records) => records
+fn load_turn_timestamps_blocking(project_hash: &str, session_id: &str) -> TurnTimestamps {
+    let manager =
+        NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(project_hash));
+    match manager.load_transcript_timestamps(session_id) {
+        Ok(timestamps) => timestamps
             .into_iter()
-            .filter_map(|record| {
-                u64::try_from(record.ts)
+            .filter_map(|(turn_id, timestamp)| {
+                u64::try_from(timestamp)
                     .ok()
                     .filter(|timestamp| *timestamp > 0)
-                    .map(|timestamp| (record.turn_id, timestamp))
+                    .map(|timestamp| (turn_id, timestamp))
             })
             .collect(),
         Err(error) => {
@@ -2173,6 +2166,27 @@ pub(crate) fn load_turn_timestamps(project_hash: &str, session_id: &str) -> Turn
             // the authoritative native snapshot unavailable; omit the label instead.
             eprintln!(
                 "[session-display] transcript timestamps unavailable for {session_id}: {error}"
+            );
+            TurnTimestamps::new()
+        }
+    }
+}
+
+pub(crate) async fn load_turn_timestamps(project_hash: &str, session_id: &str) -> TurnTimestamps {
+    let project_hash = project_hash.to_owned();
+    let session_id = session_id.to_owned();
+    let task_session_id = session_id.clone();
+    match tokio::task::spawn_blocking(move || {
+        load_turn_timestamps_blocking(&project_hash, &task_session_id)
+    })
+    .await
+    {
+        Ok(timestamps) => timestamps,
+        Err(error) => {
+            // Timestamps are display-only. A cancelled or panicked blocking task must
+            // not make the authoritative native session unavailable.
+            eprintln!(
+                "[session-display] transcript timestamp task failed for {session_id}: {error}"
             );
             TurnTimestamps::new()
         }
@@ -2262,9 +2276,7 @@ fn merge_catalog_session_messages_for_display(
                 images: None,
                 created_at: match entry.anchor {
                     DisplayAnchor::AtStart => None,
-                    DisplayAnchor::AfterTurn { turn_id } => {
-                        turn_timestamps.get(&turn_id).copied()
-                    }
+                    DisplayAnchor::AfterTurn { turn_id } => turn_timestamps.get(&turn_id).copied(),
                 },
             });
         }
@@ -2288,12 +2300,8 @@ fn merge_catalog_session_messages_for_display(
                 && atomcode_capabilities::reminder::is_system_reminder(&message.text));
         if !hidden_internal {
             let mut info = MessageInfo::from_kernel(message);
-            info.created_at = snapshot_message_timestamp(
-                &session.meta,
-                message,
-                index,
-                turn_timestamps,
-            );
+            info.created_at =
+                snapshot_message_timestamp(&session.meta, message, index, turn_timestamps);
             messages.push(info);
         }
         append_presentation(index + 1, &mut messages);
@@ -2320,9 +2328,7 @@ fn merge_catalog_session_messages_for_display(
                 images: None,
                 created_at: match entry.anchor {
                     DisplayAnchor::AtStart => None,
-                    DisplayAnchor::AfterTurn { turn_id } => {
-                        turn_timestamps.get(&turn_id).copied()
-                    }
+                    DisplayAnchor::AfterTurn { turn_id } => turn_timestamps.get(&turn_id).copied(),
                 },
             });
         }
@@ -6441,10 +6447,22 @@ mod tests {
             meta,
             presentation: PresentationFile::default(),
         };
-        let timestamps = TurnTimestamps::from([
-            (1, 1_700_000_000_000),
-            (2, 1_700_000_100_000),
-        ]);
+        let timestamps = TurnTimestamps::from([(1, 1_700_000_000_000), (2, 1_700_000_100_000)]);
+
+        let mut live_messages: Vec<_> = session
+            .snapshot
+            .messages
+            .iter()
+            .map(MessageInfo::from_kernel)
+            .collect();
+        attach_snapshot_message_timestamps(
+            &mut live_messages,
+            &session.snapshot,
+            &session.meta,
+            &timestamps,
+        );
+        assert_eq!(live_messages[0].created_at, Some(1_700_000_000_000));
+        assert_eq!(live_messages[2].created_at, Some(1_700_000_100_000));
 
         let displayed = merge_catalog_session_messages_for_display(&session, &timestamps).unwrap();
         assert_eq!(displayed[0].created_at, Some(1_700_000_000_000));
