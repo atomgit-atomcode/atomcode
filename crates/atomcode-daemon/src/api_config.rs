@@ -71,21 +71,26 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
                         .iter()
                         .filter_map(|selection| config.resolve_model(Some(selection)).ok())
                         .collect();
+                    let base_url = account
+                        .base_url
+                        .clone()
+                        .or_else(|| preset.default_base_url.map(str::to_string));
+                    let has_saved_api_key = account
+                        .api_key
+                        .as_deref()
+                        .is_some_and(|key| !key.trim().is_empty());
+                    let managed = base_url
+                        .as_deref()
+                        .is_some_and(atomcode_auth::gateway_crypto::is_atomgit_gateway);
                     ProviderAccountInfo {
                         id: id.clone(),
                         provider: account.provider,
                         display_name: account.display_name,
                         provider_type: preset.provider_type.wire().to_string(),
-                        base_url: account
-                            .base_url
-                            .or_else(|| preset.default_base_url.map(str::to_string)),
-                        has_api_key: resolved.iter().any(|model| model.api_key.is_some()),
-                        managed: resolved.iter().any(|model| {
-                            model
-                                .base_url
-                                .as_deref()
-                                .is_some_and(atomcode_auth::gateway_crypto::is_atomgit_gateway)
-                        }),
+                        base_url,
+                        has_api_key: has_saved_api_key
+                            || resolved.iter().any(|model| model.api_key.is_some()),
+                        managed,
                         model_ids,
                         legacy: config.providers.contains_key(&id),
                     }
@@ -328,6 +333,42 @@ mod tests {
         assert_eq!(account.model_ids, ["taotoken/model-a"]);
         let json = serde_json::to_string(&response).unwrap();
         assert!(!json.contains("must-not-leave-daemon"));
+    }
+
+    #[test]
+    fn config_response_reports_saved_credential_before_first_model_is_added() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "taotoken": {
+                    "provider": "openai",
+                    "base_url": "https://taotoken.net/api/v1",
+                    "api_key": "account-only-secret"
+                },
+                "AtomGit": {
+                    "provider": "openai",
+                    "base_url": "https://llm-api.atomgit.com/v1"
+                }
+            }
+        }))
+        .unwrap();
+
+        let response = config_response(&config);
+        let taotoken = response
+            .provider_accounts
+            .iter()
+            .find(|account| account.id == "taotoken")
+            .unwrap();
+        assert!(taotoken.has_api_key);
+        assert!(taotoken.model_ids.is_empty());
+        let atomgit = response
+            .provider_accounts
+            .iter()
+            .find(|account| account.id == "AtomGit")
+            .unwrap();
+        assert!(atomgit.managed);
+        assert!(atomgit.model_ids.is_empty());
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("account-only-secret"));
     }
 
     #[test]

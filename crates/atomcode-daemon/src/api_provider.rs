@@ -4,6 +4,7 @@ use atomcode_config::config::provider::{
 use axum::{extract::Path, http::StatusCode, response::IntoResponse, Json};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::time::Duration;
 
 use crate::{
@@ -17,11 +18,38 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const DISCOVERY_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const DISCOVERY_MAX_MODELS: usize = 2_000;
 
+#[derive(Debug)]
+struct AccountModelConflict(String);
+
+impl fmt::Display for AccountModelConflict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AccountModelConflict {}
+
+fn account_model_conflict(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(AccountModelConflict(message.into()))
+}
+
 fn selection_is_managed(config: &atomcode_config::config::Config, name: &str) -> bool {
     config
         .provider_config_for_selection(name)
         .and_then(|provider| provider.base_url)
         .as_deref()
+        .is_some_and(atomcode_auth::gateway_crypto::is_atomgit_gateway)
+}
+
+fn account_is_managed(config: &atomcode_config::config::Config, account_id: &str) -> bool {
+    let Some(account) = config.logical_accounts().remove(account_id) else {
+        return false;
+    };
+    let preset = atomcode_config::config::provider_preset::preset_or_compatible(&account.provider);
+    account
+        .base_url
+        .as_deref()
+        .or(preset.default_base_url)
         .is_some_and(atomcode_auth::gateway_crypto::is_atomgit_gateway)
 }
 
@@ -246,7 +274,7 @@ fn stored_discovery_transport(
     // Accept both a model selection id (legacy endpoint) and a reusable account
     // id (new add-model flow). Resolution remains server-side so credentials
     // never need to round-trip through the browser.
-    let provider = config
+    if let Some(provider) = config
         .provider_config_for_selection(provider_name)
         .or_else(|| {
             config
@@ -254,20 +282,42 @@ fn stored_discovery_transport(
                 .into_iter()
                 .find(|(_, model)| model.account == provider_name)
                 .and_then(|(selection, _)| config.provider_config_for_selection(&selection))
-        })?;
-    let saved_type = discovery_protocol(&provider.provider_type)?;
+        })
+    {
+        let saved_type = discovery_protocol(&provider.provider_type)?;
+        if saved_type != discovery_protocol(requested_type)? {
+            return None;
+        }
+        let saved_base_url = provider.base_url.as_deref()?;
+        let saved_url = discovery_url(saved_base_url, saved_type).ok()?;
+        if saved_url != *requested_url {
+            return None;
+        }
+        return Some(DiscoveryTransport {
+            api_key: provider.resolved_api_key(),
+            user_agent: provider.user_agent,
+            skip_tls_verify: provider.skip_tls_verify,
+        });
+    }
+
+    // An account can legitimately exist before its first model profile is
+    // added. In that state there is no selection to resolve, but its saved
+    // endpoint and credential are still authoritative for model discovery.
+    let account = config.logical_accounts().remove(provider_name)?;
+    let preset = atomcode_config::config::provider_preset::preset_or_compatible(&account.provider);
+    let saved_type = discovery_protocol(preset.provider_type.wire())?;
     if saved_type != discovery_protocol(requested_type)? {
         return None;
     }
-    let saved_base_url = provider.base_url.as_deref()?;
+    let saved_base_url = account.base_url.as_deref().or(preset.default_base_url)?;
     let saved_url = discovery_url(saved_base_url, saved_type).ok()?;
     if saved_url != *requested_url {
         return None;
     }
     Some(DiscoveryTransport {
-        api_key: provider.resolved_api_key(),
-        user_agent: provider.user_agent,
-        skip_tls_verify: provider.skip_tls_verify,
+        api_key: account.api_key.filter(|key| !key.trim().is_empty()),
+        user_agent: account.user_agent,
+        skip_tls_verify: account.skip_tls_verify,
     })
 }
 
@@ -317,22 +367,30 @@ fn insert_account_models(
             anyhow::bail!("max_tokens must be greater than zero");
         }
         if !batch_models.insert(model.to_string()) {
-            anyhow::bail!("duplicate model `{model}` in request");
+            return Err(account_model_conflict(format!(
+                "duplicate model `{model}` in request"
+            )));
         }
         if logical_models
             .values()
             .any(|existing| existing.account == account_id && existing.model.trim() == model)
         {
-            anyhow::bail!("model `{model}` already exists in account `{account_id}`");
+            return Err(account_model_conflict(format!(
+                "model `{model}` already exists in account `{account_id}`"
+            )));
         }
         let default_id = format!("{account_id}/{model}");
         let selection_id =
             validate_selection_id(request.selection_id.as_deref().unwrap_or(&default_id))?;
         if !batch_ids.insert(selection_id.clone()) {
-            anyhow::bail!("duplicate model selection `{selection_id}` in request");
+            return Err(account_model_conflict(format!(
+                "duplicate model selection `{selection_id}` in request"
+            )));
         }
         if config.selection_exists(&selection_id) {
-            anyhow::bail!("model selection `{selection_id}` already exists");
+            return Err(account_model_conflict(format!(
+                "model selection `{selection_id}` already exists"
+            )));
         }
         prepared.push((selection_id, model.to_string(), request));
     }
@@ -587,22 +645,12 @@ pub(crate) async fn create_account_models(
             missing = true;
             anyhow::bail!("provider account not found");
         }
-        let account_models: Vec<_> = config
-            .logical_models()
-            .into_iter()
-            .filter(|(_, model)| model.account == account)
-            .map(|(id, _)| id)
-            .collect();
-        if account_models
-            .iter()
-            .any(|selection| selection_is_managed(config, selection))
-        {
+        if account_is_managed(config, &account) {
             managed = true;
             anyhow::bail!("managed CodingPlan provider account");
         }
         created = insert_account_models(config, &account, &req.models).map_err(|error| {
-            let message = error.to_string();
-            if message.contains("already exists") || message.contains("duplicate") {
+            if error.downcast_ref::<AccountModelConflict>().is_some() {
                 conflict = true;
             }
             error
@@ -1086,10 +1134,11 @@ pub(crate) async fn patch_thinking(
 #[cfg(test)]
 mod tests {
     use super::{
-        discovery_url, fetch_discovery_body, insert_account_models, normalize_discovered_models,
-        parse_discovered_models, rename_default_selection, replace_deleted_default_selection,
-        selection_is_managed, selection_name_is_reserved, stored_discovery_transport,
-        CreateAccountModelRequest, DiscoveryRequestError, DiscoveryTransport, PatchProviderRequest,
+        account_is_managed, discovery_url, fetch_discovery_body, insert_account_models,
+        normalize_discovered_models, parse_discovered_models, rename_default_selection,
+        replace_deleted_default_selection, selection_is_managed, selection_name_is_reserved,
+        stored_discovery_transport, AccountModelConflict, CreateAccountModelRequest,
+        DiscoveryRequestError, DiscoveryTransport, PatchProviderRequest,
     };
     use crate::DiscoveredModelInfo;
     use atomcode_config::config::Config;
@@ -1138,6 +1187,17 @@ mod tests {
         }))
         .unwrap();
         assert!(selection_is_managed(&managed, "AtomGit-GLM"));
+
+        let account_only: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "AtomGit": {
+                    "provider": "openai",
+                    "base_url": "https://llm-api.atomgit.com/v1"
+                }
+            }
+        }))
+        .unwrap();
+        assert!(account_is_managed(&account_only, "AtomGit"));
 
         let custom: Config = serde_json::from_value(serde_json::json!({
             "providers": {
@@ -1293,6 +1353,20 @@ mod tests {
         let transport =
             stored_discovery_transport(&account_config, "taotoken", "openai", &taotoken).unwrap();
         assert_eq!(transport.api_key.as_deref(), Some("account-secret"));
+
+        let account_only: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "taotoken": {
+                    "provider": "openai",
+                    "base_url": "https://taotoken.net/api/v1",
+                    "api_key": "account-only-secret"
+                }
+            }
+        }))
+        .unwrap();
+        let transport =
+            stored_discovery_transport(&account_only, "taotoken", "openai", &taotoken).unwrap();
+        assert_eq!(transport.api_key.as_deref(), Some("account-only-secret"));
     }
 
     fn requested_model(model: &str) -> CreateAccountModelRequest {
@@ -1366,7 +1440,8 @@ mod tests {
             &[requested_model("model-a"), requested_model("model-b")],
         );
 
-        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.downcast_ref::<AccountModelConflict>().is_some());
         assert!(config.providers.contains_key("taotoken"));
         assert!(!config.provider_accounts.contains_key("taotoken"));
         assert!(!config.models.contains_key("taotoken/model-a"));

@@ -2902,8 +2902,22 @@ body {
   text-align: left;
 }
 
-.model-discovery-picker-multi .model-discovery-option input {
-  pointer-events: none;
+.model-discovery-checkbox {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1rem;
+  height: 1rem;
+  flex: 0 0 1rem;
+  border: 1px solid var(--app-border-subtle);
+  border-radius: 4px;
+  color: var(--app-accent-foreground);
+  font-size: .75rem;
+  line-height: 1;
+}
+
+.model-discovery-option.active .model-discovery-checkbox {
+  border-color: var(--app-accent-foreground);
 }
 
 .model-discovery-picker-multi .model-discovery-option small {

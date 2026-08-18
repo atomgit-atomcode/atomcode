@@ -553,6 +553,7 @@ function AddAccountModelsDialog({
               setModels(null);
               setSelected([]);
               setManualModel('');
+              setSearch('');
               setError(null);
             }}
           />
@@ -601,7 +602,9 @@ function AddAccountModelsDialog({
                           : [...current, candidate.id]
                       ))}
                     >
-                      <input type="checkbox" tabIndex={-1} checked={checked} disabled={exists} readOnly />
+                      <span class="model-discovery-checkbox" aria-hidden="true">
+                        {checked ? '✓' : ''}
+                      </span>
                       <span>{candidate.name ?? candidate.id}</span>
                       {candidate.name && <code>{candidate.id}</code>}
                       {exists && <small>{t('settings.alreadyAdded')}</small>}
