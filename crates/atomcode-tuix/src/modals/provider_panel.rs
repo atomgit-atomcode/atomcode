@@ -634,14 +634,17 @@ impl ModelForm {
     }
 
     /// Render the level toggles with the sub-cursor marked, e.g.
-    /// ` [x]low ‹[ ]medium› [x]high [x]max ` (focused level in guillemets).
+    /// ` ● low  ‹○ medium›  ● high  ● max ` (focused level in guillemets).
+    ///
+    /// Use text glyphs rather than emoji so each marker stays monochrome and
+    /// occupies one terminal cell on the terminals supported by the TUI.
     fn effort_levels_label(&self, focused: bool) -> String {
         atomcode_config::config::REASONING_EFFORT_LEVELS
             .iter()
             .enumerate()
             .map(|(i, level)| {
-                let mark = if self.effort_levels[i] { "x" } else { " " };
-                let cell = format!("[{mark}]{level}");
+                let mark = if self.effort_levels[i] { '●' } else { '○' };
+                let cell = format!("{mark} {level}");
                 if focused && i == self.effort_level_cursor {
                     format!("‹{cell}›")
                 } else {
@@ -2667,6 +2670,14 @@ mod tests {
         add.effort_level_cursor = 1;
         add.toggle_effort_level();
         assert_eq!(add.effort_levels, [true, false, true, true]);
+        assert_eq!(
+            add.effort_levels_label(true),
+            " ● low ‹○ medium› ● high  ● max "
+        );
+        assert_eq!(
+            add.effort_levels_label(false),
+            " ● low  ○ medium  ● high  ● max "
+        );
         // The DEFAULT cycle now skips medium: None → auto → low → high.
         add.reasoning_effort = None;
         add.cycle_effort(true);
