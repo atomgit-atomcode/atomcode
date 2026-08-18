@@ -776,11 +776,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 .with_persistence_status(snapshot_hook.persistence_status()),
         ));
     }
-    // Status awareness is UNCONDITIONAL (production parity): a per-turn <system-reminder>
-    // with date + round budget (NO context-usage gauge — pressure is handled silently by
-    // auto-compaction, never pushed to the model). Serves recall's relative-date resolution and
-    // lets the model pace itself. Injected from round 2 of each turn (round 1 is skipped — see
-    // StatusReminderHook — to avoid a user-after-user wire pair).
+    // Date awareness is UNCONDITIONAL (production parity): a per-turn <system-reminder> serves
+    // recall's relative-date resolution. Runtime pressure (context usage and round counters) is
+    // deliberately kept internal; projecting it made weak models invent urgency and rush work.
+    // Injected from round 2 of each turn (round 1 is skipped — see StatusReminderHook — to avoid
+    // a user-after-user wire pair).
     hooks.push(Arc::new(StatusReminderHook::new()));
     // Pin the workspace root the cadence uses to gate out-of-workspace edits (e.g. a throwaway
     // /tmp write must not arm the "run cargo check" nudge). INVARIANT: this must equal the dir
