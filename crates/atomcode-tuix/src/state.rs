@@ -3586,6 +3586,40 @@ mod tests {
     }
 
     #[test]
+    fn cycle_within_empty_allowed_keeps_current_value() {
+        // Regression (c814bb51): an empty allowed list must be a no-op that
+        // preserves the current value, not a value-clobbering chain start.
+        // `allowed_effort_levels` never returns empty in practice, but the cycle
+        // must defend against it so a degenerate restriction cannot silently
+        // clear the active effort.
+        let empty: &[&str] = &[];
+        let mut st = UiState::new();
+
+        // A synced concrete value is kept verbatim.
+        assert_eq!(
+            st.cycle_reasoning_effort_within(Some("high"), empty).as_deref(),
+            Some("high")
+        );
+        assert_eq!(st.reasoning_effort.as_deref(), Some("high"));
+
+        // A synced None stays None (API default), not downgraded to "low".
+        assert_eq!(st.cycle_reasoning_effort_within(None, empty), None);
+        assert_eq!(st.reasoning_effort, None);
+    }
+
+    #[test]
+    fn cycle_within_trims_whitespace_on_current_value() {
+        // c814bb51: the current value is trimmed before membership lookup, so
+        // a padded authoritative value still advances from its own slot.
+        let all = ["low", "medium", "high", "max"];
+        let mut st = UiState::new();
+        assert_eq!(
+            st.cycle_reasoning_effort_within(Some("  high  "), &all).as_deref(),
+            Some("max")
+        );
+    }
+
+    #[test]
     fn round_cap_panel_toggle_and_choice() {
         let mut p = crate::state::RoundCapPanel::new(7, 200, 200);
         assert!(p.chosen_continue());
