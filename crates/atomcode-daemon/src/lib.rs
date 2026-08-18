@@ -133,11 +133,29 @@ pub(crate) struct ConfigResponse {
     pub default_provider: String,
     pub default_workdir: Option<String>,
     pub providers: Vec<ProviderInfo>,
+    /// Sanitized reusable provider accounts. Credentials never cross this API;
+    /// `has_api_key` is the only credential-related field exposed to the UI.
+    pub provider_accounts: Vec<ProviderAccountInfo>,
     /// Compiled provider presets used by the TUI and WebUI add-provider flows.
     /// This contains connection metadata only; no credentials are exposed.
     pub provider_presets: Vec<ProviderPresetInfo>,
     /// Sanitized completion-notification config (webui reads it for defaults).
     pub notifications: NotificationConfigInfo,
+}
+
+/// Sanitized view of one reusable provider account and its model profiles.
+#[derive(Debug, Serialize)]
+pub(crate) struct ProviderAccountInfo {
+    pub id: String,
+    pub provider: String,
+    pub display_name: Option<String>,
+    #[serde(rename = "type")]
+    pub provider_type: String,
+    pub base_url: Option<String>,
+    pub has_api_key: bool,
+    pub model_ids: Vec<String>,
+    pub legacy: bool,
+    pub managed: bool,
 }
 
 /// Sanitized view of one compiled provider preset.
@@ -2021,7 +2039,11 @@ async fn get_sessions_by_working_dir(
 async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
     match crate::legacy_convert::load_catalog_session_view_in_project(&hash, &id) {
         Ok(Some(session)) => {
-            let messages = match merge_catalog_session_messages_for_display(&session) {
+            let turn_timestamps = load_turn_timestamps(&hash, &id);
+            let messages = match merge_catalog_session_messages_for_display(
+                &session,
+                &turn_timestamps,
+            ) {
                 Ok(messages) => messages,
                 Err(error) => {
                     let msg = format!("Failed to load session: {error}");
@@ -2130,8 +2152,73 @@ fn attach_image_sets(messages: &mut [MessageInfo], sets: Vec<Vec<ImageData>>) {
     }
 }
 
+pub(crate) type TurnTimestamps = std::collections::BTreeMap<u64, u64>;
+
+pub(crate) fn load_turn_timestamps(project_hash: &str, session_id: &str) -> TurnTimestamps {
+    let manager = NativeSessionManager::with_root(
+        NativeSessionManager::sessions_root().join(project_hash),
+    );
+    match manager.load_transcript_records(session_id) {
+        Ok(records) => records
+            .into_iter()
+            .filter_map(|record| {
+                u64::try_from(record.ts)
+                    .ok()
+                    .filter(|timestamp| *timestamp > 0)
+                    .map(|timestamp| (record.turn_id, timestamp))
+            })
+            .collect(),
+        Err(error) => {
+            // Transcript is auxiliary. A damaged/missing timestamp source must not make
+            // the authoritative native snapshot unavailable; omit the label instead.
+            eprintln!(
+                "[session-display] transcript timestamps unavailable for {session_id}: {error}"
+            );
+            TurnTimestamps::new()
+        }
+    }
+}
+
+fn snapshot_message_timestamp(
+    meta: &atomcode_capabilities::session::SessionMeta,
+    message: &atomcode_kernel::message::Message,
+    index: usize,
+    turn_timestamps: &TurnTimestamps,
+) -> Option<u64> {
+    let direct_turn_id = message
+        .meta
+        .as_ref()
+        .map(|message_meta| message_meta.turn_id)
+        .filter(|turn_id| *turn_id != 0);
+    let positional_turn_id = meta
+        .turn_stats
+        .iter()
+        .find(|stat| stat.position_valid && index < stat.after_message)
+        .map(|stat| stat.turn_id)
+        .filter(|turn_id| *turn_id != 0);
+    direct_turn_id
+        .or(positional_turn_id)
+        .and_then(|turn_id| turn_timestamps.get(&turn_id).copied())
+}
+
+pub(crate) fn attach_snapshot_message_timestamps(
+    messages: &mut [MessageInfo],
+    snapshot: &atomcode_kernel::message::SessionSnapshot,
+    meta: &atomcode_capabilities::session::SessionMeta,
+    turn_timestamps: &TurnTimestamps,
+) {
+    for (index, (info, message)) in messages
+        .iter_mut()
+        .zip(snapshot.messages.iter())
+        .enumerate()
+    {
+        info.created_at = snapshot_message_timestamp(meta, message, index, turn_timestamps);
+    }
+}
+
 fn merge_catalog_session_messages_for_display(
     session: &crate::legacy_convert::CatalogSessionView,
+    turn_timestamps: &TurnTimestamps,
 ) -> anyhow::Result<Vec<MessageInfo>> {
     use atomcode_capabilities::session::{DisplayAnchor, PresentationRole};
 
@@ -2151,7 +2238,6 @@ fn merge_catalog_session_messages_for_display(
         };
         presentation.entry(after_message).or_default().push(entry);
     }
-    let timestamp = Some(u64::try_from(session.meta.updated_at.max(0)).unwrap_or(0));
     let mut messages =
         Vec::with_capacity(session.snapshot.messages.len() + session.presentation.entries.len());
     let mut append_presentation = |position: usize, messages: &mut Vec<MessageInfo>| {
@@ -2174,7 +2260,12 @@ fn merge_catalog_session_messages_for_display(
                 tool_result: None,
                 artifacts: None,
                 images: None,
-                created_at: timestamp,
+                created_at: match entry.anchor {
+                    DisplayAnchor::AtStart => None,
+                    DisplayAnchor::AfterTurn { turn_id } => {
+                        turn_timestamps.get(&turn_id).copied()
+                    }
+                },
             });
         }
     };
@@ -2197,7 +2288,12 @@ fn merge_catalog_session_messages_for_display(
                 && atomcode_capabilities::reminder::is_system_reminder(&message.text));
         if !hidden_internal {
             let mut info = MessageInfo::from_kernel(message);
-            info.created_at = timestamp;
+            info.created_at = snapshot_message_timestamp(
+                &session.meta,
+                message,
+                index,
+                turn_timestamps,
+            );
             messages.push(info);
         }
         append_presentation(index + 1, &mut messages);
@@ -2222,7 +2318,12 @@ fn merge_catalog_session_messages_for_display(
                 tool_result: None,
                 artifacts: None,
                 images: None,
-                created_at: timestamp,
+                created_at: match entry.anchor {
+                    DisplayAnchor::AtStart => None,
+                    DisplayAnchor::AfterTurn { turn_id } => {
+                        turn_timestamps.get(&turn_id).copied()
+                    }
+                },
             });
         }
     }
@@ -6028,6 +6129,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             post(api_provider::discover_models).layer(DefaultBodyLimit::max(64 * 1024)),
         )
         .route(
+            "/provider-accounts/:account/models",
+            post(api_provider::create_account_models).layer(DefaultBodyLimit::max(256 * 1024)),
+        )
+        .route(
             "/providers/:name",
             patch(api_provider::patch_provider).delete(api_provider::delete_provider),
         )
@@ -6297,12 +6402,55 @@ mod tests {
             },
         };
 
-        let displayed = merge_catalog_session_messages_for_display(&session).unwrap();
+        let displayed =
+            merge_catalog_session_messages_for_display(&session, &TurnTimestamps::new()).unwrap();
         let text = displayed
             .iter()
             .map(|message| message.content.as_str())
             .collect::<Vec<_>>();
         assert_eq!(text, ["real user", "anchored display", "real assistant"]);
+    }
+
+    #[test]
+    fn display_projection_uses_persisted_turn_timestamps() {
+        use atomcode_capabilities::session::{PresentationFile, SessionMeta, TurnStat};
+        use atomcode_kernel::message::{Message, SessionSnapshot};
+
+        let mut meta = SessionMeta::new("timestamp-test", "/project", 1);
+        let stat = |turn_id, after_message| TurnStat {
+            after_message,
+            position_valid: true,
+            turn_id,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 1,
+            errored: false,
+            used_tokens: 1,
+            ctx_window: 1_000,
+            model_usage: Vec::new(),
+        };
+        meta.turn_stats = vec![stat(1, 2), stat(2, 4)];
+        let session = crate::legacy_convert::CatalogSessionView {
+            snapshot: SessionSnapshot::new(vec![
+                Message::user("first"),
+                Message::assistant("one", vec![]),
+                Message::user("second"),
+                Message::assistant("two", vec![]),
+            ]),
+            meta,
+            presentation: PresentationFile::default(),
+        };
+        let timestamps = TurnTimestamps::from([
+            (1, 1_700_000_000_000),
+            (2, 1_700_000_100_000),
+        ]);
+
+        let displayed = merge_catalog_session_messages_for_display(&session, &timestamps).unwrap();
+        assert_eq!(displayed[0].created_at, Some(1_700_000_000_000));
+        assert_eq!(displayed[1].created_at, Some(1_700_000_000_000));
+        assert_eq!(displayed[2].created_at, Some(1_700_000_100_000));
+        assert_eq!(displayed[3].created_at, Some(1_700_000_100_000));
     }
 
     #[test]
@@ -6326,7 +6474,8 @@ mod tests {
             },
         };
 
-        let displayed = merge_catalog_session_messages_for_display(&session).unwrap();
+        let displayed =
+            merge_catalog_session_messages_for_display(&session, &TurnTimestamps::new()).unwrap();
         assert_eq!(displayed.len(), 2);
         assert!(displayed.iter().all(|message| message.content == wrapped));
     }
@@ -6345,7 +6494,8 @@ mod tests {
             presentation: PresentationFile::default(),
         };
 
-        let displayed = merge_catalog_session_messages_for_display(&session).unwrap();
+        let displayed =
+            merge_catalog_session_messages_for_display(&session, &TurnTimestamps::new()).unwrap();
         assert_eq!(displayed.len(), 2);
         assert_eq!(
             displayed[1].internal_origin.as_deref(),
@@ -7794,7 +7944,7 @@ mod tests {
     // 当前工作区 A 的桶造成同 ID 双份。
     #[test]
     fn chat_continuation_loads_session_from_other_bucket_and_redirects_working_dir() {
-        let home = ScopedChatHome::new();
+        let _home = ScopedChatHome::new();
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
         let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";

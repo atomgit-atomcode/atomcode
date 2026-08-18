@@ -1,4 +1,6 @@
-use atomcode_config::config::provider::{default_context_window_for, ProviderConfig};
+use atomcode_config::config::provider::{
+    default_context_window_for, ModelProfileConfig, ProviderConfig,
+};
 use axum::{extract::Path, http::StatusCode, response::IntoResponse, Json};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -155,6 +157,21 @@ pub(crate) struct DiscoverModelsResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct CreateAccountModelsRequest {
+    pub models: Vec<CreateAccountModelRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct CreateAccountModelRequest {
+    pub selection_id: Option<String>,
+    pub model: String,
+    pub display_name: Option<String>,
+    pub context_window: Option<usize>,
+    pub max_tokens: Option<usize>,
+    pub supports_vision: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 struct OpenAiModelsResponse {
     data: Vec<OpenAiModelEntry>,
 }
@@ -226,7 +243,18 @@ fn stored_discovery_transport(
     requested_type: &str,
     requested_url: &reqwest::Url,
 ) -> Option<DiscoveryTransport> {
-    let provider = config.provider_config_for_selection(provider_name)?;
+    // Accept both a model selection id (legacy endpoint) and a reusable account
+    // id (new add-model flow). Resolution remains server-side so credentials
+    // never need to round-trip through the browser.
+    let provider = config
+        .provider_config_for_selection(provider_name)
+        .or_else(|| {
+            config
+                .logical_models()
+                .into_iter()
+                .find(|(_, model)| model.account == provider_name)
+                .and_then(|(selection, _)| config.provider_config_for_selection(&selection))
+        })?;
     let saved_type = discovery_protocol(&provider.provider_type)?;
     if saved_type != discovery_protocol(requested_type)? {
         return None;
@@ -241,6 +269,110 @@ fn stored_discovery_transport(
         user_agent: provider.user_agent,
         skip_tls_verify: provider.skip_tls_verify,
     })
+}
+
+fn validate_selection_id(value: &str) -> anyhow::Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .chars()
+            .any(|ch| matches!(ch, '\0' | '\n' | '\r' | '\t' | '\\'))
+    {
+        anyhow::bail!("model selection id is empty or contains an invalid character");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn insert_account_models(
+    config: &mut atomcode_config::config::Config,
+    account_id: &str,
+    requests: &[CreateAccountModelRequest],
+) -> anyhow::Result<Vec<String>> {
+    if requests.is_empty() || requests.len() > 100 {
+        anyhow::bail!("select between 1 and 100 models");
+    }
+    let account = config
+        .logical_accounts()
+        .remove(account_id)
+        .ok_or_else(|| anyhow::anyhow!("provider account `{account_id}` not found"))?;
+    if account.ephemeral {
+        anyhow::bail!("runtime-only provider accounts cannot be modified");
+    }
+
+    // Validate the complete batch before upgrading a legacy provider or adding
+    // any profile. A conflict therefore leaves the config untouched.
+    let logical_models = config.logical_models();
+    let mut prepared = Vec::with_capacity(requests.len());
+    let mut batch_ids = std::collections::HashSet::new();
+    let mut batch_models = std::collections::HashSet::new();
+    for request in requests {
+        let model = request.model.trim();
+        if model.is_empty() {
+            anyhow::bail!("model cannot be empty");
+        }
+        if request.context_window == Some(0) {
+            anyhow::bail!("context_window must be greater than zero");
+        }
+        if request.max_tokens == Some(0) {
+            anyhow::bail!("max_tokens must be greater than zero");
+        }
+        if !batch_models.insert(model.to_string()) {
+            anyhow::bail!("duplicate model `{model}` in request");
+        }
+        if logical_models
+            .values()
+            .any(|existing| existing.account == account_id && existing.model.trim() == model)
+        {
+            anyhow::bail!("model `{model}` already exists in account `{account_id}`");
+        }
+        let default_id = format!("{account_id}/{model}");
+        let selection_id =
+            validate_selection_id(request.selection_id.as_deref().unwrap_or(&default_id))?;
+        if !batch_ids.insert(selection_id.clone()) {
+            anyhow::bail!("duplicate model selection `{selection_id}` in request");
+        }
+        if config.selection_exists(&selection_id) {
+            anyhow::bail!("model selection `{selection_id}` already exists");
+        }
+        prepared.push((selection_id, model.to_string(), request));
+    }
+
+    if config.providers.contains_key(account_id) {
+        config.upgrade_legacy_provider(account_id)?;
+    }
+    let provider_type =
+        atomcode_config::config::provider_preset::preset_or_compatible(&account.provider)
+            .provider_type
+            .wire()
+            .to_string();
+    let mut created = Vec::with_capacity(prepared.len());
+    for (selection_id, model, request) in prepared {
+        config.models.insert(
+            selection_id.clone(),
+            ModelProfileConfig {
+                account: account_id.to_string(),
+                model,
+                display_name: request.display_name.clone(),
+                system_prompt: None,
+                supports_vision: request.supports_vision,
+                context_window: request
+                    .context_window
+                    .unwrap_or_else(|| default_context_window_for(&provider_type)),
+                max_tokens: request.max_tokens,
+                capable_model: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                reasoning_effort: None,
+                reasoning_effort_levels: None,
+                thinking_enabled: None,
+                thinking_budget: None,
+                retry_max_attempts: None,
+            },
+        );
+        created.push(selection_id);
+    }
+    Ok(created)
 }
 
 fn parse_discovered_models(
@@ -438,6 +570,68 @@ pub(crate) async fn discover_models(Json(req): Json<DiscoverModelsRequest>) -> i
         }
     };
     Json(DiscoverModelsResponse { models }).into_response()
+}
+
+/// Add several model profiles under an existing account in one CAS config
+/// update. The account credential is reused in place and never returned.
+pub(crate) async fn create_account_models(
+    Path(account): Path<String>,
+    Json(req): Json<CreateAccountModelsRequest>,
+) -> impl IntoResponse {
+    let mut created = Vec::new();
+    let mut missing = false;
+    let mut managed = false;
+    let mut conflict = false;
+    let config = match update_config(|config| {
+        if !config.logical_accounts().contains_key(&account) {
+            missing = true;
+            anyhow::bail!("provider account not found");
+        }
+        let account_models: Vec<_> = config
+            .logical_models()
+            .into_iter()
+            .filter(|(_, model)| model.account == account)
+            .map(|(id, _)| id)
+            .collect();
+        if account_models
+            .iter()
+            .any(|selection| selection_is_managed(config, selection))
+        {
+            managed = true;
+            anyhow::bail!("managed CodingPlan provider account");
+        }
+        created = insert_account_models(config, &account, &req.models).map_err(|error| {
+            let message = error.to_string();
+            if message.contains("already exists") || message.contains("duplicate") {
+                conflict = true;
+            }
+            error
+        })?;
+        Ok(())
+    }) {
+        Ok(config) => config,
+        Err(_) if missing => {
+            return json_error(StatusCode::NOT_FOUND, "Provider account not found").into_response()
+        }
+        Err(_) if managed => {
+            return json_error(
+                StatusCode::FORBIDDEN,
+                "CodingPlan provider accounts are managed by /login and cannot be modified",
+            )
+            .into_response()
+        }
+        Err(error) if conflict => return json_error(StatusCode::CONFLICT, error).into_response(),
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "created": created,
+            "config": config_response(&config),
+        })),
+    )
+        .into_response()
 }
 
 /// GET /providers - List all providers with sanitized info.
@@ -892,10 +1086,10 @@ pub(crate) async fn patch_thinking(
 #[cfg(test)]
 mod tests {
     use super::{
-        discovery_url, fetch_discovery_body, normalize_discovered_models, parse_discovered_models,
-        rename_default_selection, replace_deleted_default_selection, selection_is_managed,
-        selection_name_is_reserved, stored_discovery_transport, DiscoveryRequestError,
-        DiscoveryTransport, PatchProviderRequest,
+        discovery_url, fetch_discovery_body, insert_account_models, normalize_discovered_models,
+        parse_discovered_models, rename_default_selection, replace_deleted_default_selection,
+        selection_is_managed, selection_name_is_reserved, stored_discovery_transport,
+        CreateAccountModelRequest, DiscoveryRequestError, DiscoveryTransport, PatchProviderRequest,
     };
     use crate::DiscoveredModelInfo;
     use atomcode_config::config::Config;
@@ -1081,6 +1275,130 @@ mod tests {
         assert!(transport.skip_tls_verify);
         assert!(stored_discovery_transport(&config, "private", "openai", &attacker).is_none());
         assert!(stored_discovery_transport(&config, "private", "ollama", &trusted).is_none());
+
+        let account_config: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "taotoken": {
+                    "provider": "openai",
+                    "base_url": "https://taotoken.net/api/v1",
+                    "api_key": "account-secret"
+                }
+            },
+            "models": {
+                "taotoken/model-a": { "account": "taotoken", "model": "model-a" }
+            }
+        }))
+        .unwrap();
+        let taotoken = discovery_url("https://taotoken.net/api/v1", "openai").unwrap();
+        let transport =
+            stored_discovery_transport(&account_config, "taotoken", "openai", &taotoken).unwrap();
+        assert_eq!(transport.api_key.as_deref(), Some("account-secret"));
+    }
+
+    fn requested_model(model: &str) -> CreateAccountModelRequest {
+        CreateAccountModelRequest {
+            selection_id: None,
+            model: model.to_string(),
+            display_name: None,
+            context_window: Some(200_000),
+            max_tokens: None,
+            supports_vision: None,
+        }
+    }
+
+    #[test]
+    fn batch_add_upgrades_legacy_account_and_reuses_credential() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "default_provider": "taotoken",
+            "providers": {
+                "taotoken": {
+                    "type": "openai",
+                    "model": "existing-model",
+                    "base_url": "https://taotoken.net/api/v1",
+                    "api_key": "secret-value"
+                }
+            }
+        }))
+        .unwrap();
+
+        let created = insert_account_models(
+            &mut config,
+            "taotoken",
+            &[requested_model("model-a"), requested_model("model-b")],
+        )
+        .unwrap();
+
+        assert_eq!(created, ["taotoken/model-a", "taotoken/model-b"]);
+        assert!(!config.providers.contains_key("taotoken"));
+        assert_eq!(
+            config.provider_accounts["taotoken"].api_key.as_deref(),
+            Some("secret-value")
+        );
+        assert_eq!(config.models["taotoken/model-a"].account, "taotoken");
+        assert_eq!(config.models["taotoken/model-b"].account, "taotoken");
+        assert_eq!(config.default_model.as_deref(), Some("taotoken"));
+        assert_eq!(config.default_provider, "taotoken");
+    }
+
+    #[test]
+    fn batch_add_validates_every_model_before_upgrading_legacy_account() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "taotoken": {
+                    "type": "openai",
+                    "model": "existing-model",
+                    "base_url": "https://taotoken.net/api/v1",
+                    "api_key": "secret-value"
+                }
+            },
+            "provider_accounts": {
+                "other": { "provider": "openai" }
+            },
+            "models": {
+                "taotoken/model-b": { "account": "other", "model": "occupied" }
+            }
+        }))
+        .unwrap();
+
+        let result = insert_account_models(
+            &mut config,
+            "taotoken",
+            &[requested_model("model-a"), requested_model("model-b")],
+        );
+
+        assert!(result.is_err());
+        assert!(config.providers.contains_key("taotoken"));
+        assert!(!config.provider_accounts.contains_key("taotoken"));
+        assert!(!config.models.contains_key("taotoken/model-a"));
+        assert_eq!(
+            config.providers["taotoken"].api_key.as_deref(),
+            Some("secret-value")
+        );
+    }
+
+    #[test]
+    fn batch_add_rejects_an_existing_legacy_wire_model() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "taotoken": {
+                    "type": "openai",
+                    "model": "existing-model",
+                    "base_url": "https://taotoken.net/api/v1",
+                    "api_key": "secret-value"
+                }
+            }
+        }))
+        .unwrap();
+
+        let result = insert_account_models(
+            &mut config,
+            "taotoken",
+            &[requested_model("existing-model")],
+        );
+
+        assert!(result.is_err());
+        assert!(config.providers.contains_key("taotoken"));
+        assert!(!config.provider_accounts.contains_key("taotoken"));
     }
 
     #[tokio::test]

@@ -1030,19 +1030,23 @@ impl NativeLiveWireProjector {
                     round: progress.round,
                     elapsed_secs: progress.elapsed_secs,
                     condition: progress.condition,
-                    terminal: progress.terminal.map(|terminal| match terminal {
-                        GoalTerminal::Met => "met",
-                        GoalTerminal::Stopped => "stopped",
-                        GoalTerminal::Failed => "failed",
-                        GoalTerminal::Cancelled => "cancelled",
-                    }.into()),
+                    terminal: progress.terminal.map(|terminal| {
+                        match terminal {
+                            GoalTerminal::Met => "met",
+                            GoalTerminal::Stopped => "stopped",
+                            GoalTerminal::Failed => "failed",
+                            GoalTerminal::Cancelled => "cancelled",
+                        }
+                        .into()
+                    }),
                     phase: match progress.phase {
                         GoalPhase::Pursuing => "pursuing",
                         GoalPhase::Paused => "paused",
                         GoalPhase::PausedAtCap => "paused_at_cap",
                         GoalPhase::Satisfied => "satisfied",
                         GoalPhase::Ended => "ended",
-                    }.into(),
+                    }
+                    .into(),
                     last_reason: progress.last_reason,
                 }
             }
@@ -1147,19 +1151,23 @@ fn goal_snapshot(progress: &atomcode_coding::GoalProgress) -> LiveGoalSnapshot {
         round: progress.round,
         elapsed_secs: progress.elapsed_secs,
         condition: progress.condition.clone(),
-        terminal: progress.terminal.map(|terminal| match terminal {
-            GoalTerminal::Met => "met",
-            GoalTerminal::Stopped => "stopped",
-            GoalTerminal::Failed => "failed",
-            GoalTerminal::Cancelled => "cancelled",
-        }.into()),
+        terminal: progress.terminal.map(|terminal| {
+            match terminal {
+                GoalTerminal::Met => "met",
+                GoalTerminal::Stopped => "stopped",
+                GoalTerminal::Failed => "failed",
+                GoalTerminal::Cancelled => "cancelled",
+            }
+            .into()
+        }),
         phase: match progress.phase {
             GoalPhase::Pursuing => "pursuing",
             GoalPhase::Paused => "paused",
             GoalPhase::PausedAtCap => "paused_at_cap",
             GoalPhase::Satisfied => "satisfied",
             GoalPhase::Ended => "ended",
-        }.into(),
+        }
+        .into(),
         last_reason: progress.last_reason.clone(),
     }
 }
@@ -1255,7 +1263,9 @@ pub(crate) async fn live_stream(
         live_current_provider(),
         native_runtime_mode(live_current_approval_mode()),
         sid,
-    ).await {
+    )
+    .await
+    {
         Ok(join) => join,
         Err(error) => {
             return (
@@ -1266,14 +1276,19 @@ pub(crate) async fn live_stream(
         }
     };
     let snapshot_wd = join.binding.working_dir.clone();
-    let session_name = {
-        let bucket = atomcode_capabilities::session::SessionManager::project_hash(&snapshot_wd);
+    let project_hash =
+        atomcode_capabilities::session::SessionManager::project_hash(&snapshot_wd);
+    let (session_name, session_meta, turn_timestamps) = {
         match crate::legacy_convert::load_catalog_session_view_in_project(
-            &bucket,
+            &project_hash,
             &join.binding.session_id,
         ) {
-            Ok(Some(session)) => session.meta.name,
-            Ok(None) => String::new(),
+            Ok(Some(session)) => {
+                let timestamps =
+                    crate::load_turn_timestamps(&project_hash, &join.binding.session_id);
+                (session.meta.name.clone(), Some(session.meta), timestamps)
+            }
+            Ok(None) => (String::new(), None, crate::TurnTimestamps::new()),
             Err(error) => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -1283,7 +1298,6 @@ pub(crate) async fn live_stream(
             }
         }
     };
-    let project_hash = crate::hash_path(&snapshot_wd);
     let initial_goal = join.goal_progress.clone();
     // Keep the session id alongside the wire event until serialization.  The
     // projector can update its session after a SessionChanged event, so the id
@@ -1295,6 +1309,14 @@ pub(crate) async fn live_stream(
         .iter()
         .map(crate::MessageInfo::from_kernel)
         .collect();
+    if let Some(meta) = session_meta.as_ref() {
+        crate::attach_snapshot_message_timestamps(
+            &mut snapshot_messages,
+            &join.snapshot,
+            meta,
+            &turn_timestamps,
+        );
+    }
     // Re-attach display-only images (VL-preprocessed originals) so a refresh — which
     // rebuilds from the kernel snapshot (image stripped) — shows the thumbnail, not the
     // "missing image" placeholder. Same sidecar the HTTP session-load path reads.
@@ -2365,7 +2387,8 @@ pub(crate) async fn live_goal_start(
     {
         return Json(serde_json::json!({"accepted": false, "error": error}));
     }
-    let accepted = crate::native_live::dispatch(atomcode_coding::DriverCommand::StartGoal(condition)).is_ok();
+    let accepted =
+        crate::native_live::dispatch(atomcode_coding::DriverCommand::StartGoal(condition)).is_ok();
     Json(serde_json::json!({"accepted": accepted}))
 }
 

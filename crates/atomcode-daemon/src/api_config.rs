@@ -3,7 +3,7 @@ use atomcode_config::config::Config;
 use atomcode_config::ConfigStore;
 use axum::{response::IntoResponse, Json};
 
-use crate::{json_error, ConfigResponse, ProviderInfo, ProviderPresetInfo};
+use crate::{json_error, ConfigResponse, ProviderAccountInfo, ProviderInfo, ProviderPresetInfo};
 
 /// Load config from disk.
 pub(crate) fn load_config() -> Result<Config, String> {
@@ -37,7 +37,8 @@ fn empty_config() -> Config {
 /// `ProviderConfig` view via the resolution boundary.
 pub(crate) fn config_response(config: &Config) -> ConfigResponse {
     let default_selection = config.effective_model_selection().unwrap_or_default();
-    let mut ids: Vec<String> = config.logical_models().into_keys().collect();
+    let logical_models = config.logical_models();
+    let mut ids: Vec<String> = logical_models.keys().cloned().collect();
     ids.sort();
     let providers = ids
         .iter()
@@ -52,6 +53,47 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
         default_provider: default_selection,
         default_workdir: config.default_workdir.clone(),
         providers,
+        provider_accounts: {
+            let mut accounts: Vec<_> = config
+                .logical_accounts()
+                .into_iter()
+                .map(|(id, account)| {
+                    let preset = atomcode_config::config::provider_preset::preset_or_compatible(
+                        &account.provider,
+                    );
+                    let mut model_ids: Vec<_> = logical_models
+                        .iter()
+                        .filter(|(_, model)| model.account == id)
+                        .map(|(selection, _)| selection.clone())
+                        .collect();
+                    model_ids.sort();
+                    let resolved: Vec<_> = model_ids
+                        .iter()
+                        .filter_map(|selection| config.resolve_model(Some(selection)).ok())
+                        .collect();
+                    ProviderAccountInfo {
+                        id: id.clone(),
+                        provider: account.provider,
+                        display_name: account.display_name,
+                        provider_type: preset.provider_type.wire().to_string(),
+                        base_url: account
+                            .base_url
+                            .or_else(|| preset.default_base_url.map(str::to_string)),
+                        has_api_key: resolved.iter().any(|model| model.api_key.is_some()),
+                        managed: resolved.iter().any(|model| {
+                            model
+                                .base_url
+                                .as_deref()
+                                .is_some_and(atomcode_auth::gateway_crypto::is_atomgit_gateway)
+                        }),
+                        model_ids,
+                        legacy: config.providers.contains_key(&id),
+                    }
+                })
+                .collect();
+            accounts.sort_by(|a, b| a.id.cmp(&b.id));
+            accounts
+        },
         provider_presets: atomcode_config::config::provider_preset::PRESETS
             .iter()
             // AtomGit/CodingPlan is provisioned by `/login`; presenting it as a
@@ -75,7 +117,9 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
                 ),
                 model_source: match preset.model_source {
                     atomcode_config::config::provider_preset::ModelSource::Embedded => "embedded",
-                    atomcode_config::config::provider_preset::ModelSource::DiscoveryApi => "discovery_api",
+                    atomcode_config::config::provider_preset::ModelSource::DiscoveryApi => {
+                        "discovery_api"
+                    }
                     atomcode_config::config::provider_preset::ModelSource::Manual => "manual",
                 }
                 .to_string(),
@@ -249,6 +293,41 @@ mod tests {
             .provider_presets
             .iter()
             .any(|preset| preset.id == "atomgit"));
+        let atomgit = resp
+            .provider_accounts
+            .iter()
+            .find(|account| account.id == "AtomGit")
+            .unwrap();
+        assert_eq!(atomgit.model_ids.len(), 2);
+        assert!(atomgit.managed);
+    }
+
+    #[test]
+    fn config_response_exposes_only_credential_presence_for_accounts() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "taotoken": {
+                    "provider": "openai",
+                    "base_url": "https://taotoken.net/api/v1",
+                    "api_key": "must-not-leave-daemon"
+                }
+            },
+            "models": {
+                "taotoken/model-a": { "account": "taotoken", "model": "model-a" }
+            }
+        }))
+        .unwrap();
+
+        let response = config_response(&config);
+        let account = response
+            .provider_accounts
+            .iter()
+            .find(|account| account.id == "taotoken")
+            .unwrap();
+        assert!(account.has_api_key);
+        assert_eq!(account.model_ids, ["taotoken/model-a"]);
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("must-not-leave-daemon"));
     }
 
     #[test]

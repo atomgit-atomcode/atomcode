@@ -53,10 +53,10 @@ pub struct CodingAgentConfig {
     pub request_timeout: Option<Duration>,
     /// Safety fuse: max edit-then-verify continuations per turn (kernel default is 50).
     pub max_continuations: u32,
-    /// Coarse safety fuse for LLM/tool rounds in one turn (`0` = unbounded).
-    /// This bounds varying-call runaways that the kernel's repetition guards cannot catch.
-    /// It is deliberately generous, produces an explicit incomplete terminal, and may be
-    /// overridden with `ATOMCODE_TURN_MAX_ROUNDS`.
+    /// Optional coarse safety fuse for LLM/tool rounds in one turn (`0` = unbounded).
+    /// Deployments that need an additional varying-call runaway budget can opt in through
+    /// `[coding].max_rounds` or `ATOMCODE_TURN_MAX_ROUNDS`; exact repetition guards remain
+    /// active independently.
     pub max_rounds: u32,
     /// When true, the kernel turns the `max_rounds` cap into an interactive
     /// checkpoint (see AgentBuilder). Default false; only the TUI driver sets it.
@@ -665,7 +665,7 @@ fn default_turn_max_rounds() -> u32 {
     std::env::var("ATOMCODE_TURN_MAX_ROUNDS")
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(200)
+        .unwrap_or(0)
 }
 
 fn default_tool_loop_policy() -> Option<ToolLoopPolicy> {
@@ -815,9 +815,9 @@ mod tests {
     }
 
     #[test]
-    fn round_caps_have_generous_defaults() {
+    fn ordinary_turns_are_unbounded_by_default() {
         let c = CodingAgentConfig::new("k", "https://x/v1", "m", "/tmp");
-        assert_eq!(c.max_rounds, 200);
+        assert_eq!(c.max_rounds, 0);
         // No CodingPlan info at construction → the non-CodingPlan fallback.
         assert_eq!(c.goal_max_rounds, 300);
         // The wall-clock cap is OFF by default (0 = disabled); the goal is bounded

@@ -22,6 +22,7 @@ use serde::{de::IgnoredAny, Deserialize, Serialize};
 use super::presentation::{
     DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole, MAX_PRESENTATION_BYTES,
 };
+use super::transcript::{TurnRecord, RECORD_VERSION};
 
 /// Fast-listing metadata for ONE session — read to populate a `/resume` picker WITHOUT
 /// parsing the (large) snapshot / transcript files. Persisted as `<id>.meta`.
@@ -2859,6 +2860,36 @@ impl SessionManager {
         file.write_all(line).map_err(|e| io_at(&path, e))
     }
 
+    /// Load this session's bounded, append-only turn transcript for display/recall
+    /// projection. A missing transcript is valid for imported or older sessions.
+    pub fn load_transcript_records(&self, id: &str) -> SessionResult<Vec<TurnRecord>> {
+        let path = self.jsonl_path(id)?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(io_at(&path, error)),
+        }
+
+        let mut records = Vec::new();
+        for_each_jsonl_line(&path, |line| {
+            let record: TurnRecord =
+                serde_json::from_slice(line).map_err(|error| SessionStoreError::Corrupt {
+                    kind: "transcript record",
+                    message: format!("{}: {error}", path.display()),
+                })?;
+            if record.v > RECORD_VERSION {
+                return Err(SessionStoreError::FutureSchema {
+                    kind: "transcript record",
+                    found: record.v,
+                    supported: RECORD_VERSION,
+                });
+            }
+            records.push(record);
+            Ok(())
+        })?;
+        Ok(records)
+    }
+
     fn ensure_native_writable(&self, id: &str, operation: &'static str) -> SessionResult<()> {
         match self.read_meta(id) {
             Ok(meta) if meta.owner == StorageOwner::Legacy => {
@@ -4187,6 +4218,34 @@ mod tests {
         // 内容确实被追加写入
         let written = std::fs::read(mgr.jsonl_path(id).unwrap()).unwrap();
         assert_eq!(written, payload);
+    }
+
+    #[test]
+    fn transcript_records_load_with_turn_timestamps_and_missing_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        assert!(mgr.load_transcript_records("missing").unwrap().is_empty());
+
+        let line = serde_json::json!({
+            "v": 1,
+            "ts": 1_700_000_000_123_i64,
+            "iso": "2023-11-14T22:13:20.123Z",
+            "session_id": "s1",
+            "turn_id": 7,
+            "undone": false,
+            "user": "question",
+            "assistant": "answer",
+            "tools": [],
+            "usage": { "prompt": 1, "completion": 2, "cached": 0 }
+        });
+        let mut bytes = serde_json::to_vec(&line).unwrap();
+        bytes.push(b'\n');
+        mgr.append_jsonl_line("s1", &bytes).unwrap();
+
+        let records = mgr.load_transcript_records("s1").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].turn_id, 7);
+        assert_eq!(records[0].ts, 1_700_000_000_123);
     }
 
     fn presentation_entry(anchor: DisplayAnchor, text: &str) -> PresentationEntry {

@@ -422,6 +422,18 @@ export interface ProviderInfo {
   context_window?: number;
 }
 
+export interface ProviderAccountInfo {
+  id: string;
+  provider: string;
+  display_name?: string;
+  type: string;
+  base_url?: string;
+  has_api_key: boolean;
+  model_ids: string[];
+  legacy: boolean;
+  managed: boolean;
+}
+
 export interface ProviderPresetInfo {
   id: string;
   display_name: string;
@@ -450,6 +462,8 @@ export interface ConfigInfo {
   default_provider: string;
   default_workdir?: string;
   providers: ProviderInfo[];
+  /** Reusable connection identities. API keys are intentionally never returned. */
+  provider_accounts?: ProviderAccountInfo[];
   /** Compiled provider catalog shared with the TUI add-provider flow. */
   provider_presets?: ProviderPresetInfo[];
   /** 完成通知配置；旧 daemon 未暴露时为 undefined，前端回退默认值。 */
@@ -597,6 +611,31 @@ export async function createProvider(body: CreateProviderBody): Promise<unknown>
     body: JSON.stringify(body),
   });
   if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error((e as any).error || `HTTP ${r.status}`); }
+  return r.json();
+}
+
+export interface CreateAccountModelBody {
+  selection_id?: string;
+  model: string;
+  display_name?: string;
+  context_window?: number;
+  max_tokens?: number;
+  supports_vision?: boolean;
+}
+
+export async function createModelsForAccount(
+  account: string,
+  models: CreateAccountModelBody[],
+): Promise<{ created: string[]; config: ConfigInfo }> {
+  const r = await fetch(`/provider-accounts/${encodeURIComponent(account)}/models`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ models }),
+  });
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({}));
+    throw new Error((e as { error?: string }).error || `HTTP ${r.status}`);
+  }
   return r.json();
 }
 

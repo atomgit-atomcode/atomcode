@@ -100,7 +100,7 @@ impl Tool for EditFileTool {
         }
         let path = resolve_path(&a.file_path, &ctx.working_dir);
         // Serialize AtomCode edits to the same canonical file. The byte-for-byte
-        // pre-commit check below also detects writers outside this process.
+        // pre-commit check also catches external changes that happen before the check.
         let path_lock = edit_path_lock(&path);
         let _path_guard = path_lock.lock().await;
         let raw = match tokio::fs::read(&path).await {
@@ -269,8 +269,9 @@ async fn write_encoded(
 
 /// Commit an edit only while the file still contains the bytes read at the start of
 /// this tool invocation. This is a process-local locked compare-and-write: other
-/// AtomCode workers serialize on the same canonical path, while external writers are
-/// detected by the comparison and force a safe re-read instead of stale clobbering.
+/// AtomCode workers serialize on the same canonical path. The comparison is an additional
+/// best-effort guard for external writers; because ordinary filesystems do not provide a
+/// portable compare-and-swap write, an unrelated process can still race after the check.
 async fn write_encoded_if_unchanged(
     path: &Path,
     expected: &[u8],

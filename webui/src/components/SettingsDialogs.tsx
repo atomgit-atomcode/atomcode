@@ -7,8 +7,10 @@ import {
   getConfig,
   ConfigInfo,
   ProviderInfo,
+  ProviderAccountInfo,
   ProviderPresetInfo,
   createProvider,
+  createModelsForAccount,
   updateProvider,
   setDefaultProvider,
   deleteProvider,
@@ -266,6 +268,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
   const [config, setConfig] = useState<ConfigInfo | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [addMode, setAddMode] = useState<'preset' | 'custom' | null>(null);
+  const [addingModels, setAddingModels] = useState(false);
   const [editTarget, setEditTarget] = useState<ProviderInfo | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -367,6 +370,12 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
               ))}
             </div>
             <div class="model-provider-add-grid">
+              {(config.provider_accounts?.some((account) => !account.managed) ?? false) && (
+                <button class="model-provider-add" type="button" onClick={() => setAddingModels(true)}>
+                  <span>＋</span>
+                  <span>{t('settings.addModel')}</span>
+                </button>
+              )}
               {(config.provider_presets?.length ?? 0) > 0 && (
                 <button class="model-provider-add" type="button" onClick={() => setAddMode('preset')}>
                   <span>＋</span>
@@ -390,6 +399,17 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
         onClose={() => setAddMode(null)}
         onSaved={() => {
           setAddMode(null);
+          reload();
+        }}
+      />
+    )}
+    {addingModels && config && (
+      <AddAccountModelsDialog
+        accounts={(config.provider_accounts ?? []).filter((account) => !account.managed)}
+        providers={config.providers}
+        onClose={() => setAddingModels(false)}
+        onSaved={() => {
+          setAddingModels(false);
           reload();
         }}
       />
@@ -421,6 +441,208 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
       />
     )}
     </>
+  );
+}
+
+/** Add several model profiles under one existing account without ever
+ * round-tripping its credential through the browser. */
+function AddAccountModelsDialog({
+  accounts,
+  providers,
+  onClose,
+  onSaved,
+}: {
+  accounts: ProviderAccountInfo[];
+  providers: ProviderInfo[];
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const { t } = useSettings();
+  const [accountId, setAccountId] = useState(accounts[0]?.id ?? '');
+  const [models, setModels] = useState<DiscoveredModelInfo[] | null>(null);
+  const [selected, setSelected] = useState<string[]>([]);
+  const [manualModel, setManualModel] = useState('');
+  const [search, setSearch] = useState('');
+  const [contextWindow, setContextWindow] = useState(128000);
+  const [discovering, setDiscovering] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const account = accounts.find((candidate) => candidate.id === accountId);
+  const existingWireModels = new Set(
+    providers
+      .filter((provider) => account?.model_ids.includes(provider.name))
+      .map((provider) => provider.model),
+  );
+  const selectedSet = new Set(selected);
+  const visible = (models ?? [])
+    .filter((candidate) => {
+      const query = search.trim().toLowerCase();
+      return !query
+        || candidate.id.toLowerCase().includes(query)
+        || candidate.name?.toLowerCase().includes(query);
+    })
+    .slice(0, 200);
+
+  const discover = async () => {
+    if (!account?.base_url) {
+      setError(t('settings.fetchNeedsBaseUrl'));
+      return;
+    }
+    setDiscovering(true);
+    setError(null);
+    try {
+      const found = await discoverProviderModels({
+        type: account.type,
+        base_url: account.base_url,
+        provider_name: account.id,
+      });
+      setModels(found);
+      setSelected([]);
+      if (found.length === 0) setError(t('settings.fetchEmpty'));
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDiscovering(false);
+    }
+  };
+
+  const save = async () => {
+    const manual = manualModel.trim();
+    const wireModels = [...selected];
+    if (manual && !wireModels.includes(manual)) wireModels.push(manual);
+    if (wireModels.length === 0) {
+      setError(t('settings.selectAtLeastOneModel'));
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      await createModelsForAccount(
+        accountId,
+        wireModels.map((wireModel) => {
+          const discovered = models?.find((candidate) => candidate.id === wireModel);
+          return {
+            model: wireModel,
+            display_name: discovered?.name,
+            context_window: discovered?.context_window ?? contextWindow,
+            max_tokens: discovered?.max_tokens,
+          };
+        }),
+      );
+      onSaved();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <SettingsModal title={t('settings.addModel')} hideFooter onClose={onClose}>
+      <div class="field-group add-model-form">
+        <div class="add-model-field">
+          <label class="add-model-label">{t('settings.providerAccount')}</label>
+          <Select
+            value={accountId}
+            options={accounts.map((item) => ({
+              value: item.id,
+              label: item.display_name ? `${item.display_name} · ${item.id}` : item.id,
+            }))}
+            onChange={(value) => {
+              setAccountId(value);
+              setModels(null);
+              setSelected([]);
+              setManualModel('');
+              setError(null);
+            }}
+          />
+          {account && (
+            <span class="field-hint">
+              {account.base_url} · {account.has_api_key
+                ? t('settings.reuseSavedApiKey')
+                : t('settings.noSavedApiKey')}
+            </span>
+          )}
+        </div>
+        <div class="add-model-field">
+          <div class="add-model-label-row">
+            <label class="add-model-label">{t('settings.models')}</label>
+            <button class="provider-action-btn" type="button" disabled={discovering} onClick={() => void discover()}>
+              {discovering ? t('settings.fetchingModels') : t('settings.fetchModels')}
+            </button>
+          </div>
+          {models && models.length > 0 && (
+            <div class="model-discovery-picker model-discovery-picker-multi">
+              <input
+                class="menu-input"
+                type="search"
+                placeholder={t('settings.searchModels')}
+                value={search}
+                onInput={(e) => setSearch((e.target as HTMLInputElement).value)}
+              />
+              <div class="model-discovery-summary">
+                {t('settings.selectedModels', { count: selected.length })}
+              </div>
+              <div class="model-discovery-results">
+                {visible.map((candidate) => {
+                  const checked = selectedSet.has(candidate.id);
+                  const selectionId = `${accountId}/${candidate.id}`;
+                  const exists = (account?.model_ids.includes(selectionId) ?? false)
+                    || existingWireModels.has(candidate.id);
+                  return (
+                    <button
+                      key={candidate.id}
+                      class={'model-discovery-option' + (checked ? ' active' : '')}
+                      type="button"
+                      disabled={exists}
+                      onClick={() => setSelected((current) => (
+                        current.includes(candidate.id)
+                          ? current.filter((id) => id !== candidate.id)
+                          : [...current, candidate.id]
+                      ))}
+                    >
+                      <input type="checkbox" tabIndex={-1} checked={checked} disabled={exists} readOnly />
+                      <span>{candidate.name ?? candidate.id}</span>
+                      {candidate.name && <code>{candidate.id}</code>}
+                      {exists && <small>{t('settings.alreadyAdded')}</small>}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+        <div class="add-model-field">
+          <label class="add-model-label">{t('settings.manualModel')}</label>
+          <input
+            class="menu-input"
+            type="text"
+            placeholder="deepseek-chat"
+            value={manualModel}
+            onInput={(e) => setManualModel((e.target as HTMLInputElement).value)}
+          />
+        </div>
+        <div class="add-model-field">
+          <label class="add-model-label">{t('settings.defaultContextWindow')}</label>
+          <Select
+            value={String(contextWindow)}
+            options={CONTEXT_WINDOW_PRESETS.map((value) => ({
+              value: String(value),
+              label: `${fmtContextWindow(value)} tokens`,
+            }))}
+            onChange={(value) => setContextWindow(Number(value))}
+          />
+          <span class="field-hint">{t('settings.discoveredContextPreferred')}</span>
+        </div>
+        {error && <div class="modal-error">{t('settings.addFailed')}: {error}</div>}
+        <div class="add-model-actions">
+          <button class="btn" type="button" onClick={onClose}>{t('settings.close')}</button>
+          <button class="btn btn-primary" type="button" disabled={saving} onClick={() => void save()}>
+            {saving ? t('settings.adding') : t('settings.addSelectedModels')}
+          </button>
+        </div>
+      </div>
+    </SettingsModal>
   );
 }
 

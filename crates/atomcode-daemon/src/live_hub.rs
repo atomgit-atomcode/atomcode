@@ -459,15 +459,12 @@ impl LiveViewHub {
         } else {
             false
         };
-        let receipt = handle
-            .submit(runtime_input)
-            .await
-            .map_err(|error| {
-                if correlation_registered {
-                    self.remove_pending_web_steer(client_input_id.as_deref());
-                }
-                HubError::RuntimeRejected(error.to_string())
-            })?;
+        let receipt = handle.submit(runtime_input).await.map_err(|error| {
+            if correlation_registered {
+                self.remove_pending_web_steer(client_input_id.as_deref());
+            }
+            HubError::RuntimeRejected(error.to_string())
+        })?;
         let receipt_generation = match receipt {
             SubmitReceipt::Started { generation, .. }
             | SubmitReceipt::Steered { generation, .. } => generation,
@@ -841,8 +838,8 @@ impl LiveViewHub {
             }
         }
         if let CodingRuntimeEvent::GoalChanged(progress) = &event {
-            state.goal_progress = (progress.phase != atomcode_coding::GoalPhase::Ended)
-                .then(|| progress.clone());
+            state.goal_progress =
+                (progress.phase != atomcode_coding::GoalPhase::Ended).then(|| progress.clone());
         }
         let mapped_steer = match &event {
             CodingRuntimeEvent::SteerAcknowledged { inputs } => {
@@ -1248,9 +1245,9 @@ mod tests {
     use atomcode_kernel::message::{Message, SessionSnapshot};
 
     use super::{
-        correlate_web_steers_locked, map_session_transition_error,
-        redact_correlated_steer_images, session_change_is_noop, HubError, HubState, LiveBinding,
-        LiveRuntimeControl, LiveViewEvent, LiveViewHub, PendingWebSteer,
+        correlate_web_steers_locked, map_session_transition_error, redact_correlated_steer_images,
+        session_change_is_noop, HubError, HubState, LiveBinding, LiveRuntimeControl, LiveViewEvent,
+        LiveViewHub, PendingWebSteer,
     };
 
     #[test]
@@ -1675,9 +1672,7 @@ mod tests {
             (1, CodingRuntimeEvent::Agent(AgentEvent::TurnStarted)),
             (
                 2,
-                CodingRuntimeEvent::Agent(AgentEvent::PolicyIntervention {
-                    intervention,
-                }),
+                CodingRuntimeEvent::Agent(AgentEvent::PolicyIntervention { intervention }),
             ),
         ] {
             hub.publish(
@@ -1746,9 +1741,7 @@ mod tests {
             (1, CodingRuntimeEvent::Agent(AgentEvent::TurnStarted)),
             (
                 2,
-                CodingRuntimeEvent::Agent(AgentEvent::PolicyIntervention {
-                    intervention,
-                }),
+                CodingRuntimeEvent::Agent(AgentEvent::PolicyIntervention { intervention }),
             ),
             (
                 3,
@@ -2072,8 +2065,13 @@ mod tests {
         assert!(!hub.turn_in_progress());
 
         let (control, _) = control();
-        hub.bind("session-1", PathBuf::from("/one"), snapshot("old"), control.clone())
-            .unwrap();
+        hub.bind(
+            "session-1",
+            PathBuf::from("/one"),
+            snapshot("old"),
+            control.clone(),
+        )
+        .unwrap();
         // Ready phase, no active turn → a provider reload is safe.
         assert!(!hub.turn_in_progress());
 

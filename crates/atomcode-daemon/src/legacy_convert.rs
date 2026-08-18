@@ -4,6 +4,7 @@ use atomcode_kernel::message::{
 };
 use serde::{Deserialize, Serialize};
 
+use atomcode_capabilities::session::manager::SessionOrigin;
 use atomcode_capabilities::session::manager::{NativeImportCommitOutcome, META_VERSION};
 use atomcode_capabilities::session::presentation::PRESENTATION_VERSION;
 use atomcode_capabilities::session::{
@@ -11,7 +12,6 @@ use atomcode_capabilities::session::{
     PresentationEntry, PresentationFile, PresentationRole, SessionLease, SessionManager,
     SessionMeta, SessionResult, SessionStoreError, StorageOwner, TurnStat,
 };
-use atomcode_capabilities::session::manager::SessionOrigin;
 
 /// In-memory result of the one legacy → native conversion. S2b owns persistence
 /// and commit; keeping this function side-effect free makes conversion testable.
@@ -3707,9 +3707,8 @@ mod tests {
         let id = "preview-sixmsgs";
         let manager = SessionManager::with_root(root.path().join(bucket));
         let lease = manager.acquire_lease(id).unwrap();
-        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user(
-            "anchor",
-        )]);
+        let snapshot =
+            atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user("anchor")]);
         let mut meta = SessionMeta::new(id, "/project", 1);
         meta.owner = StorageOwner::Native;
         meta.message_count = 1;
@@ -3761,9 +3760,9 @@ mod tests {
         let id = "preview-native";
         let manager = SessionManager::with_root(root.path().join(bucket));
         let lease = manager.acquire_lease(id).unwrap();
-        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
-            KernelMessage::user("snapshot must not be loaded"),
-        ]);
+        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user(
+            "snapshot must not be loaded",
+        )]);
         let mut meta = SessionMeta::new(id, "/project", 1);
         meta.owner = StorageOwner::Native;
         meta.message_count = 1;
@@ -3830,14 +3829,12 @@ mod tests {
         assert_eq!(preview.provider_id.as_deref(), Some("provider-new"));
         assert_eq!(preview.model_id.as_deref(), Some("model-new"));
         assert_eq!(preview.excerpt.len(), 6);
-        assert_eq!(
-            preview.excerpt.first().map(String::as_str),
-            Some("line-4")
-        );
+        assert_eq!(preview.excerpt.first().map(String::as_str), Some("line-4"));
         assert_eq!(preview.excerpt.last().map(String::as_str), Some("tail"));
-        assert!(preview.excerpt.iter().all(|line| {
-            !line.chars().any(char::is_control) && !line.contains("[31m")
-        }));
+        assert!(preview
+            .excerpt
+            .iter()
+            .all(|line| { !line.chars().any(char::is_control) && !line.contains("[31m") }));
     }
 
     #[test]
@@ -3871,10 +3868,8 @@ mod tests {
 
         let file = std::fs::File::create(&presentation_path).unwrap();
         file.set_len(
-            u64::try_from(
-                atomcode_capabilities::session::presentation::MAX_PRESENTATION_BYTES + 1,
-            )
-            .unwrap(),
+            u64::try_from(atomcode_capabilities::session::presentation::MAX_PRESENTATION_BYTES + 1)
+                .unwrap(),
         )
         .unwrap();
         let oversized =

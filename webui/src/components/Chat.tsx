@@ -1409,11 +1409,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     // snapshot：确立实时会话 id 并把视图切到它（连上即对齐）。
     if (e.type === 'snapshot') {
       liveSessionIdRef.current = e.session_id || null;
-      // bot review P2: live 快照路径后端 MessageInfo.created_at 固为 None
-      // (live_api.rs 的 From impl 未注入),与 /chat 历史加载路径不一致。
-      // 此处在前端注入 Date.now() 作为每条快照消息的 ts,让快照消息也显示时间标签,
-      // 与历史加载路径行为一致 (后者用 session.updated_at * 1000 近似)。
-      const loaded = sessionMessagesToDisplay(e.messages).map(m => ({ ...m, ts: m.ts ?? Date.now() }));
+      // Historical timestamps come from the daemon's native transcript projection.
+      // Older sessions may not have transcript records; leave those timestamps absent
+      // instead of relabelling the whole conversation with the reconnect wall clock.
+      const loaded = sessionMessagesToDisplay(e.messages);
       // Live snapshot (session switch / reconnect) → start at the bottom.
       atBottomRef.current = true;
       // A persisted snapshot does not carry live activity. Replay emits the

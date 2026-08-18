@@ -2820,7 +2820,7 @@ body {
 }
 .model-provider-add-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 14px;
 }
 .model-provider-add {
@@ -2892,6 +2892,28 @@ body {
   gap: 3px;
   max-height: 220px;
   overflow-y: auto;
+}
+
+.model-discovery-picker-multi .model-discovery-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+}
+
+.model-discovery-picker-multi .model-discovery-option input {
+  pointer-events: none;
+}
+
+.model-discovery-picker-multi .model-discovery-option small {
+  color: var(--text-muted);
+}
+
+.model-discovery-summary {
+  color: var(--text-muted);
+  font-size: .82rem;
+  padding: 4px 2px 0;
 }
 
 .model-discovery-option {

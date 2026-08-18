@@ -115,7 +115,7 @@ pub struct ToolsConfig {
 impl Default for CodingConfig {
     fn default() -> Self {
         Self {
-            max_rounds: 200,
+            max_rounds: 0,
             shell_guard_policy: ShellGuardPolicy::Prompt,
         }
     }
@@ -252,7 +252,7 @@ pub struct Config {
     /// TOML section is `[loop_config]` (bare `loop` is a Rust keyword).
     #[serde(default)]
     pub loop_config: LoopConfig,
-    /// `[coding]` turn-level policy. Missing from older configs → max_rounds=200.
+    /// `[coding]` turn-level policy. Missing from older configs → max_rounds=0 (unbounded).
     #[serde(default)]
     pub coding: CodingConfig,
     /// Tool-specific behavior. Missing from older configs keeps todo enabled with
@@ -1375,6 +1375,22 @@ fn migrate_legacy_lsp_default(cfg: &mut Config) {
     }
 }
 
+/// Compatibility migration for configs written while the ordinary coding-turn
+/// default was 200 rounds. Setup/config persistence serialized that default,
+/// so changing [`CodingConfig::default`] alone would leave existing installs on
+/// the retired cap forever. Treat the exact former default as auto-written and
+/// move it to the new unbounded default. Other explicit budgets remain intact.
+///
+/// As with the LSP default migration above, intent cannot be distinguished
+/// without a historical schema-version marker: a user who deliberately chose
+/// exactly 200 must set it again after upgrading. `ATOMCODE_TURN_MAX_ROUNDS=200`
+/// remains an unambiguous opt-in and is applied after this migration.
+fn migrate_legacy_coding_round_default(cfg: &mut Config) {
+    if cfg.coding.max_rounds == 200 {
+        cfg.coding.max_rounds = 0;
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1709,6 +1725,7 @@ impl Config {
         let mut config: Config = toml::from_str(content)
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
         migrate_legacy_lsp_default(&mut config);
+        migrate_legacy_coding_round_default(&mut config);
         Ok(config)
     }
 
@@ -1746,6 +1763,7 @@ impl Config {
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
         config.quarantined_providers = quarantined;
         migrate_legacy_lsp_default(&mut config);
+        migrate_legacy_coding_round_default(&mut config);
         if config
             .quarantined_providers
             .contains_key(&config.default_provider)
@@ -2550,6 +2568,24 @@ model = "missing-type"
         migrate_legacy_lsp_default(&mut cfg);
         assert!(!cfg.lsp.enabled);
         assert!(!cfg.lsp.auto_detect);
+    }
+
+    #[test]
+    fn migrate_auto_written_coding_round_cap_to_unbounded() {
+        let mut cfg = Config::with_default_provider("x");
+        cfg.coding.max_rounds = 200;
+        migrate_legacy_coding_round_default(&mut cfg);
+        assert_eq!(cfg.coding.max_rounds, 0);
+    }
+
+    #[test]
+    fn migrate_keeps_custom_coding_round_caps() {
+        for expected in [0, 199, 500] {
+            let mut cfg = Config::with_default_provider("x");
+            cfg.coding.max_rounds = expected;
+            migrate_legacy_coding_round_default(&mut cfg);
+            assert_eq!(cfg.coding.max_rounds, expected);
+        }
     }
 
     fn blank_config_with_lsp(lsp: LspConfig) -> Config {
