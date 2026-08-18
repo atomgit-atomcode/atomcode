@@ -1812,11 +1812,6 @@ const ATOMCODE_PERSONA_PREFIX: &str =
     "You are AtomCode, an AI coding agent by AtomGit running the ";
 const MODEL_CHANGE_CONTEXT_PREFIX: &str = "=== MODEL CHANGE ===";
 
-fn persona_model(text: &str) -> Option<&str> {
-    text.strip_prefix(ATOMCODE_PERSONA_PREFIX)
-        .and_then(|rest| rest.split_once(" model.").map(|(model, _)| model))
-}
-
 /// Legacy drivers persist conversation history without the separately supplied
 /// system prompt. A v2 resume must restore that prompt, while a model switch must
 /// replace the old model identity instead of retaining or duplicating it.
@@ -1842,22 +1837,6 @@ fn reconcile_coding_persona(
     let is_model_change = |message: &Message| {
         message.role == Role::System && message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX)
     };
-    let previous_model = snapshot
-        .messages
-        .iter()
-        .find(|message| is_persona(message))
-        .and_then(|message| persona_model(&message.text))
-        .map(str::to_owned);
-    let retained_model_change = if previous_model.as_deref() == Some(cfg.model.as_str()) {
-        snapshot
-            .messages
-            .iter()
-            .rev()
-            .find(|message| is_model_change(message))
-            .cloned()
-    } else {
-        None
-    };
     let already_current = snapshot
         .messages
         .first()
@@ -1872,7 +1851,7 @@ fn reconcile_coding_persona(
             .iter()
             .filter(|message| is_model_change(message))
             .count()
-            <= 1;
+            == 0;
     if already_current {
         return;
     }
@@ -1881,14 +1860,6 @@ fn reconcile_coding_persona(
         .messages
         .retain(|message| !is_persona(message) && !is_model_change(message));
     snapshot.messages.insert(0, Message::system(persona));
-    if let Some(previous_model) = previous_model.filter(|previous| previous != &cfg.model) {
-        snapshot.messages.push(Message::system(format!(
-            "{MODEL_CHANGE_CONTEXT_PREFIX}\nThe active model changed from {previous_model} to {model}. From this point onward, {model} is the current model. Treat any earlier assistant claim about its model identity as historical context, not the current runtime identity.",
-            model = cfg.model
-        )));
-    } else if let Some(model_change) = retained_model_change {
-        snapshot.messages.push(model_change);
-    }
     snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
 }
 
@@ -2107,25 +2078,16 @@ mod tests {
             .text
             .contains("running the deepseek-v4-flash model"));
         assert!(!snapshot.messages[0].text.contains("old-model"));
-        let transitions: Vec<_> = snapshot
+        assert!(!snapshot
             .messages
             .iter()
-            .filter(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX))
-            .collect();
-        assert_eq!(transitions.len(), 1);
-        assert!(transitions[0].text.contains("old-model"));
-        assert!(transitions[0].text.contains("deepseek-v4-flash"));
-        assert_eq!(
-            snapshot.messages.last(),
-            transitions.first().copied(),
-            "the model-change boundary must be the most recent system context"
-        );
+            .any(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX)));
         assert_eq!(snapshot.cache_epoch, 1);
     }
 
     #[test]
     #[serial_test::serial(offline_verdict)]
-    fn repeated_model_switch_keeps_one_current_transition_boundary() {
+    fn repeated_model_switch_keeps_system_context_leading() {
         atomcode_config::config::offline::reset_offline_verdict_for_test();
         let _rui_guard = std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
         let mut snapshot = SessionSnapshot::new(vec![
@@ -2134,6 +2096,7 @@ mod tests {
                 crate::persona::todo_switch_enabled(),
                 crate::persona::request_user_input_switch_enabled(),
             )),
+            Message::system("=== SESSION CONTEXT ===\nworkspace state"),
             Message::user("what model are you?"),
             Message::assistant("I am model-a", vec![]),
         ]);
@@ -2141,16 +2104,28 @@ mod tests {
         reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true, true);
         reconcile_coding_persona(&mut snapshot, &agent_config("model-c"), true, true, true, true);
 
-        let transitions: Vec<_> = snapshot
+        assert!(snapshot.messages[0]
+            .text
+            .contains("running the model-c model"));
+        assert_eq!(
+            snapshot.messages[1].text,
+            "=== SESSION CONTEXT ===\nworkspace state"
+        );
+        let first_non_system = snapshot
             .messages
             .iter()
-            .filter(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX))
-            .collect();
-        assert_eq!(transitions.len(), 1);
-        assert!(transitions[0].text.contains("model-b"));
-        assert!(transitions[0].text.contains("model-c"));
-        assert!(!transitions[0].text.contains("model-a"));
-        assert_eq!(snapshot.messages.last(), transitions.first().copied());
+            .position(|message| message.role != Role::System)
+            .expect("user history remains after the leading system block");
+        assert_eq!(first_non_system, 2);
+        assert!(snapshot.messages[first_non_system..]
+            .iter()
+            .all(|message| message.role != Role::System));
+        assert_eq!(snapshot.messages[first_non_system].text, "what model are you?");
+        assert_eq!(snapshot.messages[first_non_system + 1].text, "I am model-a");
+        assert!(!snapshot
+            .messages
+            .iter()
+            .any(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX)));
     }
 
     #[test]
@@ -2216,7 +2191,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial(offline_verdict)]
-    fn language_switch_preserves_existing_model_change_boundary() {
+    fn language_switch_removes_legacy_model_change_boundary() {
         use atomcode_config::locale::Locale;
 
         atomcode_config::config::offline::reset_offline_verdict_for_test();
@@ -2230,21 +2205,18 @@ mod tests {
             Message::assistant("I am model-a", vec![]),
         ]);
         reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true, true);
-        let transition = snapshot.messages.last().cloned().unwrap();
+        snapshot.messages.push(Message::system(format!(
+            "{MODEL_CHANGE_CONTEXT_PREFIX}\nlegacy transition"
+        )));
         let mut cfg = agent_config("model-b");
         cfg.preferred_language = Some(Locale::ZhCn);
 
         reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, true);
 
-        assert_eq!(snapshot.messages.last(), Some(&transition));
-        assert_eq!(
-            snapshot
-                .messages
-                .iter()
-                .filter(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX))
-                .count(),
-            1
-        );
+        assert!(!snapshot
+            .messages
+            .iter()
+            .any(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX)));
     }
 
     #[tokio::test]

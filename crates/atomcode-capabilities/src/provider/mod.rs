@@ -99,13 +99,14 @@ fn wire_dump_to(dir: &std::path::Path, model: &str, body: &Value) {
 /// `memory.md` + any future capability), but many OpenAI-compatible models / chat
 /// templates accept only a SINGLE system message — extra ones are rejected outright or
 /// silently honor just the first (dropping memory). Both `role:"system"`-on-the-wire
-/// adapters (OpenAI-compatible and Ollama) route their `Role::System` arm through here so
-/// a model never sees more than one. (The Anthropic adapter instead lifts+joins all System
-/// messages into the top-level `system` field — same guarantee, different wire shape.)
+/// adapters use this helper so a model never sees more than one: OpenAI-compatible first
+/// lifts every System message into a leading block, while Ollama coalesces the leading
+/// contiguous run. (The Anthropic adapter instead lifts+joins all System messages into the
+/// top-level `system` field — same guarantee, different wire shape.)
 ///
-/// Coalescing is over CONSECUTIVE system entries only; in practice every System message is
-/// leading and contiguous, so this yields exactly one leading system block. It is pure and
-/// deterministic, so the outgoing prefix stays byte-stable across rounds (cache-safe).
+/// This helper itself coalesces CONSECUTIVE system entries only; callers that accept legacy
+/// late System messages must lift them before calling it. It is pure and deterministic, so
+/// the outgoing prefix stays byte-stable across rounds (cache-safe).
 pub(crate) fn push_system_coalesced(out: &mut Vec<Value>, text: &str) {
     if let Some(last) = out.last_mut() {
         if last.get("role").and_then(Value::as_str) == Some("system") {

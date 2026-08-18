@@ -881,11 +881,16 @@ fn format_messages(
     supports_vision: bool,
 ) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
+    // Strict OpenAI-compatible chat templates (including Qwen/vLLM) require
+    // system instructions to precede the conversation and often accept only
+    // one system entry. Old snapshots can still contain late system context,
+    // so lift and coalesce it before preserving the remaining message order.
+    for m in messages.iter().filter(|m| m.role == Role::System) {
+        super::push_system_coalesced(&mut out, &m.text);
+    }
     for m in messages {
         match m.role {
-            // Coalesce consecutive system messages into ONE wire entry — many
-            // OpenAI-compatible models accept only a single system message.
-            Role::System => super::push_system_coalesced(&mut out, &m.text),
+            Role::System => continue,
             Role::User => {
                 if m.images.is_empty() || !supports_vision {
                     // Text-only (no images), OR a vision-incapable target: `content`
@@ -2011,6 +2016,28 @@ mod tests {
         );
         assert_eq!(out[1], json!({"role":"user","content":"hi"}));
         assert_eq!(out.len(), 2, "exactly one system + one user");
+    }
+
+    #[test]
+    fn lifts_and_coalesces_late_system_messages_for_strict_templates() {
+        let msgs = vec![
+            Message::system("persona"),
+            Message::user("hi"),
+            Message::assistant("answer", vec![]),
+            Message::system("legacy model change"),
+            Message::user("continue"),
+        ];
+
+        let out = format_messages(&msgs, ReasoningPolicy::Exclude, true);
+
+        assert_eq!(
+            out[0],
+            json!({"role":"system","content":"persona\n\nlegacy model change"})
+        );
+        assert_eq!(out.iter().filter(|v| v["role"] == "system").count(), 1);
+        assert!(out.iter().skip(1).all(|v| v["role"] != "system"));
+        assert_eq!(out[1], json!({"role":"user","content":"hi"}));
+        assert_eq!(out[3], json!({"role":"user","content":"continue"}));
     }
 
     #[test]
