@@ -34,10 +34,12 @@ function areModelsEqual(a: ModelInfo[], b: ModelInfo[]): boolean {
 
 export function ModelSelector({
   value,
+  liveEffort,
   onChange,
   onDefaultChange,
 }: {
   value: string | null;
+  liveEffort?: string | null;
   onChange: (p: string) => void;
   onDefaultChange?: (p: string) => void;
 }) {
@@ -98,6 +100,9 @@ export function ModelSelector({
   // Switching models resets the effort display back to the new model's
   // persisted value (and hides the selector entirely for non-V4 models).
   useEffect(() => { setEffortOverride(undefined); }, [current?.provider]);
+  useEffect(() => {
+    if (liveEffort !== undefined) setEffortOverride(liveEffort);
+  }, [liveEffort]);
   const effort = effortOverride !== undefined ? effortOverride : (current?.reasoning_effort ?? null);
   const effortLabel = (v: string | null): string => {
     const o = EFFORT_OPTIONS.find((x) => x.val === v) ?? EFFORT_OPTIONS[0];

@@ -71,6 +71,15 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::Max => "max",
+        }
+    }
+
     /// Parse a config string (`"low"|"medium"|"high"|"max"`, case-insensitive) into an
     /// effort level. `None`/empty/`"off"` ⇒ `None` (no opinion); an UNKNOWN value also ⇒
     /// `None` (effort is a non-critical optimization — unlike `reasoning_history`, a typo

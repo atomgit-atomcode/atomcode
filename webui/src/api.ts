@@ -811,6 +811,7 @@ export interface PolicyInterventionEvent {
 export type LiveWireEvent =
   | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; mode: ApprovalMode }
   | { type: 'provider'; provider: string }
+  | { type: 'reasoning_effort'; provider: string; effort: string | null; applicable: boolean }
   | { type: 'mode'; mode: ApprovalMode }
   | { type: 'user'; text: string; images?: ImageData[]; client_input_id?: string }
   | { type: 'text'; content: string }

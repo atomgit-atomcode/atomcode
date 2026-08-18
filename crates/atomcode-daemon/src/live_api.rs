@@ -660,6 +660,12 @@ pub(crate) enum LiveWireEvent {
     },
     #[serde(rename = "provider")]
     Provider { provider: String },
+    #[serde(rename = "reasoning_effort")]
+    ReasoningEffort {
+        provider: String,
+        effort: Option<String>,
+        applicable: bool,
+    },
     /// 审批模式切换（build / accept_edits / bypass / plan）——
     /// webui 各 tab 的「模式」pill 据此同步。
     #[serde(rename = "mode")]
@@ -1053,6 +1059,15 @@ impl NativeLiveWireProjector {
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ProviderChanged {
                 provider, ..
             }) => LiveWireEvent::Provider { provider },
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::ReasoningEffortChanged {
+                provider,
+                effort,
+                applicable,
+            }) => LiveWireEvent::ReasoningEffort {
+                provider,
+                effort: effort.map(|value| value.as_str().to_string()),
+                applicable,
+            },
             crate::live_hub::LiveViewEvent::Runtime(Runtime::SessionNameSuggested { name }) => {
                 LiveWireEvent::SessionRenamed {
                     session_id: self.session_id.clone(),

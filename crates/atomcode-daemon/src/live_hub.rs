@@ -2402,6 +2402,47 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_event_is_not_dropped_for_the_same_provider() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind_with_provider(
+                "session-1",
+                PathBuf::from("/one"),
+                "provider-a",
+                "fingerprint-a",
+                snapshot("committed"),
+                control,
+            )
+            .unwrap();
+        let mut receiver = hub.join().unwrap().receiver;
+
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 1,
+                event: CodingRuntimeEvent::ReasoningEffortChanged {
+                    provider: "provider-a".into(),
+                    effort: Some(atomcode_kernel::provider::ReasoningEffort::High),
+                    applicable: true,
+                },
+            },
+        )
+        .unwrap();
+
+        let observation = receiver.try_recv().expect("effort change must be broadcast");
+        assert!(matches!(
+            observation.event,
+            LiveViewEvent::Runtime(CodingRuntimeEvent::ReasoningEffortChanged {
+                ref provider,
+                effort: Some(atomcode_kernel::provider::ReasoningEffort::High),
+                applicable: true
+            }) if provider == "provider-a"
+        ));
+    }
+
+    #[test]
     fn authoritative_rebind_replaces_snapshot_and_invalidates_old_requests() {
         let hub = LiveViewHub::new();
         let (control, _) = control();

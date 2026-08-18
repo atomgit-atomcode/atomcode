@@ -11125,6 +11125,39 @@ mod external_config_tests {
     }
 
     #[test]
+    fn delayed_effort_projection_updates_only_its_provider() {
+        let mut config = config("old-model", false);
+        config.providers.insert(
+            "next".into(),
+            ProviderConfig {
+                model: "next-model".into(),
+                ..config.providers["main"].clone()
+            },
+        );
+        config.providers.get_mut("main").unwrap().reasoning_effort = Some("medium".into());
+        let mut visible_effort = Some("medium".to_string());
+
+        project_reasoning_effort(
+            &mut config,
+            "main",
+            &mut visible_effort,
+            "next",
+            Some(atomcode_kernel::provider::ReasoningEffort::High),
+            true,
+        );
+
+        assert_eq!(visible_effort.as_deref(), Some("medium"));
+        assert_eq!(
+            config.providers["main"].reasoning_effort.as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            config.providers["next"].reasoning_effort.as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
     fn persisted_default_update_does_not_retarget_a_pinned_open_session() {
         let opened = config("opened-model", false);
         let mut next_default = opened.clone();
@@ -22377,8 +22410,11 @@ fn handle_runtime_event(
 ) {
     match event {
         bg_runtime::RuntimeEventPayload::SequencedNative(envelope) => {
-            let is_provider_changed =
-                matches!(&envelope.event, CodingRuntimeEvent::ProviderChanged { .. });
+            let is_provider_changed = matches!(
+                &envelope.event,
+                CodingRuntimeEvent::ProviderChanged { .. }
+                    | CodingRuntimeEvent::ReasoningEffortChanged { .. }
+            );
             let current_generation = ctx.runtime.current_generation();
             if !sequenced_event_matches_provider_generation(
                 is_provider_changed,
@@ -22405,6 +22441,15 @@ fn handle_runtime_event(
                 {
                     renderer.flush();
                 }
+                return;
+            }
+            if let CodingRuntimeEvent::ReasoningEffortChanged {
+                provider,
+                effort,
+                applicable,
+            } = &envelope.event
+            {
+                apply_reasoning_effort_projection(ctx, provider, *effort, *applicable);
                 return;
             }
             handle_runtime_event(
@@ -23089,6 +23134,14 @@ fn handle_runtime_event(
                             renderer.flush();
                         }
                     }
+                    return;
+                }
+                CodingRuntimeEvent::ReasoningEffortChanged {
+                    provider,
+                    effort,
+                    applicable,
+                } => {
+                    apply_reasoning_effort_projection(ctx, &provider, effort, applicable);
                     return;
                 }
                 CodingRuntimeEvent::ProviderReloadFinished(Err(error)) => {
@@ -29141,6 +29194,48 @@ fn sync_reasoning_effort_from_provider(ctx: &mut LoopCtx) {
     } else {
         None
     };
+}
+
+fn apply_reasoning_effort_projection(
+    ctx: &mut LoopCtx,
+    provider: &str,
+    effort: Option<atomcode_kernel::provider::ReasoningEffort>,
+    applicable: bool,
+) {
+    project_reasoning_effort(
+        &mut ctx.config,
+        &ctx.provider_selection,
+        &mut ctx.reasoning_effort,
+        provider,
+        effort,
+        applicable,
+    );
+}
+
+fn project_reasoning_effort(
+    config: &mut Config,
+    active_provider: &str,
+    active_effort: &mut Option<String>,
+    provider: &str,
+    effort: Option<atomcode_kernel::provider::ReasoningEffort>,
+    applicable: bool,
+) {
+    let runtime_effort = effort.map(|value| value.as_str().to_string());
+    // Keep `/effort`, Ctrl+T and the footer on one local projection. `auto` is
+    // the config sentinel for a supported endpoint using its API default.
+    let persisted = if applicable {
+        runtime_effort
+            .clone()
+            .or_else(|| Some("auto".to_string()))
+    } else {
+        None
+    };
+    config.update_selection_reasoning(provider, |fields| {
+        fields.reasoning_effort.clone_from(&persisted)
+    });
+    if active_provider == provider {
+        *active_effort = runtime_effort;
+    }
 }
 
 /// Persist the current reasoning_effort to config.toml

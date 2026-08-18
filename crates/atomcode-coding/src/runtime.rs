@@ -114,6 +114,14 @@ pub enum CodingRuntimeEvent {
         provider: String,
         model: String,
     },
+    /// The active runtime adopted a new reasoning-effort setting. This is
+    /// separate from `ProviderChanged`: effort can change while provider/model
+    /// identity stays the same.
+    ReasoningEffortChanged {
+        provider: String,
+        effort: Option<atomcode_kernel::provider::ReasoningEffort>,
+        applicable: bool,
+    },
     ProviderUnavailable {
         reason: ProviderUnavailableReason,
         forced: bool,
@@ -4412,6 +4420,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                 compaction_suspended = false;
                                 let provider = runtime.config.provider_name.clone();
                                 let model = runtime.config.model.clone();
+                                let reasoning_effort = runtime.config.chat_options.reasoning_effort;
+                                let reasoning_effort_applicable =
+                                    runtime.config.supports_reasoning_effort;
                                 replay_pending_resume_prompt(
                                     &agent,
                                     Some(&mut runtime),
@@ -4430,7 +4441,17 @@ fn spawn_runtime_owner_with_optional_agent(
                                     );
                                 }
                                 let _ = runtime_event_tx.send(
-                                    CodingRuntimeEvent::ProviderChanged { provider, model },
+                                    CodingRuntimeEvent::ProviderChanged {
+                                        provider: provider.clone(),
+                                        model,
+                                    },
+                                );
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::ReasoningEffortChanged {
+                                        provider,
+                                        effort: reasoning_effort,
+                                        applicable: reasoning_effort_applicable,
+                                    },
                                 );
                                 let _ = runtime_event_tx.send(
                                     CodingRuntimeEvent::Reconfigured {
@@ -13218,6 +13239,7 @@ mod tests {
         let first = runtime.events.recv().await.unwrap();
         let second = runtime.events.recv().await.unwrap();
         let third = runtime.events.recv().await.unwrap();
+        let fourth = runtime.events.recv().await.unwrap();
         assert_eq!(first.generation, 0);
         assert!(matches!(
             first.event,
@@ -13234,11 +13256,24 @@ mod tests {
         assert_eq!(third.generation, 1);
         assert!(matches!(
             third.event,
+            CodingRuntimeEvent::ReasoningEffortChanged {
+                ref provider,
+                effort: None,
+                applicable: false
+            } if provider == "next-provider"
+        ));
+        assert_eq!(fourth.generation, 1);
+        assert!(matches!(
+            fourth.event,
             CodingRuntimeEvent::Reconfigured {
                 operation: ReconfigureKind::Provider
             }
         ));
-        assert!(first.sequence < second.sequence && second.sequence < third.sequence);
+        assert!(
+            first.sequence < second.sequence
+                && second.sequence < third.sequence
+                && third.sequence < fourth.sequence
+        );
         runtime.handle.shutdown().await.unwrap();
     }
 

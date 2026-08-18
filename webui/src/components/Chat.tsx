@@ -564,6 +564,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   // 正在拉取某会话历史：用于抑制落地页，避免切到「有内容的会话」时先闪一下落地页。
   const [loading, setLoading] = useState(false);
   const [provider, setProvider] = useState<string | null>(null);
+  const [reasoningEffort, setReasoningEffort] = useState<{
+    provider: string;
+    effort: string | null;
+  } | null>(null);
   const providerRef = useRef<string | null>(null);
   const providerPinnedRef = useRef(false);
   const followDefaultProvider = useCallback((name: string) => {
@@ -1465,6 +1469,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       providerRef.current = e.provider;
       setProvider(e.provider);
       providerPinnedRef.current = false;
+      return;
+    }
+    if (e.type === 'reasoning_effort') {
+      if (providerRef.current === e.provider) {
+        setReasoningEffort({ provider: e.provider, effort: e.effort });
+      }
       return;
     }
     // 审批模式切换是进程级（另一 tab / 未来 TUI）→ 始终同步 pill。
@@ -3145,6 +3155,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           />
           <ModelSelector
             value={provider}
+            liveEffort={reasoningEffort?.provider === provider ? reasoningEffort.effort : undefined}
             onChange={(p) => switchProvider(p)}
             onDefaultChange={followDefaultProvider}
           />
