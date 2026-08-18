@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use atomcode_capabilities::reminder::synthetic_system_reminder;
 use atomcode_capabilities::tools::todo::{
-    derive_current_todos, render_todos_numbered, TodoItem, TodoStatus,
+    derive_current_todos, is_todo_plan, render_todos_numbered, TodoItem, TodoStatus,
 };
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::{Conversation, Message, Role};
@@ -308,6 +308,33 @@ actually working on as in_progress (`{\"action\":\"update\",\"id\":<id>,\"status
     None
 }
 
+/// The static "how to drive the list with `todowrite`" rules. These are CONSTANT
+/// guidance — the model already has them from the persona and from the round right
+/// after it (re)plans — so re-sending them on every execution round is pure wasted
+/// cache (~170 tokens/round of never-cached tail). Rides the reminder only when the
+/// model JUST wrote a full list (see `just_wrote_full_list`).
+const TODO_DRIVE_RULES: &str = "\n\
+- The MOMENT you START an item: `todowrite` with `{\"action\":\"update\",\"id\":<id>,\"status\":\"in_progress\"}`.\n\
+- The MOMENT you FINISH an item: `todowrite` with `{\"action\":\"update\",\"id\":<id>,\"status\":\"completed\"}` (do not leave a done item showing incomplete).\n\
+- Update ONE item at a time (the `{\"action\":...}` shape) — do NOT resend the whole `todos` list for a single status change (the full list is only for the initial plan or a full re-plan).\n\
+- Do NOT stop, summarize, or hand back while ANY item is still pending or in_progress — keep working through them, unless you truly need approval, are genuinely stuck, or the request is ambiguous.";
+
+/// True iff the model's most recent tool-using action was a FULL `todowrite` list
+/// (re)plan, as opposed to a single `todo` status update or a non-todo action. Used to
+/// ride [`TODO_DRIVE_RULES`] only right after a (re)plan — the round where the model
+/// most needs the "how to update as you go" guidance — instead of every round.
+fn just_wrote_full_list(messages: &[Message]) -> bool {
+    messages
+        .iter()
+        .rev()
+        .find(|m| !m.tool_calls.is_empty())
+        .is_some_and(|m| {
+            m.tool_calls
+                .iter()
+                .any(|c| c.name == "todowrite" && is_todo_plan(&c.arguments))
+        })
+}
+
 #[async_trait]
 impl LifecycleHooks for TodoHook {
     async fn pre_request(&self, messages: &mut Vec<Message>, _ctx: &TurnCtx) {
@@ -319,16 +346,19 @@ impl LifecycleHooks for TodoHook {
         // the pretty version). Tail-append so the cached prefix is preserved.
         // The anchor line (mid-work drift backstop) leads, so the current in_progress
         // pointer is the first thing the model sees — above the list and the rules.
+        // The anchor + list ride EVERY round (the per-round drift backstop); the static
+        // drive rules ride ONLY right after a (re)plan, to stop wasting cache re-sending
+        // constant guidance every execution round.
         let anchor = todo_anchor_line(&todos)
             .map(|a| format!("{a}\n\n"))
             .unwrap_or_default();
+        let rules = if just_wrote_full_list(messages) {
+            TODO_DRIVE_RULES
+        } else {
+            ""
+        };
         let body = format!(
-            "{anchor}Current task list (each line is `#<id> <task>`) — keep it accurate and finish it:\n\
-- The MOMENT you START an item: `todowrite` with `{{\"action\":\"update\",\"id\":<id>,\"status\":\"in_progress\"}}`.\n\
-- The MOMENT you FINISH an item: `todowrite` with `{{\"action\":\"update\",\"id\":<id>,\"status\":\"completed\"}}` (do not leave a done item showing incomplete).\n\
-- Update ONE item at a time (the `{{\"action\":...}}` shape) — do NOT resend the whole `todos` list for a single status change (the full list is only for the initial plan or a full re-plan).\n\
-- Do NOT stop, summarize, or hand back while ANY item is still pending or in_progress — keep working through them, unless you truly need approval, are genuinely stuck, or the request is ambiguous.\n\
-{}",
+            "{anchor}Current task list (each line is `#<id> <task>`) — keep it accurate and finish it:{rules}\n{}",
             render_todos_numbered(&todos, false)
         );
         messages.push(synthetic_system_reminder(&body));
@@ -364,6 +394,71 @@ mod tests {
                 arguments: args.into(),
             }],
         )
+    }
+
+    fn todo_update_msg(args: &str) -> Message {
+        Message::assistant(
+            "",
+            vec![ToolCall {
+                id: "u".into(),
+                name: "todo".into(),
+                arguments: args.into(),
+            }],
+        )
+    }
+
+    #[tokio::test]
+    async fn drive_rules_ride_only_after_a_full_write_not_a_single_update() {
+        let list = r#"{"todos":[{"content":"step one","status":"in_progress"},{"content":"step two","status":"pending"}]}"#;
+        // Right after a full (re)plan: the drive rules ARE included.
+        let mut fresh = vec![Message::user("go"), todowrite_msg(list)];
+        TodoHook.pre_request(&mut fresh, &TurnCtx::default()).await;
+        let after_plan = fresh.last().unwrap().text.clone();
+        assert!(
+            after_plan.contains("The MOMENT you START"),
+            "rules must ride the (re)plan round:\n{after_plan}"
+        );
+        assert!(
+            after_plan.contains("step one"),
+            "list present on plan round"
+        );
+
+        // An execution round whose most recent action was a single `todo` update: the
+        // rules are OMITTED (cache win), but the anchor + list still ride every round.
+        let mut exec = vec![
+            Message::user("go"),
+            todowrite_msg(list),
+            todo_update_msg(r#"{"action":"update","id":1,"status":"completed"}"#),
+        ];
+        TodoHook.pre_request(&mut exec, &TurnCtx::default()).await;
+        let after_update = exec.last().unwrap().text.clone();
+        assert!(
+            !after_update.contains("The MOMENT you START"),
+            "drive rules must NOT repeat on execution rounds:\n{after_update}"
+        );
+        assert!(
+            after_update.contains("Current task list"),
+            "list header still rides every round:\n{after_update}"
+        );
+
+        // The merged `todowrite` tool also accepts incremental action arguments.
+        // Tool name alone must not misclassify that shape as a full re-plan.
+        let mut merged_update = vec![
+            Message::user("go"),
+            todowrite_msg(list),
+            todowrite_msg(r#"{"action":"update","id":1,"status":"completed"}"#),
+        ];
+        TodoHook
+            .pre_request(&mut merged_update, &TurnCtx::default())
+            .await;
+        assert!(
+            !merged_update
+                .last()
+                .unwrap()
+                .text
+                .contains("The MOMENT you START"),
+            "incremental todowrite shape must not repeat drive rules"
+        );
     }
 
     // ---- mid-work drift backstop: the anchor line ------------------------------------------
@@ -607,7 +702,11 @@ mod tests {
 
         let mut reminder = messages.clone();
         hook.pre_request(&mut reminder, &ctx).await;
-        assert_eq!(reminder.len(), 2, "firm reminder fires despite read-only clause");
+        assert_eq!(
+            reminder.len(),
+            2,
+            "firm reminder fires despite read-only clause"
+        );
         assert!(!reminder[1].text.contains("You MUST"));
     }
 

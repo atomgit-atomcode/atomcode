@@ -11,6 +11,8 @@ import { RenameDialog, DeleteDialog } from './SessionDialogs';
 import { useAuth } from './LoginButton';
 import { mergeOptimisticSession } from '../lib/sessionList';
 import { sessionMessagesToMarkdownLines } from '../lib/historyMessages';
+import { sidebarRelativeTime } from '../lib/sidebarTime';
+import { loadSidebarViewMode, saveSidebarViewMode, sidebarProjectScope, SidebarViewMode } from '../lib/sidebarView';
 
 interface SidebarProps {
   activeSessionId: string | null;
@@ -54,7 +56,7 @@ interface SidebarProps {
 
 type Translate = (key: MsgKey, params?: Record<string, string | number>) => string;
 
-/** 把时间戳格式化为 YYYY-MM-DD（本地时区），用作日期分组键。 */
+/** 把时间戳格式化为 YYYY-MM-DD（本地时区），供跨工作区搜索结果分组。 */
 function dateKey(ts: number): string {
   const ms = ts < 1e12 ? ts * 1000 : ts;
   const d = new Date(ms);
@@ -62,7 +64,7 @@ function dateKey(ts: number): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
-/** 友好日期分组标题：今天 / 昨天 / 本年内 MM-DD / 跨年 YYYY-MM-DD。 */
+/** 跨工作区搜索弹窗的友好日期标题。 */
 function friendlyDateLabel(key: string, t: Translate): string {
   const today = dateKey(Date.now());
   if (key === today) return t('sidebar.dateToday');
@@ -74,21 +76,12 @@ function friendlyDateLabel(key: string, t: Translate): string {
 }
 
 /** 把 unix 时间戳（秒或毫秒）格式化为相对时间。 */
-function formatTime(ts: number, t: Translate): string {
+function formatTime(ts: number, t: Translate, now = Date.now()): string {
   if (!ts) return '';
-  const ms = ts < 1e12 ? ts * 1000 : ts;
-  const now = Date.now();
-  const diff = now - ms;
-  const MIN = 60000, HOUR = 3600000, DAY = 86400000;
-  if (diff < MIN) return t('time.justNow');
-  if (diff < HOUR) return t('time.minutesAgo', { n: Math.floor(diff / MIN) });
-  if (diff < DAY) return t('time.hoursAgo', { n: Math.floor(diff / HOUR) });
-  if (diff < 2 * DAY) return t('time.yesterday');
-  const d = new Date(ms);
-  const pad = (n: number) => String(n).padStart(2, '0');
-  const sameYear = d.getFullYear() === new Date(now).getFullYear();
-  const md = `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-  return sameYear ? md : `${d.getFullYear()}-${md}`;
+  const { unit, n } = sidebarRelativeTime(ts, now);
+  if (unit === 'now') return t('sidebar.timeNow');
+  const key = `sidebar.time${unit[0].toUpperCase()}${unit.slice(1)}` as MsgKey;
+  return t(key, { n });
 }
 
 function shortDir(p: string): string {
@@ -99,6 +92,19 @@ function shortDir(p: string): string {
     }
   }
   return p;
+}
+
+function dirName(p: string): string {
+  const trimmed = (p || '').replace(/[\\/]+$/, '');
+  return trimmed.split(/[\\/]/).pop() || trimmed;
+}
+
+function sidebarStorage(): Storage | null {
+  try {
+    return typeof window === 'undefined' ? null : window.localStorage;
+  } catch {
+    return null;
+  }
 }
 
 /** Inline panel-collapse glyph (monochrome, uses currentColor). */
@@ -172,6 +178,18 @@ function CheckIcon() {
   return (
     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+    </svg>
+  );
+}
+
+/** Compact sliders glyph for choosing the sidebar list layout. */
+function SlidersIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M2.5 4h11M2.5 8h11M2.5 12h11" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+      <circle cx="5" cy="4" r="1.35" fill="var(--app-sidebar-background)" stroke="currentColor" stroke-width="1.2" />
+      <circle cx="10.5" cy="8" r="1.35" fill="var(--app-sidebar-background)" stroke="currentColor" stroke-width="1.2" />
+      <circle cx="7" cy="12" r="1.35" fill="var(--app-sidebar-background)" stroke="currentColor" stroke-width="1.2" />
     </svg>
   );
 }
@@ -344,6 +362,14 @@ export function Sidebar({
   const [viewProjectHash, setViewProjectHash] = useState(projectHash);
   const [projMenuOpen, setProjMenuOpen] = useState(false);
   const projMenuRef = useRef<HTMLDivElement | null>(null);
+  const [viewMode, setViewMode] = useState<SidebarViewMode>(() =>
+    loadSidebarViewMode(sidebarStorage()),
+  );
+  const [workspaceExpanded, setWorkspaceExpanded] = useState(true);
+  const [viewMenuOpen, setViewMenuOpen] = useState(false);
+  const viewMenuRef = useRef<HTMLDivElement | null>(null);
+  // Relative labels (for example, 59min -> 1h) update without refetching sessions.
+  const [timeNow, setTimeNow] = useState(() => Date.now());
   const [query, setQuery] = useState('');
   // Skills menu: list fetched lazily; the count badge shows once loaded.
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);
@@ -400,12 +426,12 @@ export function Sidebar({
   function loadSessions() {
     const epoch = ++loadEpochRef.current;
     setLoading(true);
-    // The sidebar shows ONE project's full history. Fetch that bucket directly
-    // (uncapped) once we know its hash; `/sessions` caps at 50 across ALL
-    // projects, which starves a busy project of its own older sessions. Before
-    // the hash is known (pre-/project), fall back to the capped cross-project
-    // list so something shows immediately.
-    const load = viewProjectHash ? listProjectSessions(viewProjectHash) : listSessions();
+    // Workspace view shows one project's complete history, so fetch its bucket
+    // directly. Flat view intentionally uses the capped cross-project endpoint.
+    // Before a project hash is known, use that same cross-project fallback so
+    // the sidebar can still show useful history immediately.
+    const projectScope = sidebarProjectScope(viewMode, viewProjectHash);
+    const load = projectScope ? listProjectSessions(projectScope) : listSessions();
     load
       .then((list) => {
         if (epoch !== loadEpochRef.current) return; // superseded by a newer load
@@ -427,7 +453,7 @@ export function Sidebar({
   useEffect(() => {
     loadSessions();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reloadKey, viewProjectHash]);
+  }, [reloadKey, viewMode, viewProjectHash]);
 
   // The selector defaults to and FOLLOWS the real current project: when the
   // daemon's project changes (e.g. opening a session in another project), snap
@@ -470,6 +496,27 @@ export function Sidebar({
     document.addEventListener('mousedown', onDown);
     return () => document.removeEventListener('mousedown', onDown);
   }, [projMenuOpen]);
+
+  useEffect(() => {
+    if (!viewMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (!viewMenuRef.current?.contains(e.target as Node)) setViewMenuOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [viewMenuOpen]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setTimeNow(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  function chooseViewMode(mode: SidebarViewMode) {
+    setViewMode(mode);
+    saveSidebarViewMode(mode, sidebarStorage());
+    setViewMenuOpen(false);
+    if (mode === 'flat') setProjMenuOpen(false);
+  }
 
   // The kebab menu is fixed-positioned (so the list's overflow can't clip it);
   // close it on outside click, scroll, or resize since it won't track anchors.
@@ -994,6 +1041,9 @@ export function Sidebar({
 
   // The project the dropdown currently shows (for its button label).
   const currentViewProject = projects.find((p) => p.hash === viewProjectHash);
+  const currentProjectLabel = currentViewProject?.name
+    || dirName(currentViewProject?.working_dir || cwd || '')
+    || t('sidebar.switchProject');
 
   // 先按当前项目收窄，再按搜索词过滤。优先用物理会话桶 project_hash 收窄（不受
   // daemon 全局 working_dir 被改写影响，避免跨项目串台）；缺 hash 的条目回退按
@@ -1008,6 +1058,7 @@ export function Sidebar({
   // would leak into another project's list the user is browsing.
   const viewingCurrent = viewProjectHash === projectHash;
   const inScope = (s: SessionMetaWithProject): boolean => {
+    if (viewMode === 'flat') return true;
     if (s.id === optimisticId && viewingCurrent) return true;
     if (viewProjectHash) {
       return s.project_hash ? s.project_hash === viewProjectHash : normDir(s.working_dir) === cwdNorm;
@@ -1024,18 +1075,6 @@ export function Sidebar({
           s.id.toLowerCase().startsWith(q),
       )
     : inCwd;
-
-  // 日期分组（始终开启，对齐设计：列表按 updated_at 倒序，同一天天然相邻，按日期切段）。
-  const dateGroups: { key: string; items: SessionMetaWithProject[] }[] = [];
-  for (const s of filtered) {
-    const key = dateKey(s.updated_at || s.created_at);
-    const last = dateGroups[dateGroups.length - 1];
-    if (last && last.key === key) {
-      last.items.push(s);
-    } else {
-      dateGroups.push({ key, items: [s] });
-    }
-  }
 
   const renderItem = (s: SessionMetaWithProject) => {
     const active = s.id === activeSessionId;
@@ -1054,7 +1093,7 @@ export function Sidebar({
         <button class="session-item-main" onClick={() => onSelect(s)} title={dir}>
           <span class="session-item-name">{label}</span>
           <span class="session-item-meta">
-            {formatTime(s.updated_at || s.created_at, t)}
+            {formatTime(s.updated_at || s.created_at, t, timeNow)}
           </span>
         </button>
         <button
@@ -1196,21 +1235,79 @@ export function Sidebar({
         </button>
       </div>
 
-      {projects.length > 1 && (
-        <div class="sidebar-project" ref={projMenuRef}>
+      <div class="session-group-header">
+        <span class="session-group-label">
+          {t(viewMode === 'workspace' ? 'sidebar.workspace' : 'sidebar.sessions')}
+        </span>
+        <span class="session-group-spacer" />
+        <div class="group-by-control" ref={viewMenuRef}>
+          <button
+            class={'group-by-btn' + (viewMenuOpen ? ' on' : '')}
+            onClick={() => setViewMenuOpen((open) => !open)}
+            title={t('sidebar.groupBy')}
+            aria-label={t('sidebar.groupBy')}
+            aria-haspopup="menu"
+            aria-expanded={viewMenuOpen}
+          >
+            <SlidersIcon />
+          </button>
+          {viewMenuOpen && (
+            <div class="group-by-menu" role="menu">
+              <div class="group-by-menu-title">{t('sidebar.groupBy')}</div>
+              <button class="group-by-item" role="menuitemradio" aria-checked={viewMode === 'workspace'} onClick={() => chooseViewMode('workspace')}>
+                <span>{t('sidebar.groupWorkspace')}</span>
+                {viewMode === 'workspace' && <CheckIcon />}
+              </button>
+              <button class="group-by-item" role="menuitemradio" aria-checked={viewMode === 'flat'} onClick={() => chooseViewMode('flat')}>
+                <span>{t('sidebar.groupFlat')}</span>
+                {viewMode === 'flat' && <CheckIcon />}
+              </button>
+            </div>
+          )}
+        </div>
+        {onOpenCwd && (
+          <button
+            class="group-by-btn"
+            onClick={() => {
+              setViewMenuOpen(false);
+              setProjMenuOpen(false);
+              onOpenCwd();
+            }}
+            title={t('sidebar.addWorkspace')}
+            aria-label={t('sidebar.addWorkspace')}
+          >
+            <PlusIcon />
+          </button>
+        )}
+      </div>
+
+      {viewMode === 'workspace' && <div class="sidebar-project" ref={projMenuRef}>
+        <div class="sidebar-project-row">
+          <button
+            class="sidebar-project-expand"
+            onClick={() => setWorkspaceExpanded((expanded) => !expanded)}
+            title={t(workspaceExpanded ? 'sidebar.collapseWorkspace' : 'sidebar.expandWorkspace')}
+            aria-label={t(workspaceExpanded ? 'sidebar.collapseWorkspace' : 'sidebar.expandWorkspace')}
+            aria-expanded={workspaceExpanded}
+          >
+            <span class={'sidebar-project-expand-icon' + (workspaceExpanded ? ' open' : '')}>
+              <ChevronDownIcon />
+            </span>
+          </button>
           <button
             class={'sidebar-project-btn' + (projMenuOpen ? ' open' : '')}
             onClick={() => setProjMenuOpen((o) => !o)}
             aria-haspopup="listbox"
             aria-expanded={projMenuOpen}
-            title={currentViewProject?.working_dir || t('sidebar.switchProject')}
+            title={currentViewProject?.working_dir || cwd || t('sidebar.switchProject')}
           >
             <span class="sidebar-project-icon"><FolderIcon /></span>
             <span class="sidebar-project-name">
-              {currentViewProject?.name || currentViewProject?.working_dir || t('sidebar.switchProject')}
+              {currentProjectLabel}
             </span>
             <span class="sidebar-project-caret"><ChevronDownIcon /></span>
           </button>
+        </div>
           {projMenuOpen && (
             <div class="sidebar-project-menu" role="listbox">
               <div class="sidebar-project-menu-title">{t('sidebar.switchProject')}</div>
@@ -1236,45 +1333,31 @@ export function Sidebar({
                   <span class="sidebar-project-item-count">{p.session_count}</span>
                 </button>
               ))}
-              {onOpenCwd && (
-                <button
-                  class="sidebar-project-item sidebar-project-item-action"
-                  onClick={() => {
-                    setProjMenuOpen(false);
-                    onOpenCwd();
-                  }}
-                >
-                  <span class="sidebar-project-item-icon"><PlusIcon /></span>
-                  <span class="sidebar-project-item-main">
-                    <span class="sidebar-project-item-name">{t('sidebar.openOtherDir')}</span>
-                  </span>
-                </button>
-              )}
             </div>
           )}
-        </div>
-      )}
+      </div>}
 
-      <div class="session-group-header">
-        <span class="session-group-label">{t('sidebar.recent')}</span>
-      </div>
-
-      <div class="session-list-body" ref={sessionListBodyRef} aria-busy={loading}>
-        {loading && dateGroups.length === 0 && (
-          <div class="session-empty">{t('sidebar.loading')}</div>
+      <div
+        class={'session-list-body' + (viewMode === 'workspace' && !workspaceExpanded ? ' collapsed' : '')}
+        ref={sessionListBodyRef}
+        aria-busy={loading}
+      >
+        {(viewMode === 'flat' || workspaceExpanded) && (
+          <>
+            {loading && filtered.length === 0 && (
+              <div class="session-empty">{t('sidebar.loading')}</div>
+            )}
+            {!loading && inCwd.length === 0 && (
+              <div class="session-empty">
+                {t(viewMode === 'flat' ? 'sidebar.empty' : 'sidebar.emptyInCwd')}
+              </div>
+            )}
+            {!loading && inCwd.length > 0 && filtered.length === 0 && (
+              <div class="session-empty">{t('sidebar.noMatch')}</div>
+            )}
+            {filtered.map(renderItem)}
+          </>
         )}
-        {!loading && inCwd.length === 0 && (
-          <div class="session-empty">{t('sidebar.emptyInCwd')}</div>
-        )}
-        {!loading && inCwd.length > 0 && filtered.length === 0 && (
-          <div class="session-empty">{t('sidebar.noMatch')}</div>
-        )}
-        {dateGroups.map((g) => (
-          <div key={g.key} class="session-date-group">
-            <div class="session-date-label">{friendlyDateLabel(g.key, t)}</div>
-            {g.items.map(renderItem)}
-          </div>
-        ))}
       </div>
 
       <div class="sidebar-bottom">
@@ -1388,7 +1471,7 @@ export function Sidebar({
                         >
                           <span class="search-result-name">{label}</span>
                           <span class="search-result-dir">{dir}</span>
-                          <span class="search-result-time">{formatTime(s.updated_at || s.created_at, t)}</span>
+                          <span class="search-result-time">{formatTime(s.updated_at || s.created_at, t, timeNow)}</span>
                         </button>
                       );
                     })}

@@ -1450,38 +1450,71 @@ body {
   overflow-x: hidden;
   padding: 4px 8px 8px;
 }
+.session-list-body.collapsed { overflow: hidden; }
 
-/* --- "Recent" section label --- */
+/* --- Workspace section label --- */
 .session-group-header {
   display: flex;
   align-items: center;
   gap: 6px;
   padding: 10px 8px 4px;
 }
+.session-group-spacer { flex: 1; }
 
 /* Project selector — dropdown above the session list to browse other projects. */
 .sidebar-project {
   position: relative;
-  padding: 0 12px 4px;
+  padding: 0 8px 4px;
   flex-shrink: 0;
 }
+.sidebar-project-row {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.sidebar-project-expand {
+  width: 26px;
+  height: 34px;
+  flex: 0 0 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: var(--corner-radius-small);
+  background: transparent;
+  color: var(--app-tertiary-foreground);
+  cursor: pointer;
+}
+.sidebar-project-expand:hover {
+  background: var(--app-list-hover-background);
+  color: var(--app-primary-foreground);
+}
+.sidebar-project-expand-icon {
+  display: flex;
+  transform: rotate(-90deg);
+  transition: transform 120ms ease;
+}
+.sidebar-project-expand-icon.open { transform: rotate(0deg); }
 .sidebar-project-btn {
   display: flex;
   align-items: center;
   gap: 7px;
-  width: 100%;
-  padding: 6px 10px;
-  border: 1px solid var(--app-menu-border);
+  flex: 1;
+  min-width: 0;
+  padding: 7px 8px;
+  border: none;
   border-radius: var(--corner-radius-medium);
   background: transparent;
   color: var(--app-primary-foreground);
   cursor: pointer;
-  font-size: 0.8125rem;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
   font-family: inherit;
   text-align: left;
 }
 .sidebar-project-btn:hover,
-.sidebar-project-btn.open { background: var(--app-list-active-background); }
+.sidebar-project-btn.open { background: var(--app-list-hover-background); }
 .sidebar-project-icon {
   display: flex;
   align-items: center;
@@ -1504,8 +1537,8 @@ body {
 .sidebar-project-menu {
   position: absolute;
   top: calc(100% - 2px);
-  left: 12px;
-  right: 12px;
+  left: 8px;
+  right: 8px;
   z-index: 40;
   max-height: 320px;
   overflow-y: auto;
@@ -1571,24 +1604,6 @@ body {
   color: var(--app-tertiary-foreground);
   font-size: 0.75rem;
 }
-/* "Open another directory…" — separated action row below the project list. */
-.sidebar-project-item-action {
-  margin-top: 4px;
-  padding-top: 9px;
-  border-top: 1px solid var(--app-menu-separator, var(--app-command-menu-hover-background));
-  color: var(--app-secondary-foreground);
-}
-.sidebar-project-item-icon {
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  color: var(--app-tertiary-foreground);
-}
-.sidebar-project-item-icon svg { width: 14px; height: 14px; }
-
 .session-group-label {
   letter-spacing: 0.5px;
   font-size: 0.75rem;
@@ -1654,16 +1669,8 @@ body {
 .group-by-item:hover { background: var(--app-list-hover-background); }
 .group-by-item svg { color: var(--app-link-color); flex-shrink: 0; }
 
-/* --- Date sub-headers (date grouping) --- */
-.session-date-label {
-  padding: 10px 8px 3px;
-  font-size: 0.8125rem;
-  font-weight: 500;
-  color: var(--app-tertiary-foreground);
-}
-.session-date-group:first-child .session-date-label { padding-top: 2px; }
-
 .session-item {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 2px;
@@ -1679,34 +1686,37 @@ body {
   color: var(--app-primary-foreground);
 }
 
-/* Main clickable area (title + time), laid out as a column. */
+/* Main clickable area: a compact workspace-style row with time on the right. */
 .session-item-main {
   flex: 1;
   min-width: 0;
   display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
   padding: 6px 4px 6px 8px;
-  min-height: 30px;
+  min-height: 32px;
   border: none;
   background: transparent;
   color: inherit;
   cursor: pointer;
-  font-size: 0.8125rem;
+  font-size: 0.875rem;
   text-align: left;
 }
 
-.session-item-name { width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 1rem; }
+.session-item-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.875rem; line-height: 1.25rem; }
 .session-item.active .session-item-name { font-weight: 600; }
-.session-item-meta { font-size: 0.75rem; color: var(--app-caption-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%; }
+.session-item-meta { flex-shrink: 0; font-size: 0.75rem; line-height: 1.25rem; color: var(--app-caption-foreground); white-space: nowrap; }
 
 /* Kebab (⋮) button — appears on hover or while its menu is open. */
 .session-item-kebab {
-  flex-shrink: 0;
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  z-index: 1;
+  transform: translateY(-50%);
   width: 24px;
   height: 24px;
-  margin-right: 4px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1716,16 +1726,25 @@ body {
   color: var(--app-tertiary-foreground);
   cursor: pointer;
   opacity: 0;
+  pointer-events: none;
 }
 .session-item:hover .session-item-kebab,
-.session-item.menu-open .session-item-kebab { opacity: 1; }
+.session-item.menu-open .session-item-kebab,
+.session-item-kebab:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+.session-item:hover .session-item-meta,
+.session-item.menu-open .session-item-meta,
+.session-item:has(.session-item-kebab:focus-visible) .session-item-meta { visibility: hidden; }
 .session-item-kebab:hover {
   background: var(--app-ghost-button-hover-background);
   color: var(--app-primary-foreground);
 }
 /* Touch devices: always show the kebab (no hover). */
 @media (hover: none) {
-  .session-item-kebab { opacity: 1; }
+  .session-item-kebab { opacity: 1; pointer-events: auto; }
+  .session-item-meta { visibility: hidden; }
 }
 
 /* Per-session actions dropdown (position:fixed, anchored in JS). */
@@ -2684,6 +2703,153 @@ body {
   border-color: var(--app-brand-button);
   color: var(--app-primary-foreground);
   background: color-mix(in srgb, var(--app-brand-button) 12%, transparent);
+}
+
+/* Harness-inspired model manager. Scoped to the model dialog so the shared
+   modal chrome and unrelated settings keep their existing dimensions. */
+.modal-card.model-config-modal {
+  width: min(920px, 100%);
+  height: min(760px, 85dvh);
+}
+.model-config-page {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  min-height: 0;
+}
+.model-config-intro {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+.model-config-intro h4 {
+  margin: 0;
+  color: var(--app-primary-foreground);
+  font-size: 1.125rem;
+}
+.model-config-intro p {
+  margin: 6px 0 0;
+  color: var(--app-secondary-foreground);
+  font-size: 0.875rem;
+}
+.model-config-path {
+  max-width: 42%;
+  padding: 5px 9px;
+  overflow: hidden;
+  color: var(--app-tertiary-foreground);
+  background: var(--app-input-background);
+  border-radius: var(--corner-radius-small);
+  font-size: 0.75rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-provider-list { gap: 12px; }
+.model-provider-card {
+  padding: 18px 20px;
+  border-radius: var(--corner-radius-large);
+  background: transparent;
+}
+.model-provider-card.default {
+  border-color: var(--app-brand);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--app-brand) 16%, transparent);
+}
+.model-provider-card .provider-card-head { margin-bottom: 10px; }
+.provider-identity {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.model-provider-card .provider-name { font-size: 1rem; }
+.provider-health {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 8px;
+  border-radius: 50%;
+  background: var(--app-error-foreground);
+}
+.provider-health.ready { background: var(--app-success-foreground); }
+.provider-managed-badge {
+  padding: 2px 7px;
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  color: var(--app-secondary-foreground);
+  font-size: 0.6875rem;
+  white-space: nowrap;
+}
+.provider-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+.provider-action-btn {
+  padding: 5px 10px;
+  border: 1px solid var(--app-input-border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.75rem;
+}
+.provider-action-btn:hover {
+  border-color: var(--app-brand);
+  color: var(--app-primary-foreground);
+  background: var(--app-ghost-button-hover-background);
+}
+.provider-action-btn.danger { border-color: transparent; }
+.provider-action-btn.danger:hover {
+  border-color: var(--app-error-foreground);
+  color: var(--app-error-foreground);
+}
+.model-provider-card .provider-card-body {
+  display: grid;
+  grid-template-columns: minmax(140px, auto) auto auto minmax(180px, 1fr);
+  gap: 8px 18px;
+  align-items: center;
+  font-size: 0.8125rem;
+}
+.model-provider-card .provider-card-body code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--app-tertiary-foreground);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-provider-add-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+.model-provider-add {
+  min-height: 74px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px dashed var(--app-input-border);
+  border-radius: var(--corner-radius-large);
+  background: transparent;
+  color: var(--app-primary-foreground);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.9375rem;
+}
+.model-provider-add:hover {
+  border-color: var(--app-brand);
+  background: var(--app-ghost-button-hover-background);
+}
+
+@media (max-width: 700px) {
+  .modal-card.model-config-modal { height: 85dvh; }
+  .model-config-intro { flex-direction: column; gap: 10px; }
+  .model-config-path { max-width: 100%; width: 100%; box-sizing: border-box; }
+  .model-provider-card .provider-card-head { flex-wrap: wrap; }
+  .provider-card-actions { width: 100%; margin-left: 0; }
+  .model-provider-card .provider-card-body { grid-template-columns: 1fr; }
+  .model-provider-add-grid { grid-template-columns: 1fr; }
 }
 
 /* Add model form */
