@@ -1271,4 +1271,50 @@ mod tests {
             "https://github.com/o/r.git"
         ));
     }
+
+    // Regression (Issue #1400): when cwd == $HOME, the project-scope and
+    // user-scope `installed_plugins.json` resolve to the SAME file. Before the
+    // alias skip, `list_installed()` enumerated that file once per scope and
+    // reported every plugin twice (false "multiple marketplaces"). This guards
+    // the installer half of the dedup; paths.rs and loader.rs carry the rest.
+    #[test]
+    #[serial_test::serial]
+    fn list_installed_skips_aliased_project_scope_when_cwd_is_home() {
+        let _home = isolated_home();
+        let home_dir = _home.path().join("home");
+        std::env::set_var("ATOMCODE_HOME", home_dir.join(".atomcode"));
+
+        // Write one user-scope installed-plugin record (the aliased file).
+        let state_path = paths::installed_plugins_file().unwrap();
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        let mut state = super::super::state::InstalledPluginsFile::default();
+        state.plugins.insert(
+            super::super::state::plugin_id("probe", "mp"),
+            super::super::state::InstalledPluginEntry {
+                marketplace: "mp".into(),
+                plugin: "probe".into(),
+                plugin_dir: "marketplaces/mp/probe".into(),
+                installed_at: "now".into(),
+                scope: InstallScope::User,
+            },
+        );
+        super::super::state::save_installed_plugins_file(&state_path, &state).unwrap();
+
+        // list_installed() reads cwd internally; simulate a real `cd ~`.
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&home_dir).unwrap();
+
+        let listed = list_installed().unwrap();
+
+        std::env::set_current_dir(prev).unwrap();
+
+        assert_eq!(
+            listed.len(),
+            1,
+            "cwd == home must not double-enumerate the aliased user/project state file"
+        );
+        assert_eq!(listed[0].plugin, "probe");
+        assert_eq!(listed[0].marketplace, "mp");
+        assert_eq!(listed[0].scope, InstallScope::User);
+    }
 }
