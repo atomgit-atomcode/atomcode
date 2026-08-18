@@ -17,3 +17,19 @@ export function turnCacheHit(stats: TurnStats): number | null {
   if (stats.cached_tokens === 0 || stats.prompt_tokens === 0) return null;
   return Math.min(100, Math.floor(stats.cached_tokens / stats.prompt_tokens * 100));
 }
+
+/**
+ * Stats belong in the completed-turn footer only after a natural runtime
+ * terminal. Waiting for input/approval is still an active turn, while cancel,
+ * timeout and other explicit stop reasons are incomplete terminals.
+ *
+ * Older daemons omitted `stop_reason` on successful completion, so `undefined`
+ * remains compatible with that wire format.
+ */
+export function completedTurnStats(
+  stats: TurnStats | undefined,
+  stopReason: string | undefined,
+): TurnStats | null {
+  if (!stats) return null;
+  return stopReason === undefined || stopReason === 'stopped' ? stats : null;
+}

@@ -97,7 +97,7 @@ import {
   type PendingLiveSteer,
 } from '../lib/liveSteer';
 import { hasCoarsePointer, shouldSendComposerOnEnter } from '../lib/composerKeyboard';
-import { formatTurnDuration, formatTurnTokens, turnCacheHit } from '../lib/turnStats';
+import { completedTurnStats, formatTurnDuration, formatTurnTokens, turnCacheHit } from '../lib/turnStats';
 import { disposeNotifications, maybeNotifyTurnFinished } from '../lib/notifications';
 
 interface Message {
@@ -1547,6 +1547,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       case 'user': {
         const wasRunning = liveLifecycleRef.current.running;
         if (!wasRunning) {
+          // A newly accepted input starts a new turn before the following
+          // `state { running: true }` projection necessarily arrives. Retire
+          // the previous completed-turn footer at this authoritative boundary.
+          setTurnStats(null);
           setTodoPanelVisible(reduceTodoPanelVisibility(
             todoPanelVisibleRef.current,
             { type: 'user_input' },
@@ -1589,10 +1593,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           message: e.message,
         });
         liveLifecycleRef.current = lifecycle.state;
+        const terminal = lifecycle.terminal;
         setBusy(lifecycle.state.running);
         if (e.running) setTurnStats(null);
-        else if (e.stats) setTurnStats(e.stats);
-        const terminal = lifecycle.terminal;
+        else if (terminal) setTurnStats(completedTurnStats(e.stats, e.stop_reason));
         if (terminal) {
           finishTodoTurn(e.stop_reason === 'cancelled');
           if (terminal.discardQueued) {
@@ -2218,7 +2222,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         }
         transitionChatRecovery({ type: 'authoritative_terminal' });
         setBusy(false);
-        if (event.stats) setTurnStats(event.stats);
+        setTurnStats(completedTurnStats(event.stats, event.stop_reason));
         onPermissionResolved?.(null); // 回合结束：兜底清掉任何残留审批卡片
         setUserInputReq(null);
         if (event.stop_reason !== 'policy_denied') setPolicyIntervention(null);
@@ -3229,7 +3233,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       output: formatTurnTokens(turnStats.completion_tokens),
     }),
   ].filter((part): part is string => part !== null).join(' · ') : null;
-  const turnStatsLine = turnStats && (
+  const turnStatsLine = turnStats && !busy && (
     <div class="turn-stats" role="status">
       {turnStatsText}
     </div>
