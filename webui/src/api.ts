@@ -422,6 +422,23 @@ export interface ProviderInfo {
   context_window?: number;
 }
 
+export interface ProviderPresetInfo {
+  id: string;
+  display_name: string;
+  type: string;
+  default_base_url?: string;
+  requires_api_key: boolean;
+  /** Missing when a newer WebUI is temporarily paired with an older daemon. */
+  model_source?: 'embedded' | 'discovery_api' | 'manual';
+}
+
+export interface DiscoveredModelInfo {
+  id: string;
+  name?: string;
+  context_window?: number;
+  max_tokens?: number;
+}
+
 export interface NotificationConfigInfo {
   enabled: boolean;
   min_duration_secs: number;
@@ -433,6 +450,8 @@ export interface ConfigInfo {
   default_provider: string;
   default_workdir?: string;
   providers: ProviderInfo[];
+  /** Compiled provider catalog shared with the TUI add-provider flow. */
+  provider_presets?: ProviderPresetInfo[];
   /** 完成通知配置；旧 daemon 未暴露时为 undefined，前端回退默认值。 */
   notifications?: NotificationConfigInfo;
 }
@@ -579,6 +598,26 @@ export async function createProvider(body: CreateProviderBody): Promise<unknown>
   });
   if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error((e as any).error || `HTTP ${r.status}`); }
   return r.json();
+}
+
+export async function discoverProviderModels(body: {
+  type: string;
+  base_url: string;
+  api_key?: string;
+  provider_name?: string;
+}): Promise<DiscoveredModelInfo[]> {
+  const r = await fetch('/providers/discover-models', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({}));
+    throw new Error((e as { error?: string }).error || `HTTP ${r.status}`);
+  }
+  const payload = await r.json() as { models?: unknown };
+  if (!Array.isArray(payload.models)) throw new Error('model discovery returned an invalid payload');
+  return payload.models as DiscoveredModelInfo[];
 }
 
 export async function deleteProvider(name: string): Promise<void> {

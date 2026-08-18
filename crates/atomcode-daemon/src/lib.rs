@@ -133,8 +133,34 @@ pub(crate) struct ConfigResponse {
     pub default_provider: String,
     pub default_workdir: Option<String>,
     pub providers: Vec<ProviderInfo>,
+    /// Compiled provider presets used by the TUI and WebUI add-provider flows.
+    /// This contains connection metadata only; no credentials are exposed.
+    pub provider_presets: Vec<ProviderPresetInfo>,
     /// Sanitized completion-notification config (webui reads it for defaults).
     pub notifications: NotificationConfigInfo,
+}
+
+/// Sanitized view of one compiled provider preset.
+#[derive(Debug, Serialize)]
+pub(crate) struct ProviderPresetInfo {
+    pub id: String,
+    pub display_name: String,
+    #[serde(rename = "type")]
+    pub provider_type: String,
+    pub default_base_url: Option<String>,
+    pub requires_api_key: bool,
+    pub model_source: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DiscoveredModelInfo {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
 }
 
 /// Sanitized notification config view (subset of `NotificationConfig`).
@@ -4328,14 +4354,15 @@ fn resolve_chat_session(
     )? {
         Some(session) => session,
         None => {
-            let resolved = resolve_session_by_id(session_id_str).map_err(|error| {
-                anyhow::anyhow!("session {session_id_str:?} could not be resolved: {error}")
-            })?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "session {session_id_str:?} not found in project bucket {project_bucket}"
-                )
-            })?;
+            let resolved = resolve_session_by_id(session_id_str)
+                .map_err(|error| {
+                    anyhow::anyhow!("session {session_id_str:?} could not be resolved: {error}")
+                })?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "session {session_id_str:?} not found in project bucket {project_bucket}"
+                    )
+                })?;
             let session = crate::legacy_convert::load_catalog_session_view_in_project(
                 &resolved.project_hash,
                 &resolved.meta.id,
@@ -5995,6 +6022,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route(
             "/providers",
             get(api_provider::get_providers).post(api_provider::create_provider),
+        )
+        .route(
+            "/providers/discover-models",
+            post(api_provider::discover_models).layer(DefaultBodyLimit::max(64 * 1024)),
         )
         .route(
             "/providers/:name",

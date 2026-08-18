@@ -2870,6 +2870,57 @@ body {
   font-size: 0.75rem;
   color: var(--app-secondary-foreground);
 }
+
+.add-model-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.model-discovery-picker {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--app-border-subtle);
+  border-radius: 10px;
+  background: var(--app-layer-2-background);
+}
+
+.model-discovery-results {
+  display: grid;
+  gap: 3px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.model-discovery-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--app-primary-foreground);
+  text-align: left;
+  cursor: pointer;
+}
+
+.model-discovery-option:hover,
+.model-discovery-option.active {
+  background: var(--app-hover-background);
+}
+
+.model-discovery-option code {
+  max-width: 50%;
+  overflow: hidden;
+  color: var(--app-secondary-foreground);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .add-model-row {
   display: flex;
   gap: 12px;

@@ -3,7 +3,7 @@ use atomcode_config::config::Config;
 use atomcode_config::ConfigStore;
 use axum::{response::IntoResponse, Json};
 
-use crate::{json_error, ConfigResponse, ProviderInfo};
+use crate::{json_error, ConfigResponse, ProviderInfo, ProviderPresetInfo};
 
 /// Load config from disk.
 pub(crate) fn load_config() -> Result<Config, String> {
@@ -42,16 +42,9 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
     let providers = ids
         .iter()
         .filter_map(|id| {
-            config
-                .provider_config_for_selection(id)
-                .map(|p| {
-                    provider_info(
-                        id,
-                        &p,
-                        config.model_vision_override(id),
-                        &default_selection,
-                    )
-                })
+            config.provider_config_for_selection(id).map(|p| {
+                provider_info(id, &p, config.model_vision_override(id), &default_selection)
+            })
         })
         .collect();
     ConfigResponse {
@@ -59,6 +52,35 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
         default_provider: default_selection,
         default_workdir: config.default_workdir.clone(),
         providers,
+        provider_presets: atomcode_config::config::provider_preset::PRESETS
+            .iter()
+            // AtomGit/CodingPlan is provisioned by `/login`; presenting it as a
+            // manually configurable API-key provider would create a broken,
+            // user-owned lookalike. Existing CodingPlan models are still listed
+            // above through the unified model catalog.
+            .filter(|preset| {
+                !matches!(
+                    preset.id,
+                    "atomgit" | "openai-compatible" | "anthropic-compatible"
+                )
+            })
+            .map(|preset| ProviderPresetInfo {
+                id: preset.id.to_string(),
+                display_name: preset.display_name.to_string(),
+                provider_type: preset.provider_type.wire().to_string(),
+                default_base_url: preset.default_base_url.map(str::to_string),
+                requires_api_key: !matches!(
+                    preset.auth_kind,
+                    atomcode_config::config::provider_preset::AuthKind::None
+                ),
+                model_source: match preset.model_source {
+                    atomcode_config::config::provider_preset::ModelSource::Embedded => "embedded",
+                    atomcode_config::config::provider_preset::ModelSource::DiscoveryApi => "discovery_api",
+                    atomcode_config::config::provider_preset::ModelSource::Manual => "manual",
+                }
+                .to_string(),
+            })
+            .collect(),
         notifications: crate::NotificationConfigInfo {
             enabled: config.notifications.enabled,
             min_duration_secs: config.notifications.min_duration_secs,
@@ -219,6 +241,14 @@ mod tests {
         assert!(glm.is_default);
         assert!(glm.requires_login, "gateway base_url ⇒ requires login");
         assert_eq!(glm.model, "GLM-5.2");
+        assert!(resp
+            .provider_presets
+            .iter()
+            .any(|preset| preset.id == "deepseek"));
+        assert!(!resp
+            .provider_presets
+            .iter()
+            .any(|preset| preset.id == "atomgit"));
     }
 
     #[test]
