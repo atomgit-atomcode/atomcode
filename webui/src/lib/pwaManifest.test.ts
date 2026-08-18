@@ -18,7 +18,14 @@ const manifest = JSON.parse(
 
 test('webui advertises an installable standalone app manifest', () => {
   assert.match(indexHtml, /<link rel="manifest" href="\.\/manifest\.webmanifest" \/>/);
-  assert.match(indexHtml, /<meta name="theme-color" content="#[0-9a-f]{6}" \/>/i);
+  assert.match(
+    indexHtml,
+    /<meta name="theme-color" content="#ffffff" media="\(prefers-color-scheme: light\)" \/>/i,
+  );
+  assert.match(
+    indexHtml,
+    /<meta name="theme-color" content="#151517" media="\(prefers-color-scheme: dark\)" \/>/i,
+  );
 
   assert.equal(manifest.id, '/');
   assert.equal(manifest.name, 'AtomCode');

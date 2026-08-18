@@ -367,7 +367,9 @@ pub enum Msg<'a> {
     },
     ProviderPanelAddModelRow,
     ProviderPanelAccountsHint,
+    ProviderPanelManagedAccountHint,
     ProviderPanelModelsHint,
+    ProviderPanelManagedModelsHint,
     ProviderPanelFilteredModelsHint {
         account: &'a str,
     },

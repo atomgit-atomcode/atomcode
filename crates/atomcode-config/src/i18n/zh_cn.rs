@@ -330,8 +330,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelAddModelRow => "＋ 添加模型".into(),
         Msg::ProviderPanelAccountsHint =>
             "筛选 · ↑↓选择 · ↵模型 · Ctrl+A添加 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab切换 · Esc关闭".into(),
+        Msg::ProviderPanelManagedAccountHint =>
+            "官方 CodingPlan 账号 · 仅支持查看 · ↵模型 · Tab切换 · Esc关闭".into(),
         Msg::ProviderPanelModelsHint =>
             "筛选 · ↑↓选择 · ↵默认/添加 · Ctrl+A添加 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab切换 · Esc关闭".into(),
+        Msg::ProviderPanelManagedModelsHint =>
+            "CodingPlan 模型由 /login 管理 · ↑↓选择 · ↵设为默认 · Tab全部 · Esc关闭".into(),
         Msg::ProviderPanelFilteredModelsHint { account } =>
             format!("〔{account}〕· ↑↓选择 · ↵默认/添加 · Ctrl+A加模型 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab全部 · Esc关闭").into(),
         Msg::ProviderPanelModelSaved { model } => format!("已保存模型“{model}”。").into(),

@@ -695,6 +695,43 @@ impl Config {
         out
     }
 
+    /// Whether an account is owned by the CodingPlan login flow and therefore
+    /// read-only in manual provider management.
+    pub fn account_is_codingplan_managed(&self, account_id: &str) -> bool {
+        if is_codingplan_provider_name(account_id) {
+            return true;
+        }
+        let Some(account) = self.provider_accounts.get(account_id) else {
+            return self.providers.get(account_id).is_some_and(|provider| {
+                provider
+                    .base_url
+                    .as_deref()
+                    .is_some_and(crate::endpoints::is_codingplan_llm_gateway)
+            });
+        };
+        let preset = provider_preset::preset_or_compatible(&account.provider);
+        account
+            .base_url
+            .as_deref()
+            .or(preset.default_base_url)
+            .is_some_and(crate::endpoints::is_codingplan_llm_gateway)
+    }
+
+    /// Managed status for a concrete model selection, following its owning
+    /// account rather than assuming model ids use the `AtomGit-*` convention.
+    pub fn selection_is_codingplan_managed(&self, selection_id: &str) -> bool {
+        if let Some(model) = self.models.get(selection_id) {
+            return self.account_is_codingplan_managed(&model.account);
+        }
+        is_codingplan_provider_name(selection_id)
+            || self.providers.get(selection_id).is_some_and(|provider| {
+                provider
+                    .base_url
+                    .as_deref()
+                    .is_some_and(crate::endpoints::is_codingplan_llm_gateway)
+            })
+    }
+
     /// The unified model catalog: real `models` plus one synthetic model
     /// projected from each legacy `[providers.*]` (keyed by the legacy provider
     /// name, so `default_provider` maps to the same selection id). New-schema
@@ -709,10 +746,22 @@ impl Config {
             } else {
                 name.clone()
             };
-            out.insert(name.clone(), project_legacy_model(&account, p));
+            let mut model = project_legacy_model(&account, p);
+            model.reasoning_effort_levels = effective_reasoning_effort_levels(
+                self.selection_is_codingplan_managed(name),
+                &model.model,
+                model.reasoning_effort_levels.as_deref(),
+            );
+            out.insert(name.clone(), model);
         }
         for (id, m) in &self.models {
-            out.insert(id.clone(), m.clone());
+            let mut model = m.clone();
+            model.reasoning_effort_levels = effective_reasoning_effort_levels(
+                self.account_is_codingplan_managed(&model.account),
+                &model.model,
+                model.reasoning_effort_levels.as_deref(),
+            );
+            out.insert(id.clone(), model);
         }
         out
     }
@@ -817,9 +866,9 @@ impl Config {
             base_url,
             api_key,
             model: model.model.clone(),
-            supports_vision: model.supports_vision.unwrap_or_else(|| {
-                crate::util::model_name_suggests_vision(&model.model)
-            }),
+            supports_vision: model
+                .supports_vision
+                .unwrap_or_else(|| crate::util::model_name_suggests_vision(&model.model)),
             context_window: model.context_window,
             max_tokens: model.max_tokens,
             system_prompt: model.system_prompt.clone(),
@@ -862,7 +911,17 @@ impl Config {
                 .map(|r| r.to_provider_config());
         }
         if let Some(p) = self.providers.get(selection_id) {
-            return Some(p.clone());
+            let mut provider = p.clone();
+            provider.reasoning_effort_levels = effective_reasoning_effort_levels(
+                self.selection_is_codingplan_managed(selection_id),
+                &provider.model,
+                provider.reasoning_effort_levels.as_deref(),
+            );
+            provider.reasoning_effort = clamp_effort_to_levels(
+                provider.reasoning_effort.as_deref(),
+                provider.reasoning_effort_levels.as_deref(),
+            );
+            return Some(provider);
         }
         self.resolve_model(Some(selection_id))
             .ok()
@@ -1088,6 +1147,32 @@ pub fn codingplan_group_account_id(provider_type: &str) -> &'static str {
 /// separately, not levels.)
 pub const REASONING_EFFORT_LEVELS: [&str; 4] = ["low", "medium", "high", "max"];
 
+/// Built-in reasoning levels advertised by an official CodingPlan model.
+/// `None` means the model has no product-owned restriction and should use its
+/// persisted declaration. The API-default state is represented separately by
+/// `reasoning_effort = None`, so it does not appear in this level list.
+pub fn codingplan_builtin_effort_levels(model: &str) -> Option<Vec<String>> {
+    model
+        .eq_ignore_ascii_case("deepseek-v4-flash")
+        .then(|| vec!["high".to_string(), "max".to_string()])
+}
+
+/// Resolve a model's effective level declaration. Official CodingPlan
+/// capabilities are authoritative; custom providers retain their configured
+/// list (or unrestricted `None`).
+pub fn effective_reasoning_effort_levels(
+    codingplan_managed: bool,
+    model: &str,
+    declared: Option<&[String]>,
+) -> Option<Vec<String>> {
+    if codingplan_managed {
+        if let Some(levels) = codingplan_builtin_effort_levels(model) {
+            return Some(levels);
+        }
+    }
+    declared.map(<[String]>::to_vec)
+}
+
 /// The ordered subset of reasoning-effort levels an endpoint exposes.
 ///
 /// `declared` is the per-endpoint `reasoning_effort_levels` list (from config).
@@ -1122,10 +1207,7 @@ pub fn allowed_effort_levels(declared: Option<&[String]>) -> Vec<&'static str> {
 /// [`allowed_effort_levels`] becomes `None` (the API default); `"auto"` and
 /// `None` are capability states, not levels, and pass through unchanged. A valid
 /// value is returned verbatim (no normalization).
-pub fn clamp_effort_to_levels(
-    effort: Option<&str>,
-    declared: Option<&[String]>,
-) -> Option<String> {
+pub fn clamp_effort_to_levels(effort: Option<&str>, declared: Option<&[String]>) -> Option<String> {
     let value = effort?;
     if value.trim().eq_ignore_ascii_case("auto") {
         return Some(value.to_string());
@@ -1486,8 +1568,12 @@ fn render_datalog_section(cfg: &DatalogConfig) -> String {
     let mut out = String::new();
     out.push_str("\n# Per-turn datalog. Each turn writes a markdown summary; each LLM\n");
     out.push_str("# round appends its final request to the paired JSONL file.\n");
-    out.push_str("# Logs contain raw prompts, responses, tool inputs and tool outputs; protect them\n");
-    out.push_str("# as sensitive data. AtomCode creates project directories/files as 0700/0600 on Unix.\n");
+    out.push_str(
+        "# Logs contain raw prompts, responses, tool inputs and tool outputs; protect them\n",
+    );
+    out.push_str(
+        "# as sensitive data. AtomCode creates project directories/files as 0700/0600 on Unix.\n",
+    );
     out.push_str("# A per-project subdirectory is always appended under `dir` so multiple\n");
     out.push_str("# projects never share a bucket.\n");
     out.push_str("# - enabled = false        -> disable logging entirely\n");
@@ -1979,7 +2065,10 @@ mod tests {
             "bogus".to_string(),
             "high".to_string(),
         ];
-        assert_eq!(allowed_effort_levels(Some(&declared)), vec!["low", "high", "max"]);
+        assert_eq!(
+            allowed_effort_levels(Some(&declared)),
+            vec!["low", "high", "max"]
+        );
         // The motivating case: an endpoint that supports low/high/max but NOT medium.
         let no_medium = ["low".to_string(), "high".to_string(), "max".to_string()];
         assert_eq!(
@@ -2001,7 +2090,10 @@ mod tests {
         let low_high = ["low".to_string(), "high".to_string()];
         // A concrete level not in the allowed set ⇒ None (API default), so the wire
         // never sends a level the endpoint declares unsupported.
-        assert_eq!(clamp_effort_to_levels(Some("medium"), Some(&low_high)), None);
+        assert_eq!(
+            clamp_effort_to_levels(Some("medium"), Some(&low_high)),
+            None
+        );
         // An allowed level passes through (case/space-insensitive membership).
         assert_eq!(
             clamp_effort_to_levels(Some(" High "), Some(&low_high)).as_deref(),
@@ -2049,6 +2141,69 @@ mod tests {
         assert_eq!(
             resolved.reasoning_effort_levels.as_deref(),
             Some(["low".to_string(), "high".to_string(), "max".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn official_deepseek_flash_exposes_only_high_and_max() {
+        let expected = ["high".to_string(), "max".to_string()];
+        assert_eq!(
+            codingplan_builtin_effort_levels("deepseek-v4-flash").as_deref(),
+            Some(expected.as_slice())
+        );
+        assert_eq!(codingplan_builtin_effort_levels("GLM-5.2"), None);
+    }
+
+    #[test]
+    fn stale_official_deepseek_effort_falls_back_to_api_default() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "AtomGit-deepseek-v4-flash": {
+                    "type": "openai",
+                    "base_url": "https://llm-api.atomgit.com/v1",
+                    "model": "deepseek-v4-flash",
+                    "context_window": 1000000,
+                    "reasoning_effort": "medium"
+                }
+            }
+        }))
+        .unwrap();
+
+        let provider = cfg
+            .provider_config_for_selection("AtomGit-deepseek-v4-flash")
+            .unwrap();
+        assert_eq!(provider.reasoning_effort, None);
+        assert_eq!(
+            provider.reasoning_effort_levels.as_deref(),
+            Some(["high".to_string(), "max".to_string()].as_slice())
+        );
+        assert_eq!(
+            allowed_effort_levels(provider.reasoning_effort_levels.as_deref()),
+            vec!["high", "max"]
+        );
+
+        let catalog: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "official": {
+                    "provider": "openai",
+                    "base_url": "https://llm-api.atomgit.com/v1"
+                }
+            },
+            "models": {
+                "flash-primary": {
+                    "account": "official",
+                    "model": "deepseek-v4-flash",
+                    "reasoning_effort": "low",
+                    "context_window": 1000000
+                }
+            }
+        }))
+        .unwrap();
+        let resolved = catalog.resolve_model(Some("flash-primary")).unwrap();
+        assert_eq!(resolved.reasoning_effort, None);
+        assert_eq!(
+            resolved.reasoning_effort_levels.as_deref(),
+            Some(["high".to_string(), "max".to_string()].as_slice())
         );
     }
 

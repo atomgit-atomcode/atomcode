@@ -1324,7 +1324,8 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
         thinking_keep: None,
         reasoning_history: None,
         reasoning_effort: None,
-        reasoning_effort_levels: None,
+        reasoning_effort_levels:
+            atomcode_config::config::codingplan_builtin_effort_levels(&entry.display_model_name),
         thinking_enabled: None,
         thinking_budget: None,
         skip_tls_verify: false,
@@ -1542,6 +1543,19 @@ mod tests {
             "token loaded at runtime from auth.toml"
         );
         assert!(!p.ephemeral);
+    }
+
+    #[test]
+    fn build_provider_sets_official_deepseek_effort_levels() {
+        let deepseek = build_codingplan_provider(&entry("deepseek-v4-flash"));
+        assert_eq!(deepseek.reasoning_effort, None);
+        assert_eq!(
+            deepseek.reasoning_effort_levels.as_deref(),
+            Some(["high".to_string(), "max".to_string()].as_slice())
+        );
+
+        let glm = build_codingplan_provider(&entry("GLM-5.2"));
+        assert_eq!(glm.reasoning_effort_levels, None);
     }
 
     #[test]

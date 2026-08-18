@@ -348,8 +348,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelAddModelRow => "+ Add model".into(),
         Msg::ProviderPanelAccountsHint =>
             "Filter · ↑↓ select · ↵ models · Ctrl+A add · Ctrl+E edit · Ctrl+Dx2 delete · Tab switch · Esc close".into(),
+        Msg::ProviderPanelManagedAccountHint =>
+            "Official CodingPlan account · view only · ↵ models · Tab switch · Esc close".into(),
         Msg::ProviderPanelModelsHint =>
             "Filter · ↑↓ select · ↵ default/add · Ctrl+A add · Ctrl+E edit · Ctrl+Dx2 delete · Tab switch · Esc close".into(),
+        Msg::ProviderPanelManagedModelsHint =>
+            "CodingPlan models are managed by /login · ↑↓ select · ↵ default · Tab all · Esc close".into(),
         Msg::ProviderPanelFilteredModelsHint { account } =>
             format!("[{account}] · ↑↓ select · ↵ default/add · Ctrl+A add model · Ctrl+E edit · Ctrl+Dx2 delete · Tab all · Esc close").into(),
         Msg::ProviderPanelModelSaved { model } => format!("Saved model \"{model}\".").into(),

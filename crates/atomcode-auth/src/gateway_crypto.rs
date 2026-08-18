@@ -98,22 +98,7 @@ pub fn signer_available() -> bool {
 }
 
 pub fn is_atomgit_gateway(base_url: &str) -> bool {
-    let url = match url::Url::parse(base_url) {
-        Ok(url) => url,
-        Err(_) => return false,
-    };
-    // These fixed production hosts carry OAuth bearer credentials and request
-    // signatures. Never classify their plaintext HTTP form as an authenticated
-    // gateway, otherwise a misconfigured base URL can expose the bearer token.
-    if url.scheme() != "https" {
-        return false;
-    }
-    matches!(
-        url.host_str(),
-        Some("llm-api.atomgit.com")
-            | Some("pre-llm-api-cce.atomgit.com")
-            | Some("api-ai.gitcode.com")
-    )
+    atomcode_config::endpoints::is_codingplan_llm_gateway(base_url)
 }
 
 pub fn canonical_chat_completions_path(base_url: &str) -> String {
