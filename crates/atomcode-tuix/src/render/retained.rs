@@ -26,13 +26,13 @@ use crossterm::event::{
 };
 use crossterm::execute;
 
-use super::cell::{Cell, CellStyle, push_str_cells, push_str_cells_sgr, serialize_row};
+use super::cell::{push_str_cells, push_str_cells_sgr, serialize_row, Cell, CellStyle};
 use super::screen::Screen;
-use super::theme::{Role, role};
+use super::theme::{role, Role};
 use super::{
     DiffPanelRow, DiffPanelSpan, DiffPanelTone, MenuPayload, Renderer, StatusLine, UiLine,
 };
-use crate::i18n::{Msg, t};
+use crate::i18n::{t, Msg};
 use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
 use atomcode_coding;
@@ -374,7 +374,11 @@ fn format_ctx_usage(used: usize, window: usize) -> String {
 /// Shapes. Both variants are width-1 + a trailing space, so the layout math is
 /// identical either way.
 fn goal_marker(unicode: bool) -> &'static str {
-    if unicode { "◎ " } else { "* " }
+    if unicode {
+        "◎ "
+    } else {
+        "* "
+    }
 }
 
 /// The three display segments of the dedicated footer goal row, width-fitted:
@@ -534,7 +538,11 @@ fn format_goal_row_phase(
 /// available, `*` fallback for legacy terminals. Width-1 + trailing space,
 /// matching the layout contract of `goal_marker`.
 fn loop_marker(unicode: bool) -> &'static str {
-    if unicode { "⚡ " } else { "* " }
+    if unicode {
+        "⚡ "
+    } else {
+        "* "
+    }
 }
 
 /// The three display segments of the dedicated footer loop row, width-fitted:
@@ -1390,8 +1398,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let next = menu.map(|menu| (input.to_owned(), menu.kind, menu.items.clone()));
         if self.interaction_surface != next {
             self.interaction_surface = next;
-            self.interaction_surface_session =
-                self.interaction_surface_session.saturating_add(1);
+            self.interaction_surface_session = self.interaction_surface_session.saturating_add(1);
         }
     }
 
@@ -1561,8 +1568,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             1
         };
-        1 + detail_rows
-            + usize::from(orig_idx != crate::modals::session_picker::HEADER_ROWS)
+        1 + detail_rows + usize::from(orig_idx != crate::modals::session_picker::HEADER_ROWS)
     }
 
     fn max_menu_rows(&self, h: usize, default: usize) -> usize {
@@ -3729,8 +3735,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // to one line like the header; rendered in the Warning role.
         if let Some(note) = panel.note.as_deref() {
             let note = crate::glyph::downgrade_glyphs(note, unicode);
-            let note =
-                crate::width::truncate_with_ellipsis(&scrub_controls(&note), rule_width.saturating_sub(2));
+            let note = crate::width::truncate_with_ellipsis(
+                &scrub_controls(&note),
+                rule_width.saturating_sub(2),
+            );
             let style = self.style_for(Role::Warning);
             let mut row = Vec::new();
             push_str_cells(&mut row, "  ", &style);
@@ -3743,7 +3751,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let mut row = Vec::new();
             let selected = i == panel.selected;
             let marker = if selected {
-                if unicode { "\u{25b8} " } else { "> " } // ▸
+                if unicode {
+                    "\u{25b8} "
+                } else {
+                    "> "
+                } // ▸
             } else {
                 "  "
             };
@@ -3927,7 +3939,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     let option_start = out.len();
                     // Marker: `❯ ` on the cursor row, else two spaces.
                     let marker = if on_cursor {
-                        if unicode { "\u{276f} " } else { "> " } // ❯
+                        if unicode {
+                            "\u{276f} "
+                        } else {
+                            "> "
+                        } // ❯
                     } else {
                         "  "
                     };
@@ -3936,7 +3952,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     // the ASCII `[x]` fallback on non-unicode terminals.
                     let checkbox = if multiple {
                         if checked {
-                            if unicode { "[\u{2713}] " } else { "[x] " }
+                            if unicode {
+                                "[\u{2713}] "
+                            } else {
+                                "[x] "
+                            }
                         } else {
                             "[ ] "
                         }
@@ -4020,13 +4040,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     // checked[other_index], so Enter on Other (a no-op) can never desync it.
                     let other_has_text = !panel.custom_text.trim().is_empty();
                     let marker = if on_cursor {
-                        if unicode { "\u{276f} " } else { "> " }
+                        if unicode {
+                            "\u{276f} "
+                        } else {
+                            "> "
+                        }
                     } else {
                         "  "
                     };
                     let checkbox = if multiple {
                         if other_has_text {
-                            if unicode { "[\u{2713}] " } else { "[x] " }
+                            if unicode {
+                                "[\u{2713}] "
+                            } else {
+                                "[x] "
+                            }
                         } else {
                             "[ ] "
                         }
@@ -4116,7 +4144,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     let submit_index = panel.options.len() + panel.custom as usize;
                     let on_cursor = submit_index == panel.cursor;
                     let marker = if on_cursor {
-                        if unicode { "\u{276f} " } else { "> " }
+                        if unicode {
+                            "\u{276f} "
+                        } else {
+                            "> "
+                        }
                     } else {
                         "  "
                     };
@@ -4333,7 +4365,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .map(|i| {
                 let ans = meta.answered.get(i).copied().unwrap_or(false);
                 if unicode {
-                    if ans { "\u{2713}" } else { "\u{25cb}" }
+                    if ans {
+                        "\u{2713}"
+                    } else {
+                        "\u{25cb}"
+                    }
                 } else if ans {
                     "x"
                 } else {
@@ -4405,7 +4441,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             push_line(&mut out, &submit, &self.style_bold(Role::Plan));
             active = out.len().saturating_sub(1)..out.len();
             out.push(Vec::new()); // blank
-            // Enter 提交 · Tab/Shift+Tab 切换问题 · Esc 放弃
+                                  // Enter 提交 · Tab/Shift+Tab 切换问题 · Esc 放弃
             let hint = "Enter \u{63d0}\u{4ea4} \u{00b7} PgUp/PgDn \u{67e5}\u{770b} \u{00b7} Shift+Tab \u{8fd4}\u{56de} \u{00b7} Esc \u{653e}\u{5f03}";
             push_line(&mut out, hint, &hint_style);
         } else {
@@ -4565,7 +4601,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         {
                             let orig_idx = end;
                             if orig_idx >= 3 && orig_idx < len - hint_h {
-                                if orig_idx % 2 == 0 { 3 } else { 1 }
+                                if orig_idx % 2 == 0 {
+                                    3
+                                } else {
+                                    1
+                                }
                             } else {
                                 1
                             }
@@ -4601,7 +4641,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                                 {
                                     let orig_idx = end;
                                     if orig_idx >= 3 && orig_idx < len - hint_h {
-                                        if orig_idx % 2 == 0 { 3 } else { 1 }
+                                        if orig_idx % 2 == 0 {
+                                            3
+                                        } else {
+                                            1
+                                        }
                                     } else {
                                         1
                                     }
@@ -4724,7 +4768,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         && orig_idx >= 3
                         && orig_idx < m.items.len().saturating_sub(1)
                     {
-                        if orig_idx % 2 == 0 { 3 } else { 1 }
+                        if orig_idx % 2 == 0 {
+                            3
+                        } else {
+                            1
+                        }
                     } else if plugin_like && orig_idx == 2 {
                         3
                     } else if menu_kind == super::MenuKind::SessionList
@@ -4895,8 +4943,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             Vec::new()
         };
-        let mut middle_cells: Vec<Vec<Cell>> =
-            lines[input_view_start..input_view_start + middle_rows]
+        let mut middle_cells: Vec<Vec<Cell>> = lines
+            [input_view_start..input_view_start + middle_rows]
             .iter()
             .enumerate()
             .map(|(i, line)| {
@@ -5404,15 +5452,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let rules_top = footer_top + top_panel_rows;
 
         if !approval_active && !hide_input_box && !ghost_active {
-            self.pending_interactions.extend(
-                composer_cells
-                    .iter()
-                    .map(|cell| crate::render::interaction::HitRegion {
+            self.pending_interactions
+                .extend(composer_cells.iter().map(|cell| {
+                    crate::render::interaction::HitRegion {
                         rect: crate::render::interaction::CellRect {
-                            row: (rules_top
-                                + 1
-                                + cell.row.saturating_sub(input_view_start))
-                            .min(u16::MAX as usize) as u16,
+                            row: (rules_top + 1 + cell.row.saturating_sub(input_view_start))
+                                .min(u16::MAX as usize) as u16,
                             col: (2 + cell.col).min(u16::MAX as usize) as u16,
                             height: 1,
                             width: 1,
@@ -5420,8 +5465,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         target: crate::render::interaction::HitTarget::ComposerByte {
                             byte: cell.byte,
                         },
-                    }),
-            );
+                    }
+                }));
         }
 
         if hide_input_box {
@@ -6272,8 +6317,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let visible_run_slice = {
             let lo = visible_indices.iter().copied().min().unwrap_or(0);
             let hi = visible_indices.iter().copied().max().unwrap_or(0);
-            let start = self.body_copy_runs.partition_point(|run| run.body_index < lo);
-            let end = self.body_copy_runs.partition_point(|run| run.body_index <= hi);
+            let start = self
+                .body_copy_runs
+                .partition_point(|run| run.body_index < lo);
+            let end = self
+                .body_copy_runs
+                .partition_point(|run| run.body_index <= hi);
             start..end
         };
         for run in &self.body_copy_runs[visible_run_slice.clone()] {
@@ -7206,13 +7255,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         body: &str,
         body_style: &CellStyle,
     ) {
-        let rows = self.build_prefixed_rows_with_semantics(
-            prefix,
-            prefix_style,
-            body,
-            body_style,
-            None,
-        );
+        let rows =
+            self.build_prefixed_rows_with_semantics(prefix, prefix_style, body, body_style, None);
         for (row, soft_wrap, text) in rows {
             self.push_copyable_body_row(row, text, 0, soft_wrap);
         }
@@ -7586,7 +7630,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// positions it). Each cell is `▀` with fg=top-subpixel / bg=bottom-subpixel;
     /// a fully transparent cell is a blank space.
     fn build_mascot_rows(&self) -> Vec<Vec<Cell>> {
-        use crate::render::mascot::{MASCOT_ROWS, MASCOT_WIDTH, mascot_color};
+        use crate::render::mascot::{mascot_color, MASCOT_ROWS, MASCOT_WIDTH};
         let mut rows = Vec::with_capacity(MASCOT_ROWS.len());
         for line in MASCOT_ROWS {
             let bytes = line.as_bytes();
@@ -8232,11 +8276,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     fn disable_mouse_capture(&mut self) {
         if self.caps.mouse_sgr {
             if self.mouse_capture_enabled {
-                if self
-                    .out
-                    .write_all(b"\x1b[?1002l\x1b[?1006l")
-                    .is_ok()
-                {
+                if self.out.write_all(b"\x1b[?1002l\x1b[?1006l").is_ok() {
                     self.mouse_capture_enabled = false;
                 }
             }
@@ -9530,21 +9570,21 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // must be off before raw_mode is disabled, so the child process sees
         // the terminal with mouse disabled.
         self.disable_mouse_capture(); // Position cursor at the top of where the footer (input box +
-        // status + menu) used to be, then clear from there to end of
-        // screen. Without this, cursor stays wherever the last paint
-        // left it — usually inside the footer area — and the child's
-        // first stdout write lands ON TOP of footer rows, with later
-        // writes scrolling existing body content up through the
-        // overlap. Symptom: `/login`'s OAuth URL printed at row 1
-        // overlapping prior scrollback ("Press ESC to cancelh lines?"
-        // — our line glued onto an old conversation row).
-        //
-        // Sequence: release DECSTBM, CUP to (body_bottom+1, col 1),
-        // ED 0 (cursor → end of screen), enable autowrap. After this
-        // the child writes into a clean rectangle below the body,
-        // and as it produces more lines the terminal scrolls naturally
-        // (no scroll region active, autowrap on) — which is exactly
-        // the cooked-mode shell experience users expect.
+                                      // status + menu) used to be, then clear from there to end of
+                                      // screen. Without this, cursor stays wherever the last paint
+                                      // left it — usually inside the footer area — and the child's
+                                      // first stdout write lands ON TOP of footer rows, with later
+                                      // writes scrolling existing body content up through the
+                                      // overlap. Symptom: `/login`'s OAuth URL printed at row 1
+                                      // overlapping prior scrollback ("Press ESC to cancelh lines?"
+                                      // — our line glued onto an old conversation row).
+                                      //
+                                      // Sequence: release DECSTBM, CUP to (body_bottom+1, col 1),
+                                      // ED 0 (cursor → end of screen), enable autowrap. After this
+                                      // the child writes into a clean rectangle below the body,
+                                      // and as it produces more lines the terminal scrolls naturally
+                                      // (no scroll region active, autowrap on) — which is exactly
+                                      // the cooked-mode shell experience users expect.
         let body_bottom = self.body_bottom_row();
         let position_row = body_bottom.saturating_add(1);
         let seq = format!("\x1b[r\x1b[{};1H\x1b[J\x1b[?7h", position_row);
@@ -10063,9 +10103,7 @@ impl<W: Write + Send> Drop for RetainedRenderer<W> {
         // pushed is a harmless no-op (empty kitty stack).
         if self.caps.mouse_sgr {
             self.disable_mouse_capture();
-            let _ = self
-                .out
-                .write_all(b"\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r");
+            let _ = self.out.write_all(b"\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r");
         } else {
             let _ = self
                 .out
@@ -10275,8 +10313,8 @@ mod tests {
     use crate::render::{BadgeColour, ModeBadge};
     use crate::terminal::{EnvView, TerminalCaps};
     use std::sync::{
-        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
     };
 
     #[test]
@@ -10855,16 +10893,20 @@ mod tests {
         });
         renderer.flush_deferred();
 
-        let frame = interactions.snapshot_actionable().expect("painted preview frame");
+        let frame = interactions
+            .snapshot_actionable()
+            .expect("painted preview frame");
         let region = frame
             .regions
             .iter()
             .find(|region| {
-                region.target
-                    == crate::render::interaction::HitTarget::ModalItem { index: 0 }
+                region.target == crate::render::interaction::HitTarget::ModalItem { index: 0 }
             })
             .expect("selected preview card hit region");
-        assert_eq!(region.rect.height, 10, "title plus nine bounded detail rows");
+        assert_eq!(
+            region.rect.height, 10,
+            "title plus nine bounded detail rows"
+        );
         assert_eq!(
             frame.hit(region.rect.row + 9, region.rect.col),
             Some(crate::render::interaction::HitTarget::ModalItem { index: 0 }),
@@ -10891,24 +10933,50 @@ mod tests {
         });
         renderer.flush_deferred();
 
-        let frame = interactions.snapshot_actionable().expect("painted composer frame");
+        let frame = interactions
+            .snapshot_actionable()
+            .expect("painted composer frame");
         let first = frame
             .regions
             .iter()
             .find(|region| {
-                region.target
-                    == crate::render::interaction::HitTarget::ComposerByte { byte: 0 }
+                region.target == crate::render::interaction::HitTarget::ComposerByte { byte: 0 }
             })
             .expect("ASCII start cell");
         let row = first.rect.row;
         let col = first.rect.col;
-        assert_eq!(frame.hit(row, col), Some(crate::render::interaction::HitTarget::ComposerByte { byte: 0 }));
-        assert_eq!(frame.hit(row, col + 1), Some(crate::render::interaction::HitTarget::ComposerByte { byte: 1 }));
-        assert_eq!(frame.hit(row, col + 2), Some(crate::render::interaction::HitTarget::ComposerByte { byte: "a你".len() }));
-        assert_eq!(frame.hit(row, col + 3), Some(crate::render::interaction::HitTarget::ComposerByte { byte: "a你".len() }));
-        assert_eq!(frame.hit(row, col + 4), Some(crate::render::interaction::HitTarget::ComposerByte { byte: "a你👩‍💻".len() }));
-        assert_eq!(frame.hit(row, col + 5), Some(crate::render::interaction::HitTarget::ComposerByte { byte: "a你👩‍💻".len() }));
-        assert_eq!(frame.hit(row, col + 6), Some(crate::render::interaction::HitTarget::ComposerByte { byte: input.len() }));
+        assert_eq!(
+            frame.hit(row, col),
+            Some(crate::render::interaction::HitTarget::ComposerByte { byte: 0 })
+        );
+        assert_eq!(
+            frame.hit(row, col + 1),
+            Some(crate::render::interaction::HitTarget::ComposerByte { byte: 1 })
+        );
+        assert_eq!(
+            frame.hit(row, col + 2),
+            Some(crate::render::interaction::HitTarget::ComposerByte { byte: "a你".len() })
+        );
+        assert_eq!(
+            frame.hit(row, col + 3),
+            Some(crate::render::interaction::HitTarget::ComposerByte { byte: "a你".len() })
+        );
+        assert_eq!(
+            frame.hit(row, col + 4),
+            Some(crate::render::interaction::HitTarget::ComposerByte {
+                byte: "a你👩‍💻".len()
+            })
+        );
+        assert_eq!(
+            frame.hit(row, col + 5),
+            Some(crate::render::interaction::HitTarget::ComposerByte {
+                byte: "a你👩‍💻".len()
+            })
+        );
+        assert_eq!(
+            frame.hit(row, col + 6),
+            Some(crate::render::interaction::HitTarget::ComposerByte { byte: input.len() })
+        );
     }
 
     #[test]
@@ -10931,21 +10999,34 @@ mod tests {
         });
         renderer.flush_deferred();
 
-        let frame = interactions.snapshot_actionable().expect("painted composer frame");
+        let frame = interactions
+            .snapshot_actionable()
+            .expect("painted composer frame");
         let first = frame
             .regions
             .iter()
             .find(|region| {
-                region.target
-                    == crate::render::interaction::HitTarget::ComposerByte { byte: 0 }
+                region.target == crate::render::interaction::HitTarget::ComposerByte { byte: 0 }
             })
             .expect("tab start cell");
         let row = first.rect.row;
         let col = first.rect.col;
-        assert_eq!(frame.hit(row, col), Some(crate::render::interaction::HitTarget::ComposerByte { byte: 0 }));
-        assert_eq!(frame.hit(row, col + 1), Some(crate::render::interaction::HitTarget::ComposerByte { byte: 0 }));
-        assert_eq!(frame.hit(row, col + 2), Some(crate::render::interaction::HitTarget::ComposerByte { byte: 1 }));
-        assert_eq!(frame.hit(row, col + 3), Some(crate::render::interaction::HitTarget::ComposerByte { byte: 1 }));
+        assert_eq!(
+            frame.hit(row, col),
+            Some(crate::render::interaction::HitTarget::ComposerByte { byte: 0 })
+        );
+        assert_eq!(
+            frame.hit(row, col + 1),
+            Some(crate::render::interaction::HitTarget::ComposerByte { byte: 0 })
+        );
+        assert_eq!(
+            frame.hit(row, col + 2),
+            Some(crate::render::interaction::HitTarget::ComposerByte { byte: 1 })
+        );
+        assert_eq!(
+            frame.hit(row, col + 3),
+            Some(crate::render::interaction::HitTarget::ComposerByte { byte: 1 })
+        );
     }
 
     #[test]
@@ -10980,19 +11061,23 @@ mod tests {
         });
         renderer.flush_deferred();
 
-        let frame = interactions.snapshot_actionable().expect("painted transcript frame");
+        let frame = interactions
+            .snapshot_actionable()
+            .expect("painted transcript frame");
         let runs: Vec<(&str, bool)> = frame
             .copy_runs
             .iter()
             .map(|run| (&*run.text, run.soft_wrap))
             .collect();
-        assert!(runs.windows(2).any(|pair| pair == [("abcdefgh", true), ("ij", false)]));
+        assert!(runs
+            .windows(2)
+            .any(|pair| pair == [("abcdefgh", true), ("ij", false)]));
         assert!(runs.iter().any(|run| *run == ("hard", false)));
         assert!(runs.iter().any(|run| *run == ("  code", false)));
         assert!(runs.iter().any(|run| run.0.contains("你好")));
-        assert!(runs.windows(2).any(|pair| {
-            pair == [("       +", true), (" added", false)]
-        }));
+        assert!(runs
+            .windows(2)
+            .any(|pair| { pair == [("       +", true), (" added", false)] }));
         assert!(!runs.iter().any(|run| {
             run.0.contains("SPINNER_SENTINEL")
                 || run.0.contains("STATUS_SENTINEL")
@@ -11010,13 +11095,12 @@ mod tests {
             8,
             interactions.clone(),
         );
-        renderer.render(UiLine::AssistantText("first\nsecond\nUNDERLAY\nfourth\n".into()));
+        renderer.render(UiLine::AssistantText(
+            "first\nsecond\nUNDERLAY\nfourth\n".into(),
+        ));
         renderer.render(UiLine::AssistantLineBreak);
         renderer.render(UiLine::DiffPanel {
-            title: DiffPanelRow::new(vec![DiffPanelSpan::new(
-                "Diff",
-                DiffPanelTone::Default,
-            )]),
+            title: DiffPanelRow::new(vec![DiffPanelSpan::new("Diff", DiffPanelTone::Default)]),
             rows: vec![DiffPanelRow::new(vec![DiffPanelSpan::new(
                 "overlay",
                 DiffPanelTone::Highlight,
@@ -11131,7 +11215,9 @@ mod tests {
         renderer.render(UiLine::AssistantText("a你👩‍💻b".into()));
         renderer.render(UiLine::AssistantLineBreak);
         renderer.flush_deferred();
-        let first = interactions.snapshot_actionable().expect("first transcript frame");
+        let first = interactions
+            .snapshot_actionable()
+            .expect("first transcript frame");
         let run = first
             .copy_runs
             .iter()
@@ -11166,9 +11252,15 @@ mod tests {
         let col = run.rect.col as usize;
         assert!(!cells[row][col].style.reverse, "ASCII prefix unchanged");
         assert!(cells[row][col + 1].style.reverse, "CJK lead selected");
-        assert!(cells[row][col + 2].style.reverse, "CJK continuation selected");
+        assert!(
+            cells[row][col + 2].style.reverse,
+            "CJK continuation selected"
+        );
         assert!(cells[row][col + 3].style.reverse, "ZWJ lead selected");
-        assert!(cells[row][col + 4].style.reverse, "ZWJ continuation selected");
+        assert!(
+            cells[row][col + 4].style.reverse,
+            "ZWJ continuation selected"
+        );
         assert!(!cells[row][col + 5].style.reverse, "ASCII suffix unchanged");
     }
 
@@ -11192,7 +11284,9 @@ mod tests {
         });
         renderer.flush_deferred();
 
-        let frame = interactions.snapshot_actionable().expect("painted composer frame");
+        let frame = interactions
+            .snapshot_actionable()
+            .expect("painted composer frame");
         let z_byte = "abcd你".len();
         let z = frame
             .regions
@@ -11207,8 +11301,7 @@ mod tests {
             .regions
             .iter()
             .find(|region| {
-                region.target
-                    == crate::render::interaction::HitTarget::ComposerByte { byte: 0 }
+                region.target == crate::render::interaction::HitTarget::ComposerByte { byte: 0 }
             })
             .expect("first composer cell")
             .rect
@@ -11242,13 +11335,14 @@ mod tests {
         });
         renderer.flush_deferred();
 
-        let frame = interactions.snapshot_actionable().expect("painted composer frame");
+        let frame = interactions
+            .snapshot_actionable()
+            .expect("painted composer frame");
         let a = frame
             .regions
             .iter()
             .find(|region| {
-                region.target
-                    == crate::render::interaction::HitTarget::ComposerByte { byte: 0 }
+                region.target == crate::render::interaction::HitTarget::ComposerByte { byte: 0 }
             })
             .expect("first hard line glyph");
         let blank_row = frame
@@ -11267,9 +11361,7 @@ mod tests {
             .filter(|region| {
                 region.rect.row == blank_row
                     && region.target
-                        == crate::render::interaction::HitTarget::ComposerByte {
-                            byte: input.len(),
-                        }
+                        == crate::render::interaction::HitTarget::ComposerByte { byte: input.len() }
             })
             .min_by_key(|region| region.rect.col)
             .expect("final blank hard line padding");
@@ -11338,27 +11430,37 @@ mod tests {
         });
         renderer.flush_deferred();
 
-        let frame = interactions.snapshot_actionable().expect("painted composer frame");
+        let frame = interactions
+            .snapshot_actionable()
+            .expect("painted composer frame");
         let a = frame
             .regions
             .iter()
             .find(|region| {
-                region.target
-                    == crate::render::interaction::HitTarget::ComposerByte { byte: 0 }
+                region.target == crate::render::interaction::HitTarget::ComposerByte { byte: 0 }
             })
             .expect("a cell");
         let cells = renderer.screen.prev_cells_for_test();
         let row = a.rect.row as usize;
         let col = a.rect.col as usize;
-        assert!(!cells[row][col].style.reverse, "ASCII prefix stays unchanged");
+        assert!(
+            !cells[row][col].style.reverse,
+            "ASCII prefix stays unchanged"
+        );
         assert!(cells[row][col + 1].style.reverse, "CJK lead cell selected");
-        assert!(cells[row][col + 2].style.reverse, "CJK continuation selected");
+        assert!(
+            cells[row][col + 2].style.reverse,
+            "CJK continuation selected"
+        );
         assert!(cells[row][col + 3].style.reverse, "ZWJ lead cell selected");
         assert!(
             cells[row][col + 4].style.reverse,
             "ZWJ continuation selected"
         );
-        assert!(!cells[row][col + 5].style.reverse, "ASCII suffix stays unchanged");
+        assert!(
+            !cells[row][col + 5].style.reverse,
+            "ASCII suffix stays unchanged"
+        );
     }
 
     #[test]
@@ -12466,7 +12568,10 @@ mod tests {
             .filter(|cell| cell.width > 0)
             .map(|cell| cell.ch)
             .collect();
-        assert!(installed_text.starts_with("  * model"), "{installed_text:?}");
+        assert!(
+            installed_text.starts_with("  * model"),
+            "{installed_text:?}"
+        );
         assert!(!installed_text.contains('✓'), "{installed_text:?}");
     }
 
@@ -16671,13 +16776,11 @@ mod tests {
         // reuses the first block's trailing blank as its leading boundary.
         assert_eq!(r.body_lines.len(), rows_after_first + 2);
         assert!(r.body_lines[rows_after_first - 1].is_empty());
-        assert!(
-            r.body_lines[rows_after_first]
-                .iter()
-                .map(|cell| cell.ch)
-                .collect::<String>()
-                .contains("second")
-        );
+        assert!(r.body_lines[rows_after_first]
+            .iter()
+            .map(|cell| cell.ch)
+            .collect::<String>()
+            .contains("second"));
     }
 
     #[test]
@@ -18734,11 +18837,9 @@ mod tests {
             "footer must fit the physical screen"
         );
         assert_eq!(r.current_footer_rows(), r.last_painted_footer_rows);
-        assert!(
-            vterm
-                .dump()
-                .contains("Subtasks · 0/3 finished · 3 running · 0 pending")
-        );
+        assert!(vterm
+            .dump()
+            .contains("Subtasks · 0/3 finished · 3 running · 0 pending"));
     }
 
     #[test]
@@ -20312,7 +20413,7 @@ mod tests {
             )]),
         ];
         let title = DiffPanelRow::new(vec![
-            DiffPanelSpan::new("Diff", DiffPanelTone::Default).bold(),
+            DiffPanelSpan::new("Diff", DiffPanelTone::Default).bold()
         ]);
         let overlay = r.build_diff_panel_overlay(&title, &rows, "Esc close", 60, 20);
 
@@ -20882,8 +20983,14 @@ mod tests {
         let before = buf.lock().unwrap().len();
         r.scroll_body(-6);
         let historical = painted(&r);
-        assert_ne!(historical, bottom, "wheel-up must change the painted viewport");
-        assert!(buf.lock().unwrap().len() > before, "wheel-up must emit a frame");
+        assert_ne!(
+            historical, bottom,
+            "wheel-up must change the painted viewport"
+        );
+        assert!(
+            buf.lock().unwrap().len() > before,
+            "wheel-up must emit a frame"
+        );
 
         buf.lock().unwrap().clear();
         let appended = 30;
@@ -20916,9 +21023,7 @@ mod tests {
         r.scroll_body(10_000);
         let returned = painted(&r);
         assert!(
-            returned
-                .iter()
-                .any(|row| row.contains("pinned-native-29")),
+            returned.iter().any(|row| row.contains("pinned-native-29")),
             "wheel-down must clamp to and reveal the newest tail"
         );
 
@@ -23461,7 +23566,7 @@ mod tests {
         });
         // Open a `/diff`-style panel (sets `modal_overlay` + `diff_overlay_active`).
         let title = DiffPanelRow::new(vec![
-            DiffPanelSpan::new("Diff", DiffPanelTone::Default).bold(),
+            DiffPanelSpan::new("Diff", DiffPanelTone::Default).bold()
         ]);
         let panel_rows = vec![DiffPanelRow::new(vec![DiffPanelSpan::new(
             "a.rs",
@@ -24891,11 +24996,9 @@ mod todo_panel_rows_tests {
                 content,
             } if content == "active"
         ));
-        assert!(
-            !rows
-                .iter()
-                .any(|row| matches!(row, TodoPanelRow::More { .. }))
-        );
+        assert!(!rows
+            .iter()
+            .any(|row| matches!(row, TodoPanelRow::More { .. })));
     }
 
     #[test]

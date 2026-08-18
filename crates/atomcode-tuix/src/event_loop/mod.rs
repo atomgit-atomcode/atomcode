@@ -2269,18 +2269,14 @@ mod submit_hold_tests {
             ),
             None
         );
-        assert!(
-            provider_unavailable_announcement(
-                atomcode_coding::ProviderUnavailableReason::AuthenticationRequired
-            )
-            .is_some()
-        );
-        assert!(
-            provider_unavailable_announcement(
-                atomcode_coding::ProviderUnavailableReason::UnsupportedBuild
-            )
-            .is_some()
-        );
+        assert!(provider_unavailable_announcement(
+            atomcode_coding::ProviderUnavailableReason::AuthenticationRequired
+        )
+        .is_some());
+        assert!(provider_unavailable_announcement(
+            atomcode_coding::ProviderUnavailableReason::UnsupportedBuild
+        )
+        .is_some());
     }
 
     #[test]
@@ -3624,11 +3620,9 @@ mod local_restore_scope_tests {
             runtime.ui_availability(),
             RuntimeUiAvailability::AwaitingProvider
         );
-        assert!(
-            runtime
-                .dispatch(DriverCommand::Submit(UserInput::from("blocked")))
-                .is_err()
-        );
+        assert!(runtime
+            .dispatch(DriverCommand::Submit(UserInput::from("blocked")))
+            .is_err());
 
         adapter.shutdown().await.unwrap();
     }
@@ -3666,11 +3660,9 @@ mod local_restore_scope_tests {
             runtime.ui_availability(),
             RuntimeUiAvailability::AwaitingProvider
         );
-        assert!(
-            runtime
-                .dispatch(DriverCommand::Submit(UserInput::from("blocked")))
-                .is_err()
-        );
+        assert!(runtime
+            .dispatch(DriverCommand::Submit(UserInput::from("blocked")))
+            .is_err());
         assert!(runtime.dispatch(DriverCommand::Shutdown).is_ok());
         assert!(matches!(
             command_rx.recv().await,
@@ -3703,15 +3695,13 @@ mod local_restore_scope_tests {
         let runtime = RuntimeControl::deferred(command_tx, state_rx);
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
 
-        assert!(
-            runtime
-                .reload_provider(
-                    CodingAgentConfig::new("", "", "model", "/project"),
-                    RuntimeId::new(1),
-                    event_tx,
-                )
-                .is_err()
-        );
+        assert!(runtime
+            .reload_provider(
+                CodingAgentConfig::new("", "", "model", "/project"),
+                RuntimeId::new(1),
+                event_tx,
+            )
+            .is_err());
         assert!(command_rx.try_recv().is_err());
     }
 
@@ -3730,20 +3720,16 @@ mod local_restore_scope_tests {
             command_rx.recv().await,
             Some(DriverCommand::Shutdown)
         ));
-        assert!(
-            runtime
-                .reload_provider(
-                    CodingAgentConfig::new("", "", "model", "/project"),
-                    RuntimeId::new(1),
-                    event_tx,
-                )
-                .is_err()
-        );
-        assert!(
-            runtime
-                .dispatch_when_ready(DriverCommand::Submit(UserInput::from("late")))
-                .is_err()
-        );
+        assert!(runtime
+            .reload_provider(
+                CodingAgentConfig::new("", "", "model", "/project"),
+                RuntimeId::new(1),
+                event_tx,
+            )
+            .is_err());
+        assert!(runtime
+            .dispatch_when_ready(DriverCommand::Submit(UserInput::from("late")))
+            .is_err());
         assert!(command_rx.try_recv().is_err());
 
         adapter.shutdown().await.unwrap();
@@ -4258,8 +4244,7 @@ pub struct Buffer {
 /// 3 lines behind a `[Pasted ...]` token.
 const PASTE_FOLD_LINES: usize = 5;
 const PASTE_FOLD_CHARS: usize = 400;
-const DOUBLE_PASTE_EXPAND_WINDOW: std::time::Duration =
-    std::time::Duration::from_secs(1);
+const DOUBLE_PASTE_EXPAND_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Fold `\r\n` and lone `\r` line endings to `\n`. Bracketed-paste
 /// payloads from macOS Terminal / iTerm2 / Windows clipboard frequently
@@ -4426,11 +4411,7 @@ impl Buffer {
         self.stash_pastes.clear();
     }
 
-    fn replace_text_range(
-        &mut self,
-        range: std::ops::Range<usize>,
-        replacement: &str,
-    ) -> bool {
+    fn replace_text_range(&mut self, range: std::ops::Range<usize>, replacement: &str) -> bool {
         if range.start > range.end
             || range.end > self.text.len()
             || !self.text.is_char_boundary(range.start)
@@ -4460,7 +4441,9 @@ impl Buffer {
             if !self.pointer_selection_active {
                 return false;
             }
-            let anchor = self.selection.map_or(self.cursor, |selection| selection.anchor);
+            let anchor = self
+                .selection
+                .map_or(self.cursor, |selection| selection.anchor);
             self.selection = Some(EditSelection { anchor, head: byte });
         } else {
             self.selection = Some(EditSelection {
@@ -5039,7 +5022,8 @@ impl Buffer {
             }
             return false;
         }
-        let target_col = crate::width::display_width_with_tabs(&self.text[cur_line_start..self.cursor]);
+        let target_col =
+            crate::width::display_width_with_tabs(&self.text[cur_line_start..self.cursor]);
         let prev_line_end = cur_line_start - 1;
         let prev_line_start = self.text[..prev_line_end]
             .rfind('\n')
@@ -5073,7 +5057,8 @@ impl Buffer {
             .rfind('\n')
             .map(|i| i + 1)
             .unwrap_or(0);
-        let target_col = crate::width::display_width_with_tabs(&self.text[cur_line_start..self.cursor]);
+        let target_col =
+            crate::width::display_width_with_tabs(&self.text[cur_line_start..self.cursor]);
         let next_line_start = self.cursor + rel_end + 1;
         let next_line_end = self.text[next_line_start..]
             .find('\n')
@@ -5798,11 +5783,7 @@ mod buffer_tests {
         let first = std::time::Instant::now();
         b.insert_paste_at(big.clone(), first);
 
-        let _ = b.apply(
-            Action::Insert('x'),
-            &[],
-            &CommandRegistry::builtin(),
-        );
+        let _ = b.apply(Action::Insert('x'), &[], &CommandRegistry::builtin());
         b.insert_paste_at(big.clone(), first + std::time::Duration::from_millis(500));
 
         assert_eq!(b.text, "[Pasted #1 +10 lines]x[Pasted #2 +10 lines]");
@@ -6682,17 +6663,15 @@ mod menu_tests {
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         let lock = std::sync::RwLock::new(skills);
 
-        assert!(
-            build_menu_items(
-                "/skills brainstorming why",
-                0,
-                &reg,
-                &custom,
-                Some(&lock),
-                None
-            )
-            .is_none()
-        );
+        assert!(build_menu_items(
+            "/skills brainstorming why",
+            0,
+            &reg,
+            &custom,
+            Some(&lock),
+            None
+        )
+        .is_none());
     }
 
     #[test]
@@ -6761,10 +6740,9 @@ mod menu_tests {
         let items = build_menu_items("/effort", 0, &reg, &custom, None, None)
             .expect("/effort gateway must appear");
         assert!(items.iter().any(|(n, _)| n == "effort"));
-        assert!(!items.iter().any(|(n, _)| matches!(
-            n.as_str(),
-            "low" | "medium" | "high" | "max" | "default"
-        )));
+        assert!(!items
+            .iter()
+            .any(|(n, _)| matches!(n.as_str(), "low" | "medium" | "high" | "max" | "default")));
     }
 
     #[test]
@@ -6797,14 +6775,26 @@ mod menu_tests {
         // Any endpoint with an explicitly configured effort is applicable — the
         // TUI must no longer hide the control behind a `{deepseek, openai}`
         // provider_type gate the webui/wire never applied.
-        assert!(effort_applicable(Some("medium"), "internal-anthropic", "claude-x"));
+        assert!(effort_applicable(
+            Some("medium"),
+            "internal-anthropic",
+            "claude-x"
+        ));
         assert!(effort_applicable(Some("high"), "internal-ollama", "qwen"));
         // Unconfigured custom endpoint → not applicable.
         assert!(!effort_applicable(None, "internal-glm", "glm-5.2"));
         // Built-in CodingPlan DeepSeek V4 Flash → applicable without a config value
         // (matches `models_from_config`); a codingplan name with another model is not.
-        assert!(effort_applicable(None, "AtomGit-deepseek-v4-flash", "deepseek-v4-flash"));
-        assert!(!effort_applicable(None, "AtomGit-deepseek-v4-flash", "glm-5.2"));
+        assert!(effort_applicable(
+            None,
+            "AtomGit-deepseek-v4-flash",
+            "deepseek-v4-flash"
+        ));
+        assert!(!effort_applicable(
+            None,
+            "AtomGit-deepseek-v4-flash",
+            "glm-5.2"
+        ));
     }
 
     #[test]
@@ -7439,12 +7429,18 @@ mod menu_tests {
         buf.text = "abcd\n\tb".into();
         buf.cursor = 4;
 
-        assert!(buf.cursor_visual_down(), "fallback Down to tab-indented line");
+        assert!(
+            buf.cursor_visual_down(),
+            "fallback Down to tab-indented line"
+        );
         // After cursor_line_down: cur_line="abcd", target_col=4,
         // next_line="\tb", byte_offset_at_col("\tb", 4)
         //   → acc+=4 (SOFT_TAB_WIDTH) → acc=4 >= 4 → return i=1
         // cursor = 5 + 1 = 6
-        assert_eq!(buf.cursor, 6, "fallback down preserves column 4 on tab line");
+        assert_eq!(
+            buf.cursor, 6,
+            "fallback down preserves column 4 on tab line"
+        );
     }
 
     #[test]
@@ -7470,7 +7466,10 @@ mod menu_tests {
         buf.cursor = 4;
 
         assert!(buf.cursor_visual_down(), "Down to tab-indented line");
-        assert_eq!(buf.cursor, 6, "cursor at byte 6 ('b') — visual column 4 on tab-indented row");
+        assert_eq!(
+            buf.cursor, 6,
+            "cursor at byte 6 ('b') — visual column 4 on tab-indented row"
+        );
     }
 
     #[test]
@@ -7753,7 +7752,12 @@ mod menu_tests {
 
         assert!(notices.is_empty());
         assert_eq!(state.pending_images.len(), 1);
-        assert_eq!(std::fs::read_dir(history.cache_dir()).ok().map(|it| it.count()), None);
+        assert_eq!(
+            std::fs::read_dir(history.cache_dir())
+                .ok()
+                .map(|it| it.count()),
+            None
+        );
         assert!(legacy_cache.join("deadbeef12345678.png").exists());
     }
 
@@ -10668,7 +10672,7 @@ mod external_config_tests {
                 skip_tls_verify: false,
                 ephemeral,
                 capable_model: None,
-            retry_max_attempts: None,
+                retry_max_attempts: None,
             },
         );
         config
@@ -10837,7 +10841,7 @@ mod external_config_tests {
 
         assert_eq!(merged.default_provider, "main"); // selection preserved
         assert_eq!(merged.providers["main"].context_window, 32_000); // edit applied
-        // And the change is detected, so the runtime is actually reconfigured.
+                                                                     // And the change is detected, so the runtime is actually reconfigured.
         assert!(active_provider_config_changed(&current, &merged));
     }
 
@@ -10992,14 +10996,12 @@ mod external_config_tests {
             Some(atomcode_config::locale::Locale::ZhCn),
             "the provider delta must not overwrite an unrelated concurrent edit"
         );
-        assert!(
-            committed
-                .commit
-                .snapshot
-                .config
-                .provider_accounts
-                .contains_key("new-account")
-        );
+        assert!(committed
+            .commit
+            .snapshot
+            .config
+            .provider_accounts
+            .contains_key("new-account"));
     }
 
     #[test]
@@ -11030,7 +11032,11 @@ mod external_config_tests {
     fn explicit_current_model_edit_is_adopted_by_a_pinned_session() {
         let current = config("pinned-model", false);
         let mut persisted = current.clone();
-        persisted.providers.get_mut("main").unwrap().retry_max_attempts = Some(7);
+        persisted
+            .providers
+            .get_mut("main")
+            .unwrap()
+            .retry_max_attempts = Some(7);
 
         let desired = desired_config_from_snapshot_parts(
             &current,
@@ -11094,15 +11100,13 @@ mod external_config_tests {
         chinese.language = Some(atomcode_config::locale::Locale::ZhCn);
         let external = store.replace(&chinese).unwrap();
 
-        assert!(
-            commit_language_without_reload(
-                &store,
-                Some(&observed.snapshot.revision),
-                &english,
-                atomcode_config::locale::Locale::En,
-            )
-            .is_err()
-        );
+        assert!(commit_language_without_reload(
+            &store,
+            Some(&observed.snapshot.revision),
+            &english,
+            atomcode_config::locale::Locale::En,
+        )
+        .is_err());
         assert_eq!(store.read().unwrap().revision, external.snapshot.revision);
     }
 
@@ -12134,9 +12138,8 @@ fn attach_image_to_user_input(
 fn clear_panel_paste_command(panel: &mut crate::state::UserInputPanel) {
     use atomcode_capabilities::tools::request_user_input::UserInputMode::*;
     match panel.mode {
-        Text
-            if panel.text.trim() == "/paste"
-                || paste_command_image_path(&panel.text).is_some() =>
+        Text if panel.text.trim() == "/paste"
+            || paste_command_image_path(&panel.text).is_some() =>
         {
             panel.text.clear();
             panel.text_cursor_byte = 0;
@@ -12373,9 +12376,7 @@ fn extract_transcript_selection(
         output.extend(run.text[from..to].chars().filter(|character| {
             *character == '\n' || *character == '\t' || !character.is_control()
         }));
-        if index < end_index
-            && (!run.soft_wrap || run.next_run_id != Some(runs[index + 1].id))
-        {
+        if index < end_index && (!run.soft_wrap || run.next_run_id != Some(runs[index + 1].id)) {
             output.push('\n');
         }
     }
@@ -12495,9 +12496,9 @@ fn handle_transcript_pointer(
                 publish_transcript_selection(None, publisher);
                 return TranscriptPointerRoute::Redraw;
             }
-            if let Some(endpoint) = endpoint.filter(|endpoint| {
-                state.surviving_run_ids.contains(&endpoint.run_id)
-            }) {
+            if let Some(endpoint) =
+                endpoint.filter(|endpoint| state.surviving_run_ids.contains(&endpoint.run_id))
+            {
                 state.head = endpoint;
             }
             publish_transcript_selection(selection.as_ref(), publisher);
@@ -12513,9 +12514,9 @@ fn handle_transcript_pointer(
                 publish_transcript_selection(None, publisher);
                 return TranscriptPointerRoute::Handled;
             }
-            if let Some(endpoint) = endpoint.filter(|endpoint| {
-                state.surviving_run_ids.contains(&endpoint.run_id)
-            }) {
+            if let Some(endpoint) =
+                endpoint.filter(|endpoint| state.surviving_run_ids.contains(&endpoint.run_id))
+            {
                 state.head = endpoint;
             }
             let anchor = state.anchor;
@@ -12529,10 +12530,7 @@ fn handle_transcript_pointer(
             publish_transcript_selection(selection.as_ref(), publisher);
             extract_transcript_selection(&surviving_runs, anchor, head)
                 .filter(|text| !text.is_empty())
-                .map_or(
-                    TranscriptPointerRoute::Redraw,
-                    TranscriptPointerRoute::Copy,
-                )
+                .map_or(TranscriptPointerRoute::Redraw, TranscriptPointerRoute::Copy)
         }
         PointerKind::Move | PointerKind::Scroll(_) => TranscriptPointerRoute::Ignored,
     }
@@ -12595,12 +12593,8 @@ fn handle_composer_pointer(
         return ComposerPointerRoute::Ignored;
     }
     let route = match event.kind {
-        PointerKind::Down if buf.set_pointer_cursor(byte, false) => {
-            ComposerPointerRoute::Handled
-        }
-        PointerKind::Drag if buf.set_pointer_cursor(byte, true) => {
-            ComposerPointerRoute::Handled
-        }
+        PointerKind::Down if buf.set_pointer_cursor(byte, false) => ComposerPointerRoute::Handled,
+        PointerKind::Drag if buf.set_pointer_cursor(byte, true) => ComposerPointerRoute::Handled,
         PointerKind::Up if buf.pointer_selection_active() => {
             let _ = buf.set_pointer_cursor(byte, true);
             buf.end_pointer_selection();
@@ -12692,9 +12686,10 @@ fn handle_pointer_hit(
             };
             let buf = &app.buf;
             let state = &app.state;
-            app.menu.pointer_select_with(index, items.len(), |selected| {
-                redraw_with_menu(buf, &items, selected, state, ctx, renderer)
-            });
+            app.menu
+                .pointer_select_with(index, items.len(), |selected| {
+                    redraw_with_menu(buf, &items, selected, state, ctx, renderer)
+                });
         }
         PointerClickAction::Confirm(crate::render::interaction::HitTarget::MenuItem { index }) => {
             let Some(items) = menu_for_display(&app.buf, ctx) else {
@@ -12730,9 +12725,8 @@ fn apply_transcript_pointer_route(
             redraw_after_composer_pointer(app, ctx, renderer);
             let allow_osc52 = transcript_osc52_allowed(&ctx.caps);
             if crate::event_loop::commands::copy_text_to_clipboard(&text, allow_osc52).is_err() {
-                let notice = crate::sanitize::scrub_controls(&crate::i18n::t(
-                    crate::i18n::Msg::CopyFailed,
-                ));
+                let notice =
+                    crate::sanitize::scrub_controls(&crate::i18n::t(crate::i18n::Msg::CopyFailed));
                 renderer.render(UiLine::Warning(notice));
                 renderer.flush();
             }
@@ -12801,11 +12795,8 @@ fn finish_composer_pointer_capture(
     renderer: &mut dyn Renderer,
     event: PointerEvent,
 ) -> bool {
-    if handle_composer_pointer_release(
-        &mut app.buf,
-        &ctx.interaction_publisher,
-        event,
-    ) != ComposerPointerRoute::Redraw
+    if handle_composer_pointer_release(&mut app.buf, &ctx.interaction_publisher, event)
+        != ComposerPointerRoute::Redraw
     {
         return false;
     }
@@ -12903,17 +12894,19 @@ fn pointer_input_route(
             (pointer.kind == PointerKind::Up
                 && (composer_pointer_active || transcript_pointer_active))
                 || interaction.is_some_and(|interaction| {
-                let hit = interaction.hit(pointer.row, pointer.col);
-                match pointer.kind {
-                    PointerKind::Drag => matches!(
-                        hit,
-                        Some(crate::render::interaction::HitTarget::ComposerByte { .. })
-                            | Some(crate::render::interaction::HitTarget::TranscriptByte { .. })
-                    ),
-                    PointerKind::Down => hit.is_some(),
-                    PointerKind::Up => hit.is_some() || menu.has_pointer_press(),
-                    PointerKind::Move | PointerKind::Scroll(_) => false,
-                }
+                    let hit = interaction.hit(pointer.row, pointer.col);
+                    match pointer.kind {
+                        PointerKind::Drag => matches!(
+                            hit,
+                            Some(crate::render::interaction::HitTarget::ComposerByte { .. })
+                                | Some(
+                                    crate::render::interaction::HitTarget::TranscriptByte { .. }
+                                )
+                        ),
+                        PointerKind::Down => hit.is_some(),
+                        PointerKind::Up => hit.is_some() || menu.has_pointer_press(),
+                        PointerKind::Move | PointerKind::Scroll(_) => false,
+                    }
                 })
         }
         _ => false,
@@ -13019,51 +13012,51 @@ fn handle_input(
             .as_ref()
             .is_some_and(|selection| selection.dragging),
         || {
-        let has_non_capturing_modal = app
-            .active_modal
-            .as_ref()
-            .is_some_and(|modal| !modal.captures_all_keys());
-        let has_replay_payload =
-            !app.message_queue.is_empty() || !app.state.pending_steers.is_empty();
-        if should_release_stale_modal_interrupt_wait(
-            app.state.phase,
-            app.interrupt_drain_pending,
-            has_non_capturing_modal,
-            ctx.runtime.has_active_turn(),
-            has_replay_payload,
-        ) {
-            crate::tuix_trace!(
-                "KEY",
-                "release stale interrupt wait before routing visible modal"
-            );
-            app.interrupt_drain_pending = false;
-            app.state.phase = UiPhase::Idle;
-        }
-
-        if matches!(app.state.phase, UiPhase::Idle)
-            && app.active_modal.is_none()
-            && poll_shared_state(ctx, renderer)
-        {
-            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
-        }
-        // `/codingplan` has extra warning/quota caches beyond the generic config.
-        refresh_after_cross_process_codingplan_sync(ctx);
-
-        crate::tuix_trace!(
-            "IN",
-            "phase={:?} modal={} qlen={} ev={}",
-            app.state.phase,
-            app.active_modal.is_some(),
-            app.message_queue.len(),
-            match &ev {
-                InputEvent::Paste(t) => format!("paste({})", t.len()),
-                InputEvent::Eof => "eof".into(),
-                InputEvent::Key(k) => format!("key({:?},{:?})", k.kind, k.code),
-                InputEvent::Resize(w, h) => format!("resize({}x{})", w, h),
-                InputEvent::FocusChanged(focused) => format!("focus({focused})"),
-                InputEvent::Pointer(pointer) => format!("pointer({:?})", pointer),
+            let has_non_capturing_modal = app
+                .active_modal
+                .as_ref()
+                .is_some_and(|modal| !modal.captures_all_keys());
+            let has_replay_payload =
+                !app.message_queue.is_empty() || !app.state.pending_steers.is_empty();
+            if should_release_stale_modal_interrupt_wait(
+                app.state.phase,
+                app.interrupt_drain_pending,
+                has_non_capturing_modal,
+                ctx.runtime.has_active_turn(),
+                has_replay_payload,
+            ) {
+                crate::tuix_trace!(
+                    "KEY",
+                    "release stale interrupt wait before routing visible modal"
+                );
+                app.interrupt_drain_pending = false;
+                app.state.phase = UiPhase::Idle;
             }
-        );
+
+            if matches!(app.state.phase, UiPhase::Idle)
+                && app.active_modal.is_none()
+                && poll_shared_state(ctx, renderer)
+            {
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            }
+            // `/codingplan` has extra warning/quota caches beyond the generic config.
+            refresh_after_cross_process_codingplan_sync(ctx);
+
+            crate::tuix_trace!(
+                "IN",
+                "phase={:?} modal={} qlen={} ev={}",
+                app.state.phase,
+                app.active_modal.is_some(),
+                app.message_queue.len(),
+                match &ev {
+                    InputEvent::Paste(t) => format!("paste({})", t.len()),
+                    InputEvent::Eof => "eof".into(),
+                    InputEvent::Key(k) => format!("key({:?},{:?})", k.kind, k.code),
+                    InputEvent::Resize(w, h) => format!("resize({}x{})", w, h),
+                    InputEvent::FocusChanged(focused) => format!("focus({focused})"),
+                    InputEvent::Pointer(pointer) => format!("pointer({:?})", pointer),
+                }
+            );
         },
     );
     if preflight == PointerPreflightRoute::ComposerCleanup {
@@ -13241,7 +13234,12 @@ fn handle_input(
                 let image = paste_command_image_path(&text)
                     .and_then(try_attach_image_from_path)
                     .or_else(|| try_attach_image_from_path(&text))
-                    .or_else(|| text.trim().is_empty().then(try_paste_clipboard_image).flatten());
+                    .or_else(|| {
+                        text.trim()
+                            .is_empty()
+                            .then(try_paste_clipboard_image)
+                            .flatten()
+                    });
                 if attach_image_to_user_input(app, ctx, renderer, image)? {
                     return Ok(());
                 }
@@ -13701,7 +13699,10 @@ mod tests {
         assert_eq!(
             super::extract_transcript_selection(
                 &runs,
-                SemanticEndpoint { run_id: 10, byte: 0 },
+                SemanticEndpoint {
+                    run_id: 10,
+                    byte: 0
+                },
                 SemanticEndpoint {
                     run_id: 13,
                     byte: runs[3].text.len(),
@@ -13719,8 +13720,14 @@ mod tests {
         assert_eq!(
             super::extract_transcript_selection(
                 &runs,
-                SemanticEndpoint { run_id: 30, byte: 0 },
-                SemanticEndpoint { run_id: 32, byte: 1 },
+                SemanticEndpoint {
+                    run_id: 30,
+                    byte: 0
+                },
+                SemanticEndpoint {
+                    run_id: 32,
+                    byte: 1
+                },
             )
             .as_deref(),
             Some("A\nC"),
@@ -13737,7 +13744,10 @@ mod tests {
         assert_eq!(
             super::extract_transcript_selection(
                 &runs,
-                SemanticEndpoint { run_id: 20, byte: end },
+                SemanticEndpoint {
+                    run_id: 20,
+                    byte: end
+                },
                 SemanticEndpoint {
                     run_id: 20,
                     byte: start,
@@ -13765,7 +13775,10 @@ mod tests {
                 &publisher,
                 down,
                 &first,
-                Some(HitTarget::TranscriptByte { run_id: 100, byte: 0 }),
+                Some(HitTarget::TranscriptByte {
+                    run_id: 100,
+                    byte: 0
+                }),
             ),
             super::TranscriptPointerRoute::Handled
         );
@@ -13777,7 +13790,10 @@ mod tests {
                 &publisher,
                 drag,
                 &first,
-                Some(HitTarget::TranscriptByte { run_id: 101, byte: 5 }),
+                Some(HitTarget::TranscriptByte {
+                    run_id: 101,
+                    byte: 5
+                }),
             ),
             super::TranscriptPointerRoute::Redraw
         );
@@ -13794,7 +13810,10 @@ mod tests {
             &publisher,
             up,
             &streamed,
-            Some(HitTarget::TranscriptByte { run_id: 999, byte: 3 }),
+            Some(HitTarget::TranscriptByte {
+                run_id: 999,
+                byte: 3,
+            }),
         );
         assert_eq!(result, super::TranscriptPointerRoute::Copy("old-a".into()));
         assert!(!format!("{result:?}").contains("NEW"));
@@ -13804,7 +13823,10 @@ mod tests {
                 &publisher,
                 up,
                 &streamed,
-                Some(HitTarget::TranscriptByte { run_id: 999, byte: 3 }),
+                Some(HitTarget::TranscriptByte {
+                    run_id: 999,
+                    byte: 3
+                }),
             ),
             super::TranscriptPointerRoute::Ignored,
             "one completed gesture copies exactly once"
@@ -13900,7 +13922,10 @@ mod tests {
                 &publisher,
                 pointer(PointerKind::Down, Some(PointerButton::Primary), false),
                 &frame,
-                Some(HitTarget::TranscriptByte { run_id: 100, byte: 0 }),
+                Some(HitTarget::TranscriptByte {
+                    run_id: 100,
+                    byte: 0
+                }),
             ),
             super::TranscriptPointerRoute::Handled
         );
@@ -13963,10 +13988,10 @@ mod tests {
         buf.text = "abcde".into();
         assert_eq!(
             super::handle_composer_pointer(
-            &mut buf,
-            &publisher,
-            pointer(PointerKind::Down, Some(PointerButton::Primary), false),
-            1,
+                &mut buf,
+                &publisher,
+                pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+                1,
             ),
             super::ComposerPointerRoute::Handled
         );
@@ -13974,10 +13999,10 @@ mod tests {
 
         assert_eq!(
             super::handle_composer_pointer(
-            &mut buf,
-            &publisher,
-            pointer(PointerKind::Drag, Some(PointerButton::Primary), false),
-            4,
+                &mut buf,
+                &publisher,
+                pointer(PointerKind::Drag, Some(PointerButton::Primary), false),
+                4,
             ),
             super::ComposerPointerRoute::Handled
         );
@@ -14030,13 +14055,9 @@ mod tests {
         let mut prelude_runs = 0;
 
         assert_eq!(
-            super::handle_input_preflight(
-                &input,
-                Some(&interaction),
-                &mut menu,
-                true,
-                || prelude_runs += 1,
-            ),
+            super::handle_input_preflight(&input, Some(&interaction), &mut menu, true, || {
+                prelude_runs += 1
+            },),
             super::PointerPreflightRoute::PointerContinue
         );
         assert_eq!(prelude_runs, 1);
@@ -14113,7 +14134,10 @@ mod tests {
         );
         assert!(!buf.pointer_selection_active());
         assert_eq!(buf.selected_range(), Some(1..4));
-        assert!(!menu.has_pointer_press(), "menu confirmation must be cancelled");
+        assert!(
+            !menu.has_pointer_press(),
+            "menu confirmation must be cancelled"
+        );
     }
 
     #[test]
@@ -14126,9 +14150,7 @@ mod tests {
         let mut menu = super::MenuState::new();
         let mut prelude_runs = 0;
         assert_eq!(
-            super::handle_input_preflight(&input, None, &mut menu, true, || {
-                prelude_runs += 1
-            }),
+            super::handle_input_preflight(&input, None, &mut menu, true, || { prelude_runs += 1 }),
             super::PointerPreflightRoute::ComposerCleanup
         );
         assert_eq!(prelude_runs, 0);
@@ -14193,7 +14215,10 @@ mod tests {
             redraws += 1;
             publisher.invalidate();
         });
-        assert_eq!(redraws, 0, "selecting the current row must keep the frame actionable");
+        assert_eq!(
+            redraws, 0,
+            "selecting the current row must keep the frame actionable"
+        );
         assert!(publisher.snapshot_actionable().is_some());
         assert_eq!(
             menu.pointer_release(target, session),
@@ -14255,7 +14280,10 @@ mod tests {
 
         let _ = menu.pointer_press(target, 2);
         menu.pointer_select_with(1, 2, |_| redraws += 1);
-        assert_eq!(menu.pointer_release(target, 2), super::PointerClickAction::None);
+        assert_eq!(
+            menu.pointer_release(target, 2),
+            super::PointerClickAction::None
+        );
         let _ = menu.pointer_press(target, 2);
         menu.pointer_select_with(1, 2, |_| redraws += 1);
         assert_eq!(
@@ -15008,15 +15036,11 @@ fn idle_menu_confirmation_allowed(commit_gate_pending: bool) -> bool {
 /// Main-composer execution-mode shortcut. Crossterm normally reports
 /// Shift+Tab as `BackTab`, while a few terminals preserve it as `Tab + SHIFT`.
 /// Plain Tab is deliberately excluded so it remains dedicated to completion.
-fn is_mode_cycle_key(
-    code: KeyCode,
-    modifiers: crossterm::event::KeyModifiers,
-) -> bool {
+fn is_mode_cycle_key(code: KeyCode, modifiers: crossterm::event::KeyModifiers) -> bool {
     let shift = crossterm::event::KeyModifiers::SHIFT;
     let has_no_other_modifiers = modifiers.difference(shift).is_empty();
     has_no_other_modifiers
-        && (code == KeyCode::BackTab
-            || (code == KeyCode::Tab && modifiers.contains(shift)))
+        && (code == KeyCode::BackTab || (code == KeyCode::Tab && modifiers.contains(shift)))
 }
 
 fn streaming_top_level_slash_selection(
@@ -15287,9 +15311,7 @@ fn handle_idle_key(
                         // adding whitespace so directories can keep completing.
                         let selected_path = items[app.menu.selected].0.clone();
                         let replacement = file_index::format_at_mention_replacement(&selected_path);
-                        let _ = app
-                            .buf
-                            .replace_text_range(at_pos..end, &replacement);
+                        let _ = app.buf.replace_text_range(at_pos..end, &replacement);
                         app.menu.selected = 0;
                         if let Some(next_items) = build_menu_items(
                             &app.buf.text,
@@ -16500,9 +16522,9 @@ pub(crate) fn set_agent_mode(
         .dispatch(atomcode_coding::DriverCommand::SetMode(runtime_mode(mode)))
         .ok();
     atomcode_daemon::live_set_mode(mode); // daemon ApprovalMode == core Mode
-    // The footer persistently shows the current mode, so a scrollback feedback line
-    // is redundant in the interactive renderer — and it spams on rapid Shift+Tab
-    // cycling. Emit it ONLY in plain mode (pipe / CI), which has no persistent footer.
+                                          // The footer persistently shows the current mode, so a scrollback feedback line
+                                          // is redundant in the interactive renderer — and it spams on rapid Shift+Tab
+                                          // cycling. Emit it ONLY in plain mode (pipe / CI), which has no persistent footer.
     if ctx.is_plain_renderer {
         let msg = match mode {
             crate::state::AgentMode::Auto => {
@@ -17914,9 +17936,7 @@ fn handle_streaming_key(
                         .expect("guarded above");
                 let selected_path = items[app.menu.selected].0.clone();
                 let replacement = file_index::format_at_mention_replacement(&selected_path);
-                let _ = app
-                    .buf
-                    .replace_text_range(at_pos..end, &replacement);
+                let _ = app.buf.replace_text_range(at_pos..end, &replacement);
                 app.menu.selected = 0;
                 // Menu shape may have changed — surface on next redraw via
                 // draw_spinner_now (the streaming footer stays visible).
@@ -18133,11 +18153,9 @@ fn handle_streaming_key(
             // travel with the queued message instead of being silently
             // dropped on dispatch.
             let mut line = line;
-            for n in hydrate_recalled_attachments_for_history(
-                &mut app.state,
-                &mut line,
-                &ctx.history,
-            ) {
+            for n in
+                hydrate_recalled_attachments_for_history(&mut app.state, &mut line, &ctx.history)
+            {
                 renderer.render(UiLine::Warning(n));
             }
             let expanded = app.buf.expand_pastes(&line);
@@ -18781,7 +18799,7 @@ mod user_input_key_tests {
         p.move_down();
         p.toggle(); // check "B" (cursor 1)
         p.push_custom('x'); // custom_text="x"; no separate auto-check needed
-        // Enter on option/Other rows is NOT a submit — returns None.
+                            // Enter on option/Other rows is NOT a submit — returns None.
         assert!(
             user_input_response_for(&p, KeyCode::Enter).is_none(),
             "Enter on option row must NOT submit in multiple mode"
@@ -18810,7 +18828,7 @@ mod user_input_key_tests {
     fn multiple_custom_text_included_after_enter_on_other_row() {
         let mut p = panel(UserInputMode::Multiple);
         p.toggle(); // check "A"
-        // Move to Other row and type custom text.
+                    // Move to Other row and type custom text.
         p.move_down(); // cursor 1 (B)
         p.move_down(); // cursor 2 (Other)
         assert!(p.is_other_row());
@@ -19001,7 +19019,7 @@ mod user_input_key_tests {
         p.toggle_index(0); // '1' → check "A"
         p.toggle_index(1); // '2' → check "B"
         p.toggle_index(0); // '1' again → uncheck "A"
-        // Navigate to Submit row and confirm.
+                           // Navigate to Submit row and confirm.
         for _ in 0..=p.options.len() {
             p.move_down();
         }
@@ -19017,7 +19035,7 @@ mod user_input_key_tests {
     fn multiple_enter_on_option_row_does_not_submit() {
         let mut p = panel(UserInputMode::Multiple);
         p.toggle(); // check "A" at cursor 0
-        // Enter on cursor 0 (option "A") must NOT resolve.
+                    // Enter on cursor 0 (option "A") must NOT resolve.
         assert!(
             user_input_response_for(&p, KeyCode::Enter).is_none(),
             "Enter on option row in multiple must NOT submit"
@@ -19228,12 +19246,12 @@ fn handle_approval_key(
     }
     deliver_approval(ctx, choice);
     app.state.on_approval_resolved(); // clears approval_panel + phase → Streaming
-    // Repaint the footer NOW so the approval panel disappears immediately, the
-    // same way the `ApprovalNeeded` handler and the Up/Down arms redraw. Without
-    // this, the retained renderer keeps painting its cached `self.status`
-    // (approval still `Some`) until the next event that carries a fresh
-    // `StatusLine`, leaving a ghost panel over the input box (the inverse of
-    // issue #455's "输入框没了" — here the panel lingers after a decision).
+                                      // Repaint the footer NOW so the approval panel disappears immediately, the
+                                      // same way the `ApprovalNeeded` handler and the Up/Down arms redraw. Without
+                                      // this, the retained renderer keeps painting its cached `self.status`
+                                      // (approval still `Some`) until the next event that carries a fresh
+                                      // `StatusLine`, leaving a ghost panel over the input box (the inverse of
+                                      // issue #455's "输入框没了" — here the panel lingers after a decision).
     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
     Ok(())
 }
@@ -19385,7 +19403,11 @@ fn handle_user_input_key(
             if command == "/paste" || paste_command_image_path(command).is_some() {
                 let image = paste_command_image_path(command)
                     .and_then(try_attach_image_from_path)
-                    .or_else(|| (command == "/paste").then(try_paste_clipboard_image).flatten());
+                    .or_else(|| {
+                        (command == "/paste")
+                            .then(try_paste_clipboard_image)
+                            .flatten()
+                    });
                 if !attach_image_to_user_input(app, ctx, renderer, image)? {
                     renderer.render(UiLine::Error(
                         crate::i18n::t(crate::i18n::Msg::CmdPasteNoImage).into_owned(),
@@ -19819,7 +19841,11 @@ fn handle_user_input_batch_key(
             if command == "/paste" || paste_command_image_path(command).is_some() {
                 let image = paste_command_image_path(command)
                     .and_then(try_attach_image_from_path)
-                    .or_else(|| (command == "/paste").then(try_paste_clipboard_image).flatten());
+                    .or_else(|| {
+                        (command == "/paste")
+                            .then(try_paste_clipboard_image)
+                            .flatten()
+                    });
                 if !attach_image_to_user_input(app, ctx, renderer, image)? {
                     renderer.render(UiLine::Error(
                         crate::i18n::t(crate::i18n::Msg::CmdPasteNoImage).into_owned(),
@@ -21539,26 +21565,22 @@ mod subtask_progress_projection_tests {
         assert_eq!(progress.items[0].model, "deepseek-v4-flash");
         assert!(progress.items[0].started_at.is_none());
 
-        assert!(
-            update_subtask_progress(
-                &mut progress,
-                "\u{21bb} explore#1 \u{b7} deepseek-v4-flash \u{b7} inspect atomcode",
-            )
-            .is_none()
-        );
+        assert!(update_subtask_progress(
+            &mut progress,
+            "\u{21bb} explore#1 \u{b7} deepseek-v4-flash \u{b7} inspect atomcode",
+        )
+        .is_none());
         assert_eq!(progress.items[0].status, SubtaskStatus::Running);
         assert_eq!(progress.items[0].model, "deepseek-v4-flash");
         assert!(progress.items[0].started_at.is_some());
         assert_eq!(progress.items[1].status, SubtaskStatus::Pending);
         assert!(progress.items[1].started_at.is_none());
 
-        assert!(
-            update_subtask_progress(
-                &mut progress,
-                "\u{1e}explore#1 \u{b7} 已读取 commands.rs，正在分析内容 \u{b7} tokens=384",
-            )
-            .is_none()
-        );
+        assert!(update_subtask_progress(
+            &mut progress,
+            "\u{1e}explore#1 \u{b7} 已读取 commands.rs，正在分析内容 \u{b7} tokens=384",
+        )
+        .is_none());
         assert_eq!(
             progress.items[0].activity,
             "已读取 commands.rs，正在分析内容"
@@ -21585,20 +21607,16 @@ mod subtask_progress_projection_tests {
             "replayed terminal events must not duplicate scrollback"
         );
 
-        assert!(
-            update_subtask_progress(
-                &mut progress,
-                "\u{21bb} explore#2 \u{b7} deepseek-v4-flash \u{b7} inspect codex",
-            )
-            .is_none()
-        );
-        assert!(
-            update_subtask_progress(
-                &mut progress,
-                "\u{1e}explore#2 \u{b7} checking completion \u{b7} tokens=725",
-            )
-            .is_none()
-        );
+        assert!(update_subtask_progress(
+            &mut progress,
+            "\u{21bb} explore#2 \u{b7} deepseek-v4-flash \u{b7} inspect codex",
+        )
+        .is_none());
+        assert!(update_subtask_progress(
+            &mut progress,
+            "\u{1e}explore#2 \u{b7} checking completion \u{b7} tokens=725",
+        )
+        .is_none());
         progress.items[1].started_at =
             Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
         let failed = update_subtask_progress(
@@ -23285,11 +23303,9 @@ fn handle_runtime_event(
                         provider.clone(),
                         model.clone(),
                     );
-                    if let Err(error) = publish_live_provider_reload_success(
-                        ctx,
-                        provider.clone(),
-                        model.clone(),
-                    ) {
+                    if let Err(error) =
+                        publish_live_provider_reload_success(ctx, provider.clone(), model.clone())
+                    {
                         renderer.render(UiLine::Error(error));
                     }
                     if ctx
@@ -23511,10 +23527,7 @@ fn handle_runtime_event(
         bg_runtime::RuntimeEventPayload::Driver(
             bg_runtime::DriverEvent::SessionPreviewLoaded { selection, result },
         ) => {
-            if session_preview_result_matches(
-                ctx.session_preview_selection.as_ref(),
-                &selection,
-            ) {
+            if session_preview_result_matches(ctx.session_preview_selection.as_ref(), &selection) {
                 ctx.session_preview_result = Some(result);
             }
         }
@@ -28972,7 +28985,7 @@ pub(crate) fn summarise_task_result(output: &str) -> String {
         };
         let block = &rest[start..]; // begins with "<task "
         let Some(gt) = block.find('>') else { break }; // end of opening tag
-        // Close is searched strictly AFTER the opening tag ⇒ close index > gt, no reverse slice.
+                                                       // Close is searched strictly AFTER the opening tag ⇒ close index > gt, no reverse slice.
         let Some(close_rel) = block[gt + 1..].find("</task>") else {
             break;
         };
@@ -29224,9 +29237,7 @@ fn project_reasoning_effort(
     // Keep `/effort`, Ctrl+T and the footer on one local projection. `auto` is
     // the config sentinel for a supported endpoint using its API default.
     let persisted = if applicable {
-        runtime_effort
-            .clone()
-            .or_else(|| Some("auto".to_string()))
+        runtime_effort.clone().or_else(|| Some("auto".to_string()))
     } else {
         None
     };
@@ -29246,10 +29257,9 @@ fn persist_reasoning_effort(ctx: &mut LoopCtx) {
     // persisted model means unsupported; `auto` means supported but omitted.
     let persisted_effort = effort.clone().or_else(|| Some("auto".to_string()));
     // Schema-aware write (new-schema `[models.*]` or legacy `[providers.*]`).
-    ctx.config
-        .update_selection_reasoning(&selection, |r| {
-            *r.reasoning_effort = persisted_effort.clone()
-        });
+    ctx.config.update_selection_reasoning(&selection, |r| {
+        *r.reasoning_effort = persisted_effort.clone()
+    });
     match ctx.config_store.update(|config| {
         if !config.update_selection_reasoning(&selection, |r| {
             *r.reasoning_effort = persisted_effort.clone()
@@ -29282,7 +29292,11 @@ pub(crate) fn reasoning_effort_applicable_on_provider(ctx: &LoopCtx) -> bool {
     let Some(provider) = ctx.config.provider_config_for_selection(&selection) else {
         return false;
     };
-    effort_applicable(provider.reasoning_effort.as_deref(), &selection, &ctx.model_name)
+    effort_applicable(
+        provider.reasoning_effort.as_deref(),
+        &selection,
+        &ctx.model_name,
+    )
 }
 
 /// The reasoning-effort levels the current selection exposes (canonical order),
@@ -29597,7 +29611,7 @@ mod todo_block_tests {
         .expect("valid list");
         assert_eq!((p.completed, p.total), (1, 3));
         assert_eq!(p.current.as_deref(), Some("b")); // the in_progress task
-        // No task in progress ⇒ current None, counts still populated.
+                                                     // No task in progress ⇒ current None, counts still populated.
         let done =
             todo_progress_from_args(r#"{"todos":[{"content":"a","status":"completed"}]}"#).unwrap();
         assert_eq!((done.completed, done.total, done.current), (1, 1, None));
