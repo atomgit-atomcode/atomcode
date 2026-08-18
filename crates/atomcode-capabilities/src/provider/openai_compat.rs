@@ -1056,12 +1056,13 @@ fn build_request_body(
         let t: Vec<Value> = tools
             .iter()
             .map(|td| {
+                let parameters = normalize_openai_tool_schema(&td.parameters);
                 json!({
                     "type": "function",
                     "function": {
                         "name": td.name,
                         "description": td.description,
-                        "parameters": td.parameters,
+                        "parameters": parameters,
                     }
                 })
             })
@@ -1069,6 +1070,71 @@ fn build_request_body(
         body.insert("tools".into(), json!(t));
     }
     Value::Object(body)
+}
+
+/// Normalize tool parameter schemas for strict OpenAI-compatible gateways.
+///
+/// JSON Schema permits an object schema to omit `properties`, but LM Studio's
+/// chat-completions validator requires it to be an object. Keep the neutral
+/// kernel schema untouched and add the empty map only at this wire boundary.
+/// Recurse so externally supplied MCP/plugin schemas with nested object fields
+/// receive the same compatibility treatment as built-in tools.
+fn normalize_openai_tool_schema(schema: &Value) -> Value {
+    let mut normalized = schema.clone();
+    normalize_openai_tool_schema_in_place(&mut normalized);
+    normalized
+}
+
+fn normalize_openai_tool_schema_in_place(schema: &mut Value) {
+    let Value::Object(map) = schema else {
+        return;
+    };
+
+    let allows_object = match map.get("type") {
+        Some(Value::String(kind)) => kind == "object",
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "object"),
+        _ => false,
+    };
+    if allows_object && !map.contains_key("properties") {
+        map.insert("properties".into(), Value::Object(Map::new()));
+    }
+
+    // Traverse only values that are themselves JSON Schemas. Literal-bearing
+    // keywords such as `const`, `enum`, `default`, and `examples` must remain
+    // byte-for-byte unchanged even when their data resembles a schema.
+    if let Some(Value::Object(properties)) = map.get_mut("properties") {
+        for child in properties.values_mut() {
+            normalize_openai_tool_schema_in_place(child);
+        }
+    }
+    for key in ["items", "prefixItems", "anyOf", "oneOf", "allOf"] {
+        if let Some(child) = map.get_mut(key) {
+            normalize_openai_tool_schema_children(child);
+        }
+    }
+    if let Some(child) = map.get_mut("additionalProperties") {
+        if !child.is_boolean() {
+            normalize_openai_tool_schema_in_place(child);
+        }
+    }
+    for key in ["$defs", "definitions"] {
+        if let Some(Value::Object(definitions)) = map.get_mut(key) {
+            for child in definitions.values_mut() {
+                normalize_openai_tool_schema_in_place(child);
+            }
+        }
+    }
+}
+
+fn normalize_openai_tool_schema_children(children: &mut Value) {
+    match children {
+        Value::Array(items) => {
+            for child in items {
+                normalize_openai_tool_schema_in_place(child);
+            }
+        }
+        child => normalize_openai_tool_schema_in_place(child),
+    }
 }
 
 /// DeepSeek V4 thinking models reject the `tool_choice` control parameter while
@@ -2297,6 +2363,95 @@ mod tests {
         assert_eq!(body["max_tokens"].as_u64(), Some(100)); // cfg fallback
         assert_eq!(body["reasoning_effort"], "high"); // v4 applicable
         assert_eq!(body["tools"][0]["function"]["name"], "read");
+    }
+
+    #[test]
+    fn object_tool_schemas_gain_properties_for_strict_compatible_gateways() {
+        let cfg = OpenAiCompatConfig::new("k", "http://127.0.0.1:1234/v1", "local-model");
+        let tools = vec![
+            ToolDef {
+                name: "empty".into(),
+                description: "no arguments".into(),
+                parameters: json!({"type":"object"}),
+            },
+            ToolDef {
+                name: "nested".into(),
+                description: "nested object".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "options": {"type": ["object", "null"]},
+                        "query": {"type": "string"}
+                    }
+                }),
+            },
+            ToolDef {
+                name: "external".into(),
+                description: "external schema".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "fixed": {"const": {"type": "object"}},
+                        "choice": {"enum": [{"type": "object"}]},
+                        "fallback": {"default": {"type": "object"}},
+                        "labels": {
+                            "type": "object",
+                            "additionalProperties": {"type": "object"}
+                        }
+                    },
+                    "$defs": {
+                        "record": {"type": "object"}
+                    }
+                }),
+            },
+        ];
+
+        let body = build_request_body(
+            "local-model",
+            &[Message::user("hi")],
+            &tools,
+            &ChatOptions::default(),
+            &cfg,
+            ReasoningPolicy::Exclude,
+        );
+
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"],
+            json!({"type":"object","properties":{}})
+        );
+        assert_eq!(
+            body["tools"][1]["function"]["parameters"]["properties"]["options"],
+            json!({"type":["object","null"],"properties":{}})
+        );
+        assert_eq!(
+            body["tools"][1]["function"]["parameters"]["properties"]["query"],
+            json!({"type":"string"}),
+            "existing non-object property schemas must remain unchanged"
+        );
+        let external = &body["tools"][2]["function"]["parameters"];
+        assert_eq!(
+            external["properties"]["fixed"]["const"],
+            json!({"type":"object"}),
+            "const data must not be normalized as a schema"
+        );
+        assert_eq!(
+            external["properties"]["choice"]["enum"],
+            json!([{"type":"object"}]),
+            "enum data must not be normalized as schemas"
+        );
+        assert_eq!(
+            external["properties"]["fallback"]["default"],
+            json!({"type":"object"}),
+            "default data must not be normalized as a schema"
+        );
+        assert_eq!(
+            external["properties"]["labels"]["additionalProperties"],
+            json!({"type":"object","properties":{}})
+        );
+        assert_eq!(
+            external["$defs"]["record"],
+            json!({"type":"object","properties":{}})
+        );
     }
 
     #[test]
