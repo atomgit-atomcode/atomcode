@@ -336,23 +336,17 @@ body {
 .user-message-bubble.is-markdown > :first-child { margin-top: 0; }
 .user-message-bubble.is-markdown > :last-child { margin-bottom: 0; }
 
-/* Copy button row below user message bubble: hidden by default, shown on hover. */
+/* Persistent message metadata row. User: time → copy. Assistant: copy → time. */
 .msg-actions {
   display: flex;
+  align-items: center;
+  gap: 4px;
   justify-content: flex-end;
   padding-top: 2px;
-  opacity: 0;
-  transition: opacity 0.15s;
   height: 24px;
 }
 .msg-actions-left {
   justify-content: flex-start;
-}
-.user-message-wrapper:hover .msg-actions {
-  opacity: 1;
-}
-.timeline-message:hover .msg-actions {
-  opacity: 1;
 }
 .msg-copy-btn {
   display: flex;
@@ -490,21 +484,14 @@ body {
   outline-offset: 2px;
 }
 
-/* === PR #562: send-time label under each message === */
-/* Dimmed, small, non-interactive. Assistant turns: left-aligned under the
-   reply (matches .timeline-message's flex-start). User turns: right-aligned
-   to sit under the bubble (.msg-time-user). Full timestamp via title tooltip.
-   Note: 不设 pointer-events:none —— 那会阻断原生 title tooltip 触发
-   (bot review P2)。user-select:none 仍保留以防止误选时间文字。 */
+/* Stable local timestamp displayed beside the persistent copy action. */
 .msg-time {
-  margin-top: 4px;
   font-size: 0.75rem;
   line-height: 1.4;
   color: var(--app-caption-foreground);
   user-select: none;
 }
 .msg-time-user {
-  align-self: flex-end;
   margin-right: 2px;
 }
 
@@ -3697,15 +3684,21 @@ body {
   display: block;
 }
 
-/* Jump-to-bottom pill: shown when the user scrolls up during streaming (auto-follow
-   released). Fixed above the input bar; theme-safe via var fallbacks. */
-.jump-to-bottom {
-  position: fixed;
-  right: 28px;
-  bottom: 96px;
+/* Harness-style zero-height sticky seat: no scroll-height inflation, centered on
+   the conversation lane rather than pinned to the browser's far-right edge. */
+.jump-to-bottom-slot {
+  position: sticky;
+  bottom: 12px;
   z-index: 20;
+  height: 0;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+.jump-to-bottom {
   width: 36px;
   height: 36px;
+  margin-top: -36px;
   border-radius: 50%;
   border: 1px solid var(--border-color, rgba(128, 128, 128, 0.35));
   background: var(--app-primary-background, #1e1e1e);
@@ -3719,5 +3712,38 @@ body {
   justify-content: center;
   opacity: 0.92;
   transition: opacity 0.15s ease, transform 0.15s ease;
+  pointer-events: auto;
 }
 .jump-to-bottom:hover { opacity: 1; transform: translateY(-1px); }
+
+/* Turn deliverables: successful mutation tools only, deduped for the complete
+   user turn. Compact chips mirror DeepSeek Harness and remain keyboard usable. */
+.turn-artifacts {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+  color: var(--app-secondary-foreground);
+  font-size: 0.875rem;
+}
+.turn-artifacts-label { flex: 0 0 auto; }
+.turn-artifacts-list { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.turn-artifact-chip {
+  max-width: min(320px, 60vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: 0;
+  border-radius: 7px;
+  padding: 4px 9px;
+  background: var(--app-input-secondary-background);
+  color: var(--app-primary-foreground);
+  font: inherit;
+  font-family: var(--app-monospace-font-family);
+  cursor: pointer;
+}
+.turn-artifact-chip:hover { background: var(--app-hover-background); }
+.turn-artifact-chip:focus-visible { outline: 2px solid var(--app-brand); outline-offset: 2px; }
+.turn-artifact-more { align-self: center; color: var(--app-tertiary-foreground); }
+.turn-artifact-error { flex-basis: 100%; color: var(--app-error-fg, #b3261e); font-size: 0.8125rem; }

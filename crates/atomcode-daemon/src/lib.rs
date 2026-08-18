@@ -5853,6 +5853,117 @@ pub struct FsMkdirRequest {
     pub path: String,
 }
 
+#[derive(serde::Deserialize)]
+pub struct FsOpenRequest {
+    pub path: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+fn resolve_workspace_file(root: &std::path::Path, requested: &str) -> std::io::Result<PathBuf> {
+    let requested = PathBuf::from(requested.trim());
+    if requested.as_os_str().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file path is empty",
+        ));
+    }
+    let root = std::fs::canonicalize(root)?;
+    let unresolved = if requested.is_absolute() {
+        requested
+    } else {
+        root.join(requested)
+    };
+    let target = std::fs::canonicalize(unresolved)?;
+    if !target.starts_with(&root) || !target.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "only regular files inside the current working directory can be opened",
+        ));
+    }
+    Ok(target)
+}
+
+fn resolve_session_workspace_file(
+    sessions_root: &std::path::Path,
+    current_root: &std::path::Path,
+    requested: &str,
+    session_id: Option<&str>,
+    active_binding: Option<(&str, &std::path::Path)>,
+) -> std::io::Result<PathBuf> {
+    let root = match session_id.filter(|id| !id.trim().is_empty()) {
+        Some(session_id) => match active_binding {
+            Some((id, working_dir)) if id == session_id.trim() => working_dir.to_path_buf(),
+            _ => {
+                resolve_session_in_root(sessions_root, session_id.trim())
+                    .map_err(|error| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("cannot resolve session working directory: {error}"),
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::NotFound, "session not found")
+                    })?
+                    .meta
+                    .working_dir
+            }
+        },
+        None => current_root.to_path_buf(),
+    };
+    resolve_workspace_file(&root, requested)
+}
+
+/// Open a generated file from the WebUI. This is deliberately narrower than
+/// the agent's `open_file` tool: HTTP callers may open only an existing regular
+/// file under the daemon's current workspace, after symlinks and `..` are
+/// resolved. The endpoint never accepts URLs or directories.
+async fn fs_open(
+    State(state): State<AppState>,
+    Json(req): Json<FsOpenRequest>,
+) -> impl IntoResponse {
+    let current_root = state.project.read().await.working_dir.clone();
+    let requested = req.path;
+    let session_id = req.session_id.filter(|id| !id.trim().is_empty());
+    let active_binding = crate::native_live::binding().ok();
+    let resolved = tokio::task::spawn_blocking(move || {
+        resolve_session_workspace_file(
+            &NativeSessionManager::sessions_root(),
+            &current_root,
+            &requested,
+            session_id.as_deref(),
+            active_binding
+                .as_ref()
+                .map(|binding| (binding.session_id.as_str(), binding.working_dir.as_path())),
+        )
+    })
+    .await;
+    let target = match resolved {
+        Ok(Ok(target)) => target,
+        Ok(Err(error)) => {
+            let status = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return json_error(status, format!("cannot open file: {error}")).into_response();
+        }
+        Err(error) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("file resolution task failed: {error}"),
+            )
+            .into_response();
+        }
+    };
+    match atomcode_capabilities::tools::open_local_path(&target).await {
+        Ok(message) => {
+            Json(serde_json::json!({ "success": true, "message": message })).into_response()
+        }
+        Err(message) => json_error(StatusCode::BAD_REQUEST, message).into_response(),
+    }
+}
+
 async fn fs_mkdir(
     State(_state): State<AppState>,
     Json(req): Json<FsMkdirRequest>,
@@ -6119,6 +6230,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         // Filesystem API
         .route("/fs/list", get(fs_list))
         .route("/fs/mkdir", post(fs_mkdir))
+        .route("/fs/open", post(fs_open))
         // MCP API
         .route("/mcp/status", get(mcp_status))
         .route("/mcp/reload", post(mcp_reload))
@@ -6362,6 +6474,110 @@ mod fs_list_tests {
     #[test]
     fn errors_on_missing_dir() {
         assert!(list_subdirs(std::path::Path::new("/no/such/dir/xyz123")).is_err());
+    }
+
+    #[test]
+    fn workspace_file_resolution_accepts_files_and_rejects_escape_or_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("artifact.md"), "ok").unwrap();
+        std::fs::write(temp.path().join("outside.md"), "no").unwrap();
+
+        assert_eq!(
+            resolve_workspace_file(&workspace, "artifact.md").unwrap(),
+            std::fs::canonicalize(workspace.join("artifact.md")).unwrap()
+        );
+        assert_eq!(
+            resolve_workspace_file(&workspace, "../outside.md")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            resolve_workspace_file(&workspace, ".").unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_file_resolution_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let outside = temp.path().join("outside.md");
+        std::fs::write(&outside, "no").unwrap();
+        symlink(&outside, workspace.join("link.md")).unwrap();
+
+        assert_eq!(
+            resolve_workspace_file(&workspace, "link.md")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn workspace_file_resolution_uses_the_owning_sessions_working_directory() {
+        use atomcode_capabilities::session::{
+            PresentationFile, SessionManager, SessionMeta, StorageOwner,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_root = temp.path().join("sessions");
+        let current = temp.path().join("current");
+        let session_workspace = temp.path().join("session-workspace");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::create_dir_all(&session_workspace).unwrap();
+        std::fs::write(session_workspace.join("artifact.md"), "ok").unwrap();
+
+        let manager = SessionManager::with_root(sessions_root.join("0000000000000000"));
+        let lease = manager.acquire_lease("session-1").unwrap();
+        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+            atomcode_kernel::message::Message::user("fixture"),
+        ]);
+        let mut meta = SessionMeta::new("session-1", session_workspace.to_string_lossy(), 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 1;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+
+        // The live runtime still owns the lease here, so disk catalog discovery
+        // may be unavailable (especially under mandatory Windows locks). Its
+        // authoritative binding must still make the produced file openable.
+        assert_eq!(
+            resolve_session_workspace_file(
+                &sessions_root,
+                &current,
+                "artifact.md",
+                Some("session-1"),
+                Some(("session-1", &session_workspace)),
+            )
+            .unwrap(),
+            std::fs::canonicalize(session_workspace.join("artifact.md")).unwrap()
+        );
+        drop(lease);
+
+        assert_eq!(
+            resolve_session_workspace_file(
+                &sessions_root,
+                &current,
+                "artifact.md",
+                Some("session-1"),
+                None,
+            )
+            .unwrap(),
+            std::fs::canonicalize(session_workspace.join("artifact.md")).unwrap()
+        );
     }
 }
 

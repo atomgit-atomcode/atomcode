@@ -723,6 +723,19 @@ export async function mkdir(path: string): Promise<{ path: string }> {
   return r.json();
 }
 
+/** Open an existing file inside the active session's bound working directory. */
+export async function openWorkspaceFile(path: string, sessionId?: string): Promise<void> {
+  const r = await fetch('/fs/open', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ path, session_id: sessionId }),
+  });
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({}));
+    throw new Error((body as { error?: string }).error || `HTTP ${r.status}`);
+  }
+}
+
 // --- Change working directory ---
 
 export interface CdResponse {

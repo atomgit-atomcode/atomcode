@@ -6,6 +6,27 @@ Object.defineProperty(globalThis, 'location', {
   configurable: true,
 });
 
+test('openWorkspaceFile scopes the host opener to the owning session', async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({ url: String(url), init });
+    return new Response('{"success":true}', { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const { openWorkspaceFile } = await import('./api.ts');
+    await openWorkspaceFile('reports/result.md', 'session-1');
+    assert.equal(calls[0].url, '/fs/open');
+    assert.deepEqual(JSON.parse(String(calls[0].init?.body)), {
+      path: 'reports/result.md',
+      session_id: 'session-1',
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('postLiveMessage does not send approval_mode because live mode is global', async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   const originalFetch = globalThis.fetch;

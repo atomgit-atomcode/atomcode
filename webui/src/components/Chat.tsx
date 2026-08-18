@@ -27,7 +27,7 @@
 
 import { VNode } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -99,6 +99,7 @@ import {
 import { hasCoarsePointer, shouldSendComposerOnEnter } from '../lib/composerKeyboard';
 import { completedTurnStats, formatTurnDuration, formatTurnTokens, turnCacheHit } from '../lib/turnStats';
 import { disposeNotifications, maybeNotifyTurnFinished } from '../lib/notifications';
+import { artifactsByAssistantIndex, type TurnArtifact } from '../lib/turnArtifacts';
 
 interface Message {
   role: 'user' | 'assistant' | 'system';
@@ -144,41 +145,13 @@ function notificationDedupeKey(
   ].join(':');
 }
 
-/** Zero-pad a number to 2 digits — shared by formatMsgTime / formatMsgTimeFull. */
+/** Zero-pad a local date/time component to 2 digits. */
 const pad2 = (n: number) => (n < 10 ? '0' + n : '' + n);
 
-/** Whether two dates fall on the same calendar day (Y/M/D all equal). */
-function sameDay(a: Date, b: Date): boolean {
-  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
-}
-
-/** PR #562: format a send-time label for a message bubble.
- *  - Today → "HH:MM" (compact, the common case)
- *  - Yesterday → i18n `time.yesterday` + "HH:MM"
- *  - Same year → i18n `time.sameYear` ({m}月{d}日 {hm} / {m}/{d} {hm})
- *  - Older / other year → i18n `time.otherYear` ({y}/{m}/{d} {hm})
- *  Returns '' when ts is missing/invalid so callers can simply `{ts && …}`.
- *  `t` is the i18n resolver (passed in from the component so this stays a
- *  pure top-level helper). Local time, because a chat send time is a
- *  wall-clock fact the user reads the same way they read a timestamp in
- *  any messaging app. */
-function formatMsgTime(ts: number | undefined, t: (key: MsgKey, params?: Record<string, string | number>) => string): string {
+/** Format a message timestamp as a stable, always-visible local wall clock. */
+function formatMsgTime(ts: number | undefined): string {
   // P3 修复: 用 ts == null 而非 !ts,避免把 ts=0 (epoch 1970) 误判为无效。
   // 实际消息时间戳不会是 0,但严格区分 "缺失" 与 "值为 0" 更正确。
-  if (ts == null || !Number.isFinite(ts)) return '';
-  const d = new Date(ts);
-  if (isNaN(d.getTime())) return '';
-  const now = new Date();
-  const hm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-  if (sameDay(d, now)) return hm;
-  const yest = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
-  if (sameDay(d, yest)) return `${t('time.yesterday')} ${hm}`;
-  if (d.getFullYear() === now.getFullYear()) return t('time.sameYear', { m: d.getMonth() + 1, d: d.getDate(), hm });
-  return t('time.otherYear', { y: d.getFullYear(), m: d.getMonth() + 1, d: d.getDate(), hm });
-}
-
-/** Full local timestamp for the hover tooltip (seconds + full date). */
-function formatMsgTimeFull(ts?: number): string {
   if (ts == null || !Number.isFinite(ts)) return '';
   const d = new Date(ts);
   if (isNaN(d.getTime())) return '';
@@ -3469,12 +3442,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           }
 
           const assistantTurnEnds = assistantTurnEndFlags(messages.map((message) => message.role));
+          const turnArtifacts = artifactsByAssistantIndex(messages);
 
           return visibleMessages.map(({ msg, origIdx }, idx) => {
             const isLast = idx === lastVisibleIdx;
             const setMatchRef = (el: HTMLElement | null) => { matchRefs.current[origIdx] = el; };
-            const timeLabel = formatMsgTime(msg.ts, t);
-            const timeFull = formatMsgTimeFull(msg.ts);
+            const timeLabel = formatMsgTime(msg.ts);
             const isActiveSearchMatch = searchOpen && searchTrim ? (origIdx === matchPositions[matchIdx]) : false;
 
             if (msg.role === 'user') {
@@ -3484,7 +3457,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
                   msg={msg}
                   searchRef={setMatchRef}
                   timeLabel={timeLabel}
-                  timeFull={timeFull}
                   search={search}
                   isActiveSearchMatch={isActiveSearchMatch}
                   steerPending={isSteerPending(msg.pendingSteerId, pendingSteers)}
@@ -3518,9 +3490,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
                 lastIdx={lastIdx}
                 isLastInTurn={isLastInTurn}
                 turnText={turnTexts.get(origIdx) ?? ''}
+                artifacts={turnArtifacts.get(origIdx) ?? []}
+                sessionId={sessionId}
                 searchRef={setMatchRef}
                 timeLabel={timeLabel}
-                timeFull={timeFull}
                 search={search}
                 isActiveSearchMatch={isActiveSearchMatch}
               />
@@ -3570,6 +3543,20 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
 
         <div ref={bottomRef} />
         </div>
+        {/* Zero-height sticky seat, following Harness: the control belongs to the
+            conversation scroller and is centered on the same content lane. */}
+        {showJumpBtn && (
+          <div class="jump-to-bottom-slot">
+            <button
+              class="jump-to-bottom"
+              onClick={() => scrollToBottom('smooth')}
+              title={t('chat.jumpToBottom')}
+              aria-label={t('chat.jumpToBottom')}
+            >
+              ↓
+            </button>
+          </div>
+        )}
       </div>
 
       {/* 浮动搜索框:默认隐藏,Cmd/Ctrl+F 呼出,Esc/× 关闭。仿浏览器 Find-in-page 样式:
@@ -3650,18 +3637,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             </svg>
           </button>
         </div>
-      )}
-
-      {/* Jump-to-bottom: shown only when the user has scrolled up (follow released). */}
-      {showJumpBtn && (
-        <button
-          class="jump-to-bottom"
-          onClick={() => scrollToBottom('smooth')}
-          title={t('chat.jumpToBottom')}
-          aria-label={t('chat.jumpToBottom')}
-        >
-          ↓
-        </button>
       )}
 
       {/* Floating input */}
@@ -3764,9 +3739,10 @@ function AssistantMessageView({
   busy,
   isLastInTurn,
   turnText,
+  artifacts,
+  sessionId,
   searchRef,
   timeLabel,
-  timeFull,
   search,
   isActiveSearchMatch,
 }: {
@@ -3776,9 +3752,10 @@ function AssistantMessageView({
   lastIdx: number;
   isLastInTurn: boolean;
   turnText: string;
+  artifacts: TurnArtifact[];
+  sessionId: string | null;
   searchRef?: (el: HTMLElement | null) => void;
   timeLabel?: string;
-  timeFull?: string;
   search: string;
   isActiveSearchMatch: boolean;
 }) {
@@ -3805,6 +3782,7 @@ function AssistantMessageView({
   // Copy button: only shown on the last assistant message in a turn.
   // Copies the entire turn's text (all assistant messages in this turn joined).
   const [copied, setCopied] = useState(false);
+  const [artifactError, setArtifactError] = useState('');
 
   function handleCopy() {
     navigator.clipboard.writeText(turnText).then(() => {
@@ -3814,26 +3792,26 @@ function AssistantMessageView({
   }
 
   const copyBtn = isLastInTurn && !isError && !streaming && turnText ? (
-    <div class="msg-actions msg-actions-left">
-      <button
-        class={'msg-copy-btn' + (copied ? ' copied' : '')}
-        onClick={handleCopy}
-        title={copied ? t('copy.copied') : t('copy.copy')}
-        aria-label={copied ? t('copy.copied') : t('copy.copy')}
-      >
-        {copied ? (
-          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <path d="M3.5 8.5 6.5 11.5 12.5 4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
-          </svg>
-        ) : (
-          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <rect x="5" y="5" width="8.5" height="8.5" rx="1.5" stroke="currentColor" stroke-width="1.2" />
-            <path d="M2.5 10.5V3.5A1.5 1.5 0 0 1 4 2h7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
-          </svg>
-        )}
-      </button>
-    </div>
+    <button
+      class={'msg-copy-btn' + (copied ? ' copied' : '')}
+      onClick={handleCopy}
+      title={copied ? t('copy.copied') : t('copy.copy')}
+      aria-label={copied ? t('copy.copied') : t('copy.copy')}
+    >
+      {copied ? (
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path d="M3.5 8.5 6.5 11.5 12.5 4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      ) : (
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <rect x="5" y="5" width="8.5" height="8.5" rx="1.5" stroke="currentColor" stroke-width="1.2" />
+          <path d="M2.5 10.5V3.5A1.5 1.5 0 0 1 4 2h7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+        </svg>
+      )}
+    </button>
   ) : null;
+
+  const showTimestamp = Boolean(timeLabel) && shouldShowAssistantTimestamp(isLastInTurn, streaming, text, isError);
 
   return (
     <div class={cls} ref={searchRef}>
@@ -3851,11 +3829,40 @@ function AssistantMessageView({
           {streaming && <span class="streaming-cursor" />}
         </>
       )}
-      {copyBtn}
-      {/* One timestamp per user turn: intermediate assistant/tool rounds share
-          the turn's persisted timestamp but must not repeat it in the timeline. */}
-      {timeLabel && shouldShowAssistantTimestamp(isLastInTurn, streaming, text, isError) && (
-        <div class="msg-time" title={timeFull}>{timeLabel}</div>
+      {isLastInTurn && !streaming && artifacts.length > 0 && (
+        <div class="turn-artifacts" aria-label={t('chat.artifacts')}>
+          <span class="turn-artifacts-label">{t('chat.artifacts')}</span>
+          <div class="turn-artifacts-list">
+            {artifacts.slice(0, 6).map((artifact) => (
+              <button
+                key={artifact.path}
+                type="button"
+                class="turn-artifact-chip"
+                title={artifact.path}
+                onClick={() => {
+                  setArtifactError('');
+                  void openWorkspaceFile(artifact.path, sessionId ?? undefined).catch((error) => {
+                    setArtifactError(t('chat.artifactOpenFailed', { msg: String(error) }));
+                  });
+                }}
+              >
+                {artifact.label}
+              </button>
+            ))}
+            {artifacts.length > 6 && (
+              <span class="turn-artifact-more">+{artifacts.length - 6}</span>
+            )}
+          </div>
+          {artifactError && <div class="turn-artifact-error" role="status">{artifactError}</div>}
+        </div>
+      )}
+      {(copyBtn || showTimestamp) && (
+        <div class="msg-actions msg-actions-left">
+          {copyBtn}
+          {/* One timestamp per user turn: intermediate assistant/tool rounds share
+              the turn's persisted timestamp but must not repeat it in the timeline. */}
+          {showTimestamp && <div class="msg-time">{timeLabel}</div>}
+        </div>
       )}
     </div>
   );
@@ -3939,7 +3946,6 @@ function UserMessageView({
   msg,
   searchRef,
   timeLabel,
-  timeFull,
   search,
   isActiveSearchMatch,
   steerPending,
@@ -3947,7 +3953,6 @@ function UserMessageView({
   msg: Message;
   searchRef?: (el: HTMLElement | null) => void;
   timeLabel?: string;
-  timeFull?: string;
   search: string;
   isActiveSearchMatch: boolean;
   steerPending?: boolean;
@@ -4018,7 +4023,10 @@ function UserMessageView({
           <span class="skill-badge-hint">{t('chat.skillExpand')}</span>
         </button>
         {steerBadge}
-        {timeLabel && <div class="msg-time msg-time-user" title={timeFull}>{timeLabel}</div>}
+        <div class="msg-actions">
+          {timeLabel && <div class="msg-time msg-time-user">{timeLabel}</div>}
+          {copyBtn}
+        </div>
       </div>
     );
   }
@@ -4037,12 +4045,10 @@ function UserMessageView({
         {skillTitle ? <Markdown content={text} search={search} /> : highlightText(text, search)}
       </div>
       <div class="msg-actions">
+        {timeLabel && <div class="msg-time msg-time-user">{timeLabel}</div>}
         {copyBtn}
       </div>
       {steerBadge}
-      {/* PR #562 send-time label — below the bubble, right-aligned to match
-          the user side; full timestamp on hover. */}
-      {timeLabel && <div class="msg-time msg-time-user" title={timeFull}>{timeLabel}</div>}
     </div>
   );
 }

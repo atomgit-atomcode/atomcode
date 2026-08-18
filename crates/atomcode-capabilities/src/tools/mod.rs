@@ -103,7 +103,7 @@ pub use edit::EditFileTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use list::ListDirTool;
-pub use open_file::{OpenFileTool, OpenFileWorkspaceGate};
+pub use open_file::{open_local_path, OpenFileTool, OpenFileWorkspaceGate};
 pub use output_artifact::{
     artifact_id, ArtifactMiddleware, ArtifactStore, FetchOutputTool,
     ARTIFACT_TRUNCATION_MARKER_PREFIX, THRESHOLD_BYTES,
