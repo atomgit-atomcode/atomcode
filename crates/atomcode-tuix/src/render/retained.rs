@@ -2722,7 +2722,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let mut row1 = Vec::new();
         if selected {
             let border_style = self.style_for(Role::Border);
-            push_str_cells_sgr(&mut row1, "▸ ", border_style);
+            let marker = if self.caps.unicode_symbols {
+                "▸ "
+            } else {
+                "> "
+            };
+            push_str_cells_sgr(&mut row1, marker, border_style);
         } else {
             push_str_cells_sgr(&mut row1, "  ", CellStyle::default());
         }
@@ -2732,7 +2737,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
             if selected {
                 gray_style.bold = true;
             }
-            push_str_cells_sgr(&mut row1, "✓ ", gray_style);
+            let installed_marker = if self.caps.unicode_symbols {
+                "✓ "
+            } else {
+                "* "
+            };
+            push_str_cells_sgr(&mut row1, installed_marker, gray_style);
         } else {
             push_str_cells_sgr(&mut row1, "  ", CellStyle::default());
         }
@@ -12433,6 +12443,31 @@ mod tests {
         assert_eq!(r.session_item_height(h0, "meta", 80), 2);
         assert_eq!(r.session_item_height(h0 + 1, "meta", 80), 3);
         assert_eq!(r.session_item_height(h0 + 5, "meta", 80), 3);
+    }
+
+    #[test]
+    fn plugin_menu_markers_fall_back_to_ascii_without_unicode_symbols() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.unicode_symbols = false;
+
+        let selected = r.build_plugin_menu_rows("[Add model]", "", true, 70);
+        let selected_text: String = selected[0]
+            .iter()
+            .filter(|cell| cell.width > 0)
+            .map(|cell| cell.ch)
+            .collect();
+        assert!(selected_text.starts_with("> "), "{selected_text:?}");
+        assert!(selected_text.contains("[Add model]"), "{selected_text:?}");
+        assert!(!selected_text.contains('▸'), "{selected_text:?}");
+
+        let installed = r.build_plugin_menu_rows("model", "scope (installed)", false, 70);
+        let installed_text: String = installed[0]
+            .iter()
+            .filter(|cell| cell.width > 0)
+            .map(|cell| cell.ch)
+            .collect();
+        assert!(installed_text.starts_with("  * model"), "{installed_text:?}");
+        assert!(!installed_text.contains('✓'), "{installed_text:?}");
     }
 
     #[test]
