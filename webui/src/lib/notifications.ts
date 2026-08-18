@@ -125,6 +125,44 @@ export async function requestNotificationPermission(): Promise<boolean> {
 }
 
 /**
+ * 在首次用户交互时请求通知权限。
+ *
+ * 浏览器不允许页面加载时直接弹出通知授权框，因此这里只注册一次性用户手势
+ * 监听。调用方应在卸载时执行返回的清理函数，避免热重载或重复挂载遗留监听。
+ */
+export function initNotificationPermissionPrompt(): () => void {
+  if (typeof window === 'undefined') return () => {};
+  if (!notificationsSupported()) return () => {};
+  if (typeof Notification === 'undefined' || Notification.permission !== 'default') {
+    return () => {};
+  }
+  if (!loadPrefs().enabled) return () => {};
+
+  let active = true;
+  const cleanup = () => {
+    if (!active) return;
+    active = false;
+    window.removeEventListener('pointerdown', request);
+    window.removeEventListener('keydown', request);
+  };
+  const request = () => {
+    // 注册后 `/config` 或设置面板可能已关闭通知；在真正请求权限前再次确认，
+    // 避免使用挂载时的过期偏好。
+    if (!loadPrefs().enabled) {
+      cleanup();
+      return;
+    }
+    cleanup();
+    // 仍处于原始用户手势事件栈中，满足浏览器的权限请求约束。
+    void requestNotificationPermission();
+  };
+
+  window.addEventListener('pointerdown', request);
+  window.addEventListener('keydown', request);
+  return cleanup;
+}
+
+/**
  * 纯决策函数：是否应弹出通知。任一条件不满足返回 false。
  *
  * 条件：supported / permission granted / enabled / backgroundOnly?(hidden) /

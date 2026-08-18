@@ -7,6 +7,7 @@ import {
   applyConfigDefaults,
   shouldNotify,
   notificationsSupported,
+  initNotificationPermissionPrompt,
   maybeNotifyTurnFinished,
   disposeNotifications,
   type NotificationPrefs,
@@ -434,6 +435,104 @@ test('notificationsSupported: true on localhost-like secure context', () => {
   withBrowserGlobals(() => {
     assert.equal(notificationsSupported(), true);
   });
+});
+
+// ── 首次交互权限提示 ──────────────────────────────────────────────────
+
+test('initNotificationPermissionPrompt requests permission on first interaction only', () => {
+  withBrowserGlobals(() => {
+    const listeners = new Map<string, Set<() => void>>();
+    const fakeWindow = {
+      isSecureContext: true,
+      addEventListener(type: string, listener: () => void) {
+        const set = listeners.get(type) ?? new Set<() => void>();
+        set.add(listener);
+        listeners.set(type, set);
+      },
+      removeEventListener(type: string, listener: () => void) {
+        listeners.get(type)?.delete(listener);
+      },
+    };
+    (globalThis as Record<string, unknown>).window = fakeWindow;
+
+    let requests = 0;
+    const ctor = fakeNotificationCtor! as typeof fakeNotificationCtor & {
+      requestPermission: () => Promise<NotificationPermission>;
+    };
+    ctor.permission = 'default';
+    ctor.requestPermission = async () => {
+      requests += 1;
+      return 'granted';
+    };
+
+    initNotificationPermissionPrompt();
+    assert.equal(listeners.get('pointerdown')?.size, 1);
+    assert.equal(listeners.get('keydown')?.size, 1);
+
+    listeners.get('pointerdown')?.forEach((listener) => listener());
+    listeners.get('keydown')?.forEach((listener) => listener());
+    assert.equal(requests, 1);
+    assert.equal(listeners.get('pointerdown')?.size, 0);
+    assert.equal(listeners.get('keydown')?.size, 0);
+  }, { permission: 'default' });
+});
+
+test('initNotificationPermissionPrompt cleanup removes pending listeners', () => {
+  withBrowserGlobals(() => {
+    const listeners = new Map<string, Set<() => void>>();
+    (globalThis as Record<string, unknown>).window = {
+      isSecureContext: true,
+      addEventListener(type: string, listener: () => void) {
+        const set = listeners.get(type) ?? new Set<() => void>();
+        set.add(listener);
+        listeners.set(type, set);
+      },
+      removeEventListener(type: string, listener: () => void) {
+        listeners.get(type)?.delete(listener);
+      },
+    };
+    fakeNotificationCtor!.permission = 'default';
+
+    const cleanup = initNotificationPermissionPrompt();
+    cleanup();
+    assert.equal(listeners.get('pointerdown')?.size, 0);
+    assert.equal(listeners.get('keydown')?.size, 0);
+  }, { permission: 'default' });
+});
+
+test('initNotificationPermissionPrompt rechecks disabled preference before requesting', () => {
+  withBrowserGlobals(() => {
+    const listeners = new Map<string, Set<() => void>>();
+    (globalThis as Record<string, unknown>).window = {
+      isSecureContext: true,
+      addEventListener(type: string, listener: () => void) {
+        const set = listeners.get(type) ?? new Set<() => void>();
+        set.add(listener);
+        listeners.set(type, set);
+      },
+      removeEventListener(type: string, listener: () => void) {
+        listeners.get(type)?.delete(listener);
+      },
+    };
+
+    let requests = 0;
+    const ctor = fakeNotificationCtor! as typeof fakeNotificationCtor & {
+      requestPermission: () => Promise<NotificationPermission>;
+    };
+    ctor.permission = 'default';
+    ctor.requestPermission = async () => {
+      requests += 1;
+      return 'granted';
+    };
+
+    initNotificationPermissionPrompt();
+    savePrefs(makePrefs({ enabled: false }));
+    listeners.get('pointerdown')?.forEach((listener) => listener());
+
+    assert.equal(requests, 0);
+    assert.equal(listeners.get('pointerdown')?.size, 0);
+    assert.equal(listeners.get('keydown')?.size, 0);
+  }, { permission: 'default' });
 });
 
 // ── maybeNotifyTurnFinished 端到端（stub 全局） ───────────────────────
