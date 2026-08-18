@@ -15,6 +15,15 @@ test('landing composer starts at two text rows and keeps shared auto-growth beha
   assert.match(chat, /ta\.style\.height = Math\.min\(ta\.scrollHeight, 160\) \+ 'px';/);
 });
 
+test('composer leaves native IME text uncontrolled until composition commits', () => {
+  const chat = readFileSync(join(root, 'src/components/Chat.tsx'), 'utf8');
+
+  assert.match(chat, /value=\{composing \? undefined : input\}/);
+  assert.match(chat, /onCompositionStart=\{handleCompositionStart\}/);
+  assert.match(chat, /onCompositionEnd=\{handleCompositionEnd\}/);
+  assert.match(chat, /composingRef\.current \|\| e\.isComposing \|\| e\.keyCode === 229/);
+});
+
 test('landing review shortcut uses the supported review command', () => {
   const chat = readFileSync(join(root, 'src/components/Chat.tsx'), 'utf8');
   const i18n = readFileSync(join(root, 'src/i18n.ts'), 'utf8');

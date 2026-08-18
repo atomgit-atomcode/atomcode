@@ -464,6 +464,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
+  const [composing, setComposing] = useState(false);
+  const composingRef = useRef(false);
   const [busy, setBusyState] = useState(false);
   // Mirror of `busy` in a ref so pushCommandNotice can read it synchronously
   // without a stale closure (refs always reflect the latest render value).
@@ -2650,7 +2652,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   }, [busy, queued, modeState.pendingMode, chatRecovery]);
 
   function handleKeyDown(e: KeyboardEvent) {
-    if (e.isComposing) return;
+    // Safari/WebKit and a few desktop IMEs can report keyCode=229 while
+    // `isComposing` is false. Never let menu navigation or Enter-to-send steal
+    // a key that still belongs to the IME candidate window.
+    if (composingRef.current || e.isComposing || e.keyCode === 229) return;
 
     // 斜杠菜单导航（使用与渲染层一致的合并列表：本地命令 + 远程技能）
     if (slashOpen) {
@@ -2804,9 +2809,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     }
   }
 
-  // Auto-resize textarea + slash-command + @-mention detection
-  function handleInput(e: Event) {
-    const ta = e.target as HTMLTextAreaElement;
+  // Auto-resize textarea + slash-command + @-mention detection. During IME
+  // composition the browser owns the textarea draft; committing it into
+  // Preact state on every intermediate syllable can overwrite the native
+  // pre-edit buffer when an unrelated live event re-renders Chat.
+  function commitComposerInput(ta: HTMLTextAreaElement) {
     const val = ta.value;
     setInput(val);
     ta.style.height = 'auto';
@@ -2853,6 +2860,28 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
 
     setSlashOpen(false);
     setAtOpen(false);
+  }
+
+  function handleInput(e: Event) {
+    const ta = e.target as HTMLTextAreaElement;
+    ta.style.height = 'auto';
+    ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
+    if (composingRef.current || (e as InputEvent).isComposing) return;
+    commitComposerInput(ta);
+  }
+
+  function handleCompositionStart() {
+    composingRef.current = true;
+    setComposing(true);
+  }
+
+  function handleCompositionEnd(e: CompositionEvent) {
+    const ta = e.target as HTMLTextAreaElement;
+    composingRef.current = false;
+    // Commit the browser-owned final value before restoring the controlled
+    // `value` prop. Preact batches these updates into one safe render.
+    commitComposerInput(ta);
+    setComposing(false);
   }
 
   // 在 textarea 光标处插入文本（skill 命令 / 文件路径），并复位高度、聚焦。
@@ -3106,10 +3135,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         class="message-input"
         rows={2}
         placeholder={t('chat.inputPlaceholder')}
-        value={input}
+        value={composing ? undefined : input}
         enterkeyhint={coarsePointer ? 'enter' : 'send'}
         onInput={handleInput}
         onKeyDown={handleKeyDown}
+        onCompositionStart={handleCompositionStart}
+        onCompositionEnd={handleCompositionEnd}
         onPaste={handlePaste}
       />
       <div class="input-footer">
