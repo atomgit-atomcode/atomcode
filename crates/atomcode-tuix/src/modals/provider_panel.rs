@@ -310,6 +310,37 @@ fn editable_field_row(
     (format!("{prefix}{displayed}"), String::new())
 }
 
+/// Provider forms are also used in classic Windows conhost, where the active
+/// font commonly lacks the geometric symbols used as focus/caret chrome. Keep
+/// user content intact while applying the shared decorative-glyph fallback to
+/// both columns before the payload reaches the renderer.
+fn downgrade_panel_items(items: &mut [(String, String)], unicode_symbols: bool) {
+    if unicode_symbols {
+        return;
+    }
+
+    fn provider_chrome_ascii(text: &str) -> String {
+        crate::glyph::downgrade_glyphs(text, false)
+            .chars()
+            .map(|ch| match ch {
+                '‹' => '<',
+                '›' => '>',
+                '–' | '—' => '-',
+                // Form projections allocate one display cell for an ellipsis;
+                // keep the fallback one cell wide as well.
+                '…' => '.',
+                '＋' => '+',
+                other => other,
+            })
+            .collect()
+    }
+
+    for (label, detail) in items {
+        *label = provider_chrome_ascii(label);
+        *detail = provider_chrome_ascii(detail);
+    }
+}
+
 /// Which model-form field has focus.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ModelField {
@@ -2114,6 +2145,8 @@ impl Modal for ProviderPanel {
 
         items.push((format!("— {hint} —"), String::new()));
 
+        downgrade_panel_items(&mut items, ctx.caps.unicode_symbols);
+
         let payload = MenuPayload {
             items,
             selected,
@@ -2151,6 +2184,33 @@ impl Modal for ProviderPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_panel_chrome_downgrades_for_legacy_conhost() {
+        let mut items = vec![
+            ("▸ Model: │vendor/model…".to_string(), String::new()),
+            ("  Image input: ‹ Auto ›".to_string(), "[✓]".to_string()),
+            ("＋ Add model".to_string(), "— hint —".to_string()),
+        ];
+
+        downgrade_panel_items(&mut items, false);
+
+        assert_eq!(items[0].0, "> Model: |vendor/model.");
+        assert_eq!(items[1].0, "  Image input: < Auto >");
+        assert_eq!(items[1].1, "[v]");
+        assert_eq!(items[2].0, "+ Add model");
+        assert_eq!(items[2].1, "- hint -");
+    }
+
+    #[test]
+    fn provider_panel_chrome_is_unchanged_on_unicode_terminals() {
+        let mut items = vec![("▸ Model: │…".to_string(), "[✓]".to_string())];
+        let original = items.clone();
+
+        downgrade_panel_items(&mut items, true);
+
+        assert_eq!(items, original);
+    }
 
     #[test]
     fn add_shortcut_accepts_terminal_ctrl_a_variants() {

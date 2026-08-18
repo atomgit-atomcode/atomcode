@@ -143,6 +143,12 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_punctuation_is_not_globally_rewritten() {
+        let text = "‹model› — 正文… ＋内容";
+        assert_eq!(downgrade_glyphs(text, false), text);
+    }
+
+    #[test]
     fn single_char_ascii_maps_1col_glyphs() {
         assert_eq!(single_char_ascii('\u{2717}'), Some('x')); // ✗
         assert_eq!(single_char_ascii('\u{2713}'), Some('v')); // ✓
