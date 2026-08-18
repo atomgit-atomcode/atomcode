@@ -1106,7 +1106,13 @@ fn parse_task_args(args: &str) -> Result<Args, serde_json::Error> {
 }
 
 fn validate_task_specs(args: &Args) -> Result<Vec<crate::team::TeamTaskSpec>, String> {
-    args.tasks.iter().map(resolve_subtask_spec).collect()
+    let specs: Vec<_> = args
+        .tasks
+        .iter()
+        .map(resolve_subtask_spec)
+        .collect::<Result<_, _>>()?;
+    crate::team::validate_non_overlapping_worker_scopes(&specs)?;
+    Ok(specs)
 }
 
 fn resolve_subtask_spec(t: &SubTask) -> Result<crate::team::TeamTaskSpec, String> {
@@ -2918,6 +2924,19 @@ mod tests {
         ]};
         let specs = validate_task_specs(&args).unwrap();
         assert_eq!(workers_missing_scope(&specs), vec![3, 4]);
+    }
+
+    #[test]
+    fn synchronous_task_rejects_provably_overlapping_worker_scopes() {
+        let args = parse_task_args(
+            r#"{"tasks":[
+                {"description":"a","prompt":"p","subagent_type":"worker","scope":["tests/**"]},
+                {"description":"b","prompt":"p","subagent_type":"worker","scope":["tests/rate_limit.py"]}
+            ]}"#,
+        )
+        .unwrap();
+        let error = validate_task_specs(&args).unwrap_err();
+        assert!(error.contains("worker scopes overlap"), "{error}");
     }
 
     #[test]

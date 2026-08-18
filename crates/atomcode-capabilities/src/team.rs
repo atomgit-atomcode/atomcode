@@ -144,6 +144,93 @@ pub struct TeamTaskSpec {
     pub scope: Vec<String>,
 }
 
+/// Reject worker scope conflicts that can be proven without attempting general glob
+/// intersection: identical patterns, workspace-wide `**`, or a recursive `<dir>/**`
+/// lane containing another worker's literal/recursive lane. Complex glob intersections
+/// are intentionally left to commit-time file locking rather than guessed here.
+pub fn validate_non_overlapping_worker_scopes(tasks: &[TeamTaskSpec]) -> Result<(), String> {
+    let workers: Vec<(usize, Vec<String>)> = tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, task)| task.permission == TeamPermission::Worker)
+        .map(|(index, task)| {
+            (
+                index,
+                task.scope
+                    .iter()
+                    .map(|scope| normalize_scope(scope))
+                    .filter(|scope| !scope.is_empty())
+                    .collect(),
+            )
+        })
+        .collect();
+
+    for left in 0..workers.len() {
+        for right in left + 1..workers.len() {
+            for a in &workers[left].1 {
+                for b in &workers[right].1 {
+                    if scopes_provably_overlap(a, b) {
+                        return Err(format!(
+                            "team worker scopes overlap: task {} scope {:?} conflicts with task {} \
+                             scope {:?}. Assign non-overlapping files/directories before dispatch.",
+                            workers[left].0 + 1,
+                            a,
+                            workers[right].0 + 1,
+                            b
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_scope(scope: &str) -> String {
+    scope
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn recursive_scope_root(scope: &str) -> Option<&str> {
+    if scope == "**" {
+        Some("")
+    } else {
+        scope.strip_suffix("/**").map(|root| root.trim_end_matches('/'))
+    }
+}
+
+fn has_glob_meta(scope: &str) -> bool {
+    scope.chars().any(|ch| matches!(ch, '*' | '?' | '[' | ']' | '{' | '}'))
+}
+
+fn path_is_under(path: &str, root: &str) -> bool {
+    root.is_empty()
+        || path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn scopes_provably_overlap(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    if let Some(root) = recursive_scope_root(a) {
+        if let Some(other_root) = recursive_scope_root(b) {
+            return path_is_under(other_root, root) || path_is_under(root, other_root);
+        }
+        return !has_glob_meta(b) && path_is_under(b, root);
+    }
+    if let Some(root) = recursive_scope_root(b) {
+        return !has_glob_meta(a) && path_is_under(a, root);
+    }
+    false
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TeamEventPayload {
