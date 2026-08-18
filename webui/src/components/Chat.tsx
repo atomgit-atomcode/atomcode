@@ -443,7 +443,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
-  const [composing, setComposing] = useState(false);
+  // 组合期标记：仅用于 handleKeyDown 的守卫（菜单导航 / Enter 发送不得窃取
+  // IME 候选窗的按键）。输入值本身始终受控同步，见 handleInput。
   const composingRef = useRef(false);
   const [busy, setBusyState] = useState(false);
   // Mirror of `busy` in a ref so pushCommandNotice can read it synchronously
@@ -2818,10 +2819,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     }
   }
 
-  // Auto-resize textarea + slash-command + @-mention detection. During IME
-  // composition the browser owns the textarea draft; committing it into
-  // Preact state on every intermediate syllable can overwrite the native
-  // pre-edit buffer when an unrelated live event re-renders Chat.
+  // Auto-resize textarea + slash-command + @-mention detection. Runs on every
+  // input event (composition drafts included) so state always mirrors the DOM;
+  // Preact's equal-value check then never writes the pre-edit buffer back.
   function commitComposerInput(ta: HTMLTextAreaElement) {
     const val = ta.value;
     setInput(val);
@@ -2875,22 +2875,25 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     const ta = e.target as HTMLTextAreaElement;
     ta.style.height = 'auto';
     ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
-    if (composingRef.current || (e as InputEvent).isComposing) return;
+    // 始终把 DOM 值镜像进 state（包括组合期的中间草稿）。textarea 保持受控
+    // (value={input})，而 Preact 只在 state 与 DOM 值不同时才写回，因此：
+    //   - 组合期 state 永远等于 DOM，写回不会发生，IME 预编辑缓冲不受干扰；
+    //   - 无关 re-render 也不会把陈旧值写回（旧的 `value={composing ? undefined
+    //     : input}` 失控 hack 会在 compositionend 读到尚未提交进 ta.value 的
+    //     旧值，随后受控渲染把它强写回，刚选中的中文整段被抹掉——即"再输入
+    //     会覆盖原文"的 bug）。
     commitComposerInput(ta);
   }
 
   function handleCompositionStart() {
     composingRef.current = true;
-    setComposing(true);
   }
 
-  function handleCompositionEnd(e: CompositionEvent) {
-    const ta = e.target as HTMLTextAreaElement;
+  function handleCompositionEnd() {
     composingRef.current = false;
-    // Commit the browser-owned final value before restoring the controlled
-    // `value` prop. Preact batches these updates into one safe render.
-    commitComposerInput(ta);
-    setComposing(false);
+    // 不在此处提交值：compositionend 之后浏览器必定补发一次 input 事件
+    // （inputType=insertCompositionText，携带最终值），由 handleInput 同步。
+    // 在 compositionend 直接读 ta.value 在 WebKit 下可能还是预编辑旧值。
   }
 
   // 在 textarea 光标处插入文本（skill 命令 / 文件路径），并复位高度、聚焦。
@@ -3144,7 +3147,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         class="message-input"
         rows={2}
         placeholder={t('chat.inputPlaceholder')}
-        value={composing ? undefined : input}
+        value={input}
         enterkeyhint={coarsePointer ? 'enter' : 'send'}
         onInput={handleInput}
         onKeyDown={handleKeyDown}
