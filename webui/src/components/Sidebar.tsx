@@ -12,7 +12,12 @@ import { useAuth } from './LoginButton';
 import { mergeOptimisticSession } from '../lib/sessionList';
 import { sessionMessagesToMarkdownLines } from '../lib/historyMessages';
 import { sidebarRelativeTime } from '../lib/sidebarTime';
-import { loadSidebarViewMode, saveSidebarViewMode, sidebarProjectScope, SidebarViewMode } from '../lib/sidebarView';
+import {
+  loadSidebarViewMode,
+  saveSidebarViewMode,
+  sidebarProjectScopes,
+  SidebarViewMode,
+} from '../lib/sidebarView';
 
 interface SidebarProps {
   activeSessionId: string | null;
@@ -49,9 +54,6 @@ interface SidebarProps {
   onOpenRemote?: () => void;
   /** Open the working-directory picker (to switch to / start a project in any dir). */
   onOpenCwd?: () => void;
-  /** Switch INTO another project (by its working dir): change cwd + land on a new
-   *  conversation there + reflect it in the URL (survives refresh). */
-  onSwitchProject?: (workingDir: string) => void;
 }
 
 type Translate = (key: MsgKey, params?: Record<string, string | number>) => string;
@@ -134,15 +136,6 @@ function ChevronDownIcon() {
       <path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
     </svg>
   );
-}
-
-/** Collapse a home prefix to `~` for readability; leave everything else verbatim
- *  (temp dirs like /var/folders/… or /tmp/… stay as-is so they're identifiable). */
-function collapseHomePath(p: string): string {
-  if (!p) return '';
-  return p
-    .replace(/^\/(?:Users|home)\/[^/]+/, '~')
-    .replace(/^[A-Za-z]:\\Users\\[^\\]+/, '~');
 }
 
 /** Folder glyph for the project selector. */
@@ -335,7 +328,6 @@ export function Sidebar({
   onPickSkill,
   onOpenRemote,
   onOpenCwd,
-  onSwitchProject,
 }: SidebarProps) {
   const t = useT();
   const { theme, setTheme, lang, setLang } = useSettings();
@@ -353,24 +345,20 @@ export function Sidebar({
   // actually exists; ordinary reloads must not steal the user's scroll.
   const pendingCenterSessionIdRef = useRef<string | null>(activeSessionId);
   const previousActiveSessionIdRef = useRef<string | null>(activeSessionId);
-  // Project selector: the sidebar lists ONE project's sessions. `viewProjectHash`
-  // is which project is shown — it MIRRORS the real current project (follows the
-  // `projectHash` prop). Picking another project in the dropdown switches INTO it
-  // (via onSwitchProject → cwd + new conversation + URL), which re-pins
-  // `projectHash`, so `viewProjectHash` snaps to the switched-to project.
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
-  const [viewProjectHash, setViewProjectHash] = useState(projectHash);
-  const [projMenuOpen, setProjMenuOpen] = useState(false);
-  const projMenuRef = useRef<HTMLDivElement | null>(null);
   const [viewMode, setViewMode] = useState<SidebarViewMode>(() =>
     loadSidebarViewMode(sidebarStorage()),
   );
-  const [workspaceExpanded, setWorkspaceExpanded] = useState(true);
+  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(
+    () => new Set(projectHash ? [projectHash] : []),
+  );
+  const [loadedProjects, setLoadedProjects] = useState<Set<string>>(new Set());
+  const [loadingProjects, setLoadingProjects] = useState<Set<string>>(new Set());
+  const [failedProjects, setFailedProjects] = useState<Set<string>>(new Set());
   const [viewMenuOpen, setViewMenuOpen] = useState(false);
   const viewMenuRef = useRef<HTMLDivElement | null>(null);
   // Relative labels (for example, 59min -> 1h) update without refetching sessions.
   const [timeNow, setTimeNow] = useState(() => Date.now());
-  const [query, setQuery] = useState('');
   // Skills menu: list fetched lazily; the count badge shows once loaded.
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);
   const [skillsLoading, setSkillsLoading] = useState(false);
@@ -417,24 +405,80 @@ export function Sidebar({
   const itemMenuRef = useRef<HTMLDivElement | null>(null);
   const settingsMenuRef = useRef<HTMLDivElement | null>(null);
 
-  // Guards against out-of-order load responses: switching project sets
-  // projectHash '' → bucket, firing two loads (the capped fallback, then the
-  // per-project fetch). The fallback reads every project and is SLOWER, so
-  // without this it can land last and clobber the correct per-project list with
-  // the capped one. Only the newest load's response is applied.
+  // Guards against out-of-order reloads and lazy bucket responses after a mode
+  // switch. Workspace mode loads only expanded project buckets.
   const loadEpochRef = useRef(0);
+  const projectRequestRef = useRef(new Map<string, number>());
+
+  function replaceProjectSessions(hash: string, list: SessionMetaWithProject[]) {
+    setSessions((current) => [
+      ...current.filter((session) => session.project_hash !== hash),
+      ...list,
+    ]);
+  }
+
+  async function loadProjectBucket(hash: string, epoch = loadEpochRef.current) {
+    const request = (projectRequestRef.current.get(hash) ?? 0) + 1;
+    projectRequestRef.current.set(hash, request);
+    setLoadingProjects((current) => new Set(current).add(hash));
+    setFailedProjects((current) => {
+      const next = new Set(current);
+      next.delete(hash);
+      return next;
+    });
+    try {
+      const list = await listProjectSessions(hash);
+      if (epoch !== loadEpochRef.current || projectRequestRef.current.get(hash) !== request) return;
+      replaceProjectSessions(hash, list);
+      setLoadedProjects((current) => new Set(current).add(hash));
+      if (activeSessionId) {
+        const found = list.find((session) => session.id === activeSessionId);
+        if (found) onActiveSessionMeta?.(found);
+      }
+    } catch {
+      if (epoch !== loadEpochRef.current || projectRequestRef.current.get(hash) !== request) return;
+      setFailedProjects((current) => new Set(current).add(hash));
+    } finally {
+      if (epoch === loadEpochRef.current && projectRequestRef.current.get(hash) === request) {
+        setLoadingProjects((current) => {
+          const next = new Set(current);
+          next.delete(hash);
+          return next;
+        });
+      }
+    }
+  }
+
   function loadSessions() {
     const epoch = ++loadEpochRef.current;
     setLoading(true);
-    // Workspace view shows one project's complete history, so fetch its bucket
-    // directly. Flat view intentionally uses the capped cross-project endpoint.
-    // Before a project hash is known, use that same cross-project fallback so
-    // the sidebar can still show useful history immediately.
-    const projectScope = sidebarProjectScope(viewMode, viewProjectHash);
-    const load = projectScope ? listProjectSessions(projectScope) : listSessions();
+    setLoadingProjects(new Set());
+    const load = viewMode === 'workspace'
+      ? getProjects().then(async (nextProjects) => {
+          if (epoch !== loadEpochRef.current) return [];
+          setProjects(nextProjects);
+          const normalizedCwd = (cwd || '').replace(/\/+$/, '');
+          const currentHash = projectHash || nextProjects.find(
+            (project) => project.working_dir.replace(/\/+$/, '') === normalizedCwd,
+          )?.hash || '';
+          const retainedExpanded = projectHash && !expandedProjects.has(projectHash)
+            ? []
+            : [...expandedProjects];
+          const projectScopes = sidebarProjectScopes(
+            'workspace',
+            [currentHash, ...retainedExpanded],
+          );
+          setSessions([]);
+          setLoadedProjects(new Set());
+          setFailedProjects(new Set());
+          await Promise.all(projectScopes.map((hash) => loadProjectBucket(hash, epoch)));
+          return null;
+        })
+      : listSessions();
     load
       .then((list) => {
         if (epoch !== loadEpochRef.current) return; // superseded by a newer load
+        if (list === null) return;
         setSessions(list);
         // 回合落盘后这次刷新会带出已自动命名的当前会话 → 回传给 App 更新标题头。
         if (activeSessionId) {
@@ -443,7 +487,12 @@ export function Sidebar({
         }
       })
       .catch(() => {
-        if (epoch === loadEpochRef.current) setSessions([]);
+        if (epoch !== loadEpochRef.current) return;
+        setSessions([]);
+        if (viewMode === 'workspace') {
+          setProjects([]);
+          setLoadedProjects(new Set());
+        }
       })
       .finally(() => {
         if (epoch === loadEpochRef.current) setLoading(false);
@@ -453,13 +502,12 @@ export function Sidebar({
   useEffect(() => {
     loadSessions();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reloadKey, viewMode, viewProjectHash]);
+  }, [reloadKey, viewMode, projectHash]);
 
-  // The selector defaults to and FOLLOWS the real current project: when the
-  // daemon's project changes (e.g. opening a session in another project), snap
-  // the view back to it rather than leaving a stale browse selection.
+  // A real project switch makes the new working directory the sole expanded
+  // group. Other projects remain visible as collapsed peer rows.
   useEffect(() => {
-    setViewProjectHash(projectHash);
+    setExpandedProjects(new Set(projectHash ? [projectHash] : []));
   }, [projectHash]);
 
   useEffect(() => {
@@ -477,25 +525,16 @@ export function Sidebar({
     if (!container || !item || !container.contains(item)) return;
     item.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
     pendingCenterSessionIdRef.current = null;
-  }, [activeSessionId, collapsed, loading, sessions, viewProjectHash]);
+  }, [activeSessionId, collapsed, loading, sessions, expandedProjects]);
 
-  // Project list for the dropdown (all projects that have sessions). Cheap,
-  // refetched with the session list so newly-created projects appear.
+  // Flat mode does not need project buckets for rendering, but retaining the
+  // project catalog keeps switching back to workspace immediate.
   useEffect(() => {
+    if (viewMode === 'workspace') return;
     getProjects()
       .then(setProjects)
       .catch(() => setProjects([]));
-  }, [reloadKey]);
-
-  // Close the project dropdown on an outside click.
-  useEffect(() => {
-    if (!projMenuOpen) return;
-    const onDown = (e: MouseEvent) => {
-      if (!projMenuRef.current?.contains(e.target as Node)) setProjMenuOpen(false);
-    };
-    document.addEventListener('mousedown', onDown);
-    return () => document.removeEventListener('mousedown', onDown);
-  }, [projMenuOpen]);
+  }, [reloadKey, viewMode]);
 
   useEffect(() => {
     if (!viewMenuOpen) return;
@@ -515,7 +554,6 @@ export function Sidebar({
     setViewMode(mode);
     saveSidebarViewMode(mode, sidebarStorage());
     setViewMenuOpen(false);
-    if (mode === 'flat') setProjMenuOpen(false);
   }
 
   // The kebab menu is fixed-positioned (so the list's overflow can't clip it);
@@ -1039,42 +1077,55 @@ export function Sidebar({
   // 避免出现两条相同会话（刷新才消失）。
   const merged = mergeOptimisticSession(optimisticSession ?? null, sessions);
 
-  // The project the dropdown currently shows (for its button label).
-  const currentViewProject = projects.find((p) => p.hash === viewProjectHash);
-  const currentProjectLabel = currentViewProject?.name
-    || dirName(currentViewProject?.working_dir || cwd || '')
-    || t('sidebar.switchProject');
-
-  // 先按当前项目收窄，再按搜索词过滤。优先用物理会话桶 project_hash 收窄（不受
-  // daemon 全局 working_dir 被改写影响，避免跨项目串台）；缺 hash 的条目回退按
-  // working_dir==cwd 匹配；projectHash 为空时整体回退到旧的 cwd 过滤。乐观条目
-  // （刚发送、置顶）永远保留：它必属当前项目，但在 /project 解析出 hash 之前其
-  // working_dir/project_hash 还是空的，不豁免会被 hash 过滤误删。
+  // Workspace mode groups every uncapped project bucket. A just-created optimistic
+  // row may not have its hash yet, so assign it to the current project by cwd/hash.
   const normDir = (p: string) => (p || '').replace(/\/+$/, '');
   const cwdNorm = normDir(cwd || '');
   const optimisticId = optimisticSession?.id;
-  // The optimistic (just-sent) entry belongs to the CURRENT project — only exempt
-  // it from filtering while the dropdown is showing that current project, else it
-  // would leak into another project's list the user is browsing.
-  const viewingCurrent = viewProjectHash === projectHash;
-  const inScope = (s: SessionMetaWithProject): boolean => {
-    if (viewMode === 'flat') return true;
-    if (s.id === optimisticId && viewingCurrent) return true;
-    if (viewProjectHash) {
-      return s.project_hash ? s.project_hash === viewProjectHash : normDir(s.working_dir) === cwdNorm;
-    }
-    return cwdNorm ? normDir(s.working_dir) === cwdNorm : true;
+  const sessionProjectHash = (s: SessionMetaWithProject): string => {
+    if (s.project_hash) return s.project_hash;
+    if (s.id === optimisticId && projectHash) return projectHash;
+    const dir = normDir(s.working_dir);
+    return projects.find((project) => normDir(project.working_dir) === dir)?.hash
+      || (dir === cwdNorm ? projectHash || '' : '');
   };
-  const inCwd = merged.filter(inScope);
 
-  const q = query.trim().toLowerCase();
-  const filtered = q
-    ? inCwd.filter(
-        (s) =>
-          (s.name || '').toLowerCase().includes(q) ||
-          s.id.toLowerCase().startsWith(q),
-      )
-    : inCwd;
+  const filtered = merged;
+
+  const sessionsByProject = new Map<string, SessionMetaWithProject[]>();
+  for (const session of filtered) {
+    const hash = sessionProjectHash(session);
+    if (!hash) continue;
+    const bucket = sessionsByProject.get(hash) ?? [];
+    bucket.push(session);
+    sessionsByProject.set(hash, bucket);
+  }
+  const workspaceProjects = projectHash && !projects.some((project) => project.hash === projectHash)
+    ? [{
+        hash: projectHash,
+        name: dirName(cwd || ''),
+        working_dir: cwd || '',
+        session_count: sessionsByProject.get(projectHash)?.length ?? 0,
+        created_at: 0,
+        last_updated: 0,
+      } as ProjectInfo, ...projects]
+    : projects;
+  const currentWorkspaceHash = projectHash || projects.find(
+    (project) => normDir(project.working_dir) === cwdNorm,
+  )?.hash || '';
+  const currentProjectSessions = sessionsByProject.get(currentWorkspaceHash) ?? [];
+
+  const toggleProject = (hash: string) => {
+    setExpandedProjects((current) => {
+      const next = new Set(current);
+      if (next.has(hash)) next.delete(hash);
+      else {
+        next.add(hash);
+        if (!loadedProjects.has(hash) && !loadingProjects.has(hash)) void loadProjectBucket(hash);
+      }
+      return next;
+    });
+  };
 
   const renderItem = (s: SessionMetaWithProject) => {
     const active = s.id === activeSessionId;
@@ -1270,7 +1321,6 @@ export function Sidebar({
             class="group-by-btn"
             onClick={() => {
               setViewMenuOpen(false);
-              setProjMenuOpen(false);
               onOpenCwd();
             }}
             title={t('sidebar.addWorkspace')}
@@ -1281,83 +1331,67 @@ export function Sidebar({
         )}
       </div>
 
-      {viewMode === 'workspace' && <div class="sidebar-project" ref={projMenuRef}>
-        <div class="sidebar-project-row">
-          <button
-            class="sidebar-project-expand"
-            onClick={() => setWorkspaceExpanded((expanded) => !expanded)}
-            title={t(workspaceExpanded ? 'sidebar.collapseWorkspace' : 'sidebar.expandWorkspace')}
-            aria-label={t(workspaceExpanded ? 'sidebar.collapseWorkspace' : 'sidebar.expandWorkspace')}
-            aria-expanded={workspaceExpanded}
-          >
-            <span class={'sidebar-project-expand-icon' + (workspaceExpanded ? ' open' : '')}>
-              <ChevronDownIcon />
-            </span>
-          </button>
-          <button
-            class={'sidebar-project-btn' + (projMenuOpen ? ' open' : '')}
-            onClick={() => setProjMenuOpen((o) => !o)}
-            aria-haspopup="listbox"
-            aria-expanded={projMenuOpen}
-            title={currentViewProject?.working_dir || cwd || t('sidebar.switchProject')}
-          >
-            <span class="sidebar-project-icon"><FolderIcon /></span>
-            <span class="sidebar-project-name">
-              {currentProjectLabel}
-            </span>
-            <span class="sidebar-project-caret"><ChevronDownIcon /></span>
-          </button>
-        </div>
-          {projMenuOpen && (
-            <div class="sidebar-project-menu" role="listbox">
-              <div class="sidebar-project-menu-title">{t('sidebar.switchProject')}</div>
-              {projects.map((p) => (
-                <button
-                  key={p.hash}
-                  class={'sidebar-project-item' + (p.hash === viewProjectHash ? ' active' : '')}
-                  role="option"
-                  aria-selected={p.hash === viewProjectHash}
-                  title={p.working_dir}
-                  onClick={() => {
-                    setProjMenuOpen(false);
-                    // Re-selecting the project you're already in is a no-op (don't
-                    // drop the active chat for a fresh landing).
-                    if (p.hash === viewProjectHash) return;
-                    onSwitchProject?.(p.working_dir);
-                  }}
-                >
-                  <span class="sidebar-project-item-main">
-                    <span class="sidebar-project-item-name">{p.name || p.working_dir}</span>
-                    <span class="sidebar-project-item-path">{collapseHomePath(p.working_dir)}</span>
-                  </span>
-                  <span class="sidebar-project-item-count">{p.session_count}</span>
-                </button>
-              ))}
-            </div>
-          )}
-      </div>}
-
       <div
-        class={'session-list-body' + (viewMode === 'workspace' && !workspaceExpanded ? ' collapsed' : '')}
+        class="session-list-body"
         ref={sessionListBodyRef}
         aria-busy={loading}
       >
-        {(viewMode === 'flat' || workspaceExpanded) && (
-          <>
-            {loading && filtered.length === 0 && (
-              <div class="session-empty">{t('sidebar.loading')}</div>
-            )}
-            {!loading && inCwd.length === 0 && (
-              <div class="session-empty">
-                {t(viewMode === 'flat' ? 'sidebar.empty' : 'sidebar.emptyInCwd')}
-              </div>
-            )}
-            {!loading && inCwd.length > 0 && filtered.length === 0 && (
-              <div class="session-empty">{t('sidebar.noMatch')}</div>
-            )}
-            {filtered.map(renderItem)}
-          </>
+        {loading && filtered.length === 0 && (viewMode === 'flat' || workspaceProjects.length === 0) && (
+          <div class="session-empty">{t('sidebar.loading')}</div>
         )}
+        {!loading && merged.length === 0 && (viewMode === 'flat' || workspaceProjects.length === 0) && (
+          <div class="session-empty">{t(viewMode === 'flat' ? 'sidebar.empty' : 'sidebar.emptyInCwd')}</div>
+        )}
+        {viewMode === 'flat' && filtered.map(renderItem)}
+        {viewMode === 'workspace' && workspaceProjects.map((project) => {
+          const projectSessions = sessionsByProject.get(project.hash) ?? [];
+          const expanded = expandedProjects.has(project.hash);
+          const projectLoading = loadingProjects.has(project.hash);
+          const projectFailed = failedProjects.has(project.hash);
+          return (
+            <section class="sidebar-project" key={project.hash}>
+              <div class={'sidebar-project-row' + (project.hash === projectHash ? ' current' : '')}>
+                <button
+                  class="sidebar-project-expand"
+                  onClick={() => toggleProject(project.hash)}
+                  title={t(expanded ? 'sidebar.collapseWorkspace' : 'sidebar.expandWorkspace')}
+                  aria-label={t(expanded ? 'sidebar.collapseWorkspace' : 'sidebar.expandWorkspace')}
+                  aria-expanded={expanded}
+                >
+                  <span class={'sidebar-project-expand-icon' + (expanded ? ' open' : '')}>
+                    <ChevronDownIcon />
+                  </span>
+                </button>
+                <button
+                  class="sidebar-project-btn"
+                  onClick={() => toggleProject(project.hash)}
+                  title={project.working_dir}
+                  aria-expanded={expanded}
+                >
+                  <span class="sidebar-project-icon"><FolderIcon /></span>
+                  <span class="sidebar-project-name">{project.name || dirName(project.working_dir)}</span>
+                  <span class="sidebar-project-count">{project.session_count}</span>
+                </button>
+              </div>
+              {expanded && (
+                <div class="sidebar-project-sessions">
+                  {projectLoading && projectSessions.length === 0 && (
+                    <div class="session-empty">{t('sidebar.loading')}</div>
+                  )}
+                  {projectFailed && !projectLoading && (
+                    <button class="sidebar-project-retry" onClick={() => void loadProjectBucket(project.hash)}>
+                      {t('sidebar.loadFailedRetry')}
+                    </button>
+                  )}
+                  {!projectLoading && !projectFailed && loadedProjects.has(project.hash) && projectSessions.length === 0 && (
+                    <div class="session-empty">{t('sidebar.emptyInCwd')}</div>
+                  )}
+                  {projectSessions.map(renderItem)}
+                </div>
+              )}
+            </section>
+          );
+        })}
       </div>
 
       <div class="sidebar-bottom">
@@ -1438,10 +1472,21 @@ export function Sidebar({
               {(() => {
                 const q = searchQuery.trim();
                 // Non-empty query → cross-project results from the endpoint;
-                // empty → the current project's loaded list (recent).
-                const results = q ? searchResults : sessions;
-                if (q && searchBusy && results.length === 0) {
+                // empty → only the current project's already-loaded history.
+                const results = q ? searchResults : currentProjectSessions;
+                const currentProjectLoading = !q && loadingProjects.has(currentWorkspaceHash);
+                if ((q && searchBusy && results.length === 0) || currentProjectLoading) {
                   return <div class="search-empty">{t('sidebar.searching')}</div>;
+                }
+                if (!q && failedProjects.has(currentWorkspaceHash)) {
+                  return (
+                    <button
+                      class="sidebar-project-retry"
+                      onClick={() => void loadProjectBucket(currentWorkspaceHash)}
+                    >
+                      {t('sidebar.loadFailedRetry')}
+                    </button>
+                  );
                 }
                 if (results.length === 0) {
                   return <div class="search-empty">{t('sidebar.noMatch')}</div>;

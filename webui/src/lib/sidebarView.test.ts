@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { loadSidebarViewMode, saveSidebarViewMode, sidebarProjectScope } from './sidebarView.ts';
+import { loadSidebarViewMode, saveSidebarViewMode, sidebarProjectScopes } from './sidebarView.ts';
 
 test('sidebar view defaults to workspace and accepts only the flat preference', () => {
   assert.equal(loadSidebarViewMode(null), 'workspace');
@@ -23,8 +23,11 @@ test('sidebar view preference is persisted without making storage mandatory', ()
 }));
 });
 
-test('workspace view scopes to one project while flat view loads across projects', () => {
-  assert.equal(sidebarProjectScope('workspace', 'project-1'), 'project-1');
-  assert.equal(sidebarProjectScope('workspace', ''), null);
-  assert.equal(sidebarProjectScope('flat', 'project-1'), null);
+test('workspace view loads requested expanded buckets while flat view uses the global feed', () => {
+  assert.deepEqual(sidebarProjectScopes('workspace', ['project-1', 'project-2']), [
+    'project-1',
+    'project-2',
+  ]);
+  assert.deepEqual(sidebarProjectScopes('workspace', ['', 'project-2', 'project-2']), ['project-2']);
+  assert.deepEqual(sidebarProjectScopes('flat', ['project-1']), []);
 });

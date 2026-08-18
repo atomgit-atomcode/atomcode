@@ -369,7 +369,6 @@ export function App() {
         onPickSkill={(name) => setSkillInsert({ name, seq: Date.now() })}
         onOpenRemote={() => setSettingsSection('remote')}
         onOpenCwd={() => setShowCwd(true)}
-        onSwitchProject={handlePickCwd}
       />
       <div
         class={'sidebar-backdrop' + (sidebarOpen ? ' show' : '')}

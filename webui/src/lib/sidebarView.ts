@@ -27,10 +27,10 @@ export function saveSidebarViewMode(
   }
 }
 
-/** A grouped workspace view owns one complete project bucket; a flat view is cross-project. */
-export function sidebarProjectScope(
+/** Return requested expanded project buckets only when workspace grouping is active. */
+export function sidebarProjectScopes(
   mode: SidebarViewMode,
-  projectHash?: string,
-): string | null {
-  return mode === 'workspace' && projectHash ? projectHash : null;
+  projectHashes: readonly string[],
+): string[] {
+  return mode === 'workspace' ? [...new Set(projectHashes.filter(Boolean))] : [];
 }

@@ -1450,7 +1450,6 @@ body {
   overflow-x: hidden;
   padding: 4px 8px 8px;
 }
-.session-list-body.collapsed { overflow: hidden; }
 
 /* --- Workspace section label --- */
 .session-group-header {
@@ -1461,17 +1460,17 @@ body {
 }
 .session-group-spacer { flex: 1; }
 
-/* Project selector — dropdown above the session list to browse other projects. */
+/* Workspace projects are peer rows in the scrollable list. */
 .sidebar-project {
-  position: relative;
-  padding: 0 8px 4px;
-  flex-shrink: 0;
+  padding: 0 0 2px;
 }
 .sidebar-project-row {
   display: flex;
   align-items: center;
   min-width: 0;
+  border-radius: var(--corner-radius-medium);
 }
+.sidebar-project-row.current { background: var(--app-list-hover-background); }
 .sidebar-project-expand {
   width: 26px;
   height: 34px;
@@ -1513,14 +1512,26 @@ body {
   font-family: inherit;
   text-align: left;
 }
-.sidebar-project-btn:hover,
-.sidebar-project-btn.open { background: var(--app-list-hover-background); }
+.sidebar-project-btn:hover {
+  background: var(--app-list-hover-background);
+}
 .sidebar-project-icon {
   display: flex;
   align-items: center;
   color: var(--app-brand);
   flex-shrink: 0;
 }
+.sidebar-project-retry {
+  width: 100%;
+  padding: 7px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--app-accent-foreground);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+.sidebar-project-retry:hover { text-decoration: underline; }
 .sidebar-project-name {
   flex: 1;
   min-width: 0;
@@ -1528,73 +1539,7 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.sidebar-project-caret {
-  display: flex;
-  align-items: center;
-  color: var(--app-tertiary-foreground);
-  flex-shrink: 0;
-}
-.sidebar-project-menu {
-  position: absolute;
-  top: calc(100% - 2px);
-  left: 8px;
-  right: 8px;
-  z-index: 40;
-  max-height: 320px;
-  overflow-y: auto;
-  padding: 4px;
-  border-radius: var(--corner-radius-medium, 6px);
-  /* Opaque menu surface (same as skills/mcp/settings menus) so the session list
-     below can't bleed through. */
-  background: var(--app-menu-background);
-  border: 1px solid var(--app-menu-border);
-  box-shadow: 0 4px 12px #0000004d;
-}
-.sidebar-project-menu-title {
-  padding: 6px 9px 4px;
-  font-size: 0.75rem;
-  font-weight: 600;
-  letter-spacing: 0.4px;
-  color: var(--app-tertiary-foreground);
-}
-.sidebar-project-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 7px 9px;
-  border: none;
-  border-radius: var(--corner-radius-small, 6px);
-  background: transparent;
-  color: var(--app-menu-foreground);
-  cursor: pointer;
-  font-family: inherit;
-  text-align: left;
-}
-.sidebar-project-item:hover { background: var(--app-command-menu-hover-background); }
-.sidebar-project-item.active { background: var(--app-menu-selection-background); }
-.sidebar-project-item-main {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-.sidebar-project-item-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 0.8125rem;
-}
-.sidebar-project-item.active .sidebar-project-item-name { font-weight: 600; }
-.sidebar-project-item-path {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 0.75rem;
-  color: var(--app-caption-foreground);
-}
-.sidebar-project-item-count {
+.sidebar-project-count {
   flex-shrink: 0;
   min-width: 18px;
   text-align: center;
@@ -1604,6 +1549,7 @@ body {
   color: var(--app-tertiary-foreground);
   font-size: 0.75rem;
 }
+.sidebar-project-sessions { padding-left: 18px; }
 .session-group-label {
   letter-spacing: 0.5px;
   font-size: 0.75rem;
