@@ -12682,12 +12682,8 @@ fn handle_pointer_hit(
     frame: &crate::render::interaction::InteractionFrame,
 ) -> Result<()> {
     let target = frame.hit(event.row, event.col);
-    // A scroll shifts transcript content UNDER the cell grid, so a press at the
-    // same (row, col) after scrolling is a different glyph — drop the last-click
-    // record so it can't be misread as a double/triple click.
-    if matches!(event.kind, PointerKind::Scroll(_)) {
-        app.pointer_click = None;
-    }
+    // (Scroll resets `pointer_click` in the ScrollContinue branch of
+    // `handle_input`, before this fn — scroll never reaches here.)
     // Classify multi-clicks on primary presses (double = word, triple = line).
     // `Instant::now()` lives here at the impure boundary; the pure logic is in
     // `pointer_select::next_click`.
@@ -13186,6 +13182,12 @@ fn handle_input(
         }
         InputEvent::Pointer(pointer) => {
             if preflight == PointerPreflightRoute::ScrollContinue {
+                // A scroll shifts transcript content UNDER the cell grid, so a
+                // press at the same (row, col) afterward is a different glyph —
+                // drop the last-click record so it can't be misread as a
+                // double/triple click. Scroll is routed here (ScrollContinue),
+                // bypassing `handle_pointer_hit`, so the reset must live here.
+                app.pointer_click = None;
                 apply_pointer_event(pointer, renderer);
             } else {
                 if let Some(interaction) = interaction.as_deref() {
