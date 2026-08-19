@@ -150,10 +150,6 @@ body {
   to { opacity: 1; transform: translateY(0); }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
-@keyframes blink {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0; }
-}
 @keyframes breathe {
   0%, 100% { opacity: 1; box-shadow: 0 0 4px rgba(76, 175, 80, 0.5); }
   50% { opacity: 0.35; box-shadow: 0 0 10px rgba(76, 175, 80, 0.8); }
@@ -658,20 +654,8 @@ body {
   white-space: pre-wrap;
 }
 
-.streaming-cursor {
-  display: inline-block;
-  width: 7px;
-  height: 14px;
-  background: var(--app-primary-foreground);
-  margin-left: 2px;
-  vertical-align: text-bottom;
-  animation: blink 1s step-end infinite;
-}
-
-/* Three-dot waiting indicator: shown while a turn is busy but no visible
-   assistant output has arrived yet (first text/reasoning/tool event clears
-   it, since parts become non-empty). The active dot sweeps left→right like
-   the TUI's ●·· → ·●· → ··● sweep. */
+/* Three-dot working indicator: shown for the whole busy turn (thinking +
+   text output), pulsing left→right like the TUI's ●·· → ·●· → ··● sweep. */
 .waiting-dots {
   display: inline-flex;
   align-items: baseline;
