@@ -37,6 +37,7 @@ import {
   type SlashHandlers,
 } from '../lib/slashCommands';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
+import { isDuplicateTrailingNotice } from '../lib/notices';
 import { beginModeSwitch, completeModeSwitch, failModeSwitch, initModeState, modeForQueuedPrompt } from '../lib/modeSwitch';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
@@ -1762,11 +1763,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   // 确保 appendToLastAssistant 始终以真正的 assistant 气泡为最后一条。
   function pushCommandNotice(text: string) {
     setMessages((prev) => {
-      const note: Message = { role: 'system', parts: [{ kind: 'notice', text }], ts: Date.now() };
       const last = prev[prev.length - 1];
+      const insertBeforeBusyAssistant = !!(last && last.role === 'assistant' && busyRef.current);
+      // Recovery / active-check failures re-fire on every session load and every
+      // blocked send attempt; skip a notice already sitting in the trailing
+      // notice run so an unreachable daemon can't stack a wall of identical rows
+      // (the reported "刷了一屏"). The run resets once real content follows, so a
+      // genuine later repeat still shows.
+      if (isDuplicateTrailingNotice(prev, text, insertBeforeBusyAssistant)) return prev;
+      const note: Message = { role: 'system', parts: [{ kind: 'notice', text }], ts: Date.now() };
       // Keep an in-flight streaming assistant reply as the last element so
       // appendToLastAssistant still targets IT, not this notice.
-      if (last && last.role === 'assistant' && busyRef.current) {
+      if (insertBeforeBusyAssistant) {
         return [...prev.slice(0, -1), note, last];
       }
       return [...prev, note];
