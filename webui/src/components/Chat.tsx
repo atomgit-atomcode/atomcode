@@ -97,6 +97,7 @@ import {
   type PendingLiveSteer,
 } from '../lib/liveSteer';
 import { hasCoarsePointer, shouldSendComposerOnEnter } from '../lib/composerKeyboard';
+import { randomId } from '../lib/randomId';
 import { completedTurnStats, formatTurnDuration, formatTurnTokens, turnCacheHit } from '../lib/turnStats';
 import { disposeNotifications, maybeNotifyTurnFinished } from '../lib/notifications';
 import { artifactsByAssistantIndex, type TurnArtifact } from '../lib/turnArtifacts';
@@ -2397,7 +2398,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       }
       const now = Date.now();
       const pendingSteer: PendingLiveSteer = {
-        id: crypto.randomUUID(),
+        id: randomId(),
         text,
         images: images.length ? images : undefined,
         confirmed: false,
@@ -2501,7 +2502,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
 
     const controller = new AbortController();
     abortRef.current = controller;
-    const requestId = crypto.randomUUID();
+    const requestId = randomId();
     requestIdRef.current = requestId;
     const requestGeneration = sessionGenerationRef.current;
     let keepStopAlias = false;
