@@ -16,8 +16,10 @@ pub fn write(port: u16, pid: u32, token: &str) -> std::io::Result<PathBuf> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let body = format!("{{\"pid\":{pid},\"port\":{port},\"token\":{}}}",
-        serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_string()));
+    let body = format!(
+        "{{\"pid\":{pid},\"port\":{port},\"token\":{}}}",
+        serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_string())
+    );
     #[cfg(unix)]
     {
         use std::io::Write;

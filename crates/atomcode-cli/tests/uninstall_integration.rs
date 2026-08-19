@@ -4,7 +4,7 @@ use tempfile::TempDir;
 
 // Redirect ATOMCODE_HOME to a throwaway temp dir before any test in this binary
 // runs, so tests never persist into the developer's real home. isolate_home is a
-// no-op when the var is already set.
+// inherited shell values are replaced before tests run.
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
     atomcode_kernel::test_support::isolate_home();

@@ -1220,8 +1220,8 @@ mod tests {
                 vec![ToolCall {
                     id: "ok".into(),
                     name: "todowrite".into(),
-                    arguments:
-                        r#"{"todos":[{"content":"保留任务","status":"in_progress"}]}"#.into(),
+                    arguments: r#"{"todos":[{"content":"保留任务","status":"in_progress"}]}"#
+                        .into(),
                 }],
             ),
             Message::tool_result("ok", "1 task", false),

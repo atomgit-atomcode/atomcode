@@ -145,6 +145,15 @@ pub const PRESETS: &[ProviderPreset] = &[
         model_source: ModelSource::DiscoveryApi,
     },
     ProviderPreset {
+        id: "longcat",
+        display_name: "LongCat",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some("https://api.longcat.chat/openai/v1"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: Some("LONGCAT_API_KEY"),
+        model_source: ModelSource::DiscoveryApi,
+    },
+    ProviderPreset {
         id: "zhipu",
         display_name: "Zhipu AI",
         provider_type: ProviderType::OpenAi,
@@ -245,13 +254,13 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// The curated vendor set (14 vendors + 2 generic compatible presets) must
+    /// The curated vendor set and 2 generic compatible presets must
     /// all be present and resolvable by id.
     #[test]
     fn registry_covers_the_curated_vendors() {
         assert!(
-            PRESETS.len() >= 16,
-            "expected the curated vendor set (>=16), got {}",
+            PRESETS.len() >= 18,
+            "expected the curated vendor set (>=18), got {}",
             PRESETS.len()
         );
         for id in [
@@ -260,6 +269,7 @@ mod tests {
             "volcengine",
             "xiaomi-mimo",
             "deepseek",
+            "longcat",
             "zhipu",
             "moonshot",
             "minimax",
@@ -313,6 +323,20 @@ mod tests {
     }
 
     #[test]
+    fn longcat_uses_its_openai_compatible_endpoint() {
+        let longcat = preset("longcat").expect("longcat preset");
+        assert_eq!(longcat.display_name, "LongCat");
+        assert_eq!(longcat.provider_type, ProviderType::OpenAi);
+        assert_eq!(
+            longcat.default_base_url,
+            Some("https://api.longcat.chat/openai/v1")
+        );
+        assert_eq!(longcat.auth_kind, AuthKind::ApiKey);
+        assert_eq!(longcat.api_key_env, Some("LONGCAT_API_KEY"));
+        assert_eq!(longcat.model_source, ModelSource::DiscoveryApi);
+    }
+
+    #[test]
     fn every_preset_has_required_stable_fields() {
         for p in PRESETS {
             assert!(!p.id.is_empty(), "empty id");
@@ -324,10 +348,7 @@ mod tests {
             // Concrete hosted vendors ship a default base_url. The generic
             // `*-compatible` presets legitimately leave it unset (the user
             // fills in the endpoint on the custom row).
-            let endpoint_optional = matches!(
-                p.id,
-                "openai-compatible" | "anthropic-compatible"
-            );
+            let endpoint_optional = matches!(p.id, "openai-compatible" | "anthropic-compatible");
             if !endpoint_optional {
                 assert!(
                     p.default_base_url.is_some(),

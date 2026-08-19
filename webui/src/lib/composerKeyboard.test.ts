@@ -13,5 +13,6 @@ test('coarse-pointer Enter remains a newline for mobile soft keyboards', () => {
 
 test('composition and non-Enter keys never submit', () => {
   assert.equal(shouldSendComposerOnEnter({ key: 'Enter', shiftKey: false, isComposing: true }, false), false);
+  assert.equal(shouldSendComposerOnEnter({ key: 'Enter', shiftKey: false, isComposing: false, keyCode: 229 }, false), false);
   assert.equal(shouldSendComposerOnEnter({ key: 'a', shiftKey: false, isComposing: false }, false), false);
 });

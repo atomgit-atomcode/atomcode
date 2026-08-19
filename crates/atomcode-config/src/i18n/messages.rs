@@ -367,7 +367,9 @@ pub enum Msg<'a> {
     },
     ProviderPanelAddModelRow,
     ProviderPanelAccountsHint,
+    ProviderPanelManagedAccountHint,
     ProviderPanelModelsHint,
+    ProviderPanelManagedModelsHint,
     ProviderPanelFilteredModelsHint {
         account: &'a str,
     },
@@ -389,6 +391,8 @@ pub enum Msg<'a> {
     ProviderPanelVisionAuto,
     ProviderPanelVisionEnabled,
     ProviderPanelVisionDisabled,
+    ProviderPanelFieldEffort,
+    ProviderPanelFieldEffortLevels,
     ProviderPanelFieldWindow,
     ProviderPanelFieldMakeDefault,
     ProviderPanelSwitchHint,
@@ -450,6 +454,9 @@ pub enum Msg<'a> {
         tool: &'a str,
         detail: &'a str,
     },
+    /// Advisory line shown under a credential-suspected Bash approval, warning that
+    /// allowing it may send secrets or sensitive content to the model provider.
+    CredentialApprovalNote,
 
     // ── Tool result markers ──
     ToolDenied,
@@ -1903,6 +1910,11 @@ pub enum Msg<'a> {
     /// when it usually isn't. The elapsed timer already conveys duration; this adds
     /// only the one thing not otherwise surfaced mid-stream — that esc cancels.
     StreamStalled,
+    StreamRecoveryRunning {
+        attempt: u32,
+        max_attempts: u32,
+    },
+    StreamRecoverySucceeded,
 
     // ── legacy Windows console (conhost) one-shot hint ──
     /// Shown once at startup ONLY on the classic Windows console host

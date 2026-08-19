@@ -4,6 +4,7 @@ use atomcode_kernel::message::{
 };
 use serde::{Deserialize, Serialize};
 
+use atomcode_capabilities::session::manager::SessionOrigin;
 use atomcode_capabilities::session::manager::{NativeImportCommitOutcome, META_VERSION};
 use atomcode_capabilities::session::presentation::PRESENTATION_VERSION;
 use atomcode_capabilities::session::{
@@ -11,7 +12,6 @@ use atomcode_capabilities::session::{
     PresentationEntry, PresentationFile, PresentationRole, SessionLease, SessionManager,
     SessionMeta, SessionResult, SessionStoreError, StorageOwner, TurnStat,
 };
-use atomcode_capabilities::session::manager::SessionOrigin;
 
 /// In-memory result of the one legacy → native conversion. S2b owns persistence
 /// and commit; keeping this function side-effect free makes conversion testable.
@@ -31,6 +31,39 @@ pub struct CatalogSessionView {
     pub meta: SessionMeta,
     pub presentation: PresentationFile,
 }
+
+/// Bounded, presentation-only read model for `/resume` selection previews.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogSessionPreview {
+    pub session_id: String,
+    pub project_bucket: String,
+    pub provider_id: Option<String>,
+    pub model_id: Option<String>,
+    pub excerpt: Vec<String>,
+}
+
+/// Sanitized preview failures. Display strings intentionally contain no paths,
+/// raw serde diagnostics, or stored session content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogSessionPreviewError {
+    InvalidLocation,
+    Corrupt,
+    TooLarge,
+    Unavailable,
+}
+
+impl std::fmt::Display for CatalogSessionPreviewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidLocation => "invalid session preview location",
+            Self::Corrupt => "session preview data is corrupt",
+            Self::TooLarge => "session preview data is too large",
+            Self::Unavailable => "session preview is unavailable",
+        })
+    }
+}
+
+impl std::error::Error for CatalogSessionPreviewError {}
 
 /// Exact catalog selection prepared for a runtime resume. The importer and the
 /// replacement runtime share `lease`; dropping this value before handing the
@@ -1112,6 +1145,196 @@ pub fn load_catalog_session_view_in_project(
     id: &str,
 ) -> anyhow::Result<Option<CatalogSessionView>> {
     load_catalog_session_view_in_project_root(&SessionManager::sessions_root(), project_bucket, id)
+}
+
+pub fn preview_catalog_session_in_project(
+    project_bucket: &str,
+    id: &str,
+) -> Result<Option<CatalogSessionPreview>, CatalogSessionPreviewError> {
+    preview_catalog_session_in_project_root(&SessionManager::sessions_root(), project_bucket, id)
+}
+
+/// How many recent messages the preview excerpt keeps.
+const PREVIEW_EXCERPT_MESSAGES: usize = 6;
+
+/// The most recent `<= PREVIEW_EXCERPT_MESSAGES` messages, each collapsed to a
+/// SINGLE sanitized line (its first non-empty line). One line per MESSAGE — not
+/// per source line — so a multi-line assistant reply can't fill the whole preview
+/// and drop the preceding user prompt (the most useful "which session is this"
+/// signal). Messages that sanitize to nothing don't consume a slot.
+fn preview_excerpt<'a>(message_texts: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut excerpt: std::collections::VecDeque<String> =
+        std::collections::VecDeque::with_capacity(PREVIEW_EXCERPT_MESSAGES);
+    for text in message_texts {
+        let Some(line) = text
+            .lines()
+            .map(sanitize_preview_line)
+            .find(|line| !line.is_empty())
+        else {
+            continue;
+        };
+        if excerpt.len() == PREVIEW_EXCERPT_MESSAGES {
+            excerpt.pop_front();
+        }
+        excerpt.push_back(line);
+    }
+    excerpt.into()
+}
+
+/// Provider/model of the most recent turn that recorded model usage.
+fn provider_model_from_meta(meta: &SessionMeta) -> (Option<String>, Option<String>) {
+    let latest_usage = meta
+        .turn_stats
+        .iter()
+        .rev()
+        .find(|turn| !turn.model_usage.is_empty())
+        .and_then(|turn| turn.model_usage.last());
+    let provider_id = latest_usage
+        .map(|usage| sanitize_preview_line(&usage.provider_id))
+        .filter(|value| !value.is_empty());
+    let model_id = latest_usage
+        .map(|usage| sanitize_preview_line(&usage.model_id))
+        .filter(|value| !value.is_empty());
+    (provider_id, model_id)
+}
+
+pub(crate) fn preview_catalog_session_in_project_root(
+    sessions_root: &std::path::Path,
+    project_bucket: &str,
+    id: &str,
+) -> Result<Option<CatalogSessionPreview>, CatalogSessionPreviewError> {
+    validate_project_bucket(project_bucket)
+        .map_err(|_| CatalogSessionPreviewError::InvalidLocation)?;
+    let manager = SessionManager::with_root(sessions_root.join(project_bucket));
+
+    // Read-only across EVERY on-disk state (never acquires a lease / ownership),
+    // so a mere /resume hover cannot converge or mutate a session — yet the
+    // preview must work for the whole backlog, not only sessions already resumed
+    // into an owner=Native aggregate with a presentation sidecar.
+    let (provider_id, model_id, excerpt) = match manager.read_meta(id) {
+        Ok(meta) => {
+            let (provider_id, model_id) = provider_model_from_meta(&meta);
+            let excerpt = match manager.read_presentation(id) {
+                // owner=Native: the display presentation is authoritative.
+                Ok(presentation) => {
+                    preview_excerpt(presentation.entries.iter().map(|entry| entry.text.as_str()))
+                }
+                // Pre-owner (Unconfirmed) native: no presentation sidecar yet, so
+                // derive read-only from the snapshot's user/assistant messages
+                // rather than reporting a healthy session as unavailable/corrupt.
+                Err(SessionStoreError::NotFound { .. }) => match manager.load_snapshot(id) {
+                    Ok(snapshot) => preview_excerpt(
+                        snapshot
+                            .messages
+                            .iter()
+                            .filter(|message| {
+                                matches!(
+                                    message.role,
+                                    atomcode_kernel::message::Role::User
+                                        | atomcode_kernel::message::Role::Assistant
+                                )
+                            })
+                            .map(|message| message.text.as_str()),
+                    ),
+                    Err(SessionStoreError::NotFound { .. }) => return Ok(None),
+                    Err(error) => return Err(classify_preview_error(&error)),
+                },
+                Err(error) => return Err(classify_preview_error(&error)),
+            };
+            (provider_id, model_id, excerpt)
+        }
+        // Legacy-only: no native meta. Read + convert in memory (no persist, no
+        // ownership) purely to project the preview.
+        Err(SessionStoreError::NotFound { .. }) => {
+            let bytes = match manager.read_legacy_bytes(id) {
+                Ok(bytes) => bytes,
+                Err(SessionStoreError::NotFound { .. }) => return Ok(None),
+                Err(error) => return Err(classify_preview_error(&error)),
+            };
+            let legacy: LegacySession =
+                serde_json::from_slice(&bytes).map_err(|_| CatalogSessionPreviewError::Corrupt)?;
+            let converted =
+                convert_legacy_session(&legacy).map_err(|_| CatalogSessionPreviewError::Corrupt)?;
+            let (provider_id, model_id) = provider_model_from_meta(&converted.meta);
+            let excerpt = preview_excerpt(
+                converted
+                    .presentation
+                    .entries
+                    .iter()
+                    .map(|entry| entry.text.as_str()),
+            );
+            (provider_id, model_id, excerpt)
+        }
+        Err(error) => return Err(classify_preview_error(&error)),
+    };
+
+    Ok(Some(CatalogSessionPreview {
+        session_id: id.to_string(),
+        project_bucket: project_bucket.to_string(),
+        provider_id,
+        model_id,
+        excerpt,
+    }))
+}
+
+fn classify_preview_error(error: &SessionStoreError) -> CatalogSessionPreviewError {
+    match error {
+        SessionStoreError::InvalidId { .. } | SessionStoreError::UnsafeFile { .. } => {
+            CatalogSessionPreviewError::InvalidLocation
+        }
+        SessionStoreError::TooLarge { .. } => CatalogSessionPreviewError::TooLarge,
+        SessionStoreError::FutureSchema { .. } | SessionStoreError::Corrupt { .. } => {
+            CatalogSessionPreviewError::Corrupt
+        }
+        SessionStoreError::NotFound { .. }
+        | SessionStoreError::SessionInUse { .. }
+        | SessionStoreError::AmbiguousId { .. }
+        | SessionStoreError::LeaseMismatch { .. }
+        | SessionStoreError::OwnershipConflict { .. }
+        | SessionStoreError::Io { .. }
+        | SessionStoreError::UncertainCommit { .. } => CatalogSessionPreviewError::Unavailable,
+    }
+}
+
+fn sanitize_preview_line(line: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum Escape {
+        Text,
+        Start,
+        Csi,
+        Osc,
+        OscEscape,
+    }
+
+    let mut state = Escape::Text;
+    let mut clean = String::with_capacity(line.len().min(512));
+    let mut visible = 0usize;
+    for character in line.chars() {
+        state = match state {
+            Escape::Text if character == '\u{1b}' => Escape::Start,
+            Escape::Text => {
+                if character == '\t' && visible < 512 {
+                    clean.push(' ');
+                    visible += 1;
+                } else if !character.is_control() && visible < 512 {
+                    clean.push(character);
+                    visible += 1;
+                }
+                Escape::Text
+            }
+            Escape::Start if character == '[' => Escape::Csi,
+            Escape::Start if character == ']' => Escape::Osc,
+            Escape::Start => Escape::Text,
+            Escape::Csi if ('@'..='~').contains(&character) => Escape::Text,
+            Escape::Csi => Escape::Csi,
+            Escape::Osc if character == '\u{7}' => Escape::Text,
+            Escape::Osc if character == '\u{1b}' => Escape::OscEscape,
+            Escape::Osc => Escape::Osc,
+            Escape::OscEscape if character == '\\' => Escape::Text,
+            Escape::OscEscape => Escape::Osc,
+        };
+    }
+    clean.trim().to_string()
 }
 
 /// Resolve one exact catalog location, converge it to native ownership under an
@@ -3401,6 +3624,258 @@ mod tests {
 
         std::fs::remove_file(manager.presentation_path(id).unwrap()).unwrap();
         assert!(load_catalog_session_view_in_root(dir.path(), &entry).is_err());
+    }
+
+    #[test]
+    fn catalog_preview_derives_from_snapshot_for_a_pre_owner_native_session() {
+        // Pre-owner native session: valid meta (owner=Unconfirmed) + snapshot but
+        // NO presentation sidecar — the state of the entire not-yet-resumed
+        // backlog. Read-only, it must STILL preview (derive from the snapshot),
+        // not report "unavailable"/corrupt.
+        let root = tempfile::tempdir().unwrap();
+        let bucket = "0123456789abcdef";
+        let id = "preview-preowner";
+        let manager = SessionManager::with_root(root.path().join(bucket));
+
+        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+            KernelMessage::user("please refactor the auth module"),
+            KernelMessage::assistant(
+                "Sure — updating it now.\nsecond line of the same message",
+                vec![],
+            ),
+        ]);
+        let mut meta = SessionMeta::new(id, "/project", 1);
+        meta.owner = StorageOwner::Unconfirmed;
+        meta.message_count = 2;
+        manager.write_meta(&meta).unwrap();
+        std::fs::write(
+            manager.snapshot_path(id).unwrap(),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let preview = preview_catalog_session_in_project_root(root.path(), bucket, id)
+            .unwrap()
+            .expect("a pre-owner native session must still preview, not be 'unavailable'");
+
+        assert_eq!(preview.session_id, id);
+        // Derived from the snapshot's user/assistant messages; the multi-line
+        // assistant reply collapses to ONE line and the user prompt is kept (S4).
+        assert_eq!(
+            preview.excerpt,
+            vec![
+                "please refactor the auth module".to_string(),
+                "Sure — updating it now.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn catalog_preview_derives_from_legacy_blob_read_only() {
+        // Legacy-only session: no native meta, data in a single legacy JSON blob.
+        // The preview must convert it in memory (no persist / no ownership) and
+        // still project a preview.
+        let root = tempfile::tempdir().unwrap();
+        let bucket = "0123456789abcdef";
+        let legacy = full_legacy_session();
+        let id = legacy.id.clone();
+        let manager = SessionManager::with_root(root.path().join(bucket));
+        let legacy_path = manager.legacy_path(&id).unwrap();
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let preview = preview_catalog_session_in_project_root(root.path(), bucket, &id)
+            .unwrap()
+            .expect("a legacy-only session must still preview");
+
+        assert_eq!(preview.session_id, id);
+        assert!(
+            !preview.excerpt.is_empty(),
+            "legacy preview must derive an excerpt from the converted presentation"
+        );
+        // Nothing was persisted: the read-only preview must not create native
+        // meta / snapshot / presentation sidecars.
+        assert!(!manager.meta_path(&id).unwrap().exists());
+    }
+
+    #[test]
+    fn catalog_preview_keeps_last_six_messages_not_lines() {
+        // S4: a single multi-line assistant message must not fill the excerpt and
+        // evict earlier messages — each message contributes exactly one line.
+        let root = tempfile::tempdir().unwrap();
+        let bucket = "0123456789abcdef";
+        let id = "preview-sixmsgs";
+        let manager = SessionManager::with_root(root.path().join(bucket));
+        let lease = manager.acquire_lease(id).unwrap();
+        let snapshot =
+            atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user("anchor")]);
+        let mut meta = SessionMeta::new(id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 1;
+        // 8 single-line user messages then one 20-line assistant message.
+        let mut entries: Vec<PresentationEntry> = (0..8)
+            .map(|n| PresentationEntry {
+                anchor: DisplayAnchor::AtStart,
+                role: PresentationRole::User,
+                text: format!("msg-{n}"),
+            })
+            .collect();
+        entries.push(PresentationEntry {
+            anchor: DisplayAnchor::AtStart,
+            role: PresentationRole::Assistant,
+            text: (0..20)
+                .map(|n| format!("reply line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+        let presentation = PresentationFile {
+            v: PRESENTATION_VERSION,
+            entries,
+        };
+        manager
+            .commit_native_import(&lease, Some(&snapshot), Some(&presentation), &meta)
+            .unwrap();
+        drop(lease);
+
+        let preview = preview_catalog_session_in_project_root(root.path(), bucket, id)
+            .unwrap()
+            .unwrap();
+
+        // 6 messages: msg-3..msg-7 (5 users) + the assistant's FIRST line only.
+        assert_eq!(preview.excerpt.len(), 6);
+        assert_eq!(preview.excerpt.first().map(String::as_str), Some("msg-3"));
+        assert_eq!(
+            preview.excerpt.last().map(String::as_str),
+            Some("reply line 0"),
+            "a multi-line message contributes ONE line, not many"
+        );
+    }
+
+    #[test]
+    fn catalog_preview_is_bounded_sanitized_and_does_not_load_snapshot() {
+        use atomcode_capabilities::session::{ModelUsageStat, TokenBreakdown};
+
+        let root = tempfile::tempdir().unwrap();
+        let bucket = "0123456789abcdef";
+        let id = "preview-native";
+        let manager = SessionManager::with_root(root.path().join(bucket));
+        let lease = manager.acquire_lease(id).unwrap();
+        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user(
+            "snapshot must not be loaded",
+        )]);
+        let mut meta = SessionMeta::new(id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 1;
+        for (turn_id, usage) in [
+            (1, None),
+            (2, Some(("provider-old", "model-old"))),
+            (3, None),
+            (4, Some(("provider-new", "model-new"))),
+        ] {
+            meta.turn_stats.push(TurnStat {
+                after_message: 1,
+                position_valid: true,
+                turn_id,
+                round_count: 1,
+                tool_call_count: 0,
+                duration_ms: 1,
+                total_tokens: 1,
+                errored: false,
+                used_tokens: 1,
+                ctx_window: 128,
+                model_usage: usage
+                    .map(|(provider_id, model_id)| {
+                        vec![ModelUsageStat {
+                            provider_id: provider_id.into(),
+                            model_id: model_id.into(),
+                            tokens: TokenBreakdown {
+                                input: 1,
+                                output: 1,
+                                cached_input: 0,
+                            },
+                        }]
+                    })
+                    .unwrap_or_default(),
+            });
+        }
+        let presentation = PresentationFile {
+            v: PRESENTATION_VERSION,
+            entries: (0..10)
+                .map(|line| PresentationEntry {
+                    anchor: DisplayAnchor::AtStart,
+                    role: PresentationRole::Assistant,
+                    text: if line == 9 {
+                        "tail\u{1b}[31m\u{7}".into()
+                    } else {
+                        format!("line-{line}")
+                    },
+                })
+                .collect(),
+        };
+        manager
+            .commit_native_import(&lease, Some(&snapshot), Some(&presentation), &meta)
+            .unwrap();
+        drop(lease);
+
+        // Poison the snapshot after the aggregate is committed. Preview is a
+        // meta + presentation projection and must remain usable.
+        std::fs::write(manager.snapshot_path(id).unwrap(), b"not-json").unwrap();
+        let preview = preview_catalog_session_in_project_root(root.path(), bucket, id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(preview.session_id, id);
+        assert_eq!(preview.project_bucket, bucket);
+        assert_eq!(preview.provider_id.as_deref(), Some("provider-new"));
+        assert_eq!(preview.model_id.as_deref(), Some("model-new"));
+        assert_eq!(preview.excerpt.len(), 6);
+        assert_eq!(preview.excerpt.first().map(String::as_str), Some("line-4"));
+        assert_eq!(preview.excerpt.last().map(String::as_str), Some("tail"));
+        assert!(preview
+            .excerpt
+            .iter()
+            .all(|line| { !line.chars().any(char::is_control) && !line.contains("[31m") }));
+    }
+
+    #[test]
+    fn catalog_preview_returns_typed_sanitized_corrupt_and_oversize_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = "0123456789abcdef";
+        let id = "preview-errors";
+        let manager = SessionManager::with_root(root.path().join(bucket));
+        let lease = manager.acquire_lease(id).unwrap();
+        let mut meta = SessionMeta::new(id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&atomcode_kernel::message::SessionSnapshot::new(Vec::new())),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        drop(lease);
+        let presentation_path = manager.presentation_path(id).unwrap();
+
+        std::fs::write(&presentation_path, b"{not-json").unwrap();
+        let corrupt = preview_catalog_session_in_project_root(root.path(), bucket, id).unwrap_err();
+        assert_eq!(corrupt, CatalogSessionPreviewError::Corrupt);
+        assert_eq!(corrupt.to_string(), "session preview data is corrupt");
+        assert!(!corrupt.to_string().contains(id));
+        assert!(!corrupt
+            .to_string()
+            .contains(&root.path().to_string_lossy().to_string()));
+
+        let file = std::fs::File::create(&presentation_path).unwrap();
+        file.set_len(
+            u64::try_from(atomcode_capabilities::session::presentation::MAX_PRESENTATION_BYTES + 1)
+                .unwrap(),
+        )
+        .unwrap();
+        let oversized =
+            preview_catalog_session_in_project_root(root.path(), bucket, id).unwrap_err();
+        assert_eq!(oversized, CatalogSessionPreviewError::TooLarge);
+        assert_eq!(oversized.to_string(), "session preview data is too large");
     }
 
     #[test]

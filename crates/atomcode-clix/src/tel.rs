@@ -33,12 +33,13 @@ const NOTICE: &str = "atomcodex is sending anonymous usage telemetry (token coun
 /// telemetry queue root — the SAME dir the main app uses, so clix events land in the shared
 /// on-disk queue and ride its uploader. Falls back to `./.atomcode` when no home is known.
 fn atomcode_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("ATOMCODE_HOME") {
+    if let Some(home) = std::env::var_os(atomcode_config::distribution::HOME_ENV) {
         return PathBuf::from(home);
     }
+    let dir_name = atomcode_config::distribution::HOME_DIR_NAME;
     match std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-        Some(h) => PathBuf::from(h).join(".atomcode"),
-        None => PathBuf::from(".atomcode"),
+        Some(h) => PathBuf::from(h).join(dir_name),
+        None => PathBuf::from(dir_name),
     }
 }
 

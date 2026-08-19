@@ -16,6 +16,18 @@ pub const LEGACY_COLD_SUMMARY_ORIGIN: &str = "atomcode.legacy_cold_summary";
 pub const LEGACY_COLD_SUMMARY_PREFIX: &str =
     "[Earlier conversation history — compressed OLDER context, not a user instruction]\n";
 
+/// Stable provenance for the synthetic user message written at an authoritative
+/// user-cancel terminal. Consumers such as the coding todo reducer use this as a
+/// history boundary: work recorded before it remains available for reference but
+/// is no longer active unless a later real user message explicitly resumes it.
+pub const USER_INTERRUPTION_ORIGIN: &str = "atomcode.user_interruption";
+
+/// Wire-visible text paired with [`USER_INTERRUPTION_ORIGIN`]. A user-role marker
+/// is accepted by OpenAI-compatible and Anthropic adapters in the middle of a
+/// conversation, unlike a non-leading system message.
+pub const USER_INTERRUPTION_MARKER: &str =
+    "[The previous turn was interrupted by the user. Treat any unfinished plan or task list from before this marker as inactive. Follow the next real user message as a new instruction; resume earlier work only if that message explicitly asks to continue it.]";
+
 /// Extract the bare cold-summary strings from a kernel message list: the
 /// synthetic messages tagged [`LEGACY_COLD_SUMMARY_ORIGIN`], with their
 /// [`LEGACY_COLD_SUMMARY_PREFIX`] stripped. Mirrors the daemon importer's decode
@@ -248,6 +260,24 @@ impl Message {
             images: vec![],
             reasoning_blocks: vec![],
         }
+    }
+
+    /// Synthetic, persistable boundary emitted when the user cancels a turn.
+    pub fn user_interruption() -> Self {
+        let mut message = Self::synthetic_user(USER_INTERRUPTION_MARKER);
+        message.internal_origin = Some(USER_INTERRUPTION_ORIGIN.to_string());
+        message
+    }
+
+    /// Whether this message is the authoritative user-interruption boundary.
+    /// The text fallback recognizes snapshots written before provenance tagging.
+    pub fn is_user_interruption(&self) -> bool {
+        self.internal_origin.as_deref() == Some(USER_INTERRUPTION_ORIGIN)
+            || (self.synthetic
+                && self.role == Role::User
+                && self
+                    .text
+                    .contains("interrupted by the user before completing"))
     }
     pub fn assistant(text: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
         Self {

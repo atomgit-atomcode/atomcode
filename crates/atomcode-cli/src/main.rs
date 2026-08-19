@@ -21,8 +21,8 @@ use atomcode::uninstall;
 
 // Redirect ATOMCODE_HOME to a throwaway temp dir before any test in this binary
 // runs, so unit tests never persist into the developer's real `~/.atomcode`.
-// Tests that set their own ATOMCODE_HOME still win (isolate_home is a no-op when
-// the var is already set).
+// An inherited shell ATOMCODE_HOME is replaced; individual tests may install
+// their own temporary home after this ctor runs.
 #[cfg(test)]
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
@@ -1488,6 +1488,13 @@ async fn run() -> Result<i32> {
             }
             Commands::Webui { port, host } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
+                // Fail before binding a port and opening a browser: without the
+                // assets every page would be a 404, and the cause is a build
+                // step, not anything the running server can recover from.
+                if !atomcode_daemon::webui::is_built() {
+                    eprint!("{}", atomcode_daemon::webui::NOT_BUILT_HELP);
+                    return Ok(1);
+                }
                 let msg = atomcode_daemon::ensure_server_and_open(&host, port, false).await;
                 eprintln!("{msg}");
                 // server 是后台 task；保持进程存活直到用户 Ctrl+C
@@ -2110,9 +2117,15 @@ fn into_tui_native_runtime(
 #[cfg(unix)]
 fn redirect_stderr_to_log_file() {
     use std::os::unix::io::AsRawFd;
-    let Some(home) = std::env::var_os("ATOMCODE_HOME")
+    // Both halves come from `distribution`, which is what `HOME_ENV`'s doc
+    // comment asks of the resolvers it enumerates — this is one of them. The
+    // fallback is rarely taken (`bootstrap_home` has normally set the variable
+    // already), and that is exactly why a literal here is a liability: the one
+    // path that reaches it is the one nobody exercises.
+    let home_env = std::env::var_os(atomcode_config::distribution::HOME_ENV);
+    let Some(home) = home_env
         .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".atomcode")))
+        .or_else(|| dirs::home_dir().map(|h| h.join(atomcode_config::distribution::HOME_DIR_NAME)))
     else {
         return;
     };
@@ -2955,6 +2968,7 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
         match e {
             HookEvent::PreToolUse => "PreToolUse",
             HookEvent::PostToolUse => "PostToolUse",
+            HookEvent::PostToolUseFailure => "PostToolUseFailure",
             HookEvent::SessionStart => "SessionStart",
             HookEvent::SessionEnd => "SessionEnd",
             HookEvent::UserPromptSubmit => "UserPromptSubmit",
@@ -3064,6 +3078,10 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                         HookEvent::PostToolUse => serde_json::json!({
                             "session_id": sid, "hook_event_name": "PostToolUse", "cwd": cwd_s,
                             "tool_name": "bash", "tool_response": "hello\n",
+                        }),
+                        HookEvent::PostToolUseFailure => serde_json::json!({
+                            "session_id": sid, "hook_event_name": "PostToolUseFailure", "cwd": cwd_s,
+                            "tool_name": "bash", "tool_response": "command failed\n",
                         }),
                         HookEvent::UserPromptSubmit => serde_json::json!({
                             "session_id": sid, "hook_event_name": "UserPromptSubmit",
@@ -3299,10 +3317,13 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                             );
                             for p in &matches {
                                 msg.push_str(&format!(
-                                    "  atomcode plugin uninstall {}@{}\n",
-                                    p.plugin, p.marketplace
+                                    "  {}@{} ({})\n",
+                                    p.plugin, p.marketplace, p.scope
                                 ));
                             }
+                            msg.push_str(
+                                "Use /plugin to select the installation scope to remove.\n",
+                            );
                             anyhow::bail!(msg.trim().to_string());
                         }
                     }
@@ -3330,13 +3351,14 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                 }
                 many => {
                     let mut msg =
-                        format!("plugin `{name}` installed from multiple marketplaces:\n");
+                        format!("plugin `{name}` has hooks in multiple installations:\n");
                     for s in many {
                         msg.push_str(&format!(
-                            "  atomcode plugin trust {}@{}\n",
-                            s.plugin, s.marketplace
+                            "  {}@{} ({})\n",
+                            s.plugin, s.marketplace, s.scope
                         ));
                     }
+                    msg.push_str("Use /plugin to inspect the installation scopes.\n");
                     anyhow::bail!(msg);
                 }
             }
@@ -3357,13 +3379,14 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                 }
                 many => {
                     let mut msg =
-                        format!("plugin `{name}` installed from multiple marketplaces:\n");
+                        format!("plugin `{name}` has hooks in multiple installations:\n");
                     for s in many {
                         msg.push_str(&format!(
-                            "  atomcode plugin untrust {}@{}\n",
-                            s.plugin, s.marketplace
+                            "  {}@{} ({})\n",
+                            s.plugin, s.marketplace, s.scope
                         ));
                     }
+                    msg.push_str("Use /plugin to inspect the installation scopes.\n");
                     anyhow::bail!(msg);
                 }
             }

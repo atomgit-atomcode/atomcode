@@ -27,6 +27,41 @@ export function isInternalHistoryAssistantMessage(msg: SessionMessage): boolean 
     && !(msg.tool_calls?.length);
 }
 
+export function isUserInterruptionMessage(msg: SessionMessage): boolean {
+  const internalOrigin = msg.internal_origin ?? msg.internalOrigin;
+  return internalOrigin === 'atomcode.user_interruption'
+    || (msg.synthetic === true
+      && msg.role === 'user'
+      && msg.content.includes('interrupted by the user before completing'));
+}
+
+export function shouldShowAssistantTimestamp(
+  isLastInTurn: boolean,
+  streaming: boolean,
+  text: string,
+  isError: boolean,
+): boolean {
+  return isLastInTurn && !streaming && text.length > 0 && !isError;
+}
+
+/** Return one flag per timeline message. System notices are transparent and only
+ * a real user message closes the preceding assistant turn. */
+export function assistantTurnEndFlags(roles: readonly string[]): boolean[] {
+  const result = roles.map(() => false);
+  let lastAssistant = -1;
+
+  for (let index = 0; index < roles.length; index += 1) {
+    if (roles[index] === 'assistant') {
+      lastAssistant = index;
+    } else if (roles[index] === 'user' && lastAssistant >= 0) {
+      result[lastAssistant] = true;
+      lastAssistant = -1;
+    }
+  }
+  if (lastAssistant >= 0) result[lastAssistant] = true;
+  return result;
+}
+
 export function sessionMessagesToMarkdownLines(
   messages: SessionMessage[],
   title: string,

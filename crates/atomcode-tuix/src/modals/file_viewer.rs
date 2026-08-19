@@ -29,7 +29,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use super::{Modal, ModalAction};
+use super::{
+    backspace_at_cursor, delete_at_cursor, insert_at_cursor, next_grapheme_boundary,
+    previous_grapheme_boundary, Modal, ModalAction,
+};
 use crate::event_loop::file_index::{Entry, FileIndex};
 use crate::event_loop::{Buffer, LoopCtx};
 use crate::render::{DiffPanelRow, DiffPanelSpan, DiffPanelTone, Renderer, UiLine};
@@ -88,6 +91,7 @@ struct Picker {
     index: FileIndex,
     working_dir: PathBuf,
     query: String,
+    query_cursor_byte: usize,
     /// Matching FILE entries (directories filtered out).
     matches: Vec<Entry>,
     /// When the query is a path-like string (`/…`, `~/…`, `./…`) resolving to a
@@ -172,9 +176,14 @@ impl Picker {
     /// to keep the selection visible, and a "more files" row appears when the
     /// result set is larger. `screen_h` only bounds the panel on tiny terminals.
     fn build_panel(&self, screen_w: u16, screen_h: u16) -> UiLine {
+        let mut query_with_cursor = self.query.clone();
+        query_with_cursor.insert(
+            self.query_cursor_byte.min(query_with_cursor.len()),
+            '\u{258f}',
+        );
         let title = DiffPanelRow::new(vec![
             DiffPanelSpan::new(l("Select file", "选择文件"), DiffPanelTone::Brand),
-            DiffPanelSpan::new(format!("  {}\u{258f}", self.query), DiffPanelTone::Muted),
+            DiffPanelSpan::new(format!("  {query_with_cursor}"), DiffPanelTone::Muted),
         ]);
 
         let mut rows: Vec<DiffPanelRow> = Vec::new();
@@ -265,6 +274,7 @@ impl FileViewer {
             index,
             working_dir,
             query: String::new(),
+            query_cursor_byte: 0,
             matches: Vec::new(),
             external: None,
             selected: 0,
@@ -369,13 +379,33 @@ impl FileViewer {
             KeyCode::PageUp => picker.move_up(page),
             KeyCode::PageDown => picker.move_down(page),
             KeyCode::Backspace => {
-                picker.query.pop();
+                backspace_at_cursor(&mut picker.query, &mut picker.query_cursor_byte);
                 picker.selected = 0;
                 picker.error = None;
                 picker.refresh();
             }
             KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
-                picker.query.push(c);
+                insert_at_cursor(
+                    &mut picker.query,
+                    &mut picker.query_cursor_byte,
+                    c.encode_utf8(&mut [0; 4]),
+                );
+                picker.selected = 0;
+                picker.error = None;
+                picker.refresh();
+            }
+            KeyCode::Left => {
+                picker.query_cursor_byte =
+                    previous_grapheme_boundary(&picker.query, picker.query_cursor_byte)
+            }
+            KeyCode::Right => {
+                picker.query_cursor_byte =
+                    next_grapheme_boundary(&picker.query, picker.query_cursor_byte)
+            }
+            KeyCode::Home => picker.query_cursor_byte = 0,
+            KeyCode::End => picker.query_cursor_byte = picker.query.len(),
+            KeyCode::Delete => {
+                delete_at_cursor(&mut picker.query, &mut picker.query_cursor_byte);
                 picker.selected = 0;
                 picker.error = None;
                 picker.refresh();
@@ -638,6 +668,7 @@ mod tests {
             index,
             working_dir: root.to_path_buf(),
             query: query.to_string(),
+            query_cursor_byte: query.len(),
             matches: Vec::new(),
             external: None,
             selected: 0,
@@ -784,6 +815,7 @@ mod tests {
             index,
             working_dir: root,
             query: "rs".into(),
+            query_cursor_byte: 0,
             matches: Vec::new(),
             external: None,
             selected: 0,
@@ -824,6 +856,7 @@ mod tests {
             index,
             working_dir: root,
             query: "alpha".into(),
+            query_cursor_byte: 0,
             matches: Vec::new(),
             external: None,
             selected: 0,

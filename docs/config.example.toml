@@ -57,6 +57,8 @@ api_key = "sk-..."
 model = "deepseek-chat"
 base_url = "https://api.deepseek.com/v1"
 context_window = 64000
+# Total attempts including the first request. Default: 3; set 1 to disable retries.
+# retry_max_attempts = 5
 
 # DeepSeek V4 专属：推理历史回显策略
 # (unset = auto-detect: deepseek-v4* → include, deepseek-reasoner/r1 → exclude)
@@ -234,21 +236,25 @@ mode = "follow_system"
 # =============================================================================
 # Agent 循环保险（环境变量）
 # =============================================================================
-# 普通 coding 回合默认最多 200 个模型轮次；这只是变化型 runaway 的高水位，
-# 不是“任务完成”的判定。需要更长任务时可提高，设为 0 表示不设轮次上限：
+# 普通 coding 回合默认不设模型轮次上限；精确无进展防护仍然生效。
+# 无人值守或成本敏感的部署可显式设置额外的变化型 runaway 高水位：
 #   ATOMCODE_TURN_MAX_ROUNDS=200
 # 精确无进展防护比较“实际工具名 + 规范化参数 + 有效 cwd + 模型可见结果 + 错误状态”；
 # 默认第 3 次提醒、第 4 次完成真实工具结果后停止。合法任务若明确需要重复相同调用和
-# 相同结果，可提高这两个阈值；STOP 设为 0 可关闭。关闭后仍建议保留粗粒度轮次/时间上限：
+# 相同结果，可提高这两个阈值；STOP 设为 0 可关闭：
 #   ATOMCODE_TOOL_LOOP_WARNING_THRESHOLD=3
 #   ATOMCODE_TOOL_LOOP_STOP_THRESHOLD=4
-# goal 另有独立轮次/墙钟上限（默认 200 轮、7200 秒；0 均表示不设上限）：
-#   ATOMCODE_GOAL_MAX_ROUNDS=200
-#   ATOMCODE_GOAL_MAX_DURATION_SECS=7200
+# goal 另有独立轮次上限（无套餐信息时默认 300 轮，会按套餐调用额度调整）；
+# 墙钟上限默认关闭。二者设为 0 均表示不设上限：
+#   ATOMCODE_GOAL_MAX_ROUNDS=300
+#   ATOMCODE_GOAL_MAX_DURATION_SECS=0
 # /loop 使用 [loop_config] 的 max_rounds，并可由 ATOMCODE_LOOP_MAX_ROUNDS 覆盖；0 表示不设上限。
 # 内嵌 code_review 在父回合等待期间有自己的默认保险（200 轮/900 秒），均可覆盖，0 为关闭：
 #   ATOMCODE_REVIEW_MAX_ROUNDS=200
 #   ATOMCODE_REVIEW_MAX_DURATION_SECS=900
+[coding]
+max_rounds = 0
+
 [loop_config]
 max_rounds = 100
 

@@ -348,8 +348,8 @@ impl LifecycleHooks for VerifyCadenceHook {
     }
 
     async fn offer_typed_continuation(&self, convo: &Conversation) -> Option<Continuation> {
-        if !self.execution_policy.current().is_default()
-            || !execution_policy_for_messages(&convo.messages).is_default()
+        if self.execution_policy.current().skips_verification()
+            || execution_policy_for_messages(&convo.messages).skips_verification()
         {
             return None;
         }
@@ -450,6 +450,7 @@ mod tests {
             "修改代码，但禁止编译和禁止执行脚本",
             "Make the edit, but do not run tests.",
             "不要运行任何命令，只修改文件",
+            "直接写完代码 不验证",
         ] {
             let msgs = vec![
                 user(instruction),

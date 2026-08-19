@@ -3,12 +3,12 @@ use std::sync::Arc;
 use atomcode_capabilities::provider::{
     atomgit_request_signer, is_atomgit_gateway, signer_available, AnthropicConfig,
     AnthropicProvider, OllamaConfig, OllamaProvider, OpenAiCompatConfig, OpenAiCompatProvider,
-    ReasoningPolicy, RequestSigner,
+    ReasoningPolicy, RequestSigner, RetryPolicy,
 };
 use atomcode_kernel::provider::LlmProvider;
 
 use crate::CodingAgentConfig;
-use crate::{SubagentProvider, TierProvider};
+use crate::{SubagentModelProviders, SubagentModelResolver, SubagentProvider, TierProvider};
 
 #[derive(Debug)]
 pub enum ProviderBuildError {
@@ -119,6 +119,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 ac.thinking = cfg.thinking_enabled.unwrap_or(false);
                 ac.user_agent = Some(ua.clone());
                 ac.skip_tls_verify = cfg.skip_tls_verify;
+                ac.retry = retry_policy_for(cfg.retry_max_attempts)?;
                 Arc::new(
                     AnthropicProvider::new(ac)
                         .map_err(|e| ProviderBuildError::Adapter(e.message))?,
@@ -134,6 +135,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 oc.think = cfg.thinking_enabled.unwrap_or(false);
                 oc.user_agent = Some(ua.clone());
                 oc.skip_tls_verify = cfg.skip_tls_verify;
+                oc.retry = retry_policy_for(cfg.retry_max_attempts)?;
                 Arc::new(
                     OllamaProvider::new(oc).map_err(|e| ProviderBuildError::Adapter(e.message))?,
                 )
@@ -144,6 +146,10 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 pc.idle_timeout = cfg.stream_timeout;
                 pc.supports_vision = cfg.supports_vision;
                 pc.max_tokens = Some(default_max_tokens(cfg.context_window));
+                // An explicit per-model default is also an explicit capability
+                // declaration. CodingPlan's DeepSeek V4 Flash predates server-side
+                // capability metadata, so keep that one exact built-in fallback.
+                pc.supports_reasoning_effort = supports_reasoning_effort(cfg);
                 pc.reasoning_policy =
                     ReasoningPolicy::from_config(cfg.reasoning_history.as_deref())
                         .map_err(ProviderBuildError::Adapter)?;
@@ -151,6 +157,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 pc.thinking_keep = cfg.thinking_keep.clone();
                 pc.user_agent = Some(ua);
                 pc.skip_tls_verify = cfg.skip_tls_verify;
+                pc.retry = retry_policy_for(cfg.retry_max_attempts)?;
                 if let Some(authenticator) = &self.authenticator {
                     pc.request_signer = authenticator.request_signer(&cfg.base_url)?;
                 }
@@ -167,8 +174,33 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
     }
 }
 
+fn supports_reasoning_effort(cfg: &CodingAgentConfig) -> bool {
+    cfg.supports_reasoning_effort
+        || (atomcode_config::config::is_codingplan_provider_name(&cfg.provider_name)
+            && cfg.model.eq_ignore_ascii_case("deepseek-v4-flash"))
+}
+
 pub fn default_max_tokens(context_window: u32) -> u32 {
     (context_window / 4).clamp(8_000, 16_384)
+}
+
+/// Build the adapter retry policy from the user's `retry_max_attempts` config
+/// knob. `None` ⇒ the adapter default (3 attempts incl. the first request);
+/// `Some(n)` ⇒ exactly `n` attempts. `1` disables automatic retries.
+/// Reject zero instead of silently rewriting it: accepting `0` in
+/// `config.toml` but executing one request makes the persisted configuration
+/// disagree with the runtime and is especially surprising during `/reload`.
+fn retry_policy_for(max_attempts: Option<u32>) -> Result<RetryPolicy, ProviderBuildError> {
+    match max_attempts {
+        None => Ok(RetryPolicy::default_policy()),
+        Some(0) => Err(ProviderBuildError::Adapter(
+            "invalid retry_max_attempts: expected at least 1 (1 disables automatic retries)".into(),
+        )),
+        Some(n) => Ok(RetryPolicy {
+            max_attempts: n,
+            ..RetryPolicy::default_policy()
+        }),
+    }
 }
 
 pub fn derive_tier_config(
@@ -192,11 +224,19 @@ pub fn derive_tier_config(
     tier.thinking_type = provider.thinking_type.clone();
     tier.thinking_keep = provider.thinking_keep.clone();
     tier.reasoning_history = provider.reasoning_history.clone();
+    tier.chat_options.reasoning_effort = atomcode_kernel::provider::ReasoningEffort::from_config(
+        provider.reasoning_effort.as_deref(),
+    );
+    tier.supports_reasoning_effort = provider.reasoning_effort.is_some()
+        || (atomcode_config::config::is_codingplan_provider_name(provider_name)
+            && provider.model.eq_ignore_ascii_case("deepseek-v4-flash"));
     tier.thinking_enabled = provider.thinking_enabled;
     tier.user_agent = provider.user_agent.clone();
     tier.skip_tls_verify = provider.skip_tls_verify;
+    tier.retry_max_attempts = provider.retry_max_attempts;
     tier.subagent_fast_provider = None;
     tier.subagent_capable_provider = None;
+    tier.subagent_model_providers = None;
     tier.subagent_config = None;
     tier
 }
@@ -238,11 +278,19 @@ pub fn derive_tier_config_from_resolved(
     tier.thinking_type = resolved.thinking_type.clone();
     tier.thinking_keep = resolved.thinking_keep.clone();
     tier.reasoning_history = resolved.reasoning_history.clone();
+    tier.chat_options.reasoning_effort = atomcode_kernel::provider::ReasoningEffort::from_config(
+        resolved.reasoning_effort.as_deref(),
+    );
+    tier.supports_reasoning_effort = resolved.reasoning_effort.is_some()
+        || (atomcode_config::config::is_codingplan_provider_name(&resolved.selection_id)
+            && resolved.model.eq_ignore_ascii_case("deepseek-v4-flash"));
     tier.thinking_enabled = resolved.thinking_enabled;
     tier.user_agent = resolved.user_agent.clone();
     tier.skip_tls_verify = resolved.skip_tls_verify;
+    tier.retry_max_attempts = resolved.retry_max_attempts;
     tier.subagent_fast_provider = None;
     tier.subagent_capable_provider = None;
+    tier.subagent_model_providers = None;
     tier.subagent_config = None;
     tier
 }
@@ -285,20 +333,49 @@ pub fn resolve_subagent_tier_thunks(
     (thunk_for(&fast_key), thunk_for(&capable_key))
 }
 
+pub fn resolve_subagent_model_thunk(
+    factory: Arc<dyn CodingProviderFactory>,
+    base: &CodingAgentConfig,
+    config: &atomcode_config::config::Config,
+) -> SubagentModelResolver {
+    let base = base.clone();
+    let config = config.clone();
+    Arc::new(move |selection| {
+        let resolved = config
+            .resolve_model(Some(selection))
+            .map_err(|error| error.to_string())?;
+        if resolved.selection_id == base.provider_name {
+            return Ok(None);
+        }
+        let tier = derive_tier_config_from_resolved(&base, &resolved);
+        factory
+            .build(&tier, None)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    })
+}
+
 pub fn refresh_subagent_tiers(
     factory: Arc<dyn CodingProviderFactory>,
     coding: &CodingAgentConfig,
     config: &atomcode_config::config::Config,
 ) {
-    if coding.subagent_fast_provider.is_none() && coding.subagent_capable_provider.is_none() {
+    if coding.subagent_fast_provider.is_none()
+        && coding.subagent_capable_provider.is_none()
+        && coding.subagent_model_providers.is_none()
+    {
         return;
     }
-    let (fast, capable) = resolve_subagent_tier_thunks(factory, coding, &coding.model, config);
+    let (fast, capable) =
+        resolve_subagent_tier_thunks(factory.clone(), coding, &coding.model, config);
     if let Some(cell) = &coding.subagent_fast_provider {
         cell.reset(fast);
     }
     if let Some(cell) = &coding.subagent_capable_provider {
         cell.reset(capable);
+    }
+    if let Some(models) = &coding.subagent_model_providers {
+        models.reset(resolve_subagent_model_thunk(factory, coding, config));
     }
 }
 
@@ -307,9 +384,13 @@ pub fn install_subagent_tiers(
     coding: &mut CodingAgentConfig,
     config: &atomcode_config::config::Config,
 ) {
-    let (fast, capable) = resolve_subagent_tier_thunks(factory, coding, &coding.model, config);
+    let (fast, capable) =
+        resolve_subagent_tier_thunks(factory.clone(), coding, &coding.model, config);
     coding.subagent_fast_provider = Some(TierProvider::new(fast));
     coding.subagent_capable_provider = Some(TierProvider::new(capable));
+    coding.subagent_model_providers = Some(SubagentModelProviders::new(
+        resolve_subagent_model_thunk(factory, coding, config),
+    ));
 }
 
 #[cfg(test)]
@@ -346,5 +427,80 @@ mod tests {
         assert_eq!(default_max_tokens(16_000), 8_000);
         assert_eq!(default_max_tokens(64_000), 16_000);
         assert_eq!(default_max_tokens(200_000), 16_384);
+    }
+
+    #[test]
+    fn retry_policy_uses_default_accepts_explicit_values_and_rejects_zero() {
+        assert_eq!(retry_policy_for(None).unwrap().max_attempts, 3);
+        assert_eq!(retry_policy_for(Some(1)).unwrap().max_attempts, 1);
+        assert_eq!(retry_policy_for(Some(5)).unwrap().max_attempts, 5);
+
+        let error = retry_policy_for(Some(0)).unwrap_err().to_string();
+        assert!(error.contains("expected at least 1"), "{error}");
+    }
+
+    #[test]
+    fn effort_capability_is_explicit_except_for_atomgit_deepseek_flash() {
+        let mut custom = config("openai");
+        custom.model = "glm-5.2".into();
+        custom.provider_name = "internal-glm".into();
+        assert!(!supports_reasoning_effort(&custom));
+
+        custom.supports_reasoning_effort = true;
+        assert!(supports_reasoning_effort(&custom));
+
+        let mut atomgit = config("openai");
+        atomgit.model = "deepseek-v4-flash".into();
+        atomgit.provider_name = "AtomGit-deepseek-v4-flash".into();
+        assert!(supports_reasoning_effort(&atomgit));
+
+        atomgit.provider_name = "private-deepseek".into();
+        assert!(!supports_reasoning_effort(&atomgit));
+    }
+
+    #[test]
+    fn tier_configs_preserve_default_effort_and_capability() {
+        let catalog: atomcode_config::config::Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "custom": {
+                    "provider": "openai-compatible",
+                    "base_url": "https://example.invalid/v1"
+                }
+            },
+            "models": {
+                "custom/model": {
+                    "account": "custom",
+                    "model": "vendor-model",
+                    "reasoning_effort": "medium",
+                    "retry_max_attempts": 7
+                }
+            },
+            "default_model": "custom/model"
+        }))
+        .unwrap();
+        let resolved = catalog.resolve_model(Some("custom/model")).unwrap();
+        let tier = derive_tier_config_from_resolved(&config("openai"), &resolved);
+
+        assert!(tier.supports_reasoning_effort);
+        assert_eq!(
+            tier.chat_options.reasoning_effort,
+            Some(atomcode_kernel::provider::ReasoningEffort::Medium)
+        );
+        assert_eq!(tier.retry_max_attempts, Some(7));
+    }
+
+    #[test]
+    fn legacy_tier_config_preserves_retry_attempts() {
+        let provider: atomcode_config::config::provider::ProviderConfig =
+            serde_json::from_value(serde_json::json!({
+                "type": "openai",
+                "model": "tier-model",
+                "base_url": "https://example.invalid/v1",
+                "retry_max_attempts": 6
+            }))
+            .unwrap();
+
+        let tier = derive_tier_config(&config("openai"), "tier-provider", &provider);
+        assert_eq!(tier.retry_max_attempts, Some(6));
     }
 }

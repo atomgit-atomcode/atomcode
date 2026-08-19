@@ -102,9 +102,17 @@ async fn cancel_aborts_a_turn_hung_in_the_stream_open() {
         }
     };
     assert!(
-        !snap.messages.iter().any(|m| m.text.contains("hi")),
+        !snap.messages.iter().any(|m| m.text == "hi"),
         "cancelled prompt must be rolled back, leaving no trace: {:?}",
         snap.messages
+    );
+    assert_eq!(
+        snap.messages
+            .iter()
+            .filter(|message| message.is_user_interruption())
+            .count(),
+        1,
+        "cancel must persist exactly one interruption boundary"
     );
 
     handle.commands.send(AgentCommand::Shutdown).unwrap();
@@ -446,6 +454,10 @@ async fn shutdown_during_turn_emits_cancel_terminal_and_latest_snapshot() {
         "the replacement snapshot must retain the interrupted turn: {:?}",
         snapshot.messages
     );
+    assert!(
+        !snapshot.messages.iter().any(Message::is_user_interruption),
+        "internal shutdown must not retire the user's unfinished intent"
+    );
     assert_no_dangling_tool_calls(&snapshot.messages);
 }
 
@@ -771,5 +783,9 @@ async fn preserve_mode_injects_interruption_marker() {
     assert!(
         marker.synthetic,
         "marker must be synthetic so /undo and compaction skip it in prompt counting"
+    );
+    assert!(
+        marker.is_user_interruption(),
+        "marker must carry stable interruption provenance"
     );
 }

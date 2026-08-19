@@ -188,7 +188,17 @@ fn spawn_runtime(
 /// `AgentEvent::ApprovalNeeded` (which carries a snapshot of
 /// `conversation.messages`).  So by the time `/bg` runs,
 /// `ctx.current_session.messages` should be up-to-date.
-fn sync_bg_foreground(ctx: &mut LoopCtx) {
+fn sync_bg_foreground(ctx: &mut LoopCtx, state: &UiState) {
+    // Keep the runtime-owned projection that is currently rendered.  This is
+    // important after `/bg resume`: `ctx.config` still describes the config
+    // used to spawn new runtimes, while the resumed endpoint may own a
+    // different model/window.
+    let context_window = state
+        .last_context
+        .as_ref()
+        .map(|snapshot| snapshot.ctx_window)
+        .filter(|window| *window > 0)
+        .unwrap_or_else(|| ctx.config.default_context_window());
     ctx.bg_manager.set_foreground_runtime(
         ctx.foreground_runtime_id,
         super::RuntimeEndpoint {
@@ -196,6 +206,7 @@ fn sync_bg_foreground(ctx: &mut LoopCtx) {
         },
         ctx.current_session.clone(),
         ctx.working_dir.clone(),
+        context_window,
     );
 }
 
@@ -2581,7 +2592,7 @@ fn execute_slash_command_impl(
                         renderer.flush();
                         return Ok(());
                     }
-                    sync_bg_foreground(ctx);
+                    sync_bg_foreground(ctx, state);
                     if !ctx.bg_manager.has_capacity() {
                         renderer.render(UiLine::Error(
                             t(Msg::BgSlotLimitReached {
@@ -2662,7 +2673,7 @@ fn execute_slash_command_impl(
                         renderer.flush();
                         return Ok(());
                     }
-                    sync_bg_foreground(ctx);
+                    sync_bg_foreground(ctx, state);
                     let outcome = match ctx
                         .bg_manager
                         .resume_slot(slot, foreground_state_from_ui(state))
@@ -2714,6 +2725,8 @@ fn execute_slash_command_impl(
                     ctx.current_session = outcome.resumed_session;
                     bind_telemetry_to_session(ctx, &ctx.current_session);
                     apply_resumed_runtime_state(state, outcome.resumed_state);
+                    state.last_context = None;
+                    state.on_model_window_changed(outcome.resumed_context_window);
                     crate::modals::session_picker::replay_session(
                         renderer,
                         state,
@@ -2809,6 +2822,7 @@ fn execute_slash_command_impl(
                 endpoint.clone(),
                 session,
                 ctx.working_dir.clone(),
+                ctx.config.default_context_window(),
                 bg_runtime::RuntimeState::Running,
             ) {
                 Ok(slot) => slot,
@@ -2859,7 +2873,15 @@ fn execute_slash_command_impl(
             // LLM-driven: submit the init prompt as a normal user turn; the agent explores the
             // repo with its tools and writes/improves AGENTS.md via write_file. Replaces the old
             // static .atomcode.md generator.
-            submit_agent_turn(ctx, state, atomcode_coding::INIT_PROMPT.to_string());
+            let prompt = match build_init_prompt_from_config(&ctx.config) {
+                Ok(prompt) => prompt,
+                Err(error) => {
+                    renderer.render(UiLine::Error(error.to_string()));
+                    renderer.flush();
+                    return Ok(());
+                }
+            };
+            submit_agent_turn(ctx, state, prompt);
             renderer.render(UiLine::CommandOutput(t(Msg::InitKickoff).into_owned()));
             renderer.flush();
         }
@@ -3329,14 +3351,20 @@ fn execute_slash_command_impl(
                     renderer.flush();
                 }
                 Some(p) => {
+                    // Only offer/accept the levels THIS endpoint exposes.
+                    let allowed = crate::event_loop::selection_allowed_efforts(ctx);
+                    let usage = format!(
+                        "  Usage: /effort {} | default\n  Shortcut: Ctrl+T\n",
+                        allowed.join(" | ")
+                    );
                     if sub.is_empty() {
                         // Show current status
-                        let current = p.reasoning_effort.as_deref().unwrap_or("off (API default)");
+                        let current = effort_status_label(p.reasoning_effort.as_deref());
                         renderer.render(UiLine::CommandOutput(format!(
-                            "  Current reasoning effort: {current}\n  Usage: /effort high | max | off\n  Shortcut: Ctrl+T\n"
+                            "  Current reasoning effort: {current}\n{usage}"
                         )));
                         renderer.flush();
-                    } else if sub == "high" || sub == "max" {
+                    } else if allowed.iter().any(|level| level.eq_ignore_ascii_case(&sub)) {
                         let mut desired = ctx.config.clone();
                         desired.update_selection_reasoning(&provider_name, |r| {
                             *r.reasoning_effort = Some(sub.to_string())
@@ -3348,22 +3376,25 @@ fn execute_slash_command_impl(
                             format!("  ○ Reasoning effort set to: {sub}\n"),
                             false,
                         );
-                    } else if sub == "off" {
+                    } else if matches!(sub.as_str(), "default" | "auto" | "off") {
+                        // `default` is the documented keyword; `auto`/`off` are
+                        // accepted aliases. All return to the API-selected effort
+                        // while KEEPING the endpoint capability (disable it in
+                        // /provider). Persisted as the `"auto"` sentinel.
                         let mut desired = ctx.config.clone();
                         desired.update_selection_reasoning(&provider_name, |r| {
-                            *r.reasoning_effort = None
+                            *r.reasoning_effort = Some("auto".to_string())
                         });
                         crate::event_loop::save_and_reload(
                             ctx,
                             desired,
                             renderer,
-                            "  ○ Reasoning effort: default (API auto)\n".to_string(),
+                            "  ○ Reasoning effort: default (API-selected; capability kept)\n"
+                                .to_string(),
                             false,
                         );
                     } else {
-                        renderer.render(UiLine::CommandOutput(
-                            "  Usage: /effort high | max | off\n  Shortcut: Ctrl+T\n".into(),
-                        ));
+                        renderer.render(UiLine::CommandOutput(usage));
                         renderer.flush();
                     }
                 }
@@ -3481,6 +3512,26 @@ fn execute_slash_command_impl(
                     state.goal_armed = false;
                     state.goal_round = 0;
                     state.goal_started_at = Some(std::time::Instant::now());
+                    // The runtime emits the authoritative GoalChanged event
+                    // asynchronously.  Publish the controller state immediately
+                    // as well so an already-connected App cannot miss the first
+                    // active update during that hand-off.  This path only updates
+                    // LiveHub's controller snapshot/view and deliberately does
+                    // not consume a runtime sequence number; the later native
+                    // event remains authoritative for replay and ordering.
+                    if let (Some(binding), Some(goal)) = (
+                        ctx.live_binding.as_ref(),
+                        current_live_goal(state),
+                    ) {
+                        if let Err(error) = atomcode_daemon::native_live::seed_goal_progress(
+                            binding, goal,
+                        ) {
+                            renderer.render(UiLine::Error(format!(
+                                "Live Goal synchronization failed: {error:?}"
+                            )));
+                            renderer.flush();
+                        }
+                    }
                     if submit_agent_text(ctx, condition) {
                         state.on_submit();
                     }
@@ -3840,6 +3891,52 @@ fn execute_slash_command_impl(
         }
     }
     Ok(())
+}
+
+fn build_init_prompt_from_config(config: &atomcode_config::Config) -> Result<String, String> {
+    let locale = config
+        .language
+        .unwrap_or_else(atomcode_config::i18n::current_locale);
+    atomcode_coding::build_init_prompt(locale, config.init_prompt_file.as_deref())
+}
+
+/// Reload the current-project session picker after a cancelled resume without
+/// blocking the TUI event loop.
+pub(crate) fn request_session_catalog(ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    renderer.render(UiLine::CommandOutput(
+        t(Msg::CmdSessionListLoading).into_owned(),
+    ));
+    renderer.flush();
+    let working_dir = ctx.working_dir.clone();
+    let event_working_dir = working_dir.clone();
+    let event_tx = ctx.runtime_event_tx.clone();
+    let runtime_id = ctx.foreground_runtime_id;
+    tokio::spawn(async move {
+        let scanned = tokio::task::spawn_blocking(move || {
+            atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)
+                .map(|all| {
+                    all.into_iter()
+                        .filter(|entry| entry.message_count > 0)
+                        .map(crate::session::SessionMeta::from)
+                        .collect::<Vec<_>>()
+                })
+                .map_err(|error| error.to_string())
+        })
+        .await;
+        let result = match scanned {
+            Ok(inner) => inner,
+            Err(join) => Err(join.to_string()),
+        };
+        let _ = event_tx.send(crate::event_loop::bg_runtime::RuntimeEvent {
+            runtime_id,
+            event: crate::event_loop::bg_runtime::RuntimeEventPayload::Driver(
+                crate::event_loop::bg_runtime::DriverEvent::SessionCatalogLoaded {
+                    working_dir: event_working_dir,
+                    result,
+                },
+            ),
+        });
+    });
 }
 
 /// 贪婪切分 `/skills` 参数：从左到右扫 whitespace 分词，`resolve(token)` 返回该
@@ -6056,16 +6153,51 @@ fn resolve_copy(md: &str, arg: &str) -> CopyResolve {
     }
 }
 
-/// Write `text` to the system clipboard. Tries arboard (system clipboard
-/// API) first; falls back to OSC 52 emitted to `stdout` for headless / SSH
-/// sessions where no windowing system is available.
-///
-/// OSC 52 format: `\x1b]52;c;<base64>\x1b\\`
-///
-/// This is the public entry-point used by both the `/copy` command and the
-/// retained renderer's auto-copy path (issue #699).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClipboardBackend {
+    Arboard,
+    Osc52,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClipboardError {
+    Unavailable,
+    Writer,
+}
+
+/// Copy through the system clipboard first and permit OSC 52 only when the
+/// caller's probed terminal capabilities explicitly allow that fallback.
+pub(crate) fn copy_text_to_clipboard(
+    text: &str,
+    allow_osc52: bool,
+) -> Result<ClipboardBackend, ClipboardError> {
+    if try_arboard_clipboard(text) {
+        return Ok(ClipboardBackend::Arboard);
+    }
+    if !allow_osc52 {
+        return Err(ClipboardError::Unavailable);
+    }
+    copy_text_to_clipboard_via_impl(&mut std::io::stdout(), text, true, |_| false)
+}
+
+fn copy_text_to_clipboard_via_impl(
+    writer: &mut impl std::io::Write,
+    text: &str,
+    allow_osc52: bool,
+    try_arboard: impl FnOnce(&str) -> bool,
+) -> Result<ClipboardBackend, ClipboardError> {
+    if try_arboard(text) {
+        return Ok(ClipboardBackend::Arboard);
+    }
+    if !allow_osc52 {
+        return Err(ClipboardError::Unavailable);
+    }
+    write_osc52_clipboard_to(writer, text)
+        .then_some(ClipboardBackend::Osc52)
+        .ok_or(ClipboardError::Writer)
+}
+
 pub(crate) fn copy_text_to_clipboard_osc52(text: &str) -> bool {
-    // Tier 1: system clipboard via arboard (desktop)
     if try_arboard_clipboard(text) {
         return true;
     }
@@ -6076,7 +6208,7 @@ pub(crate) fn copy_text_to_clipboard_osc52(text: &str) -> bool {
     if !std::io::stdout().is_terminal() {
         return false;
     }
-    write_osc52_clipboard_to(&mut std::io::stdout(), text)
+    copy_text_to_clipboard_via_impl(&mut std::io::stdout(), text, true, |_| false).is_ok()
 }
 
 /// Variant of [`copy_text_to_clipboard_osc52`] that emits the OSC 52
@@ -6087,10 +6219,7 @@ pub(crate) fn copy_text_to_clipboard_osc52_via(
     writer: &mut impl std::io::Write,
     text: &str,
 ) -> bool {
-    if try_arboard_clipboard(text) {
-        return true;
-    }
-    write_osc52_clipboard_to(writer, text)
+    copy_text_to_clipboard_via_impl(writer, text, true, try_arboard_clipboard).is_ok()
 }
 
 fn try_arboard_clipboard(text: &str) -> bool {
@@ -7435,9 +7564,65 @@ mod expand_cd_target_tests {
     }
 }
 
+/// Human label for the persisted `reasoning_effort` in the `/effort` status line.
+/// `None` = the endpoint has no effort capability; the `"auto"` sentinel means
+/// "capable, using the API default" and must never surface as the raw string.
+fn effort_status_label(persisted: Option<&str>) -> &str {
+    match persisted {
+        None => "unsupported",
+        Some(v) if v.eq_ignore_ascii_case("auto") => "default (API default)",
+        Some(v) => v,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effort_status_label_hides_the_auto_sentinel() {
+        assert_eq!(effort_status_label(None), "unsupported");
+        assert_eq!(effort_status_label(Some("auto")), "default (API default)");
+        assert_eq!(effort_status_label(Some("AUTO")), "default (API default)");
+        assert_eq!(effort_status_label(Some("high")), "high");
+    }
+
+    #[test]
+    fn clipboard_policy_denies_osc52_without_explicit_permission() {
+        let mut bytes = Vec::new();
+        assert_eq!(
+            copy_text_to_clipboard_via_impl(&mut bytes, "secret", false, |_| false),
+            Err(ClipboardError::Unavailable)
+        );
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn clipboard_policy_reports_osc52_writer_failure() {
+        struct DeniedWriter;
+        impl std::io::Write for DeniedWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(
+            copy_text_to_clipboard_via_impl(&mut DeniedWriter, "secret", true, |_| false),
+            Err(ClipboardError::Writer)
+        );
+    }
+
+    #[test]
+    fn clipboard_policy_prefers_arboard_and_emits_no_osc52() {
+        let mut bytes = Vec::new();
+        assert_eq!(
+            copy_text_to_clipboard_via_impl(&mut bytes, "text", true, |_| true),
+            Ok(ClipboardBackend::Arboard)
+        );
+        assert!(bytes.is_empty());
+    }
 
     #[derive(Default)]
     struct ReplayLifecycleProbe {
@@ -7613,9 +7798,9 @@ mod tests {
         assert!(review_prompt("staged").contains(
             r#"{"scope":{"kind":"staged"}}"#
         ));
-        let range = review_prompt("release/v5.0.6");
+        let range = review_prompt("release/v5.0.7");
         assert!(range.contains(
-            r#"{"scope":{"kind":"range","base":"release/v5.0.6","head":"HEAD"}}"#
+            r#"{"scope":{"kind":"range","base":"release/v5.0.7","head":"HEAD"}}"#
         ));
         assert!(!range.contains(r#"{"base":"#));
     }
@@ -8219,7 +8404,8 @@ mod memory_command_tests {
 #[cfg(test)]
 mod todo_command_tests {
     use super::{
-        decide_custom_command, format_todo_command, render_custom_command_error, CustomDispatch,
+        build_init_prompt_from_config, decide_custom_command, format_todo_command,
+        render_custom_command_error, CustomDispatch,
     };
     use crate::custom_commands::ArgsRequirement;
     use crate::render::{Renderer, UiLine};
@@ -8739,9 +8925,20 @@ mod todo_command_tests {
     }
 
     #[test]
-    fn init_submits_the_coding_init_prompt() {
-        // handler 用 atomcode_coding::INIT_PROMPT 作为提交文本;这里锁定接线源。
-        assert!(atomcode_coding::INIT_PROMPT.contains("AGENTS.md"));
+    fn init_prompt_uses_the_language_from_the_live_config() {
+        let mut config = atomcode_config::Config::default();
+        config.language = Some(atomcode_config::locale::Locale::ZhCn);
+        let prompt = build_init_prompt_from_config(&config).unwrap();
+        assert!(prompt.contains("最终文件使用简体中文编写"));
+    }
+
+    #[test]
+    fn init_prompt_config_error_prevents_a_submit_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = atomcode_config::Config::default();
+        config.init_prompt_file = Some(dir.path().join("missing.md"));
+        let error = build_init_prompt_from_config(&config).unwrap_err();
+        assert!(error.contains("failed to read custom /init prompt"));
     }
 
     #[test]

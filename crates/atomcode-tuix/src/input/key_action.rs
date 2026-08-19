@@ -67,6 +67,12 @@ pub fn classify(code: KeyCode, modifiers: KeyModifiers) -> Action {
         // behaviour symmetric with the bare `KeyCode::Delete` arm below.
         (KeyCode::Char('?'), true) => Action::DeleteForward,
         (KeyCode::Char(c), false) => Action::Insert(c),
+        // A few terminals preserve Shift+Tab as `Tab + SHIFT` instead of
+        // crossterm's usual `BackTab`. The main composer intercepts that chord
+        // for mode cycling when no completion menu is open. If a menu is open,
+        // keep it inert rather than accidentally accepting the highlighted
+        // completion through the generic Tab fallback.
+        (KeyCode::Tab, _) if shift => Action::NoOp,
         (KeyCode::Tab, _) => Action::Complete,
         (KeyCode::Left, _) => Action::CursorLeft,
         (KeyCode::Right, _) => Action::CursorRight,
@@ -93,6 +99,13 @@ mod tests {
     #[test]
     fn enter_submits() {
         assert_eq!(k(KeyCode::Enter, KeyModifiers::NONE), Action::Submit);
+    }
+
+    #[test]
+    fn shift_tab_never_degrades_to_plain_completion() {
+        assert_eq!(k(KeyCode::Tab, KeyModifiers::SHIFT), Action::NoOp);
+        assert_eq!(k(KeyCode::Tab, KeyModifiers::NONE), Action::Complete);
+        assert_eq!(k(KeyCode::BackTab, KeyModifiers::SHIFT), Action::NoOp);
     }
 
     #[test]

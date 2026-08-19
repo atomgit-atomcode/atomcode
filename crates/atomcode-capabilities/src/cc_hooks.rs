@@ -55,6 +55,9 @@ use crate::tools::{request_approval_decision, PermissionDecision, APPROVAL_KIND}
 pub enum HookEvent {
     PreToolUse,
     PostToolUse,
+    /// Fired when a tool call FAILS (`ToolResult.is_error`), so a plugin can tell
+    /// "tool succeeded" (`PostToolUse`) apart from "tool failed" (`PostToolUseFailure`).
+    PostToolUseFailure,
     SessionStart,
     SessionEnd,
     UserPromptSubmit,
@@ -72,6 +75,7 @@ impl HookEvent {
         Some(match name {
             "PreToolUse" | "pre_tool_use" => HookEvent::PreToolUse,
             "PostToolUse" | "post_tool_use" => HookEvent::PostToolUse,
+            "PostToolUseFailure" | "post_tool_use_failure" => HookEvent::PostToolUseFailure,
             "SessionStart" | "session_start" => HookEvent::SessionStart,
             "SessionEnd" | "session_end" => HookEvent::SessionEnd,
             "UserPromptSubmit" | "user_prompt_submit" => HookEvent::UserPromptSubmit,
@@ -86,6 +90,7 @@ impl HookEvent {
         match self {
             HookEvent::PreToolUse => "PreToolUse",
             HookEvent::PostToolUse => "PostToolUse",
+            HookEvent::PostToolUseFailure => "PostToolUseFailure",
             HookEvent::SessionStart => "SessionStart",
             HookEvent::SessionEnd => "SessionEnd",
             HookEvent::UserPromptSubmit => "UserPromptSubmit",
@@ -99,7 +104,7 @@ impl HookEvent {
 #[derive(Debug, Clone)]
 pub struct HookConfig {
     pub event: HookEvent,
-    /// Tool-name matcher (`PreToolUse`/`PostToolUse` only). `None`/`"*"` = all;
+    /// Tool-name matcher (`PreToolUse`/`PostToolUse`/`PostToolUseFailure`). `None`/`"*"` = all;
     /// `"foo_*"` = prefix; otherwise exact.
     pub matcher: Option<String>,
     pub command: String,
@@ -477,20 +482,24 @@ pub struct CCExternalHooks {
     /// when the driver persists one. `None` for one-shot runs (the Stop /
     /// StopFailure payload then carries `null`).
     transcript_path: Option<String>,
-    /// Whether any PostToolUse hook is configured — gates the call→tool bookkeeping
-    /// below so the (common) no-PostToolUse path allocates nothing.
+    /// Whether any PostToolUse / PostToolUseFailure hook is configured — gates the
+    /// call→tool bookkeeping below so the (common) no-PostToolUse path allocates
+    /// nothing.
     has_post_tool_hooks: bool,
-    /// `tool_call_id → tool_name`, populated by `before` so PostToolUse `after` (which
-    /// the kernel does not hand a tool name) can honor tool-name matchers. An entry is
-    /// recorded only for a call that will RUN (gate ≠ Deny) and removed by `after`, so
-    /// the map never outlives a turn's in-flight calls.
+    /// `tool_call_id → tool_name`, populated by `before` so PostToolUse /
+    /// PostToolUseFailure `after` (which the kernel does not hand a tool name) can
+    /// honor tool-name matchers. An entry is recorded only for a call that will RUN
+    /// (gate ≠ Deny) and removed by `after`, so the map never outlives a turn's
+    /// in-flight calls.
     call_tools: Mutex<HashMap<String, String>>,
 }
 
 impl CCExternalHooks {
     /// Build from an explicit hook list (used by tests + a future plugin source).
     pub fn new(hooks: Vec<HookConfig>, cwd: impl Into<String>) -> Self {
-        let has_post_tool_hooks = hooks.iter().any(|h| h.event == HookEvent::PostToolUse);
+        let has_post_tool_hooks = hooks.iter().any(|h| {
+            matches!(h.event, HookEvent::PostToolUse | HookEvent::PostToolUseFailure)
+        });
         Self {
             hooks,
             cwd: cwd.into(),
@@ -846,9 +855,10 @@ impl ToolMiddleware for CCExternalHooks {
         if matches!(gate, BeforeOutcome::Ask { .. }) {
             gate = self.resolve_ask(call, rt).await;
         }
-        // Remember this call's tool name for PostToolUse `after` (kernel hands it no tool
-        // name), but ONLY for a call that will actually run — a Deny here means the tool is
-        // blocked, so its PostToolUse must not fire. `after` removes the entry.
+        // Remember this call's tool name for PostToolUse / PostToolUseFailure `after`
+        // (kernel hands it no tool name), but ONLY for a call that will actually run — a
+        // Deny here means the tool is blocked, so its post-tool hook must not fire.
+        // `after` removes the entry.
         if self.has_post_tool_hooks && !gate.is_deny() {
             if let Ok(mut m) = self.call_tools.lock() {
                 m.insert(call.id.clone(), call.name.clone());
@@ -859,27 +869,36 @@ impl ToolMiddleware for CCExternalHooks {
 
     async fn after(&self, result: &mut ToolResult) -> AfterOutcome {
         // Recover the tool name `before` stashed for this call_id (kernel doesn't thread
-        // it into `after`), so PostToolUse tool-name matchers are honored. Absent ⇒ the
-        // call never ran our `before` (e.g. denied earlier) ⇒ only all-tools hooks fire.
+        // it into `after`), so PostToolUse / PostToolUseFailure tool-name matchers are
+        // honored. Absent ⇒ the call never ran our `before` (e.g. denied earlier) ⇒ only
+        // all-tools hooks fire.
         let tool_name = self
             .call_tools
             .lock()
             .ok()
             .and_then(|mut m| m.remove(&result.call_id));
+        // A failed tool call (`is_error`) fires PostToolUseFailure instead of
+        // PostToolUse, so a plugin can branch on success vs failure — but the payload
+        // and the rewrite/block semantics stay identical for both.
+        let event = if result.is_error {
+            HookEvent::PostToolUseFailure
+        } else {
+            HookEvent::PostToolUse
+        };
         let payload = serde_json::json!({
             "session_id": self.session_id,
-            "hook_event_name": HookEvent::PostToolUse.cc_name(),
+            "hook_event_name": event.cc_name(),
             "tool_name": tool_name,
             "tool_response": result.content,
             "cwd": self.cwd,
         })
         .to_string();
         // SEQUENTIAL so the last `updatedToolOutput` rewrite of `result.content` wins
-        // deterministically (the per-tool path typically has 0-1 PostToolUse hooks, so
-        // there is little to gain from the session_*-style concurrency here).
+        // deterministically (the per-tool path typically has 0-1 hooks, so there is
+        // little to gain from the session_*-style concurrency here).
         let mut outcome = AfterOutcome::Proceed;
         for hook in self.hooks.iter().filter(|h| {
-            h.event == HookEvent::PostToolUse && post_tool_matches(&h.matcher, tool_name.as_deref())
+            h.event == event && post_tool_matches(&h.matcher, tool_name.as_deref())
         }) {
             let Some((_code, stdout, _stderr)) = run_command_hook(hook, &payload).await else {
                 continue;
@@ -899,7 +918,7 @@ impl ToolMiddleware for CCExternalHooks {
                         reason: d
                             .reason
                             .clone()
-                            .unwrap_or_else(|| "blocked by PostToolUse hook".into()),
+                            .unwrap_or_else(|| "blocked by hook".into()),
                     };
                 }
             }
@@ -1649,6 +1668,66 @@ mod tests {
         assert_eq!(
             result.content, "orig",
             "matcher 'bash' must NOT fire for tool grep"
+        );
+    }
+
+    /// PostToolUseFailure: a FAILED tool call (`is_error`) fires the failure event
+    /// instead of PostToolUse, so a plugin can tell success from failure. Both
+    /// events share the same payload/rewrite semantics.
+    #[tokio::test]
+    async fn failed_tool_fires_post_tool_use_failure() {
+        let ok_hook = HookConfig {
+            event: HookEvent::PostToolUse,
+            matcher: None,
+            command: r#"echo '{"hookSpecificOutput":{"updatedToolOutput":"OK-REWRITE"}}'"#.into(),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        let fail_hook = HookConfig {
+            event: HookEvent::PostToolUseFailure,
+            matcher: None,
+            command: r#"echo '{"hookSpecificOutput":{"updatedToolOutput":"FAIL-REWRITE"}}'"#.into(),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        let cc = CCExternalHooks::new(vec![ok_hook, fail_hook], "/tmp");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let rt = RequestCtx::new(tx, Some(Duration::from_millis(50)));
+        let tool: Arc<dyn Tool> = Arc::new(atomcode_kernel::testkit::EchoTool);
+
+        // A SUCCESSFUL call: only the PostToolUse hook may rewrite.
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        let _ = cc.before(&mut call, &tool, &rt).await;
+        let mut ok = ToolResult {
+            call_id: "1".into(),
+            content: "orig".into(),
+            is_error: false,
+            images: vec![],
+        };
+        cc.after(&mut ok).await;
+        assert_eq!(ok.content, "OK-REWRITE", "success must fire PostToolUse, not PostToolUseFailure");
+
+        // A FAILED call: only the PostToolUseFailure hook may rewrite.
+        let mut call = ToolCall {
+            id: "2".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        let _ = cc.before(&mut call, &tool, &rt).await;
+        let mut failed = ToolResult {
+            call_id: "2".into(),
+            content: "orig".into(),
+            is_error: true,
+            images: vec![],
+        };
+        cc.after(&mut failed).await;
+        assert_eq!(
+            failed.content, "FAIL-REWRITE",
+            "failed call must fire PostToolUseFailure, not PostToolUse"
         );
     }
 

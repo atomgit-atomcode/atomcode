@@ -163,6 +163,31 @@ pub fn history_path() -> PathBuf {
     atomcode_config::config::Config::config_dir().join("history")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectHistoryPaths {
+    pub entries: PathBuf,
+    pub lock: PathBuf,
+    pub image_cache: PathBuf,
+    pub legacy_entries: PathBuf,
+    pub legacy_image_cache: PathBuf,
+}
+
+/// Project-scoped prompt-history storage. The bucket id deliberately reuses the
+/// native session hash so cwd normalization has one authority across the TUI.
+/// The legacy global files remain separate and read-only.
+pub fn project_history_paths(working_dir: &std::path::Path) -> ProjectHistoryPaths {
+    let config_dir = atomcode_config::config::Config::config_dir();
+    let bucket = atomcode_capabilities::session::SessionManager::project_hash(working_dir);
+    let root = config_dir.join("history-v2").join(bucket);
+    ProjectHistoryPaths {
+        entries: root.join("entries.jsonl"),
+        lock: root.join("write.lock"),
+        image_cache: root.join("images"),
+        legacy_entries: config_dir.join("history"),
+        legacy_image_cache: config_dir.join("image-cache"),
+    }
+}
+
 /// Path for the per-user image attachment cache. Sibling to `history_path()`.
 /// Used by the History image-attachment feature to persist pasted bytes so
 /// up-arrow recall can rehydrate them on a future submit.
@@ -387,5 +412,18 @@ mod tests {
         let cfg = atomcode_config::config::Config::config_dir();
         assert!(p.starts_with(&cfg), "{:?} should be under {:?}", p, cfg);
         assert_eq!(p.file_name().and_then(|s| s.to_str()), Some("image-cache"));
+    }
+
+    #[test]
+    fn project_history_paths_are_stable_and_separate_projects() {
+        let a = project_history_paths(std::path::Path::new("/workspace/a"));
+        let a_again = project_history_paths(std::path::Path::new("/workspace/a/"));
+        let b = project_history_paths(std::path::Path::new("/workspace/b"));
+
+        assert_eq!(a, a_again);
+        assert_ne!(a.entries, b.entries);
+        assert_eq!(a.legacy_entries, history_path());
+        assert_eq!(a.legacy_image_cache, image_cache_dir());
+        assert_eq!(a.entries.file_name().and_then(|s| s.to_str()), Some("entries.jsonl"));
     }
 }

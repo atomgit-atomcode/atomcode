@@ -873,9 +873,24 @@ mod tests {
         assert_eq!(references[0].column, 5);
 
         let hover = client.hover(&path, 2, 3, &cancel).await.unwrap();
+        // The mock echoes the wire `position` back through `format!("{pos}")`,
+        // so the response body carries whatever key order serde_json happens to
+        // use. That order is not a property of this crate: `preserve_order` is a
+        // feature of the shared serde_json, and cargo unifies features across a
+        // build — `-p atomcode-capabilities` leaves it off (BTreeMap, sorted)
+        // while `--workspace` turns it on via agent-client-protocol (IndexMap,
+        // insertion order). Comparing the rendered string therefore passes or
+        // fails depending on which crates are in the build, not on the client.
+        // Parse it back and compare structurally; only the position is the claim.
+        let echoed = hover
+            .pointer("/contents/value")
+            .and_then(Value::as_str)
+            .and_then(|value| value.strip_prefix("position="))
+            .expect("hover result echoes the wire position");
         assert_eq!(
-            hover.pointer("/contents/value").and_then(Value::as_str),
-            Some("position={\"character\":3,\"line\":2}")
+            serde_json::from_str::<Value>(echoed).unwrap(),
+            json!({ "line": 2, "character": 3 }),
+            "hover must send the caller's 0-based coordinates through unchanged"
         );
     }
 

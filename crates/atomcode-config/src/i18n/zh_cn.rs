@@ -203,7 +203,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     Right                            接受下一步建议（不会自动发送）
 
   ── 模式与模型 ──
-    Tab / Shift+Tab                  无补全菜单时切换下一个 / 上一个执行模式
+    Shift+Tab                        无补全菜单时切换到下一个执行模式
     F2 / Shift+F2                    下一个 / 上一个模型（Mac：Fn+F2 / Fn+Shift+F2）
     Ctrl+T                           切换 reasoning_effort
 
@@ -330,8 +330,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelAddModelRow => "＋ 添加模型".into(),
         Msg::ProviderPanelAccountsHint =>
             "筛选 · ↑↓选择 · ↵模型 · Ctrl+A添加 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab切换 · Esc关闭".into(),
+        Msg::ProviderPanelManagedAccountHint =>
+            "官方 CodingPlan 账号 · 仅支持查看 · ↵模型 · Tab切换 · Esc关闭".into(),
         Msg::ProviderPanelModelsHint =>
             "筛选 · ↑↓选择 · ↵默认/添加 · Ctrl+A添加 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab切换 · Esc关闭".into(),
+        Msg::ProviderPanelManagedModelsHint =>
+            "CodingPlan 模型由 /login 管理 · ↑↓选择 · ↵设为默认 · Tab全部 · Esc关闭".into(),
         Msg::ProviderPanelFilteredModelsHint { account } =>
             format!("〔{account}〕· ↑↓选择 · ↵默认/添加 · Ctrl+A加模型 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab全部 · Esc关闭").into(),
         Msg::ProviderPanelModelSaved { model } => format!("已保存模型“{model}”。").into(),
@@ -349,6 +353,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelVisionAuto => "自动".into(),
         Msg::ProviderPanelVisionEnabled => "启用".into(),
         Msg::ProviderPanelVisionDisabled => "禁用".into(),
+        Msg::ProviderPanelFieldEffort => "默认思考强度".into(),
+        Msg::ProviderPanelFieldEffortLevels => "支持档位".into(),
         Msg::ProviderPanelFieldWindow => "上下文窗口".into(),
         Msg::ProviderPanelFieldMakeDefault => "设为默认".into(),
         Msg::ProviderPanelSwitchHint => "←→ 切换".into(),
@@ -395,6 +401,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
                 format!("允许 {tool}（{detail}）？").into()
             }
         }
+        Msg::CredentialApprovalNote => "⚠ 可能把凭据或敏感内容发送给模型 Provider".into(),
         Msg::ToolDenied => "已拒绝".into(),
         Msg::ToolBlockedBySecurityPolicy =>
             "安全策略已阻止工具调用：凭据不能通过通用 shell 参数、临时文件或环境变量传递".into(),
@@ -936,11 +943,11 @@ Msg::PluginActionBackDesc => "返回已安装插件列表".into(),
             ).into(),
         Msg::PluginMarketplaceUpdated { name, commit } =>
             format!("✓ marketplace `{name}` 已更新至 {commit}").into(),
-        Msg::PluginInstallDone { plugin, marketplace: _, loaded: _, skipped: _, show_details_hint: _ } => {
-            format!("  ⎿  ✓ Installed {plugin}. Run /reload-plugins to apply.").into()
+        Msg::PluginInstallDone { plugin, marketplace: _, loaded, skipped, show_details_hint } => {
+            format!("  ⎿  ✓ 已安装 {plugin} —— {}", plugin_reload_summary(loaded, skipped, show_details_hint)).into()
         }
-        Msg::PluginUpdateDone { plugin, marketplace: _, loaded: _, skipped: _, show_details_hint: _ } => {
-            format!("  ⎿  ✓ Updated {plugin}. Run /reload-plugins to apply.").into()
+        Msg::PluginUpdateDone { plugin, marketplace: _, loaded, skipped, show_details_hint } => {
+            format!("  ⎿  ✓ 已更新 {plugin} —— {}", plugin_reload_summary(loaded, skipped, show_details_hint)).into()
         }
         Msg::SetupAutoReloaded { skills, warnings } =>
             format!("✓ Setup 完成，已自动刷新：{skills} 个 skill，{warnings} 个警告").into(),
@@ -982,7 +989,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescBuild => "切换到 Build 模式（完整执行）".into(),
         Msg::CmdDescAuto => "切换到 Auto 模式（所有工具自动批准）".into(),
         Msg::CmdDescThink => "深度思考控制（on/off/budget N）".into(),
-        Msg::CmdDescEffort => "DeepSeek 推理强度控制（high / max / off）".into(),
+        Msg::CmdDescEffort => "模型推理强度控制（low / medium / high / max / auto）".into(),
         Msg::CmdDescHelp => "显示帮助".into(),
         Msg::CmdDescKeys => "显示键盘快捷键".into(),
         Msg::CmdDescLanguage => "切换显示语言".into(),
@@ -1055,7 +1062,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         }
 
         // ── reasoning effort ──
-        Msg::ReasoningEffortNoEffect => "当前模型不支持 reasoning_effort（仅对 DeepSeek V4 有效）".into(),
+        Msg::ReasoningEffortNoEffect => "当前模型未配置 reasoning_effort 支持，请在 /provider 中启用".into(),
 
         // ── 配置保存失败 ──
         Msg::ConfigSaveFailed { error } =>
@@ -1379,6 +1386,11 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
                  或将该 provider 指向带 api_key 的标准 OpenAI 兼容端点。"
             ).into(),
         Msg::StreamStalled => "按 esc 可取消".into(),
+        Msg::StreamRecoveryRunning { attempt, max_attempts } => format!(
+            "流响应超时，正在从已保存进度安全续接（{attempt}/{max_attempts}）…"
+        )
+        .into(),
+        Msg::StreamRecoverySucceeded => "✓ 已从流中断处恢复".into(),
         Msg::ConhostScrollHint =>
             "提示：经典 Windows 控制台功能受限——任务执行中无法上滚查看历史，字符与吉祥物也会降级显示。\
              换用 \x1b[1;96mWindows Terminal\x1b[0m 体验更佳。"
@@ -1428,4 +1440,16 @@ mod codingplan_crypto_tests {
         assert!(s.contains("Windows Terminal"));
         assert!(s.contains("滚"));
     }
+}
+
+/// 同 `en.rs` 的对应函数：重载在这条提示打印之前就已经做完，这里报的是结果。
+fn plugin_reload_summary(loaded: usize, skipped: usize, show_details_hint: bool) -> String {
+    let mut out = format!("已加载 {loaded} 个技能");
+    if skipped > 0 {
+        out.push_str(&format!("，跳过 {skipped} 个"));
+    }
+    if show_details_hint {
+        out.push_str("（Ctrl+O 查看详情）");
+    }
+    out
 }

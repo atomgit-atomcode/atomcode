@@ -27,7 +27,7 @@
 
 import { VNode } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, postLiveCompact, postLiveUserInput, postChatUserInput, postLivePolicyInterventionResolution, type CommandResult, UserInputRequestEvent, type PolicyInterventionEvent } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -56,7 +56,21 @@ import {
 } from '../lib/atMention';
 import { toolResultStatus, updateToolProgress, upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
 import { commitTodoCall, todoToolDetail, type TodoTitles } from '../lib/todoToolDetail';
-import { isInternalHistoryAssistantMessage, isInternalHistoryUserMessage } from '../lib/historyMessages';
+import {
+  applyTodoCall,
+  isTodoTool,
+  projectTodoCalls,
+  reduceTodoPanelVisibility,
+  type TodoItem,
+  type TodoProjectionCall,
+} from '../lib/todoState';
+import {
+  assistantTurnEndFlags,
+  isInternalHistoryAssistantMessage,
+  isInternalHistoryUserMessage,
+  isUserInterruptionMessage,
+  shouldShowAssistantTimestamp,
+} from '../lib/historyMessages';
 import {
   activeTurnSubmissionDisposition,
   chatRecoveryPolicy,
@@ -83,14 +97,18 @@ import {
   type PendingLiveSteer,
 } from '../lib/liveSteer';
 import { hasCoarsePointer, shouldSendComposerOnEnter } from '../lib/composerKeyboard';
+import { completedTurnStats, formatTurnDuration, formatTurnTokens, turnCacheHit } from '../lib/turnStats';
+import { disposeNotifications, maybeNotifyTurnFinished } from '../lib/notifications';
+import { artifactsByAssistantIndex, type TurnArtifact } from '../lib/turnArtifacts';
 
 interface Message {
   role: 'user' | 'assistant' | 'system';
   parts: MsgPart[];
   images?: ImageData[];
   /** Epoch ms this message was sent/received (PR #562 send-time labels).
-   *  Live + freshly-typed turns stamp `Date.now()`; history loaded from the
-   *  daemon carries the session's `updated_at` (also ms). Optional so the
+   *  Live user messages use submission time and assistant messages receive a
+   *  timestamp only at the terminal boundary. Persisted history carries the
+   *  corresponding start/completion timestamp from the transcript. Optional so the
    *  type stays backward-compatible with the few code paths that build a
    *  Message literal without a clock (e.g. the queued-placeholder). */
   ts?: number;
@@ -110,41 +128,31 @@ function messageText(m: Message): string {
   return m.parts.reduce((acc, p) => (p.kind === 'text' ? acc + p.text : acc), '');
 }
 
-/** Zero-pad a number to 2 digits — shared by formatMsgTime / formatMsgTimeFull. */
+/** Stable across tabs because every observer receives the same terminal stats. */
+function notificationDedupeKey(
+  sessionId: string | undefined,
+  stopReason: string | undefined,
+  stats: TurnStats | undefined,
+): string | undefined {
+  if (!sessionId || !stats) return undefined;
+  return [
+    sessionId,
+    stopReason ?? 'finished',
+    stats.duration_ms,
+    stats.rounds,
+    stats.tool_calls,
+    stats.prompt_tokens,
+    stats.completion_tokens,
+  ].join(':');
+}
+
+/** Zero-pad a local date/time component to 2 digits. */
 const pad2 = (n: number) => (n < 10 ? '0' + n : '' + n);
 
-/** Whether two dates fall on the same calendar day (Y/M/D all equal). */
-function sameDay(a: Date, b: Date): boolean {
-  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
-}
-
-/** PR #562: format a send-time label for a message bubble.
- *  - Today → "HH:MM" (compact, the common case)
- *  - Yesterday → i18n `time.yesterday` + "HH:MM"
- *  - Same year → i18n `time.sameYear` ({m}月{d}日 {hm} / {m}/{d} {hm})
- *  - Older / other year → i18n `time.otherYear` ({y}/{m}/{d} {hm})
- *  Returns '' when ts is missing/invalid so callers can simply `{ts && …}`.
- *  `t` is the i18n resolver (passed in from the component so this stays a
- *  pure top-level helper). Local time, because a chat send time is a
- *  wall-clock fact the user reads the same way they read a timestamp in
- *  any messaging app. */
-function formatMsgTime(ts: number | undefined, t: (key: MsgKey, params?: Record<string, string | number>) => string): string {
+/** Format a message timestamp as a stable, always-visible local wall clock. */
+function formatMsgTime(ts: number | undefined): string {
   // P3 修复: 用 ts == null 而非 !ts,避免把 ts=0 (epoch 1970) 误判为无效。
   // 实际消息时间戳不会是 0,但严格区分 "缺失" 与 "值为 0" 更正确。
-  if (ts == null || !Number.isFinite(ts)) return '';
-  const d = new Date(ts);
-  if (isNaN(d.getTime())) return '';
-  const now = new Date();
-  const hm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-  if (sameDay(d, now)) return hm;
-  const yest = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
-  if (sameDay(d, yest)) return `${t('time.yesterday')} ${hm}`;
-  if (d.getFullYear() === now.getFullYear()) return t('time.sameYear', { m: d.getMonth() + 1, d: d.getDate(), hm });
-  return t('time.otherYear', { y: d.getFullYear(), m: d.getMonth() + 1, d: d.getDate(), hm });
-}
-
-/** Full local timestamp for the hover tooltip (seconds + full date). */
-function formatMsgTimeFull(ts?: number): string {
   if (ts == null || !Number.isFinite(ts)) return '';
   const d = new Date(ts);
   if (isNaN(d.getTime())) return '';
@@ -245,6 +253,8 @@ interface ChatProps {
   onSessionId: (id: string) => void;
   cwd: string;
   onPermission: (req: PermissionRequestEvent) => void;
+  /** App-owned `/chat` approval projected into this component's composer seat. */
+  pendingPermission?: PermissionRequestEvent | null;
   /** 审批已被解决时通知 App 清掉 /chat 的审批卡片：传 call_id 仅在匹配时清（工具已执行），
    *  传 null 则无条件清（回合 done/stopped/error 或用户中止——此时不可能再有待批准项）。 */
   onPermissionResolved?: (callId: string | null) => void;
@@ -424,10 +434,13 @@ function detectSkillContent(text: string): string | null {
   return title || null;
 }
 
-export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, onSessionRenamed }: ChatProps) {
+export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, onSessionRenamed }: ChatProps) {
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
+  // 组合期标记：仅用于 handleKeyDown 的守卫（菜单导航 / Enter 发送不得窃取
+  // IME 候选窗的按键）。输入值本身始终受控同步，见 handleInput。
+  const composingRef = useRef(false);
   const [busy, setBusyState] = useState(false);
   // Mirror of `busy` in a ref so pushCommandNotice can read it synchronously
   // without a stale closure (refs always reflect the latest render value).
@@ -439,6 +452,27 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // `/chat` turn cannot be mistaken for an idle direct-send window.
     busyRef.current = next;
     setBusyState(next);
+  }
+  // 回合开始时刻（本 tab 主动 submit 时记录；live 恢复/重放不得重置），
+  // 用于 min_duration 过滤与通知正文时长；终态事件计算后即清空。
+  const turnStartedAtRef = useRef<number | null>(null);
+  // 只有当前 tab 实际提交过回合，或从 /live 观察到 running=true，终态才有
+  // 通知资格。初始/重连时重放的 idle state 不能伪装成一次新完成事件。
+  const notificationTurnActiveRef = useRef(false);
+  function finishTurnNotification(info: {
+    stopReason?: string;
+    sessionId?: string;
+    message?: string;
+    durationMs?: number;
+    dedupeKey?: string;
+  }) {
+    if (!notificationTurnActiveRef.current) return;
+    const durationMs = info.durationMs ?? (
+      turnStartedAtRef.current !== null ? Date.now() - turnStartedAtRef.current : undefined
+    );
+    notificationTurnActiveRef.current = false;
+    turnStartedAtRef.current = null;
+    maybeNotifyTurnFinished({ ...info, durationMs });
   }
   const [chatRecovery, setChatRecovery] = useState<ChatRecoveryState>('ready');
   const chatRecoveryRef = useRef<ChatRecoveryState>('ready');
@@ -498,6 +532,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     pushCommandNotice(t('chat.steerRecovered'));
   }
   const [tokens, setTokens] = useState<TokenUsage | null>(null);
+  const [turnStats, setTurnStats] = useState<TurnStats | null>(null);
   const [historyHint, setHistoryHint] = useState<string | null>(null);
   // Auxiliary persistence failures belong to application chrome, not the
   // assistant transcript. Replacing this value also deduplicates repeated
@@ -506,6 +541,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   // 正在拉取某会话历史：用于抑制落地页，避免切到「有内容的会话」时先闪一下落地页。
   const [loading, setLoading] = useState(false);
   const [provider, setProvider] = useState<string | null>(null);
+  const [reasoningEffort, setReasoningEffort] = useState<{
+    provider: string;
+    effort: string | null;
+  } | null>(null);
   const providerRef = useRef<string | null>(null);
   const providerPinnedRef = useRef(false);
   const followDefaultProvider = useCallback((name: string) => {
@@ -544,8 +583,24 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const [livePending, setLivePending] = useState<{ tool_name: string; reason: string; call_id: string; arguments: string } | null>(null);
   // Pending structured input from either transport. The event's optional session_id
   // selects `/chat/user-input`; live requests answer the bound `/live` runtime.
-  const [userInputReq, setUserInputReq] = useState<UserInputRequestEvent | null>(null);
+  const [userInputReq, setUserInputReq] = useState<RoutedUserInputRequest | null>(null);
   const [policyIntervention, setPolicyIntervention] = useState<PolicyInterventionEvent | null>(null);
+  const [todoItems, setTodoItems] = useState<TodoItem[]>([]);
+  const [todoPreview, setTodoPreview] = useState<TodoItem[] | null>(null);
+  const [todoPanelVisible, setTodoPanelVisibleState] = useState(false);
+  const todoPanelVisibleRef = useRef(false);
+  const todoVisibilityCacheRef = useRef<Map<string, boolean>>(new Map());
+  const todoItemsRef = useRef<TodoItem[]>([]);
+  const todoCacheRef = useRef<Map<string, TodoItem[]>>(new Map());
+  const todoBatchRef = useRef<{
+    base: TodoItem[];
+    calls: TodoProjectionCall[];
+    visibleBase: boolean;
+  }>({
+    base: [],
+    calls: [],
+    visibleBase: false,
+  });
   const abortRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef<string | null>(null);
   const liveAbortRef = useRef<AbortController | null>(null);
@@ -624,16 +679,116 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const todoTitlesRef = useRef<TodoTitles>(new Map());
   const pendingTodoCallsRef = useRef<Map<string, { name: string; args: string }>>(new Map());
 
+  function setTodoPanelVisible(visible: boolean, persist = true) {
+    todoPanelVisibleRef.current = visible;
+    setTodoPanelVisibleState(visible);
+    const activeId = activeIdRef.current;
+    if (persist && activeId) todoVisibilityCacheRef.current.set(activeId, visible);
+  }
+
+  function replaceTodoItems(items: readonly TodoItem[], persist = true) {
+    const next = items.map((item) => ({ ...item }));
+    todoItemsRef.current = next;
+    setTodoItems(next);
+    const activeId = activeIdRef.current;
+    if (persist && activeId) todoCacheRef.current.set(activeId, next);
+    todoTitlesRef.current = new Map(next.map((item, index) => [index + 1, item.content]));
+  }
+
+  function resetTodoBatch(clearCommitted: boolean, persistClear = true) {
+    todoBatchRef.current = {
+      base: [],
+      calls: [],
+      visibleBase: clearCommitted ? false : todoPanelVisibleRef.current,
+    };
+    pendingTodoCallsRef.current.clear();
+    setTodoPreview(null);
+    if (clearCommitted) {
+      replaceTodoItems([], persistClear);
+      setTodoPanelVisible(false, persistClear);
+    }
+  }
+
+  function stageTodoCall(id: string, name: string, args: string) {
+    if (!isTodoTool(name)) return;
+    const batch = todoBatchRef.current;
+    if (batch.calls.length === 0) {
+      batch.base = todoItemsRef.current.map((item) => ({ ...item }));
+      batch.visibleBase = todoPanelVisibleRef.current;
+    }
+    if (!batch.calls.some((call) => call.id === id)) {
+      batch.calls.push({ id, name, args });
+    }
+    const projected = projectTodoCalls(batch.base, batch.calls);
+    setTodoPanelVisible(projected.hasApplicable ? true : batch.visibleBase);
+    setTodoPreview(projected.hasUnresolved ? projected.preview : null);
+  }
+
+  function settleTodoCall(id: string, success: boolean) {
+    const batch = todoBatchRef.current;
+    const call = batch.calls.find((candidate) => candidate.id === id);
+    if (!call) return;
+    call.success = success;
+    const projected = projectTodoCalls(batch.base, batch.calls);
+    setTodoPanelVisible(projected.hasApplicable ? true : batch.visibleBase);
+    replaceTodoItems(projected.committed);
+    if (projected.hasUnresolved) {
+      setTodoPreview(projected.preview);
+    } else {
+      todoBatchRef.current = {
+        base: projected.committed,
+        calls: [],
+        visibleBase: todoPanelVisibleRef.current,
+      };
+      setTodoPreview(null);
+    }
+  }
+
+  function finishTodoTurn(cancelled: boolean) {
+    if (cancelled) {
+      resetTodoBatch(true);
+      return;
+    }
+    const batch = todoBatchRef.current;
+    if (batch.calls.length > 0) {
+      replaceTodoItems(projectTodoCalls(batch.base, batch.calls).committed);
+    }
+    resetTodoBatch(false);
+  }
+
   function restoreTodoTitles(messages: Message[]) {
     todoTitlesRef.current.clear();
-    pendingTodoCallsRef.current.clear();
+    resetTodoBatch(false);
+    let restoredItems: TodoItem[] = [];
     for (const message of messages) {
       for (const part of message.parts) {
         if (part.kind === 'tool' && part.tool.status === 'done') {
           commitTodoCall(part.tool.name, part.tool.args, todoTitlesRef.current);
+          restoredItems = applyTodoCall(restoredItems, part.tool.name, part.tool.args);
         }
       }
     }
+    replaceTodoItems(restoredItems);
+    let restoredVisible = false;
+    let visibilityItems: TodoItem[] = [];
+    for (const message of messages) {
+      if (message.role === 'user') {
+        restoredVisible = reduceTodoPanelVisibility(restoredVisible, { type: 'user_input' });
+      }
+      for (const part of message.parts) {
+        if (part.kind === 'tool' && part.tool.status === 'done' && isTodoTool(part.tool.name)) {
+          const projected = projectTodoCalls(visibilityItems, [{
+            id: part.tool.id,
+            name: part.tool.name,
+            args: part.tool.args,
+            success: true,
+          }]);
+          visibilityItems = projected.committed;
+          if (projected.hasApplicable) restoredVisible = true;
+        }
+      }
+    }
+    setTodoPanelVisible(restoredVisible);
   }
 
   // 切换/恢复会话时重置画布并加载历史。依赖 project_hash：刷新后 sessionId 先于
@@ -672,7 +827,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
       activeIdRef.current = sessionId;
       todoTitlesRef.current.clear();
-      pendingTodoCallsRef.current.clear();
+      resetTodoBatch(true, false);
       providerPinnedRef.current = false;
       loadedForRef.current = null;
       optimisticFiredRef.current = false;
@@ -698,6 +853,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         detachedController?.abort();
       }
       liveLifecycleRef.current = createLiveLifecycleState();
+      notificationTurnActiveRef.current = false;
+      turnStartedAtRef.current = null;
+      disposeNotifications();
       setBusy(false);
       setQueued([]);
       setLivePending(null);
@@ -707,7 +865,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
       const cached = sessionId ? messageCacheRef.current.get(sessionId) : undefined;
       if (cached && cached.length > 0) {
+        const cachedTodos = sessionId ? todoCacheRef.current.get(sessionId) : undefined;
+        const cachedTodoVisibility = sessionId
+          ? todoVisibilityCacheRef.current.get(sessionId)
+          : undefined;
         restoreTodoTitles(cached);
+        if (cachedTodos) replaceTodoItems(cachedTodos);
+        if (cachedTodoVisibility !== undefined) setTodoPanelVisible(cachedTodoVisibility);
         setMessages(cached);
       } else {
         setMessages([]);
@@ -717,6 +881,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       setSearch('');
       setMatchIdx(0);
       setTokens(null);
+      setTurnStats(null);
       setHistoryHint(null);
       setPersistenceWarning(null);
       // 切到一个有 id 的会话 → 进入「加载中」，先抑制落地页（避免闪屏）；
@@ -781,9 +946,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
         let nextHint: string | null = null;
         if (sessionResult.status === 'fulfilled' && sessionResult.value && Array.isArray(sessionResult.value.messages)) {
+          const currentCached = messageCacheRef.current.get(loadId);
+          const cachedTodos = todoCacheRef.current.get(loadId);
+          const cachedTodoVisibility = todoVisibilityCacheRef.current.get(loadId);
           // Convert loaded messages to display format (reuses sessionMessagesToDisplay).
           const loaded = sessionMessagesToDisplay(sessionResult.value.messages);
-          const currentCached = messageCacheRef.current.get(loadId);
 
           if (currentCached && currentCached.length > 0) {
             // If the loaded messages from the backend are shorter than the cached messages,
@@ -792,6 +959,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             if (loaded.length >= currentCached.length) {
               setMessages(loaded);
               messageCacheRef.current.delete(loadId);
+            } else {
+              // `sessionMessagesToDisplay` also projects Todo state. If the
+              // persisted transcript loses to our longer local cache, restore
+              // the matching local Todo projection as well; otherwise the
+              // canvas and task card would represent different revisions.
+              restoreTodoTitles(currentCached);
+              if (cachedTodos) replaceTodoItems(cachedTodos);
+              if (cachedTodoVisibility !== undefined) {
+                setTodoPanelVisible(cachedTodoVisibility);
+              }
             }
           } else if (loaded.length > 0) {
             // A newly loaded session starts at the bottom regardless of prior scroll state.
@@ -848,6 +1025,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   const scrollToBottom = (behavior: ScrollBehavior = 'auto') => {
     atBottomRef.current = true;
     setShowJumpBtn(false);
+    // Completion stats belong to the previous turn. Clear them as soon as a
+    // new message is actually delivered so stale data is never shown while
+    // the next turn is running or after an early transport failure.
+    setTurnStats(null);
     bottomRef.current?.scrollIntoView({ behavior });
   };
 
@@ -1078,9 +1259,20 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     const loaded: Message[] = [];
     const todoTitles: TodoTitles = new Map();
     const pendingTodoCalls = new Map<string, { name: string; args: string }>();
+    const orderedTodoCalls: TodoProjectionCall[] = [];
+    const todoCallEpochs = new Map<string, number>();
+    let inputEpoch = 0;
     for (const msg of msgs) {
       if (msg.role === 'user') {
+        if (isUserInterruptionMessage(msg)) {
+          orderedTodoCalls.length = 0;
+          pendingTodoCalls.clear();
+          todoCallEpochs.clear();
+          inputEpoch += 1;
+          continue;
+        }
         if (isInternalHistoryUserMessage(msg.content ?? '', msg.synthetic)) continue;
+        inputEpoch += 1;
         loaded.push({
           role: 'user',
           parts: [{ kind: 'text', text: stripVisionAnnotation(msg.content ?? '') }],
@@ -1106,6 +1298,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             },
           });
           pendingTodoCalls.set(tc.id, { name: tc.name, args });
+          if (isTodoTool(tc.name)) {
+            orderedTodoCalls.push({ id: tc.id, name: tc.name, args });
+            todoCallEpochs.set(tc.id, inputEpoch);
+          }
         }
         loaded.push({ role: 'assistant', parts, ts: msg.created_at });
       } else if (msg.role === 'tool' && msg.tool_result) {
@@ -1118,8 +1314,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
               p.tool.output = result.summary;
               p.tool.status = toolResultStatus(result.success, result.summary);
               const pending = pendingTodoCalls.get(result.call_id);
-              if (result.success && pending) {
-                commitTodoCall(pending.name, pending.args, todoTitles);
+              if (pending && isTodoTool(pending.name)) {
+                const call = orderedTodoCalls.find((candidate) => candidate.id === result.call_id);
+                if (call) {
+                  call.success = result.success;
+                }
+                const projected = projectTodoCalls([], orderedTodoCalls);
+                todoTitles.clear();
+                projected.committed.forEach((item, index) => {
+                  todoTitles.set(index + 1, item.content);
+                });
               }
               pendingTodoCalls.delete(result.call_id);
               break outer;
@@ -1129,8 +1333,32 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       }
       // system messages: skip
     }
-    todoTitlesRef.current = todoTitles;
+    const restoredProjection = projectTodoCalls([], orderedTodoCalls);
+    const restoredTodoItems = restoredProjection.committed;
+    const priorTodoCalls = orderedTodoCalls.filter(
+      (call) => (todoCallEpochs.get(call.id) ?? 0) < inputEpoch,
+    );
+    const currentTodoCalls = orderedTodoCalls.filter(
+      (call) => todoCallEpochs.get(call.id) === inputEpoch,
+    );
+    const priorTodoItems = projectTodoCalls([], priorTodoCalls).committed;
+    const restoredTodoVisible = projectTodoCalls(
+      priorTodoItems,
+      currentTodoCalls,
+    ).hasApplicable;
+    todoTitlesRef.current = new Map(
+      restoredTodoItems.map((item, index) => [index + 1, item.content]),
+    );
     pendingTodoCallsRef.current = pendingTodoCalls;
+    todoBatchRef.current = restoredProjection.hasUnresolved
+      ? { base: [], calls: orderedTodoCalls, visibleBase: false }
+      : { base: restoredTodoItems, calls: [], visibleBase: restoredTodoVisible };
+    setTodoPreview(restoredProjection.hasUnresolved ? restoredProjection.preview : null);
+    replaceTodoItems(restoredTodoItems);
+    setTodoPanelVisible(
+      restoredTodoVisible
+        && (restoredProjection.preview.length > 0 || restoredTodoItems.length > 0),
+    );
     return loaded;
   }
 
@@ -1164,11 +1392,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // snapshot：确立实时会话 id 并把视图切到它（连上即对齐）。
     if (e.type === 'snapshot') {
       liveSessionIdRef.current = e.session_id || null;
-      // bot review P2: live 快照路径后端 MessageInfo.created_at 固为 None
-      // (live_api.rs 的 From impl 未注入),与 /chat 历史加载路径不一致。
-      // 此处在前端注入 Date.now() 作为每条快照消息的 ts,让快照消息也显示时间标签,
-      // 与历史加载路径行为一致 (后者用 session.updated_at * 1000 近似)。
-      const loaded = sessionMessagesToDisplay(e.messages).map(m => ({ ...m, ts: m.ts ?? Date.now() }));
+      // Historical timestamps come from the daemon's native transcript projection.
+      // Older sessions may not have transcript records; leave those timestamps absent
+      // instead of relabelling the whole conversation with the reconnect wall clock.
+      const loaded = sessionMessagesToDisplay(e.messages);
       // Live snapshot (session switch / reconnect) → start at the bottom.
       atBottomRef.current = true;
       // A persisted snapshot does not carry live activity. Replay emits the
@@ -1221,6 +1448,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       providerPinnedRef.current = false;
       return;
     }
+    if (e.type === 'reasoning_effort') {
+      if (providerRef.current === e.provider) {
+        setReasoningEffort({ provider: e.provider, effort: e.effort });
+      }
+      return;
+    }
     // 审批模式切换是进程级（另一 tab / 未来 TUI）→ 始终同步 pill。
     if (e.type === 'mode') {
       setModeState(initModeState(e.mode));
@@ -1259,13 +1492,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         sessionGenerationRef.current += 1;
         onSessionId(e.session_id);
         todoTitlesRef.current.clear();
-        pendingTodoCallsRef.current.clear();
+        resetTodoBatch(true, false);
         setMessages([]);
         // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
         setSearch('');
         setMatchIdx(0);
         setSearchOpen(false);
         setTokens(null);
+        setTurnStats(null);
         setHistoryHint(null);
         setPersistenceWarning(null);
       }
@@ -1288,6 +1522,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
     switch (e.type) {
       case 'user': {
+        const wasRunning = liveLifecycleRef.current.running;
+        if (!wasRunning) {
+          // A newly accepted input starts a new turn before the following
+          // `state { running: true }` projection necessarily arrives. Retire
+          // the previous completed-turn footer at this authoritative boundary.
+          setTurnStats(null);
+          setTodoPanelVisible(reduceTodoPanelVisibility(
+            todoPanelVisibleRef.current,
+            { type: 'user_input' },
+          ));
+        }
         const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
           type: 'input_accepted',
         });
@@ -1308,12 +1553,16 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         setMessages((prev) => [
           ...prev,
           { role: 'user', parts: [{ kind: 'text', text: e.text }], images: e.images && e.images.length ? e.images : undefined, ts: now },
-          { role: 'assistant', parts: [], ts: now },
+          { role: 'assistant', parts: [] },
         ]);
         break;
       }
 
       case 'state': {
+        if (e.running && !notificationTurnActiveRef.current) {
+          notificationTurnActiveRef.current = true;
+          turnStartedAtRef.current = Date.now();
+        }
         const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
           type: 'state',
           running: e.running,
@@ -1321,9 +1570,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           message: e.message,
         });
         liveLifecycleRef.current = lifecycle.state;
-        setBusy(lifecycle.state.running);
         const terminal = lifecycle.terminal;
+        setBusy(lifecycle.state.running);
+        if (e.running) setTurnStats(null);
+        else if (terminal) setTurnStats(completedTurnStats(e.stats, e.stop_reason));
         if (terminal) {
+          stampLastAssistantCompletion();
+          finishTodoTurn(e.stop_reason === 'cancelled');
           if (terminal.discardQueued) {
             // Abnormal terminal (cancel / error): the kernel CLEARS its steer
             // buffer (agent.rs Cancel/Shutdown), so a leftover steer is NOT
@@ -1346,6 +1599,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           setLivePending(null);
           setUserInputReq(null);
           if (e.stop_reason !== 'policy_denied') setPolicyIntervention(null);
+          // 回合结束：计算通知信息并触发浏览器提醒（若守卫通过）。
+          finishTurnNotification({
+            stopReason: e.stop_reason,
+            sessionId: liveSessionIdRef.current ?? undefined,
+            message: e.message,
+            durationMs: e.stats?.duration_ms,
+            dedupeKey: notificationDedupeKey(
+              liveSessionIdRef.current ?? undefined,
+              e.stop_reason,
+              e.stats,
+            ),
+          });
           // turn 完成后 session 已落盘，通知 App 刷新侧栏列表。
           onLiveTurnDone?.();
         }
@@ -1377,7 +1642,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       }
       case 'user_input_request': {
         // Show the UserInputCard for the bound live runtime.
-        setUserInputReq(e);
+        setUserInputReq({ ...e, response_transport: 'live' });
         break;
       }
       case 'user_input_resolved': {
@@ -1473,6 +1738,21 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         parts.push({ kind: 'text', text: content });
       }
       return [...prev.slice(0, -1), { ...last, parts }];
+    });
+  }
+
+  /** Stamp the assistant when the turn actually finishes. The optimistic
+   *  placeholder intentionally has no clock, keeping reply completion distinct
+   *  from the user's submission time. */
+  function stampLastAssistantCompletion(ts = Date.now()) {
+    setMessages((prev) => {
+      for (let index = prev.length - 1; index >= 0; index -= 1) {
+        if (prev[index].role !== 'assistant') continue;
+        const next = prev.slice();
+        next[index] = { ...next[index], ts };
+        return next;
+      }
+      return prev;
     });
   }
 
@@ -1838,9 +2118,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         appendToLastAssistant(event.content);
         break;
 
+      case 'reasoning':
+        // 推理内容不渲染（沿用既有行为）；三点 loading 覆盖整个回合，
+        // 推理事件不再切换闪烁光标。
+        break;
+
       case 'tool_start': {
         const argsStr = formatArgs(event.arguments);
-        pendingTodoCallsRef.current.set(event.id, { name: event.name, args: argsStr });
+        if (isTodoTool(event.name)) {
+          pendingTodoCallsRef.current.set(event.id, { name: event.name, args: argsStr });
+          stageTodoCall(event.id, event.name, argsStr);
+        }
         addToolToLastAssistant({
           id: event.id,
           name: event.name,
@@ -1870,9 +2158,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       case 'tool_result':
         {
           const pending = pendingTodoCallsRef.current.get(event.id);
-          if (event.success && pending) {
-            commitTodoCall(pending.name, pending.args, todoTitlesRef.current);
-          }
+          if (pending) settleTodoCall(event.id, event.success);
           pendingTodoCallsRef.current.delete(event.id);
         }
         updateToolInLastAssistant(event.id, {
@@ -1902,7 +2188,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         break;
 
       case 'user_input_request':
-        setUserInputReq(event);
+        setUserInputReq({ ...event, response_transport: 'chat' });
         break;
 
       case 'policy_intervention':
@@ -1910,10 +2196,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         break;
 
       case 'done': {
+        // A normal terminal keeps only successful calls; a user cancellation
+        // retires the active plan at the same boundary as kernel/TUI.
+        stampLastAssistantCompletion();
+        finishTodoTurn(event.stop_reason === 'cancelled');
         // 标记这是本 Chat 自己产生的会话 id，避免下面的 useEffect 误把当前对话清空，
         // 并标记其历史「已就位」（就是当前画布），防止 project_hash 回填后重新加载覆盖。
         activeIdRef.current = event.session_id;
         loadedForRef.current = event.session_id;
+        if (event.stop_reason === 'cancelled') {
+          todoCacheRef.current.set(event.session_id, []);
+        }
         onSessionId(event.session_id);
         const terminal = classifyChatDone({
           stopReason: event.stop_reason,
@@ -1928,27 +2221,54 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         }
         transitionChatRecovery({ type: 'authoritative_terminal' });
         setBusy(false);
+        setTurnStats(completedTurnStats(event.stats, event.stop_reason));
         onPermissionResolved?.(null); // 回合结束：兜底清掉任何残留审批卡片
         setUserInputReq(null);
         if (event.stop_reason !== 'policy_denied') setPolicyIntervention(null);
+        finishTurnNotification({
+          stopReason: event.stop_reason,
+          sessionId: event.session_id,
+          message: event.message,
+          durationMs: event.stats?.duration_ms,
+          dedupeKey: notificationDedupeKey(
+            event.session_id,
+            event.stop_reason,
+            event.stats,
+          ),
+        });
         break;
       }
 
       case 'stopped':
+        // User cancellation is an authoritative interruption boundary: the
+        // previous plan remains historical but is no longer active.
+        stampLastAssistantCompletion();
+        resetTodoBatch(true);
         transitionChatRecovery({ type: 'authoritative_terminal' });
         setBusy(false);
         setQueued([]); // 用户中止：丢弃排队消息（对齐 VSCode 插件）
         onPermissionResolved?.(null);
         setUserInputReq(null);
+        finishTurnNotification({
+          stopReason: 'cancelled',
+          sessionId: activeIdRef.current ?? undefined,
+        });
         break;
 
       case 'error':
+        stampLastAssistantCompletion();
+        resetTodoBatch(false);
         appendToLastAssistant('\n\n' + t('chat.error', { msg: event.message }));
         transitionChatRecovery({ type: 'authoritative_terminal' });
         setBusy(false);
         setQueued([]); // 出错：丢弃排队消息
         onPermissionResolved?.(null);
         setUserInputReq(null);
+        finishTurnNotification({
+          stopReason: 'error',
+          sessionId: activeIdRef.current ?? undefined,
+          message: event.message,
+        });
         break;
 
       case 'warning':
@@ -2046,6 +2366,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     // sendMessage, so merely QUEUEING a message while reading history doesn't yank them.
     atBottomRef.current = true;
     setShowJumpBtn(false);
+    const startsNewTurn = !busyRef.current;
+    if (startsNewTurn) {
+      setTodoPanelVisible(reduceTodoPanelVisibility(
+        todoPanelVisibleRef.current,
+        { type: 'user_input' },
+      ));
+    }
     // 本会话首条消息：用消息前 10 字做临时标题，立刻通知 App 乐观插入侧栏，
     // 让会话「一发送就出现在左侧」。回合 done 后列表刷新会换成后端自动命名。
     if (!optimisticFiredRef.current && messages.length === 0) {
@@ -2063,6 +2390,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       //    case via `pendingSelfEchoRef`.
       const steering = busyRef.current;
       setBusy(true);
+      // 回合起点只记录一次（steer 不重置）：供终态通知计算 durationMs。
+      if (!steering) {
+        notificationTurnActiveRef.current = true;
+        turnStartedAtRef.current = Date.now();
+      }
       const now = Date.now();
       const pendingSteer: PendingLiveSteer = {
         id: crypto.randomUUID(),
@@ -2080,7 +2412,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           ts: now,
           pendingSteerId: pendingSteer.id,
         },
-        { role: 'assistant', parts: [], ts: now, pendingSteerId: pendingSteer.id },
+        { role: 'assistant', parts: [], pendingSteerId: pendingSteer.id },
       ]);
       // Register before the HTTP round-trip. A very fast round boundary can
       // emit `steered` on SSE before the submit response reaches this tab.
@@ -2137,6 +2469,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           setPendingImages((current) => [...images, ...current]);
         } else {
           setBusy(false);
+          notificationTurnActiveRef.current = false;
+          turnStartedAtRef.current = null;
         }
         setQueued([]);
         setHistoryHint(t('chat.connError', { msg: String(error) }));
@@ -2150,6 +2484,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
     // ── Normal path ──
     setBusy(true);
+    // 回合起点只记录一次：供终态通知计算 durationMs。
+    notificationTurnActiveRef.current = true;
+    turnStartedAtRef.current = Date.now();
     // 消息发出后延迟刷新侧栏列表，给后端落盘时间；
     // done 事件中 onSessionId 会再刷一次确保更新。
     setTimeout(() => onLiveTurnDone?.(), 200);
@@ -2159,7 +2496,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     setMessages((prev) => [
       ...prev,
       { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined, ts: now },
-      { role: 'assistant', parts: [], ts: now },
+      { role: 'assistant', parts: [] },
     ]);
 
     const controller = new AbortController();
@@ -2314,7 +2651,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
   }, [busy, queued, modeState.pendingMode, chatRecovery]);
 
   function handleKeyDown(e: KeyboardEvent) {
-    if (e.isComposing) return;
+    // Safari/WebKit and a few desktop IMEs can report keyCode=229 while
+    // `isComposing` is false. Never let menu navigation or Enter-to-send steal
+    // a key that still belongs to the IME candidate window.
+    if (composingRef.current || e.isComposing || e.keyCode === 229) return;
 
     // 斜杠菜单导航（使用与渲染层一致的合并列表：本地命令 + 远程技能）
     if (slashOpen) {
@@ -2468,9 +2808,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     }
   }
 
-  // Auto-resize textarea + slash-command + @-mention detection
-  function handleInput(e: Event) {
-    const ta = e.target as HTMLTextAreaElement;
+  // Auto-resize textarea + slash-command + @-mention detection. Runs on every
+  // input event (composition drafts included) so state always mirrors the DOM;
+  // Preact's equal-value check then never writes the pre-edit buffer back.
+  function commitComposerInput(ta: HTMLTextAreaElement) {
     const val = ta.value;
     setInput(val);
     ta.style.height = 'auto';
@@ -2517,6 +2858,31 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
     setSlashOpen(false);
     setAtOpen(false);
+  }
+
+  function handleInput(e: Event) {
+    const ta = e.target as HTMLTextAreaElement;
+    ta.style.height = 'auto';
+    ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
+    // 始终把 DOM 值镜像进 state（包括组合期的中间草稿）。textarea 保持受控
+    // (value={input})，而 Preact 只在 state 与 DOM 值不同时才写回，因此：
+    //   - 组合期 state 永远等于 DOM，写回不会发生，IME 预编辑缓冲不受干扰；
+    //   - 无关 re-render 也不会把陈旧值写回（旧的 `value={composing ? undefined
+    //     : input}` 失控 hack 会在 compositionend 读到尚未提交进 ta.value 的
+    //     旧值，随后受控渲染把它强写回，刚选中的中文整段被抹掉——即"再输入
+    //     会覆盖原文"的 bug）。
+    commitComposerInput(ta);
+  }
+
+  function handleCompositionStart() {
+    composingRef.current = true;
+  }
+
+  function handleCompositionEnd() {
+    composingRef.current = false;
+    // 不在此处提交值：compositionend 之后浏览器必定补发一次 input 事件
+    // （inputType=insertCompositionText，携带最终值），由 handleInput 同步。
+    // 在 compositionend 直接读 ta.value 在 WebKit 下可能还是预编辑旧值。
   }
 
   // 在 textarea 光标处插入文本（skill 命令 / 文件路径），并复位高度、聚焦。
@@ -2774,6 +3140,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         enterkeyhint={coarsePointer ? 'enter' : 'send'}
         onInput={handleInput}
         onKeyDown={handleKeyDown}
+        onCompositionStart={handleCompositionStart}
+        onCompositionEnd={handleCompositionEnd}
         onPaste={handlePaste}
       />
       <div class="input-footer">
@@ -2823,6 +3191,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
           />
           <ModelSelector
             value={provider}
+            liveEffort={reasoningEffort?.provider === provider ? reasoningEffort.effort : undefined}
             onChange={(p) => switchProvider(p)}
             onDefaultChange={followDefaultProvider}
           />
@@ -2886,6 +3255,22 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     </div>
   );
 
+  const cacheHit = turnStats ? turnCacheHit(turnStats) : null;
+  const turnStatsText = turnStats ? [
+    t('stats.counts', { rounds: turnStats.rounds, tools: turnStats.tool_calls }),
+    t('stats.duration', { duration: formatTurnDuration(turnStats.duration_ms) }),
+    cacheHit !== null ? t('stats.cacheHit', { percent: cacheHit }) : null,
+    t('stats.tokens', {
+      input: formatTurnTokens(turnStats.prompt_tokens),
+      output: formatTurnTokens(turnStats.completion_tokens),
+    }),
+  ].filter((part): part is string => part !== null).join(' · ') : null;
+  const turnStatsLine = turnStats && !busy && (
+    <div class="turn-stats" role="status">
+      {turnStatsText}
+    </div>
+  );
+
   // 文件选择器模态（落地态与常规态共用一份）。
   const filePickerModal = showFilePicker && (
     <FilePicker
@@ -2905,14 +3290,21 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
     />
   );
 
+  // `/chat` owns its pending approval in App, but presentation belongs to the
+  // same composer seat as `/live` interactions.
+  const chatPermissionCard = pendingPermission && (
+    <PermissionCard
+      req={pendingPermission}
+      onDone={() => onPermissionResolved?.(pendingPermission.call_id)}
+    />
+  );
+
   // Shared structured-input card for `/chat` and `/live`.
   const userInputCard = userInputReq && (
     <UserInputCard
       req={userInputReq}
       onDone={() => setUserInputReq(null)}
-      submitAnswer={(body) => userInputReq.session_id
-        ? postChatUserInput(userInputReq.session_id, body)
-        : postLiveUserInput(body)}
+      submitAnswer={(body) => postUserInputAnswer(userInputReq, body)}
     />
   );
 
@@ -2940,6 +3332,27 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
       }}
     />
   );
+
+  // A runtime should expose only one pending human decision. This ordering is
+  // defensive against stale cross-channel UI state and keeps recovery actions
+  // reachable before approvals and questions.
+  const blockingInteraction = policyInterventionCard
+    ?? livePermissionCard
+    ?? chatPermissionCard
+    ?? userInputCard;
+  const hasBlockingInteraction = blockingInteraction != null;
+  const wasBlockingInteractionRef = useRef(false);
+
+  useEffect(() => {
+    const wasBlocking = wasBlockingInteractionRef.current;
+    wasBlockingInteractionRef.current = hasBlockingInteraction;
+    if (!wasBlocking || hasBlockingInteraction) return;
+
+    const frame = requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [hasBlockingInteraction]);
 
   // 落地页快捷提示胶囊：点击把文本填入输入框并聚焦（不自动发送，便于二次编辑）。
   const quickChips: { label: string; insert: string }[] = [
@@ -2975,22 +3388,27 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             </div>
             <div class="landing-tagline">{t('chat.greeting')}</div>
             <div class="landing-input">
-              {inputBox}
-              {inputSubbar}
+              {blockingInteraction ? (
+                <div class="interaction-dock-seat">{blockingInteraction}</div>
+              ) : (
+                <>
+                  {inputBox}
+                  {inputSubbar}
+                </>
+              )}
             </div>
-            <div class="landing-chips">
-              {quickChips.map((c) => (
-                <button key={c.label} class="landing-chip" onClick={() => fillInput(c.insert)}>
-                  {c.label}
-                </button>
-              ))}
-            </div>
+            {!blockingInteraction && (
+              <div class="landing-chips">
+                {quickChips.map((c) => (
+                  <button key={c.label} class="landing-chip" onClick={() => fillInput(c.insert)}>
+                    {c.label}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         </div>
         {filePickerModal}
-        {livePermissionCard}
-        {userInputCard}
-        {policyInterventionCard}
       </>
     );
   }
@@ -3051,21 +3469,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
             }
           }
 
-          // Helper: skip system messages when looking for the "next role".
-          // Needed so a trailing system notice doesn't hide the copy button
-          // on the real last AI reply of the turn.
-          function nextNonSystemRole(from: number): string | undefined {
-            for (let k = from; k < messages.length; k++) {
-              if (messages[k].role !== 'system') return messages[k].role;
-            }
-            return undefined;
-          }
+          const assistantTurnEnds = assistantTurnEndFlags(messages.map((message) => message.role));
+          const turnArtifacts = artifactsByAssistantIndex(messages);
 
           return visibleMessages.map(({ msg, origIdx }, idx) => {
             const isLast = idx === lastVisibleIdx;
             const setMatchRef = (el: HTMLElement | null) => { matchRefs.current[origIdx] = el; };
-            const timeLabel = formatMsgTime(msg.ts, t);
-            const timeFull = formatMsgTimeFull(msg.ts);
+            const timeLabel = formatMsgTime(msg.ts);
             const isActiveSearchMatch = searchOpen && searchTrim ? (origIdx === matchPositions[matchIdx]) : false;
 
             if (msg.role === 'user') {
@@ -3075,7 +3485,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
                   msg={msg}
                   searchRef={setMatchRef}
                   timeLabel={timeLabel}
-                  timeFull={timeFull}
                   search={search}
                   isActiveSearchMatch={isActiveSearchMatch}
                   steerPending={isSteerPending(msg.pendingSteerId, pendingSteers)}
@@ -3095,14 +3504,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
               );
             }
 
-            // Determine if this assistant message is the last one in the current
-            // turn (i.e. the next NON-SYSTEM message is a user message, or there
-            // are no more non-system messages). Only the last assistant message in
-            // a turn gets the copy button, so one user turn → one copy button.
-            // 用 origIdx(原数组索引)查 turnTexts 与判断 isLastInTurn,
-            // 因为这两者是基于完整 messages 序列算的。
-            const nextRole = nextNonSystemRole(origIdx + 1);
-            const isLastInTurn = nextRole === 'user' || nextRole === undefined;
+            // One user turn → one terminal assistant row. Compute this once over
+            // the complete message sequence so intermediate rounds cannot each render
+            // copy/time controls and system notices remain transparent.
+            const isLastInTurn = assistantTurnEnds[origIdx] === true;
 
             return (
               <AssistantMessageView
@@ -3113,9 +3518,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
                 lastIdx={lastIdx}
                 isLastInTurn={isLastInTurn}
                 turnText={turnTexts.get(origIdx) ?? ''}
+                artifacts={turnArtifacts.get(origIdx) ?? []}
+                sessionId={sessionId}
                 searchRef={setMatchRef}
                 timeLabel={timeLabel}
-                timeFull={timeFull}
                 search={search}
                 isActiveSearchMatch={isActiveSearchMatch}
               />
@@ -3165,6 +3571,20 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
 
         <div ref={bottomRef} />
         </div>
+        {/* Zero-height sticky seat, following Harness: the control belongs to the
+            conversation scroller and is centered on the same content lane. */}
+        {showJumpBtn && (
+          <div class="jump-to-bottom-slot">
+            <button
+              class="jump-to-bottom"
+              onClick={() => scrollToBottom('smooth')}
+              title={t('chat.jumpToBottom')}
+              aria-label={t('chat.jumpToBottom')}
+            >
+              ↓
+            </button>
+          </div>
+        )}
       </div>
 
       {/* 浮动搜索框:默认隐藏,Cmd/Ctrl+F 呼出,Esc/× 关闭。仿浏览器 Find-in-page 样式:
@@ -3247,18 +3667,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         </div>
       )}
 
-      {/* Jump-to-bottom: shown only when the user has scrolled up (follow released). */}
-      {showJumpBtn && (
-        <button
-          class="jump-to-bottom"
-          onClick={() => scrollToBottom('smooth')}
-          title={t('chat.jumpToBottom')}
-          aria-label={t('chat.jumpToBottom')}
-        >
-          ↓
-        </button>
-      )}
-
       {/* Floating input */}
       {persistenceWarning && (
         <div class="persistence-warning" role="status">
@@ -3275,16 +3683,77 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, onPermissionRe
         </div>
       )}
       <div class="input-container">
+        {todoPanelVisible && (todoPreview ?? todoItems).length > 0 && (
+          <TodoProgressPanel items={todoPreview ?? todoItems} />
+        )}
         <div class="input-wrap">
-          {inputBox}
-          {inputSubbar}
+          {blockingInteraction ? (
+            <div class="interaction-dock-seat">{blockingInteraction}</div>
+          ) : (
+            <>
+              {inputBox}
+              {inputSubbar}
+              {turnStatsLine}
+            </>
+          )}
         </div>
       </div>
       {filePickerModal}
-      {livePermissionCard}
-      {userInputCard}
-      {policyInterventionCard}
     </>
+  );
+}
+
+function TodoProgressPanel({ items }: { items: TodoItem[] }) {
+  const t = useT();
+  const [expanded, setExpanded] = useState(false);
+  const inProgress = items.filter((item) => item.status === 'in_progress').length;
+  const pending = items.filter((item) => item.status === 'pending').length;
+  const completed = items.filter((item) => item.status === 'completed').length;
+  const summary = [
+    inProgress > 0 ? t('todo.panel.inProgress', { n: inProgress }) : '',
+    pending > 0 ? t('todo.panel.pending', { n: pending }) : '',
+    completed > 0 ? t('todo.panel.completed', { n: completed }) : '',
+  ].filter(Boolean).join(' · ');
+
+  return (
+    <section class={'todo-progress-panel' + (expanded ? ' expanded' : '')} aria-label={t('todo.panel.title')}>
+      <button
+        type="button"
+        class="todo-progress-head"
+        aria-expanded={expanded}
+        aria-label={expanded ? t('todo.panel.collapse') : t('todo.panel.expand')}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        <svg class="todo-progress-list-icon" width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+          <circle cx="4" cy="4" r="1.5" stroke="currentColor" stroke-width="1.4" />
+          <path d="m3.2 4 0.6.7L5 3.2M8 4h7M3 9h2M8 9h7M3 14h2M8 14h7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        <span class="todo-progress-title">{t('todo.panel.title')}</span>
+        <span class="todo-progress-summary">{summary}</span>
+        <svg class="todo-progress-chevron" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path d="m4 6 4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      </button>
+      {expanded && (
+        <ol class="todo-progress-list">
+          {items.map((item, index) => (
+            <li class={`todo-progress-item ${item.status}`} key={`${index}-${item.content}`}>
+              <span class="todo-progress-status" role="img" aria-label={t(`todo.panel.status.${item.status}` as MsgKey)}>
+                {item.status === 'completed' ? (
+                  <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+                    <circle cx="9" cy="9" r="7" stroke="currentColor" stroke-width="1.5" />
+                    <path d="m5.7 9.1 2.1 2.1 4.6-4.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                ) : (
+                  <span class="todo-progress-ring" aria-hidden="true" />
+                )}
+              </span>
+              <span class="todo-progress-text">{item.content}</span>
+            </li>
+          ))}
+        </ol>
+      )}
+    </section>
   );
 }
 
@@ -3298,9 +3767,10 @@ function AssistantMessageView({
   busy,
   isLastInTurn,
   turnText,
+  artifacts,
+  sessionId,
   searchRef,
   timeLabel,
-  timeFull,
   search,
   isActiveSearchMatch,
 }: {
@@ -3310,9 +3780,10 @@ function AssistantMessageView({
   lastIdx: number;
   isLastInTurn: boolean;
   turnText: string;
+  artifacts: TurnArtifact[];
+  sessionId: string | null;
   searchRef?: (el: HTMLElement | null) => void;
   timeLabel?: string;
-  timeFull?: string;
   search: string;
   isActiveSearchMatch: boolean;
 }) {
@@ -3324,6 +3795,8 @@ function AssistantMessageView({
     text.includes('[Error:') ||
     text.includes('[Connection error:');
   const streaming = isLast && busy;
+  // 三点 loading 覆盖整个回合：思考（无可见输出）和文本输出阶段都显示，
+  // 直到回合结束（busy 变 false）才消失。不再使用闪烁光标。
   // 终条且简短（无工具、单行）时，去掉多余 of "时间线末端"橙点，只留一个起始点。
   const terse =
     isLast && !streaming && !messageHasTools(msg) && !text.includes('\n');
@@ -3331,7 +3804,6 @@ function AssistantMessageView({
   const cls =
     'timeline-message ' +
     dotClass +
-    (streaming ? ' dot-blink' : '') +
     (isLast ? ' is-last' : '') +
     (terse ? ' is-terse' : '') +
     (isActiveSearchMatch ? ' is-active-search-match' : '');
@@ -3339,6 +3811,7 @@ function AssistantMessageView({
   // Copy button: only shown on the last assistant message in a turn.
   // Copies the entire turn's text (all assistant messages in this turn joined).
   const [copied, setCopied] = useState(false);
+  const [artifactError, setArtifactError] = useState('');
 
   function handleCopy() {
     navigator.clipboard.writeText(turnText).then(() => {
@@ -3348,26 +3821,26 @@ function AssistantMessageView({
   }
 
   const copyBtn = isLastInTurn && !isError && !streaming && turnText ? (
-    <div class="msg-actions msg-actions-left">
-      <button
-        class={'msg-copy-btn' + (copied ? ' copied' : '')}
-        onClick={handleCopy}
-        title={copied ? t('copy.copied') : t('copy.copy')}
-        aria-label={copied ? t('copy.copied') : t('copy.copy')}
-      >
-        {copied ? (
-          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <path d="M3.5 8.5 6.5 11.5 12.5 4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
-          </svg>
-        ) : (
-          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <rect x="5" y="5" width="8.5" height="8.5" rx="1.5" stroke="currentColor" stroke-width="1.2" />
-            <path d="M2.5 10.5V3.5A1.5 1.5 0 0 1 4 2h7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
-          </svg>
-        )}
-      </button>
-    </div>
+    <button
+      class={'msg-copy-btn' + (copied ? ' copied' : '')}
+      onClick={handleCopy}
+      title={copied ? t('copy.copied') : t('copy.copy')}
+      aria-label={copied ? t('copy.copied') : t('copy.copy')}
+    >
+      {copied ? (
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path d="M3.5 8.5 6.5 11.5 12.5 4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      ) : (
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <rect x="5" y="5" width="8.5" height="8.5" rx="1.5" stroke="currentColor" stroke-width="1.2" />
+          <path d="M2.5 10.5V3.5A1.5 1.5 0 0 1 4 2h7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+        </svg>
+      )}
+    </button>
   ) : null;
+
+  const showTimestamp = Boolean(timeLabel) && shouldShowAssistantTimestamp(isLastInTurn, streaming, text, isError);
 
   return (
     <div class={cls} ref={searchRef}>
@@ -3375,22 +3848,62 @@ function AssistantMessageView({
       {isError ? (
         <div class="error-message-content">
           {highlightText(text, search)}
-          {streaming && <span class="streaming-cursor" />}
+          {streaming && (
+            <span class="waiting-dots" role="status" aria-label={t('chat.waiting')}>
+              <span class="waiting-dot" />
+              <span class="waiting-dot" />
+              <span class="waiting-dot" />
+            </span>
+          )}
         </div>
       ) : (
         <>
           {/* Segments in chronological order: text→tool→text→tool,
               matching the TUI. Consecutive tools share one tool-list. */}
           {renderAssistantParts(msg.parts, search)}
-          {streaming && <span class="streaming-cursor" />}
+          {streaming && (
+            <span class="waiting-dots" role="status" aria-label={t('chat.waiting')}>
+              <span class="waiting-dot" />
+              <span class="waiting-dot" />
+              <span class="waiting-dot" />
+            </span>
+          )}
         </>
       )}
-      {copyBtn}
-      {/* PR #562 send-time label — under the reply, dimmed; full timestamp in
-          the tooltip. Suppressed while streaming (turn isn't done yet), on
-          error turns, and on tool-only turns with no text. */}
-      {timeLabel && !streaming && text && !isError && (
-        <div class="msg-time" title={timeFull}>{timeLabel}</div>
+      {isLastInTurn && !streaming && artifacts.length > 0 && (
+        <div class="turn-artifacts" aria-label={t('chat.artifacts')}>
+          <span class="turn-artifacts-label">{t('chat.artifacts')}</span>
+          <div class="turn-artifacts-list">
+            {artifacts.slice(0, 6).map((artifact) => (
+              <button
+                key={artifact.path}
+                type="button"
+                class="turn-artifact-chip"
+                title={artifact.path}
+                onClick={() => {
+                  setArtifactError('');
+                  void openWorkspaceFile(artifact.path, sessionId ?? undefined).catch((error) => {
+                    setArtifactError(t('chat.artifactOpenFailed', { msg: String(error) }));
+                  });
+                }}
+              >
+                {artifact.label}
+              </button>
+            ))}
+            {artifacts.length > 6 && (
+              <span class="turn-artifact-more">+{artifacts.length - 6}</span>
+            )}
+          </div>
+          {artifactError && <div class="turn-artifact-error" role="status">{artifactError}</div>}
+        </div>
+      )}
+      {(copyBtn || showTimestamp) && (
+        <div class="msg-actions msg-actions-left">
+          {copyBtn}
+          {/* One timestamp per user turn: intermediate assistant/tool rounds share
+              the turn's persisted timestamp but must not repeat it in the timeline. */}
+          {showTimestamp && <div class="msg-time">{timeLabel}</div>}
+        </div>
       )}
     </div>
   );
@@ -3410,13 +3923,16 @@ function renderAssistantParts(parts: MsgPart[], search: string): VNode[] {
         tools.push(q.tool);
         i++;
       }
-      out.push(
-        <div class="tool-list" key={`tg-${groupKey}`}>
-          {tools.map((tool) => (
-            <ToolRowView key={tool.id} tool={tool} />
-          ))}
-        </div>,
-      );
+      const visibleTools = tools.filter(shouldShowToolRow);
+      if (visibleTools.length > 0) {
+        out.push(
+          <div class="tool-list" key={`tg-${groupKey}`}>
+            {visibleTools.map((tool) => (
+              <ToolRowView key={tool.id} tool={tool} />
+            ))}
+          </div>,
+        );
+      }
     } else if (p.kind === 'notice') {
       out.push(
         <div class="msg-notice" key={`nt-${i}`}>
@@ -3471,7 +3987,6 @@ function UserMessageView({
   msg,
   searchRef,
   timeLabel,
-  timeFull,
   search,
   isActiveSearchMatch,
   steerPending,
@@ -3479,7 +3994,6 @@ function UserMessageView({
   msg: Message;
   searchRef?: (el: HTMLElement | null) => void;
   timeLabel?: string;
-  timeFull?: string;
   search: string;
   isActiveSearchMatch: boolean;
   steerPending?: boolean;
@@ -3550,7 +4064,10 @@ function UserMessageView({
           <span class="skill-badge-hint">{t('chat.skillExpand')}</span>
         </button>
         {steerBadge}
-        {timeLabel && <div class="msg-time msg-time-user" title={timeFull}>{timeLabel}</div>}
+        <div class="msg-actions">
+          {timeLabel && <div class="msg-time msg-time-user">{timeLabel}</div>}
+          {copyBtn}
+        </div>
       </div>
     );
   }
@@ -3569,12 +4086,10 @@ function UserMessageView({
         {skillTitle ? <Markdown content={text} search={search} /> : highlightText(text, search)}
       </div>
       <div class="msg-actions">
+        {timeLabel && <div class="msg-time msg-time-user">{timeLabel}</div>}
         {copyBtn}
       </div>
       {steerBadge}
-      {/* PR #562 send-time label — below the bubble, right-aligned to match
-          the user side; full timestamp on hover. */}
-      {timeLabel && <div class="msg-time msg-time-user" title={timeFull}>{timeLabel}</div>}
     </div>
   );
 }
@@ -3719,10 +4234,16 @@ function ToolStatusIcon({ cls }: { cls: string }) {
   );
 }
 
+function shouldShowToolRow(tool: ToolRow): boolean {
+  return !isTodoTool(tool.name) || tool.status === 'error' || tool.status === 'incomplete';
+}
+
 function ToolRowView({ tool }: { tool: ToolRow }) {
   const t = useT();
   const [expanded, setExpanded] = useState(false);
 
+  // Successful TodoWrite calls are represented by the persistent composer
+  // panel. Keep failures in the transcript so malformed plans remain visible.
   let annotation: { cls: string; label: string } | null = null;
   if (tool.status === 'waiting_approval') {
     annotation = { cls: 'waiting', label: t('tool.waiting') };

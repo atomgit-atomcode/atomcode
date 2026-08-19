@@ -132,6 +132,72 @@ pub struct StallThenProvider {
     events: Mutex<Option<Vec<StreamEvent>>>,
 }
 
+/// First call emits a replay-unsafe prefix and then stalls; later calls return a
+/// normal scripted response. Used to verify partial-stream continuation without
+/// replaying the original request.
+pub struct PartialStallThenProvider {
+    calls: AtomicUsize,
+    requests: Mutex<Vec<Vec<Message>>>,
+    prefix: Mutex<Option<Vec<StreamEvent>>>,
+    recovered: Mutex<Option<Vec<StreamEvent>>>,
+    recovered_stalls: bool,
+}
+
+impl PartialStallThenProvider {
+    pub fn new(prefix: Vec<StreamEvent>, recovered: Vec<StreamEvent>) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+            prefix: Mutex::new(Some(prefix)),
+            recovered: Mutex::new(Some(recovered)),
+            recovered_stalls: false,
+        }
+    }
+
+    pub fn with_recovered_stall(mut self) -> Self {
+        self.recovered_stalls = true;
+        self
+    }
+
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    pub fn requests(&self) -> Vec<Vec<Message>> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LlmProvider for PartialStallThenProvider {
+    fn model_name(&self) -> &str {
+        "partial-stall-then"
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _tools: &[ToolDef],
+        _options: &ChatOptions,
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        self.requests.lock().unwrap().push(messages.to_vec());
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            let prefix = self.prefix.lock().unwrap().take().unwrap_or_default();
+            return Ok(Box::pin(
+                futures::stream::iter(prefix).chain(futures::stream::pending()),
+            ));
+        }
+        let recovered = self.recovered.lock().unwrap().take().unwrap_or_default();
+        if self.recovered_stalls {
+            Ok(Box::pin(
+                futures::stream::iter(recovered).chain(futures::stream::pending()),
+            ))
+        } else {
+            Ok(Box::pin(futures::stream::iter(recovered)))
+        }
+    }
+}
+
 impl StallThenProvider {
     pub fn new(stall_calls: usize, events: Vec<StreamEvent>) -> Self {
         Self {

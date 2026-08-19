@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.6</span>
+    <span class="dhdr-ver">v5.0.7</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -112,7 +112,7 @@
           <tr><td><code>/compact</code></td><td>压缩历史消息,把早期对话压缩成摘要以腾出上下文预算</td></tr>
           <tr><td><code>/rewind</code></td><td>选择历史提示，并回退对话、代码或两者；详见 <a href="./sessions.html">会话与撤销</a></td></tr>
           <tr><td><code>/clear</code></td><td>清空当前会话的消息(保留工作目录和模型)</td></tr>
-          <tr><td><code>/init</code></td><td>扫描当前工作目录,生成 / 刷新 <code>.atomcode.md</code> 项目指令文件 — 内含 build / test 命令、技术栈摘要、目录结构等,后续每次启动都会作为系统提示注入</td></tr>
+          <tr><td><code>/init</code></td><td>扫描当前工作目录，按优先级创建或完善当前生效的项目指令文件（<code>.atomcode.md</code>、<code>AGENTS.md</code> 或 <code>CLAUDE.md</code>）。生成内容跟随当前语言，并可在 <code>/config</code> 中配置自定义提示词文件。</td></tr>
           <tr><td><code>/background &lt;任务&gt;</code></td><td>把任务派发给一个隔离的后台 agent(只读为主的工具子集),不污染当前主对话上下文。用于"顺手让它去查一下 X"这类轻探索。详见 <a href="./sessions.html#bg">后台会话</a></td></tr>
           <tr><td><code>/worktree &lt;子命令&gt;</code></td><td>Git worktree 隔离:<code>create</code> 在新分支上拉一份独立 worktree、<code>list</code> 查看现有 worktree、<code>done</code> 把 worktree 改动 squash 回主分支、<code>cleanup</code> 清理已完成的 worktree</td></tr>
           <tr><td><code>/todo</code> · <code>/todo add &lt;任务&gt;</code> · <code>/todo clear</code></td><td>重新打印当前待办清单 —— 从会话记录里派生(定位最近一次 <code>todowrite</code> 工具调用并重渲染),带「进行中 / 已完成」状态标记。<code>/todo add &lt;任务&gt;</code> 确定性地追加一条任务(不走模型);<code>/todo clear</code> 清空清单。清单是无状态派生的,不额外落盘;模型执行长任务时会自己维护它,你也可以随时用此命令查看进度</td></tr>

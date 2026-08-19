@@ -724,4 +724,55 @@ mod tests {
             "zh: {zh}"
         );
     }
+
+    #[test]
+    fn plugin_install_toast_reports_the_reload_it_already_did() {
+        let _g = test_lock();
+        // `reload_plugins` runs immediately before this toast is rendered, so
+        // the skills are already live. The old text said "Run /reload-plugins
+        // to apply" — a slash command that does not exist, asking for work
+        // that had already happened — while discarding all three counts.
+        for locale in [Locale::En, Locale::ZhCn] {
+            let msg = t_with(
+                locale,
+                Msg::PluginInstallDone {
+                    plugin: "some-plugin",
+                    marketplace: "atomcode-plugins-official",
+                    loaded: 5,
+                    skipped: 0,
+                    show_details_hint: false,
+                },
+            );
+            assert!(msg.contains("some-plugin"), "{locale:?}: {msg}");
+            assert!(
+                msg.contains('5'),
+                "must report the count: {locale:?}: {msg}"
+            );
+            assert!(
+                !msg.contains("/reload-plugins"),
+                "must not name a command that does not exist: {locale:?}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_install_toast_surfaces_skipped_skills_and_the_details_hint() {
+        let _g = test_lock();
+        // A rejected SKILL.md is the case a user most needs to notice; the
+        // counts were being computed and then thrown away.
+        for locale in [Locale::En, Locale::ZhCn] {
+            let msg = t_with(
+                locale,
+                Msg::PluginUpdateDone {
+                    plugin: "some-plugin",
+                    marketplace: "atomcode-plugins-official",
+                    loaded: 2,
+                    skipped: 3,
+                    show_details_hint: true,
+                },
+            );
+            assert!(msg.contains('3'), "skipped count: {locale:?}: {msg}");
+            assert!(msg.contains("Ctrl+O"), "details hint: {locale:?}: {msg}");
+        }
+    }
 }

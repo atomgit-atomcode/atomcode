@@ -2,7 +2,7 @@
 // blocks below (the atomic-rename + chmod-600 path uses them; the
 // Windows fallback at line 49 just calls `std::fs::write`). Gate the
 // imports so a Windows build doesn't fire unused_imports.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 use std::io::Write;
 use std::path::Path;
 #[cfg(unix)]
@@ -59,7 +59,30 @@ pub fn write_auth_file_secure(path: &Path, content: &str) -> Result<()> {
             .with_context(|| format!("Failed to chmod 600 {}", path.display()))?;
     }
 
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
+    {
+        let parent = path
+            .parent()
+            .context("Invalid auth file path — please use /login again")?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+            format!("Failed to create temp auth file beside {}", path.display())
+        })?;
+        temp.write_all(content.as_bytes())
+            .context("Failed to write auth content")?;
+        temp.as_file()
+            .sync_all()
+            .context("Failed to sync auth file")?;
+        temp.persist(path)
+            .map_err(|error| error.error)
+            .with_context(|| {
+                format!(
+                    "Failed to atomically replace auth file at {}",
+                    path.display()
+                )
+            })?;
+    }
+
+    #[cfg(not(any(unix, target_os = "windows")))]
     {
         std::fs::write(path, content)
             .with_context(|| format!("Failed to write auth file at {}", path.display()))?;
@@ -168,5 +191,20 @@ mod tests {
 
         let file_mode = std::fs::metadata(&auth_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(file_mode, 0o600);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn write_auth_file_secure_atomically_replaces_existing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_path = tmp.path().join("auth.toml");
+        std::fs::write(&auth_path, "access_token = \"old\"\n").unwrap();
+
+        write_auth_file_secure(&auth_path, "access_token = \"new\"\n").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(auth_path).unwrap(),
+            "access_token = \"new\"\n"
+        );
     }
 }

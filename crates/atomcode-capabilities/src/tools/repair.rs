@@ -924,6 +924,7 @@ const TASK_SUBTASK_KEYS: &[&str] =
         "prompt",
         "subagent_type",
         "difficulty",
+        "model",
         "role",
         "scope",
     ];

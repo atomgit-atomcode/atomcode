@@ -118,12 +118,14 @@ const MAX_OVERFLOW_ATTEMPTS: u8 = 3;
 /// waits) so the user perceives a retry is happening AND a fresh connection gets
 /// a real chance to recover (the stale keep-alive class). NON-retryable errors
 /// (auth / 400 / balance) never enter this path — they fail fast.
-const MAX_PROVIDER_RETRIES: u32 = 3;
+const DEFAULT_MAX_PROVIDER_RETRIES: u32 = 3;
 /// Max mid-stream RECONNECTS after a stream idle-timeout before failing the turn
 /// (codex parity: 5). Each reconnect re-issues the SAME round from history
 /// (partial output discarded), with exponential backoff. Distinct from
-/// `MAX_PROVIDER_RETRIES` (which covers failures at OPEN, before any token).
+/// `max_provider_retries` (which covers failures at OPEN, before any token).
 const MAX_STREAM_RETRIES: u32 = 5;
+const MAX_PARTIAL_STREAM_RECOVERIES: u32 = 1;
+const PARTIAL_STREAM_RESUME_NUDGE: &str = "[The previous assistant stream timed out after partial output. The preserved assistant message and any interrupted tool results above are authoritative. Continue from that saved progress. Do not repeat completed tool calls or restart the task.]";
 
 /// Safety fuse: maximum consecutive `WaitAndRetry` rate-limit sleeps within a
 /// single turn before the kernel forces a `Pause` stop (RateLimited), regardless
@@ -134,7 +136,7 @@ const MAX_STREAM_RETRIES: u32 = 5;
 ///
 /// Worst-case in-turn blocking = `MAX_RATE_LIMIT_WAITS` × the host's per-wait cap
 /// (`atomcode_kernel::hook::RATE_LIMIT_AUTO_WAIT_SECS`, 120s) = 5 × 120s = 10 min.
-/// Kept on the scale of the other per-turn fuses (`MAX_PROVIDER_RETRIES` = 3,
+/// Kept on the scale of the other per-turn fuses (default provider retries = 3,
 /// `EMPTY_RESPONSE_MAX_RETRIES` = 5) rather than the old 20 (which permitted a
 /// 40-minute hang from a broken hook, far past the 300s `stream_timeout`).
 const MAX_RATE_LIMIT_WAITS: u32 = 5;
@@ -153,8 +155,8 @@ const SILENT_FIRST_RATE_LIMIT_RETRY: std::time::Duration = std::time::Duration::
 
 /// How many times the agent loop re-issues a round after the provider returns a
 /// COMPLETELY EMPTY but otherwise-successful completion (a 200 with no text, no
-/// tool calls, no reasoning). This is a DISTINCT tier from `MAX_PROVIDER_RETRIES`
-/// (which only fires on a `retryable` OPEN/stream `Err`): an empty 200 opens fine
+/// tool calls, no reasoning). This is a DISTINCT tier from the outer provider
+/// retry budget (which only fires on a `retryable` OPEN/stream `Err`): an empty 200 opens fine
 /// and streams a clean `Done`, so it would otherwise be mistaken for the model
 /// choosing to stop. Confirmed transient on the atomgit→DeepSeek path — the SAME
 /// request resent recovers — so it gets MORE attempts and a much SHORTER backoff
@@ -531,6 +533,7 @@ enum CallPlan {
 struct ExecutedCallResult {
     result: ToolResult,
     effective_cwd: Option<std::path::PathBuf>,
+    policy_intervention: Option<PolicyIntervention>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -746,6 +749,13 @@ pub struct Outcome {
     /// on the code instead of string-matching `error`.
     pub http_status: Option<u16>,
     pub error_code: Option<String>,
+    /// Provider-classified retryability for the last error. Kept separate
+    /// from HTTP status because transport failures often have no response.
+    pub provider_retryable: Option<bool>,
+    /// A hard policy boundary raised during this run. One-shot child drivers
+    /// preserve it so their parent tool can lift the same structured recovery
+    /// contract instead of reducing it to an ordinary string failure.
+    pub policy_intervention: Option<PolicyIntervention>,
 }
 
 /// Auto-response policy for the one-shot adapter (no human in the loop).
@@ -771,6 +781,10 @@ pub struct Agent {
     middlewares: Vec<Arc<dyn ToolMiddleware>>,
     hooks: Arc<dyn LifecycleHooks>,
     max_rounds: Option<u32>,
+    /// Number of outer same-round reopens after a retryable provider OPEN
+    /// failure. The provider adapter may already own an explicit bounded retry
+    /// policy, in which case its host sets this neutral outer budget to zero.
+    max_provider_retries: u32,
     /// Opt-in exact tool-loop policy. `None` keeps the neutral kernel behavior.
     tool_loop_policy: Option<ToolLoopPolicy>,
     /// SAFETY FUSE (FAILURE PERCEPTION): max times a `offer_continuation` hook may CONTINUE a
@@ -905,6 +919,7 @@ impl Agent {
             hooks: self.hooks,
             rt: RequestCtx::new(ev_tx, self.request_timeout),
             max_rounds: self.max_rounds,
+            max_provider_retries: self.max_provider_retries,
             tool_loop_policy: self.tool_loop_policy,
             max_continuations: self.max_continuations,
             resume: self.resume,
@@ -974,10 +989,15 @@ impl Agent {
                     message,
                     http_status,
                     code,
+                    retryable,
                 } => {
                     outcome.error = Some(message);
                     outcome.http_status = http_status;
                     outcome.error_code = code;
+                    outcome.provider_retryable = retryable;
+                }
+                AgentEvent::PolicyIntervention { intervention } => {
+                    outcome.policy_intervention = Some(intervention);
                 }
                 AgentEvent::TurnComplete { reason } => {
                     outcome.stop = reason;
@@ -1007,6 +1027,7 @@ struct RunningAgent {
     hooks: Arc<dyn LifecycleHooks>,
     rt: RequestCtx,
     max_rounds: Option<u32>,
+    max_provider_retries: u32,
     /// Opt-in exact tool-loop policy. State derived from this policy is owned by
     /// `session_loop`, not by the immutable runtime configuration.
     tool_loop_policy: Option<ToolLoopPolicy>,
@@ -1450,6 +1471,7 @@ impl RunningAgent {
                 message: format!("prompt rejected: {reason}"),
                 http_status: None,
                 code: None,
+                retryable: None,
             });
             self.rt.emit(AgentEvent::TurnComplete {
                 reason: StopReason::PromptRejected,
@@ -1495,6 +1517,10 @@ impl RunningAgent {
         // = a fresh independent token (prior behavior). Centralized in
         // `new_turn_token` so every site stays consistent.
         let turn_token = self.new_turn_token();
+        // Distinguish lifecycle shutdown/reconfigure from a user-facing cancel.
+        // Both stop the turn through the same terminal funnel, but only the latter
+        // retires user intent (and therefore writes an interruption boundary).
+        let internal_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Drive the turn while STILL servicing commands (Respond/Cancel/Shutdown)
         // so a middleware blocked on approval can be answered out-of-band.
         let steer: SteerBuf =
@@ -1502,6 +1528,7 @@ impl RunningAgent {
         let mut turn = Box::pin(self.run_turn(
             convo,
             turn_token.clone(),
+            internal_cancel.clone(),
             rollback_len,
             steer.clone(),
             tool_loop_state.as_mut(),
@@ -1520,6 +1547,7 @@ impl RunningAgent {
                         // canonical snapshot. Cancel the turn and wait for its normal
                         // terminal funnel instead.
                         shutdown = true;
+                        internal_cancel.store(true, Ordering::Release);
                         turn_token.cancel();
                         self.rt.cancel_pending();
                         steer.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1758,32 +1786,29 @@ impl RunningAgent {
     /// - `keep_interrupted_context = true`: PRESERVE — keep this turn's partial
     ///   assistant/tool work; backfill a `(cancelled)` result for every dangling
     ///   tool_call so the wire stays API-valid. APPEND-ONLY — prefix-cache safe.
-    async fn finish_cancelled(&self, convo: &mut Conversation, rollback_len: usize, ctx: &TurnCtx) {
+    async fn finish_cancelled(
+        &self,
+        convo: &mut Conversation,
+        rollback_len: usize,
+        ctx: &TurnCtx,
+        internal_cancel: bool,
+    ) {
         if self.keep_interrupted_context {
             // PRESERVE: keep this turn's partial assistant/tool work; backfill a
             // `(cancelled)` result for every dangling tool_call so the wire stays
             // API-valid. APPEND-ONLY — prefix-cache safe. Mirrors v1's
             // `Conversation::cancel_current_turn`.
             convo.backfill_cancelled_tool_results();
-            // Inject a SYNTHETIC user-role interruption marker — wire-safe on all
-            // adapters. A system message placed mid-conversation is rejected or silently
-            // dropped by many openai-compat gateways (non-leading system), and the
-            // Anthropic adapter lifts ALL system messages to the top-level `system`
-            // field, detaching this marker from its position. A user-role message merges
-            // cleanly into the next user prompt on Anthropic and is valid consecutive-user
-            // on openai-compat.
-            // `synthetic_user` (not `user`) so the marker is excluded from prompt
-            // counting: `compute_runtime_undo` skips `synthetic = true` messages
-            // when locating the /undo target, and compaction's `active_turn_start`
-            // skip synthetic messages when computing keep-recent-turns boundaries.
-            convo.push(Message::synthetic_user(
-                "[The previous response was interrupted by the user before completing. \
-                 Reconsider the approach in light of this interruption before continuing.]",
-            ));
         } else {
             // CANCEL = UNDO (default): roll back to before the user message so the
             // cancelled prompt + partial work leaves NO trace.
             convo.messages.truncate(rollback_len);
+        }
+        if !internal_cancel {
+            // Persist one common USER-cancellation boundary in both preservation
+            // modes. Internal shutdown/reconfigure terminals deliberately omit it:
+            // they stop execution but do not mean the user abandoned the intent.
+            convo.push(Message::user_interruption());
         }
         self.rt.emit(AgentEvent::Cancelled);
         self.finish_turn(convo, StopReason::Cancelled, ctx).await;
@@ -1809,6 +1834,7 @@ impl RunningAgent {
         &self,
         convo: &mut Conversation,
         cancel: tokio_util::sync::CancellationToken,
+        internal_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
         rollback_len: usize,
         steer: SteerBuf,
         mut tool_loop_state: Option<&mut ToolLoopState>,
@@ -1855,6 +1881,14 @@ impl RunningAgent {
         // deliberately NOT reset on `open` (a re-open must not refill it mid-round,
         // else a permanently-stalling stream would retry forever within one round).
         let mut stream_retry: u32 = 0;
+        // A partial stream may already contain visible text or complete tool calls.
+        // Replaying that request can duplicate output or side effects, so recover at
+        // most once by preserving it and opening a NEW continuation in this turn.
+        let mut partial_stream_recoveries: u32 = 0;
+        // One-shot marker consumed immediately after breaking out of the stalled
+        // stream. Keep it separate from the turn-wide recovery counter: later 429
+        // retries must retain their normal same-round accounting.
+        let mut retry_is_partial_continuation = false;
         // RATE-LIMIT WaitAndRetry counter for the WHOLE turn: incremented on each
         // WaitAndRetry sleep (OPEN or mid-stream); reset to 0 on a successful open
         // (the window has reopened). Capped at MAX_RATE_LIMIT_WAITS to prevent a
@@ -1934,7 +1968,13 @@ impl RunningAgent {
                             // Terminate through the canonical cancel funnel so the
                             // turn ends as Cancelled — matching every other
                             // mid-turn cancel arm — not MaxRounds.
-                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                            self.finish_cancelled(
+                                convo,
+                                rollback_len,
+                                &turn_ctx,
+                                internal_cancel.load(Ordering::Acquire),
+                            )
+                            .await;
                             return;
                         } else {
                             // Explicit stop (Esc / picker) OR fail-closed default
@@ -1948,6 +1988,7 @@ impl RunningAgent {
                             message: format!("max rounds ({cap}) reached"),
                             http_status: None,
                             code: None,
+                            retryable: None,
                         });
                         self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
                             .await;
@@ -2102,7 +2143,13 @@ impl RunningAgent {
             let opened = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                    self.finish_cancelled(
+                        convo,
+                        rollback_len,
+                        &turn_ctx,
+                        internal_cancel.load(Ordering::Acquire),
+                    )
+                    .await;
                     return;
                 }
                 opened = self.provider.chat_stream(&messages, &defs, &request_options) => opened,
@@ -2157,9 +2204,8 @@ impl RunningAgent {
                     } else {
                         self.hooks.on_rate_limit(&hint).await
                     };
-                    let quiet_first_eligible = host_verdict.is_none()
-                        && hint.retry_after_secs.is_none()
-                        && !hint.terminal;
+                    let quiet_first_eligible =
+                        host_verdict.is_none() && hint.retry_after_secs.is_none() && !hint.terminal;
                     let decision = host_verdict
                         .unwrap_or_else(|| crate::hook::RateLimitDecision::from_hint(&hint));
                     match decision {
@@ -2199,7 +2245,13 @@ impl RunningAgent {
                             tokio::select! {
                                 biased;
                                 _ = cancel.cancelled() => {
-                                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                    self.finish_cancelled(
+                                        convo,
+                                        rollback_len,
+                                        &turn_ctx,
+                                        internal_cancel.load(Ordering::Acquire),
+                                    )
+                                    .await;
                                     return;
                                 }
                                 _ = tokio::time::sleep(wait) => {}
@@ -2237,19 +2289,26 @@ impl RunningAgent {
                 // errors (auth / 400 / balance) skip this and hard-fail below, so we
                 // never spin ~18s on an error that cannot recover. 429 is handled
                 // above by the host hook before reaching this branch.
-                Err(e) if e.retryable && provider_retry < MAX_PROVIDER_RETRIES => {
+                Err(e) if e.retryable && provider_retry < self.max_provider_retries => {
                     provider_retry += 1;
                     let wait = (provider_retry as u64 * 3).min(15); // 3 / 6 / 9s, matching v1
                     self.rt.emit(AgentEvent::Warning(format!(
-                        "API error {}，{wait} 秒后重试({provider_retry}/{MAX_PROVIDER_RETRIES})...",
-                        retry_reason(&e)
+                        "API error {}，{wait} 秒后重试({provider_retry}/{})...",
+                        retry_reason(&e),
+                        self.max_provider_retries
                     )));
                     // Cancellable backoff: Esc during the wait aborts the turn instead
                     // of forcing the user to sit through the full delay.
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => {
-                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                            self.finish_cancelled(
+                                convo,
+                                rollback_len,
+                                &turn_ctx,
+                                internal_cancel.load(Ordering::Acquire),
+                            )
+                            .await;
                             return;
                         }
                         _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
@@ -2263,6 +2322,7 @@ impl RunningAgent {
                         message: e.message,
                         http_status: e.http_status,
                         code: e.code,
+                        retryable: Some(e.retryable),
                     });
                     self.finish_turn(convo, StopReason::ProviderError, &turn_ctx)
                         .await;
@@ -2330,7 +2390,13 @@ impl RunningAgent {
                 let ev = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
-                        self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                        self.finish_cancelled(
+                            convo,
+                            rollback_len,
+                            &turn_ctx,
+                            internal_cancel.load(Ordering::Acquire),
+                        )
+                        .await;
                         return;
                     }
                     _ = async { tokio::time::sleep(self.stream_timeout.unwrap()).await }, if self.stream_timeout.is_some() => {
@@ -2340,6 +2406,11 @@ impl RunningAgent {
                         // per-round accumulators reset on `continue`, so partial output is
                         // discarded and never pushed), with exponential backoff. Only after
                         // the budget is spent do we take the clean-fail path.
+                        // A content-free (no-token) stall is a safe REPLAY, so
+                        // reconnect up to MAX_STREAM_RETRIES per round — including on
+                        // the fresh continuation round after a partial recovery
+                        // (`stream_retry` was reset to 0 for it). The recovery itself
+                        // stays capped by `partial_stream_recoveries` below.
                         if !saw_stream_content && stream_retry < MAX_STREAM_RETRIES {
                             stream_retry += 1;
                             self.rt.emit(AgentEvent::Warning(format!(
@@ -2355,7 +2426,13 @@ impl RunningAgent {
                             tokio::select! {
                                 biased;
                                 _ = cancel.cancelled() => {
-                                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                    self.finish_cancelled(
+                                        convo,
+                                        rollback_len,
+                                        &turn_ctx,
+                                        internal_cancel.load(Ordering::Acquire),
+                                    )
+                                    .await;
                                     return;
                                 }
                                 _ = tokio::time::sleep(backoff) => {}
@@ -2364,6 +2441,7 @@ impl RunningAgent {
                             break;
                         }
                         if saw_stream_content {
+                            let progress_len = convo.messages.len();
                             Self::persist_partial_assistant(
                                 convo,
                                 &assistant_text,
@@ -2372,14 +2450,49 @@ impl RunningAgent {
                                 &pending_calls,
                                 suppress_internal_stream,
                             );
+                            // `saw_stream_content` includes display-only ToolCallDelta,
+                            // which persists NOTHING. Only recover (and push the
+                            // "continue from saved progress" nudge) when something was
+                            // actually preserved — else the nudge references a message
+                            // that does not exist and burns the one-shot recovery.
+                            let preserved_progress = convo.messages.len() > progress_len;
+                            if preserved_progress
+                                && partial_stream_recoveries < MAX_PARTIAL_STREAM_RECOVERIES
+                            {
+                                partial_stream_recoveries += 1;
+                                self.rt.emit(AgentEvent::StreamRecovery {
+                                    attempt: partial_stream_recoveries,
+                                    max_attempts: MAX_PARTIAL_STREAM_RECOVERIES,
+                                    recovered: false,
+                                });
+                                convo.push(Message::synthetic_user(
+                                    PARTIAL_STREAM_RESUME_NUDGE.to_string(),
+                                ));
+                                stream_retry = 0;
+                                retry_this_round = true;
+                                retry_is_partial_continuation = true;
+                                // This is a new continuation, not a replay of the timed-out
+                                // provider request. Keep the same accepted turn and let the
+                                // outer loop mint a fresh request id/round.
+                                break;
+                            }
                         }
-                        let msg = if saw_stream_content {
+                        let msg = if partial_stream_recoveries
+                            >= MAX_PARTIAL_STREAM_RECOVERIES
+                        {
+                            "stream timed out again after one safe continuation; current progress was preserved; send 'continue' to resume"
+                        } else if saw_stream_content {
                             "stream timeout after partial response; to avoid duplicate output or tool execution, the request was not replayed; partial response preserved"
                         } else {
                             "stream timeout after automatic reconnects"
                         }.to_string();
                         self.hooks.on_error(&msg).await;
-                        self.rt.emit(AgentEvent::Error { message: msg, http_status: None, code: None });
+                        self.rt.emit(AgentEvent::Error {
+                            message: msg,
+                            http_status: None,
+                            code: None,
+                            retryable: None,
+                        });
                         self.finish_turn(convo, StopReason::Timeout, &turn_ctx).await;
                         return;
                     }
@@ -2593,7 +2706,13 @@ impl RunningAgent {
                                 tokio::select! {
                                     biased;
                                     _ = cancel.cancelled() => {
-                                        self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                        self.finish_cancelled(
+                                            convo,
+                                            rollback_len,
+                                            &turn_ctx,
+                                            internal_cancel.load(Ordering::Acquire),
+                                        )
+                                        .await;
                                         return;
                                     }
                                     _ = tokio::time::sleep(wait) => {}
@@ -2636,6 +2755,7 @@ impl RunningAgent {
                             message: e.message,
                             http_status: e.http_status,
                             code: e.code,
+                            retryable: Some(e.retryable),
                         });
                         self.finish_turn(convo, StopReason::ProviderError, &turn_ctx)
                             .await;
@@ -2659,7 +2779,13 @@ impl RunningAgent {
             // broke out. Re-issue the same logical round (round was already
             // incremented at the top of the outer loop, so decrement to neutralize).
             if retry_this_round {
-                round -= 1;
+                // A partial-output recovery is an explicit continuation and keeps
+                // its new round number. A content-free reconnect is a replay and
+                // neutralizes the round increment as before.
+                if !retry_is_partial_continuation {
+                    round -= 1;
+                }
+                retry_is_partial_continuation = false;
                 continue;
             }
             // The stream reached a natural end rather than another 429, so this
@@ -2718,7 +2844,13 @@ impl RunningAgent {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => {
-                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                            self.finish_cancelled(
+                                convo,
+                                rollback_len,
+                                &turn_ctx,
+                                internal_cancel.load(Ordering::Acquire),
+                            )
+                            .await;
                             return;
                         }
                         _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
@@ -2748,6 +2880,7 @@ impl RunningAgent {
                     message: msg,
                     http_status: None,
                     code: None,
+                    retryable: None,
                 });
                 self.finish_turn(convo, StopReason::ProviderError, &turn_ctx)
                     .await;
@@ -2922,6 +3055,7 @@ impl RunningAgent {
                                 ),
                                 http_status: None,
                                 code: None,
+                                retryable: None,
                             });
                             self.finish_turn(convo, StopReason::MaxContinuations, &turn_ctx)
                                 .await;
@@ -2951,6 +3085,13 @@ impl RunningAgent {
                     self.rt.emit(AgentEvent::Warning(
                         "response truncated: finish_reason=length".into(),
                     ));
+                }
+                if partial_stream_recoveries > 0 {
+                    self.rt.emit(AgentEvent::StreamRecovery {
+                        attempt: partial_stream_recoveries,
+                        max_attempts: MAX_PARTIAL_STREAM_RECOVERIES,
+                        recovered: true,
+                    });
                 }
                 self.finish_turn(convo, StopReason::Stopped, &turn_ctx)
                     .await;
@@ -3047,7 +3188,13 @@ impl RunningAgent {
                         elapsed_ms: started_at.elapsed().as_millis() as u64,
                     });
                 }
-                self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                self.finish_cancelled(
+                    convo,
+                    rollback_len,
+                    &turn_ctx,
+                    internal_cancel.load(Ordering::Acquire),
+                )
+                .await;
                 return;
             }
             let mut plans: Vec<CallPlan> = Vec::with_capacity(pending_calls.len());
@@ -3264,11 +3411,16 @@ impl RunningAgent {
                     results[i] = Some(ExecutedCallResult {
                         result: r.clone(),
                         effective_cwd: None,
+                        policy_intervention: None,
                     });
                 }
             }
 
             let mut ordered: FuturesOrdered<_> = FuturesOrdered::new();
+            // Independent from user cancellation: a hard policy result stops
+            // Execute plans that have not crossed their execution lock yet,
+            // without changing the authoritative terminal to Cancelled.
+            let policy_stop = tokio_util::sync::CancellationToken::new();
             for (idx, plan) in plans.iter().enumerate() {
                 let CallPlan::Execute {
                     tool,
@@ -3284,6 +3436,7 @@ impl RunningAgent {
                 let gate = gate.clone();
                 let sem = sem.clone();
                 let cancel = cancel.clone();
+                let policy_stop = policy_stop.clone();
                 // SEAM 1/1b: a per-agent working dir (when set) PINS the tool
                 // context's dir instead of the process-global `current_dir()`.
                 let cwd = self.cwd.clone();
@@ -3313,6 +3466,22 @@ impl RunningAgent {
                     // serial loop's skip-the-rest behavior.
                     if cancel.is_cancelled() {
                         return (idx, None);
+                    }
+                    if policy_stop.is_cancelled() {
+                        return (
+                            idx,
+                            Some(ExecutedCallResult {
+                                result: ToolResult {
+                                    call_id: call.id.clone(),
+                                    content: "blocked: another call in this batch terminated the turn by policy"
+                                        .into(),
+                                    is_error: true,
+                                    images: vec![],
+                                },
+                                effective_cwd: None,
+                                policy_intervention: None,
+                            }),
+                        );
                     }
                     // SNAPSHOT cwd AFTER acquiring the lock so a prior write-locked
                     // `change_dir` (which held the exclusive barrier) is visible here.
@@ -3364,11 +3533,21 @@ impl RunningAgent {
                         },
                     };
                     r.call_id = call.id.clone();
+                    // Composed tools may own a child agent. Lift and sanitize a
+                    // child policy terminal at the execution boundary, before
+                    // middleware/history/model observation. Signal sibling
+                    // futures immediately; those still waiting on the execution
+                    // lock produce paired blocked results without running.
+                    let policy_intervention = tool.take_policy_intervention(&mut r);
+                    if policy_intervention.is_some() {
+                        policy_stop.cancel();
+                    }
                     (
                         idx,
                         Some(ExecutedCallResult {
                             result: r,
                             effective_cwd: Some(effective_cwd),
+                            policy_intervention,
                         }),
                     )
                 });
@@ -3416,10 +3595,15 @@ impl RunningAgent {
                 let Some(ExecutedCallResult {
                     mut result,
                     effective_cwd,
+                    policy_intervention: result_policy_intervention,
                 }) = result_slot.take()
                 else {
                     continue; // Skip plan (no result to apply)
                 };
+                if let Some(intervention) = result_policy_intervention {
+                    policy_intervention.get_or_insert(intervention);
+                    policy_denied = true;
+                }
                 // ToolMiddleware after-chain: transform / observe the result and
                 // collect any CONTINUATION decision. Middleware sees the RAW
                 // (uncapped) result. The first `Block` reason wins.
@@ -3537,7 +3721,13 @@ impl RunningAgent {
                         elapsed_ms: started_at.elapsed().as_millis() as u64,
                     });
                 }
-                self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                self.finish_cancelled(
+                    convo,
+                    rollback_len,
+                    &turn_ctx,
+                    internal_cancel.load(Ordering::Acquire),
+                )
+                .await;
                 return;
             }
             // ── Close batch (if one was opened) ──
@@ -3632,6 +3822,7 @@ impl RunningAgent {
                     ),
                     http_status: None,
                     code: None,
+                    retryable: None,
                 });
                 self.finish_turn(convo, StopReason::RepeatLoop, &turn_ctx)
                     .await;
@@ -3655,6 +3846,7 @@ pub struct AgentBuilder {
     /// an empty Vec yields an empty `HookChain` that behaves exactly like `NoopHooks`.
     hooks: Vec<Arc<dyn LifecycleHooks>>,
     max_rounds: Option<u32>,
+    max_provider_retries: u32,
     tool_loop_policy: Option<ToolLoopPolicy>,
     max_continuations: Option<u32>,
     resume: Option<SessionSnapshot>,
@@ -3697,6 +3889,7 @@ impl Default for AgentBuilder {
             middlewares: Vec::new(),
             hooks: Vec::new(),
             max_rounds: None,
+            max_provider_retries: DEFAULT_MAX_PROVIDER_RETRIES,
             // Neutral default: exact loop detection is product policy and must be
             // enabled explicitly by the runtime assembling this agent.
             tool_loop_policy: None,
@@ -3782,6 +3975,15 @@ impl AgentBuilder {
     /// Hard cap on LLM rounds per turn (safety fuse; None = unlimited).
     pub fn max_rounds(mut self, n: u32) -> Self {
         self.max_rounds = Some(n);
+        self
+    }
+    /// Set the neutral outer retry budget for provider OPEN failures. This is
+    /// independent of retries performed inside a provider adapter; hosts that
+    /// configure an adapter-wide total should set this to zero to avoid
+    /// multiplying that total. The default preserves the historical three
+    /// outer retries.
+    pub fn max_provider_retries(mut self, n: u32) -> Self {
+        self.max_provider_retries = n;
         self
     }
     /// See `AgentBuilder.round_cap_checkpoint`. Default false.
@@ -4002,6 +4204,7 @@ impl AgentBuilder {
             // run-loop call sites are unchanged — they still call one hook object.
             hooks: Arc::new(HookChain::new(self.hooks)),
             max_rounds: self.max_rounds,
+            max_provider_retries: self.max_provider_retries,
             tool_loop_policy: self.tool_loop_policy,
             max_continuations: self.max_continuations,
             resume: self.resume,
@@ -4688,6 +4891,74 @@ mod cap_tests {
             a.content, b.content,
             "same content + same cap must yield byte-identical truncation"
         );
+    }
+}
+
+#[cfg(test)]
+mod provider_retry_budget_tests {
+    use super::*;
+    use crate::stream::ProviderError;
+    use crate::tool::{ToolDef, ToolRegistry};
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct AlwaysRetryable {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for AlwaysRetryable {
+        fn model_name(&self) -> &str {
+            "always-retryable"
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDef],
+            _options: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ProviderError {
+                retryable: true,
+                message: "transient open failure".into(),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_outer_budget_never_replays_an_exhausted_adapter_request() {
+        let provider = Arc::new(AlwaysRetryable {
+            calls: AtomicUsize::new(0),
+        });
+        let mut handle = Agent::builder()
+            .provider(provider.clone())
+            .tools(ToolRegistry::new().mount(&[]))
+            .max_provider_retries(0)
+            .build()
+            .spawn();
+
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "test".into(),
+                images: Vec::new(),
+            })
+            .unwrap();
+        let mut warned = false;
+        while let Some(event) = handle.events.recv().await {
+            warned |= matches!(event, AgentEvent::Warning(_));
+            if matches!(event, AgentEvent::TurnComplete { .. }) {
+                break;
+            }
+        }
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert!(!warned, "a disabled outer retry must not announce a replay");
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
     }
 }
 

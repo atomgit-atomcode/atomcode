@@ -1,8 +1,11 @@
-//! UI-neutral catalog for safely editable non-provider settings.
+//! UI-neutral catalog for safely editable settings.
 //!
 //! The catalog deliberately contains no model, provider, account, endpoint, or
 //! credential fields. Drivers can render it without learning the full `Config`
 //! schema, while writes remain document-level patches through `ConfigStore`.
+//! The one current-model setting exposed by `/config` uses the explicit helper
+//! below instead of entering the static catalog, because its TOML path depends
+//! on whether the active selection uses the legacy or account/model schema.
 
 use anyhow::{bail, Result};
 use toml_edit::{value, DocumentMut, Item, Table};
@@ -15,6 +18,7 @@ pub enum SettingKind {
     OptionalBoolean,
     Integer { min: i64, max: i64 },
     Choice(&'static [&'static str]),
+    Text,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +44,7 @@ pub struct SettingSpec {
 const TODO_EAGERNESS: &[&str] = &["auto", "preferred", "always"];
 const THEMES: &[&str] = &["auto", "dark", "light"];
 const LANGUAGES: &[&str] = &["auto", "en", "zh_CN"];
+const SHELL_GUARD_POLICIES: &[&str] = &["prompt", "strict", "off"];
 
 pub static SETTINGS: &[SettingSpec] = &[
     bool_setting(
@@ -83,6 +88,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         aliases: &["rounds"],
         kind: SettingKind::Integer { min: 0, max: 10000 },
         apply: ApplyPolicy::AgentReassemble,
+    },
+    SettingSpec {
+        id: "coding.shell_guard_policy",
+        path: &["coding", "shell_guard_policy"],
+        label_en: "Shell safety policy",
+        label_zh: "Shell 安全策略",
+        aliases: &["安全", "凭据", "credential", "shell"],
+        kind: SettingKind::Choice(SHELL_GUARD_POLICIES),
+        apply: ApplyPolicy::CapabilityReprepare,
     },
     SettingSpec {
         id: "loop_config.max_rounds",
@@ -217,6 +231,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         kind: SettingKind::Choice(LANGUAGES),
         apply: ApplyPolicy::ImmediateUi,
     },
+    SettingSpec {
+        id: "init_prompt_file",
+        path: &["init_prompt_file"],
+        label_en: "Custom /init prompt file",
+        label_zh: "自定义 /init 提示词文件",
+        aliases: &["agents", "AGENTS.md", "初始化"],
+        kind: SettingKind::Text,
+        apply: ApplyPolicy::NextTurn,
+    },
 ];
 
 const fn bool_setting(
@@ -258,6 +281,9 @@ impl SettingSpec {
             "tools.todo.enabled" => config.tools.todo.enabled.to_string(),
             "tools.todo.eager" => format!("{:?}", config.tools.todo.eager).to_lowercase(),
             "coding.max_rounds" => config.coding.max_rounds.to_string(),
+            "coding.shell_guard_policy" => {
+                format!("{:?}", config.coding.shell_guard_policy).to_lowercase()
+            }
             "loop_config.max_rounds" => config.loop_config.max_rounds.to_string(),
             "subagent.max_concurrent" => config.subagent.max_concurrent.to_string(),
             "subagent.max_rounds" => config.subagent.max_rounds.to_string(),
@@ -283,6 +309,11 @@ impl SettingSpec {
                 .language
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "auto".into()),
+            "init_prompt_file" => config
+                .init_prompt_file
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
             _ => String::new(),
         }
     }
@@ -330,6 +361,14 @@ impl SettingSpec {
                     bail!("expected one of: {}", values.join(", "));
                 }
                 if self.id == "language" && input == "auto" {
+                    self.reset(document);
+                    return Ok(());
+                }
+                value(input)
+            }
+            SettingKind::Text => {
+                let input = input.trim();
+                if input.is_empty() {
                     self.reset(document);
                     return Ok(());
                 }
@@ -402,36 +441,124 @@ fn integer_at_path(document: &DocumentMut, path: &[&str]) -> Option<i64> {
     table.get(leaf)?.as_integer()
 }
 
+/// Read the retry override for one concrete model selection. New-schema model
+/// profiles win on an id collision, matching `Config::resolve_model`.
+pub fn selection_retry_max_attempts(config: &Config, selection: &str) -> Option<u32> {
+    if let Some(model) = config.models.get(selection) {
+        return model.retry_max_attempts;
+    }
+    config
+        .providers
+        .get(selection)
+        .and_then(|provider| provider.retry_max_attempts)
+}
+
+/// Patch/reset the active selection's retry override without exposing provider
+/// credentials to the generic `/config` catalog. An empty value resets to the
+/// per-layer defaults; explicit values must fit the runtime's `u32` contract.
+pub fn patch_selection_retry_max_attempts(
+    document: &mut DocumentMut,
+    selection: &str,
+    input: Option<&str>,
+) -> Result<()> {
+    // The document is authoritative here, not the runtime Config. Runtime-only
+    // OAuth/CLI providers intentionally exist in memory but are filtered from
+    // disk; using Config membership would materialize an incomplete provider or
+    // model table containing only retry_max_attempts. Looking at the document
+    // also makes this atomic update safe when another process migrated schemas
+    // after the panel opened.
+    let contains = |parent: &str| {
+        document
+            .as_table()
+            .get(parent)
+            .and_then(Item::as_table)
+            .is_some_and(|table| table.contains_key(selection))
+    };
+    let parent = if contains("models") {
+        "models"
+    } else if contains("providers") {
+        "providers"
+    } else {
+        bail!("active model selection `{selection}` is temporary or not persisted in config.toml");
+    };
+    let path = [parent, selection, "retry_max_attempts"];
+    let Some(input) = input.map(str::trim).filter(|input| !input.is_empty()) else {
+        remove_path(document, &path);
+        return Ok(());
+    };
+    let attempts = input
+        .parse::<u32>()
+        .map_err(|_| anyhow::anyhow!("expected an integer between 1 and {}", u32::MAX))?;
+    if attempts == 0 {
+        bail!("value must be at least 1; use 1 to disable automatic retries");
+    }
+    set_path(document, &path, value(i64::from(attempts)));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Provider config, model selection and credentials have their own deliberate UIs and must
+    /// never be editable through this generic catalog.
+    ///
+    /// That is a claim about what a setting IS — its id and path — not about the words it can
+    /// be found by. The two were checked together against one blob, which made the catalog
+    /// unable to hold a setting that merely *talks about* the forbidden concepts:
+    /// `coding.shell_guard_policy` is the guard that protects credential files, and listing
+    /// "credential" / "凭据" among its aliases is how a user finds it. Under the old blob check
+    /// that alias read as a credential leak and failed the suite.
+    ///
+    /// So: identity is checked against every word, search text only against the ones that name
+    /// a secret's VALUE. No setting needs "api_key" or "token" to be discoverable — those
+    /// appearing in a label means a secret is being edited here, whatever the id says.
     #[test]
     fn catalog_excludes_provider_model_and_credentials() {
+        const SECRET_VALUE_WORDS: &[&str] = &["api_key", "apikey", "token"];
+        const CONCEPT_WORDS: &[&str] = &["provider", "model", "credential"];
+
         for setting in SETTINGS {
-            let searchable = std::iter::once(setting.id)
+            let identity = std::iter::once(setting.id)
                 .chain(setting.path.iter().copied())
-                .chain(std::iter::once(setting.label_en))
+                .collect::<Vec<_>>()
+                .join(".")
+                .to_lowercase();
+            for forbidden in SECRET_VALUE_WORDS.iter().chain(CONCEPT_WORDS) {
+                assert!(
+                    !identity.contains(forbidden),
+                    "{} is a {forbidden} setting; it does not belong in the generic catalog",
+                    setting.id
+                );
+            }
+
+            let search_text = std::iter::once(setting.label_en)
                 .chain(std::iter::once(setting.label_zh))
                 .chain(setting.aliases.iter().copied())
                 .collect::<Vec<_>>()
                 .join(".")
                 .to_lowercase();
-            for forbidden in [
-                "provider",
-                "model",
-                "api_key",
-                "apikey",
-                "token",
-                "credential",
-            ] {
+            for forbidden in SECRET_VALUE_WORDS {
                 assert!(
-                    !searchable.contains(forbidden),
-                    "sensitive catalog surface in {}",
+                    !search_text.contains(forbidden),
+                    "{} surfaces {forbidden} in its label or aliases",
                     setting.id
                 );
             }
         }
+    }
+
+    #[test]
+    fn credential_shell_guard_stays_findable_by_the_word_credential() {
+        // The concession the split above buys, pinned so a future tightening cannot silently
+        // take it back: the setting that decides how hard the shell guard protects credential
+        // files must remain searchable by that word, in both languages.
+        let guard = SETTINGS
+            .iter()
+            .find(|s| s.id == "coding.shell_guard_policy")
+            .expect("the shell guard policy is in the catalog");
+        assert!(guard.aliases.contains(&"credential"));
+        assert!(guard.aliases.contains(&"凭据"));
     }
 
     #[test]
@@ -489,6 +616,112 @@ mod tests {
         assert!(document.to_string().contains("enabled = false"));
         setting.patch(&mut document, "auto").unwrap();
         assert!(!document.to_string().contains("enabled"));
+    }
+
+    #[test]
+    fn shell_guard_policy_defaults_to_prompt_and_patches_strict() {
+        let setting = SETTINGS
+            .iter()
+            .find(|setting| setting.id == "coding.shell_guard_policy")
+            .unwrap();
+        let mut document = DocumentMut::new();
+        let defaults = Config::default();
+        assert_eq!(setting.value(&defaults), "prompt");
+        assert_eq!(setting.apply, ApplyPolicy::CapabilityReprepare);
+
+        setting.patch(&mut document, "strict").unwrap();
+        let configured: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(setting.value(&configured), "strict");
+        assert!(document
+            .to_string()
+            .contains("shell_guard_policy = \"strict\""));
+    }
+
+    #[test]
+    fn shell_guard_policy_reads_legacy_recover_as_prompt() {
+        // The retired `recover` value must keep parsing (as `prompt`) so an existing
+        // TOML does not break on upgrade.
+        let configured: Config =
+            toml::from_str("[coding]\nshell_guard_policy = \"recover\"\n").unwrap();
+        let setting = SETTINGS
+            .iter()
+            .find(|setting| setting.id == "coding.shell_guard_policy")
+            .unwrap();
+        assert_eq!(setting.value(&configured), "prompt");
+    }
+
+    #[test]
+    fn init_prompt_file_is_editable_and_empty_input_resets_it() {
+        let setting = SETTINGS
+            .iter()
+            .find(|setting| setting.id == "init_prompt_file")
+            .unwrap();
+        let mut document = DocumentMut::new();
+        setting.patch(&mut document, "prompts/init-zh.md").unwrap();
+        let configured: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(setting.value(&configured), "prompts/init-zh.md");
+
+        setting.patch(&mut document, "  ").unwrap();
+        assert!(!document.to_string().contains("init_prompt_file"));
+    }
+
+    #[test]
+    fn retry_attempts_patch_the_selected_legacy_provider_and_reset_cleanly() {
+        let source = r#"
+default_provider = "legacy"
+[providers.legacy]
+type = "openai"
+model = "model-a"
+base_url = "https://example.invalid/v1"
+"#;
+        let mut document = source.parse::<DocumentMut>().unwrap();
+
+        patch_selection_retry_max_attempts(&mut document, "legacy", Some("5")).unwrap();
+        let configured: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(selection_retry_max_attempts(&configured, "legacy"), Some(5));
+
+        patch_selection_retry_max_attempts(&mut document, "legacy", None).unwrap();
+        let reset: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(selection_retry_max_attempts(&reset, "legacy"), None);
+    }
+
+    #[test]
+    fn retry_attempts_patch_quoted_new_schema_model_and_reject_zero() {
+        let source = r#"
+default_model = "account/model"
+[provider_accounts.account]
+provider = "openai"
+[models."account/model"]
+account = "account"
+model = "model-a"
+"#;
+        let mut document = source.parse::<DocumentMut>().unwrap();
+
+        patch_selection_retry_max_attempts(&mut document, "account/model", Some("9")).unwrap();
+        let configured: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(
+            selection_retry_max_attempts(&configured, "account/model"),
+            Some(9)
+        );
+        assert!(
+            patch_selection_retry_max_attempts(&mut document, "account/model", Some("0")).is_err()
+        );
+    }
+
+    #[test]
+    fn retry_attempts_never_materialize_runtime_only_selections() {
+        let mut document = "default_provider = \"persisted\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+
+        let error =
+            patch_selection_retry_max_attempts(&mut document, "oauth-runtime-only", Some("5"))
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("temporary or not persisted"), "{error}");
+        assert!(!document.to_string().contains("oauth-runtime-only"));
+        assert!(!document.to_string().contains("retry_max_attempts"));
     }
 
     #[test]
@@ -553,6 +786,7 @@ mod tests {
             "tools.todo.enabled",
             "tools.todo.eager",
             "coding.max_rounds",
+            "coding.shell_guard_policy",
             "subagent.max_concurrent",
             "subagent.max_rounds",
             "ui.ai_session_naming",
@@ -567,7 +801,8 @@ mod tests {
                 | "subagent.max_rounds"
                 | "datalog.enabled"
                 | "lsp.enabled"
-                | "lsp.auto_detect" => ApplyPolicy::CapabilityReprepare,
+                | "lsp.auto_detect"
+                | "coding.shell_guard_policy" => ApplyPolicy::CapabilityReprepare,
                 _ => ApplyPolicy::AgentReassemble,
             };
             assert_eq!(setting.apply, expected, "{id}");

@@ -11,7 +11,10 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
-use super::{Modal, ModalAction};
+use super::{
+    backspace_at_cursor, delete_at_cursor, insert_at_cursor, next_grapheme_boundary,
+    previous_grapheme_boundary, Modal, ModalAction,
+};
 use crate::event_loop::{build_status, Buffer, LoopCtx};
 use crate::render::{Renderer, UiLine};
 use crate::state::UiState;
@@ -39,6 +42,7 @@ pub enum ModalActionTest {
 pub struct PasswordModal {
     pub(crate) prompt: String,
     pub(crate) pw: Zeroizing<String>,
+    cursor_byte: usize,
     pub(crate) reply: Option<oneshot::Sender<Option<String>>>,
 }
 
@@ -47,6 +51,7 @@ impl PasswordModal {
         Self {
             prompt,
             pw: Zeroizing::new(String::new()),
+            cursor_byte: 0,
             reply: Some(reply),
         }
     }
@@ -56,11 +61,35 @@ impl PasswordModal {
     fn apply_key(&mut self, code: KeyCode, mods: KeyModifiers) -> KeyOutcome {
         match code {
             KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
-                self.pw.push(c);
+                insert_at_cursor(
+                    &mut self.pw,
+                    &mut self.cursor_byte,
+                    c.encode_utf8(&mut [0; 4]),
+                );
                 KeyOutcome::Continue
             }
             KeyCode::Backspace => {
-                self.pw.pop();
+                backspace_at_cursor(&mut self.pw, &mut self.cursor_byte);
+                KeyOutcome::Continue
+            }
+            KeyCode::Delete => {
+                delete_at_cursor(&mut self.pw, &mut self.cursor_byte);
+                KeyOutcome::Continue
+            }
+            KeyCode::Left => {
+                self.cursor_byte = previous_grapheme_boundary(&self.pw, self.cursor_byte);
+                KeyOutcome::Continue
+            }
+            KeyCode::Right => {
+                self.cursor_byte = next_grapheme_boundary(&self.pw, self.cursor_byte);
+                KeyOutcome::Continue
+            }
+            KeyCode::Home => {
+                self.cursor_byte = 0;
+                KeyOutcome::Continue
+            }
+            KeyCode::End => {
+                self.cursor_byte = self.pw.len();
                 KeyOutcome::Continue
             }
             KeyCode::Enter => KeyOutcome::Submit,
@@ -76,6 +105,12 @@ impl PasswordModal {
 
     pub(crate) fn masked_line(&self) -> String {
         format!("{} {}", self.prompt, "•".repeat(self.pw.chars().count()))
+    }
+
+    fn masked_cursor_byte(&self) -> usize {
+        let prefix = format!("{} ", self.prompt);
+        let bullets_before_cursor = self.pw[..self.cursor_byte].chars().count() * '•'.len_utf8();
+        prefix.len() + bullets_before_cursor
     }
 
     // ── Test seams (no LoopCtx / Renderer needed) ────────────────────────────
@@ -146,7 +181,7 @@ impl Modal for PasswordModal {
 
     fn draw(&self, _buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
         let line = self.masked_line();
-        let cursor = line.len();
+        let cursor = self.masked_cursor_byte();
         renderer.render(UiLine::InputPrompt {
             buf: line,
             cursor_byte: cursor,
@@ -157,7 +192,7 @@ impl Modal for PasswordModal {
         renderer.flush();
     }
 
-    /// Override: append pasted text directly into `pw` (never into `buf`).
+    /// Override: paste directly into `pw` at its cursor (never into `buf`).
     fn handle_paste(
         &mut self,
         text: &str,
@@ -166,7 +201,7 @@ impl Modal for PasswordModal {
         ctx: &mut LoopCtx,
         renderer: &mut dyn Renderer,
     ) -> Result<ModalAction> {
-        self.pw.push_str(text);
+        insert_at_cursor(&mut self.pw, &mut self.cursor_byte, text);
         self.draw(buf, state, ctx, renderer);
         Ok(ModalAction::Continue)
     }
@@ -206,6 +241,20 @@ mod tests {
             ModalActionTest::Close
         );
         assert_eq!(rx.blocking_recv().unwrap(), None);
+    }
+
+    #[test]
+    fn edits_password_at_the_cursor_without_exposing_it() {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let mut m = PasswordModal::new("p".into(), tx);
+        for c in ['a', '你', 'b'] {
+            m.feed_for_test(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        m.feed_for_test(KeyCode::Left, KeyModifiers::NONE);
+        m.feed_for_test(KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(&*m.pw, "ab");
+        assert_eq!(m.masked_line(), "p ••");
+        assert_eq!(m.masked_cursor_byte(), "p •".len());
     }
 
     // Ctrl+C must be an escape hatch: dismiss the prompt (like Esc) rather than be

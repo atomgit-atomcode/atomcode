@@ -67,12 +67,12 @@ pub use assemble::{build_coding_agent, build_coding_agent_with, try_build_coding
 pub use atomcode_kernel::message::ImageContent;
 pub use config::{
     apply_provider_config, resolve_loop_max_rounds, resolve_turn_max_rounds, CodingAgentConfig,
-    CodingRuntimeConfig,
-    SubagentProvider, TierProvider,
+    CodingRuntimeConfig, SubagentModelProviders, SubagentModelResolver, SubagentProvider,
+    TierProvider,
 };
 pub use controllers::{GoalPhase, GoalProgress, GoalTerminal, LoopProgress};
 pub use discipline::VerifyCadenceHook;
-pub use init_prompt::INIT_PROMPT;
+pub use init_prompt::{build_init_prompt, INIT_PROMPT, INIT_PROMPT_ZH_CN};
 pub use parts::{
     assemble, prepare, prepare_with_plugin_hook_source, prepare_with_plugin_hooks,
     subagent_enabled_from_env, CodingParts, PrepareOptions, SessionBinding, SessionMode,

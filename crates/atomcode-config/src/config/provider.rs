@@ -48,13 +48,21 @@ pub struct ProviderConfig {
     /// Lets users work around new provider quirks without a code change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_history: Option<String>,
-    /// DeepSeek V4 reasoning effort control ("high" | "max").
+    /// Reasoning effort control. `"auto"` declares that this concrete endpoint
+    /// supports effort switching while leaving the API default in effect;
+    /// `"low" | "medium" | "high" | "max"` also set the model default.
     /// Sent as top-level `reasoning_effort` in the request body.
-    /// None = don't send the field (API uses its own default).
-    /// Only emitted when the provider's base_url or model name
-    /// matches the applicable heuristic (see OpenAiProvider).
+    /// None = endpoint capability is unknown/disabled; don't send the field.
+    /// For OpenAI-compatible endpoints, a configured value explicitly enables
+    /// the field for this model profile; unconfigured custom endpoints omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Optional per-endpoint restriction of which reasoning-effort LEVELS this
+    /// model exposes (a subset of `["low","medium","high","max"]`). `None`/empty
+    /// ⇒ all levels. See [`super::allowed_effort_levels`]. Constrains only what the
+    /// UI offers and what `/effort` accepts; the wire still sends a single value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort_levels: Option<Vec<String>>,
     /// Whether extended thinking is enabled for this provider.
     /// For Claude: sends `thinking.type = "enabled"` in request body.
     /// Default: not set (thinking disabled).
@@ -82,6 +90,11 @@ pub struct ProviderConfig {
     /// tier; fewer than 2 (or a non-participating host) ⇒ the subagent uses the current model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capable_model: Option<i64>,
+    /// Max attempts (including the first request) for provider OPEN retries;
+    /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
+    /// each layer's default. Set `1` to disable adapter-level and 429 retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_max_attempts: Option<u32>,
 }
 
 /// A provider *account*: a reusable connection + credential identity (new schema,
@@ -151,9 +164,16 @@ pub struct ModelProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort_levels: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_budget: Option<u32>,
+    /// Max attempts (including the first request) for provider OPEN retries;
+    /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
+    /// each layer's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_max_attempts: Option<u32>,
 }
 
 /// One flattened, immutable resolution of a model selection (design §3.4). This
@@ -184,9 +204,14 @@ pub struct ResolvedModelConfig {
     pub thinking_keep: Option<String>,
     pub reasoning_history: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub reasoning_effort_levels: Option<Vec<String>>,
     pub thinking_enabled: Option<bool>,
     pub thinking_budget: Option<u32>,
     pub capable_model: Option<i64>,
+    /// Max attempts (including the first request) for provider OPEN retries;
+    /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
+    /// each layer's default.
+    pub retry_max_attempts: Option<u32>,
 }
 
 impl std::fmt::Debug for ResolvedModelConfig {
@@ -226,11 +251,13 @@ impl ResolvedModelConfig {
             thinking_keep: self.thinking_keep.clone(),
             reasoning_history: self.reasoning_history.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
+            reasoning_effort_levels: self.reasoning_effort_levels.clone(),
             thinking_enabled: self.thinking_enabled,
             thinking_budget: self.thinking_budget,
             skip_tls_verify: self.skip_tls_verify,
             ephemeral: false,
             capable_model: self.capable_model,
+            retry_max_attempts: self.retry_max_attempts,
         }
     }
 }
@@ -509,11 +536,13 @@ mod tests {
             thinking_keep: None,
             reasoning_history: None,
             reasoning_effort: None,
+            reasoning_effort_levels: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            retry_max_attempts: None,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
@@ -538,11 +567,13 @@ mod tests {
             thinking_keep: None,
             reasoning_history: None,
             reasoning_effort: None,
+            reasoning_effort_levels: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: true,
             ephemeral: false,
             capable_model: None,
+            retry_max_attempts: None,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
@@ -568,6 +599,7 @@ mod tests {
         assert!(s.contains("capable_model = 1"), "set rank must serialize");
         let none_cfg = ProviderConfig {
             capable_model: None,
+            retry_max_attempts: None,
             ..cfg
         };
         let s2 = toml::to_string(&none_cfg).expect("serialize");
@@ -614,11 +646,13 @@ mod tests {
             thinking_keep: None,
             reasoning_history: None,
             reasoning_effort: None,
+            reasoning_effort_levels: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            retry_max_attempts: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-from-env-var".to_string()));
@@ -642,11 +676,13 @@ mod tests {
             thinking_keep: None,
             reasoning_history: None,
             reasoning_effort: None,
+            reasoning_effort_levels: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            retry_max_attempts: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-custom-123".to_string()));
@@ -670,11 +706,13 @@ mod tests {
             thinking_keep: None,
             reasoning_history: None,
             reasoning_effort: None,
+            reasoning_effort_levels: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
+            retry_max_attempts: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-openai-std".to_string()));

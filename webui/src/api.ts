@@ -28,7 +28,7 @@ export type SSEEvent =
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown }
   | UserInputRequestEvent
-  | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stop_reason?: string; message?: string }
+  | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stats?: TurnStats; stop_reason?: string; message?: string }
   | { type: 'stopped' }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
@@ -49,11 +49,15 @@ export interface ModelInfo {
   model: string;
   provider_type: string;
   is_default: boolean;
-  /** Whether this model accepts the DeepSeek `reasoning_effort` control
-   *  (deepseek-v4 family). The effort selector is shown only when true. */
+  /** Whether this concrete model endpoint accepts `reasoning_effort`.
+   *  The effort selector is shown only when true. */
   effort_applicable: boolean;
-  /** Current effort: 'high' | 'max' | null (model default). */
+  /** Current effort: 'low' | 'medium' | 'high' | 'max' | null (model default). */
   reasoning_effort: string | null;
+  /** The effort LEVELS this endpoint exposes (subset of low/medium/high/max,
+   *  canonical order). The selector shows only these; an unrestricted endpoint
+   *  lists all four (never empty). */
+  effort_levels: string[];
 }
 
 export async function getModels(): Promise<ModelInfo[]> {
@@ -260,9 +264,8 @@ export interface SessionMessage {
   tool_result?: ToolResultInfo;
   artifacts?: unknown;
   images?: ImageData[];
-  /** Epoch ms this message was authored (PR #562 send-time labels). Absent
-   *  on older daemons and on live/snapshot turns (the webui injects Date.now()
-   *  there). Optional + `?` so historical payloads without it still parse. */
+  /** Epoch ms for the message's completed turn. Older sessions without a native
+   *  transcript omit it; the UI must not replace it with the current wall clock. */
   created_at?: number;
 }
 
@@ -418,11 +421,52 @@ export interface ProviderInfo {
   context_window?: number;
 }
 
+export interface ProviderAccountInfo {
+  id: string;
+  provider: string;
+  display_name?: string;
+  type: string;
+  base_url?: string;
+  has_api_key: boolean;
+  model_ids: string[];
+  legacy: boolean;
+  managed: boolean;
+}
+
+export interface ProviderPresetInfo {
+  id: string;
+  display_name: string;
+  type: string;
+  default_base_url?: string;
+  requires_api_key: boolean;
+  /** Missing when a newer WebUI is temporarily paired with an older daemon. */
+  model_source?: 'embedded' | 'discovery_api' | 'manual';
+}
+
+export interface DiscoveredModelInfo {
+  id: string;
+  name?: string;
+  context_window?: number;
+  max_tokens?: number;
+}
+
+export interface NotificationConfigInfo {
+  enabled: boolean;
+  min_duration_secs: number;
+  bell: boolean;
+}
+
 export interface ConfigInfo {
   path: string;
   default_provider: string;
   default_workdir?: string;
   providers: ProviderInfo[];
+  /** Reusable connection identities. API keys are intentionally never returned. */
+  provider_accounts?: ProviderAccountInfo[];
+  /** Compiled provider catalog shared with the TUI add-provider flow. */
+  provider_presets?: ProviderPresetInfo[];
+  /** 完成通知配置；旧 daemon 未暴露时为 undefined，前端回退默认值。 */
+  notifications?: NotificationConfigInfo;
 }
 
 export async function getConfig(): Promise<ConfigInfo> {
@@ -569,6 +613,51 @@ export async function createProvider(body: CreateProviderBody): Promise<unknown>
   return r.json();
 }
 
+export interface CreateAccountModelBody {
+  selection_id?: string;
+  model: string;
+  display_name?: string;
+  context_window?: number;
+  max_tokens?: number;
+  supports_vision?: boolean;
+}
+
+export async function createModelsForAccount(
+  account: string,
+  models: CreateAccountModelBody[],
+): Promise<{ created: string[]; config: ConfigInfo }> {
+  const r = await fetch(`/provider-accounts/${encodeURIComponent(account)}/models`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ models }),
+  });
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({}));
+    throw new Error((e as { error?: string }).error || `HTTP ${r.status}`);
+  }
+  return r.json();
+}
+
+export async function discoverProviderModels(body: {
+  type: string;
+  base_url: string;
+  api_key?: string;
+  provider_name?: string;
+}): Promise<DiscoveredModelInfo[]> {
+  const r = await fetch('/providers/discover-models', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({}));
+    throw new Error((e as { error?: string }).error || `HTTP ${r.status}`);
+  }
+  const payload = await r.json() as { models?: unknown };
+  if (!Array.isArray(payload.models)) throw new Error('model discovery returned an invalid payload');
+  return payload.models as DiscoveredModelInfo[];
+}
+
 export async function deleteProvider(name: string): Promise<void> {
   const r = await fetch(`/providers/${encodeURIComponent(name)}`, { method: 'DELETE', headers: authHeaders() });
   if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error((e as any).error || `HTTP ${r.status}`); }
@@ -634,6 +723,19 @@ export async function mkdir(path: string): Promise<{ path: string }> {
   return r.json();
 }
 
+/** Open an existing file inside the active session's bound working directory. */
+export async function openWorkspaceFile(path: string, sessionId?: string): Promise<void> {
+  const r = await fetch('/fs/open', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ path, session_id: sessionId }),
+  });
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({}));
+    throw new Error((body as { error?: string }).error || `HTTP ${r.status}`);
+  }
+}
+
 // --- Change working directory ---
 
 export interface CdResponse {
@@ -697,6 +799,15 @@ export interface ApprovalModeResponse {
   mode: ApprovalMode;
 }
 
+export interface TurnStats {
+  duration_ms: number;
+  rounds: number;
+  tool_calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cached_tokens: number;
+}
+
 export type PolicyRecoveryAction =
   | 'complete_externally'
   | 'skip_step'
@@ -713,6 +824,7 @@ export interface PolicyInterventionEvent {
 export type LiveWireEvent =
   | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; mode: ApprovalMode }
   | { type: 'provider'; provider: string }
+  | { type: 'reasoning_effort'; provider: string; effort: string | null; applicable: boolean }
   | { type: 'mode'; mode: ApprovalMode }
   | { type: 'user'; text: string; images?: ImageData[]; client_input_id?: string }
   | { type: 'text'; content: string }
@@ -722,7 +834,7 @@ export type LiveWireEvent =
   | { type: 'tool_progress'; id: string; progress: string }
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
-  | { type: 'state'; running: boolean; stop_reason?: string; message?: string }
+  | { type: 'state'; running: boolean; stop_reason?: string; message?: string; stats?: TurnStats }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
   | { type: 'persistence_warning'; message: string }
@@ -943,9 +1055,9 @@ export async function getApprovalMode(): Promise<ApprovalMode> {
   return body.mode;
 }
 
-/** Set the DeepSeek V4 `reasoning_effort` for a provider. `effort` is
- *  'high' | 'max' | null (clear → model default). Persists to the provider
- *  config so the next turn (live or /chat) picks it up. */
+/** Set `reasoning_effort` for a provider endpoint. `effort` is
+ *  'low' | 'medium' | 'high' | 'max' | null (clear → model default).
+ *  Persists to the provider config so the next turn (live or /chat) picks it up. */
 export async function postLiveReasoningEffort(
   effort: string | null,
   provider?: string,
@@ -994,7 +1106,7 @@ export interface UserInputResponseBody {
 export interface UserInputRequestEvent {
   type: 'user_input_request';
   request_id: number;
-  /** Present on the `/chat` path; `/live` is already bound to one session. */
+  /** Session correlation. Session-scoped `/live` events may also carry this field. */
   session_id?: string;
   header: string;
   question: string;
@@ -1006,6 +1118,11 @@ export interface UserInputRequestEvent {
   /// Offer the "type your own answer" row for a single question. Absent ⇒ true.
   custom?: boolean;
 }
+
+/** A structured-input wire event after Chat records which transport emitted it. */
+export type RoutedUserInputRequest = UserInputRequestEvent & {
+  response_transport: 'chat' | 'live';
+};
 
 export function isUserInputBatch(req: UserInputRequestEvent): boolean {
   return Array.isArray(req.questions) && req.questions.length > 0;
@@ -1063,4 +1180,22 @@ export async function postChatUserInput(
     throw new Error(result.error ?? 'chat runtime did not accept the user input answer');
   }
   return result;
+}
+
+/**
+ * Answer a structured-input request through the transport that emitted it.
+ * A scoped `/live` event also has a `session_id`, so endpoint selection must
+ * use the explicit client-side transport marker rather than field presence.
+ */
+export function postUserInputAnswer(
+  req: RoutedUserInputRequest,
+  body: UserInputAnswer,
+): Promise<{ accepted: boolean }> {
+  if (req.response_transport === 'chat') {
+    if (!req.session_id) {
+      return Promise.reject(new Error('chat user input request is missing session_id'));
+    }
+    return postChatUserInput(req.session_id, body);
+  }
+  return postLiveUserInput(body);
 }

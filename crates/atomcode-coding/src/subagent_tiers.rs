@@ -62,11 +62,13 @@ mod tests {
             thinking_keep: None,
             reasoning_history: None,
             reasoning_effort: None,
+            reasoning_effort_levels: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: capable,
+            retry_max_attempts: None,
         }
     }
 

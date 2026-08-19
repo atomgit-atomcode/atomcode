@@ -408,6 +408,7 @@ mod tests {
     fn rec(session: &str, ts: i64, user: &str, assistant: &str) -> TurnRecord {
         TurnRecord {
             v: crate::session::transcript::RECORD_VERSION,
+            started_at: None,
             ts,
             iso: String::new(),
             session_id: session.into(),

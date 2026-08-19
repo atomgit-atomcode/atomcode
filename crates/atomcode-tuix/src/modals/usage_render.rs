@@ -249,7 +249,7 @@ pub fn braille_line_plot(
         let mut dy_prev = sample(0);
         // Plot the first dot
         {
-            let cell_x = 0 / 2;
+            let cell_x = 0;
             let cell_y = dy_prev / 4;
             let sub_col = 0 % 2;
             let sub_row = dy_prev % 4;

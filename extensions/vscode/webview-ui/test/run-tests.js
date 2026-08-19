@@ -25,6 +25,7 @@ async function main() {
     'session-list-regression.test.ts',
     'search.test.ts',
     'todo-regression.test.ts',
+    'tab-title-truncation.test.ts',
     'daemon-client-token.test.ts',
   ];
 

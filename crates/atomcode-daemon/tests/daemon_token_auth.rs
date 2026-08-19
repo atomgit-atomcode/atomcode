@@ -43,7 +43,11 @@ async fn chat_requires_token_health_is_public() {
         .send()
         .await
         .unwrap();
-    assert_eq!(no_tok.status(), 401, "protected route without token must 401");
+    assert_eq!(
+        no_tok.status(),
+        401,
+        "protected route without token must 401"
+    );
 
     let with_tok = reqwest::Client::new()
         .get(format!("{base}/models"))

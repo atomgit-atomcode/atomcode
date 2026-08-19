@@ -125,7 +125,7 @@ fn build_coding_agent_from_tools(
         // Keep hard credential policy ahead of every middleware that may return
         // `Allow` and short-circuit the remaining before-chain.
         .middleware(Arc::new(
-            atomcode_capabilities::tools::CredentialBashGate::new(),
+            atomcode_capabilities::tools::CredentialBashGate::new(cfg.credential_shell_policy),
         ));
     #[cfg(feature = "atomgit")]
     let builder = builder.middleware(Arc::new(

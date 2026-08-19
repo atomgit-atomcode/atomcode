@@ -52,7 +52,7 @@ pub use rewind::{
 };
 pub use snapshot::{RewindTransactionReceipt, SnapshotHook};
 pub use status_reminder::StatusReminderHook;
-pub use transcript::{ToolRecord, TranscriptHook, TurnRecord, UsageRecord};
+pub use transcript::{ToolRecord, TranscriptHook, TurnRecord, TurnTimestamp, UsageRecord};
 pub use usage_provider::UsageRecordingProvider;
 
 /// Current wall-clock as epoch MILLISECONDS, UTC. The single L1 time source the

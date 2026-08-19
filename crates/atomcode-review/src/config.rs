@@ -69,6 +69,11 @@ pub struct ReviewAgentConfig {
     /// skill with bundled `scripts/` / `references/`) or single `<name>.md` files.
     /// LOW→HIGH priority order (later dirs override earlier on name collision).
     pub skill_dirs: Vec<PathBuf>,
+    /// Review-scope path allowlist (repo-relative changed/reviewable files). Empty
+    /// (default) ⇒ tools only confined to the repo root. Non-empty ⇒ `read_file` /
+    /// `grep` / … may only touch these files and their ancestor directories — stops
+    /// the model from re-reading files already dropped from the diff (e.g. notes.md).
+    pub review_paths: Vec<String>,
 }
 
 impl ReviewAgentConfig {
@@ -96,6 +101,7 @@ impl ReviewAgentConfig {
             no_web: false,
             graph_max_indexed_files: usize::MAX, // no degrade by default (bare-CLI behavior)
             skill_dirs: Vec::new(), // no skills by default (bare-CLI behavior)
+            review_paths: Vec::new(), // no file allowlist by default (root-only confine)
         }
     }
 

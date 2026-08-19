@@ -17,6 +17,9 @@ use atomcode_capabilities::session::{
 };
 #[cfg(test)]
 use atomcode_capabilities::session::{PresentationFile, SessionMeta, StorageOwner};
+use atomcode_capabilities::tools::request_user_input::{
+    UserInputResponse, REQUEST_USER_INPUT_KIND,
+};
 use atomcode_capabilities::tools::{ApprovalResponse, APPROVAL_KIND};
 use atomcode_kernel::agent::AgentHandle;
 use atomcode_kernel::checkpoint::CompactionCheckpointError;
@@ -66,6 +69,13 @@ pub enum CodingRuntimeEvent {
     VisionPreprocessFailed {
         reason: String,
     },
+    /// Driver-correlation acknowledgement for inputs accepted as in-turn
+    /// steers. Unlike the kernel `AgentEvent::Steered`, these are the original
+    /// inputs submitted at the runtime boundary, before local-context or vision
+    /// preprocessing rewrites them.
+    SteerAcknowledged {
+        inputs: Vec<UserInput>,
+    },
     /// A potentially slow compaction strategy has started.
     CompactionStarted {
         trigger: CompactTrigger,
@@ -103,6 +113,14 @@ pub enum CodingRuntimeEvent {
     ProviderChanged {
         provider: String,
         model: String,
+    },
+    /// The active runtime adopted a new reasoning-effort setting. This is
+    /// separate from `ProviderChanged`: effort can change while provider/model
+    /// identity stays the same.
+    ReasoningEffortChanged {
+        provider: String,
+        effort: Option<atomcode_kernel::provider::ReasoningEffort>,
+        applicable: bool,
     },
     ProviderUnavailable {
         reason: ProviderUnavailableReason,
@@ -390,9 +408,29 @@ pub struct RuntimeRequest {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RuntimeTurnStats {
     pub last_usage: Option<MessageMeta>,
+    /// Sum of provider usage across every model round in this user turn.
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub cached_tokens: usize,
     pub duration: std::time::Duration,
     pub turn_count: usize,
     pub tool_call_count: usize,
+}
+
+impl RuntimeTurnStats {
+    fn record_usage(&mut self, meta: &MessageMeta) {
+        self.turn_count = self.turn_count.saturating_add(1);
+        self.prompt_tokens = self
+            .prompt_tokens
+            .saturating_add(meta.tokens.prompt as usize);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(meta.tokens.completion as usize);
+        self.cached_tokens = self
+            .cached_tokens
+            .saturating_add(meta.tokens.cached as usize);
+        self.last_usage = Some(meta.clone());
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -420,6 +458,65 @@ pub struct RuntimeSnapshotError {
 pub struct UserInput {
     pub text: String,
     pub images: Vec<ImageContent>,
+}
+
+/// One accepted in-turn submit, before and after runtime-owned preprocessing.
+///
+/// Kernel `Steered` events necessarily describe the input that reached the
+/// kernel. Drivers, however, correlate those acknowledgements with the input
+/// they submitted. Vision preprocessing and pending local context can rewrite
+/// that payload, so the runtime owner keeps the two projections together until
+/// the kernel confirms the fold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingSteerAcknowledgement {
+    generation: u64,
+    original: UserInput,
+    forwarded: UserInput,
+}
+
+fn acknowledge_steered_inputs(
+    pending: &mut VecDeque<PendingSteerAcknowledgement>,
+    generation: u64,
+    inputs: &[atomcode_kernel::event::SteeredInput],
+) -> Vec<UserInput> {
+    while pending
+        .front()
+        .is_some_and(|entry| entry.generation != generation)
+    {
+        pending.pop_front();
+    }
+
+    inputs
+        .iter()
+        .filter_map(|input| {
+            let matches_front = pending.front().is_some_and(|entry| {
+                entry.forwarded.text == input.text && entry.forwarded.images == input.images
+            });
+            if !matches_front {
+                return None;
+            }
+
+            Some(
+                pending
+                    .pop_front()
+                    .expect("front was checked above")
+                    .original,
+            )
+        })
+        .collect()
+}
+
+fn forwarded_steer_for_acknowledgement(
+    original: Option<&UserInput>,
+    command: &AgentCommand,
+) -> Option<UserInput> {
+    match (original, command) {
+        (Some(_), AgentCommand::SendMessage { text, images }) => Some(UserInput {
+            text: text.clone(),
+            images: images.clone(),
+        }),
+        _ => None,
+    }
 }
 
 /// Ordered, fire-and-forget driver requests. This is the native replacement for
@@ -485,6 +582,7 @@ pub enum SubmitReceipt {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeError {
     Busy,
+    Cancelled,
     SessionInUse { id: String },
     StaleRequest { id: RequestId },
     NoPendingPolicyIntervention,
@@ -504,6 +602,7 @@ impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Busy => f.write_str("coding runtime is busy"),
+            Self::Cancelled => f.write_str("coding runtime operation was cancelled"),
             Self::SessionInUse { id } => {
                 write!(f, "session {id:?} is already in use by another runtime")
             }
@@ -1475,6 +1574,26 @@ impl CodingRuntimeHandle {
             id: id.into(),
             working_dir,
             lease,
+            cancel: None,
+        })
+        .await
+    }
+
+    /// Resume with a driver-owned cancellation signal. Cancellation is honored
+    /// only while the replacement is still in preflight; after the persistence
+    /// commit point the runtime transition remains authoritative.
+    pub async fn resume_session_with_lease_cancelable(
+        &self,
+        id: impl Into<String>,
+        working_dir: std::path::PathBuf,
+        lease: SessionLease,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<SessionChanged, RuntimeError> {
+        self.reprepare_target(ReprepareTarget::ResumeWithLease {
+            id: id.into(),
+            working_dir,
+            lease,
+            cancel: Some(cancel),
         })
         .await
     }
@@ -2222,6 +2341,7 @@ pub enum ReprepareTarget {
         id: String,
         working_dir: std::path::PathBuf,
         lease: SessionLease,
+        cancel: Option<tokio_util::sync::CancellationToken>,
     },
     ChangeDirectory(std::path::PathBuf),
 }
@@ -2611,7 +2731,9 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut next_turn_id = 0u64;
         let mut conversation_revision = 0u64;
         let mut active_turn = None;
-        let mut pending_requests = BTreeSet::new();
+        // Keep each request kind until its correlated response is delivered.
+        // `request_user_input` image answers need runtime-owned preprocessing.
+        let mut pending_requests = BTreeMap::new();
         let mut pending_policy_intervention: Option<PolicyIntervention> = None;
         let mut snapshot_waiters: Vec<RuntimeSnapshotWaiter> = Vec::new();
         let mut snapshot_in_flight = false;
@@ -2623,6 +2745,7 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut cancel_pending = false;
         let mut turn_stats = RuntimeTurnStats::default();
         let mut turn_started_at: Option<std::time::Instant> = None;
+        let mut pending_steer_acknowledgements = VecDeque::new();
         let mut next_prompt_task: Option<tokio::task::JoinHandle<()>> = None;
         let mut pending_local_context = Vec::new();
         let mut next_controller_id = 0u64;
@@ -2677,6 +2800,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         if !compaction_suspended {
                             generation = generation.wrapping_add(1);
                             event_generation.store(generation, Ordering::Release);
+                            pending_steer_acknowledgements.clear();
                             compaction_suspended = true;
                             controls
                                 .state
@@ -2706,6 +2830,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         if !compaction_suspended {
                             generation = generation.wrapping_add(1);
                             event_generation.store(generation, Ordering::Release);
+                            pending_steer_acknowledgements.clear();
                         }
                         compaction_suspended = true;
                         controls
@@ -2774,6 +2899,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         if resume_after_replace {
                             generation = generation.wrapping_add(1);
                             event_generation.store(generation, Ordering::Release);
+                            pending_steer_acknowledgements.clear();
                             compaction_suspended = true;
                             controls
                                 .state
@@ -2851,6 +2977,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         if !compaction_suspended {
                             generation = generation.wrapping_add(1);
                             event_generation.store(generation, Ordering::Release);
+                            pending_steer_acknowledgements.clear();
                         }
                         controls
                             .state
@@ -2969,7 +3096,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     }
                     let mut finish_reason = None;
                     let mut continuation = None;
-                    // Only GoalResult::Met keeps the goal registered after the turn ends.
+                    // GoalResult::Met keeps the goal registered after the turn ends.
                     // All other finish_reason paths (e.g. evaluator Error) must still clear it.
                     let mut keep_goal_on_eval = false;
                     match outcome.result {
@@ -2995,6 +3122,23 @@ fn spawn_runtime_owner_with_optional_agent(
                                     Some(goal_continuation_message(&verdict, &state.condition));
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
+                        }
+                        GoalResult::Inconclusive(reason) => {
+                            // The evaluator returned no usable verdict (e.g. an
+                            // empty stream). This is NOT a failure of the agent's
+                            // work and NOT a provider error: the evaluator simply
+                            // produced nothing to judge. End the goal as Stopped
+                            // (not Failed) and skip the red ControllerWarning —
+                            // repeatedly yelling about an empty verdict made the
+                            // agent spin in pointless retries (issue #17).
+                            if let Some(state) = goal.as_mut() {
+                                state.finish(
+                                    GoalTerminal::Stopped,
+                                    format!("goal evaluation inconclusive: {reason}"),
+                                );
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                            }
+                            finish_reason = Some(StopReason::Stopped);
                         }
                         GoalResult::Error(error) => {
                             if let Some(state) = goal.as_mut() {
@@ -3319,6 +3463,8 @@ fn spawn_runtime_owner_with_optional_agent(
                                 turn_id: next_turn_id,
                             }
                         };
+                        let original_steer_input = matches!(receipt, SubmitReceipt::Steered { .. })
+                            .then(|| input.clone());
                         if !pending_local_context.is_empty() {
                             let prefix = pending_local_context.drain(..).collect::<Vec<_>>().join("\n\n");
                             input.text = if input.text.is_empty() {
@@ -3390,7 +3536,28 @@ fn spawn_runtime_owner_with_optional_agent(
                                 images: input.images,
                             },
                         };
+                        // Only a plain `SendMessage` can enter the kernel's
+                        // in-turn steer buffer. A context-bearing message is
+                        // deliberately queued by the kernel for the next turn,
+                        // so registering it here would leave an acknowledgement
+                        // at the FIFO head that can never match `Steered` and
+                        // would block every later acknowledgement behind it.
+                        let forwarded_steer_input = forwarded_steer_for_acknowledgement(
+                            original_steer_input.as_ref(),
+                            &command,
+                        );
                         if send_agent_command(&agent, command) {
+                            if let (Some(original), Some(forwarded)) =
+                                (original_steer_input, forwarded_steer_input)
+                            {
+                                pending_steer_acknowledgements.push_back(
+                                    PendingSteerAcknowledgement {
+                                        generation,
+                                        original,
+                                        forwarded,
+                                    },
+                                );
+                            }
                             let _ = done.send(Ok(receipt));
                         } else {
                             agent_available = false;
@@ -3410,23 +3577,35 @@ fn spawn_runtime_owner_with_optional_agent(
                     }) => {
                         if !native_protocol || request_generation != generation || !agent_available {
                             let _ = done.send(Err(RuntimeError::Unavailable));
-                        } else if !pending_requests.remove(&id) {
+                        } else if !pending_requests.contains_key(&id) {
                             let _ = done.send(Err(RuntimeError::StaleRequest { id }));
-                        } else if !send_agent_command(&agent, AgentCommand::Respond { id, value }) {
-                            agent_available = false;
-                            controls.state.store(
-                                runtime_phase_state(generation, RuntimePhase::Failed),
-                                Ordering::Release,
-                            );
-                            let _ = done.send(Err(RuntimeError::DeliveryFailed));
                         } else {
-                            if pending_requests.is_empty() {
+                            let kind = pending_requests
+                                .remove(&id)
+                                .expect("pending request checked above");
+                            let value = preprocess_request_response(
+                                &kind,
+                                value,
+                                resources.as_ref(),
+                                &runtime_event_tx,
+                            )
+                            .await;
+                            if !send_agent_command(&agent, AgentCommand::Respond { id, value }) {
+                                agent_available = false;
                                 controls.state.store(
-                                    runtime_phase_state(generation, RuntimePhase::InTurn),
+                                    runtime_phase_state(generation, RuntimePhase::Failed),
                                     Ordering::Release,
                                 );
+                                let _ = done.send(Err(RuntimeError::DeliveryFailed));
+                            } else {
+                                if pending_requests.is_empty() {
+                                    controls.state.store(
+                                        runtime_phase_state(generation, RuntimePhase::InTurn),
+                                        Ordering::Release,
+                                    );
+                                }
+                                let _ = done.send(Ok(()));
                             }
-                            let _ = done.send(Ok(()));
                         }
                     }
                     Some(CodingRuntimeControl::ResolvePolicyIntervention {
@@ -3795,7 +3974,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 runtime.loop_active.store(false, Ordering::Release);
                             }
                             pending_wakeup = None;
-                            for id in pending_requests.iter().copied() {
+                            for id in pending_requests.keys().copied() {
                                 let _ = send_agent_command(&agent, AgentCommand::Respond {
                                     id,
                                     value: serde_json::Value::Null,
@@ -3861,7 +4040,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             cancel_pending = false;
                             let _ = done.send(Ok(()));
                         } else {
-                            for id in pending_requests.iter().copied() {
+                            for id in pending_requests.keys().copied() {
                                 let _ = send_agent_command(&agent, AgentCommand::Respond {
                                     id,
                                     value: serde_json::Value::Null,
@@ -4083,9 +4262,12 @@ fn spawn_runtime_owner_with_optional_agent(
                         next.subagent_fast_provider = runtime.config.subagent_fast_provider.clone();
                         next.subagent_capable_provider =
                             runtime.config.subagent_capable_provider.clone();
+                        next.subagent_model_providers =
+                            runtime.config.subagent_model_providers.clone();
                         let refresh_routing = if let Some(config) = routing {
                             if next.subagent_fast_provider.is_none()
                                 && next.subagent_capable_provider.is_none()
+                                && next.subagent_model_providers.is_none()
                             {
                                 crate::provider_factory::install_subagent_tiers(
                                     runtime.provider_factory.clone(),
@@ -4222,6 +4404,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 agent = Some(candidate.spawn());
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
+                                pending_steer_acknowledgements.clear();
                                 // Do NOT begin a new team generation here: a `/model`
                                 // reassemble keeps the session, so in-flight team runs
                                 // (and their events) must survive rather than be cancelled.
@@ -4237,6 +4420,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                 compaction_suspended = false;
                                 let provider = runtime.config.provider_name.clone();
                                 let model = runtime.config.model.clone();
+                                let reasoning_effort = runtime.config.chat_options.reasoning_effort;
+                                let reasoning_effort_applicable =
+                                    runtime.config.supports_reasoning_effort;
                                 replay_pending_resume_prompt(
                                     &agent,
                                     Some(&mut runtime),
@@ -4255,7 +4441,17 @@ fn spawn_runtime_owner_with_optional_agent(
                                     );
                                 }
                                 let _ = runtime_event_tx.send(
-                                    CodingRuntimeEvent::ProviderChanged { provider, model },
+                                    CodingRuntimeEvent::ProviderChanged {
+                                        provider: provider.clone(),
+                                        model,
+                                    },
+                                );
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::ReasoningEffortChanged {
+                                        provider,
+                                        effort: reasoning_effort,
+                                        applicable: reasoning_effort_applicable,
+                                    },
                                 );
                                 let _ = runtime_event_tx.send(
                                     CodingRuntimeEvent::Reconfigured {
@@ -4312,6 +4508,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                                 ),
                                                 http_status: None,
                                                 code: None,
+                                                retryable: None,
                                             }),
                                         );
                                     }
@@ -4432,6 +4629,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         generation = generation.wrapping_add(1);
                         event_generation.store(generation, Ordering::Release);
+                        pending_steer_acknowledgements.clear();
                         agent_available = false;
                         provider_unavailable_reason = Some(reason);
                         controls.provider_unavailable_reason.store(
@@ -4485,7 +4683,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         // A same-directory ChangeDirectory resolves to no input: the current
                         // runtime remains authoritative, with no candidate session, generation
                         // advance, or reconfiguration events.
-                        let Some((input, prepared_lease)) = resolved else {
+                        let Some((input, prepared_lease, reprepare_cancel)) = resolved else {
                             let unchanged = session_changed(generation, &runtime);
                             resources = Some(runtime);
                             let _ = done.send(Ok(unchanged));
@@ -4539,14 +4737,32 @@ fn spawn_runtime_owner_with_optional_agent(
                         let reuse_lease = prepared_lease.or_else(|| {
                             matching_session_lease(&runtime.parts, &input.prepare.session)
                         });
-                        let candidate_parts = prepare_with_plugin_hook_source_reusing_lease(
+                        let prepare_candidate = prepare_with_plugin_hook_source_reusing_lease(
                             &input.config,
                             input.prepare.clone(),
                             runtime.plugin_hooks.as_ref(),
                             reuse_lease,
                             true,
-                        )
-                        .await;
+                        );
+                        let candidate_parts = match reprepare_cancel.as_ref() {
+                            Some(cancel) => {
+                                tokio::select! {
+                                    biased;
+                                    _ = cancel.cancelled() => Err(RuntimeError::Cancelled),
+                                    result = tokio::time::timeout(
+                                        std::time::Duration::from_secs(30),
+                                        prepare_candidate,
+                                    ) => match result {
+                                        Ok(result) => result.map_err(runtime_prepare_error),
+                                        Err(_) => Err(RuntimeError::ReconfigureFailed(
+                                            "session resume preflight timed out after 30 seconds"
+                                                .to_string(),
+                                        )),
+                                    },
+                                }
+                            }
+                            None => prepare_candidate.await.map_err(runtime_prepare_error),
+                        };
                         let mut candidate = match candidate_parts {
                             Ok(parts) => RuntimeResources {
                                 config: input.config,
@@ -4561,7 +4777,6 @@ fn spawn_runtime_owner_with_optional_agent(
                                 image_preprocessor: runtime.image_preprocessor.clone(),
                             },
                             Err(error) => {
-                                let error = runtime_prepare_error(error);
                                 controls.state.store(
                                     runtime_phase_state(generation, previous_phase),
                                     Ordering::Release,
@@ -4720,6 +4935,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         agent = Some(replacement);
                         generation = generation.wrapping_add(1);
                         event_generation.store(generation, Ordering::Release);
+                        pending_steer_acknowledgements.clear();
                         runtime
                             .parts
                             .team_manager
@@ -4824,6 +5040,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             ),
                                             http_status: None,
                                             code: None,
+                                            retryable: None,
                                         },
                                     ));
                                 }
@@ -4878,6 +5095,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 agent = Some(replacement);
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
+                                pending_steer_acknowledgements.clear();
                                 runtime.parts.team_manager.begin_generation(generation);
                                 agent_available = true;
                                 observed_tokens = None;
@@ -4926,6 +5144,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             ),
                                             http_status: None,
                                             code: None,
+                                            retryable: None,
                                         },
                                     ));
                                 } else {
@@ -4958,6 +5177,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                                     ),
                                                     http_status: None,
                                                     code: None,
+                                                    retryable: None,
                                                 }),
                                             );
                                         }
@@ -5062,6 +5282,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 agent = Some(replacement);
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
+                                pending_steer_acknowledgements.clear();
                                 runtime.parts.team_manager.begin_generation(generation);
                                 agent_available = true;
                                 observed_tokens = None;
@@ -5123,6 +5344,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             ),
                                             http_status: None,
                                             code: None,
+                                            retryable: None,
                                         },
                                     ));
                                 } else {
@@ -5155,6 +5377,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                                     ),
                                                     http_status: None,
                                                     code: None,
+                                                    retryable: None,
                                                 }),
                                             );
                                         }
@@ -5516,6 +5739,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     message: message.clone(),
                                     http_status: None,
                                     code: None,
+                                    retryable: None,
                                 },
                             ));
                             if let Some(turn_id) = active_turn.take() {
@@ -5552,8 +5776,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                             AgentEvent::Usage(meta) => {
                                 observed_tokens = Some(meta.used_tokens as usize);
-                                turn_stats.turn_count = turn_stats.turn_count.saturating_add(1);
-                                turn_stats.last_usage = Some(meta.clone());
+                                turn_stats.record_usage(&meta);
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(
                                     AgentEvent::Usage(meta),
                                 ));
@@ -5582,7 +5805,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     // teardown will fail it closed; never claim success for a
                                     // response that did not reach the kernel.
                                 }
-                                pending_requests.insert(id);
+                                pending_requests.insert(id, kind.clone());
                                 controls.state.store(
                                     runtime_phase_state(
                                         generation,
@@ -5603,6 +5826,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 ));
                             }
                             AgentEvent::TurnComplete { reason } => {
+                                pending_steer_acknowledgements.clear();
                                 let persistence_status = resources.as_ref().and_then(|runtime| {
                                     runtime.parts.snapshot_persistence_status()
                                 });
@@ -5658,6 +5882,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             message: message.clone(),
                                             http_status: None,
                                             code: None,
+                                            retryable: None,
                                         },
                                     ));
                                     let _ = runtime_event_tx.send(
@@ -6100,6 +6325,23 @@ fn spawn_runtime_owner_with_optional_agent(
                                     turn_stats.tool_call_count.saturating_add(1);
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(event));
                             }
+                            AgentEvent::Steered { count, inputs } => {
+                                let acknowledged = acknowledge_steered_inputs(
+                                    &mut pending_steer_acknowledgements,
+                                    generation,
+                                    &inputs,
+                                );
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(
+                                    AgentEvent::Steered { count, inputs },
+                                ));
+                                if !acknowledged.is_empty() {
+                                    let _ = runtime_event_tx.send(
+                                        CodingRuntimeEvent::SteerAcknowledged {
+                                            inputs: acknowledged,
+                                        },
+                                    );
+                                }
+                            }
                             event => {
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(event));
                             }
@@ -6334,13 +6576,111 @@ fn reject_runtime_control(
     }
 }
 
+/// Apply normal turn vision preprocessing to images attached while answering
+/// `request_user_input`; tool responses otherwise bypass the submit boundary.
+async fn preprocess_request_response(
+    kind: &str,
+    mut value: serde_json::Value,
+    resources: Option<&RuntimeResources>,
+    runtime_event_tx: &RuntimeEventEmitter,
+) -> serde_json::Value {
+    if kind != REQUEST_USER_INPUT_KIND {
+        return value;
+    }
+    let Some(runtime) = resources else {
+        return value;
+    };
+    // Native multimodal models must receive the original image bytes.
+    if runtime.config.supports_vision {
+        return value;
+    }
+    let Some(preprocessor) = runtime.image_preprocessor.clone() else {
+        return value;
+    };
+    let session_id = runtime
+        .parts
+        .session
+        .as_ref()
+        .map(|binding| binding.id.clone());
+
+    if let Some(responses) = value
+        .get_mut("responses")
+        .and_then(|item| item.as_array_mut())
+    {
+        let pending = std::mem::take(responses);
+        *responses = futures::future::join_all(pending.into_iter().map(|response| {
+            preprocess_one_user_input_response(
+                response,
+                preprocessor.as_ref(),
+                session_id.clone(),
+                runtime_event_tx,
+            )
+        }))
+        .await;
+    } else {
+        value = preprocess_one_user_input_response(
+            value,
+            preprocessor.as_ref(),
+            session_id,
+            runtime_event_tx,
+        )
+        .await;
+    }
+    value
+}
+
+async fn preprocess_one_user_input_response(
+    value: serde_json::Value,
+    preprocessor: &dyn ImagePreprocessor,
+    session_id: Option<String>,
+    runtime_event_tx: &RuntimeEventEmitter,
+) -> serde_json::Value {
+    let Ok(mut response) = serde_json::from_value::<UserInputResponse>(value.clone()) else {
+        return value;
+    };
+    if response.images.is_empty() {
+        return value;
+    }
+
+    // Choice-mode answers keep their selected labels in `selected`; using them
+    // as the VL caption would duplicate those labels in the formatted tool
+    // result. Only free-form text belongs in the recognition prompt.
+    let prompt = response.text.clone().unwrap_or_default();
+    let (processed, notice) = preprocessor
+        .preprocess(
+            prompt,
+            std::mem::take(&mut response.images),
+            false,
+            session_id,
+        )
+        .await;
+    response.text = (!processed.text.is_empty()).then_some(processed.text);
+    response.images = processed.images;
+    match notice {
+        Some(VisionNotice::Recognised {
+            vl_model,
+            char_count,
+        }) => {
+            let _ = runtime_event_tx.send(CodingRuntimeEvent::VisionPreprocessSuccess {
+                vl_model,
+                char_count,
+            });
+        }
+        Some(VisionNotice::Failed { reason }) => {
+            let _ = runtime_event_tx.send(CodingRuntimeEvent::VisionPreprocessFailed { reason });
+        }
+        None => {}
+    }
+    serde_json::to_value(response).unwrap_or(value)
+}
+
 fn fail_close_pending_requests(
     agent: &Option<AgentHandle>,
-    pending_requests: &mut BTreeSet<RequestId>,
+    pending_requests: &mut BTreeMap<RequestId, String>,
     cancel_turn: bool,
 ) {
     if let Some(agent) = agent.as_ref() {
-        for id in pending_requests.iter().copied() {
+        for id in pending_requests.keys().copied() {
             let _ = agent.commands.send(AgentCommand::Respond {
                 id,
                 value: serde_json::Value::Null,
@@ -6419,9 +6759,16 @@ async fn receive_agent_event(agent: &mut Option<AgentHandle>) -> Option<AgentEve
 fn resolve_reprepare_input(
     runtime: &RuntimeResources,
     target: ReprepareTarget,
-) -> Result<Option<(ReprepareInput, Option<SessionLease>)>, RuntimeError> {
+) -> Result<
+    Option<(
+        ReprepareInput,
+        Option<SessionLease>,
+        Option<tokio_util::sync::CancellationToken>,
+    )>,
+    RuntimeError,
+> {
     match target {
-        ReprepareTarget::Exact(input) => Ok(Some((input, None))),
+        ReprepareTarget::Exact(input) => Ok(Some((input, None, None))),
         ReprepareTarget::Reload { plugin_skill_dirs } => {
             let mut prepare = runtime.prepare.clone();
             if let Some(plugin_skill_dirs) = plugin_skill_dirs {
@@ -6438,6 +6785,7 @@ fn resolve_reprepare_input(
                     operation: ReconfigureKind::Reprepare,
                 },
                 None,
+                None,
             )))
         }
         ReprepareTarget::ReloadConfig(config) => {
@@ -6453,6 +6801,7 @@ fn resolve_reprepare_input(
                     operation: ReconfigureKind::Reprepare,
                 },
                 None,
+                None,
             )))
         }
         ReprepareTarget::Fresh => {
@@ -6464,6 +6813,7 @@ fn resolve_reprepare_input(
                     prepare,
                     operation: ReconfigureKind::FreshSession,
                 },
+                None,
                 None,
             )))
         }
@@ -6477,12 +6827,14 @@ fn resolve_reprepare_input(
                     operation: ReconfigureKind::ResumeSession,
                 },
                 None,
+                None,
             )))
         }
         ReprepareTarget::ResumeWithLease {
             id,
             working_dir,
             lease,
+            cancel,
         } => {
             if lease.id() != id {
                 return Err(RuntimeError::ReconfigureFailed(format!(
@@ -6517,6 +6869,7 @@ fn resolve_reprepare_input(
                     operation: ReconfigureKind::ResumeSession,
                 },
                 Some(lease),
+                cancel,
             )))
         }
         ReprepareTarget::ChangeDirectory(directory) => {
@@ -6556,6 +6909,7 @@ fn resolve_reprepare_input(
                     prepare,
                     operation: ReconfigureKind::ChangeDirectory,
                 },
+                None,
                 None,
             )))
         }
@@ -6647,6 +7001,7 @@ fn build_goal_evaluator_provider(
                 evaluator.skip_tls_verify = resolved.skip_tls_verify;
                 evaluator.subagent_fast_provider = None;
                 evaluator.subagent_capable_provider = None;
+                evaluator.subagent_model_providers = None;
                 evaluator.subagent_config = None;
                 // An evaluator is an independent provider boundary. Never let a
                 // missing target credential/endpoint inherit the host provider's
@@ -7331,6 +7686,7 @@ fn fail_close_after_stopped_persistence(
         message: message.clone(),
         http_status: None,
         code: None,
+        retryable: None,
     }));
     Some(RuntimeError::ReconfigureFailed(message))
 }
@@ -7400,6 +7756,7 @@ fn fail_close_after_forced_provider_stop(
         message: message.to_string(),
         http_status: None,
         code: None,
+        retryable: None,
     }));
 }
 
@@ -7529,6 +7886,149 @@ async fn resolve_goal_round_cap(
 mod tests {
     use super::*;
 
+    fn test_image(data: &str) -> ImageContent {
+        ImageContent {
+            media_type: "image/png".into(),
+            data: data.into(),
+        }
+    }
+
+    #[test]
+    fn steered_acknowledgement_restores_preprocessed_original_input() {
+        let original = UserInput {
+            text: "before\n[Image #1]\nafter".into(),
+            images: vec![test_image("raw-image")],
+        };
+        let forwarded = UserInput {
+            text: "before\n[image description]\nafter".into(),
+            images: Vec::new(),
+        };
+        let mut pending = VecDeque::from([PendingSteerAcknowledgement {
+            generation: 7,
+            original: original.clone(),
+            forwarded: forwarded.clone(),
+        }]);
+
+        let acknowledged = acknowledge_steered_inputs(
+            &mut pending,
+            7,
+            &[atomcode_kernel::event::SteeredInput {
+                text: forwarded.text,
+                images: forwarded.images,
+            }],
+        );
+
+        assert_eq!(acknowledged, vec![original]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn steered_acknowledgement_does_not_consume_an_unrelated_client_input() {
+        let original = UserInput::from("local");
+        let mut pending = VecDeque::from([PendingSteerAcknowledgement {
+            generation: 4,
+            original: original.clone(),
+            forwarded: UserInput::from("local-forwarded"),
+        }]);
+        let remote = atomcode_kernel::event::SteeredInput {
+            text: "remote".into(),
+            images: Vec::new(),
+        };
+
+        assert_eq!(
+            acknowledge_steered_inputs(&mut pending, 4, &[remote]),
+            Vec::<UserInput>::new()
+        );
+        assert_eq!(pending.len(), 1);
+
+        let local = acknowledge_steered_inputs(
+            &mut pending,
+            4,
+            &[atomcode_kernel::event::SteeredInput {
+                text: "local-forwarded".into(),
+                images: Vec::new(),
+            }],
+        );
+        assert_eq!(local[0].text, original.text);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn steered_acknowledgement_drops_stale_generation_state() {
+        let mut pending = VecDeque::from([PendingSteerAcknowledgement {
+            generation: 2,
+            original: UserInput::from("old"),
+            forwarded: UserInput::from("same"),
+        }]);
+        let current = atomcode_kernel::event::SteeredInput {
+            text: "same".into(),
+            images: Vec::new(),
+        };
+
+        assert_eq!(
+            acknowledge_steered_inputs(&mut pending, 3, &[current]),
+            Vec::<UserInput>::new()
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn context_bearing_next_turn_is_not_registered_as_a_steer_acknowledgement() {
+        let original = UserInput::from("continue");
+        let command = AgentCommand::SendMessageWithContext {
+            text: "continue".into(),
+            images: Vec::new(),
+            context: "recovery".into(),
+        };
+
+        assert_eq!(
+            forwarded_steer_for_acknowledgement(Some(&original), &command),
+            None
+        );
+    }
+
+    #[test]
+    fn plain_in_turn_message_is_registered_as_a_steer_acknowledgement() {
+        let original = UserInput::from("original");
+        let command = AgentCommand::SendMessage {
+            text: "processed".into(),
+            images: Vec::new(),
+        };
+
+        assert_eq!(
+            forwarded_steer_for_acknowledgement(Some(&original), &command),
+            Some(UserInput::from("processed"))
+        );
+    }
+
+    #[test]
+    fn runtime_turn_stats_sum_usage_across_rounds() {
+        let mut stats = RuntimeTurnStats::default();
+        for tokens in [
+            atomcode_kernel::stream::TokenUsage {
+                prompt: 100,
+                completion: 10,
+                cached: 80,
+            },
+            atomcode_kernel::stream::TokenUsage {
+                prompt: 150,
+                completion: 20,
+                cached: 120,
+            },
+        ] {
+            stats.record_usage(&MessageMeta {
+                tokens,
+                ..Default::default()
+            });
+        }
+
+        assert_eq!(stats.turn_count, 2);
+        assert_eq!(stats.prompt_tokens, 250);
+        assert_eq!(stats.completion_tokens, 30);
+        assert_eq!(stats.cached_tokens, 200);
+        assert_eq!(stats.last_usage.unwrap().tokens.prompt, 150);
+    }
+
     fn team_event(
         generation: u64,
         run: &str,
@@ -7580,7 +8080,10 @@ mod tests {
             ),
         )
         .expect("ordered terminal must be delivered");
-        assert!(matches!(terminal.payload, TeamEventPayload::RunFinished { .. }));
+        assert!(matches!(
+            terminal.payload,
+            TeamEventPayload::RunFinished { .. }
+        ));
     }
 
     #[derive(Debug)]
@@ -8029,6 +8532,23 @@ mod tests {
         }
     }
 
+    /// A provider whose stream yields NO text — simulating an evaluator that
+    /// returns an empty response (issue #17). The goal must end as `Stopped`
+    /// (not `Failed`) and must NOT emit a `ControllerWarning` spam line.
+    struct GoalInconclusiveProviderFactory;
+
+    impl CodingProviderFactory for GoalInconclusiveProviderFactory {
+        fn build(
+            &self,
+            _config: &CodingAgentConfig,
+            _session_id: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+            Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(vec![vec![
+                atomcode_kernel::stream::StreamEvent::Done { truncated: false },
+            ]])))
+        }
+    }
+
     impl CodingProviderFactory for GoalMetProviderFactory {
         fn build(
             &self,
@@ -8148,11 +8668,13 @@ mod tests {
             thinking_keep: None,
             reasoning_history: None,
             reasoning_effort: None,
+            reasoning_effort_levels: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: Some(rank),
+            retry_max_attempts: None,
         }
     }
 
@@ -9182,6 +9704,99 @@ mod tests {
                 .await
                 .is_err(),
             "an evaluator failure must not dispatch a synthetic main-agent retry"
+        );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_evaluator_response_ends_goal_stopped_without_warning_spam() {
+        // Regression for issue #17: when the goal evaluator returns an EMPTY
+        // stream, the goal must end as `Stopped` (the agent's work is not failed)
+        // and the runtime must NOT emit the `goal evaluator failed` warning line
+        // that previously spammed the transcript and made the agent retry.
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            _wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(GoalInconclusiveProviderFactory)).await;
+
+        handle.start_goal("tests pass").await.unwrap();
+        let _ = runtime_events.recv().await;
+        handle
+            .submit(UserInput::from("initial turn"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+            })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("done", vec![])]),
+            })
+            .unwrap();
+
+        let mut saw_stopped_goal = false;
+        let mut saw_failed_goal = false;
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                        active: false,
+                        terminal: Some(GoalTerminal::Stopped),
+                        ..
+                    })) => saw_stopped_goal = true,
+                    Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                        active: false,
+                        terminal: Some(GoalTerminal::Failed),
+                        ..
+                    })) => saw_failed_goal = true,
+                    Some(CodingRuntimeEvent::TurnFinished(completion)) => break completion,
+                    Some(CodingRuntimeEvent::ControllerWarning(_)) => {
+                        panic!("empty evaluator response must not emit a ControllerWarning")
+                    }
+                    Some(_) => {}
+                    None => panic!("runtime events closed before goal terminal"),
+                }
+            }
+        })
+        .await
+        .expect("empty evaluator response lost the held terminal");
+        assert!(
+            saw_stopped_goal,
+            "empty evaluator response must end the goal as Stopped, not Failed"
+        );
+        assert!(
+            !saw_failed_goal,
+            "empty evaluator response must not mark the goal Failed"
+        );
+        assert!(matches!(
+            terminal,
+            TurnCompletion::Completed {
+                reason: StopReason::Stopped,
+                ..
+            }
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), kernel_commands.recv())
+                .await
+                .is_err(),
+            "an inconclusive evaluation must not dispatch a synthetic main-agent retry"
         );
 
         handle.shutdown().await.unwrap();
@@ -11409,25 +12024,56 @@ mod tests {
         }
     }
 
+    struct ConcurrentPreprocessor {
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        max_active: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ImagePreprocessor for ConcurrentPreprocessor {
+        async fn preprocess(
+            &self,
+            text: String,
+            _images: Vec<ImageContent>,
+            _supports_vision: bool,
+            _session_id: Option<String>,
+        ) -> (UserInput, Option<VisionNotice>) {
+            let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+            self.max_active.fetch_max(active, Ordering::AcqRel);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            (
+                UserInput {
+                    text: format!("VL[{text}]"),
+                    images: Vec::new(),
+                },
+                None,
+            )
+        }
+    }
+
     async fn spawn_with_preprocessor(
         pp: Option<Arc<dyn ImagePreprocessor>>,
+        supports_vision: bool,
     ) -> (
         CodingRuntimeHandle,
         mpsc::UnboundedReceiver<AgentCommand>,
+        mpsc::UnboundedSender<AgentEvent>,
         mpsc::UnboundedReceiver<CodingRuntimeEvent>,
         KernelRuntimeAdapter,
     ) {
-        let (agent, kernel_commands, _kernel_events) = fake_agent();
+        let (agent, kernel_commands, kernel_events) = fake_agent();
         let (handle, controls) = coding_runtime_control_channel();
         let (runtime_tx, runtime_events) = mpsc::unbounded_channel();
         let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
         let CodingRuntimeStart {
-            agent: config,
+            agent: mut config,
             prepare,
             provider_factory,
             plugin_hooks,
             ..
         } = native_start(false);
+        config.supports_vision = supports_vision;
         let parts =
             prepare_with_plugin_hook_source(&config, prepare.clone(), plugin_hooks.as_ref())
                 .await
@@ -11452,7 +12098,13 @@ mod tests {
             Some(resources),
             Some(wakeup_rx),
         );
-        (handle, kernel_commands, runtime_events, adapter)
+        (
+            handle,
+            kernel_commands,
+            kernel_events,
+            runtime_events,
+            adapter,
+        )
     }
 
     // The installed preprocessor runs on an image-carrying submit, and its
@@ -11461,10 +12113,13 @@ mod tests {
     #[tokio::test]
     async fn image_submit_runs_installed_preprocessor_before_kernel() {
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (handle, mut kernel_commands, mut runtime_events, _adapter) =
-            spawn_with_preprocessor(Some(Arc::new(RecordingPreprocessor {
-                called: called.clone(),
-            })))
+        let (handle, mut kernel_commands, _kernel_events, mut runtime_events, _adapter) =
+            spawn_with_preprocessor(
+                Some(Arc::new(RecordingPreprocessor {
+                    called: called.clone(),
+                })),
+                false,
+            )
             .await;
 
         handle
@@ -11508,15 +12163,250 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn request_user_input_image_response_runs_preprocessor_for_text_model() {
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (handle, mut kernel_commands, kernel_events, mut runtime_events, _adapter) =
+            spawn_with_preprocessor(
+                Some(Arc::new(RecordingPreprocessor {
+                    called: called.clone(),
+                })),
+                false,
+            )
+            .await;
+
+        kernel_events
+            .send(AgentEvent::Request {
+                id: 7,
+                kind: REQUEST_USER_INPUT_KIND.into(),
+                payload: serde_json::json!({"question": "show me"}),
+            })
+            .unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::Request(RuntimeRequest { id: 7, .. }))
+        ));
+
+        let response = UserInputResponse {
+            declined: false,
+            selected: vec!["[Image #1]".into()],
+            text: None,
+            images: vec![test_image("raw-image")],
+        };
+        handle
+            .respond(7, serde_json::to_value(response).unwrap())
+            .await
+            .unwrap();
+
+        match kernel_commands.recv().await {
+            Some(AgentCommand::Respond { id: 7, value }) => {
+                let response: UserInputResponse = serde_json::from_value(value).unwrap();
+                assert_eq!(response.selected, vec!["[Image #1]"]);
+                assert_eq!(response.text.as_deref(), Some("VL[]"));
+                assert!(response.images.is_empty());
+            }
+            other => panic!("expected preprocessed Respond, got {other:?}"),
+        }
+        assert!(called.load(Ordering::Acquire));
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::VisionPreprocessSuccess { char_count: 3, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_user_input_batch_images_preprocess_concurrently_in_original_order() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (handle, mut kernel_commands, kernel_events, mut runtime_events, _adapter) =
+            spawn_with_preprocessor(
+                Some(Arc::new(ConcurrentPreprocessor {
+                    active: active.clone(),
+                    max_active: max_active.clone(),
+                })),
+                false,
+            )
+            .await;
+
+        kernel_events
+            .send(AgentEvent::Request {
+                id: 9,
+                kind: REQUEST_USER_INPUT_KIND.into(),
+                payload: serde_json::json!({"question": "show me"}),
+            })
+            .unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::Request(RuntimeRequest { id: 9, .. }))
+        ));
+
+        let responses = vec![
+            UserInputResponse {
+                declined: false,
+                selected: Vec::new(),
+                text: Some("first".into()),
+                images: vec![test_image("first-image")],
+            },
+            UserInputResponse {
+                declined: false,
+                selected: Vec::new(),
+                text: Some("second".into()),
+                images: vec![test_image("second-image")],
+            },
+        ];
+        handle
+            .respond(9, serde_json::json!({ "responses": responses }))
+            .await
+            .unwrap();
+
+        match kernel_commands.recv().await {
+            Some(AgentCommand::Respond { id: 9, value }) => {
+                let responses = value["responses"].as_array().unwrap();
+                assert_eq!(responses[0]["text"], "VL[first]");
+                assert_eq!(responses[1]["text"], "VL[second]");
+            }
+            other => panic!("expected preprocessed batch Respond, got {other:?}"),
+        }
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert!(
+            max_active.load(Ordering::Acquire) >= 2,
+            "batch image preprocessing should overlap"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_user_input_image_response_preserves_native_vision_images() {
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (handle, mut kernel_commands, kernel_events, mut runtime_events, _adapter) =
+            spawn_with_preprocessor(
+                Some(Arc::new(RecordingPreprocessor {
+                    called: called.clone(),
+                })),
+                true,
+            )
+            .await;
+        kernel_events
+            .send(AgentEvent::Request {
+                id: 8,
+                kind: REQUEST_USER_INPUT_KIND.into(),
+                payload: serde_json::json!({"question": "show me"}),
+            })
+            .unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::Request(RuntimeRequest { id: 8, .. }))
+        ));
+
+        let response = UserInputResponse {
+            declined: false,
+            selected: vec!["[Image #1]".into()],
+            text: None,
+            images: vec![test_image("raw-image")],
+        };
+        handle
+            .respond(8, serde_json::to_value(&response).unwrap())
+            .await
+            .unwrap();
+        match kernel_commands.recv().await {
+            Some(AgentCommand::Respond { id: 8, value }) => {
+                assert_eq!(
+                    serde_json::from_value::<UserInputResponse>(value).unwrap(),
+                    response
+                );
+            }
+            other => panic!("expected untouched Respond, got {other:?}"),
+        }
+        assert!(!called.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn image_steer_acknowledges_the_driver_original_after_preprocessing() {
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (handle, mut kernel_commands, kernel_events, mut runtime_events, _adapter) =
+            spawn_with_preprocessor(
+                Some(Arc::new(RecordingPreprocessor {
+                    called: called.clone(),
+                })),
+                false,
+            )
+            .await;
+
+        handle.submit(UserInput::from("first")).await.unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { text, .. }) if text == "first"
+        ));
+
+        let original = UserInput {
+            text: "before\n[Image #1]\nafter".into(),
+            images: vec![test_image("raw-image")],
+        };
+        assert!(matches!(
+            handle.submit(original.clone()).await.unwrap(),
+            SubmitReceipt::Steered { .. }
+        ));
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { text, images })
+                if text == "VL[before\n[Image #1]\nafter]" && images.is_empty()
+        ));
+
+        kernel_events
+            .send(AgentEvent::Steered {
+                count: 1,
+                inputs: vec![atomcode_kernel::event::SteeredInput {
+                    text: "VL[before\n[Image #1]\nafter]".into(),
+                    images: Vec::new(),
+                }],
+            })
+            .unwrap();
+
+        let (authoritative, acknowledged) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut authoritative = None;
+                let mut acknowledged = None;
+                loop {
+                    match runtime_events.recv().await {
+                        Some(CodingRuntimeEvent::Agent(AgentEvent::Steered { inputs, .. })) => {
+                            authoritative = Some(inputs)
+                        }
+                        Some(CodingRuntimeEvent::SteerAcknowledged { inputs }) => {
+                            acknowledged = Some(inputs)
+                        }
+                        Some(_) => {}
+                        None => panic!("runtime event stream closed"),
+                    }
+                    if authoritative.is_some() && acknowledged.is_some() {
+                        break (authoritative.unwrap(), acknowledged.unwrap());
+                    }
+                }
+            })
+            .await
+            .expect("missing steered acknowledgement");
+        assert_eq!(
+            authoritative,
+            vec![atomcode_kernel::event::SteeredInput {
+                text: "VL[before\n[Image #1]\nafter]".into(),
+                images: Vec::new(),
+            }],
+            "kernel Steered must preserve the input actually folded into conversation"
+        );
+        assert_eq!(acknowledged, vec![original]);
+        assert!(called.load(Ordering::Acquire));
+    }
+
     // Guard: a text-only submit skips the preprocessor entirely (no images),
     // so the original text passes through untouched.
     #[tokio::test]
     async fn text_only_submit_skips_preprocessor() {
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (handle, mut kernel_commands, _runtime_events, _adapter) =
-            spawn_with_preprocessor(Some(Arc::new(RecordingPreprocessor {
-                called: called.clone(),
-            })))
+        let (handle, mut kernel_commands, _kernel_events, _runtime_events, _adapter) =
+            spawn_with_preprocessor(
+                Some(Arc::new(RecordingPreprocessor {
+                    called: called.clone(),
+                })),
+                false,
+            )
             .await;
 
         handle
@@ -11541,8 +12431,8 @@ mod tests {
     // text-only turn.
     #[tokio::test]
     async fn image_submit_failure_emits_failed_event_and_text_only_turn() {
-        let (handle, mut kernel_commands, mut runtime_events, _adapter) =
-            spawn_with_preprocessor(Some(Arc::new(FailingPreprocessor))).await;
+        let (handle, mut kernel_commands, _kernel_events, mut runtime_events, _adapter) =
+            spawn_with_preprocessor(Some(Arc::new(FailingPreprocessor)), false).await;
 
         handle
             .submit(UserInput {
@@ -12349,6 +13239,7 @@ mod tests {
         let first = runtime.events.recv().await.unwrap();
         let second = runtime.events.recv().await.unwrap();
         let third = runtime.events.recv().await.unwrap();
+        let fourth = runtime.events.recv().await.unwrap();
         assert_eq!(first.generation, 0);
         assert!(matches!(
             first.event,
@@ -12365,11 +13256,24 @@ mod tests {
         assert_eq!(third.generation, 1);
         assert!(matches!(
             third.event,
+            CodingRuntimeEvent::ReasoningEffortChanged {
+                ref provider,
+                effort: None,
+                applicable: false
+            } if provider == "next-provider"
+        ));
+        assert_eq!(fourth.generation, 1);
+        assert!(matches!(
+            fourth.event,
             CodingRuntimeEvent::Reconfigured {
                 operation: ReconfigureKind::Provider
             }
         ));
-        assert!(first.sequence < second.sequence && second.sequence < third.sequence);
+        assert!(
+            first.sequence < second.sequence
+                && second.sequence < third.sequence
+                && third.sequence < fourth.sequence
+        );
         runtime.handle.shutdown().await.unwrap();
     }
 
@@ -12879,6 +13783,54 @@ mod tests {
             manager.acquire_lease(target_id),
             Err(SessionStoreError::SessionInUse { .. })
         ));
+
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn cancelled_preflight_keeps_the_current_runtime_authoritative() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
+        let target_id = "cancelled-target";
+        persist_native_session(
+            &manager,
+            target_id,
+            project.path(),
+            &SessionSnapshot::new(vec![Message::user("target history")]),
+        );
+        let target_lease = manager.acquire_lease(target_id).unwrap();
+
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Fresh;
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        let old_id = runtime.session.as_ref().unwrap().id.clone();
+        let old_snapshot = runtime.handle.snapshot().await.unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        let result = runtime
+            .handle
+            .resume_session_with_lease_cancelable(
+                target_id,
+                project.path().to_path_buf(),
+                target_lease,
+                cancel,
+            )
+            .await;
+
+        assert_eq!(result, Err(RuntimeError::Cancelled));
+        assert_eq!(runtime.handle.status().generation, 0);
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        assert_eq!(runtime.handle.snapshot().await.unwrap(), old_snapshot);
+        assert!(matches!(
+            manager.acquire_lease(&old_id),
+            Err(SessionStoreError::SessionInUse { .. })
+        ));
+        assert!(manager.acquire_lease(target_id).is_ok());
 
         runtime.handle.shutdown().await.unwrap();
     }

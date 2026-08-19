@@ -17,6 +17,22 @@ use rust_embed::RustEmbed;
 #[allow_missing = true]
 pub struct WebuiAssets;
 
+/// 本二进制是否真的带上了 webui 资源。
+///
+/// `#[allow_missing]` 让 `webui/dist/` 缺席时照样编译通过，代价是缺失只在运行
+/// 期以 404 的形式暴露。调用方（`webui` 命令）用它在起服务之前就说清楚，而不是
+/// 等用户开了浏览器才看到一行报错。
+pub fn is_built() -> bool {
+    WebuiAssets::get("index.html").is_some()
+}
+
+/// 资源缺失时的说明，含修复步骤。命令启动前与运行期 404 共用同一段文案。
+pub const NOT_BUILT_HELP: &str = "webui assets are not embedded in this binary.\n\
+     Build the frontend first, then rebuild:\n\
+     \n\
+     \x20   cd webui && npm install && npm run build\n\
+     \x20   cargo build -p atomcode\n";
+
 /// 取静态资源；未命中时回退 index.html 的内容（SPA）。
 pub fn asset_or_index(path: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
     let p = path.trim_start_matches('/');
@@ -45,7 +61,7 @@ pub async fn serve_webui(uri: Uri) -> Response {
         }
         None => match WebuiAssets::get("index.html") {
             Some(index) => ([(header::CONTENT_TYPE, "text/html")], index.data).into_response(),
-            None => (StatusCode::NOT_FOUND, "webui not built").into_response(),
+            None => (StatusCode::NOT_FOUND, NOT_BUILT_HELP).into_response(),
         },
     }
 }

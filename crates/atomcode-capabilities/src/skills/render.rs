@@ -49,8 +49,30 @@ pub struct CatalogEntry {
 
 /// Source-priority tier from a skill's `source_path`. Curated, product-native
 /// dirs survive a budget squeeze over community bulk. Kept as approved:
-/// `.atomcode` > `.claude` > `.agents` > everything else.
+/// product-native > `.claude` > `.agents` > everything else.
+///
+/// "Product-native" is the config tree THIS build owns, matched by prefix
+/// against `ATOMCODE_HOME` — the same variable
+/// [`runtime_skill_dirs`](super::registry::runtime_skill_dirs) reads, and the
+/// one `distribution::bootstrap_home` settles before anything else runs.
+///
+/// It used to be the literal `.atomcode`, which is correct only while the
+/// config dir is named that. A build that relocated its tree ranked its OWN
+/// installed plugins at 3 — below `~/.claude` and `~/.agents` — so a budget
+/// squeeze cut the deployment's curated plugins and kept third-party bulk. The
+/// symptom is invisible from the outside: the plugin installs fine and
+/// `/plugin list` shows it, but its name never reaches the model, so the model
+/// answers as if the skill did not exist.
+///
+/// Prefix, not substring: `$ATOMCODE_HOME` can be any path, and a substring
+/// test on a short directory name would rank unrelated paths that merely
+/// contain it. The `.atomcode` branch stays as the fallback for the window
+/// before the variable is settled (and for tests that do not set it), which is
+/// also what keeps this byte-identical on a build whose home IS `~/.atomcode`.
 pub fn source_rank(path: &Path) -> u8 {
+    if native_config_root().is_some_and(|root| path.starts_with(&root)) {
+        return 0;
+    }
     let s = path.to_string_lossy();
     if s.contains(".atomcode") {
         0
@@ -61,6 +83,21 @@ pub fn source_rank(path: &Path) -> u8 {
     } else {
         3
     }
+}
+
+/// The config tree this build owns, once `bootstrap_home` has settled it.
+/// `None` before that, or when explicitly emptied — an empty value must not
+/// become a bare relative path that every source path starts with.
+///
+/// The variable name is spelled out rather than taken from
+/// `atomcode_config::distribution::HOME_ENV` because the `skills` feature is
+/// `[]` — it deliberately pulls no dependencies, and `atomcode-config` is
+/// optional. `runtime_skill_dirs` reads the same variable the same way, for the
+/// same reason; the two must stay in step.
+fn native_config_root() -> Option<std::path::PathBuf> {
+    std::env::var_os("ATOMCODE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
 }
 
 /// Truncate a description to [`PER_SKILL_DESC_CAP`] chars on a char boundary,
@@ -173,6 +210,75 @@ mod tests {
             2
         );
         assert_eq!(source_rank(&PathBuf::from("/opt/plugins/foo/SKILL.md")), 3);
+    }
+
+    /// The regression this ranking was silently getting wrong on any build
+    /// whose config dir is not literally `.atomcode`: its OWN installed
+    /// plugins ranked below `~/.claude` and `~/.agents`, so a catalog over
+    /// budget dropped the curated ones and kept third-party bulk.
+    #[test]
+    #[serial_test::serial]
+    fn a_relocated_config_tree_still_outranks_third_party_dirs() {
+        let previous = std::env::var_os("ATOMCODE_HOME");
+        std::env::set_var("ATOMCODE_HOME", "/home/u/.longcode");
+
+        let own =
+            PathBuf::from("/home/u/.longcode/plugins/marketplaces/mp/plugins/p/skills/s/SKILL.md");
+        let claude = PathBuf::from("/home/u/.claude/skills/x/SKILL.md");
+        let agents = PathBuf::from("/home/u/.agents/skills/x/SKILL.md");
+
+        assert_eq!(source_rank(&own), 0, "this build's own tree must rank top");
+        assert!(
+            source_rank(&own) < source_rank(&claude),
+            "own plugins must outrank ~/.claude"
+        );
+        assert!(
+            source_rank(&own) < source_rank(&agents),
+            "own plugins must outrank ~/.agents"
+        );
+
+        match previous {
+            Some(v) => std::env::set_var("ATOMCODE_HOME", v),
+            None => std::env::remove_var("ATOMCODE_HOME"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_home_named_atomcode_is_unchanged() {
+        // Upstream's own value. The whole change must be a no-op there.
+        let previous = std::env::var_os("ATOMCODE_HOME");
+        std::env::set_var("ATOMCODE_HOME", "/home/u/.atomcode");
+        assert_eq!(
+            source_rank(&PathBuf::from("/home/u/.atomcode/skills/x/SKILL.md")),
+            0
+        );
+        assert_eq!(
+            source_rank(&PathBuf::from("/home/u/.claude/skills/x/SKILL.md")),
+            1
+        );
+        match previous {
+            Some(v) => std::env::set_var("ATOMCODE_HOME", v),
+            None => std::env::remove_var("ATOMCODE_HOME"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_empty_home_does_not_make_everything_native() {
+        // An exported-but-empty value becomes a bare relative path that every
+        // absolute path would "start with" if it were used unchecked.
+        let previous = std::env::var_os("ATOMCODE_HOME");
+        std::env::set_var("ATOMCODE_HOME", "");
+        assert_eq!(
+            source_rank(&PathBuf::from("/home/u/.agents/skills/x/SKILL.md")),
+            2
+        );
+        assert_eq!(source_rank(&PathBuf::from("/opt/plugins/foo/SKILL.md")), 3);
+        match previous {
+            Some(v) => std::env::set_var("ATOMCODE_HOME", v),
+            None => std::env::remove_var("ATOMCODE_HOME"),
+        }
     }
 
     #[test]

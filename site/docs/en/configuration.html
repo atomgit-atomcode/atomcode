@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.6</span>
+    <span class="dhdr-ver">v5.0.7</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -97,7 +97,7 @@ base_url = "https://api.deepseek.com/v1"
 context_window = 64000</code></pre>
       <p>This config is enough to launch atomcode and start chatting with DeepSeek.</p>
       <div class="callout callout-info">
-        <strong>Provider management in v5.0.6</strong>
+        <strong>Provider management in v5.0.7</strong>
         <p>The recommended path is <code>/provider</code>: add a provider account, then add one or more models under it. Protocol, base URL, and API key are shared by the account; model name and context window are stored per model. Legacy <code>[providers.*]</code> entries remain supported and are projected automatically.</p>
       </div>
 
@@ -111,6 +111,7 @@ context_window = 64000</code></pre>
           <tr><td><code>default_workdir</code></td><td>string?</td><td>Default working directory. <code>/cd</code> writes back here; restored next launch</td></tr>
           <tr><td><code>providers</code></td><td>table</td><td>Map of provider name to <a href="#provider-config">ProviderConfig</a></td></tr>
           <tr><td><code>vision_preprocessor_provider</code></td><td>string?</td><td>When the main provider can't see images but the user attaches one, forward it to this provider for OCR / description; the result is spliced back into the prompt as text. See <a href="#vision-preprocessor">Vision preprocessor</a></td></tr>
+          <tr><td><code>init_prompt_file</code></td><td>string?</td><td>UTF-8 file whose requirements are appended to the built-in <code>/init</code> prompt. Relative paths resolve from <code>$ATOMCODE_HOME</code>; maximum size is 64 KiB. This can also be edited in <code>/config</code>.</td></tr>
         </tbody>
       </table>
 
@@ -127,6 +128,7 @@ context_window = 64000</code></pre>
           <tr><td><code>base_url</code></td><td>string</td><td>yes</td><td>API base URL, pointing at the actual endpoint. e.g. <code>https://api.deepseek.com/v1</code>, <code>http://localhost:11434</code></td></tr>
           <tr><td><code>context_window</code></td><td>integer</td><td>no</td><td>Model context window (tokens), default 64000. Default 8000 for <code>ollama</code></td></tr>
           <tr><td><code>max_tokens</code></td><td>integer?</td><td>no</td><td>Max output tokens per response. Defaults to <code>context_window / 4</code> when unset</td></tr>
+          <tr><td><code>retry_max_attempts</code></td><td>integer?</td><td>no</td><td>Total attempts in the provider OPEN retry loop; when set, it also caps kernel-owned HTTP 429 recovery (both include the first request). Unset preserves the existing defaults (3 adapter attempts and the kernel's rate-limit safety policy). Set to 1 to disable adapter-level and 429 retries. Must be at least 1. In the account/model schema, set this on the <code>[models."..."]</code> profile because retry behavior is model-specific.</td></tr>
           <tr><td><code>system_prompt</code></td><td>string?</td><td>no</td><td>Override the default system prompt. Rarely needed</td></tr>
           <tr><td><code>user_agent</code></td><td>string?</td><td>no</td><td>Override the HTTP User-Agent — useful when the upstream blocks the default UA</td></tr>
         </tbody>
@@ -304,7 +306,7 @@ base_url = "https://api.siliconflow.cn/v1"</code></pre>
       <h2>Three ways to edit the config</h2>
       <ul>
         <li><strong>Hand-edit</strong> — open <code>~/.atomcode/config.toml</code> in your favourite editor.</li>
-        <li><strong><code>/config</code> in the TUI</strong> — atomcode opens the config in your default editor.</li>
+        <li><strong><code>/config</code> in the TUI</strong> — search and edit safe settings in place. The dynamic <em>Retry attempts (current model)</em> row writes <code>retry_max_attempts</code> to the active model; press Delete twice to restore the default.</li>
         <li><strong><code>/provider</code> in the TUI</strong> — interactively manage provider accounts and their models; changes are written back to disk.</li>
       </ul>
 

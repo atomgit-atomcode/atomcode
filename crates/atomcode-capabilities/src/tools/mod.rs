@@ -96,12 +96,14 @@ pub use bash::{
 };
 pub use bash_workspace_gate::BashWorkspaceGate;
 pub use cd::ChangeDirTool;
-pub use credential_bash_gate::CredentialBashGate;
+pub use credential_bash_gate::{
+    bash_command_may_expose_credentials, CredentialBashGate, CredentialShellPolicy,
+};
 pub use edit::EditFileTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use list::ListDirTool;
-pub use open_file::{OpenFileTool, OpenFileWorkspaceGate};
+pub use open_file::{open_local_path, OpenFileTool, OpenFileWorkspaceGate};
 pub use output_artifact::{
     artifact_id, ArtifactMiddleware, ArtifactStore, FetchOutputTool,
     ARTIFACT_TRUNCATION_MARKER_PREFIX, THRESHOLD_BYTES,
@@ -112,7 +114,10 @@ pub use repair::{repair_tool_args, RepairToolArgsMiddleware};
 pub use report_finding::{Finding, ReportFindingTool};
 pub use search_replace::SearchReplaceTool;
 pub use sensitive_path::{path_is_sensitive, references_sensitive_path, SensitivePathGate};
-pub use task::{subagent_child_middlewares, team_child_middlewares, TaskTool};
+pub use task::{
+    subagent_child_middlewares, subagent_child_middlewares_for_policy, team_child_middlewares,
+    team_child_middlewares_for_policy, TaskTool,
+};
 pub use todo::TodoTool;
 #[cfg(feature = "web")]
 pub use web_fetch::WebFetchTool;

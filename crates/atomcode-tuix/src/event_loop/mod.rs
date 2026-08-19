@@ -29,6 +29,7 @@ pub use commands::{perform_session_rename, validate_session_name, MAX_SESSION_NA
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::session::{Session, SessionId};
 use anyhow::Result;
@@ -47,7 +48,7 @@ use crate::commands::{parse_bash_command, parse_slash_line, CommandRegistry};
 use crate::custom_commands::ArgsRequirement;
 use crate::input::history::History;
 use crate::input::key_action::{classify, Action};
-use crate::input::InputEvent;
+use crate::input::{InputEvent, PointerEvent, PointerKind};
 use crate::render::{Renderer, UiLine};
 use crate::state::{UiPhase, UiState};
 use crate::think::ThinkStripper;
@@ -634,10 +635,33 @@ pub(crate) fn compute_input_attachments(
 /// notice string for the caller to render.
 ///
 /// Returns the list of notice strings (empty when every attachment hit).
+#[cfg(test)]
 pub(crate) fn hydrate_recalled_attachments(
     state: &mut UiState,
     line: &mut String,
     cache_dir: &std::path::Path,
+) -> Vec<String> {
+    hydrate_recalled_attachments_from_caches(state, line, cache_dir, None)
+}
+
+fn hydrate_recalled_attachments_for_history(
+    state: &mut UiState,
+    line: &mut String,
+    history: &crate::input::history::History,
+) -> Vec<String> {
+    hydrate_recalled_attachments_from_caches(
+        state,
+        line,
+        history.cache_dir(),
+        history.legacy_cache_dir(),
+    )
+}
+
+fn hydrate_recalled_attachments_from_caches(
+    state: &mut UiState,
+    line: &mut String,
+    cache_dir: &std::path::Path,
+    legacy_cache_dir: Option<&std::path::Path>,
 ) -> Vec<String> {
     use base64::Engine;
     let mut notices = Vec::new();
@@ -645,8 +669,14 @@ pub(crate) fn hydrate_recalled_attachments(
         return notices;
     }
     for refed in std::mem::take(&mut state.pending_recalled_attachments) {
-        let cache_path = cache_dir.join(format!("{}.{}", refed.hash, ext_for_mt(&refed.mt)));
-        match std::fs::read(&cache_path) {
+        let cache_name = format!("{}.{}", refed.hash, ext_for_mt(&refed.mt));
+        let raw = std::fs::read(cache_dir.join(&cache_name)).or_else(|primary_error| {
+            let Some(legacy_cache_dir) = legacy_cache_dir else {
+                return Err(primary_error);
+            };
+            std::fs::read(legacy_cache_dir.join(&cache_name))
+        });
+        match raw {
             Ok(raw) => {
                 state.session_image_count += 1;
                 let new_marker = state.session_image_count;
@@ -809,11 +839,7 @@ fn try_attach_at_image_from_path(
     token: &str,
     working_dir: &std::path::Path,
 ) -> Option<(ImageContent, u64)> {
-    let path = resolve_at_image_path(
-        token,
-        working_dir,
-        crate::platform::home_dir().as_deref(),
-    )?;
+    let path = resolve_at_image_path(token, working_dir, crate::platform::home_dir().as_deref())?;
     try_attach_image_from_path(path.to_str()?)
 }
 
@@ -1288,10 +1314,13 @@ pub(crate) struct PendingSessionResume {
     pub session: Session,
     pub working_dir: PathBuf,
     pub committed: Option<atomcode_coding::SessionChanged>,
+    pub cancel: tokio_util::sync::CancellationToken,
+    pub cancel_requested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingSessionResumePreparation {
+    pub operation_id: u64,
     pub project_bucket: String,
     pub session_id: String,
     pub working_dir: PathBuf,
@@ -1387,6 +1416,8 @@ mod session_resume_tests {
             session,
             working_dir: working_dir.clone(),
             committed: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            cancel_requested: false,
         };
         let exact = atomcode_coding::SessionChanged {
             generation: atomcode_coding::RuntimeGeneration(1),
@@ -1879,6 +1910,7 @@ mod submit_hold_tests {
                 message: "round limit reached".into(),
                 http_status: None,
                 code: None,
+                retryable: None,
             },
         ));
         assert_eq!(type_ahead_queue_action(&event), TypeAheadQueueAction::None);
@@ -2148,6 +2180,7 @@ mod submit_hold_tests {
                 message: "maximum rounds reached".into(),
                 http_status: None,
                 code: None,
+                retryable: None,
             },
         ));
         let mut state = UiState::new();
@@ -2405,6 +2438,7 @@ enum ReadyRuntimeRequest {
         id: String,
         working_dir: PathBuf,
         lease: atomcode_capabilities::session::SessionLease,
+        cancel: tokio_util::sync::CancellationToken,
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     },
@@ -2473,6 +2507,7 @@ impl ReadyRuntimeControl {
                 message: format!("coding runtime {operation} delivery failed"),
                 http_status: None,
                 code: None,
+                retryable: None,
             }),
         ));
     }
@@ -2655,12 +2690,13 @@ impl ReadyRuntimeControl {
                     id,
                     working_dir,
                     lease,
+                    cancel,
                     runtime_id,
                     event_tx,
                 } => {
                     let result = self
                         .handle
-                        .resume_session_with_lease(id, working_dir, lease)
+                        .resume_session_with_lease_cancelable(id, working_dir, lease, cancel)
                         .await;
                     RuntimeControl::send_native_result(
                         &event_tx,
@@ -3162,6 +3198,7 @@ impl RuntimeControl {
         id: String,
         working_dir: PathBuf,
         lease: atomcode_capabilities::session::SessionLease,
+        cancel: tokio_util::sync::CancellationToken,
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     ) -> Result<(), atomcode_coding::RuntimeUnavailable> {
@@ -3170,6 +3207,7 @@ impl RuntimeControl {
                 id,
                 working_dir,
                 lease,
+                cancel,
                 runtime_id,
                 event_tx,
             }),
@@ -3183,7 +3221,7 @@ impl RuntimeControl {
                 };
                 tokio::spawn(async move {
                     let result = handle
-                        .resume_session_with_lease(id, working_dir, lease)
+                        .resume_session_with_lease_cancelable(id, working_dir, lease, cancel)
                         .await;
                     RuntimeControl::send_native_result(
                         &event_tx,
@@ -3780,12 +3818,19 @@ impl AuthObservation {
         }
     }
 
+    fn read_checked() -> anyhow::Result<Self> {
+        Ok(Self {
+            user_id: atomcode_auth::get_stored_auth_checked()?.map(|auth| auth.user.id),
+        })
+    }
+
     fn is_available(&self) -> bool {
         self.user_id.is_some()
     }
 }
 
 pub struct LoopCtx {
+    pub(crate) interaction_publisher: crate::render::interaction::InteractionPublisher,
     pub config: Config,
     /// Exact active model selection id. Unlike `model_name`, this remains
     /// unambiguous when two accounts expose the same wire model.
@@ -3836,6 +3881,14 @@ pub struct LoopCtx {
     /// agent tool).
     pub recent_dirs: Vec<PathBuf>,
     pub history: History,
+    /// Project histories whose pending entries could not be persisted during a
+    /// cwd switch. Kept in memory and retried instead of silently dropping the
+    /// old project's unsaved prompts.
+    pub deferred_histories: Vec<History>,
+    /// Set by the single working-directory projection seam. The main loop
+    /// consumes it after event dispatch to detach Buffer navigation/search
+    /// indexes from the previous project's history without discarding a draft.
+    pub history_rebound: bool,
     pub input_rx: mpsc::UnboundedReceiver<InputEvent>,
     pub commands: CommandRegistry,
     /// Session actively being accumulated. Updated on TurnComplete /
@@ -3982,6 +4035,9 @@ pub struct LoopCtx {
     /// Exact picker selection whose catalog convergence and lease acquisition run
     /// off the input thread before the runtime resume is accepted.
     pub(crate) pending_session_resume_preparation: Option<PendingSessionResumePreparation>,
+    /// Monotonic identity for `/resume` preparation. Cancellation clears the
+    /// pending operation; any result carrying an older identity is ignored.
+    pub(crate) next_session_resume_operation_id: u64,
     /// `/resume` catalog scan result loaded off the UI thread, waiting to be
     /// installed into the session picker by the main loop (which owns `app`).
     /// Carries the dir the scan was for so install can drop a result the user has
@@ -3991,6 +4047,16 @@ pub struct LoopCtx {
         std::path::PathBuf,
         Result<Vec<crate::session::SessionMeta>, String>,
     )>,
+    pub(crate) session_preview_request_tx:
+        tokio::sync::watch::Sender<Option<bg_runtime::SessionPreviewRequest>>,
+    pub(crate) next_session_preview_generation: u64,
+    pub(crate) session_preview_selection: Option<crate::session::SessionPreviewSelection>,
+    pub(crate) session_preview_result: Option<
+        Result<
+            Option<atomcode_daemon::legacy_convert::CatalogSessionPreview>,
+            atomcode_daemon::legacy_convert::CatalogSessionPreviewError,
+        >,
+    >,
     /// Runtime-owned Rewind points loaded after the double-Esc gesture. The
     /// main loop installs the modal because this event handler does not own
     /// `App::active_modal`.
@@ -4115,9 +4181,37 @@ fn rgba_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
 /// spliced back in when the line is submitted. This keeps the visible
 /// input short (matching CC's paste UX) without truncating what the
 /// agent actually sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EditSelection {
+    anchor: usize,
+    head: usize,
+}
+
+impl EditSelection {
+    fn ordered(self) -> std::ops::Range<usize> {
+        self.anchor.min(self.head)..self.anchor.max(self.head)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RecentFoldedPaste {
+    id: usize,
+    placeholder_start: usize,
+    placeholder: String,
+    inserted_at: std::time::Instant,
+}
+
 pub struct Buffer {
     pub text: String,
     pub cursor: usize,
+    selection: Option<EditSelection>,
+    pointer_selection_active: bool,
+    /// Display width of the input area (in terminal columns), used by
+    /// [`cursor_visual_up`] / [`cursor_visual_down`] to navigate by
+    /// **visual** (soft-wrapped) lines rather than logical `\n` lines.
+    /// Set from the event loop on resize. 0 = disabled (falls back to
+    /// logical-line navigation).
+    pub input_width: usize,
     history_idx: Option<usize>,
     /// One-shot: suppress the slash-command menu for text placed into the
     /// buffer programmatically (a cancelled message restored on Esc). Without
@@ -4133,6 +4227,9 @@ pub struct Buffer {
     /// that contained a folded paste survives a round-trip through
     /// history navigation. Mirrors `stash` for the paste registry.
     stash_pastes: Vec<String>,
+    /// The most recent folded text paste. A second identical paste may
+    /// expand it in place when no editing happened in between.
+    recent_folded_paste: Option<RecentFoldedPaste>,
     /// True while Ctrl+R reverse-i-search is active. In this state keys
     /// edit `search_query` (not `text`); `history_idx` doubles as the
     /// index of the current match so attachment rehydration and menu
@@ -4147,6 +4244,7 @@ pub struct Buffer {
 /// 3 lines behind a `[Pasted ...]` token.
 const PASTE_FOLD_LINES: usize = 5;
 const PASTE_FOLD_CHARS: usize = 400;
+const DOUBLE_PASTE_EXPAND_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Fold `\r\n` and lone `\r` line endings to `\n`. Bracketed-paste
 /// payloads from macOS Terminal / iTerm2 / Windows clipboard frequently
@@ -4161,11 +4259,18 @@ impl Buffer {
         Self {
             text: String::new(),
             cursor: 0,
+            selection: None,
+            pointer_selection_active: false,
+            // The real width is supplied by `run_loop` before interactive
+            // input starts. Until then, disable visual wrapping rather than
+            // guessing 80 columns and changing navigation in non-TUI callers.
+            input_width: 0,
             history_idx: None,
             menu_suppressed: false,
             stash: String::new(),
             pastes: Vec::new(),
             stash_pastes: Vec::new(),
+            recent_folded_paste: None,
             searching: false,
             search_query: String::new(),
         }
@@ -4181,8 +4286,10 @@ impl Buffer {
     /// restored on Esc): cursor at the end, and suppress the slash menu for
     /// one frame so a restored `/command` doesn't immediately re-pop the list.
     pub fn set_restored_text(&mut self, text: String) {
+        self.recent_folded_paste = None;
         self.cursor = text.len();
         self.text = text;
+        self.clear_selection();
         self.history_idx = None;
         self.searching = false;
         self.search_query.clear();
@@ -4239,6 +4346,7 @@ impl Buffer {
         self.cursor = self.text.len();
         self.history_idx = None;
         self.menu_suppressed = false;
+        self.clear_selection();
         true
     }
 
@@ -4249,6 +4357,116 @@ impl Buffer {
     /// buffer is showing.
     pub fn history_idx(&self) -> Option<usize> {
         self.history_idx
+    }
+
+    fn selected_range(&self) -> Option<std::ops::Range<usize>> {
+        self.selection
+            .map(EditSelection::ordered)
+            .filter(|range| !range.is_empty())
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.pointer_selection_active = false;
+    }
+
+    fn replace_selection(&mut self, replacement: &str) -> bool {
+        let Some(range) = self.selected_range() else {
+            self.clear_selection();
+            return false;
+        };
+        self.text.replace_range(range.clone(), replacement);
+        self.cursor = range.start + replacement.len();
+        self.clear_selection();
+        self.history_idx = None;
+        true
+    }
+
+    fn replace_all_text(&mut self, text: String) {
+        self.recent_folded_paste = None;
+        self.text = text;
+        self.cursor = self.text.len();
+        self.clear_selection();
+    }
+
+    fn clear_text(&mut self) {
+        self.recent_folded_paste = None;
+        self.text.clear();
+        self.cursor = 0;
+        self.clear_selection();
+    }
+
+    fn reset_history_navigation(&mut self) {
+        if self.history_idx.is_some() || self.searching {
+            self.text = std::mem::take(&mut self.stash);
+            self.pastes = std::mem::take(&mut self.stash_pastes);
+            self.cursor = self.text.len();
+            self.recent_folded_paste = None;
+            self.clear_selection();
+        }
+        self.history_idx = None;
+        self.searching = false;
+        self.search_query.clear();
+        self.stash.clear();
+        self.stash_pastes.clear();
+    }
+
+    fn replace_text_range(&mut self, range: std::ops::Range<usize>, replacement: &str) -> bool {
+        if range.start > range.end
+            || range.end > self.text.len()
+            || !self.text.is_char_boundary(range.start)
+            || !self.text.is_char_boundary(range.end)
+        {
+            return false;
+        }
+        self.recent_folded_paste = None;
+        self.clear_selection();
+        self.text.replace_range(range.clone(), replacement);
+        self.cursor = range.start + replacement.len();
+        true
+    }
+
+    fn insert_at_cursor(&mut self, text: &str) {
+        self.recent_folded_paste = None;
+        self.replace_selection("");
+        self.text.insert_str(self.cursor, text);
+        self.cursor += text.len();
+    }
+
+    fn set_pointer_cursor(&mut self, byte: usize, extend: bool) -> bool {
+        if byte > self.text.len() || !self.text.is_char_boundary(byte) {
+            return false;
+        }
+        if extend {
+            if !self.pointer_selection_active {
+                return false;
+            }
+            let anchor = self
+                .selection
+                .map_or(self.cursor, |selection| selection.anchor);
+            self.selection = Some(EditSelection { anchor, head: byte });
+        } else {
+            self.selection = Some(EditSelection {
+                anchor: byte,
+                head: byte,
+            });
+            self.pointer_selection_active = true;
+        }
+        self.cursor = byte;
+        self.history_idx = None;
+        self.recent_folded_paste = None;
+        true
+    }
+
+    fn pointer_selection_active(&self) -> bool {
+        self.pointer_selection_active
+    }
+
+    fn end_pointer_selection(&mut self) {
+        self.pointer_selection_active = false;
+        if self.selected_range().is_none() {
+            self.selection = None;
+        }
     }
 
     /// Insert a pasted block. Folds into a `[Pasted …]` placeholder if
@@ -4268,7 +4486,16 @@ impl Buffer {
     /// and lone `\r` to `\n` at ingress so both the placeholder summary
     /// and the expanded agent payload are in canonical form.
     pub fn insert_paste(&mut self, text: String) -> String {
+        self.insert_paste_at(text, std::time::Instant::now())
+    }
+
+    fn insert_paste_at(&mut self, text: String, now: std::time::Instant) -> String {
         let text = normalize_newlines(&text);
+        if self.expand_recent_folded_paste(&text, now) {
+            return text;
+        }
+        self.recent_folded_paste = None;
+        self.replace_selection("");
         let line_count = text.lines().count().max(1);
         let char_count = text.chars().count();
         if line_count >= PASTE_FOLD_LINES || char_count >= PASTE_FOLD_CHARS {
@@ -4279,8 +4506,15 @@ impl Buffer {
                 format!("[Pasted #{} +{} lines]", id, line_count)
             };
             self.pastes.push(text);
+            let placeholder_start = self.cursor;
             self.text.insert_str(self.cursor, &placeholder);
             self.cursor += placeholder.len();
+            self.recent_folded_paste = Some(RecentFoldedPaste {
+                id,
+                placeholder_start,
+                placeholder: placeholder.clone(),
+                inserted_at: now,
+            });
             placeholder
         } else {
             let n = text.len();
@@ -4288,6 +4522,38 @@ impl Buffer {
             self.cursor += n;
             text
         }
+    }
+
+    fn expand_recent_folded_paste(&mut self, incoming: &str, now: std::time::Instant) -> bool {
+        let Some(recent) = self.recent_folded_paste.clone() else {
+            return false;
+        };
+        let within_window = now
+            .checked_duration_since(recent.inserted_at)
+            .is_some_and(|elapsed| elapsed <= DOUBLE_PASTE_EXPAND_WINDOW);
+        let placeholder_end = recent.placeholder_start + recent.placeholder.len();
+        let placeholder_is_untouched = self.cursor == placeholder_end
+            && self.selected_range().is_none()
+            && self
+                .text
+                .get(recent.placeholder_start..placeholder_end)
+                .is_some_and(|current| current == recent.placeholder);
+        let backing_matches = recent.id == self.pastes.len()
+            && self
+                .pastes
+                .get(recent.id.saturating_sub(1))
+                .is_some_and(|body| body == incoming);
+        if !within_window || !placeholder_is_untouched || !backing_matches {
+            return false;
+        }
+
+        self.text
+            .replace_range(recent.placeholder_start..placeholder_end, incoming);
+        self.cursor = recent.placeholder_start + incoming.len();
+        self.pastes.pop();
+        self.recent_folded_paste = None;
+        self.history_idx = None;
+        true
     }
 
     /// Expand every `[Pasted #N +M lines]` token in `line` back to the
@@ -4332,6 +4598,7 @@ impl Buffer {
     }
 
     fn clear_pastes(&mut self) {
+        self.recent_folded_paste = None;
         self.pastes.clear();
     }
 
@@ -4353,6 +4620,9 @@ impl Buffer {
         // restore, so editing / navigating a restored `/command` reopens the
         // command list as usual.
         self.menu_suppressed = false;
+        // A keyboard action between two paste events means they are separate
+        // edits, not the double-paste gesture used to expand a folded block.
+        self.recent_folded_paste = None;
         // Ctrl+R reverse-i-search owns the keys while active: typing edits
         // the query, Ctrl+R steps to the next older match, Enter accepts the
         // current match into the buffer, Esc restores the pre-search draft.
@@ -4361,12 +4631,14 @@ impl Buffer {
         }
         match action {
             Action::Insert(c) => {
+                self.replace_selection("");
                 self.text.insert(self.cursor, c);
                 self.cursor += c.len_utf8();
                 self.history_idx = None;
                 BufferResult::Redraw
             }
             Action::Submit => {
+                self.clear_selection();
                 // Line continuation: a `\` immediately before the cursor
                 // is consumed and replaced with `\n`. Lets users insert
                 // newlines on terminals that swallow Shift/Ctrl/Alt+Enter
@@ -4405,6 +4677,7 @@ impl Buffer {
                 BufferResult::Commit(line)
             }
             Action::InsertNewline => {
+                self.replace_selection("");
                 self.text.insert(self.cursor, '\n');
                 self.cursor += 1;
                 BufferResult::Redraw
@@ -4415,6 +4688,7 @@ impl Buffer {
                 } else {
                     self.text.clear();
                     self.cursor = 0;
+                    self.clear_selection();
                     self.history_idx = None;
                     self.pastes.clear();
                     BufferResult::Redraw
@@ -4423,10 +4697,14 @@ impl Buffer {
             Action::ClearLine => {
                 self.text.clear();
                 self.cursor = 0;
+                self.clear_selection();
                 self.pastes.clear();
                 BufferResult::Redraw
             }
             Action::DeleteWordBackward => {
+                if self.replace_selection("") {
+                    return BufferResult::Redraw;
+                }
                 let before = &self.text[..self.cursor];
                 let trimmed = before.trim_end_matches(' ');
                 let word_start = trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0);
@@ -4435,6 +4713,9 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::DeleteToEnd => {
+                if self.replace_selection("") {
+                    return BufferResult::Redraw;
+                }
                 let end = self.text[self.cursor..]
                     .find('\n')
                     .map(|i| self.cursor + i)
@@ -4443,6 +4724,9 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::Backspace => {
+                if self.replace_selection("") {
+                    return BufferResult::Redraw;
+                }
                 if self.cursor > 0 {
                     let p = prev_boundary(&self.text, self.cursor);
                     self.text.drain(p..self.cursor);
@@ -4451,6 +4735,9 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::DeleteForward => {
+                if self.replace_selection("") {
+                    return BufferResult::Redraw;
+                }
                 if self.cursor < self.text.len() {
                     let n = next_boundary(&self.text, self.cursor);
                     self.text.drain(self.cursor..n);
@@ -4458,18 +4745,31 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::CursorLeft => {
+                if let Some(range) = self.selected_range() {
+                    self.cursor = range.start;
+                    self.clear_selection();
+                    return BufferResult::Redraw;
+                }
+                self.clear_selection();
                 if self.cursor > 0 {
                     self.cursor = prev_boundary(&self.text, self.cursor);
                 }
                 BufferResult::Redraw
             }
             Action::CursorRight => {
+                if let Some(range) = self.selected_range() {
+                    self.cursor = range.end;
+                    self.clear_selection();
+                    return BufferResult::Redraw;
+                }
+                self.clear_selection();
                 if self.cursor < self.text.len() {
                     self.cursor = next_boundary(&self.text, self.cursor);
                 }
                 BufferResult::Redraw
             }
             Action::LineStart => {
+                self.clear_selection();
                 let start = self.text[..self.cursor]
                     .rfind('\n')
                     .map(|i| i + 1)
@@ -4478,6 +4778,7 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::LineEnd => {
+                self.clear_selection();
                 let end = self.text[self.cursor..]
                     .find('\n')
                     .map(|i| self.cursor + i)
@@ -4486,6 +4787,7 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::HistorySearch => {
+                self.clear_selection();
                 // Enter Ctrl+R reverse-i-search. The current draft is
                 // stashed so Esc restores it; `search_query` seeds from the
                 // draft (readline-style: Ctrl+R on a non-empty line searches
@@ -4504,6 +4806,7 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::HistoryPrev => {
+                self.clear_selection();
                 if history.is_empty() {
                     return BufferResult::Redraw;
                 }
@@ -4544,6 +4847,7 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::HistoryNext => {
+                self.clear_selection();
                 if let Some(i) = self.history_idx {
                     if i + 1 < history.len() {
                         // Still inside history — same cursor-at-0 rule
@@ -4568,6 +4872,7 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::Complete => {
+                self.clear_selection();
                 if self.text.starts_with('/') {
                     let prefix = &self.text[1..];
                     let matches = commands.matching_prefix(prefix);
@@ -4644,6 +4949,7 @@ impl Buffer {
     /// typed; an empty query matches every entry, so the most recent
     /// one is shown (readline behaviour).
     fn search_jump_newest(&mut self, history: &[crate::input::history::HistoryEntry]) {
+        self.clear_selection();
         let q = self.search_query.to_lowercase();
         let hit = (0..history.len())
             .rev()
@@ -4679,6 +4985,7 @@ impl Buffer {
     /// Display history entry `i` as the current search match: rehydrate
     /// text + paste registry and park the cursor (mirrors HistoryPrev).
     fn search_show(&mut self, history: &[crate::input::history::HistoryEntry], i: usize) {
+        self.clear_selection();
         self.history_idx = Some(i);
         self.text = history[i].text.clone();
         self.pastes = history[i].pastes.clone();
@@ -4696,6 +5003,12 @@ impl Buffer {
     /// kicks in but rescues anyone who paged Up to fix a typo on
     /// line 1 from losing their draft.
     pub fn cursor_line_up(&mut self) -> bool {
+        if let Some(range) = self.selected_range() {
+            self.cursor = range.start;
+            self.clear_selection();
+            return true;
+        }
+        self.clear_selection();
         let cur_line_start = self.text[..self.cursor]
             .rfind('\n')
             .map(|i| i + 1)
@@ -4709,7 +5022,8 @@ impl Buffer {
             }
             return false;
         }
-        let target_col = crate::width::display_width(&self.text[cur_line_start..self.cursor]);
+        let target_col =
+            crate::width::display_width_with_tabs(&self.text[cur_line_start..self.cursor]);
         let prev_line_end = cur_line_start - 1;
         let prev_line_start = self.text[..prev_line_end]
             .rfind('\n')
@@ -4726,6 +5040,12 @@ impl Buffer {
     /// first snaps to end-of-buffer; the keystroke after that hands
     /// off to history.
     pub fn cursor_line_down(&mut self) -> bool {
+        if let Some(range) = self.selected_range() {
+            self.cursor = range.end;
+            self.clear_selection();
+            return true;
+        }
+        self.clear_selection();
         let Some(rel_end) = self.text[self.cursor..].find('\n') else {
             if self.cursor < self.text.len() {
                 self.cursor = self.text.len();
@@ -4737,7 +5057,8 @@ impl Buffer {
             .rfind('\n')
             .map(|i| i + 1)
             .unwrap_or(0);
-        let target_col = crate::width::display_width(&self.text[cur_line_start..self.cursor]);
+        let target_col =
+            crate::width::display_width_with_tabs(&self.text[cur_line_start..self.cursor]);
         let next_line_start = self.cursor + rel_end + 1;
         let next_line_end = self.text[next_line_start..]
             .find('\n')
@@ -4747,19 +5068,94 @@ impl Buffer {
             + byte_offset_at_col(&self.text[next_line_start..next_line_end], target_col);
         true
     }
+
+    /// Move the cursor UP by one **visual** (soft-wrapped) line, as opposed
+    /// to by logical `\n` delimiters. Uses [`wrap_with_spans`] to determine
+    /// the visual line layout at `self.input_width` columns.
+    ///
+    /// When `input_width` is 0 (unset) or the text fits on a single visual
+    /// line, delegates to the original [`cursor_line_up`] logic so existing
+    /// callers (history navigation fallback) keep working unchanged.
+    ///
+    /// Returns `false` only when the cursor is already at byte 0 — the
+    /// caller falls through to `HistoryPrev`.
+    pub fn cursor_visual_up(&mut self) -> bool {
+        let max_cols = self.input_width;
+        if max_cols == 0 || self.cursor == 0 {
+            return self.cursor_line_up();
+        }
+        let (display, display_cursor) =
+            crate::markdown::normalize_circled_list_spacing_with_cursor(&self.text, self.cursor);
+        let (spans, cur_row, cur_col) =
+            crate::width::wrap_with_spans(&display, max_cols, display_cursor);
+        if cur_row == 0 {
+            // Already on first visual line → snap to byte 0.
+            // `self.cursor > 0` is guaranteed here: the early return
+            // above handles cursor == 0.
+            self.cursor = 0;
+            return true;
+        }
+        // Previous visual line: spans[cur_row - 1]
+        let (prev_start, prev_end) = spans[cur_row - 1];
+        let prev_text = &display[prev_start..prev_end];
+        let prev_width = crate::width::display_width_with_tabs(prev_text);
+        let target_col = cur_col.min(prev_width);
+        let display_target = prev_start + byte_offset_at_col(prev_text, target_col);
+        self.cursor = crate::markdown::source_cursor_from_circled_list_display_cursor(
+            &self.text,
+            display_target,
+        );
+        true
+    }
+
+    /// Mirror of [`cursor_visual_up`] for Down. Returns `false` only
+    /// when the cursor is already at `text.len()` — the caller falls
+    /// through to `HistoryNext`.
+    pub fn cursor_visual_down(&mut self) -> bool {
+        let max_cols = self.input_width;
+        if max_cols == 0 || self.cursor == self.text.len() {
+            return self.cursor_line_down();
+        }
+        let (display, display_cursor) =
+            crate::markdown::normalize_circled_list_spacing_with_cursor(&self.text, self.cursor);
+        let (spans, cur_row, cur_col) =
+            crate::width::wrap_with_spans(&display, max_cols, display_cursor);
+        // Cursor is on the last visual line: no next span to jump to.
+        // Fall back to logical-line down, which snaps to `text.len()`
+        // (returning `true`) so the next Down falls through to
+        // `HistoryNext`.
+        if cur_row + 1 >= spans.len() {
+            return self.cursor_line_down();
+        }
+        // Next visual line: spans[cur_row + 1]
+        let (next_start, next_end) = spans[cur_row + 1];
+        let next_text = &display[next_start..next_end];
+        let next_width = crate::width::display_width_with_tabs(next_text);
+        let target_col = cur_col.min(next_width);
+        let display_target = next_start + byte_offset_at_col(next_text, target_col);
+        self.cursor = crate::markdown::source_cursor_from_circled_list_display_cursor(
+            &self.text,
+            display_target,
+        );
+        true
+    }
 }
 
-/// Find the byte offset within `line` at the first character whose
-/// cumulative display width meets or exceeds `target_col`. If the line
-/// is shorter than `target_col` cells, returns `line.len()` — the
-/// caller clamps the cursor to the end of that shorter line.
+/// Find the byte offset within `line` at the first grapheme cluster whose
+/// cumulative display width meets or exceeds `target_col`. Iterates by
+/// grapheme cluster (not code points) and uses the same width model as
+/// [`wrap_with_spans`] — including `SOFT_TAB_WIDTH` for `\t` — so the
+/// cursor never lands mid-cluster or misaligns on tab-indented lines.
+///
+/// If the line is shorter than `target_col` cells, returns `line.len()` —
+/// the caller clamps the cursor to the end of that shorter line.
 fn byte_offset_at_col(line: &str, target_col: usize) -> usize {
     let mut acc = 0usize;
-    for (i, ch) in line.char_indices() {
+    for (i, g) in line.grapheme_indices(true) {
         if acc >= target_col {
             return i;
         }
-        acc += crate::width::cell_char_width(ch).unwrap_or(0);
+        acc += crate::width::cluster_display_width(g);
     }
     line.len()
 }
@@ -4767,6 +5163,160 @@ fn byte_offset_at_col(line: &str, target_col: usize) -> usize {
 #[cfg(test)]
 mod buffer_tests {
     use super::*;
+
+    #[test]
+    fn buffer_selection_tracks_utf8_grapheme_boundaries_in_both_directions() {
+        let mut buf = Buffer::new();
+        buf.text = "a你好👩‍💻z".into();
+        let after_ascii = "a".len();
+        let after_emoji = "a你好👩‍💻".len();
+
+        buf.set_pointer_cursor(after_ascii, false);
+        buf.set_pointer_cursor(after_emoji, true);
+        assert_eq!(buf.selected_range(), Some(after_ascii..after_emoji));
+        assert_eq!(buf.cursor, after_emoji);
+
+        buf.set_pointer_cursor(after_emoji, false);
+        buf.set_pointer_cursor(after_ascii, true);
+        assert_eq!(buf.selected_range(), Some(after_ascii..after_emoji));
+        assert_eq!(buf.cursor, after_ascii);
+    }
+
+    #[test]
+    fn buffer_selection_is_replaced_by_typing_backspace_delete_and_paste() {
+        let history = Vec::new();
+        let commands = CommandRegistry::builtin();
+
+        let mut typed = Buffer::new();
+        typed.text = "abcde".into();
+        typed.set_pointer_cursor(1, false);
+        typed.set_pointer_cursor(4, true);
+        assert!(matches!(
+            typed.apply(Action::Insert('X'), &history, &commands),
+            BufferResult::Redraw
+        ));
+        assert_eq!((typed.text.as_str(), typed.cursor), ("aXe", 2));
+        assert_eq!(typed.selected_range(), None);
+
+        for action in [Action::Backspace, Action::DeleteForward] {
+            let mut deleted = Buffer::new();
+            deleted.text = "abcde".into();
+            deleted.set_pointer_cursor(1, false);
+            deleted.set_pointer_cursor(4, true);
+            assert!(matches!(
+                deleted.apply(action, &history, &commands),
+                BufferResult::Redraw
+            ));
+            assert_eq!((deleted.text.as_str(), deleted.cursor), ("ae", 1));
+            assert_eq!(deleted.selected_range(), None);
+        }
+
+        let mut pasted = Buffer::new();
+        pasted.text = "abcde".into();
+        pasted.set_pointer_cursor(1, false);
+        pasted.set_pointer_cursor(4, true);
+        assert_eq!(pasted.insert_paste("ZZ".into()), "ZZ");
+        assert_eq!((pasted.text.as_str(), pasted.cursor), ("aZZe", 3));
+        assert_eq!(pasted.selected_range(), None);
+    }
+
+    #[test]
+    fn buffer_selection_collapses_to_the_directional_cursor_edge() {
+        let history = Vec::new();
+        let commands = CommandRegistry::builtin();
+
+        let mut left = Buffer::new();
+        left.text = "abcde".into();
+        left.set_pointer_cursor(1, false);
+        left.set_pointer_cursor(4, true);
+        let _ = left.apply(Action::CursorLeft, &history, &commands);
+        assert_eq!(left.cursor, 1);
+        assert_eq!(left.selected_range(), None);
+
+        let mut right = Buffer::new();
+        right.text = "abcde".into();
+        right.set_pointer_cursor(4, false);
+        right.set_pointer_cursor(1, true);
+        let _ = right.apply(Action::CursorRight, &history, &commands);
+        assert_eq!(right.cursor, 4);
+        assert_eq!(right.selected_range(), None);
+    }
+
+    #[test]
+    fn buffer_selection_clears_on_history_recall_and_submit() {
+        let commands = CommandRegistry::builtin();
+        let history = vec![crate::input::history::HistoryEntry {
+            text: "recalled".into(),
+            images: Vec::new(),
+            pastes: Vec::new(),
+        }];
+        let mut recalled = Buffer::new();
+        recalled.text = "draft".into();
+        recalled.set_pointer_cursor(1, false);
+        recalled.set_pointer_cursor(4, true);
+        let _ = recalled.apply(Action::HistoryPrev, &history, &commands);
+        assert_eq!(recalled.text, "recalled");
+        assert_eq!(recalled.selected_range(), None);
+
+        let mut submitted = Buffer::new();
+        submitted.text = "submit me".into();
+        submitted.set_pointer_cursor(0, false);
+        submitted.set_pointer_cursor(6, true);
+        assert!(matches!(
+            submitted.apply(Action::Submit, &[], &commands),
+            BufferResult::Commit(line) if line == "submit me"
+        ));
+        assert_eq!(submitted.selected_range(), None);
+    }
+
+    #[test]
+    fn buffer_selection_replacing_a_folded_paste_cannot_expand_stale_metadata() {
+        let mut buf = Buffer::new();
+        let original = "fold me\n".repeat(PASTE_FOLD_LINES);
+        let placeholder = buf.insert_paste(original.clone());
+        assert!(placeholder.starts_with("[Pasted #1 "));
+        assert_eq!(buf.expanded_text(), original);
+
+        buf.set_pointer_cursor(0, false);
+        buf.set_pointer_cursor(buf.text.len(), true);
+        let _ = buf.apply(Action::Insert('X'), &[], &CommandRegistry::builtin());
+
+        assert_eq!(buf.text, "X");
+        assert_eq!(buf.expanded_text(), "X");
+        assert_eq!(buf.selected_range(), None);
+    }
+
+    #[test]
+    fn buffer_selection_skill_enter_clear_then_typing_has_no_stale_range() {
+        let mut buf = Buffer::new();
+        buf.replace_all_text("$br".into());
+        buf.set_pointer_cursor(0, false);
+        buf.set_pointer_cursor(2, true);
+
+        assert_eq!(
+            apply_skill_menu_buffer_selection(&mut buf, "brainstorming", KeyCode::Enter),
+            SkillMenuBufferResult::Committed("$brainstorming".into())
+        );
+        let _ = buf.apply(Action::Insert('x'), &[], &CommandRegistry::builtin());
+
+        assert_eq!(buf.text, "x");
+        assert_eq!(buf.cursor, 1);
+        assert_eq!(buf.selected_range(), None);
+    }
+
+    #[test]
+    fn buffer_image_marker_insertion_replaces_the_active_selection() {
+        let mut buf = Buffer::new();
+        buf.replace_all_text("abc".into());
+        buf.set_pointer_cursor(1, false);
+        buf.set_pointer_cursor(2, true);
+
+        buf.insert_at_cursor("[Image #1]");
+
+        assert_eq!(buf.text, "a[Image #1]c");
+        assert_eq!(buf.cursor, "a[Image #1]".len());
+        assert_eq!(buf.selected_range(), None);
+    }
 
     #[test]
     fn second_esc_within_window_triggers_undo() {
@@ -4994,7 +5544,7 @@ mod buffer_tests {
         state.footer_usage = Some(empty_usage_panel());
 
         // buffer_empty = false: the user is typing a queued message. Even the nav
-        // keys must edit the buffer (cursor movement / agent-mode Tab), NOT steer
+        // keys must edit the buffer (cursor movement / completion Tab), NOT steer
         // the report.
         assert!(!handle_footer_usage_tab_key(
             &mut state,
@@ -5191,6 +5741,71 @@ mod buffer_tests {
         b.insert_paste(big.clone());
         assert!(b.text.contains("[Pasted #1 +10 lines]"));
         assert_eq!(b.pastes, vec![big]);
+    }
+
+    #[test]
+    fn second_identical_long_paste_expands_recent_placeholder_without_duplication() {
+        let mut b = Buffer::new();
+        let big = "line\n".repeat(10);
+        let first = std::time::Instant::now();
+
+        b.insert_paste_at(big.clone(), first);
+        assert_eq!(b.text, "[Pasted #1 +10 lines]");
+
+        b.insert_paste_at(big.clone(), first + std::time::Duration::from_millis(500));
+        assert_eq!(b.text, big);
+        assert!(
+            b.pastes.is_empty(),
+            "expanded paste no longer needs backing storage"
+        );
+    }
+
+    #[test]
+    fn repeated_long_paste_after_timeout_stays_as_two_folded_pastes() {
+        let mut b = Buffer::new();
+        let big = "line\n".repeat(10);
+        let first = std::time::Instant::now();
+
+        b.insert_paste_at(big.clone(), first);
+        b.insert_paste_at(
+            big.clone(),
+            first + DOUBLE_PASTE_EXPAND_WINDOW + std::time::Duration::from_millis(1),
+        );
+
+        assert_eq!(b.text, "[Pasted #1 +10 lines][Pasted #2 +10 lines]");
+        assert_eq!(b.pastes, vec![big.clone(), big]);
+    }
+
+    #[test]
+    fn intervening_input_cancels_double_paste_expansion() {
+        let mut b = Buffer::new();
+        let big = "line\n".repeat(10);
+        let first = std::time::Instant::now();
+        b.insert_paste_at(big.clone(), first);
+
+        let _ = b.apply(Action::Insert('x'), &[], &CommandRegistry::builtin());
+        b.insert_paste_at(big.clone(), first + std::time::Duration::from_millis(500));
+
+        assert_eq!(b.text, "[Pasted #1 +10 lines]x[Pasted #2 +10 lines]");
+        assert_eq!(b.pastes, vec![big.clone(), big]);
+    }
+
+    #[test]
+    fn image_marker_cancels_text_double_paste_expansion() {
+        let mut b = Buffer::new();
+        let big = "line\n".repeat(10);
+        let first = std::time::Instant::now();
+        b.insert_paste_at(big.clone(), first);
+
+        // Image paste uses this exact insertion seam after image detection.
+        b.insert_at_cursor("[Image #1]");
+        b.insert_paste_at(big.clone(), first + std::time::Duration::from_millis(500));
+
+        assert_eq!(
+            b.text,
+            "[Pasted #1 +10 lines][Image #1][Pasted #2 +10 lines]"
+        );
+        assert_eq!(b.pastes, vec![big.clone(), big]);
     }
 
     #[test]
@@ -5670,7 +6285,14 @@ mod buffer_tests {
 
     #[test]
     fn submit_preserves_prompt_like_chars_without_space() {
-        for source in ["#8，。。。。", "#标题", ">quote", "%value", "λx", "❯git status"] {
+        for source in [
+            "#8，。。。。",
+            "#标题",
+            ">quote",
+            "%value",
+            "λx",
+            "❯git status",
+        ] {
             match commit_of(source) {
                 BufferResult::Commit(s) => assert_eq!(s, source),
                 _ => panic!("expected Commit for {source:?}"),
@@ -5706,6 +6328,20 @@ mod menu_tests {
     use super::*;
     use crate::custom_commands::CustomCommand;
     use crate::custom_commands::CustomCommandRegistry;
+
+    #[test]
+    fn main_composer_reserves_plain_tab_for_completion() {
+        use crossterm::event::KeyModifiers;
+
+        assert!(!is_mode_cycle_key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(is_mode_cycle_key(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert!(is_mode_cycle_key(KeyCode::BackTab, KeyModifiers::NONE));
+        assert!(is_mode_cycle_key(KeyCode::Tab, KeyModifiers::SHIFT));
+        assert!(!is_mode_cycle_key(
+            KeyCode::BackTab,
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL
+        ));
+    }
 
     #[test]
     fn pending_transition_routes_enter_through_common_commit_gate() {
@@ -6106,19 +6742,21 @@ mod menu_tests {
         assert!(items.iter().any(|(n, _)| n == "effort"));
         assert!(!items
             .iter()
-            .any(|(n, _)| n == "high" || n == "max" || n == "off"));
+            .any(|(n, _)| matches!(n.as_str(), "low" | "medium" | "high" | "max" | "default")));
     }
 
     #[test]
     fn effort_sub_mode_lists_and_filters_choices() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        // `/effort ` (trailing space) → all three choices.
+        // `/effort ` (trailing space) → every reasoning-effort choice.
         let all = build_menu_items("/effort ", 0, &reg, &custom, None, None)
             .expect("/effort sub-mode must list choices");
         let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
         assert!(
-            names.contains(&"high") && names.contains(&"max") && names.contains(&"off"),
+            ["low", "medium", "high", "max", "default"]
+                .iter()
+                .all(|v| names.contains(v)),
             "got: {names:?}"
         );
         // Prefix narrows.
@@ -6130,6 +6768,33 @@ mod menu_tests {
         assert!(build_menu_items("/effort zz", 0, &reg, &custom, None, None).is_none());
         // A chosen value followed by a space (typing past) hides the menu.
         assert!(build_menu_items("/effort high ", 0, &reg, &custom, None, None).is_none());
+    }
+
+    #[test]
+    fn effort_applicable_ignores_provider_type_and_matches_webui() {
+        // Any endpoint with an explicitly configured effort is applicable — the
+        // TUI must no longer hide the control behind a `{deepseek, openai}`
+        // provider_type gate the webui/wire never applied.
+        assert!(effort_applicable(
+            Some("medium"),
+            "internal-anthropic",
+            "claude-x"
+        ));
+        assert!(effort_applicable(Some("high"), "internal-ollama", "qwen"));
+        // Unconfigured custom endpoint → not applicable.
+        assert!(!effort_applicable(None, "internal-glm", "glm-5.2"));
+        // Built-in CodingPlan DeepSeek V4 Flash → applicable without a config value
+        // (matches `models_from_config`); a codingplan name with another model is not.
+        assert!(effort_applicable(
+            None,
+            "AtomGit-deepseek-v4-flash",
+            "deepseek-v4-flash"
+        ));
+        assert!(!effort_applicable(
+            None,
+            "AtomGit-deepseek-v4-flash",
+            "glm-5.2"
+        ));
     }
 
     #[test]
@@ -6660,6 +7325,176 @@ mod menu_tests {
         assert_eq!(buf.cursor, 6);
     }
 
+    // ── Visual-line navigation (soft-wrap aware Up/Down) ──
+
+    #[test]
+    fn cursor_visual_up_navigates_wrapped_single_paragraph() {
+        // A long single line that wraps to 3 visual rows at max_cols=10.
+        // "abcdefghijklmnopqrstuvwxyz" wraps as:
+        //   [0..10)  "abcdefghij"
+        //   [10..20) "klmnopqrst"
+        //   [20..26) "uvwxyz"
+        // Cursor at end (byte 26, col 6 on visual row 2): Up → row 1, col 6.
+        let mut buf = Buffer::new();
+        buf.input_width = 10;
+        buf.text = "abcdefghijklmnopqrstuvwxyz".into();
+        buf.cursor = buf.text.len(); // byte 26
+
+        assert!(buf.cursor_visual_up(), "Up from last visual row");
+        // Should land at byte 20 (start of "uvwxyz") + col 6 = byte 26
+        // Wait: cur_col = 6, target_col = 6, prev line "klmnopqrst" width=10
+        // byte_offset_at_col("klmnopqrst", 6) → byte 6 (since "klmnop" = 6 chars)
+        // prev_start = 10 → cursor = 10 + 6 = 16
+        assert_eq!(buf.cursor, 16, "should be at 'g' on row 1");
+
+        assert!(buf.cursor_visual_up(), "Up to first visual row");
+        assert_eq!(buf.cursor, 6, "should be at 'g' on row 0");
+
+        assert!(buf.cursor_visual_up(), "snap to byte 0");
+        assert_eq!(buf.cursor, 0);
+
+        assert!(!buf.cursor_visual_up(), "already at byte 0 → false");
+    }
+
+    #[test]
+    fn cursor_visual_down_navigates_wrapped_single_paragraph() {
+        let mut buf = Buffer::new();
+        buf.input_width = 10;
+        buf.text = "abcdefghijklmnopqrstuvwxyz".into();
+        buf.cursor = 0; // byte 0, visual row 0, col 0
+
+        assert!(buf.cursor_visual_down(), "Down to second visual row");
+        // cur_col = 0, next line "klmnopqrst" → byte_offset_at_col(_, 0) = 0
+        // next_start = 10 → cursor = 10
+        assert_eq!(buf.cursor, 10, "should be start of row 1");
+
+        assert!(buf.cursor_visual_down(), "Down to third visual row");
+        assert_eq!(buf.cursor, 20, "should be start of row 2");
+
+        assert!(buf.cursor_visual_down(), "snap to end");
+        assert_eq!(buf.cursor, buf.text.len());
+
+        assert!(!buf.cursor_visual_down(), "already at end → false");
+    }
+
+    #[test]
+    fn cursor_visual_up_down_preserves_column_alignment() {
+        // Multi-line text where the second line wraps because it exceeds
+        // input_width. Cursor at byte 22 (the \n after "klmnopqrstu"),
+        // which `wrap_with_spans` places on visual row 2 ("u"), col 1.
+        // Byte layout:
+        //   "abcdefghij\n"              → [0..11),  visual row 0
+        //   "klmnopqrst"                → [11..21), visual row 1
+        //   "u"                         → [21..22), visual row 2
+        //   "\nvwxyz"                   → [22..28), visual row 3
+        //   cursor = 22 → visual row 2, col 1 (after "u" at col 0)
+        let mut buf = Buffer::new();
+        buf.input_width = 10;
+        buf.text = "abcdefghij\nklmnopqrstu\nvwxyz".into();
+        buf.cursor = 22;
+        assert_eq!(&buf.text[..buf.cursor], "abcdefghij\nklmnopqrstu");
+
+        // Up: navigate from visual row 2 ("u") to row 1 ("klmnopqrst"),
+        // preserving col 1 → byte_offset_at_col("klmnopqrst", 1) = 'l' at byte 12.
+        assert!(buf.cursor_visual_up());
+        assert_eq!(buf.cursor, 12, "cursor at 'l' (col 1) on visual row 1");
+
+        // Down back: from visual row 1 back to row 2 ("u"), preserving col 1.
+        // byte_offset_at_col("u", 1) returns 1 (line.len()), so cursor = 21 + 1 = 22,
+        // which is the \n after "u" — the byte just past the "u" grapheme.
+        assert!(buf.cursor_visual_down());
+        assert_eq!(buf.cursor, 22, "cursor at '\\n' after 'u' on visual row 2");
+    }
+
+    #[test]
+    fn cursor_visual_up_down_input_width_zero_falls_back_to_logical() {
+        // With input_width=0, cursor_visual_up/down should behave like cursor_line_up/down
+        let mut buf = Buffer::new();
+        buf.input_width = 0; // disable visual navigation
+        buf.text = "line1\nline2\nline3".into();
+        buf.cursor = buf.text.len();
+
+        assert!(buf.cursor_visual_up(), "falls back to logical line up");
+        assert_eq!(&buf.text[..buf.cursor], "line1\nline2");
+    }
+
+    #[test]
+    fn cursor_visual_up_down_input_width_zero_fallback_preserves_tab_columns() {
+        // With input_width=0 the visual nav falls back to cursor_line_up/down.
+        // The fallback must still use display_width_with_tabs for the target
+        // column so that a tab-indented line doesn't get width 0 and snap
+        // the cursor to byte 0 of the target line instead of the real column.
+        let mut buf = Buffer::new();
+        buf.input_width = 0;
+        buf.text = "abcd\n\tb".into();
+        buf.cursor = 4;
+
+        assert!(
+            buf.cursor_visual_down(),
+            "fallback Down to tab-indented line"
+        );
+        // After cursor_line_down: cur_line="abcd", target_col=4,
+        // next_line="\tb", byte_offset_at_col("\tb", 4)
+        //   → acc+=4 (SOFT_TAB_WIDTH) → acc=4 >= 4 → return i=1
+        // cursor = 5 + 1 = 6
+        assert_eq!(
+            buf.cursor, 6,
+            "fallback down preserves column 4 on tab line"
+        );
+    }
+
+    #[test]
+    fn cursor_visual_navigation_preserves_tab_columns() {
+        // Tab-indented second line: "abcd" is 4 cols, "\tb" renders as
+        // 4 (SOFT_TAB_WIDTH) + 1 = 5 cols. Cursor at col 4 on line 0
+        // ("abcd") — Down must land at the corresponding column on the
+        // tab-indented visual row, not clamped to display_width("\tb")==1.
+        //
+        // wrap_with_spans("abcd\n\tb", 20) produces:
+        //   spans = [(0,4), (5,7)]
+        //   cursor at byte 4 → row 0, col 4
+        // cursor_visual_down:
+        //   next_text = "\tb" (bytes 5..7)
+        //   display_width_with_tabs("\tb") = 4 + 1 = 5
+        //   target_col = min(4, 5) = 4
+        //   byte_offset_at_col("\tb", 4):
+        //     i=0, g="\t", width=4 → acc=4 >= 4 → return i=1
+        //   cursor = 5 + 1 = 6 (start of "b")
+        let mut buf = Buffer::new();
+        buf.input_width = 20;
+        buf.text = "abcd\n\tb".into();
+        buf.cursor = 4;
+
+        assert!(buf.cursor_visual_down(), "Down to tab-indented line");
+        assert_eq!(
+            buf.cursor, 6,
+            "cursor at byte 6 ('b') — visual column 4 on tab-indented row"
+        );
+    }
+
+    #[test]
+    fn buffer_starts_with_visual_navigation_disabled_until_geometry_is_known() {
+        assert_eq!(Buffer::new().input_width, 0);
+    }
+
+    #[test]
+    fn cursor_visual_navigation_matches_circled_label_display_projection() {
+        let mut buf = Buffer::new();
+        buf.input_width = 4;
+        buf.text = "①Rustabcde".into();
+        // Renderer projection is "① Rustabcde". The cursor after `s` is on
+        // visual row 1, column 1; Up lands immediately after the circled label,
+        // not at byte 0 as the unprojected layout would.
+        buf.cursor = "①Rus".len();
+
+        assert!(buf.cursor_visual_up());
+        assert_eq!(buf.cursor, '①'.len_utf8());
+        assert_eq!(
+            buf.text, "①Rustabcde",
+            "display spacing must stay ephemeral"
+        );
+    }
+
     #[test]
     fn history_next_back_to_stash_restores_cursor_to_end() {
         let mut buf = Buffer::new();
@@ -6884,6 +7719,67 @@ mod menu_tests {
         assert_eq!(notice.len(), 1, "expected one cache-miss notice");
         assert!(notice[0].contains("[Image #3]"));
         assert!(notice[0].contains("缓存"));
+    }
+
+    #[test]
+    fn project_history_hydrates_legacy_image_cache_without_copying_it() {
+        use crate::input::history::{History, HistoryImageRef};
+        use crate::platform::ProjectHistoryPaths;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("history-v2/project");
+        let legacy_cache = dir.path().join("image-cache");
+        std::fs::create_dir_all(&legacy_cache).unwrap();
+        std::fs::write(legacy_cache.join("deadbeef12345678.png"), b"\x89PNG").unwrap();
+        let history = History::load_project(ProjectHistoryPaths {
+            entries: project_dir.join("entries.jsonl"),
+            lock: project_dir.join("write.lock"),
+            image_cache: project_dir.join("images"),
+            legacy_entries: dir.path().join("history"),
+            legacy_image_cache: legacy_cache.clone(),
+        });
+
+        let mut state = UiState::new();
+        state.pending_recalled_attachments.push(HistoryImageRef {
+            hash: "deadbeef12345678".into(),
+            mt: "image/png".into(),
+            n: 1,
+        });
+        let mut line = "legacy [Image #1]".to_owned();
+
+        let notices =
+            super::hydrate_recalled_attachments_for_history(&mut state, &mut line, &history);
+
+        assert!(notices.is_empty());
+        assert_eq!(state.pending_images.len(), 1);
+        assert_eq!(
+            std::fs::read_dir(history.cache_dir())
+                .ok()
+                .map(|it| it.count()),
+            None
+        );
+        assert!(legacy_cache.join("deadbeef12345678.png").exists());
+    }
+
+    #[test]
+    fn history_rebind_resets_navigation_without_discarding_the_draft() {
+        let history = vec![crate::input::history::HistoryEntry {
+            text: "old project prompt".into(),
+            images: Vec::new(),
+            pastes: Vec::new(),
+        }];
+        let registry = CommandRegistry::builtin();
+        let mut buffer = Buffer::new();
+        buffer.insert_at_cursor("draft");
+        let _ = buffer.apply(Action::HistoryPrev, &history, &registry);
+        assert!(buffer.history_idx().is_some());
+
+        buffer.reset_history_navigation();
+
+        assert_eq!(buffer.text, "draft");
+        assert_eq!(buffer.cursor, "draft".len());
+        assert_eq!(buffer.history_idx(), None);
+        assert!(!buffer.is_searching());
     }
 
     #[test]
@@ -8053,6 +8949,17 @@ pub struct App {
     /// Accumulates reasoning/thinking content for display in verbose mode.
     /// Flushed on newline or when buffer exceeds threshold.
     pub reasoning_buffer: String,
+    transcript_selection: Option<TranscriptSelectionState>,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptSelectionState {
+    generation: u64,
+    surface_session: u64,
+    anchor: crate::render::interaction::SemanticEndpoint,
+    head: crate::render::interaction::SemanticEndpoint,
+    surviving_run_ids: Vec<u64>,
+    dragging: bool,
 }
 
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
@@ -8119,7 +9026,7 @@ fn dismiss_footer_command_output(state: &mut UiState) -> bool {
 ///    start with a digit ("3 retries"), so digit tab-jump stays modal-only and
 ///    the streaming footer owns only pure navigation keys (Tab/BackTab/←/→).
 ///  - `buffer_empty`: while composing a queued (type-ahead) message even those
-///    nav keys belong to the draft (cursor movement, agent-mode Tab), so the
+///    nav keys belong to the draft (cursor movement, completion Tab), so the
 ///    report only owns them when the input box is empty.
 fn handle_footer_usage_tab_key(
     state: &mut UiState,
@@ -8166,6 +9073,7 @@ impl App {
             esc_undo_last_at: None,
             setup_pending: false,
             reasoning_buffer: String::new(),
+            transcript_selection: None,
         }
     }
 }
@@ -8238,6 +9146,12 @@ pub(crate) fn handle_loop_decision(
 
 pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<ExitReason> {
     let mut app = App::new(&ctx.caps);
+    // The active runtime/model owns the context-window denominator. Seed it
+    // before `-c` history replay below: persisted turn stats may have been
+    // produced by a different model, so replay may restore their used-token
+    // count but must not replace the current model's window.
+    app.state
+        .on_model_window_changed(ctx.config.default_context_window());
     apply_startup_bypass(
         ctx.dangerously_skip_permissions,
         &mut app.state.agent_mode,
@@ -8252,6 +9166,14 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             atomcode_daemon::live_set_mode(crate::state::AgentMode::Auto);
         },
     );
+
+    // Sync the initial input width from the live terminal geometry so visual
+    // line navigation wraps at the same width as the renderer from turn one.
+    // (Without this, Buffer defaults to 80 cols and wraps differently from
+    // any terminal that isn't exactly 82 columns wide.)
+    if let Ok((cols, _)) = crossterm::terminal::size() {
+        app.buf.input_width = crate::width::composer_text_width(cols as usize, ctx.caps.jediterm);
+    }
 
     crate::tuix_trace!(
         "SES",
@@ -8858,6 +9780,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             maybe = ctx.runtime_event_rx.recv() => {
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let event_render_effect = runtime_event_render_effect(
+                        ctx.session_preview_selection.as_ref(),
+                        &runtime_event.event,
+                    );
+                    let redraw_policy = runtime_event_redraw_policy(
+                        event_render_effect,
+                        app.active_modal
+                            .as_ref()
+                            .is_some_and(|modal| modal.accepts_session_preview()),
+                    );
                     let redraw_modal_after_terminal =
                         is_provider_reload_terminal(&runtime_event.event);
                     let provider_reload_failed =
@@ -8907,7 +9839,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     }
-                    if matches!(app.state.phase, UiPhase::Idle) {
+                    if matches!(app.state.phase, UiPhase::Idle)
+                        && redraw_policy == RuntimeEventRedrawPolicy::Default
+                    {
                         // The end of a turn is the first safe provider reload
                         // boundary. Reconcile before draining type-ahead so the
                         // next queued message cannot start on the stale model.
@@ -8950,6 +9884,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         } else {
                             crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
                             redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                        }
+                    }
+                    if redraw_policy == RuntimeEventRedrawPolicy::ActiveModal {
+                        if let Some(modal) = app.active_modal.as_ref() {
+                            modal.draw(&app.buf, &app.state, &ctx, renderer);
                         }
                     }
                     if redraw_modal_after_terminal {
@@ -9260,6 +10199,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             maybe = ctx.runtime_event_rx.recv() => {
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let event_render_effect = runtime_event_render_effect(
+                        ctx.session_preview_selection.as_ref(),
+                        &runtime_event.event,
+                    );
+                    let redraw_policy = runtime_event_redraw_policy(
+                        event_render_effect,
+                        app.active_modal
+                            .as_ref()
+                            .is_some_and(|modal| modal.accepts_session_preview()),
+                    );
                     let redraw_modal_after_terminal =
                         is_provider_reload_terminal(&runtime_event.event);
                     let provider_reload_failed =
@@ -9309,7 +10258,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     }
-                    if matches!(app.state.phase, UiPhase::Idle) {
+                    if matches!(app.state.phase, UiPhase::Idle)
+                        && redraw_policy == RuntimeEventRedrawPolicy::Default
+                    {
                         let config_redraw = poll_shared_state(&mut ctx, renderer);
                         if !app.queue_drain_authorized {
                             redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
@@ -9347,6 +10298,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                         }
                     }
+                    if redraw_policy == RuntimeEventRedrawPolicy::ActiveModal {
+                        if let Some(modal) = app.active_modal.as_ref() {
+                            modal.draw(&app.buf, &app.state, &ctx, renderer);
+                        }
+                    }
                     if redraw_modal_after_terminal {
                         if let Some(modal) = app.active_modal.as_ref() {
                             modal.draw(&app.buf, &app.state, &ctx, renderer);
@@ -9362,6 +10318,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         }
 
         drain_foreground_replay_events(&mut app, &mut ctx, renderer);
+        if std::mem::take(&mut ctx.history_rebound) {
+            app.buf.reset_history_navigation();
+            sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
+        }
         install_pending_session_picker(&mut app, &mut ctx, renderer);
         install_pending_rewind_modal(&mut app, &mut ctx, renderer);
 
@@ -9403,7 +10363,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 "EXIT",
                 "shutdown watchdog fired -> hard exit (teardown wedged)"
             );
-            let _ = ctx.history.save();
+            save_all_histories(&mut ctx);
             renderer.render(UiLine::ClearTransient);
             renderer.shutdown();
             // `process::exit(0)` skips `TerminalGuard` and `ReaderHandle` drops.
@@ -9420,7 +10380,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // is immediate and has no downside — the task holds no resources
     // beyond the interval timer.
     spin_task.abort();
-    let _ = ctx.history.save();
+    save_all_histories(&mut ctx);
 
     // Determine the exit reason. If the upgrade_done flag was set,
     // the loop exited because /upgrade (or /upgrade rollback) succeeded
@@ -9706,11 +10666,13 @@ mod external_config_tests {
                 thinking_keep: None,
                 reasoning_history: None,
                 reasoning_effort: None,
+                reasoning_effort_levels: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral,
                 capable_model: None,
+                retry_max_attempts: None,
             },
         );
         config
@@ -10067,6 +11029,28 @@ mod external_config_tests {
     }
 
     #[test]
+    fn explicit_current_model_edit_is_adopted_by_a_pinned_session() {
+        let current = config("pinned-model", false);
+        let mut persisted = current.clone();
+        persisted
+            .providers
+            .get_mut("main")
+            .unwrap()
+            .retry_max_attempts = Some(7);
+
+        let desired = desired_config_from_snapshot_parts(
+            &current,
+            crate::ProviderSelectionMode::Pinned,
+            persisted,
+            true,
+        );
+
+        assert_eq!(desired.default_provider, "main");
+        assert_eq!(desired.providers["main"].model, "pinned-model");
+        assert_eq!(desired.providers["main"].retry_max_attempts, Some(7));
+    }
+
+    #[test]
     fn proxy_runtime_config_retains_an_ephemeral_provider_missing_from_disk() {
         let current = config("oauth-model", true);
         let mut persisted = Config::default();
@@ -10142,6 +11126,39 @@ mod external_config_tests {
         let saved = config_for_persistence(&desired, &persisted, true);
 
         assert_eq!(saved.default_provider, "next");
+    }
+
+    #[test]
+    fn delayed_effort_projection_updates_only_its_provider() {
+        let mut config = config("old-model", false);
+        config.providers.insert(
+            "next".into(),
+            ProviderConfig {
+                model: "next-model".into(),
+                ..config.providers["main"].clone()
+            },
+        );
+        config.providers.get_mut("main").unwrap().reasoning_effort = Some("medium".into());
+        let mut visible_effort = Some("medium".to_string());
+
+        project_reasoning_effort(
+            &mut config,
+            "main",
+            &mut visible_effort,
+            "next",
+            Some(atomcode_kernel::provider::ReasoningEffort::High),
+            true,
+        );
+
+        assert_eq!(visible_effort.as_deref(), Some("medium"));
+        assert_eq!(
+            config.providers["main"].reasoning_effort.as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            config.providers["next"].reasoning_effort.as_deref(),
+            Some("high")
+        );
     }
 
     #[test]
@@ -10729,19 +11746,30 @@ pub(crate) fn apply_config_panel_commit(
     previous_document: String,
     force_agent_reassemble: bool,
     force_capability_reprepare: bool,
+    adopt_active_provider_edit: bool,
     success_message: String,
 ) -> Result<PersistedConfigReload, anyhow::Error> {
     if provider_transition_pending(ctx) {
-        let rollback = ctx.config_store.replace_document_if_revision(
-            &commit.snapshot.revision,
-            &previous_document,
-        )?;
+        let rollback = ctx
+            .config_store
+            .replace_document_if_revision(&commit.snapshot.revision, &previous_document)?;
         if rollback.is_some() {
             ctx.observed_config_revision = rollback.map(|commit| commit.snapshot.revision);
         }
         anyhow::bail!("a runtime configuration transition is already in progress");
     }
-    let desired = desired_config_from_snapshot(ctx, commit.snapshot.config, false);
+    // Most panel settings are provider-neutral, so a pinned session keeps its
+    // opened model just like it does for external config changes. A dynamic
+    // setting that explicitly edits the current model (currently retry count)
+    // must adopt that model profile from the committed snapshot; otherwise the
+    // pinned merge would put the stale runtime copy back and report false
+    // success even though only the on-disk value changed.
+    let desired = desired_config_from_snapshot_parts(
+        &ctx.config,
+        ctx.provider_selection_mode,
+        commit.snapshot.config,
+        adopt_active_provider_edit,
+    );
     let auth_available = AuthObservation::read().is_available();
     let wants_reload = force_agent_reassemble
         || force_capability_reprepare
@@ -10871,7 +11899,18 @@ fn commit_auth_observation(
 /// the cross-process protocol. Token refreshes for the same account therefore do
 /// not cause provider reassembly, while logout/login transitions do.
 fn poll_external_auth(ctx: &mut LoopCtx) -> bool {
-    let current = AuthObservation::read();
+    let current = match AuthObservation::read_checked() {
+        Ok(current) => current,
+        Err(error) => {
+            // A transient read/parse failure is not proof of logout. Preserve
+            // the live provider and retry instead of cancelling an active turn.
+            crate::tuix_trace!(
+                "AUTH",
+                "credential observation failed; preserving current provider: {error:#}"
+            );
+            return false;
+        }
+    };
     let changed = ctx.observed_auth.as_ref() != Some(&current);
     if !changed || provider_transition_pending(ctx) {
         return false;
@@ -11011,11 +12050,9 @@ fn attach_image_to_input(
     let Some((img, hash)) = img_hash else {
         return Ok(false);
     };
-    if let Some(reject) = image_attach_reject_line(
-        &ctx.config,
-        &ctx.provider_selection,
-        &ctx.model_name,
-    ) {
+    if let Some(reject) =
+        image_attach_reject_line(&ctx.config, &ctx.provider_selection, &ctx.model_name)
+    {
         renderer.render(UiLine::Error(reject));
         renderer.flush();
         if matches!(app.state.phase, UiPhase::Idle) {
@@ -11032,10 +12069,9 @@ fn attach_image_to_input(
     app.state.pending_images.push(img.clone());
     app.state.pending_image_hashes.push(hash);
     app.state.pending_image_markers.push(n);
-    cache_write_image(&crate::platform::image_cache_dir(), &img, hash);
+    cache_write_image(ctx.history.cache_dir(), &img, hash);
     let marker = format!("[Image #{}]", n);
-    app.buf.text.insert_str(app.buf.cursor, &marker);
-    app.buf.cursor += marker.len();
+    app.buf.insert_at_cursor(&marker);
     if matches!(app.state.phase, UiPhase::Streaming) {
         draw_spinner_now(
             &mut app.state,
@@ -11049,6 +12085,101 @@ fn attach_image_to_input(
         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
     }
     Ok(true)
+}
+
+fn attach_image_to_user_input(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    image: Option<(ImageContent, u64)>,
+) -> Result<bool> {
+    let Some((image, _)) = image else {
+        return Ok(false);
+    };
+    if let Some(reject) =
+        image_attach_reject_line(&ctx.config, &ctx.provider_selection, &ctx.model_name)
+    {
+        renderer.render(UiLine::Error(reject));
+        renderer.flush();
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(true);
+    }
+    if app.state.user_input_panel.is_none()
+        && app
+            .state
+            .user_input_batch
+            .as_ref()
+            .map_or(true, |batch| batch.on_submit_stop())
+    {
+        return Ok(true);
+    }
+    app.state.session_image_count += 1;
+    let marker = format!("[Image #{}]", app.state.session_image_count);
+    let panel = if let Some(batch) = app.state.user_input_batch.as_mut() {
+        &mut batch.questions[batch.current]
+    } else if let Some(panel) = app.state.user_input_panel.as_mut() {
+        panel
+    } else {
+        return Ok(true);
+    };
+    clear_panel_paste_command(panel);
+    if !matches!(
+        panel.mode,
+        atomcode_capabilities::tools::request_user_input::UserInputMode::Text
+    ) {
+        panel.cursor = panel.other_index();
+    }
+    panel.images.push(image);
+    panel.insert_paste(&marker);
+    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    Ok(true)
+}
+
+fn clear_panel_paste_command(panel: &mut crate::state::UserInputPanel) {
+    use atomcode_capabilities::tools::request_user_input::UserInputMode::*;
+    match panel.mode {
+        Text if panel.text.trim() == "/paste"
+            || paste_command_image_path(&panel.text).is_some() =>
+        {
+            panel.text.clear();
+            panel.text_cursor_byte = 0;
+        }
+        Single | Multiple
+            if panel.is_other_row()
+                && (panel.custom_text.trim() == "/paste"
+                    || paste_command_image_path(&panel.custom_text).is_some()) =>
+        {
+            panel.custom_text.clear();
+            panel.custom_text_cursor_byte = 0;
+        }
+        _ => {}
+    }
+}
+
+fn paste_command_image_path(text: &str) -> Option<&str> {
+    let rest = text.trim().strip_prefix("/paste")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let path = rest.trim();
+    (!path.is_empty()).then_some(path)
+}
+
+fn user_input_text(state: &crate::state::UiState) -> Option<&str> {
+    let panel = if let Some(batch) = state.user_input_batch.as_ref() {
+        if batch.on_submit_stop() {
+            return None;
+        }
+        &batch.questions[batch.current]
+    } else {
+        state.user_input_panel.as_ref()?
+    };
+    use atomcode_capabilities::tools::request_user_input::UserInputMode::*;
+    match panel.mode {
+        Text => Some(&panel.text),
+        Single | Multiple if panel.is_other_row() => Some(&panel.custom_text),
+        _ => None,
+    }
 }
 
 /// Submit-time image-path recognition.
@@ -11167,6 +12298,702 @@ fn handle_paste_command(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerRoute {
+    ScrollBody(i32),
+    Ignored,
+}
+
+fn route_pointer(event: PointerEvent) -> PointerRoute {
+    if event.shift && matches!(event.kind, PointerKind::Drag) {
+        return PointerRoute::Ignored;
+    }
+
+    match event.kind {
+        PointerKind::Scroll(delta) => PointerRoute::ScrollBody(i32::from(delta)),
+        PointerKind::Down | PointerKind::Up | PointerKind::Drag | PointerKind::Move => {
+            PointerRoute::Ignored
+        }
+    }
+}
+
+fn apply_pointer_event(event: PointerEvent, renderer: &mut dyn Renderer) {
+    match route_pointer(event) {
+        PointerRoute::ScrollBody(delta) => renderer.scroll_body(delta),
+        PointerRoute::Ignored => {}
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerPointerRoute {
+    Ignored,
+    Handled,
+    Redraw,
+}
+
+fn transcript_endpoint_index(
+    runs: &[crate::render::interaction::CopyRun],
+    endpoint: crate::render::interaction::SemanticEndpoint,
+) -> Option<usize> {
+    runs.iter().position(|run| run.id == endpoint.run_id)
+}
+
+fn extract_transcript_selection(
+    runs: &[crate::render::interaction::CopyRun],
+    anchor: crate::render::interaction::SemanticEndpoint,
+    head: crate::render::interaction::SemanticEndpoint,
+) -> Option<String> {
+    let anchor_index = transcript_endpoint_index(runs, anchor)?;
+    let head_index = transcript_endpoint_index(runs, head)?;
+    let (start_index, start_byte, end_index, end_byte) =
+        if (anchor_index, anchor.byte) <= (head_index, head.byte) {
+            (anchor_index, anchor.byte, head_index, head.byte)
+        } else {
+            (head_index, head.byte, anchor_index, anchor.byte)
+        };
+    let start_run = &runs[start_index];
+    let end_run = &runs[end_index];
+    if start_byte > start_run.text.len()
+        || end_byte > end_run.text.len()
+        || !start_run.text.is_char_boundary(start_byte)
+        || !end_run.text.is_char_boundary(end_byte)
+    {
+        return None;
+    }
+
+    let mut output = String::new();
+    for index in start_index..=end_index {
+        let run = &runs[index];
+        let from = if index == start_index { start_byte } else { 0 };
+        let to = if index == end_index {
+            end_byte
+        } else {
+            run.text.len()
+        };
+        if from > to || !run.text.is_char_boundary(from) || !run.text.is_char_boundary(to) {
+            return None;
+        }
+        output.extend(run.text[from..to].chars().filter(|character| {
+            *character == '\n' || *character == '\t' || !character.is_control()
+        }));
+        if index < end_index && (!run.soft_wrap || run.next_run_id != Some(runs[index + 1].id)) {
+            output.push('\n');
+        }
+    }
+    Some(output)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TranscriptPointerRoute {
+    Ignored,
+    Handled,
+    Redraw,
+    Copy(String),
+}
+
+fn publish_transcript_selection(
+    state: Option<&TranscriptSelectionState>,
+    publisher: &crate::render::interaction::InteractionPublisher,
+) {
+    publisher.set_transcript_selection(state.map(|state| {
+        crate::render::interaction::TranscriptSelection {
+            anchor: state.anchor,
+            head: state.head,
+            run_ids: state.surviving_run_ids.clone().into(),
+        }
+    }));
+}
+
+fn clamp_endpoint_to_runs(
+    endpoint: crate::render::interaction::SemanticEndpoint,
+    runs: &[crate::render::interaction::CopyRun],
+    allowed: &[u64],
+) -> Option<crate::render::interaction::SemanticEndpoint> {
+    let run = runs
+        .iter()
+        .filter(|run| allowed.contains(&run.id))
+        .min_by_key(|run| run.id.abs_diff(endpoint.run_id))?;
+    let mut byte = endpoint.byte.min(run.text.len());
+    while byte > 0 && !run.text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    Some(crate::render::interaction::SemanticEndpoint {
+        run_id: run.id,
+        byte,
+    })
+}
+
+fn reconcile_transcript_selection(
+    selection: &mut TranscriptSelectionState,
+    frame: &crate::render::interaction::InteractionFrame,
+) -> bool {
+    if selection.surface_session != frame.surface_session {
+        return false;
+    }
+    if selection.generation == frame.generation {
+        return true;
+    }
+    selection
+        .surviving_run_ids
+        .retain(|id| frame.copy_runs.iter().any(|run| run.id == *id));
+    let Some(anchor) = clamp_endpoint_to_runs(
+        selection.anchor,
+        &frame.copy_runs,
+        &selection.surviving_run_ids,
+    ) else {
+        return false;
+    };
+    let Some(head) = clamp_endpoint_to_runs(
+        selection.head,
+        &frame.copy_runs,
+        &selection.surviving_run_ids,
+    ) else {
+        return false;
+    };
+    selection.anchor = anchor;
+    selection.head = head;
+    selection.generation = frame.generation;
+    true
+}
+
+fn handle_transcript_pointer(
+    selection: &mut Option<TranscriptSelectionState>,
+    publisher: &crate::render::interaction::InteractionPublisher,
+    event: PointerEvent,
+    frame: &crate::render::interaction::InteractionFrame,
+    target: Option<crate::render::interaction::HitTarget>,
+) -> TranscriptPointerRoute {
+    use crate::render::interaction::{HitTarget, SemanticEndpoint};
+    if event.shift || event.button != Some(crate::input::PointerButton::Primary) {
+        return TranscriptPointerRoute::Ignored;
+    }
+    let endpoint = match target {
+        Some(HitTarget::TranscriptByte { run_id, byte }) => Some(SemanticEndpoint { run_id, byte }),
+        _ => None,
+    };
+    match event.kind {
+        PointerKind::Down => {
+            let Some(endpoint) = endpoint else {
+                return TranscriptPointerRoute::Ignored;
+            };
+            *selection = Some(TranscriptSelectionState {
+                generation: frame.generation,
+                surface_session: frame.surface_session,
+                anchor: endpoint,
+                head: endpoint,
+                surviving_run_ids: frame.copy_runs.iter().map(|run| run.id).collect(),
+                dragging: true,
+            });
+            publish_transcript_selection(selection.as_ref(), publisher);
+            TranscriptPointerRoute::Handled
+        }
+        PointerKind::Drag => {
+            let Some(state) = selection.as_mut().filter(|state| state.dragging) else {
+                return TranscriptPointerRoute::Ignored;
+            };
+            if !reconcile_transcript_selection(state, frame) {
+                *selection = None;
+                publish_transcript_selection(None, publisher);
+                return TranscriptPointerRoute::Redraw;
+            }
+            if let Some(endpoint) =
+                endpoint.filter(|endpoint| state.surviving_run_ids.contains(&endpoint.run_id))
+            {
+                state.head = endpoint;
+            }
+            publish_transcript_selection(selection.as_ref(), publisher);
+            TranscriptPointerRoute::Redraw
+        }
+        PointerKind::Up => {
+            let Some(state) = selection.as_mut().filter(|state| state.dragging) else {
+                return TranscriptPointerRoute::Ignored;
+            };
+            state.dragging = false;
+            if !reconcile_transcript_selection(state, frame) {
+                *selection = None;
+                publish_transcript_selection(None, publisher);
+                return TranscriptPointerRoute::Handled;
+            }
+            if let Some(endpoint) =
+                endpoint.filter(|endpoint| state.surviving_run_ids.contains(&endpoint.run_id))
+            {
+                state.head = endpoint;
+            }
+            let anchor = state.anchor;
+            let head = state.head;
+            let surviving_runs: Vec<_> = frame
+                .copy_runs
+                .iter()
+                .filter(|run| state.surviving_run_ids.contains(&run.id))
+                .cloned()
+                .collect();
+            publish_transcript_selection(selection.as_ref(), publisher);
+            extract_transcript_selection(&surviving_runs, anchor, head)
+                .filter(|text| !text.is_empty())
+                .map_or(TranscriptPointerRoute::Redraw, TranscriptPointerRoute::Copy)
+        }
+        PointerKind::Move | PointerKind::Scroll(_) => TranscriptPointerRoute::Ignored,
+    }
+}
+
+fn finish_transcript_pointer_capture(
+    selection: &mut Option<TranscriptSelectionState>,
+    publisher: &crate::render::interaction::InteractionPublisher,
+) -> TranscriptPointerRoute {
+    let Some(state) = selection.as_mut().filter(|state| state.dragging) else {
+        return TranscriptPointerRoute::Ignored;
+    };
+    state.dragging = false;
+    let frame = publisher.snapshot();
+    if publisher
+        .worker_authority()
+        .is_some_and(|(_, surface_session)| surface_session != state.surface_session)
+        || !reconcile_transcript_selection(state, &frame)
+    {
+        *selection = None;
+        publish_transcript_selection(None, publisher);
+        return TranscriptPointerRoute::Handled;
+    }
+    let anchor = state.anchor;
+    let head = state.head;
+    let surviving_runs: Vec<_> = frame
+        .copy_runs
+        .iter()
+        .filter(|run| state.surviving_run_ids.contains(&run.id))
+        .cloned()
+        .collect();
+    publish_transcript_selection(selection.as_ref(), publisher);
+    extract_transcript_selection(&surviving_runs, anchor, head)
+        .filter(|text| !text.is_empty())
+        .map_or(TranscriptPointerRoute::Redraw, TranscriptPointerRoute::Copy)
+}
+
+fn sync_composer_selection(
+    buf: &Buffer,
+    publisher: &crate::render::interaction::InteractionPublisher,
+) {
+    publisher.set_composer_selection(&buf.text, buf.selected_range());
+}
+
+fn cleanup_composer_pointer_capture(
+    buf: &mut Buffer,
+    publisher: &crate::render::interaction::InteractionPublisher,
+) {
+    buf.end_pointer_selection();
+    sync_composer_selection(buf, publisher);
+}
+
+fn handle_composer_pointer(
+    buf: &mut Buffer,
+    publisher: &crate::render::interaction::InteractionPublisher,
+    event: PointerEvent,
+    byte: usize,
+) -> ComposerPointerRoute {
+    if event.shift || event.button != Some(crate::input::PointerButton::Primary) {
+        return ComposerPointerRoute::Ignored;
+    }
+    let route = match event.kind {
+        PointerKind::Down if buf.set_pointer_cursor(byte, false) => ComposerPointerRoute::Handled,
+        PointerKind::Drag if buf.set_pointer_cursor(byte, true) => ComposerPointerRoute::Handled,
+        PointerKind::Up if buf.pointer_selection_active() => {
+            let _ = buf.set_pointer_cursor(byte, true);
+            buf.end_pointer_selection();
+            ComposerPointerRoute::Redraw
+        }
+        PointerKind::Down | PointerKind::Up | PointerKind::Drag => ComposerPointerRoute::Ignored,
+        PointerKind::Move | PointerKind::Scroll(_) => ComposerPointerRoute::Ignored,
+    };
+    if route != ComposerPointerRoute::Ignored {
+        sync_composer_selection(buf, publisher);
+    }
+    route
+}
+
+fn handle_pointer_hit(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    event: PointerEvent,
+    frame: &crate::render::interaction::InteractionFrame,
+) -> Result<()> {
+    let target = frame.hit(event.row, event.col);
+    let transcript_route = handle_transcript_pointer(
+        &mut app.transcript_selection,
+        &ctx.interaction_publisher,
+        event,
+        frame,
+        target,
+    );
+    if apply_transcript_pointer_route(app, ctx, renderer, transcript_route)? {
+        return Ok(());
+    }
+    match route_active_composer_pointer(
+        &mut app.buf,
+        &ctx.interaction_publisher,
+        &mut app.menu,
+        event,
+        target,
+    ) {
+        ComposerPointerRoute::Redraw => {
+            redraw_after_composer_pointer(app, ctx, renderer);
+            return Ok(());
+        }
+        ComposerPointerRoute::Handled => return Ok(()),
+        ComposerPointerRoute::Ignored => {}
+    }
+    let Some(target) = target else {
+        app.menu.pointer_cancel();
+        return Ok(());
+    };
+    let click = match event.kind {
+        PointerKind::Down => app.menu.pointer_press(target, frame.surface_session),
+        PointerKind::Up => app.menu.pointer_release(target, frame.surface_session),
+        PointerKind::Drag | PointerKind::Move | PointerKind::Scroll(_) => {
+            return Ok(());
+        }
+    };
+    let pointer_action = match click {
+        PointerClickAction::Select(crate::render::interaction::HitTarget::ModalItem { index }) => {
+            Some(crate::modals::ModalPointerAction::Select(index))
+        }
+        PointerClickAction::Confirm(crate::render::interaction::HitTarget::ModalItem { index }) => {
+            Some(crate::modals::ModalPointerAction::Confirm(index))
+        }
+        PointerClickAction::Select(crate::render::interaction::HitTarget::ModalCancel)
+        | PointerClickAction::Confirm(crate::render::interaction::HitTarget::ModalCancel) => {
+            Some(crate::modals::ModalPointerAction::Cancel)
+        }
+        _ => None,
+    };
+    if let Some(action) = pointer_action {
+        if matches!(app.state.phase, UiPhase::Idle) {
+            if let Some(modal) = app.active_modal.as_mut() {
+                let outcome =
+                    modal.handle_pointer(action, &mut app.buf, &mut app.state, ctx, renderer)?;
+                if outcome == crate::modals::ModalAction::Close {
+                    app.menu.pointer_cancel();
+                    app.active_modal = None;
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                }
+            }
+        }
+        return Ok(());
+    }
+    match click {
+        PointerClickAction::Select(crate::render::interaction::HitTarget::MenuItem { index }) => {
+            let Some(items) = menu_for_display(&app.buf, ctx) else {
+                return Ok(());
+            };
+            let buf = &app.buf;
+            let state = &app.state;
+            app.menu
+                .pointer_select_with(index, items.len(), |selected| {
+                    redraw_with_menu(buf, &items, selected, state, ctx, renderer)
+                });
+        }
+        PointerClickAction::Confirm(crate::render::interaction::HitTarget::MenuItem { index }) => {
+            let Some(items) = menu_for_display(&app.buf, ctx) else {
+                return Ok(());
+            };
+            app.menu.select_index(index, items.len());
+            let commit_gate_pending = idle_commit_gate_pending(ctx);
+            if let Some(result) = handle_pointer_menu_confirmation(
+                app,
+                |app| &mut app.menu,
+                commit_gate_pending,
+                items.len(),
+                |app, selected| confirm_idle_menu_selected(app, ctx, renderer, &items, selected),
+            ) {
+                result?;
+            }
+        }
+        PointerClickAction::None
+        | PointerClickAction::Select(_)
+        | PointerClickAction::Confirm(_) => {}
+    }
+    Ok(())
+}
+
+fn apply_transcript_pointer_route(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    route: TranscriptPointerRoute,
+) -> Result<bool> {
+    match route {
+        TranscriptPointerRoute::Copy(text) => {
+            redraw_after_composer_pointer(app, ctx, renderer);
+            let allow_osc52 = transcript_osc52_allowed(&ctx.caps);
+            if crate::event_loop::commands::copy_text_to_clipboard(&text, allow_osc52).is_err() {
+                let notice =
+                    crate::sanitize::scrub_controls(&crate::i18n::t(crate::i18n::Msg::CopyFailed));
+                renderer.render(UiLine::Warning(notice));
+                renderer.flush();
+            }
+            app.menu.pointer_cancel();
+            Ok(true)
+        }
+        TranscriptPointerRoute::Redraw => {
+            redraw_after_composer_pointer(app, ctx, renderer);
+            app.menu.pointer_cancel();
+            Ok(true)
+        }
+        TranscriptPointerRoute::Handled => {
+            app.menu.pointer_cancel();
+            Ok(true)
+        }
+        TranscriptPointerRoute::Ignored => Ok(false),
+    }
+}
+
+fn transcript_osc52_allowed(caps: &crate::terminal::TerminalCaps) -> bool {
+    caps.osc52_clipboard
+}
+
+fn route_active_composer_pointer(
+    buf: &mut Buffer,
+    publisher: &crate::render::interaction::InteractionPublisher,
+    menu: &mut MenuState,
+    event: PointerEvent,
+    target: Option<crate::render::interaction::HitTarget>,
+) -> ComposerPointerRoute {
+    let route = if event.kind == PointerKind::Up && buf.pointer_selection_active() {
+        if let Some(crate::render::interaction::HitTarget::ComposerByte { byte }) = target {
+            handle_composer_pointer(buf, publisher, event, byte)
+        } else {
+            handle_composer_pointer_release(buf, publisher, event)
+        }
+    } else if let Some(crate::render::interaction::HitTarget::ComposerByte { byte }) = target {
+        handle_composer_pointer(buf, publisher, event, byte)
+    } else {
+        ComposerPointerRoute::Ignored
+    };
+    if route != ComposerPointerRoute::Ignored {
+        menu.pointer_cancel();
+    }
+    route
+}
+
+fn redraw_after_composer_pointer(app: &mut App, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+    if matches!(app.state.phase, UiPhase::Idle) {
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    } else {
+        draw_spinner_now(
+            &mut app.state,
+            &app.buf,
+            ctx,
+            renderer,
+            app.message_queue.len(),
+            app.menu.selected,
+        );
+    }
+}
+
+fn finish_composer_pointer_capture(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    event: PointerEvent,
+) -> bool {
+    if handle_composer_pointer_release(&mut app.buf, &ctx.interaction_publisher, event)
+        != ComposerPointerRoute::Redraw
+    {
+        return false;
+    }
+    app.menu.pointer_cancel();
+    redraw_after_composer_pointer(app, ctx, renderer);
+    true
+}
+
+fn handle_composer_pointer_release(
+    buf: &mut Buffer,
+    publisher: &crate::render::interaction::InteractionPublisher,
+    event: PointerEvent,
+) -> ComposerPointerRoute {
+    if event.shift
+        || event.button != Some(crate::input::PointerButton::Primary)
+        || event.kind != PointerKind::Up
+        || !buf.pointer_selection_active()
+    {
+        return ComposerPointerRoute::Ignored;
+    }
+    buf.end_pointer_selection();
+    sync_composer_selection(buf, publisher);
+    ComposerPointerRoute::Redraw
+}
+
+fn handle_pointer_menu_confirmation<S, R>(
+    state: &mut S,
+    menu_for_state: impl for<'a> Fn(&'a mut S) -> &'a mut MenuState,
+    commit_gate_pending: bool,
+    item_count: usize,
+    execute: impl FnOnce(&mut S, usize) -> R,
+) -> Option<R> {
+    let selected = {
+        let menu = menu_for_state(state);
+        if !menu.pointer_confirmation_allowed(commit_gate_pending) {
+            return None;
+        }
+        menu.confirm_selected(item_count)?
+    };
+    Some(execute(state, selected))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerPreflightRoute {
+    ScrollContinue,
+    PointerContinue,
+    ComposerCleanup,
+    TranscriptCleanup,
+    ReturnIgnored,
+    NotPointer,
+}
+
+fn pointer_input_route(
+    event: &InputEvent,
+    interaction: Option<&crate::render::interaction::InteractionFrame>,
+    menu: &mut MenuState,
+    composer_pointer_active: bool,
+    transcript_pointer_active: bool,
+) -> PointerPreflightRoute {
+    if composer_pointer_active
+        && matches!(
+            event,
+            InputEvent::Pointer(PointerEvent {
+                kind: PointerKind::Up,
+                button: Some(crate::input::PointerButton::Primary),
+                shift: true,
+                ..
+            })
+        )
+    {
+        return PointerPreflightRoute::ComposerCleanup;
+    }
+    if transcript_pointer_active
+        && matches!(
+            event,
+            InputEvent::Pointer(PointerEvent {
+                kind: PointerKind::Up,
+                button: Some(crate::input::PointerButton::Primary),
+                shift: true,
+                ..
+            })
+        )
+    {
+        return PointerPreflightRoute::TranscriptCleanup;
+    }
+    let pointer_actionable = match event {
+        InputEvent::Pointer(pointer)
+            if !pointer.shift
+                && pointer.button == Some(crate::input::PointerButton::Primary)
+                && matches!(
+                    pointer.kind,
+                    PointerKind::Down | PointerKind::Up | PointerKind::Drag
+                ) =>
+        {
+            (pointer.kind == PointerKind::Up
+                && (composer_pointer_active || transcript_pointer_active))
+                || interaction.is_some_and(|interaction| {
+                    let hit = interaction.hit(pointer.row, pointer.col);
+                    match pointer.kind {
+                        PointerKind::Drag => matches!(
+                            hit,
+                            Some(crate::render::interaction::HitTarget::ComposerByte { .. })
+                                | Some(
+                                    crate::render::interaction::HitTarget::TranscriptByte { .. }
+                                )
+                        ),
+                        PointerKind::Down => hit.is_some(),
+                        PointerKind::Up => hit.is_some() || menu.has_pointer_press(),
+                        PointerKind::Move | PointerKind::Scroll(_) => false,
+                    }
+                })
+        }
+        _ => false,
+    };
+    if cancel_unactionable_pointer_release(event, pointer_actionable, menu) {
+        return PointerPreflightRoute::ReturnIgnored;
+    }
+    pointer_preflight_route(event, pointer_actionable)
+}
+
+fn pointer_preflight_route(event: &InputEvent, pointer_actionable: bool) -> PointerPreflightRoute {
+    match event {
+        InputEvent::Pointer(PointerEvent {
+            kind: PointerKind::Scroll(_),
+            ..
+        }) => PointerPreflightRoute::ScrollContinue,
+        InputEvent::Pointer(_) if pointer_actionable => PointerPreflightRoute::PointerContinue,
+        InputEvent::Pointer(_) => PointerPreflightRoute::ReturnIgnored,
+        _ => PointerPreflightRoute::NotPointer,
+    }
+}
+
+fn handle_input_preflight_with_transcript(
+    event: &InputEvent,
+    interaction: Option<&crate::render::interaction::InteractionFrame>,
+    menu: &mut MenuState,
+    composer_pointer_active: bool,
+    transcript_pointer_active: bool,
+    run_general_prelude: impl FnOnce(),
+) -> PointerPreflightRoute {
+    let route = pointer_input_route(
+        event,
+        interaction,
+        menu,
+        composer_pointer_active,
+        transcript_pointer_active,
+    );
+    if !matches!(
+        route,
+        PointerPreflightRoute::ReturnIgnored
+            | PointerPreflightRoute::ComposerCleanup
+            | PointerPreflightRoute::TranscriptCleanup
+    ) {
+        run_general_prelude();
+    }
+    route
+}
+
+#[cfg(test)]
+fn handle_input_preflight(
+    event: &InputEvent,
+    interaction: Option<&crate::render::interaction::InteractionFrame>,
+    menu: &mut MenuState,
+    composer_pointer_active: bool,
+    run_general_prelude: impl FnOnce(),
+) -> PointerPreflightRoute {
+    handle_input_preflight_with_transcript(
+        event,
+        interaction,
+        menu,
+        composer_pointer_active,
+        false,
+        run_general_prelude,
+    )
+}
+
+fn cancel_unactionable_pointer_release(
+    event: &InputEvent,
+    pointer_actionable: bool,
+    menu: &mut MenuState,
+) -> bool {
+    let cancel = !pointer_actionable
+        && matches!(
+            event,
+            InputEvent::Pointer(PointerEvent {
+                kind: PointerKind::Up,
+                button: Some(crate::input::PointerButton::Primary),
+                ..
+            })
+        )
+        && menu.has_pointer_press();
+    if cancel {
+        menu.pointer_cancel();
+    }
+    cancel
+}
+
 fn handle_input(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -11175,61 +13002,126 @@ fn handle_input(
 ) -> Result<()> {
     use crate::modals::ModalAction;
 
-    let has_non_capturing_modal = app
-        .active_modal
-        .as_ref()
-        .is_some_and(|modal| !modal.captures_all_keys());
-    let has_replay_payload = !app.message_queue.is_empty() || !app.state.pending_steers.is_empty();
-    if should_release_stale_modal_interrupt_wait(
-        app.state.phase,
-        app.interrupt_drain_pending,
-        has_non_capturing_modal,
-        ctx.runtime.has_active_turn(),
-        has_replay_payload,
-    ) {
-        crate::tuix_trace!(
-            "KEY",
-            "release stale interrupt wait before routing visible modal"
-        );
-        app.interrupt_drain_pending = false;
-        app.state.phase = UiPhase::Idle;
-    }
+    let interaction = ctx.interaction_publisher.snapshot_actionable();
+    let preflight = handle_input_preflight_with_transcript(
+        &ev,
+        interaction.as_deref(),
+        &mut app.menu,
+        app.buf.pointer_selection_active(),
+        app.transcript_selection
+            .as_ref()
+            .is_some_and(|selection| selection.dragging),
+        || {
+            let has_non_capturing_modal = app
+                .active_modal
+                .as_ref()
+                .is_some_and(|modal| !modal.captures_all_keys());
+            let has_replay_payload =
+                !app.message_queue.is_empty() || !app.state.pending_steers.is_empty();
+            if should_release_stale_modal_interrupt_wait(
+                app.state.phase,
+                app.interrupt_drain_pending,
+                has_non_capturing_modal,
+                ctx.runtime.has_active_turn(),
+                has_replay_payload,
+            ) {
+                crate::tuix_trace!(
+                    "KEY",
+                    "release stale interrupt wait before routing visible modal"
+                );
+                app.interrupt_drain_pending = false;
+                app.state.phase = UiPhase::Idle;
+            }
 
-    if matches!(app.state.phase, UiPhase::Idle)
-        && app.active_modal.is_none()
-        && poll_shared_state(ctx, renderer)
-    {
-        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
-    }
-    // `/codingplan` has extra warning/quota caches beyond the generic config.
-    refresh_after_cross_process_codingplan_sync(ctx);
+            if matches!(app.state.phase, UiPhase::Idle)
+                && app.active_modal.is_none()
+                && poll_shared_state(ctx, renderer)
+            {
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            }
+            // `/codingplan` has extra warning/quota caches beyond the generic config.
+            refresh_after_cross_process_codingplan_sync(ctx);
 
-    crate::tuix_trace!(
-        "IN",
-        "phase={:?} modal={} qlen={} ev={}",
-        app.state.phase,
-        app.active_modal.is_some(),
-        app.message_queue.len(),
-        match &ev {
-            InputEvent::Paste(t) => format!("paste({})", t.len()),
-            InputEvent::Eof => "eof".into(),
-            InputEvent::Key(k) => format!("key({:?},{:?})", k.kind, k.code),
-            InputEvent::Resize(w, h) => format!("resize({}x{})", w, h),
-            InputEvent::MouseScroll(d) => format!("mouse_scroll({})", d),
-        }
+            crate::tuix_trace!(
+                "IN",
+                "phase={:?} modal={} qlen={} ev={}",
+                app.state.phase,
+                app.active_modal.is_some(),
+                app.message_queue.len(),
+                match &ev {
+                    InputEvent::Paste(t) => format!("paste({})", t.len()),
+                    InputEvent::Eof => "eof".into(),
+                    InputEvent::Key(k) => format!("key({:?},{:?})", k.kind, k.code),
+                    InputEvent::Resize(w, h) => format!("resize({}x{})", w, h),
+                    InputEvent::FocusChanged(focused) => format!("focus({focused})"),
+                    InputEvent::Pointer(pointer) => format!("pointer({:?})", pointer),
+                }
+            );
+        },
     );
+    if preflight == PointerPreflightRoute::ComposerCleanup {
+        cleanup_composer_pointer_capture(&mut app.buf, &ctx.interaction_publisher);
+        return Ok(());
+    }
+    if preflight == PointerPreflightRoute::TranscriptCleanup {
+        if let Some(selection) = app.transcript_selection.as_mut() {
+            selection.dragging = false;
+        }
+        return Ok(());
+    }
+    if preflight == PointerPreflightRoute::ReturnIgnored {
+        return Ok(());
+    }
+    if !matches!(ev, InputEvent::Pointer(_)) {
+        app.menu.pointer_cancel();
+    }
 
     match ev {
-        InputEvent::MouseScroll(delta) => {
-            // Mouse wheel is a no-op: SGR mouse capture (`?1002h` /
-            // `?1006h`) is intentionally NOT enabled, so wheel ticks
-            // resolve at the terminal level (native scrollback) before
-            // reaching us. This arm survives only as a defensive
-            // catch-all for terminals that forward wheel events
-            // outside the SGR mouse protocol.
-            renderer.scroll_body(delta);
+        InputEvent::FocusChanged(focused) => {
+            // A focus change can swallow an in-flight drag's mouse-Up (it lands on
+            // the window that took focus), leaving `dragging` stuck so the next
+            // motion report phantom-extends the selection. Abort the drag; the
+            // already-selected span stays highlighted until the next Down.
+            if let Some(selection) = app.transcript_selection.as_mut() {
+                selection.dragging = false;
+            }
+            if focused {
+                // Focus events are delivered after the terminal host resumes.
+                // Re-emit the renderer's authoritative retained projection;
+                // merely rendering the same InputPrompt again is insufficient
+                // because the diff cache would classify it as unchanged.
+                renderer.force_repaint();
+            }
+        }
+        InputEvent::Pointer(pointer) => {
+            if preflight == PointerPreflightRoute::ScrollContinue {
+                apply_pointer_event(pointer, renderer);
+            } else {
+                if let Some(interaction) = interaction.as_deref() {
+                    handle_pointer_hit(app, ctx, renderer, pointer, interaction)?;
+                } else {
+                    if app.buf.pointer_selection_active() {
+                        let _ = finish_composer_pointer_capture(app, ctx, renderer, pointer);
+                    } else if app
+                        .transcript_selection
+                        .as_ref()
+                        .is_some_and(|selection| selection.dragging)
+                    {
+                        let route = finish_transcript_pointer_capture(
+                            &mut app.transcript_selection,
+                            &ctx.interaction_publisher,
+                        );
+                        let _ = apply_transcript_pointer_route(app, ctx, renderer, route)?;
+                    }
+                }
+            }
         }
         InputEvent::Resize(mut cols, mut rows) => {
+            // A resize can swallow an in-flight drag's mouse-Up; abort the drag so
+            // a later motion report can't phantom-extend a now-stale selection.
+            if let Some(selection) = app.transcript_selection.as_mut() {
+                selection.dragging = false;
+            }
             // Coalesce burst-fired SIGWINCH events. gnome-terminal /
             // alacritty / iTerm2 send a Resize per pixel during a
             // window drag — a 200ms drag fires 30+ events. Without
@@ -11267,6 +13159,12 @@ fn handle_input(
             // `on_resize` already fully wipes+reflows the terminal and drops the
             // stale modal overlay itself (so #1158 duplication stays fixed).
             renderer.on_resize(cols, rows);
+            // Sync the input area display width so Buffer's visual line
+            // navigation uses the new geometry. Account for the "> "
+            // prompt prefix (2 cols normally, 3 on JediTerm for the
+            // right-edge reserve that its paint layer requires).
+            app.buf.input_width =
+                crate::width::composer_text_width(cols as usize, ctx.caps.jediterm);
             // A resize invalidates any open modal's cached overlay
             // geometry (it was built for the old size). Rebuild it now so
             // the window re-centres at the new dimensions instead of
@@ -11333,6 +13231,18 @@ fn handle_input(
             // Paste event — without this branch it fell through every arm and
             // was silently dropped, so the user could only type answers.
             if matches!(app.state.phase, UiPhase::UserInput) {
+                let image = paste_command_image_path(&text)
+                    .and_then(try_attach_image_from_path)
+                    .or_else(|| try_attach_image_from_path(&text))
+                    .or_else(|| {
+                        text.trim()
+                            .is_empty()
+                            .then(try_paste_clipboard_image)
+                            .flatten()
+                    });
+                if attach_image_to_user_input(app, ctx, renderer, image)? {
+                    return Ok(());
+                }
                 app.state.insert_user_input_paste(&text);
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
@@ -11366,6 +13276,7 @@ fn handle_input(
                     return Ok(());
                 }
                 app.buf.insert_paste(text);
+                sync_composer_selection(&app.buf, &ctx.interaction_publisher);
                 if matches!(app.state.phase, UiPhase::Streaming) {
                     draw_spinner_now(
                         &mut app.state,
@@ -11586,6 +13497,18 @@ fn handle_input(
             // Ctrl+Alt+V (the Windows-Terminal alternate) both trigger; only
             // Ctrl+Shift+V is excluded so a terminal's "paste as plain text"
             // chord still passes through.
+            if matches!(app.state.phase, UiPhase::UserInput)
+                && is_paste_image_chord(code, modifiers)
+            {
+                if attach_image_to_user_input(app, ctx, renderer, try_paste_clipboard_image())? {
+                    return Ok(());
+                }
+                if let Some(text) = try_paste_clipboard_text() {
+                    app.state.insert_user_input_paste(&text);
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                }
+                return Ok(());
+            }
             if matches!(app.state.phase, UiPhase::Idle | UiPhase::Streaming)
                 && is_paste_image_chord(code, modifiers)
             {
@@ -11648,6 +13571,990 @@ fn provider_transition_allows_idle_commit(line: &str) -> bool {
             "reload" | "context" | "status" | "keys" | "quit" | "exit"
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_pointer_event, handle_input_preflight, route_pointer, PointerPreflightRoute,
+        PointerRoute,
+    };
+    use crate::input::{PointerButton, PointerEvent, PointerKind};
+    use crate::render::interaction::{CellRect, HitRegion, HitTarget, InteractionFrame};
+    use crate::render::{Renderer, UiLine};
+
+    #[derive(Default)]
+    struct ScrollCapture {
+        deltas: Vec<i32>,
+    }
+
+    impl Renderer for ScrollCapture {
+        fn render(&mut self, _line: UiLine) {}
+        fn flush(&mut self) {}
+        fn shutdown(&mut self) {}
+        fn reset(&mut self) {}
+        fn clear_screen(&mut self) {}
+        fn suspend_for_external(&mut self) {}
+        fn resume_from_external(&mut self) {}
+        fn flush_deferred(&mut self) {}
+
+        fn scroll_body(&mut self, delta: i32) {
+            self.deltas.push(delta);
+        }
+    }
+
+    fn pointer(kind: PointerKind, button: Option<PointerButton>, shift: bool) -> PointerEvent {
+        PointerEvent {
+            kind,
+            button,
+            row: 12,
+            col: 34,
+            shift,
+            control: false,
+            alt: false,
+        }
+    }
+
+    fn pointer_interaction() -> InteractionFrame {
+        InteractionFrame {
+            generation: 1,
+            surface_session: 1,
+            regions: vec![HitRegion {
+                rect: CellRect {
+                    row: 12,
+                    col: 34,
+                    height: 1,
+                    width: 1,
+                },
+                target: HitTarget::MenuItem { index: 0 },
+            }],
+            copy_runs: Vec::new(),
+        }
+    }
+
+    fn composer_pointer_interaction() -> InteractionFrame {
+        InteractionFrame {
+            generation: 1,
+            surface_session: 1,
+            regions: vec![HitRegion {
+                rect: CellRect {
+                    row: 12,
+                    col: 34,
+                    height: 1,
+                    width: 1,
+                },
+                target: HitTarget::ComposerByte { byte: 1 },
+            }],
+            copy_runs: Vec::new(),
+        }
+    }
+
+    fn copy_run(id: u64, text: &str, soft_wrap: bool) -> crate::render::interaction::CopyRun {
+        crate::render::interaction::CopyRun {
+            id,
+            rect: CellRect {
+                row: id as u16,
+                col: 0,
+                height: 1,
+                width: 20,
+            },
+            text: std::sync::Arc::from(text),
+            soft_wrap,
+            next_run_id: soft_wrap.then_some(id.saturating_add(1)),
+        }
+    }
+
+    fn transcript_frame(
+        generation: u64,
+        surface_session: u64,
+        runs: Vec<crate::render::interaction::CopyRun>,
+    ) -> InteractionFrame {
+        let regions = runs
+            .iter()
+            .map(|run| HitRegion {
+                rect: run.rect,
+                target: HitTarget::TranscriptByte {
+                    run_id: run.id,
+                    byte: run.text.len(),
+                },
+            })
+            .collect();
+        InteractionFrame {
+            generation,
+            surface_session,
+            regions,
+            copy_runs: runs,
+        }
+    }
+
+    #[test]
+    fn transcript_extraction_joins_soft_wraps_and_preserves_hard_breaks() {
+        use crate::render::interaction::SemanticEndpoint;
+        let runs = vec![
+            copy_run(10, "abcdefgh", true),
+            copy_run(11, "ij", false),
+            copy_run(12, "  code", false),
+            copy_run(13, "你好👩‍💻\u{0007}", false),
+        ];
+        assert_eq!(
+            super::extract_transcript_selection(
+                &runs,
+                SemanticEndpoint {
+                    run_id: 10,
+                    byte: 0
+                },
+                SemanticEndpoint {
+                    run_id: 13,
+                    byte: runs[3].text.len(),
+                },
+            )
+            .as_deref(),
+            Some("abcdefghij\n  code\n你好👩‍💻")
+        );
+    }
+
+    #[test]
+    fn transcript_extraction_does_not_join_across_hidden_soft_wrap_continuation() {
+        use crate::render::interaction::SemanticEndpoint;
+        let runs = vec![copy_run(30, "A", true), copy_run(32, "C", false)];
+        assert_eq!(
+            super::extract_transcript_selection(
+                &runs,
+                SemanticEndpoint {
+                    run_id: 30,
+                    byte: 0
+                },
+                SemanticEndpoint {
+                    run_id: 32,
+                    byte: 1
+                },
+            )
+            .as_deref(),
+            Some("A\nC"),
+            "a hidden continuation is a semantic projection boundary"
+        );
+    }
+
+    #[test]
+    fn transcript_extraction_supports_reverse_utf8_selection_without_terminal_bytes() {
+        use crate::render::interaction::SemanticEndpoint;
+        let runs = vec![copy_run(20, "diff + 你好👩‍💻", false)];
+        let start = "diff + ".len();
+        let end = runs[0].text.len();
+        assert_eq!(
+            super::extract_transcript_selection(
+                &runs,
+                SemanticEndpoint {
+                    run_id: 20,
+                    byte: end
+                },
+                SemanticEndpoint {
+                    run_id: 20,
+                    byte: start,
+                },
+            )
+            .as_deref(),
+            Some("你好👩‍💻")
+        );
+    }
+
+    #[test]
+    fn transcript_pointer_stream_frame_clamps_to_survivors_and_never_copies_new_run() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let first = transcript_frame(
+            10,
+            7,
+            vec![copy_run(100, "old-a", false), copy_run(101, "old-b", false)],
+        );
+        let mut selection = None;
+        let mut down = pointer(PointerKind::Down, Some(PointerButton::Primary), false);
+        down.row = 100;
+        assert_eq!(
+            super::handle_transcript_pointer(
+                &mut selection,
+                &publisher,
+                down,
+                &first,
+                Some(HitTarget::TranscriptByte {
+                    run_id: 100,
+                    byte: 0
+                }),
+            ),
+            super::TranscriptPointerRoute::Handled
+        );
+        let mut drag = pointer(PointerKind::Drag, Some(PointerButton::Primary), false);
+        drag.row = 101;
+        assert_eq!(
+            super::handle_transcript_pointer(
+                &mut selection,
+                &publisher,
+                drag,
+                &first,
+                Some(HitTarget::TranscriptByte {
+                    run_id: 101,
+                    byte: 5
+                }),
+            ),
+            super::TranscriptPointerRoute::Redraw
+        );
+
+        let streamed = transcript_frame(
+            11,
+            7,
+            vec![copy_run(100, "old-a", false), copy_run(999, "NEW", false)],
+        );
+        let mut up = pointer(PointerKind::Up, Some(PointerButton::Primary), false);
+        up.row = 999;
+        let result = super::handle_transcript_pointer(
+            &mut selection,
+            &publisher,
+            up,
+            &streamed,
+            Some(HitTarget::TranscriptByte {
+                run_id: 999,
+                byte: 3,
+            }),
+        );
+        assert_eq!(result, super::TranscriptPointerRoute::Copy("old-a".into()));
+        assert!(!format!("{result:?}").contains("NEW"));
+        assert_eq!(
+            super::handle_transcript_pointer(
+                &mut selection,
+                &publisher,
+                up,
+                &streamed,
+                Some(HitTarget::TranscriptByte {
+                    run_id: 999,
+                    byte: 3
+                }),
+            ),
+            super::TranscriptPointerRoute::Ignored,
+            "one completed gesture copies exactly once"
+        );
+    }
+
+    #[test]
+    fn transcript_pointer_session_switch_clears_stale_capture_without_copy() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let first = transcript_frame(1, 10, vec![copy_run(1, "session-a", false)]);
+        let mut selection = None;
+        assert_eq!(
+            super::handle_transcript_pointer(
+                &mut selection,
+                &publisher,
+                pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+                &first,
+                Some(HitTarget::TranscriptByte { run_id: 1, byte: 0 }),
+            ),
+            super::TranscriptPointerRoute::Handled
+        );
+        let next = transcript_frame(2, 11, vec![copy_run(1, "session-b", false)]);
+        assert_eq!(
+            super::handle_transcript_pointer(
+                &mut selection,
+                &publisher,
+                pointer(PointerKind::Up, Some(PointerButton::Primary), false),
+                &next,
+                Some(HitTarget::TranscriptByte { run_id: 1, byte: 9 }),
+            ),
+            super::TranscriptPointerRoute::Handled
+        );
+        assert!(selection.is_none());
+        assert!(publisher.transcript_selection().is_none());
+    }
+
+    #[test]
+    fn transcript_capture_uses_production_preflight_for_outside_and_shift_release() {
+        let mut menu = super::MenuState::new();
+        let outside_up = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Up,
+            Some(PointerButton::Primary),
+            false,
+        ));
+        assert_eq!(
+            super::handle_input_preflight_with_transcript(
+                &outside_up,
+                None,
+                &mut menu,
+                false,
+                true,
+                || {},
+            ),
+            super::PointerPreflightRoute::PointerContinue
+        );
+        let shift_up = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Up,
+            Some(PointerButton::Primary),
+            true,
+        ));
+        assert_eq!(
+            super::handle_input_preflight_with_transcript(
+                &shift_up,
+                None,
+                &mut menu,
+                false,
+                true,
+                || panic!("cleanup must not run the general prelude"),
+            ),
+            super::PointerPreflightRoute::TranscriptCleanup
+        );
+    }
+
+    #[test]
+    fn transcript_release_without_actionable_frame_uses_last_safe_semantic_authority_once() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let source = transcript_frame(
+            41,
+            7,
+            vec![copy_run(100, "old-a", false), copy_run(101, "old-b", false)],
+        );
+        assert!(publisher.publish_frame_if_current(
+            publisher.current_epoch(),
+            source.surface_session,
+            source.regions,
+            source.copy_runs,
+        ));
+        let frame = publisher.snapshot();
+        let mut selection = None;
+        assert_eq!(
+            super::handle_transcript_pointer(
+                &mut selection,
+                &publisher,
+                pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+                &frame,
+                Some(HitTarget::TranscriptByte {
+                    run_id: 100,
+                    byte: 0
+                }),
+            ),
+            super::TranscriptPointerRoute::Handled
+        );
+        assert_eq!(
+            super::handle_transcript_pointer(
+                &mut selection,
+                &publisher,
+                pointer(PointerKind::Drag, Some(PointerButton::Primary), false),
+                &frame,
+                Some(HitTarget::TranscriptByte {
+                    run_id: 101,
+                    byte: "old-b".len(),
+                }),
+            ),
+            super::TranscriptPointerRoute::Redraw
+        );
+        publisher.fail_closed();
+
+        assert_eq!(
+            super::finish_transcript_pointer_capture(&mut selection, &publisher),
+            super::TranscriptPointerRoute::Copy("old-a\nold-b".into()),
+            "slow worker invalidation must not discard the semantic release"
+        );
+        assert_eq!(
+            super::finish_transcript_pointer_capture(&mut selection, &publisher),
+            super::TranscriptPointerRoute::Ignored,
+            "one gesture owns exactly one copy attempt"
+        );
+        assert!(selection.as_ref().is_some_and(|state| !state.dragging));
+    }
+
+    #[test]
+    fn transcript_osc52_policy_uses_terminal_capability_not_tty_assumption() {
+        let mut caps = crate::terminal::TerminalCaps {
+            tty: true,
+            colors: true,
+            spinner: true,
+            bracketed_paste: true,
+            raw_mode: true,
+            scroll_region: true,
+            unicode_symbols: true,
+            legacy_conhost: false,
+            jediterm: false,
+            modern_emulator: true,
+            kitty_keyboard: false,
+            mouse_sgr: true,
+            osc52_clipboard: false,
+            tmux_passthrough: false,
+        };
+        assert!(!super::transcript_osc52_allowed(&caps));
+        caps.osc52_clipboard = true;
+        assert!(super::transcript_osc52_allowed(&caps));
+    }
+
+    #[test]
+    fn pointer_composer_down_drag_up_keeps_the_frame_until_one_release_redraw() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        publisher.publish(1, composer_pointer_interaction().regions);
+        let mut buf = super::Buffer::new();
+        buf.text = "abcde".into();
+        assert_eq!(
+            super::handle_composer_pointer(
+                &mut buf,
+                &publisher,
+                pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+                1,
+            ),
+            super::ComposerPointerRoute::Handled
+        );
+        assert!(publisher.snapshot_actionable().is_some());
+
+        assert_eq!(
+            super::handle_composer_pointer(
+                &mut buf,
+                &publisher,
+                pointer(PointerKind::Drag, Some(PointerButton::Primary), false),
+                4,
+            ),
+            super::ComposerPointerRoute::Handled
+        );
+        assert_eq!(buf.selected_range(), Some(1..4));
+        assert!(publisher.snapshot_actionable().is_some());
+
+        assert_eq!(
+            super::handle_composer_pointer(
+                &mut buf,
+                &publisher,
+                pointer(PointerKind::Up, Some(PointerButton::Primary), false),
+                4,
+            ),
+            super::ComposerPointerRoute::Redraw
+        );
+        publisher.invalidate();
+        assert!(!buf.pointer_selection_active());
+        assert!(publisher.snapshot_actionable().is_none());
+    }
+
+    #[test]
+    fn pointer_composer_drag_continues_through_the_production_preflight() {
+        let input = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Drag,
+            Some(PointerButton::Primary),
+            false,
+        ));
+        let interaction = composer_pointer_interaction();
+        let mut menu = super::MenuState::new();
+        let mut prelude_runs = 0;
+
+        assert_eq!(
+            super::handle_input_preflight(&input, Some(&interaction), &mut menu, false, || {
+                prelude_runs += 1
+            }),
+            super::PointerPreflightRoute::PointerContinue
+        );
+        assert_eq!(prelude_runs, 1);
+    }
+
+    #[test]
+    fn pointer_composer_release_outside_still_finishes_capture() {
+        let input = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Up,
+            Some(PointerButton::Primary),
+            false,
+        ));
+        let interaction = composer_pointer_interaction();
+        let mut menu = super::MenuState::new();
+        let mut prelude_runs = 0;
+
+        assert_eq!(
+            super::handle_input_preflight(&input, Some(&interaction), &mut menu, true, || {
+                prelude_runs += 1
+            },),
+            super::PointerPreflightRoute::PointerContinue
+        );
+        assert_eq!(prelude_runs, 1);
+
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let mut buf = super::Buffer::new();
+        buf.text = "abcde".into();
+        assert!(buf.set_pointer_cursor(1, false));
+        assert!(buf.set_pointer_cursor(4, true));
+        assert_eq!(
+            super::handle_composer_pointer_release(
+                &mut buf,
+                &publisher,
+                pointer(PointerKind::Up, Some(PointerButton::Primary), false),
+            ),
+            super::ComposerPointerRoute::Redraw
+        );
+        assert!(!buf.pointer_selection_active());
+        assert_eq!(buf.selected_range(), Some(1..4));
+        assert_eq!(
+            super::handle_composer_pointer(
+                &mut buf,
+                &publisher,
+                pointer(PointerKind::Drag, Some(PointerButton::Primary), false),
+                5,
+            ),
+            super::ComposerPointerRoute::Ignored
+        );
+        assert_eq!(buf.selected_range(), Some(1..4));
+    }
+
+    #[test]
+    fn keyboard_cursor_collapse_clears_same_source_published_selection() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let mut buf = super::Buffer::new();
+        buf.text = "abcde".into();
+        assert!(buf.set_pointer_cursor(1, false));
+        assert!(buf.set_pointer_cursor(4, true));
+        super::sync_composer_selection(&buf, &publisher);
+        assert!(publisher.composer_selection().is_some());
+
+        let _ = buf.apply(
+            super::Action::CursorLeft,
+            &[],
+            &crate::commands::CommandRegistry::builtin(),
+        );
+        super::sync_composer_selection(&buf, &publisher);
+
+        assert_eq!(buf.text, "abcde", "cursor collapse does not change source");
+        assert_eq!(buf.cursor, 1);
+        assert!(publisher.composer_selection().is_none());
+    }
+
+    #[test]
+    fn active_composer_release_preempts_a_menu_target() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let mut buf = super::Buffer::new();
+        let mut menu = super::MenuState::new();
+        buf.text = "abcde".into();
+        assert!(buf.set_pointer_cursor(1, false));
+        assert!(buf.set_pointer_cursor(4, true));
+        let target = HitTarget::MenuItem { index: 0 };
+        let _ = menu.pointer_press(target, 1);
+
+        assert_eq!(
+            super::route_active_composer_pointer(
+                &mut buf,
+                &publisher,
+                &mut menu,
+                pointer(PointerKind::Up, Some(PointerButton::Primary), false),
+                Some(target),
+            ),
+            super::ComposerPointerRoute::Redraw
+        );
+        assert!(!buf.pointer_selection_active());
+        assert_eq!(buf.selected_range(), Some(1..4));
+        assert!(
+            !menu.has_pointer_press(),
+            "menu confirmation must be cancelled"
+        );
+    }
+
+    #[test]
+    fn shift_release_cleans_composer_capture_without_claiming_ui_action() {
+        let input = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Up,
+            Some(PointerButton::Primary),
+            true,
+        ));
+        let mut menu = super::MenuState::new();
+        let mut prelude_runs = 0;
+        assert_eq!(
+            super::handle_input_preflight(&input, None, &mut menu, true, || { prelude_runs += 1 }),
+            super::PointerPreflightRoute::ComposerCleanup
+        );
+        assert_eq!(prelude_runs, 0);
+
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let mut buf = super::Buffer::new();
+        buf.text = "abc".into();
+        assert!(buf.set_pointer_cursor(0, false));
+        assert!(buf.set_pointer_cursor(2, true));
+        super::cleanup_composer_pointer_capture(&mut buf, &publisher);
+        assert!(!buf.pointer_selection_active());
+        assert_eq!(buf.selected_range(), Some(0..2));
+    }
+
+    #[test]
+    fn pointer_click_selects_first_and_only_a_second_same_target_click_confirms() {
+        let target = HitTarget::MenuItem { index: 2 };
+        let other = HitTarget::MenuItem { index: 3 };
+        let mut menu = super::MenuState::new();
+        let session = 7;
+
+        assert_eq!(
+            menu.pointer_press(target, session),
+            super::PointerClickAction::Select(target)
+        );
+        assert_eq!(
+            menu.pointer_release(target, session),
+            super::PointerClickAction::None
+        );
+        assert_eq!(
+            menu.pointer_press(other, session),
+            super::PointerClickAction::Select(other)
+        );
+        assert_eq!(
+            menu.pointer_release(other, session),
+            super::PointerClickAction::None
+        );
+        assert_eq!(
+            menu.pointer_press(other, session),
+            super::PointerClickAction::Select(other)
+        );
+        assert_eq!(
+            menu.pointer_release(other, session),
+            super::PointerClickAction::Confirm(other)
+        );
+    }
+
+    #[test]
+    fn pointer_current_command_row_keeps_frame_open_until_second_click_confirms() {
+        let target = HitTarget::MenuItem { index: 0 };
+        let mut menu = super::MenuState::new();
+        let mut redraws = 0;
+        let session = 7;
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        publisher.publish(session, pointer_interaction().regions);
+
+        assert_eq!(
+            menu.pointer_press(target, session),
+            super::PointerClickAction::Select(target)
+        );
+        menu.pointer_select_with(0, 2, |_| {
+            redraws += 1;
+            publisher.invalidate();
+        });
+        assert_eq!(
+            redraws, 0,
+            "selecting the current row must keep the frame actionable"
+        );
+        assert!(publisher.snapshot_actionable().is_some());
+        assert_eq!(
+            menu.pointer_release(target, session),
+            super::PointerClickAction::None
+        );
+
+        let _ = menu.pointer_press(target, session);
+        menu.pointer_select_with(0, 2, |_| {
+            redraws += 1;
+            publisher.invalidate();
+        });
+        assert_eq!(
+            menu.pointer_release(target, session),
+            super::PointerClickAction::Confirm(target)
+        );
+        let mut callbacks = 0;
+        assert_eq!(
+            super::handle_pointer_menu_confirmation(
+                &mut menu,
+                |menu| menu,
+                false,
+                2,
+                |_menu, selected| {
+                    assert_eq!(selected, 0);
+                    callbacks += 1;
+                },
+            ),
+            Some(())
+        );
+        assert_eq!(callbacks, 1);
+    }
+
+    #[test]
+    fn pointer_changed_command_row_redraws_once_then_fresh_clicks_can_confirm() {
+        let target = HitTarget::MenuItem { index: 1 };
+        let mut menu = super::MenuState::new();
+        let mut redraws = 0;
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        publisher.publish(1, pointer_interaction().regions);
+
+        let _ = menu.pointer_press(target, 1);
+        menu.pointer_select_with(1, 2, |_| {
+            redraws += 1;
+            publisher.invalidate();
+        });
+        assert_eq!(redraws, 1);
+        assert!(publisher.snapshot_actionable().is_none());
+        let slow_up = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Up,
+            Some(PointerButton::Primary),
+            false,
+        ));
+        let mut prelude_runs = 0;
+        assert_eq!(
+            super::handle_input_preflight(&slow_up, None, &mut menu, false, || prelude_runs += 1),
+            super::PointerPreflightRoute::ReturnIgnored
+        );
+        assert_eq!(prelude_runs, 0);
+
+        let _ = menu.pointer_press(target, 2);
+        menu.pointer_select_with(1, 2, |_| redraws += 1);
+        assert_eq!(
+            menu.pointer_release(target, 2),
+            super::PointerClickAction::None
+        );
+        let _ = menu.pointer_press(target, 2);
+        menu.pointer_select_with(1, 2, |_| redraws += 1);
+        assert_eq!(
+            menu.pointer_release(target, 2),
+            super::PointerClickAction::Confirm(target)
+        );
+        assert_eq!(redraws, 1);
+    }
+
+    #[test]
+    fn pointer_confirmation_arm_does_not_cross_modal_or_content_sessions() {
+        let target = HitTarget::ModalItem { index: 0 };
+        let mut menu = super::MenuState::new();
+
+        assert_eq!(
+            menu.pointer_press(target, 11),
+            super::PointerClickAction::Select(target)
+        );
+        assert_eq!(
+            menu.pointer_release(target, 11),
+            super::PointerClickAction::None
+        );
+
+        // The same target index in a newly painted modal/content session is a
+        // fresh selection, not confirmation inherited from the prior picker.
+        assert_eq!(
+            menu.pointer_press(target, 12),
+            super::PointerClickAction::Select(target)
+        );
+        assert_eq!(
+            menu.pointer_release(target, 12),
+            super::PointerClickAction::None
+        );
+        assert_eq!(
+            menu.pointer_press(target, 12),
+            super::PointerClickAction::Select(target)
+        );
+        assert_eq!(
+            menu.pointer_release(target, 12),
+            super::PointerClickAction::Confirm(target)
+        );
+    }
+
+    #[test]
+    fn pointer_release_outside_the_pressed_target_cancels_confirmation() {
+        let target = HitTarget::MenuItem { index: 2 };
+        let outside = HitTarget::MenuItem { index: 4 };
+        let mut menu = super::MenuState::new();
+        let session = 3;
+
+        assert_eq!(
+            menu.pointer_press(target, session),
+            super::PointerClickAction::Select(target)
+        );
+        assert_eq!(
+            menu.pointer_release(outside, session),
+            super::PointerClickAction::None
+        );
+        assert_eq!(
+            menu.pointer_press(target, session),
+            super::PointerClickAction::Select(target)
+        );
+        assert_eq!(
+            menu.pointer_release(outside, session),
+            super::PointerClickAction::None
+        );
+    }
+
+    #[test]
+    fn pointer_shift_drag_uses_terminal_selection_escape_hatch() {
+        assert_eq!(
+            route_pointer(pointer(
+                PointerKind::Drag,
+                Some(PointerButton::Primary),
+                true,
+            )),
+            PointerRoute::Ignored
+        );
+    }
+
+    #[test]
+    fn pointer_non_scroll_fails_closed_before_general_input_prelude() {
+        for event in [
+            pointer(PointerKind::Drag, Some(PointerButton::Primary), true),
+            pointer(PointerKind::Move, None, false),
+            pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+            pointer(PointerKind::Up, Some(PointerButton::Primary), false),
+        ] {
+            let input = crate::input::InputEvent::Pointer(event);
+            let mut prelude_runs = 0;
+            let renderer = ScrollCapture::default();
+            let mut menu = super::MenuState::new();
+
+            let route =
+                handle_input_preflight(&input, None, &mut menu, false, || prelude_runs += 1);
+
+            assert_eq!(route, PointerPreflightRoute::ReturnIgnored);
+            assert_eq!(prelude_runs, 0);
+            assert!(renderer.deltas.is_empty());
+        }
+    }
+
+    #[test]
+    fn pointer_scroll_continues_through_general_input_prelude() {
+        for delta in [-3, 3] {
+            let event = pointer(PointerKind::Scroll(delta), None, false);
+            let input = crate::input::InputEvent::Pointer(event);
+            let mut prelude_runs = 0;
+            let mut renderer = ScrollCapture::default();
+            let mut menu = super::MenuState::new();
+
+            let route =
+                handle_input_preflight(&input, None, &mut menu, false, || prelude_runs += 1);
+            if let PointerPreflightRoute::ScrollContinue = route {
+                apply_pointer_event(event, &mut renderer);
+            }
+
+            assert_eq!(route, PointerPreflightRoute::ScrollContinue);
+            assert_eq!(prelude_runs, 1);
+            assert_eq!(renderer.deltas, vec![i32::from(delta)]);
+        }
+    }
+
+    #[test]
+    fn pointer_hit_continues_through_the_same_production_prelude_gate() {
+        let input = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Down,
+            Some(PointerButton::Primary),
+            false,
+        ));
+        let mut prelude_runs = 0;
+        let mut menu = super::MenuState::new();
+        let interaction = pointer_interaction();
+
+        let route = handle_input_preflight(&input, Some(&interaction), &mut menu, false, || {
+            prelude_runs += 1
+        });
+
+        assert_eq!(route, PointerPreflightRoute::PointerContinue);
+        assert_eq!(prelude_runs, 1);
+    }
+
+    #[test]
+    fn unactionable_primary_up_cancels_a_slow_click_before_the_general_prelude() {
+        let target = HitTarget::MenuItem { index: 0 };
+        let mut menu = super::MenuState::new();
+        let _ = menu.pointer_press(target, 1);
+        let mut prelude_runs = 0;
+        let up = crate::input::InputEvent::Pointer(pointer(
+            PointerKind::Up,
+            Some(PointerButton::Primary),
+            false,
+        ));
+
+        assert_eq!(
+            super::handle_input_preflight(&up, None, &mut menu, false, || prelude_runs += 1),
+            super::PointerPreflightRoute::ReturnIgnored
+        );
+        assert_eq!(prelude_runs, 0);
+        assert!(!menu.has_pointer_press());
+        let _ = menu.pointer_press(target, 2);
+        assert_eq!(
+            menu.pointer_release(target, 2),
+            super::PointerClickAction::None,
+            "a new frame needs two complete clicks after the slow release"
+        );
+        let _ = menu.pointer_press(target, 2);
+        assert_eq!(
+            menu.pointer_release(target, 2),
+            super::PointerClickAction::Confirm(target)
+        );
+    }
+
+    #[test]
+    fn blocked_pointer_confirmation_rearms_as_a_fresh_selection() {
+        struct ConfirmationHarness {
+            menu: super::MenuState,
+            callbacks: usize,
+        }
+
+        let target = HitTarget::MenuItem { index: 1 };
+        let mut harness = ConfirmationHarness {
+            menu: super::MenuState::new(),
+            callbacks: 0,
+        };
+        harness.menu.select_index(1, 2);
+        let session = 9;
+        let _ = harness.menu.pointer_press(target, session);
+        let _ = harness.menu.pointer_release(target, session);
+        let _ = harness.menu.pointer_press(target, session);
+        assert_eq!(
+            harness.menu.pointer_release(target, session),
+            super::PointerClickAction::Confirm(target)
+        );
+
+        assert_eq!(
+            super::handle_pointer_menu_confirmation(
+                &mut harness,
+                |harness| &mut harness.menu,
+                true,
+                2,
+                |harness, _selected| harness.callbacks += 1,
+            ),
+            None
+        );
+        assert_eq!(harness.callbacks, 0);
+        let _ = harness.menu.pointer_press(target, session);
+        assert_eq!(
+            harness.menu.pointer_release(target, session),
+            super::PointerClickAction::None,
+            "after a blocked commit, the next click must select again"
+        );
+        let _ = harness.menu.pointer_press(target, session);
+        assert_eq!(
+            harness.menu.pointer_release(target, session),
+            super::PointerClickAction::Confirm(target)
+        );
+        assert_eq!(
+            super::handle_pointer_menu_confirmation(
+                &mut harness,
+                |harness| &mut harness.menu,
+                false,
+                2,
+                |harness, selected| {
+                    assert_eq!(selected, 1);
+                    harness.callbacks += 1;
+                },
+            ),
+            Some(())
+        );
+        assert_eq!(harness.callbacks, 1);
+    }
+
+    #[test]
+    fn pointer_vertical_scroll_preserves_existing_body_scroll_amount() {
+        assert_eq!(
+            route_pointer(pointer(PointerKind::Scroll(-3), None, false)),
+            PointerRoute::ScrollBody(-3)
+        );
+        assert_eq!(
+            route_pointer(pointer(PointerKind::Scroll(3), None, false)),
+            PointerRoute::ScrollBody(3)
+        );
+    }
+
+    #[test]
+    fn pointer_scroll_is_forwarded_once_to_existing_renderer_scroll_body() {
+        let mut renderer = ScrollCapture::default();
+
+        apply_pointer_event(pointer(PointerKind::Scroll(-3), None, false), &mut renderer);
+        apply_pointer_event(pointer(PointerKind::Scroll(3), None, false), &mut renderer);
+
+        assert_eq!(renderer.deltas, vec![-3, 3]);
+    }
+
+    #[test]
+    fn pointer_buttons_and_motion_are_ignored_until_hit_routing_exists() {
+        for (kind, button) in [
+            (PointerKind::Down, Some(PointerButton::Primary)),
+            (PointerKind::Up, Some(PointerButton::Primary)),
+            (PointerKind::Drag, Some(PointerButton::Primary)),
+            (PointerKind::Move, None),
+            (PointerKind::Down, Some(PointerButton::Secondary)),
+            (PointerKind::Down, Some(PointerButton::Middle)),
+        ] {
+            assert_eq!(
+                route_pointer(pointer(kind, button, false)),
+                PointerRoute::Ignored
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -11760,12 +14667,93 @@ fn handle_scroll_key(
 /// Slash-command palette state. Active whenever buf starts with '/'.
 pub struct MenuState {
     pub selected: usize,
+    pointer_selected: Option<(u64, crate::render::interaction::HitTarget)>,
+    pointer_pressed: Option<(u64, crate::render::interaction::HitTarget)>,
+    pointer_confirm_on_release: bool,
 }
 
 impl MenuState {
     pub fn new() -> Self {
-        Self { selected: 0 }
+        Self {
+            selected: 0,
+            pointer_selected: None,
+            pointer_pressed: None,
+            pointer_confirm_on_release: false,
+        }
     }
+
+    fn pointer_press(
+        &mut self,
+        target: crate::render::interaction::HitTarget,
+        surface_session: u64,
+    ) -> PointerClickAction {
+        let identity = (surface_session, target);
+        self.pointer_confirm_on_release = self.pointer_selected == Some(identity);
+        self.pointer_selected = Some(identity);
+        self.pointer_pressed = Some(identity);
+        PointerClickAction::Select(target)
+    }
+
+    fn pointer_release(
+        &mut self,
+        target: crate::render::interaction::HitTarget,
+        surface_session: u64,
+    ) -> PointerClickAction {
+        let identity = (surface_session, target);
+        let confirm = self.pointer_pressed == Some(identity) && self.pointer_confirm_on_release;
+        self.pointer_pressed = None;
+        self.pointer_confirm_on_release = false;
+        if self.pointer_selected != Some(identity) {
+            self.pointer_selected = None;
+        }
+        if confirm {
+            PointerClickAction::Confirm(target)
+        } else {
+            PointerClickAction::None
+        }
+    }
+
+    fn pointer_cancel(&mut self) {
+        self.pointer_selected = None;
+        self.pointer_pressed = None;
+        self.pointer_confirm_on_release = false;
+    }
+
+    fn has_pointer_press(&self) -> bool {
+        self.pointer_pressed.is_some()
+    }
+
+    fn pointer_confirmation_allowed(&mut self, commit_gate_pending: bool) -> bool {
+        let allowed = idle_menu_confirmation_allowed(commit_gate_pending);
+        if !allowed {
+            self.pointer_cancel();
+        }
+        allowed
+    }
+
+    fn select_index(&mut self, index: usize, len: usize) -> bool {
+        let selected = if len == 0 { 0 } else { index.min(len - 1) };
+        let changed = self.selected != selected;
+        self.selected = selected;
+        changed
+    }
+
+    fn pointer_select_with(&mut self, index: usize, len: usize, redraw: impl FnOnce(usize)) {
+        if self.select_index(index, len) {
+            redraw(self.selected);
+        }
+    }
+
+    fn confirm_selected(&self, len: usize) -> Option<usize> {
+        (len > 0).then(|| self.selected.min(len - 1))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerClickAction {
+    Select(crate::render::interaction::HitTarget),
+    Confirm(crate::render::interaction::HitTarget),
+    None,
 }
 
 // `ModelPicker` moved to `crate::modals::model_picker`; re-exported at
@@ -11947,7 +14935,7 @@ fn build_menu_items(
     }
 
     // Two-level palette for `/effort` (same gateway pattern as `/skills`).
-    // Once `/effort ` (trailing space) is in the buffer, list the three
+    // Once `/effort ` (trailing space) is in the buffer, list the
     // reasoning-effort choices; submission commits `/effort <choice>`.
     if let Some(after) = buf.strip_prefix("/effort ") {
         if after.contains(char::is_whitespace) {
@@ -11955,9 +14943,11 @@ fn build_menu_items(
         }
         let prefix = after.to_ascii_lowercase();
         let items: Vec<(String, String)> = [
-            ("high", "Deeper reasoning (DeepSeek V4)"),
-            ("max", "Maximum reasoning depth (DeepSeek V4)"),
-            ("off", "Use the API default"),
+            ("low", "Minimal reasoning effort"),
+            ("medium", "Moderate reasoning effort"),
+            ("high", "Deeper reasoning"),
+            ("max", "Maximum reasoning depth"),
+            ("default", "Return to the API default (keeps capability)"),
         ]
         .into_iter()
         .filter(|(n, _)| n.starts_with(prefix.as_str()))
@@ -12036,7 +15026,21 @@ fn menu_handles_selection_key(
 ) -> bool {
     matches!(code, KeyCode::Enter | KeyCode::Tab)
         && !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
-        && !(code == KeyCode::Enter && commit_gate_pending)
+        && (code != KeyCode::Enter || idle_menu_confirmation_allowed(commit_gate_pending))
+}
+
+fn idle_menu_confirmation_allowed(commit_gate_pending: bool) -> bool {
+    !commit_gate_pending
+}
+
+/// Main-composer execution-mode shortcut. Crossterm normally reports
+/// Shift+Tab as `BackTab`, while a few terminals preserve it as `Tab + SHIFT`.
+/// Plain Tab is deliberately excluded so it remains dedicated to completion.
+fn is_mode_cycle_key(code: KeyCode, modifiers: crossterm::event::KeyModifiers) -> bool {
+    let shift = crossterm::event::KeyModifiers::SHIFT;
+    let has_no_other_modifiers = modifiers.difference(shift).is_empty();
+    has_no_other_modifiers
+        && (code == KeyCode::BackTab || (code == KeyCode::Tab && modifiers.contains(shift)))
 }
 
 fn streaming_top_level_slash_selection(
@@ -12056,6 +15060,104 @@ fn streaming_top_level_slash_selection(
     ))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SkillMenuBufferResult {
+    Completed,
+    Committed(String),
+}
+
+fn apply_skill_menu_buffer_selection(
+    buf: &mut Buffer,
+    name: &str,
+    code: KeyCode,
+) -> SkillMenuBufferResult {
+    if code == KeyCode::Tab {
+        buf.replace_all_text(format!("${name} "));
+        SkillMenuBufferResult::Completed
+    } else {
+        let committed = format!("${name}");
+        buf.clear_text();
+        SkillMenuBufferResult::Committed(committed)
+    }
+}
+
+fn confirm_idle_menu_selected(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    items: &[(String, String)],
+    selected: usize,
+) -> Result<()> {
+    let name = items[selected].0.clone();
+    let needs_args = ctx
+        .commands
+        .find(&name)
+        .map(|command| command.needs_args)
+        .or_else(|| {
+            ctx.custom_commands
+                .resolve(&name)
+                .map(|command| command.args_requirement != ArgsRequirement::None)
+        })
+        .unwrap_or(false);
+    app.menu.selected = 0;
+    if needs_args {
+        app.buf.replace_all_text(format!("/{name} "));
+        if matches!(name.as_str(), "skills" | "effort") {
+            if let Some(next_items) = build_menu_items(
+                &app.buf.text,
+                app.buf.cursor,
+                &ctx.commands,
+                &ctx.custom_commands,
+                Some(&ctx.skill_registry),
+                Some(&ctx.file_index),
+            ) {
+                redraw_with_menu(&app.buf, &next_items, 0, &app.state, ctx, renderer);
+                return Ok(());
+            }
+            if name == "skills" {
+                renderer.render(UiLine::CommandOutput(
+                    "  ⓘ No user-invocable skills installed yet.\n    \
+                    • Drop SKILL.md into ~/.atomcode/skills/<name>/ \n      \
+                      (Windows: %USERPROFILE%\\.atomcode\\skills\\<name>\\)\n    \
+                    • Or install a plugin that ships skills via /plugin install <git-url>\n\n"
+                        .into(),
+                ));
+            }
+        }
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
+    let committed = format!("/{name}");
+    renderer.render(UiLine::ClearTransient);
+    renderer.render(UiLine::User(committed.clone()));
+    app.buf.clear_text();
+    ctx.history.push(crate::input::history::HistoryEntry {
+        text: committed.clone(),
+        images: Vec::new(),
+        pastes: Vec::new(),
+    });
+    if let Some((command, arg)) = parse_slash_line(&committed) {
+        if command.eq_ignore_ascii_case("paste") {
+            handle_paste_command(app, ctx, renderer)?;
+        } else {
+            execute_slash_command(
+                command,
+                arg,
+                &mut app.state,
+                ctx,
+                renderer,
+                &mut app.active_modal,
+                &mut app.setup_pending,
+            )?;
+        }
+        if matches!(app.state.phase, UiPhase::Idle) {
+            redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
+        }
+    }
+    Ok(())
+}
+
 fn handle_idle_key(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -12063,6 +15165,34 @@ fn handle_idle_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
+    let cancel_resume = code == KeyCode::Esc && modifiers.is_empty()
+        || code == KeyCode::Char('c')
+            && modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+    if cancel_resume && ctx.pending_session_resume_preparation.take().is_some() {
+        renderer.render(UiLine::Warning(match crate::i18n::current_locale() {
+            crate::i18n::Locale::ZhCn => "已取消加载会话".into(),
+            crate::i18n::Locale::En => "Session loading cancelled".into(),
+        }));
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        commands::request_session_catalog(ctx, renderer);
+        return Ok(());
+    }
+    if cancel_resume {
+        if let Some(pending) = ctx
+            .pending_session_resume
+            .as_mut()
+            .filter(|pending| pending.committed.is_none() && !pending.cancel_requested)
+        {
+            pending.cancel_requested = true;
+            pending.cancel.cancel();
+            renderer.render(UiLine::Warning(match crate::i18n::current_locale() {
+                crate::i18n::Locale::ZhCn => "正在取消加载会话…".into(),
+                crate::i18n::Locale::En => "Cancelling session loading…".into(),
+            }));
+            renderer.flush();
+            return Ok(());
+        }
+    }
     // GOAL ESCAPE HATCH (Idle). A `/goal` continuation is driven SERVER-SIDE,
     // so the TUI can legitimately sit in Idle while the agent keeps looping
     // rounds. From Idle, Esc/Ctrl+C otherwise just clear the input / arm exit —
@@ -12076,8 +15206,8 @@ fn handle_idle_key(
         let is_ctrl_c = code == KeyCode::Char('c')
             && modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
         let is_bare_esc = code == KeyCode::Esc && app.buf.text.is_empty();
-        let should_pause = is_bare_esc
-            && app.state.goal_phase == atomcode_coding::GoalPhase::Pursuing;
+        let should_pause =
+            is_bare_esc && app.state.goal_phase == atomcode_coding::GoalPhase::Pursuing;
         if is_ctrl_c || should_pause {
             let has_active_turn = ctx.runtime.has_active_turn();
             let sent = if is_ctrl_c {
@@ -12146,6 +15276,15 @@ fn handle_idle_key(
             (selection_key @ (KeyCode::Enter | KeyCode::Tab), m)
                 if menu_handles_selection_key(selection_key, m, idle_commit_gate_pending(ctx)) =>
             {
+                if selection_key == KeyCode::Enter
+                    && app.buf.text.starts_with('/')
+                    && !app.buf.text[1..].contains(char::is_whitespace)
+                {
+                    let Some(selected) = app.menu.confirm_selected(items.len()) else {
+                        return Ok(());
+                    };
+                    return confirm_idle_menu_selected(app, ctx, renderer, items, selected);
+                }
                 // Tab and Enter both pick the highlighted entry, but
                 // they diverge on no-arg top-level commands:
                 //   * Enter   → execute immediately (legacy behavior).
@@ -12172,8 +15311,7 @@ fn handle_idle_key(
                         // adding whitespace so directories can keep completing.
                         let selected_path = items[app.menu.selected].0.clone();
                         let replacement = file_index::format_at_mention_replacement(&selected_path);
-                        app.buf.text.replace_range(at_pos..end, &replacement);
-                        app.buf.cursor = at_pos + replacement.len();
+                        let _ = app.buf.replace_text_range(at_pos..end, &replacement);
                         app.menu.selected = 0;
                         if let Some(next_items) = build_menu_items(
                             &app.buf.text,
@@ -12206,18 +15344,15 @@ fn handle_idle_key(
                 if app.buf.text.starts_with('$') && !items.is_empty() {
                     let name = items[app.menu.selected].0.clone();
                     app.menu.selected = 0;
-                    if code == KeyCode::Tab {
-                        app.buf.text = format!("${} ", name);
-                        app.buf.cursor = app.buf.text.len();
+                    let SkillMenuBufferResult::Committed(committed) =
+                        apply_skill_menu_buffer_selection(&mut app.buf, &name, code)
+                    else {
                         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                         return Ok(());
-                    }
+                    };
                     // Enter → invoke now via the shared skills arm.
-                    let committed = format!("${}", name);
                     renderer.render(UiLine::ClearTransient);
                     renderer.render(UiLine::User(committed.clone()));
-                    app.buf.text.clear();
-                    app.buf.cursor = 0;
                     ctx.history.push(crate::input::history::HistoryEntry {
                         text: committed.clone(),
                         images: Vec::new(),
@@ -12258,8 +15393,7 @@ fn handle_idle_key(
                     // Menu rebuilds on next keystroke — with the trailing
                     // space parse_slash_line returns `Some(("name", ""))`
                     // so build_menu_items correctly hides the menu.
-                    app.buf.text = format!("/{} ", name);
-                    app.buf.cursor = app.buf.text.len();
+                    app.buf.replace_all_text(format!("/{} ", name));
 
                     // The `/skills` gateway is special: build_menu_items
                     // recognises the `/skills ` prefix and returns the
@@ -12340,16 +15474,14 @@ fn handle_idle_key(
                 let in_effort_sub_mode = app.buf.text.starts_with("/effort ");
                 if in_effort_sub_mode {
                     if code == KeyCode::Tab {
-                        app.buf.text = format!("/effort {} ", name);
-                        app.buf.cursor = app.buf.text.len();
+                        app.buf.replace_all_text(format!("/effort {} ", name));
                         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                         return Ok(());
                     }
                     let committed = format!("/effort {}", name);
                     renderer.render(UiLine::ClearTransient);
                     renderer.render(UiLine::User(committed.clone()));
-                    app.buf.text.clear();
-                    app.buf.cursor = 0;
+                    app.buf.clear_text();
                     ctx.history.push(crate::input::history::HistoryEntry {
                         text: committed.clone(),
                         images: Vec::new(),
@@ -12380,8 +15512,7 @@ fn handle_idle_key(
 
                 let in_skills_sub_mode = app.buf.text.starts_with("/skills ");
                 if in_skills_sub_mode {
-                    app.buf.text = format!("/skills {} ", name);
-                    app.buf.cursor = app.buf.text.len();
+                    app.buf.replace_all_text(format!("/skills {} ", name));
                     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                     return Ok(());
                 }
@@ -12394,8 +15525,7 @@ fn handle_idle_key(
                 // (parse_slash_line treats `/name ` as a fully-named
                 // command with empty arg).
                 if code == KeyCode::Tab {
-                    app.buf.text = format!("/{} ", name);
-                    app.buf.cursor = app.buf.text.len();
+                    app.buf.replace_all_text(format!("/{} ", name));
                     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                     return Ok(());
                 }
@@ -12404,8 +15534,7 @@ fn handle_idle_key(
                 let committed = format!("/{}", name);
                 renderer.render(UiLine::ClearTransient);
                 renderer.render(UiLine::User(committed.clone()));
-                app.buf.text.clear();
-                app.buf.cursor = 0;
+                app.buf.clear_text();
                 // Mirror the regular-message and queued-message paths
                 // below: pushing the just-submitted line into `ctx.history`
                 // is what Up-arrow recall reads from. Without this, a
@@ -12442,8 +15571,7 @@ fn handle_idle_key(
             }
             (KeyCode::Esc, _) => {
                 // Close menu by clearing buffer.
-                app.buf.text.clear();
-                app.buf.cursor = 0;
+                app.buf.clear_text();
                 app.menu.selected = 0;
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
@@ -12452,13 +15580,10 @@ fn handle_idle_key(
         }
     }
 
-    // Tab / Shift+Tab cycle execution mode when no completion menu is up.
-    if (code == KeyCode::Tab || code == KeyCode::BackTab) && menu_items.is_none() {
-        let next = if code == KeyCode::BackTab {
-            app.state.agent_mode.prev()
-        } else {
-            app.state.agent_mode.next()
-        };
+    // Shift+Tab cycles execution mode when no completion menu is up. Plain Tab
+    // is reserved for slash-command, skill, and @file completion.
+    if is_mode_cycle_key(code, modifiers) && menu_items.is_none() {
+        let next = app.state.agent_mode.next();
         set_agent_mode(app, ctx, renderer, next);
         return Ok(());
     }
@@ -12550,11 +15675,9 @@ fn handle_idle_key(
             // ModelArts.81001 "message[N].content[0] has invalid
             // field(s): text, type" for GLM-5.1). Helper in
             // `Config::can_handle_attached_images`.
-            if let Some(reject) = image_attach_reject_line(
-                &ctx.config,
-                &ctx.provider_selection,
-                &ctx.model_name,
-            ) {
+            if let Some(reject) =
+                image_attach_reject_line(&ctx.config, &ctx.provider_selection, &ctx.model_name)
+            {
                 renderer.render(UiLine::Error(reject));
                 renderer.flush();
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
@@ -12573,10 +15696,10 @@ fn handle_idle_key(
             app.state.pending_images.push(img.clone());
             app.state.pending_image_hashes.push(hash);
             app.state.pending_image_markers.push(n);
-            cache_write_image(&crate::platform::image_cache_dir(), &img, hash);
+            cache_write_image(ctx.history.cache_dir(), &img, hash);
             let marker = format!("[Image #{}]", n);
-            app.buf.text.insert_str(app.buf.cursor, &marker);
-            app.buf.cursor += marker.len();
+            app.buf.insert_at_cursor(&marker);
+            sync_composer_selection(&app.buf, &ctx.interaction_publisher);
             redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
             return Ok(());
         }
@@ -12602,10 +15725,17 @@ fn handle_idle_key(
             redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
             return Ok(());
         }
-        let new_val = app.state.cycle_reasoning_effort();
-        ctx.reasoning_effort = new_val.map(|s| s.to_string());
+        // Seed from the authoritative `ctx` value (the display already trusts it):
+        // `app.state.reasoning_effort` is otherwise never seeded from config, so a
+        // bare cycle would downgrade a persisted level to the chain head on the
+        // first press. Cycle only within the levels this endpoint exposes.
+        let allowed = selection_allowed_efforts(ctx);
+        let new_val = app
+            .state
+            .cycle_reasoning_effort_within(ctx.reasoning_effort.as_deref(), &allowed);
+        ctx.reasoning_effort = new_val.clone();
         persist_reasoning_effort(ctx);
-        let msg = match new_val {
+        let msg = match new_val.as_deref() {
             Some(v) => format!("  reasoning_effort → {}\n", v),
             None => "  reasoning_effort cleared (API default)\n".into(),
         };
@@ -12616,18 +15746,20 @@ fn handle_idle_key(
     }
 
     // Multi-line cursor nav (idle path). Mirror of the streaming-mode
-    // handler: in a buffer with embedded newlines, plain Up/Down walks
-    // through the lines first; only when the cursor is already on the
-    // first/last line does it surface as HistoryPrev/Next. Gated to
-    // "no modifiers" so Shift+Up (body scroll) and other compound keys
-    // still classify normally.
+    // handler: plain Up/Down walks through visual (soft-wrapped) lines
+    // first; only when the cursor is at the very first/last position
+    // does it surface as HistoryPrev/Next. Gated to "no modifiers" so
+    // Shift+Up (body scroll) and other compound keys still classify
+    // normally.
     if modifiers.is_empty() {
         match code {
-            KeyCode::Up if app.buf.cursor_line_up() => {
+            KeyCode::Up if app.buf.cursor_visual_up() => {
+                sync_composer_selection(&app.buf, &ctx.interaction_publisher);
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
             }
-            KeyCode::Down if app.buf.cursor_line_down() => {
+            KeyCode::Down if app.buf.cursor_visual_down() => {
+                sync_composer_selection(&app.buf, &ctx.interaction_publisher);
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
             }
@@ -12641,6 +15773,7 @@ fn handle_idle_key(
         if let Some(suggestion) = app.state.next_prompt_suggestion.clone() {
             if app.buf.accept_next_prompt_suggestion(&suggestion) {
                 app.state.next_prompt_suggestion = None;
+                sync_composer_selection(&app.buf, &ctx.interaction_publisher);
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
             }
@@ -12651,6 +15784,7 @@ fn handle_idle_key(
     }
 
     let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
+    sync_composer_selection(&app.buf, &ctx.interaction_publisher);
     sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
     crate::tuix_trace!(
         "KEY",
@@ -12726,11 +15860,9 @@ fn handle_idle_key(
             // Reject before clearing the editor when neither the live model nor
             // a configured VL preprocessor can consume it; otherwise the raw
             // path reaches the model and it falls back to a futile read_file.
-            if let Some(reject) = image_attach_reject_line(
-                &ctx.config,
-                &ctx.provider_selection,
-                &ctx.model_name,
-            ) {
+            if let Some(reject) =
+                image_attach_reject_line(&ctx.config, &ctx.provider_selection, &ctx.model_name)
+            {
                 if contains_attachable_at_image(&line, &ctx.working_dir) {
                     renderer.render(UiLine::Error(reject));
                     renderer.flush();
@@ -12739,8 +15871,7 @@ fn handle_idle_key(
                 }
             }
             renderer.render(UiLine::ClearTransient);
-            app.buf.text.clear();
-            app.buf.cursor = 0;
+            app.buf.clear_text();
             // NB: `app.buf.clear_pastes()` is deferred until AFTER the
             // submit path calls `expand_pastes(&line)` — wiping the
             // paste Vec here used to leave `expand_pastes` with
@@ -12907,9 +16038,12 @@ fn handle_idle_key(
                 // while the echo + payload carry `[Image #2]` — the
                 // user reasonably reads that as a bug ("two different
                 // numbers for the same image").
-                let cache_dir = crate::platform::image_cache_dir();
                 let mut line = line; // shadow as mutable so hydrate can rewrite it
-                for n in hydrate_recalled_attachments(&mut app.state, &mut line, &cache_dir) {
+                for n in hydrate_recalled_attachments_for_history(
+                    &mut app.state,
+                    &mut line,
+                    &ctx.history,
+                ) {
                     renderer.render(UiLine::Warning(n));
                 }
                 let mut expanded = app.buf.expand_pastes(&line);
@@ -13136,6 +16270,7 @@ fn redraw_with_menu(
     ctx: &LoopCtx,
     renderer: &mut dyn Renderer,
 ) {
+    sync_composer_selection(buf, &ctx.interaction_publisher);
     let kind = if file_index::detect_at_mention_range(&buf.text, buf.cursor).is_some() {
         crate::render::MenuKind::AtMention
     } else if buf.text.starts_with('$') {
@@ -13366,7 +16501,7 @@ mod midturn_submit_route_tests {
     }
 }
 
-/// Switch execution mode from a single place. Used by Tab, Shift+Tab, and the
+/// Switch execution mode from a single place. Used by Shift+Tab and the
 /// /build /auto /plan commands. Sends the unified SetMode to the runtime, mirrors
 /// to the daemon LIVE mode (cross-tab / webui sync), prints a feedback line, and
 /// repaints the footer.
@@ -13378,7 +16513,7 @@ pub(crate) fn set_agent_mode(
 ) {
     app.state.agent_mode = mode;
     // Reveal the Build badge when the user explicitly switches to Build
-    // via Tab/Shift+Tab or `/build`. The default startup state stays
+    // via Shift+Tab or `/build`. The default startup state stays
     // badge-less.
     if mode == crate::state::AgentMode::Build {
         app.state.build_badge_visible = true;
@@ -13388,7 +16523,7 @@ pub(crate) fn set_agent_mode(
         .ok();
     atomcode_daemon::live_set_mode(mode); // daemon ApprovalMode == core Mode
                                           // The footer persistently shows the current mode, so a scrollback feedback line
-                                          // is redundant in the interactive renderer — and it spams on rapid Tab / Shift+Tab
+                                          // is redundant in the interactive renderer — and it spams on rapid Shift+Tab
                                           // cycling. Emit it ONLY in plain mode (pipe / CI), which has no persistent footer.
     if ctx.is_plain_renderer {
         let msg = match mode {
@@ -13411,7 +16546,7 @@ pub(crate) fn set_agent_mode(
     // `redraw_idle_plain` renders `UiLine::InputPrompt`, whose retained handler
     // treats reaching the idle prompt as "the turn is over" and
     // `commit_inflight_tool()` + `clear_live_spinner()`. That is correct at
-    // idle, but this is also reached MID-TURN from the streaming Tab / Shift+Tab
+    // idle, but this is also reached MID-TURN from the streaming Shift+Tab
     // mode-cycle handler — where a tool is still in flight. Committing it early
     // (then re-establishing the strip on the very next `draw_spinner_now`) makes
     // the live spinner/thinking row flash a garbled frame that self-heals on the
@@ -13424,6 +16559,7 @@ pub(crate) fn set_agent_mode(
 }
 
 fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    sync_composer_selection(buf, &ctx.interaction_publisher);
     let attachments = compute_input_attachments(state, &buf.text);
     let mut status = build_input_status(state, ctx, buf);
     // Discoverability: while composing a `!` shell command, surface a brand-purple
@@ -14574,7 +17710,9 @@ fn handle_streaming_key(
             "\x1b[2m"
         };
         let status = if app.state.show_tool_output {
-            format!("{mute}  ○ Verbose mode enabled (tool output + reasoning visible) (Ctrl+o to hide){reset}\n")
+            format!(
+                "{mute}  ○ Verbose mode enabled (tool output + reasoning visible) (Ctrl+o to hide){reset}\n"
+            )
         } else {
             format!(
                 "{mute}  ○ Verbose mode disabled (Ctrl+o to show tool output + reasoning){reset}\n"
@@ -14710,18 +17848,14 @@ fn handle_streaming_key(
     // which emits the "disabled while a turn is running" hint.
     let menu_items = menu_for_display(&app.buf, ctx);
 
-    // Tab / Shift+Tab cycle execution mode MID-TURN (when no completion menu is
+    // Shift+Tab cycles execution mode MID-TURN (when no completion menu is
     // up), mirroring the idle handler. `SetMode` flips atomic flags the agent loop
     // reads on each subsequent tool call, so the switch applies LIVE to the rest of
     // this turn (matching Claude Code's mid-run Shift+Tab). Already-surfaced
     // approvals are not retroactively changed — only later tool calls see the new
     // mode. Repaint the spinner footer so the mode badge updates immediately.
-    if (code == KeyCode::Tab || code == KeyCode::BackTab) && menu_items.is_none() {
-        let next = if code == KeyCode::BackTab {
-            app.state.agent_mode.prev()
-        } else {
-            app.state.agent_mode.next()
-        };
+    if is_mode_cycle_key(code, modifiers) && menu_items.is_none() {
+        let next = app.state.agent_mode.next();
         set_agent_mode(app, ctx, renderer, next);
         draw_spinner_now(
             &mut app.state,
@@ -14766,8 +17900,7 @@ fn handle_streaming_key(
                 return Ok(());
             }
             KeyCode::Esc => {
-                app.buf.text.clear();
-                app.buf.cursor = 0;
+                app.buf.clear_text();
                 app.menu.selected = 0;
                 draw_spinner_now(
                     &mut app.state,
@@ -14803,8 +17936,7 @@ fn handle_streaming_key(
                         .expect("guarded above");
                 let selected_path = items[app.menu.selected].0.clone();
                 let replacement = file_index::format_at_mention_replacement(&selected_path);
-                app.buf.text.replace_range(at_pos..end, &replacement);
-                app.buf.cursor = at_pos + replacement.len();
+                let _ = app.buf.replace_text_range(at_pos..end, &replacement);
                 app.menu.selected = 0;
                 // Menu shape may have changed — surface on next redraw via
                 // draw_spinner_now (the streaming footer stays visible).
@@ -14831,8 +17963,7 @@ fn handle_streaming_key(
                 if let Some((completed, submit)) =
                     streaming_top_level_slash_selection(&app.buf.text, &name, needs_args, code)
                 {
-                    app.buf.text = completed;
-                    app.buf.cursor = app.buf.text.len();
+                    app.buf.replace_all_text(completed);
                     app.menu.selected = 0;
                     if !submit {
                         draw_spinner_now(
@@ -14854,17 +17985,15 @@ fn handle_streaming_key(
         }
     }
 
-    // Multi-line cursor nav: in a buffer with embedded newlines, plain
-    // Up/Down should walk through the lines first; only when the
-    // cursor is already on the first/last line does it surface as
-    // HistoryPrev/Next. Matches the convention from fish / Cursor /
-    // Claude Code — losing a multi-line draft to "I was just trying
-    // to fix line 2" is far worse than the historical single-line
-    // shortcut.  Gated to "no modifiers" so Shift+Up (selection in
-    // some terminals) and other compound keys still classify normally.
+    // Multi-line cursor nav: plain Up/Down walks through visual
+    // (soft-wrapped) lines first; only when the cursor is at the very
+    // first/last position does it surface as HistoryPrev/Next. Gated to
+    // "no modifiers" so Shift+Up (selection in some terminals) and
+    // other compound keys still classify normally.
     if modifiers.is_empty() {
         match code {
-            KeyCode::Up if app.buf.cursor_line_up() => {
+            KeyCode::Up if app.buf.cursor_visual_up() => {
+                sync_composer_selection(&app.buf, &ctx.interaction_publisher);
                 draw_spinner_now(
                     &mut app.state,
                     &app.buf,
@@ -14875,7 +18004,8 @@ fn handle_streaming_key(
                 );
                 return Ok(());
             }
-            KeyCode::Down if app.buf.cursor_line_down() => {
+            KeyCode::Down if app.buf.cursor_visual_down() => {
+                sync_composer_selection(&app.buf, &ctx.interaction_publisher);
                 draw_spinner_now(
                     &mut app.state,
                     &app.buf,
@@ -14892,6 +18022,7 @@ fn handle_streaming_key(
 
     let action = classify(code, modifiers);
     let apply_result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
+    sync_composer_selection(&app.buf, &ctx.interaction_publisher);
     sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
     match apply_result {
         BufferResult::NoOp => {}
@@ -14977,8 +18108,7 @@ fn handle_streaming_key(
                     app.think.reset();
                     app.reasoning_buffer.clear();
                 }
-                app.buf.text.clear();
-                app.buf.cursor = 0;
+                app.buf.clear_text();
                 app.menu.selected = 0;
                 if readonly {
                     // Restore the streaming footer/spinner after executing the report.
@@ -15005,8 +18135,7 @@ fn handle_streaming_key(
                     "  (slash commands are disabled while a turn is running)\n".into(),
                 ));
                 renderer.flush();
-                app.buf.text.clear();
-                app.buf.cursor = 0;
+                app.buf.clear_text();
                 app.menu.selected = 0;
                 draw_spinner_now(
                     &mut app.state,
@@ -15024,8 +18153,8 @@ fn handle_streaming_key(
             // travel with the queued message instead of being silently
             // dropped on dispatch.
             let mut line = line;
-            let cache_dir_for_hydrate = crate::platform::image_cache_dir();
-            for n in hydrate_recalled_attachments(&mut app.state, &mut line, &cache_dir_for_hydrate)
+            for n in
+                hydrate_recalled_attachments_for_history(&mut app.state, &mut line, &ctx.history)
             {
                 renderer.render(UiLine::Warning(n));
             }
@@ -15110,8 +18239,7 @@ fn handle_streaming_key(
                     renderer.render(UiLine::CommandOutput(format!("  ↳ queued: {}\n", line)));
                 }
             }
-            app.buf.text.clear();
-            app.buf.cursor = 0;
+            app.buf.clear_text();
             app.buf.clear_pastes();
             renderer.flush();
             draw_spinner_now(
@@ -15550,7 +18678,7 @@ mod bypass_approval_tests {
 
 #[cfg(test)]
 mod user_input_key_tests {
-    use super::user_input_response_for;
+    use super::{clear_panel_paste_command, paste_command_image_path, user_input_response_for};
     use crate::state::UserInputPanel;
     use atomcode_capabilities::tools::request_user_input::{
         UserInputMode, UserInputOption, UserInputRequest,
@@ -15764,6 +18892,40 @@ mod user_input_key_tests {
         assert!(!resp.declined);
         assert!(resp.selected.is_empty());
         assert_eq!(resp.text.as_deref(), Some("hi there"));
+    }
+
+    #[test]
+    fn successful_image_attach_replaces_paste_command_with_marker() {
+        let mut p = panel(UserInputMode::Text);
+        p.text = "/paste".into();
+        p.text_cursor_byte = p.text.len();
+        clear_panel_paste_command(&mut p);
+        p.insert_paste("[Image #1]");
+        p.images.push(atomcode_kernel::message::ImageContent {
+            media_type: "image/png".into(),
+            data: "aW1hZ2U=".into(),
+        });
+        assert_eq!(p.text, "[Image #1]");
+        let response = user_input_response_for(&p, KeyCode::Enter).unwrap();
+        assert_eq!(response.images.len(), 1);
+    }
+
+    #[test]
+    fn failed_image_attach_keeps_paste_command_available_for_retry() {
+        let mut p = panel(UserInputMode::Text);
+        p.text = "/paste".into();
+        p.text_cursor_byte = p.text.len();
+        assert_eq!(p.text, "/paste");
+        assert!(p.images.is_empty());
+    }
+
+    #[test]
+    fn explicit_windows_image_path_is_parsed_as_paste_command() {
+        assert_eq!(
+            paste_command_image_path(r#"/paste C:\Users\linux\Videos\image.jpg"#),
+            Some(r#"C:\Users\linux\Videos\image.jpg"#)
+        );
+        assert_eq!(paste_command_image_path("/pasteboard x.png"), None);
     }
 
     // Navigation / typing keys do NOT resolve (return None so the caller mutates
@@ -16117,13 +19279,14 @@ pub(crate) fn user_input_response_for(
     match (&panel.mode, code) {
         (_, KeyCode::Esc) => Some(UserInputResponse::declined()),
         (UserInputMode::Text, KeyCode::Enter) => {
-            if panel.text.trim().is_empty() {
+            if panel.text.trim().is_empty() && panel.images.is_empty() {
                 None // empty buffer → no-op, keep panel open
             } else {
                 Some(UserInputResponse {
                     declined: false,
                     selected: vec![],
                     text: Some(panel.text.clone()),
+                    images: panel.images.clone(),
                 })
             }
         }
@@ -16235,6 +19398,27 @@ fn handle_user_input_key(
     if app.state.user_input_batch.is_some() {
         return handle_user_input_batch_key(app, ctx, renderer, code, modifiers);
     }
+    if code == KeyCode::Enter {
+        if let Some(command) = user_input_text(&app.state).map(str::trim) {
+            if command == "/paste" || paste_command_image_path(command).is_some() {
+                let image = paste_command_image_path(command)
+                    .and_then(try_attach_image_from_path)
+                    .or_else(|| {
+                        (command == "/paste")
+                            .then(try_paste_clipboard_image)
+                            .flatten()
+                    });
+                if !attach_image_to_user_input(app, ctx, renderer, image)? {
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::CmdPasteNoImage).into_owned(),
+                    ));
+                    renderer.flush();
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                }
+                return Ok(());
+            }
+        }
+    }
     let Some(panel) = app.state.user_input_panel.as_ref() else {
         return Ok(());
     };
@@ -16284,13 +19468,66 @@ fn handle_user_input_key(
     match (mode, code) {
         (UserInputMode::Text, KeyCode::Char(c)) => {
             if let Some(p) = app.state.user_input_panel.as_mut() {
-                p.text.push(c);
+                p.insert_text_char(c);
             }
         }
         (UserInputMode::Text, KeyCode::Backspace) => {
             if let Some(p) = app.state.user_input_panel.as_mut() {
-                p.text.pop();
+                p.backspace_text();
             }
+        }
+        (UserInputMode::Text, KeyCode::Left) => {
+            app.state
+                .user_input_panel
+                .as_mut()
+                .unwrap()
+                .move_text_cursor_left();
+        }
+        (UserInputMode::Text, KeyCode::Right) => {
+            app.state
+                .user_input_panel
+                .as_mut()
+                .unwrap()
+                .move_text_cursor_right();
+        }
+        (_, KeyCode::Home) => {
+            app.state
+                .user_input_panel
+                .as_mut()
+                .unwrap()
+                .move_active_cursor_home();
+        }
+        (_, KeyCode::End) => {
+            app.state
+                .user_input_panel
+                .as_mut()
+                .unwrap()
+                .move_active_cursor_end();
+        }
+        (_, KeyCode::Delete) => {
+            app.state
+                .user_input_panel
+                .as_mut()
+                .unwrap()
+                .delete_active_cursor();
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Left)
+            if app.state.user_input_panel.as_ref().unwrap().is_other_row() =>
+        {
+            app.state
+                .user_input_panel
+                .as_mut()
+                .unwrap()
+                .move_custom_cursor_left();
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Right)
+            if app.state.user_input_panel.as_ref().unwrap().is_other_row() =>
+        {
+            app.state
+                .user_input_panel
+                .as_mut()
+                .unwrap()
+                .move_custom_cursor_right();
         }
         (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Up) => {
             if let Some(p) = app.state.user_input_panel.as_mut() {
@@ -16472,12 +19709,7 @@ fn handle_policy_intervention_key(
                     // Recovery acknowledgement is driver-owned. Never turn it into
                     // model input: the prior transcript may contain credential-like
                     // material that a fresh model turn could reconstruct or repeat.
-                    request_policy_intervention_resolution(
-                        &mut app.state,
-                        ctx,
-                        renderer,
-                        action,
-                    );
+                    request_policy_intervention_resolution(&mut app.state, ctx, renderer, action);
                 }
                 Some(PolicyRecoveryAction::EndTask) | None => {
                     request_policy_intervention_resolution(
@@ -16604,6 +19836,27 @@ fn handle_user_input_batch_key(
 ) -> Result<()> {
     use atomcode_capabilities::tools::request_user_input::{UserInputMode, UserInputResponse};
     use crossterm::event::KeyModifiers;
+    if code == KeyCode::Enter {
+        if let Some(command) = user_input_text(&app.state).map(str::trim) {
+            if command == "/paste" || paste_command_image_path(command).is_some() {
+                let image = paste_command_image_path(command)
+                    .and_then(try_attach_image_from_path)
+                    .or_else(|| {
+                        (command == "/paste")
+                            .then(try_paste_clipboard_image)
+                            .flatten()
+                    });
+                if !attach_image_to_user_input(app, ctx, renderer, image)? {
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::CmdPasteNoImage).into_owned(),
+                    ));
+                    renderer.flush();
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                }
+                return Ok(());
+            }
+        }
+    }
     let Some(batch) = app.state.user_input_batch.as_ref() else {
         return Ok(());
     };
@@ -16691,14 +19944,35 @@ fn handle_user_input_batch_key(
 
     match (mode, code) {
         (UserInputMode::Text, KeyCode::Char(c)) => {
-            app.state.user_input_batch.as_mut().unwrap().questions[cur]
-                .text
-                .push(c);
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].insert_text_char(c);
         }
         (UserInputMode::Text, KeyCode::Backspace) => {
-            app.state.user_input_batch.as_mut().unwrap().questions[cur]
-                .text
-                .pop();
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].backspace_text();
+        }
+        (UserInputMode::Text, KeyCode::Left) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].move_text_cursor_left();
+        }
+        (UserInputMode::Text, KeyCode::Right) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].move_text_cursor_right();
+        }
+        (_, KeyCode::Home) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].move_active_cursor_home();
+        }
+        (_, KeyCode::End) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].move_active_cursor_end();
+        }
+        (_, KeyCode::Delete) => {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].delete_active_cursor();
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Left)
+            if app.state.user_input_batch.as_ref().unwrap().questions[cur].is_other_row() =>
+        {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].move_custom_cursor_left();
+        }
+        (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Right)
+            if app.state.user_input_batch.as_ref().unwrap().questions[cur].is_other_row() =>
+        {
+            app.state.user_input_batch.as_mut().unwrap().questions[cur].move_custom_cursor_right();
         }
         (UserInputMode::Single | UserInputMode::Multiple, KeyCode::Up) => {
             app.state.user_input_batch.as_mut().unwrap().questions[cur].move_up();
@@ -17925,13 +21199,71 @@ fn ephemeral_tool_activity<'a>(tool_display: Option<&str>, chunk: &'a str) -> Op
 }
 
 fn todo_panel_is_active(state: &crate::state::UiState) -> bool {
-    effective_todo_progress(state)
-        .is_some_and(|todo| todo.total > 0 && todo.completed < todo.total)
+    effective_todo_progress(state).is_some_and(|todo| todo.total > 0 && todo.completed < todo.total)
 }
 
-fn effective_todo_progress(
-    state: &crate::state::UiState,
-) -> Option<&crate::render::TodoProgress> {
+fn team_action(args: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(args)
+        .ok()?
+        .get("action")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn projected_team_action(tool_name: &str, args: &str, plain: bool) -> Option<String> {
+    (!plain && tool_name == "team")
+        .then(|| team_action(args))
+        .flatten()
+}
+
+/// Interactive TUI already projects successful Team state through the dedicated
+/// agent panel. Keep only lifecycle actions that benefit from a permanent,
+/// compact acknowledgement; polling/result calls are panel-only. The complete
+/// JSON remains in the kernel conversation and in plain/headless renderers.
+fn team_success_notice(action: &str, output: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(output).ok()?;
+    let run_id = value.get("run_id")?.as_str()?;
+    match action {
+        "delegate" => Some(format!("  ○ Team dispatched · {run_id}\n")),
+        "stop" => Some(format!("  ○ Team stopped · {run_id}\n")),
+        "result" => {
+            let members = value.get("members")?.as_array()?;
+            let mut lines = vec![format!("  Team results · {run_id}")];
+            for member in members {
+                let id = member
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("agent");
+                let status = member
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                let result = member.get("result").and_then(|value| value.as_str());
+                let result = result
+                    .map(|text| crate::width::truncate_with_ellipsis(&summarise(text), 500))
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or_else(|| "no report".into());
+                lines.push(format!("  └ {id} · {status} · {result}"));
+            }
+            lines.push(String::new());
+            Some(lines.join("\n"))
+        }
+        "status" | "wait" => None,
+        _ => None,
+    }
+}
+
+fn team_batch_result_suffix(action: &str, output: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(output).ok()?;
+    match action {
+        "delegate" => Some(format!("dispatched · {}", value.get("run_id")?.as_str()?)),
+        "stop" => Some(format!("stopped · {}", value.get("run_id")?.as_str()?)),
+        "status" | "wait" | "result" => Some("updated".into()),
+        _ => None,
+    }
+}
+
+fn effective_todo_progress(state: &crate::state::UiState) -> Option<&crate::render::TodoProgress> {
     state
         .pending_todo_preview
         .as_ref()
@@ -18103,7 +21435,9 @@ fn update_subtask_progress(
 }
 
 fn task_call_id_from_team_run(run_id: &str) -> Option<&str> {
-    run_id.strip_prefix("task:").filter(|call_id| !call_id.is_empty())
+    run_id
+        .strip_prefix("task:")
+        .filter(|call_id| !call_id.is_empty())
 }
 
 fn correlate_task_team_progress(
@@ -18164,8 +21498,9 @@ fn completed_task_detail(
 #[cfg(test)]
 mod subtask_progress_projection_tests {
     use super::{
-        completed_task_detail, correlate_task_team_progress, should_defer_task_approval_row,
-        subtask_progress_from_args, task_call_id_from_team_run, update_subtask_progress,
+        completed_task_detail, correlate_task_team_progress, projected_team_action,
+        should_defer_task_approval_row, subtask_progress_from_args, task_call_id_from_team_run,
+        team_action, team_batch_result_suffix, team_success_notice, update_subtask_progress,
     };
     use crate::render::SubtaskStatus;
 
@@ -18362,6 +21697,58 @@ mod subtask_progress_projection_tests {
         assert_eq!(
             state.active_subtasks.as_ref().map(|p| p.call_id.as_str()),
             Some("call-task-10")
+        );
+    }
+
+    #[test]
+    fn team_tool_success_is_compact_for_interactive_projection() {
+        assert_eq!(
+            team_action(r#"{"action":"delegate","tasks":[]}"#),
+            Some("delegate".into())
+        );
+        assert_eq!(
+            team_success_notice("delegate", r#"{"run_id":"team-2-2","status":"running"}"#),
+            Some("  ○ Team dispatched · team-2-2\n".into())
+        );
+        assert_eq!(
+            team_success_notice("stop", r#"{"run_id":"team-2-2","status":"stopped"}"#),
+            Some("  ○ Team stopped · team-2-2\n".into())
+        );
+        assert_eq!(
+            team_success_notice("wait", r#"{"run_id":"team-2-2","terminal":false}"#),
+            None
+        );
+        let result = team_success_notice(
+            "result",
+            r#"{"run_id":"team-2-2","members":[{"id":"reviewer#1","status":"completed","result":"Found one race"},{"id":"tester#2","status":"failed","result":null}]}"#,
+        )
+        .unwrap();
+        assert!(result.contains("Team results · team-2-2"), "{result}");
+        assert!(
+            result.contains("reviewer#1 · completed · Found one race"),
+            "{result}"
+        );
+        assert!(result.contains("tester#2 · failed · no report"), "{result}");
+        assert_eq!(team_success_notice("delegate", "not json"), None);
+        assert_eq!(
+            projected_team_action("team", r#"{"action":"wait"}"#, false),
+            Some("wait".into())
+        );
+        assert_eq!(
+            projected_team_action("team", r#"{"action":"wait"}"#, true),
+            None
+        );
+        assert_eq!(
+            projected_team_action("bash", r#"{"action":"wait"}"#, false),
+            None
+        );
+        assert_eq!(
+            team_batch_result_suffix("delegate", r#"{"run_id":"team-2-2","status":"running"}"#),
+            Some("dispatched · team-2-2".into())
+        );
+        assert_eq!(
+            team_batch_result_suffix("result", r#"{"run_id":"team-2-2"}"#),
+            Some("updated".into())
         );
     }
 
@@ -18696,6 +22083,15 @@ fn project_kernel_event(
             snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
         }),
         Kernel::Warning(message) => Some(AgentEvent::Warning(message)),
+        Kernel::StreamRecovery {
+            attempt,
+            max_attempts,
+            recovered,
+        } => Some(AgentEvent::StreamRecovery {
+            attempt,
+            max_attempts,
+            recovered,
+        }),
         Kernel::RateLimited {
             reset_at_display,
             reset_label,
@@ -18709,7 +22105,11 @@ fn project_kernel_event(
             auto_resuming,
             server_message,
         }),
-        Kernel::Steered { count, inputs } => Some(AgentEvent::Steered { count, inputs }),
+        // Runtime-owned preprocessing can rewrite an accepted steer before it
+        // reaches the kernel. The raw kernel event remains authoritative for
+        // conversation observers; TUI correlation is driven separately by
+        // `CodingRuntimeEvent::SteerAcknowledged` with the submitted payload.
+        Kernel::Steered { .. } => None,
         Kernel::Cancelled
         | Kernel::Request { .. }
         | Kernel::Snapshot { .. }
@@ -18946,8 +22346,9 @@ fn install_pending_session_picker(app: &mut App, ctx: &mut LoopCtx, renderer: &m
             renderer.flush();
         }
         Ok(sessions) => {
-            let picker: Box<dyn crate::modals::Modal> =
-                Box::new(crate::modals::SessionPicker::open(sessions));
+            let picker = crate::modals::SessionPicker::open(sessions);
+            picker.begin_preview(ctx);
+            let picker: Box<dyn crate::modals::Modal> = Box::new(picker);
             picker.draw(&app.buf, &app.state, ctx, renderer);
             app.active_modal = Some(picker);
         }
@@ -19027,8 +22428,11 @@ fn handle_runtime_event(
 ) {
     match event {
         bg_runtime::RuntimeEventPayload::SequencedNative(envelope) => {
-            let is_provider_changed =
-                matches!(&envelope.event, CodingRuntimeEvent::ProviderChanged { .. });
+            let is_provider_changed = matches!(
+                &envelope.event,
+                CodingRuntimeEvent::ProviderChanged { .. }
+                    | CodingRuntimeEvent::ReasoningEffortChanged { .. }
+            );
             let current_generation = ctx.runtime.current_generation();
             if !sequenced_event_matches_provider_generation(
                 is_provider_changed,
@@ -19055,6 +22459,15 @@ fn handle_runtime_event(
                 {
                     renderer.flush();
                 }
+                return;
+            }
+            if let CodingRuntimeEvent::ReasoningEffortChanged {
+                provider,
+                effort,
+                applicable,
+            } = &envelope.event
+            {
+                apply_reasoning_effort_projection(ctx, provider, *effort, *applicable);
                 return;
             }
             handle_runtime_event(
@@ -19085,6 +22498,30 @@ fn handle_runtime_event(
                 ctx.pending_runtime_request_id = Some(request.id);
             }
             match event {
+                CodingRuntimeEvent::SteerAcknowledged { inputs } => {
+                    let inputs = inputs
+                        .into_iter()
+                        .map(|input| atomcode_kernel::event::SteeredInput {
+                            text: input.text,
+                            images: input.images,
+                        })
+                        .collect::<Vec<_>>();
+                    handle_agent_event(
+                        AgentEvent::Steered {
+                            count: inputs.len(),
+                            inputs,
+                        },
+                        state,
+                        think,
+                        renderer,
+                        pending_tools,
+                        ctx,
+                        setup_pending,
+                        reasoning_buffer,
+                        buf,
+                    );
+                    return;
+                }
                 CodingRuntimeEvent::Team { generation, event } => {
                     let run_id = event.run_id.to_string();
                     // A new run started THIS turn → the completion banner should say
@@ -19650,6 +23087,10 @@ fn handle_runtime_event(
                 CodingRuntimeEvent::SnapshotRestoreFinished { .. } => return,
                 CodingRuntimeEvent::SessionResumeFinished(result) => {
                     match result {
+                        Err(atomcode_coding::RuntimeError::Cancelled) => {
+                            ctx.pending_session_resume = None;
+                            commands::request_session_catalog(ctx, renderer);
+                        }
                         Err(error) => {
                             ctx.pending_session_resume = None;
                             let message = error.to_string();
@@ -19711,6 +23152,14 @@ fn handle_runtime_event(
                             renderer.flush();
                         }
                     }
+                    return;
+                }
+                CodingRuntimeEvent::ReasoningEffortChanged {
+                    provider,
+                    effort,
+                    applicable,
+                } => {
+                    apply_reasoning_effort_projection(ctx, &provider, effort, applicable);
                     return;
                 }
                 CodingRuntimeEvent::ProviderReloadFinished(Err(error)) => {
@@ -19809,9 +23258,12 @@ fn handle_runtime_event(
                         match expected_persisted_revision.as_ref() {
                             Some(_) => match ctx.config_store.read() {
                                 Ok(snapshot) => (Some(snapshot.revision), None),
-                                Err(error) => (None, Some(format!(
-                                "runtime reloaded, but the active config revision could not be verified: {error}"
-                                ))),
+                                Err(error) => (
+                                    None,
+                                    Some(format!(
+                                        "runtime reloaded, but the active config revision could not be verified: {error}"
+                                    )),
+                                ),
                             },
                             None => (None, None),
                         };
@@ -19851,6 +23303,11 @@ fn handle_runtime_event(
                         provider.clone(),
                         model.clone(),
                     );
+                    if let Err(error) =
+                        publish_live_provider_reload_success(ctx, provider.clone(), model.clone())
+                    {
+                        renderer.render(UiLine::Error(error));
+                    }
                     if ctx
                         .pending_provider_projection
                         .as_ref()
@@ -19973,6 +23430,7 @@ fn handle_runtime_event(
         }
         bg_runtime::RuntimeEventPayload::Driver(
             bg_runtime::DriverEvent::SessionResumePrepared {
+                operation_id,
                 project_bucket,
                 session_id,
                 working_dir,
@@ -19980,6 +23438,7 @@ fn handle_runtime_event(
             },
         ) => {
             let expected = PendingSessionResumePreparation {
+                operation_id,
                 project_bucket,
                 session_id,
                 working_dir,
@@ -20028,10 +23487,12 @@ fn handle_runtime_event(
                     return;
                 }
             };
+            let cancel = tokio_util::sync::CancellationToken::new();
             if let Err(error) = ctx.runtime.resume_session(
                 session.id.clone(),
                 expected.working_dir.clone(),
                 prepared.lease,
+                cancel.clone(),
                 ctx.foreground_runtime_id,
                 ctx.runtime_event_tx.clone(),
             ) {
@@ -20048,6 +23509,8 @@ fn handle_runtime_event(
                 session,
                 working_dir: expected.working_dir,
                 committed: None,
+                cancel,
+                cancel_requested: false,
             });
         }
         bg_runtime::RuntimeEventPayload::Driver(
@@ -20060,6 +23523,13 @@ fn handle_runtime_event(
             // `active_modal`). Carry `working_dir` so install can re-validate — it
             // may be deferred behind a modal past a later dir change.
             ctx.pending_session_picker = Some((working_dir, result));
+        }
+        bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionPreviewLoaded { selection, result },
+        ) => {
+            if session_preview_result_matches(ctx.session_preview_selection.as_ref(), &selection) {
+                ctx.session_preview_result = Some(result);
+            }
         }
         bg_runtime::RuntimeEventPayload::Driver(
             bg_runtime::DriverEvent::SessionTransitionFinished { operation, result },
@@ -20131,6 +23601,123 @@ fn handle_runtime_event(
     }
 }
 
+fn session_preview_result_matches(
+    current: Option<&crate::session::SessionPreviewSelection>,
+    incoming: &crate::session::SessionPreviewSelection,
+) -> bool {
+    current == Some(incoming)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeEventRenderEffect {
+    Other,
+    SessionPreviewInstalled,
+    SessionPreviewIgnored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeEventRedrawPolicy {
+    Default,
+    ActiveModal,
+    None,
+}
+
+fn runtime_event_render_effect(
+    current: Option<&crate::session::SessionPreviewSelection>,
+    event: &bg_runtime::RuntimeEventPayload,
+) -> RuntimeEventRenderEffect {
+    match event {
+        bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionPreviewLoaded { selection, .. },
+        ) if session_preview_result_matches(current, selection) => {
+            RuntimeEventRenderEffect::SessionPreviewInstalled
+        }
+        bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionPreviewLoaded { .. },
+        ) => RuntimeEventRenderEffect::SessionPreviewIgnored,
+        _ => RuntimeEventRenderEffect::Other,
+    }
+}
+
+fn runtime_event_redraw_policy(
+    effect: RuntimeEventRenderEffect,
+    active_modal_accepts_preview: bool,
+) -> RuntimeEventRedrawPolicy {
+    match (effect, active_modal_accepts_preview) {
+        (RuntimeEventRenderEffect::SessionPreviewInstalled, true) => {
+            RuntimeEventRedrawPolicy::ActiveModal
+        }
+        (RuntimeEventRenderEffect::SessionPreviewInstalled, false)
+        | (RuntimeEventRenderEffect::SessionPreviewIgnored, _) => RuntimeEventRedrawPolicy::None,
+        (RuntimeEventRenderEffect::Other, _) => RuntimeEventRedrawPolicy::Default,
+    }
+}
+
+#[cfg(test)]
+mod session_preview_generation_tests {
+    use super::*;
+
+    fn selection(id: &str, generation: u64) -> crate::session::SessionPreviewSelection {
+        crate::session::SessionPreviewSelection {
+            project_bucket: "0123456789abcdef".into(),
+            session_id: id.into(),
+            generation,
+        }
+    }
+
+    #[test]
+    fn preview_result_requires_the_current_bucket_id_and_generation() {
+        let current = selection("selected", 7);
+        assert!(session_preview_result_matches(Some(&current), &current));
+        assert!(!session_preview_result_matches(
+            Some(&current),
+            &selection("selected", 6),
+        ));
+        assert!(!session_preview_result_matches(
+            Some(&current),
+            &selection("other", 7),
+        ));
+        assert!(!session_preview_result_matches(None, &current));
+    }
+
+    #[test]
+    fn preview_runtime_event_redraws_only_the_current_session_picker() {
+        let current = selection("selected", 7);
+        let exact = bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionPreviewLoaded {
+                selection: current.clone(),
+                result: Ok(None),
+            },
+        );
+        let stale = bg_runtime::RuntimeEventPayload::Driver(
+            bg_runtime::DriverEvent::SessionPreviewLoaded {
+                selection: selection("selected", 6),
+                result: Ok(None),
+            },
+        );
+        assert_eq!(
+            runtime_event_render_effect(Some(&current), &exact),
+            RuntimeEventRenderEffect::SessionPreviewInstalled,
+        );
+        assert_eq!(
+            runtime_event_render_effect(Some(&current), &stale),
+            RuntimeEventRenderEffect::SessionPreviewIgnored,
+        );
+        assert_eq!(
+            runtime_event_redraw_policy(RuntimeEventRenderEffect::SessionPreviewInstalled, true),
+            RuntimeEventRedrawPolicy::ActiveModal,
+        );
+        assert_eq!(
+            runtime_event_redraw_policy(RuntimeEventRenderEffect::SessionPreviewIgnored, true),
+            RuntimeEventRedrawPolicy::None,
+        );
+        assert_eq!(
+            runtime_event_redraw_policy(RuntimeEventRenderEffect::SessionPreviewInstalled, false),
+            RuntimeEventRedrawPolicy::None,
+        );
+    }
+}
+
 /// Close the local presentation only for an authoritative failure terminal
 /// that cannot be projected as a normal `TurnComplete` (missing snapshot or a
 /// runtime stop that violated the turn-terminal contract).
@@ -20175,6 +23762,30 @@ fn publish_live_runtime_event(
     match result {
         Ok(()) | Err(atomcode_daemon::live_hub::HubError::StaleEvent) => Ok(()),
         Err(error) => Err(format!("Live event synchronization failed: {error:?}")),
+    }
+}
+
+/// Publish the provider selected by a successfully committed `/model` reload.
+///
+/// The runtime emits `ProviderChanged` asynchronously, while the TUI receives
+/// the reload terminal through a separate channel.  Publishing at the terminal
+/// makes the successful state observable even when the asynchronous event is
+/// consumed by a deferred-runtime path.  LiveHub de-duplicates an identical
+/// projection, so this is safe when the runtime event was already forwarded.
+fn publish_live_provider_reload_success(
+    ctx: &LoopCtx,
+    provider: String,
+    model: String,
+) -> Result<(), String> {
+    let Some(binding) = &ctx.live_binding else {
+        return Ok(());
+    };
+    match atomcode_daemon::native_live::publish_unsequenced(
+        binding,
+        CodingRuntimeEvent::ProviderChanged { provider, model },
+    ) {
+        Ok(()) | Err(atomcode_daemon::live_hub::HubError::StaleEvent) => Ok(()),
+        Err(error) => Err(format!("Live provider synchronization failed: {error:?}")),
     }
 }
 
@@ -20317,7 +23928,7 @@ fn apply_native_session_changed(
         Ok(None) => {
             return Err(format!(
                 "Session {session_id} disappeared after runtime switch"
-            ))
+            ));
         }
         Err(error) => return Err(format!("Failed to resolve session {session_id}: {error}")),
     };
@@ -20369,6 +23980,11 @@ fn commit_native_session_changed(
     state.completion_tokens = 0;
     state.cached_tokens = 0;
     state.last_context = None;
+    // Session history can outlive the model that produced it. Establish the
+    // current runtime/model window before replay restores persisted usage, so
+    // switching to an old DeepSeek session while GLM is active cannot put the
+    // stale 1M denominator back into the footer.
+    state.on_model_window_changed(ctx.config.default_context_window());
     state.pending_context_render = None;
     state.thinking_idx = 0;
     state.on_turn_complete();
@@ -20415,11 +24031,65 @@ pub(crate) fn commit_working_dir_projection(ctx: &mut LoopCtx, working_dir: Path
     let Some(working_dir) = planned_runtime_working_dir(&ctx.working_dir, &working_dir) else {
         return;
     };
+    retry_deferred_history_saves(&mut ctx.deferred_histories);
+    let paths = crate::platform::project_history_paths(&working_dir);
+    let next_history = take_or_load_project_history(&mut ctx.deferred_histories, paths);
+    let previous_history = std::mem::replace(&mut ctx.history, next_history);
+    let history_save_error = save_or_defer_history(previous_history, &mut ctx.deferred_histories);
+    ctx.history_rebound = true;
+    if let Some(error) = history_save_error {
+        crate::tuix_trace!(
+            "HISTORY",
+            "stage=working_dir_rebind old={} new={} save_error={error}",
+            ctx.working_dir.display(),
+            working_dir.display()
+        );
+    }
     ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, working_dir.clone()));
     ctx.file_index.reset(working_dir.clone());
     commands::push_recent_dir(&mut ctx.recent_dirs, working_dir.clone());
     commands::save_recent_dirs(&ctx.recent_dirs);
     atomcode_daemon::live_set_working_dir(working_dir);
+}
+
+fn take_or_load_project_history(
+    deferred: &mut Vec<History>,
+    paths: crate::platform::ProjectHistoryPaths,
+) -> History {
+    if let Some(index) = deferred
+        .iter()
+        .position(|history| history.storage_path() == paths.entries)
+    {
+        deferred.remove(index)
+    } else {
+        History::load_project(paths)
+    }
+}
+
+fn save_or_defer_history(
+    mut history: History,
+    deferred: &mut Vec<History>,
+) -> Option<std::io::Error> {
+    match history.save() {
+        Ok(()) => None,
+        Err(error) => {
+            deferred.push(history);
+            Some(error)
+        }
+    }
+}
+
+fn retry_deferred_history_saves(deferred: &mut Vec<History>) {
+    deferred.retain_mut(|history| history.save().is_err());
+}
+
+fn save_all_histories(ctx: &mut LoopCtx) {
+    let active = std::mem::replace(
+        &mut ctx.history,
+        History::load_project(crate::platform::project_history_paths(&ctx.working_dir)),
+    );
+    let _ = save_or_defer_history(active, &mut ctx.deferred_histories);
+    retry_deferred_history_saves(&mut ctx.deferred_histories);
 }
 
 fn planned_runtime_working_dir(
@@ -20432,7 +24102,9 @@ fn planned_runtime_working_dir(
 
 #[cfg(test)]
 mod working_dir_projection_tests {
-    use super::planned_runtime_working_dir;
+    use super::{planned_runtime_working_dir, retry_deferred_history_saves, save_or_defer_history};
+    use crate::input::history::{History, HistoryEntry};
+    use crate::platform::ProjectHistoryPaths;
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -20445,6 +24117,38 @@ mod working_dir_projection_tests {
             planned_runtime_working_dir(Path::new("/same"), Path::new("/same")),
             None
         );
+    }
+
+    #[test]
+    fn failed_project_history_save_is_retained_and_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, "not a directory").unwrap();
+        let paths = ProjectHistoryPaths {
+            entries: blocked.join("entries.jsonl"),
+            lock: blocked.join("write.lock"),
+            image_cache: blocked.join("images"),
+            legacy_entries: dir.path().join("history"),
+            legacy_image_cache: dir.path().join("image-cache"),
+        };
+        let mut history = History::load_project(paths.clone());
+        history.push(HistoryEntry {
+            text: "must survive".into(),
+            images: Vec::new(),
+            pastes: Vec::new(),
+        });
+        let mut deferred = Vec::new();
+
+        assert!(save_or_defer_history(history, &mut deferred).is_some());
+        assert_eq!(deferred.len(), 1);
+
+        std::fs::remove_file(&blocked).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        retry_deferred_history_saves(&mut deferred);
+
+        assert!(deferred.is_empty());
+        let reloaded = History::load_project(paths);
+        assert_eq!(reloaded.entries().last().unwrap().text, "must survive");
     }
 }
 
@@ -21253,6 +24957,7 @@ fn handle_agent_event(
             let detail = format_tool_detail(&name, &arguments);
             let detail = enrich_todo_detail(&name, &arguments, &detail, &state.todo_titles);
             let display = display_tool_name(&name);
+            let projected_team = projected_team_action(&name, &arguments, ctx.is_plain_renderer);
 
             // The merged `todowrite` carries EITHER the full-list PLAN shape (`{todos:[…]}`) or
             // the incremental `{action}` shape; a resumed session may also carry legacy `todo`
@@ -21301,9 +25006,12 @@ fn handle_agent_event(
             // carries the disambiguated detail — don't overwrite with
             // the raw basename (issue #439).
             if state.call_id_to_batch.contains_key(&id) {
-                pending_tools
+                let entry = pending_tools
                     .entry(id)
                     .or_insert((display.clone(), detail, true));
+                if let Some(action) = projected_team {
+                    entry.1 = action;
+                }
                 state.on_tool_call_started(&display);
                 return;
             }
@@ -21315,7 +25023,7 @@ fn handle_agent_event(
             // ToolCallInFlight row would duplicate the tool line.
             if let Some((stored_display, stored_detail, true)) = pending_tools.get_mut(&id) {
                 *stored_display = display.clone();
-                *stored_detail = detail.clone();
+                *stored_detail = projected_team.unwrap_or_else(|| detail.clone());
                 state.on_tool_call_started(&display);
                 return;
             }
@@ -21327,6 +25035,16 @@ fn handle_agent_event(
             if todo_plan.is_some() {
                 // call_rendered=true ⇒ ToolCallResult suppresses the result row.
                 pending_tools.insert(id, (display.clone(), detail, true));
+                state.on_tool_call_started(&display);
+                return;
+            }
+
+            // Team has its own structured live projection. In the interactive
+            // renderer, keep the action only as correlation metadata and avoid
+            // painting a generic `Team` tool row whose JSON result would repeat
+            // the dedicated panel. Plain/headless output remains unchanged.
+            if let Some(action) = projected_team {
+                pending_tools.insert(id, (display.clone(), action, false));
                 state.on_tool_call_started(&display);
                 return;
             }
@@ -21467,9 +25185,7 @@ fn handle_agent_event(
                         progress.completed = progress
                             .items
                             .iter()
-                            .filter(|item| {
-                                item.status == crate::render::SubtaskStatus::Completed
-                            })
+                            .filter(|item| item.status == crate::render::SubtaskStatus::Completed)
                             .count();
                         renderer.render(UiLine::AgentGroup {
                             progress,
@@ -21528,8 +25244,20 @@ fn handle_agent_event(
                 let web_sources = (name == "web_search" && success)
                     .then(|| web_search_result_suffix(&output))
                     .flatten();
+                let team_action = (name == "team" && !ctx.is_plain_renderer)
+                    .then(|| {
+                        pending_tools
+                            .get(&call_id)
+                            .map(|(_, detail, _)| detail.clone())
+                    })
+                    .flatten();
                 let suffix = if !success {
                     format!(" {} \u{2717}", arrow)
+                } else if let Some(team) = team_action
+                    .as_deref()
+                    .and_then(|action| team_batch_result_suffix(action, &output))
+                {
+                    format!(" {} {}", arrow, team)
                 } else if let Some(srcs) = web_sources {
                     format!(" {} {}", arrow, srcs)
                 } else {
@@ -21562,6 +25290,32 @@ fn handle_agent_event(
                 // a blank-looking termination with no actionable explanation.
                 if credential_policy_block {
                     render_credential_policy_error(state, renderer);
+                } else if name == "team" && !success {
+                    // The compact batch child still needs an actionable error;
+                    // unlike successful JSON, failures have no structured panel
+                    // equivalent and must remain visible.
+                    renderer.render(UiLine::Error(summarise(&output)));
+                } else if team_action.as_deref() == Some("result") && success {
+                    if let Some(report) = team_success_notice("result", &output) {
+                        renderer.render(UiLine::CommandOutput(report));
+                    }
+                }
+                renderer.flush();
+                return;
+            }
+
+            // Successful Team calls are already represented by the structured
+            // Team projection. Replace raw JSON with at most one short lifecycle
+            // acknowledgement. Failures deliberately fall through to the normal
+            // red error path, and plain/headless renderers keep the full payload.
+            if name == "team" && success && !ctx.is_plain_renderer {
+                let action = pending_tools
+                    .remove(&call_id)
+                    .map(|(_, detail, _)| detail)
+                    .unwrap_or_default();
+                if let Some(notice) = team_success_notice(&action, &output) {
+                    renderer.render(UiLine::AssistantLineBreak);
+                    renderer.render(UiLine::CommandOutput(notice));
                 }
                 renderer.flush();
                 return;
@@ -21772,11 +25526,19 @@ fn handle_agent_event(
                 &call.arguments,
                 ctx.is_plain_renderer,
             );
+            let projected_team =
+                projected_team_action(&tool_name, &call.arguments, ctx.is_plain_renderer);
 
             // Check if ToolCallStarted already rendered this tool call as a
             // dynamic ToolCallInFlight spinner. If so, we need to freeze it
             // to a static `▸` row before showing the approval prompt.
-            if defer_task_row {
+            if let Some(action) = projected_team {
+                // The approval panel itself names the risky Team delegation.
+                // Defer its transcript row exactly like Task: once approved,
+                // structured Team events own the visual lifecycle; if denied,
+                // the normal failed ToolResult still renders the reason.
+                pending_tools.insert(call.id.clone(), (display.clone(), action, false));
+            } else if defer_task_row {
                 // The approval panel already names the Task being approved.
                 // Keep its transcript row deferred so ToolCallResult can append
                 // exactly one permanent `Task(... completed · duration)` row.
@@ -21807,12 +25569,20 @@ fn handle_agent_event(
                 pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), true));
             }
 
+            // Warn when the command about to be approved would trip the credential
+            // guard: allowing it may forward secrets/sensitive content to the provider.
+            let note = (call.name == "bash"
+                && atomcode_capabilities::tools::bash_command_may_expose_credentials(
+                    &call.arguments,
+                ))
+            .then(|| crate::i18n::t(crate::i18n::Msg::CredentialApprovalNote).into_owned());
             state.approval_panel = Some(crate::state::ApprovalPanel {
                 tool: display.clone(),
                 detail: detail.clone(),
                 options: build_approval_options(&display),
                 selected: 0,
                 cache_key,
+                note,
             });
             renderer.flush();
             atomcode_capabilities::notify::notify(
@@ -22194,6 +25964,27 @@ fn handle_agent_event(
             renderer.render(UiLine::Warning(w));
             renderer.flush();
         }
+        AgentEvent::StreamRecovery {
+            attempt,
+            max_attempts,
+            recovered,
+        } => {
+            if recovered {
+                state.spinner_label = state.current_thinking().to_string();
+                renderer.render(UiLine::Muted(
+                    crate::i18n::t(crate::i18n::Msg::StreamRecoverySucceeded).into_owned(),
+                ));
+            } else {
+                state.spinner_label = crate::i18n::t(crate::i18n::Msg::StreamRecoveryRunning {
+                    attempt,
+                    max_attempts,
+                })
+                .into_owned();
+            }
+            // Keep the running state transient in the existing streaming row;
+            // only the recovered marker enters scrollback.
+            renderer.flush();
+        }
         AgentEvent::HookWarningHint(msg) => {
             if let Ok(mut slot) = ctx.hook_warning_hint.lock() {
                 *slot = Some(msg);
@@ -22227,8 +26018,7 @@ fn handle_agent_event(
             // user sees blank space where their text should be (bug report:
             // "多张图片发送后丢失文字，只保留了最后一张").
             if let Some(restore) = state.last_submitted_message.take() {
-                buf.text = restore;
-                buf.cursor = buf.text.len();
+                buf.replace_all_text(restore);
             }
             //
             // Hash table is rebuilt as best-effort: we hash the base64
@@ -22243,7 +26033,7 @@ fn handle_agent_event(
                 let mut hasher = DefaultHasher::new();
                 img.data.hash(&mut hasher);
                 let h = hasher.finish();
-                cache_write_image(&crate::platform::image_cache_dir(), &img, h);
+                cache_write_image(ctx.history.cache_dir(), &img, h);
                 state.pending_image_hashes.push(h);
                 state.pending_images.push(img);
                 state.pending_image_markers.push(marker);
@@ -22253,8 +26043,7 @@ fn handle_agent_event(
                 // positions alongside the user's text.
                 let marker_text = format!("[Image #{}]", marker);
                 if !buf.text.contains(&marker_text) {
-                    buf.text.insert_str(buf.cursor, &marker_text);
-                    buf.cursor += marker_text.len();
+                    buf.insert_at_cursor(&marker_text);
                 }
             }
             // Don't redraw — TUI is in Streaming phase here (turn isn't
@@ -22576,15 +26365,13 @@ fn handle_agent_event(
                     (display_tool_name_short(&c.name), detail.clone(), true),
                 );
             }
-            state
-                .active_tool_batches
-                .insert(
-                    batch_id.clone(),
-                    crate::state::ActiveToolBatch {
-                        call_ids,
-                        edit_displays: std::collections::HashMap::new(),
-                    },
-                );
+            state.active_tool_batches.insert(
+                batch_id.clone(),
+                crate::state::ActiveToolBatch {
+                    call_ids,
+                    edit_displays: std::collections::HashMap::new(),
+                },
+            );
             // Anchor the spinner clock to the batch start. The interleaved
             // per-tool events that follow won't reset it (they no-op the reset
             // while a batch is active), so the elapsed-ms ticks steadily instead
@@ -22616,7 +26403,8 @@ fn handle_agent_event(
                 // goal) so the badge reads `round 1 · <fresh time>` — NOT on mid-Pursuing
                 // updates that also carry round==0 (e.g. AdjustGoalRounds), which would
                 // otherwise rewind a fresh goal's clock mid-first-turn.
-                if goal_clock_should_reset(entering_from_pursuing, state.goal_started_at.is_none()) {
+                if goal_clock_should_reset(entering_from_pursuing, state.goal_started_at.is_none())
+                {
                     state.goal_started_at = Some(std::time::Instant::now());
                 }
             } else {
@@ -23776,7 +27564,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         }
         crate::state::AgentMode::Build if state.build_badge_visible => {
             // `⏸ build` — only shown after the user explicitly switches to
-            // Build via Tab/Shift+Tab or `/build`; the default startup stays
+            // Build via Shift+Tab or `/build`; the default startup stays
             // badge-less. Rendered in faint secondary style so it blends
             // into the status row naturally.
             Some(ModeBadge {
@@ -23794,7 +27582,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     // Auto mode badge: a single warning-colored LEFT badge `⏵⏵ auto` (rendered
     // in place of the PLAN badge, since Plan and Auto are mutually exclusive).
     // `--dangerously-skip-permissions` seeds `agent_mode = Auto` at startup, so
-    // keying off the mode covers both the startup flag AND the runtime Tab /
+    // keying off the mode covers both the startup flag AND the runtime Shift+Tab /
     // `/auto` toggle. The `⏵⏵` glyph downgrades to `>>` on non-unicode terminals.
     let bypass_indicator = if matches!(state.agent_mode, crate::state::AgentMode::Auto) {
         Some(if ctx.caps.unicode_symbols {
@@ -23875,6 +27663,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             detail: p.detail.clone(),
             options: p.options.iter().map(|o| o.label.clone()).collect(),
             selected: p.selected,
+            note: p.note.clone(),
         });
     // A pending batch takes precedence over a single panel (mutually exclusive in
     // practice). The view carries the CURRENT question's fields plus batch navigator
@@ -23903,7 +27692,9 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             cursor: p.cursor,
             checked: p.checked.clone(),
             text: p.text.clone(),
+            text_cursor_byte: p.text_cursor_byte,
             custom_text: p.custom_text.clone(),
+            custom_text_cursor_byte: p.custom_text_cursor_byte,
             custom: p.custom,
             scroll_offset: if b.on_submit_stop() {
                 b.submit_scroll_offset
@@ -23933,7 +27724,9 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
                 cursor: p.cursor,
                 checked: p.checked.clone(),
                 text: p.text.clone(),
+                text_cursor_byte: p.text_cursor_byte,
                 custom_text: p.custom_text.clone(),
+                custom_text_cursor_byte: p.custom_text_cursor_byte,
                 custom: p.custom,
                 scroll_offset: p.scroll_offset,
                 batch: None,
@@ -24112,6 +27905,7 @@ fn draw_spinner_now(
     queue_len: usize,
     menu_selected: usize,
 ) {
+    sync_composer_selection(buf, &ctx.interaction_publisher);
     let frame = state.tick_spinner();
     // Same source + applicability gate as the status bar's `[high]`, so the
     // spinner's effort hint and the status line never disagree. (Reading
@@ -25409,21 +29203,67 @@ fn sync_reasoning_effort_from_provider(ctx: &mut LoopCtx) {
         ctx.config
             .provider_config_for_selection(&sel)
             .and_then(|p| p.reasoning_effort)
+            .filter(|effort| !effort.eq_ignore_ascii_case("auto"))
     } else {
         None
     };
+}
+
+fn apply_reasoning_effort_projection(
+    ctx: &mut LoopCtx,
+    provider: &str,
+    effort: Option<atomcode_kernel::provider::ReasoningEffort>,
+    applicable: bool,
+) {
+    project_reasoning_effort(
+        &mut ctx.config,
+        &ctx.provider_selection,
+        &mut ctx.reasoning_effort,
+        provider,
+        effort,
+        applicable,
+    );
+}
+
+fn project_reasoning_effort(
+    config: &mut Config,
+    active_provider: &str,
+    active_effort: &mut Option<String>,
+    provider: &str,
+    effort: Option<atomcode_kernel::provider::ReasoningEffort>,
+    applicable: bool,
+) {
+    let runtime_effort = effort.map(|value| value.as_str().to_string());
+    // Keep `/effort`, Ctrl+T and the footer on one local projection. `auto` is
+    // the config sentinel for a supported endpoint using its API default.
+    let persisted = if applicable {
+        runtime_effort.clone().or_else(|| Some("auto".to_string()))
+    } else {
+        None
+    };
+    config.update_selection_reasoning(provider, |fields| {
+        fields.reasoning_effort.clone_from(&persisted)
+    });
+    if active_provider == provider {
+        *active_effort = runtime_effort;
+    }
 }
 
 /// Persist the current reasoning_effort to config.toml
 fn persist_reasoning_effort(ctx: &mut LoopCtx) {
     let selection = ctx.config.effective_model_selection().unwrap_or_default();
     let effort = ctx.reasoning_effort.clone();
+    // Preserve capability when cycling back to API default. `None` in the
+    // persisted model means unsupported; `auto` means supported but omitted.
+    let persisted_effort = effort.clone().or_else(|| Some("auto".to_string()));
     // Schema-aware write (new-schema `[models.*]` or legacy `[providers.*]`).
-    ctx.config
-        .update_selection_reasoning(&selection, |r| *r.reasoning_effort = effort.clone());
+    ctx.config.update_selection_reasoning(&selection, |r| {
+        *r.reasoning_effort = persisted_effort.clone()
+    });
     match ctx.config_store.update(|config| {
-        if !config.update_selection_reasoning(&selection, |r| *r.reasoning_effort = effort.clone())
-        {
+        if !config.update_selection_reasoning(&selection, |r| {
+            *r.reasoning_effort = persisted_effort.clone()
+        }) {
             anyhow::bail!("provider {selection:?} not found");
         }
         Ok(())
@@ -25433,17 +29273,43 @@ fn persist_reasoning_effort(ctx: &mut LoopCtx) {
     }
 }
 
+/// Whether the current selection exposes a reasoning-effort control. Mirrors the
+/// daemon's `models_from_config` derivation EXACTLY (an explicitly configured
+/// value declares the capability, plus the one built-in CodingPlan DeepSeek V4
+/// Flash fallback) so the TUI `/effort`, the webui selector, and the wire gate
+/// never disagree. Deliberately NOT gated on `provider_type`: the old
+/// `{deepseek, openai}` restriction hid the control in the TUI for any other
+/// endpoint the user had explicitly configured with an effort, while the webui
+/// still showed it.
+fn effort_applicable(reasoning_effort: Option<&str>, selection: &str, model: &str) -> bool {
+    reasoning_effort.is_some()
+        || (atomcode_config::config::is_codingplan_provider_name(selection)
+            && model.eq_ignore_ascii_case("deepseek-v4-flash"))
+}
+
 pub(crate) fn reasoning_effort_applicable_on_provider(ctx: &LoopCtx) -> bool {
     let selection = ctx.config.effective_model_selection().unwrap_or_default();
-    let ptype = ctx
+    let Some(provider) = ctx.config.provider_config_for_selection(&selection) else {
+        return false;
+    };
+    effort_applicable(
+        provider.reasoning_effort.as_deref(),
+        &selection,
+        &ctx.model_name,
+    )
+}
+
+/// The reasoning-effort levels the current selection exposes (canonical order),
+/// from its `reasoning_effort_levels` declaration. `None`/empty ⇒ all levels. The
+/// single source of truth the Ctrl+T cycle and `/effort` both consult so neither
+/// offers a level the endpoint rejects.
+pub(crate) fn selection_allowed_efforts(ctx: &LoopCtx) -> Vec<&'static str> {
+    let selection = ctx.config.effective_model_selection().unwrap_or_default();
+    let levels = ctx
         .config
         .provider_config_for_selection(&selection)
-        .map(|p| p.provider_type)
-        .unwrap_or_default();
-    // Model-name check delegates to the provider so the UI "applicable" hint
-    // and the actual request-body gate (OpenAiProvider) can never diverge.
-    (ptype == "deepseek" || ptype == "openai")
-        && atomcode_capabilities::provider::reason_effort_applicable(&ctx.model_name)
+        .and_then(|p| p.reasoning_effort_levels);
+    atomcode_config::config::allowed_effort_levels(levels.as_deref())
 }
 
 /// Install a [`crate::modals::password::PasswordModal`] as the active modal on
@@ -25561,10 +29427,7 @@ fn todo_items_from_progress(
         .unwrap_or_default()
 }
 
-fn apply_todo_mutation(
-    items: &mut Vec<atomcode_capabilities::tools::todo::TodoItem>,
-    args: &str,
-) {
+fn apply_todo_mutation(items: &mut Vec<atomcode_capabilities::tools::todo::TodoItem>, args: &str) {
     if let Some(progress) = todo_progress_from_args(args) {
         *items = todo_items_from_progress(Some(&progress));
     } else {
@@ -25640,9 +29503,8 @@ mod todo_block_tests {
     #[test]
     fn failed_live_todo_result_discards_staged_mutation() {
         let mut state = crate::state::UiState::new();
-        state.active_todos = todo_progress_from_args(
-            r#"{"todos":[{"content":"keep","status":"in_progress"}]}"#,
-        );
+        state.active_todos =
+            todo_progress_from_args(r#"{"todos":[{"content":"keep","status":"in_progress"}]}"#);
         stage_todo_call_preview(
             &mut state,
             "failed",
@@ -25680,9 +29542,8 @@ mod todo_block_tests {
     #[test]
     fn successful_todo_preview_becomes_authoritative() {
         let mut state = crate::state::UiState::new();
-        state.active_todos = todo_progress_from_args(
-            r#"{"todos":[{"content":"run agents","status":"pending"}]}"#,
-        );
+        state.active_todos =
+            todo_progress_from_args(r#"{"todos":[{"content":"run agents","status":"pending"}]}"#);
         let args = r#"{"action":"update","id":1,"status":"in_progress"}"#;
         stage_todo_call_preview(&mut state, "preview", args);
 
@@ -25701,16 +29562,9 @@ mod todo_block_tests {
             r#"{"todos":[{"content":"first","status":"in_progress"}]}"#,
         );
         commit_todo_call_result(&mut state, "plan", "todowrite", true);
-        assert_eq!(
-            state.active_todos.as_ref().unwrap().items[0].1,
-            "first"
-        );
+        assert_eq!(state.active_todos.as_ref().unwrap().items[0].1, "first");
 
-        stage_todo_call_preview(
-            &mut state,
-            "add",
-            r#"{"action":"add","content":"second"}"#,
-        );
+        stage_todo_call_preview(&mut state, "add", r#"{"action":"add","content":"second"}"#);
         commit_todo_call_result(&mut state, "add", "todowrite", true);
 
         let progress = state.active_todos.expect("successful action is committed");
@@ -25721,19 +29575,14 @@ mod todo_block_tests {
     #[test]
     fn concurrent_todo_previews_replay_in_call_order_and_exclude_failures() {
         let mut state = crate::state::UiState::new();
-        state.active_todos = todo_progress_from_args(
-            r#"{"todos":[{"content":"first","status":"pending"}]}"#,
-        );
+        state.active_todos =
+            todo_progress_from_args(r#"{"todos":[{"content":"first","status":"pending"}]}"#);
         stage_todo_call_preview(
             &mut state,
             "a",
             r#"{"action":"update","id":1,"status":"in_progress"}"#,
         );
-        stage_todo_call_preview(
-            &mut state,
-            "b",
-            r#"{"action":"add","content":"second"}"#,
-        );
+        stage_todo_call_preview(&mut state, "b", r#"{"action":"add","content":"second"}"#);
 
         let preview = effective_todo_progress(&state).unwrap();
         assert_eq!(preview.in_progress, 1);
@@ -25986,6 +29835,9 @@ mod install_password_modal_tests {
             jediterm: false,
             modern_emulator: false,
             kitty_keyboard: false,
+            mouse_sgr: false,
+            osc52_clipboard: false,
+            tmux_passthrough: false,
         }
     }
 

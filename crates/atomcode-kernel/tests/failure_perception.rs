@@ -25,7 +25,8 @@ use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
 use atomcode_kernel::request::RequestCtx;
 use atomcode_kernel::stream::{ProviderError, StreamEvent};
 use atomcode_kernel::testkit::{AlwaysStopProvider, EchoTool, MockProvider, ScriptedProvider};
-use atomcode_kernel::tool::{Tool, ToolCall, ToolRegistry};
+use atomcode_kernel::tool::{Tool, ToolCall, ToolContext, ToolRegistry, ToolResult};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,6 +80,117 @@ impl ToolMiddleware for RecoverableTerminalDeny {
             PolicyIntervention::credential_shell_blocked(),
         )
     }
+}
+
+struct NestedPolicyTool;
+
+#[async_trait]
+impl Tool for NestedPolicyTool {
+    fn name(&self) -> &str {
+        "nested_policy"
+    }
+
+    fn description(&self) -> &str {
+        "test composed policy boundary"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object"})
+    }
+
+    fn take_policy_intervention(&self, result: &mut ToolResult) -> Option<PolicyIntervention> {
+        if result.content != "inner-policy-marker" {
+            return None;
+        }
+        result.content = "blocked: sanitized nested policy denial".into();
+        result.is_error = true;
+        Some(PolicyIntervention::credential_shell_blocked())
+    }
+
+    async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
+        ToolResult {
+            content: "inner-policy-marker".into(),
+            ..Default::default()
+        }
+    }
+}
+
+struct CountingTool(Arc<AtomicUsize>);
+
+#[async_trait]
+impl Tool for CountingTool {
+    fn name(&self) -> &str {
+        "counting"
+    }
+
+    fn description(&self) -> &str {
+        "records whether the tool executed"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object"})
+    }
+
+    async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        ToolResult {
+            content: "executed".into(),
+            ..Default::default()
+        }
+    }
+}
+
+#[tokio::test]
+async fn composed_tool_policy_intervention_is_lifted_and_sanitized() {
+    let provider = Arc::new(ScriptedProvider::events(vec![
+        StreamEvent::ToolCall(tool_call("c1", "nested_policy", "{}")),
+        StreamEvent::Done { truncated: false },
+    ]));
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(NestedPolicyTool));
+    let outcome = Agent::builder()
+        .provider(provider)
+        .tools(tools.mount(&["nested_policy"]))
+        .build()
+        .run_to_completion("go", AutoRespond::AllowAll)
+        .await;
+
+    assert_eq!(outcome.stop, StopReason::PolicyDenied);
+    assert!(outcome.policy_intervention.is_some());
+    assert_eq!(outcome.tool_results.len(), 1);
+    assert_eq!(
+        outcome.tool_results[0].content,
+        "blocked: sanitized nested policy denial"
+    );
+    assert!(!outcome.tool_results[0]
+        .content
+        .contains("inner-policy-marker"));
+}
+
+#[tokio::test]
+async fn composed_policy_intervention_stops_later_exclusive_tools_in_the_batch() {
+    let provider = Arc::new(ScriptedProvider::events(vec![
+        StreamEvent::ToolCall(tool_call("c1", "nested_policy", "{}")),
+        StreamEvent::ToolCall(tool_call("c2", "counting", "{}")),
+        StreamEvent::Done { truncated: false },
+    ]));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(NestedPolicyTool));
+    tools.register(Arc::new(CountingTool(executions.clone())));
+    let outcome = Agent::builder()
+        .provider(provider)
+        .tools(tools.mount(&["nested_policy", "counting"]))
+        .build()
+        .run_to_completion("go", AutoRespond::AllowAll)
+        .await;
+
+    assert_eq!(outcome.stop, StopReason::PolicyDenied);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    assert_eq!(outcome.tool_results.len(), 2);
+    assert!(outcome.tool_results[1]
+        .content
+        .contains("another call in this batch terminated the turn by policy"));
 }
 
 #[tokio::test]

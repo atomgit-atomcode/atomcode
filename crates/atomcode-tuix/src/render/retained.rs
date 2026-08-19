@@ -18,6 +18,7 @@
 
 use std::fs::File;
 use std::io::{BufWriter, Stdout, Write};
+use std::sync::Arc;
 
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, PopKeyboardEnhancementFlags,
@@ -36,8 +37,147 @@ use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
 use atomcode_coding;
 use crossterm::style::Color;
+use unicode_segmentation::UnicodeSegmentation;
 
 const PAD_COL: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComposerCellByte {
+    row: usize,
+    col: usize,
+    byte: usize,
+    source_start: usize,
+    source_end: usize,
+}
+
+#[derive(Debug, Clone)]
+struct BodyCopyRun {
+    id: u64,
+    body_index: usize,
+    col: usize,
+    text: Arc<str>,
+    soft_wrap: bool,
+    next_run_id: Option<u64>,
+}
+
+fn composer_cell_bytes(
+    source: &str,
+    lines: &[String],
+    max_cols: usize,
+    visible_rows: std::ops::Range<usize>,
+) -> Vec<ComposerCellByte> {
+    if max_cols == 0 || lines.is_empty() {
+        return Vec::new();
+    }
+    let safe = scrub_controls(source);
+    if safe != source {
+        return Vec::new();
+    }
+    let (display, _) = crate::markdown::normalize_circled_list_spacing_with_cursor(&safe, 0);
+    let source_graphemes: Vec<(usize, &str)> = source.grapheme_indices(true).collect();
+    let mut display_starts = Vec::with_capacity(source_graphemes.len());
+    let mut display_cursor = 0usize;
+    for (_, grapheme) in &source_graphemes {
+        let Some(relative) = display[display_cursor..].find(grapheme) else {
+            return Vec::new();
+        };
+        let start = display_cursor + relative;
+        display_starts.push(start);
+        display_cursor = start + grapheme.len();
+    }
+
+    #[derive(Clone, Copy)]
+    struct DisplaySpan {
+        display_start: usize,
+        display_end: usize,
+        source_start: usize,
+        source_end: usize,
+    }
+    let spans: Vec<DisplaySpan> = source_graphemes
+        .iter()
+        .enumerate()
+        .map(|(index, (source_start, grapheme))| DisplaySpan {
+            display_start: display_starts[index],
+            display_end: display_starts
+                .get(index + 1)
+                .copied()
+                .unwrap_or(display.len()),
+            source_start: *source_start,
+            source_end: source_start + grapheme.len(),
+        })
+        .collect();
+
+    let mut cells = Vec::new();
+    let mut next_display_byte = 0usize;
+    let mut span_index = 0usize;
+    for (row, line) in lines.iter().enumerate() {
+        let mut col = 0usize;
+        for grapheme in line.graphemes(true) {
+            let Some(relative) = display[next_display_byte..].find(grapheme) else {
+                return Vec::new();
+            };
+            let display_byte = next_display_byte + relative;
+            next_display_byte = display_byte + grapheme.len();
+            while spans
+                .get(span_index)
+                .is_some_and(|span| span.display_end <= display_byte)
+            {
+                span_index += 1;
+            }
+            let Some(span) = spans.get(span_index).copied().filter(|span| {
+                span.display_start <= display_byte && display_byte < span.display_end
+            }) else {
+                col += crate::width::display_width(grapheme);
+                continue;
+            };
+            let width = if grapheme == "\t" {
+                crate::render::cell::SOFT_TAB_WIDTH
+            } else {
+                crate::width::display_width(grapheme)
+            };
+            if visible_rows.contains(&row) {
+                for offset in 0..width {
+                    cells.push(ComposerCellByte {
+                        row,
+                        col: col + offset,
+                        byte: if display_byte == span.display_start && offset * 2 < width {
+                            span.source_start
+                        } else {
+                            span.source_end
+                        },
+                        source_start: span.source_start,
+                        source_end: span.source_end,
+                    });
+                }
+            }
+            col += width;
+        }
+    }
+
+    let end_row = lines.len() - 1;
+    let end_col = lines[end_row]
+        .graphemes(true)
+        .map(|grapheme| {
+            if grapheme == "\t" {
+                crate::render::cell::SOFT_TAB_WIDTH
+            } else {
+                crate::width::display_width(grapheme)
+            }
+        })
+        .sum::<usize>();
+    if visible_rows.contains(&end_row) {
+        for col in end_col..max_cols {
+            cells.push(ComposerCellByte {
+                row: end_row,
+                col,
+                byte: source.len(),
+                source_start: source.len(),
+                source_end: source.len(),
+            });
+        }
+    }
+    cells
+}
 
 /// Max body_lines kept in the in-app scrollback buffer (matches alt-screen).
 /// Bounded so memory doesn't grow without limit on long sessions.
@@ -110,6 +250,81 @@ struct UserInputRows {
     rows: Vec<Vec<Cell>>,
     /// Full rendered range belonging to the active option/input/submit row.
     active: std::ops::Range<usize>,
+}
+
+/// Final physical-row budget for the retained footer. Individual widgets cap
+/// themselves, but their independent caps can still overflow a short terminal
+/// when several widgets are visible at once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FooterRows {
+    approval_active: bool,
+    middle: usize,
+    command_output: usize,
+    attachment: usize,
+    menu: usize,
+    goal: usize,
+    pending: usize,
+    subtask: usize,
+    todo: usize,
+    approval: usize,
+    status: usize,
+}
+
+impl FooterRows {
+    fn top_panel(self) -> usize {
+        self.pending + self.subtask + self.todo
+    }
+
+    fn total(self, hide_input_box: bool) -> usize {
+        1 + if self.approval_active || hide_input_box {
+            0
+        } else {
+            self.middle + 1 + self.command_output
+        } + self.attachment
+            + self.menu
+            + self.goal
+            + self.top_panel()
+            + self.approval
+            + if self.approval_active || hide_input_box {
+                0
+            } else {
+                self.status
+            }
+    }
+
+    fn fit(mut self, height: usize, hide_input_box: bool) -> Self {
+        let trim = |rows: &mut usize, overflow: &mut usize| {
+            let removed = (*rows).min(*overflow);
+            *rows -= removed;
+            *overflow -= removed;
+        };
+        let mut overflow = self.total(hide_input_box).saturating_sub(height);
+
+        // Preserve the active composer/menu/modal. These auxiliary rows are
+        // transient and are reconstructed automatically when the window grows.
+        if !self.approval_active && !hide_input_box {
+            trim(&mut self.command_output, &mut overflow);
+        }
+        trim(&mut self.pending, &mut overflow);
+        trim(&mut self.todo, &mut overflow);
+        trim(&mut self.subtask, &mut overflow);
+        if !self.approval_active && !hide_input_box {
+            trim(&mut self.status, &mut overflow);
+        }
+        trim(&mut self.goal, &mut overflow);
+        trim(&mut self.attachment, &mut overflow);
+        trim(&mut self.menu, &mut overflow);
+
+        if !hide_input_box && !self.approval_active {
+            let removed = self.middle.saturating_sub(1).min(overflow);
+            self.middle -= removed;
+            overflow -= removed;
+        }
+        if self.approval_active {
+            trim(&mut self.approval, &mut overflow);
+        }
+        self
+    }
 }
 
 impl std::ops::Deref for UserInputRows {
@@ -209,7 +424,10 @@ fn goal_row_parts(
 }
 
 fn goal_condition_preview(condition: &str) -> String {
-    let mut lines = condition.lines().map(str::trim).filter(|line| !line.is_empty());
+    let mut lines = condition
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
     let first = lines.next().unwrap_or_default();
     if lines.next().is_some() {
         format!("{first}…")
@@ -533,12 +751,7 @@ fn todo_panel_rows(
 /// Wrap the current task into a small, width-safe preview. The sticky footer
 /// remains bounded, so an oversized task gets at most `max_lines`; the final
 /// visible line carries an ellipsis when more content exists.
-fn wrap_todo_content(
-    content: &str,
-    width: usize,
-    max_lines: usize,
-    ellipsis: &str,
-) -> Vec<String> {
+fn wrap_todo_content(content: &str, width: usize, max_lines: usize, ellipsis: &str) -> Vec<String> {
     if width == 0 || max_lines == 0 {
         return Vec::new();
     }
@@ -752,6 +965,27 @@ fn wrap_cells_to_width(cells: &[Cell], max_cols: usize) -> Vec<Vec<Cell>> {
     chunks
 }
 
+fn copy_text_from_body_row(row: &[Cell]) -> (String, usize) {
+    let col = if row
+        .get(..PAD_COL)
+        .is_some_and(|prefix| prefix.iter().all(|cell| cell.width == 1 && cell.ch == ' '))
+    {
+        PAD_COL
+    } else {
+        0
+    };
+    let end = row
+        .iter()
+        .rposition(|cell| cell.width > 0 && cell.ch != ' ')
+        .map_or(col, |index| index + 1);
+    let text = row[col.min(end)..end]
+        .iter()
+        .filter(|cell| cell.width > 0)
+        .map(|cell| cell.ch)
+        .collect();
+    (text, col)
+}
+
 fn apply_sgr(params: &str, style: &mut CellStyle) {
     // `\x1b[m` (empty params) is treated as SGR 0 per ECMA-48.
     let parts: Vec<&str> = if params.is_empty() {
@@ -815,6 +1049,12 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
 pub struct RetainedRenderer<W: Write + Send> {
     out: W,
     caps: TerminalCaps,
+    mouse_capture_enabled: bool,
+    interaction_publisher: crate::render::interaction::InteractionPublisher,
+    pending_interactions: Vec<crate::render::interaction::HitRegion>,
+    pending_copy_runs: Vec<crate::render::interaction::CopyRun>,
+    interaction_surface: Option<(String, super::MenuKind, Vec<(String, String)>)>,
+    interaction_surface_session: u64,
     screen: Screen,
     // ── widget state ──
     input_buf: String,
@@ -840,6 +1080,8 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// `PAD_COL` indent. `paint_body` just `draw_row`s the last N
     /// directly.
     body_lines: Vec<Vec<Cell>>,
+    body_copy_runs: Vec<BodyCopyRun>,
+    next_copy_run_id: u64,
     /// Message boundary markers for "jump to prev/next message" navigation.
     /// Tracks which line_idx marks the start of a User / Assistant / ToolCall / ToolResult message.
     message_marks: Vec<crate::render::MessageMark>,
@@ -918,6 +1160,10 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// region monotonically advance through `body_lines` regardless of
     /// tail mutations.
     scrolled_off: usize,
+    /// Explicit in-app history viewport used while AtomCode owns SGR mouse
+    /// capture. `None` follows the live tail; `Some` pins a bounded logical
+    /// row until the user scrolls back to the bottom.
+    body_scroll_start: Option<usize>,
     /// Cached `(model, working_dir, chosen_pool_indices)` so resize rebuilds
     /// the SAME mascot + tips instead of re-rolling the random pick.
     welcome_banner: Option<(String, String, Vec<usize>)>,
@@ -1117,6 +1363,13 @@ impl Write for StdoutTap {
 
 impl RetainedRenderer<StdoutTap> {
     pub fn new(caps: TerminalCaps) -> Self {
+        Self::new_with_interactions(caps, Default::default())
+    }
+
+    pub fn new_with_interactions(
+        caps: TerminalCaps,
+        interactions: crate::render::interaction::InteractionPublisher,
+    ) -> Self {
         let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
         let mirror = std::env::var("ATOMCODE_RENDER_DUMP")
             .ok()
@@ -1136,32 +1389,50 @@ impl RetainedRenderer<StdoutTap> {
         // cleared). So we never touch the console mode. (conhost's click-pause is its
         // standard, recoverable behavior — Esc cancels, Enter copies; far better than
         // losing the whole mouse.) See the deleted `render::conhost` module's history.
-        Self::with_writer(tap, caps, w, h)
+        Self::with_writer_and_interactions(tap, caps, w, h, interactions)
     }
 }
 
 impl<W: Write + Send> RetainedRenderer<W> {
-    pub fn with_writer(mut out: W, caps: TerminalCaps, w: u16, h: u16) -> Self {
+    fn update_interaction_surface(&mut self, input: &str, menu: Option<&MenuPayload>) {
+        let next = menu.map(|menu| (input.to_owned(), menu.kind, menu.items.clone()));
+        if self.interaction_surface != next {
+            self.interaction_surface = next;
+            self.interaction_surface_session = self.interaction_surface_session.saturating_add(1);
+        }
+    }
+
+    pub fn with_writer(out: W, caps: TerminalCaps, w: u16, h: u16) -> Self {
+        Self::with_writer_and_interactions(out, caps, w, h, Default::default())
+    }
+
+    pub fn with_writer_and_interactions(
+        mut out: W,
+        caps: TerminalCaps,
+        w: u16,
+        h: u16,
+        interaction_publisher: crate::render::interaction::InteractionPublisher,
+    ) -> Self {
         // Clear scrollback buffer so previous terminal content (e.g. git log)
         // doesn't remain visible above the atomcode viewport and mix with
         // the atomcode session transcript. `\x1b[3J` only affects scrollback;
         // it does not touch the visible screen rows.
         //
-        // Mouse capture (`\x1b[?1002h` button-event + `\x1b[?1006h` SGR
-        // coords) is intentionally NOT enabled here. We defer mouse wheel,
-        // cmd+drag selection, and cmd+C copy to the terminal's native
-        // handling — matches Claude Code's UX model. Trade-off: atomcode's
-        // reverse-video drag selection and arboard/OSC52 clipboard write
-        // path are no longer reachable from interactive events. The
-        // disable-on-shutdown (`?1002l`/`?1006l`) sequences below are
-        // preserved as defensive hygiene against any other actor (a child
-        // process that exited weirdly, a prior atomcode run that
-        // panicked before Drop) having left capture on.
         let _ = out.write_all(b"\x1b[3J");
+        let mouse_capture_enabled = caps.mouse_sgr;
+        if mouse_capture_enabled {
+            let _ = out.write_all(b"\x1b[?1002h\x1b[?1006h");
+        }
         let _ = out.flush();
         Self {
             out,
             caps,
+            mouse_capture_enabled,
+            interaction_publisher,
+            pending_interactions: Vec::new(),
+            pending_copy_runs: Vec::new(),
+            interaction_surface: None,
+            interaction_surface_session: 0,
             screen: Screen::new(w, h).with_jediterm(caps.jediterm),
             input_buf: String::new(),
             input_cursor_byte: 0,
@@ -1169,6 +1440,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             status: StatusLine::default(),
             input_attachments: Vec::new(),
             body_lines: Vec::new(),
+            body_copy_runs: Vec::new(),
+            next_copy_run_id: 1,
             message_marks: Vec::new(),
             last_mark_was_assistant: false,
             suppress_auto_copy: false,
@@ -1180,6 +1453,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             last_painted_footer_rows: 0,
             skip_body_scroll_count: 0,
             scrolled_off: 0,
+            body_scroll_start: None,
             welcome_banner: None,
             welcome_tip_indices: None,
             welcome_line_count: 0,
@@ -1272,19 +1546,29 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
-    /// Rendered row count for a `/resume` session item at menu index
-    /// `orig_idx` (>= HEADER_ROWS): 2 rows (title + metadata) for the first
-    /// session, 3 for the rest — the extra row is the leading blank spacer that
-    /// separates cards. This MUST stay in lockstep with the render loop's
+    /// Rendered detail-row count for a `/resume` item. Ordinary and narrow rows
+    /// remain one metadata line; a wide selected preview may use the remaining
+    /// half-screen modal budget. This MUST stay in lockstep with the render loop's
     /// `if orig_idx > HEADER_ROWS { push blank }`; both the paginator's
     /// fit-loops and the footer `menu_rows` reservation call it so the three
     /// height accountings never drift.
-    fn session_item_height(orig_idx: usize) -> usize {
-        if orig_idx == crate::modals::session_picker::HEADER_ROWS {
-            2
-        } else {
-            3
+    fn session_detail_rows(&self, orig_idx: usize, desc: &str, rule_width: usize) -> usize {
+        if rule_width < 96 || !desc.contains('\n') {
+            return 1;
         }
+        let spacer = usize::from(orig_idx != crate::modals::session_picker::HEADER_ROWS);
+        let modal_cap = (self.screen.height() as usize / 2).max(9);
+        let available = modal_cap.saturating_sub(7 + 1 + spacer).max(1);
+        desc.lines().take(9).take(available).count().max(1)
+    }
+
+    fn session_item_height(&self, orig_idx: usize, desc: &str, rule_width: usize) -> usize {
+        let detail_rows = if rule_width >= 96 {
+            self.session_detail_rows(orig_idx, desc, rule_width)
+        } else {
+            1
+        };
+        1 + detail_rows + usize::from(orig_idx != crate::modals::session_picker::HEADER_ROWS)
     }
 
     fn max_menu_rows(&self, h: usize, default: usize) -> usize {
@@ -1302,6 +1586,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     // menu plus that row remains within the half-screen budget.
                     let cap = (h / 2).saturating_sub(1).max(1);
                     return natural.min(cap);
+                }
+                if m.kind == super::MenuKind::SessionList
+                    && m.items.iter().any(|(_, desc)| desc.contains('\n'))
+                {
+                    // The selected preview consumes the picker's existing
+                    // half-screen modal budget; pagination removes other cards
+                    // before this cap can affect global layout.
+                    return (h / 2).max(9);
                 }
                 let base = m.kind.max_visible_rows(h, m.items.len());
                 let has_hint = m
@@ -1603,7 +1895,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 remove,
                 self.scrolled_off
             );
-            self.body_lines.truncate(self.body_lines.len() - remove);
+            self.truncate_body_lines(self.body_lines.len() - remove);
             self.inflight_tool_rows = 0;
             return;
         }
@@ -1623,7 +1915,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 prev_rows,
                 self.scrolled_off
             );
-            self.body_lines.truncate(keep);
+            self.truncate_body_lines(keep);
             let first = bottom - n as u16 + 1;
             for row in &new_rows {
                 self.body_lines.push(row.clone());
@@ -1677,7 +1969,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 remove,
                 self.scrolled_off
             );
-            self.body_lines.truncate(self.body_lines.len() - remove);
+            self.truncate_body_lines(self.body_lines.len() - remove);
             // The old strip rows are already gone (truncated above), so clear the count
             // BEFORE re-pushing: otherwise `push_body_row`'s `lift_inflight_strip` would see
             // the stale `prev_rows` and pop that many rows of REAL content off the tail.
@@ -2325,7 +2617,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             push_str_cells_sgr(&mut row, &shown, name_style.clone());
             let rest = full_w.saturating_sub(indicator_w + shown_w);
             for _ in 0..rest {
-                row.push(Cell { ch: ' ', style: name_style.clone(), width: 1 });
+                row.push(Cell {
+                    ch: ' ',
+                    style: name_style.clone(),
+                    width: 1,
+                });
             }
         } else {
             let sep = 2usize;
@@ -2345,7 +2641,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let used = indicator_w + shown_name_w + sep + desc_w;
             let rest = full_w.saturating_sub(used);
             for _ in 0..rest {
-                row.push(Cell { ch: ' ', style: name_style.clone(), width: 1 });
+                row.push(Cell {
+                    ch: ' ',
+                    style: name_style.clone(),
+                    width: 1,
+                });
             }
         }
         row
@@ -2428,7 +2728,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let mut row1 = Vec::new();
         if selected {
             let border_style = self.style_for(Role::Border);
-            push_str_cells_sgr(&mut row1, "▸ ", border_style);
+            let marker = if self.caps.unicode_symbols {
+                "▸ "
+            } else {
+                "> "
+            };
+            push_str_cells_sgr(&mut row1, marker, border_style);
         } else {
             push_str_cells_sgr(&mut row1, "  ", CellStyle::default());
         }
@@ -2438,7 +2743,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
             if selected {
                 gray_style.bold = true;
             }
-            push_str_cells_sgr(&mut row1, "✓ ", gray_style);
+            let installed_marker = if self.caps.unicode_symbols {
+                "✓ "
+            } else {
+                "* "
+            };
+            push_str_cells_sgr(&mut row1, installed_marker, gray_style);
         } else {
             push_str_cells_sgr(&mut row1, "  ", CellStyle::default());
         }
@@ -2521,7 +2831,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         rows
     }
 
-    /// Two-line renderer for a `/resume` session row. Simpler than
+    /// Renderer for a `/resume` session row. The ordinary/narrow form stays two
+    /// lines; only a wide selected item appends bounded preview details. Simpler than
     /// `build_plugin_menu_rows`: row 1 is an optional `▸ ` marker (Border when
     /// selected, else spaces) + the session title in the terminal's default fg
     /// (bold when selected) — NO `✓`, NO name padding, NO installed/scope suffix
@@ -2534,6 +2845,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         desc: &str,
         selected: bool,
         rule_width: usize,
+        orig_idx: usize,
     ) -> Vec<Vec<Cell>> {
         // Selected title + marker use the theme-aware highlight colour (cyan on
         // dark, magenta on light); unselected rows stay in the terminal default.
@@ -2566,30 +2878,41 @@ impl<W: Write + Send> RetainedRenderer<W> {
             });
         }
 
-        // Row 2: gray metadata, indented four spaces.
+        // Row 2+: gray metadata and, on wide terminals only, the selected
+        // session's bounded cwd/provider/excerpt preview. Narrow cards retain
+        // their historical two-row shape exactly.
         let meta_style = self.style_for(Role::Muted);
-        let line_str = if desc.is_empty() {
-            String::new()
+        let detail_lines: Vec<&str> = if rule_width >= 96 && selected {
+            let cap = self.session_detail_rows(orig_idx, desc, rule_width);
+            desc.lines().take(cap).collect()
         } else {
-            format!("    {}", desc)
+            vec![desc.lines().next().unwrap_or_default()]
         };
-        let mut row2 = Vec::new();
-        push_str_cells_sgr(&mut row2, &line_str, meta_style.clone());
-        let content_w2 = crate::width::display_width(&line_str);
-        let right_pad2 = rule_width.saturating_sub(content_w2);
-        for _ in 0..right_pad2 {
-            row2.push(Cell {
-                ch: ' ',
-                width: 1,
-                style: if selected {
-                    meta_style.clone()
-                } else {
-                    CellStyle::default()
-                },
-            });
+        let mut rows = vec![row1];
+        for detail in detail_lines {
+            let detail = crate::width::truncate_with_ellipsis(detail, rule_width.saturating_sub(4));
+            let line_str = if detail.is_empty() {
+                String::new()
+            } else {
+                format!("    {detail}")
+            };
+            let mut row = Vec::new();
+            push_str_cells_sgr(&mut row, &line_str, meta_style.clone());
+            let content_width = crate::width::display_width(&line_str);
+            for _ in 0..rule_width.saturating_sub(content_width) {
+                row.push(Cell {
+                    ch: ' ',
+                    width: 1,
+                    style: if selected {
+                        meta_style.clone()
+                    } else {
+                        CellStyle::default()
+                    },
+                });
+            }
+            rows.push(row);
         }
-
-        vec![row1, row2]
+        rows
     }
 
     fn build_marketplace_menu_rows(
@@ -2873,11 +3196,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
     /// Number of rows the todo panel will occupy. Use the width-aware builder
     /// directly so wrapped current-task rows and footer height math cannot drift.
-    fn todo_panel_row_count(
-        &self,
-        todo: &crate::render::TodoProgress,
-        rule_width: usize,
-    ) -> usize {
+    fn todo_panel_row_count(&self, todo: &crate::render::TodoProgress, rule_width: usize) -> usize {
         self.build_todo_rows(todo, rule_width).len()
     }
 
@@ -3031,9 +3350,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .saturating_add(failed)
             .saturating_add(stopped);
         let pending_count = if subtasks.call_id.starts_with("team:") {
-            subtasks
-                .total
-                .saturating_sub(finished + running.len())
+            subtasks.total.saturating_sub(finished + running.len())
         } else {
             pending.len()
         };
@@ -3104,10 +3421,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if needs_summary && rows.len() < cap {
             let mut parts = Vec::new();
             let hidden_running = running.len().saturating_sub(visible_running);
-            let expands_single_pending = pending.len() == 1
-                && pending_count == 1
-                && hidden_running == 0
-                && failed == 0;
+            let expands_single_pending =
+                pending.len() == 1 && pending_count == 1 && hidden_running == 0 && failed == 0;
             if hidden_running > 0 {
                 parts.push(format!("{hidden_running} running"));
             }
@@ -3364,8 +3679,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// the header/detail/hint: the command is already shown in the `▸ Tool(detail)`
     /// body row above, so the panel is just the selectable choices.
     fn approval_panel_row_count(&self, panel: &crate::render::ApprovalPanelView) -> usize {
-        // 1 header row ("Allow Tool(detail)?") + N option rows + 1 hint row.
-        panel.options.len() + 2
+        // 1 header row ("Allow Tool(detail)?") + optional advisory note + N option
+        // rows + 1 hint row. MUST track `build_approval_rows` exactly or the footer
+        // height under-counts and the panel overlaps the body.
+        panel.options.len() + 2 + usize::from(panel.note.is_some())
     }
 
     /// Build the compact footer approval panel: numbered selectable options
@@ -3411,6 +3728,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let mut row = Vec::new();
             push_str_cells(&mut row, "  ", &style);
             push_str_cells(&mut row, &header_trunc, &style);
+            out.push(row);
+        }
+
+        // Advisory row: e.g. a credential-exposure warning under the header. Truncated
+        // to one line like the header; rendered in the Warning role.
+        if let Some(note) = panel.note.as_deref() {
+            let note = crate::glyph::downgrade_glyphs(note, unicode);
+            let note = crate::width::truncate_with_ellipsis(
+                &scrub_controls(&note),
+                rule_width.saturating_sub(2),
+            );
+            let style = self.style_for(Role::Warning);
+            let mut row = Vec::new();
+            push_str_cells(&mut row, "  ", &style);
+            push_str_cells(&mut row, &note, &style);
             out.push(row);
         }
 
@@ -3548,7 +3880,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     ///     each with an optional faint description line, and a final inline
     ///     custom-answer row (faint placeholder when empty, typed text + cursor
     ///     indicator when non-empty / active). The cursor row is marked `❯`;
-    ///     multiple adds `[x]`/`[ ]` checkboxes; the cursor label is emphasized
+    ///     multiple adds `[✓]`/`[ ]` checkboxes; the cursor label is emphasized
     ///     in the orange highlight colour.
     ///   - Text: a single `> {buffer}` input row.
     /// The caller measures returned rows directly because wrapping makes height
@@ -3615,10 +3947,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     } else {
                         "  "
                     };
-                    // Multiple mode prepends a checkbox.
+                    // Multiple mode prepends a checkbox. The checked glyph is a
+                    // light check ✓ (matching Claude Code's selection style), with
+                    // the ASCII `[x]` fallback on non-unicode terminals.
                     let checkbox = if multiple {
                         if checked {
-                            "[x] "
+                            if unicode {
+                                "[\u{2713}] "
+                            } else {
+                                "[x] "
+                            }
                         } else {
                             "[ ] "
                         }
@@ -3712,7 +4050,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     };
                     let checkbox = if multiple {
                         if other_has_text {
-                            "[x] "
+                            if unicode {
+                                "[\u{2713}] "
+                            } else {
+                                "[x] "
+                            }
                         } else {
                             "[ ] "
                         }
@@ -3776,15 +4118,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         } else {
                             budget
                         };
-                        let text = crate::width::truncate_with_ellipsis(
-                            &scrub_controls(&panel.custom_text),
-                            text_budget,
-                        );
+                        let safe_text = scrub_controls(&panel.custom_text);
+                        let text = if on_cursor {
+                            crate::width::editable_value_projection(
+                                &safe_text,
+                                panel.custom_text_cursor_byte,
+                                budget,
+                            )
+                        } else {
+                            crate::width::truncate_with_ellipsis(&safe_text, text_budget)
+                        };
                         push_str_cells(&mut row, &text, &text_style);
-                        if on_cursor {
-                            let cursor_glyph = if unicode { "\u{258f}" } else { "|" }; // ▏
-                            push_str_cells(&mut row, cursor_glyph, &chrome_style);
-                        }
                     }
                     out.push(row);
                     if on_cursor {
@@ -3846,7 +4190,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 blank_row(&mut out);
 
                 let field_width = rule_width;
-                let placeholder = if unicode { "输入答案…" } else { "Enter answer..." };
+                let placeholder = if unicode {
+                    "输入答案…"
+                } else {
+                    "Enter answer..."
+                };
                 let safe_text = scrub_controls(&panel.text);
                 if field_width < 5 {
                     let mut row = Vec::new();
@@ -3867,11 +4215,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
                     let mut top = Vec::new();
                     push_str_cells(&mut top, top_left, &border_style);
-                    push_str_cells(
-                        &mut top,
-                        &horizontal.repeat(inner_width),
-                        &border_style,
-                    );
+                    push_str_cells(&mut top, &horizontal.repeat(inner_width), &border_style);
                     push_str_cells(&mut top, top_right, &border_style);
                     out.push(top);
 
@@ -3881,7 +4225,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     let text_budget = inner_width
                         .saturating_sub(crate::width::display_width(prompt))
                         .saturating_sub(crate::width::display_width(caret));
-                    let buf = crate::width::truncate_with_ellipsis(&safe_text, text_budget);
+                    let buf = if panel.text.is_empty() {
+                        String::new()
+                    } else {
+                        crate::width::editable_value_projection(
+                            &safe_text,
+                            panel.text_cursor_byte,
+                            text_budget + crate::width::display_width(caret),
+                        )
+                    };
                     let visible_text = if buf.is_empty() {
                         crate::width::truncate_with_ellipsis(placeholder, text_budget)
                     } else {
@@ -3899,7 +4251,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         push_str_cells(&mut row, &visible_text, &text_style);
                     } else {
                         push_str_cells(&mut row, &visible_text, &text_style);
-                        push_str_cells(&mut row, caret, &border_style);
                     }
                     let used = crate::width::display_width(prompt)
                         + crate::width::display_width(&visible_text)
@@ -3917,11 +4268,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
                     let mut bottom = Vec::new();
                     push_str_cells(&mut bottom, bottom_left, &border_style);
-                    push_str_cells(
-                        &mut bottom,
-                        &horizontal.repeat(inner_width),
-                        &border_style,
-                    );
+                    push_str_cells(&mut bottom, &horizontal.repeat(inner_width), &border_style);
                     push_str_cells(&mut bottom, bottom_right, &border_style);
                     out.push(bottom);
                 }
@@ -3937,9 +4284,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Hint row: mode-appropriate guidance, muted + glyph-downgraded. N is the
         // number of navigable options INCLUDING the always-appended "Other".
         let n = panel.options.len() + panel.custom as usize;
-        let single_hint = format!("\u{2191}\u{2193} move \u{00b7} 1-{n} select \u{00b7} Enter confirm \u{00b7} Esc cancel");
+        let single_hint = format!(
+            "\u{2191}\u{2193} move \u{00b7} 1-{n} select \u{00b7} Enter confirm \u{00b7} Esc cancel"
+        );
         // Multiple: Enter toggles rows, confirms only on the Submit row.
-        let multiple_hint = format!("\u{2191}\u{2193} move \u{00b7} Space toggle \u{00b7} Enter \u{63d0}\u{4ea4}\u{884c}\u{786e}\u{8ba4} \u{00b7} Esc cancel");
+        let multiple_hint = format!(
+            "\u{2191}\u{2193} move \u{00b7} Space toggle \u{00b7} Enter \u{63d0}\u{4ea4}\u{884c}\u{786e}\u{8ba4} \u{00b7} Esc cancel"
+        );
         let hint_raw: &str = match panel.mode {
             UserInputMode::Single => &single_hint,
             UserInputMode::Multiple => &multiple_hint,
@@ -4040,7 +4391,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let answered = meta.answered.iter().filter(|a| **a).count();
             push_line(
                 &mut out,
-                if unicode { "提交前确认" } else { "Review answers" },
+                if unicode {
+                    "提交前确认"
+                } else {
+                    "Review answers"
+                },
                 &self.style_bold(Role::Plan),
             );
             out.push(Vec::new());
@@ -4050,11 +4405,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     &format!("{}. {}", i + 1, summary.header),
                     &self.style_bold(Role::Secondary),
                 );
-                push_wrapped(
-                    &mut out,
-                    &summary.question,
-                    &self.style_faint(Role::Muted),
-                );
+                push_wrapped(&mut out, &summary.question, &self.style_faint(Role::Muted));
                 match summary.answer.as_deref() {
                     Some(answer) => push_wrapped(
                         &mut out,
@@ -4153,8 +4504,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // (wide CJK) glyph, colliding that soft-wrap with our own explicit wrap
         // and duplicating/garbling the row. Keeping the last column empty means
         // no glyph ever reaches the edge, so JediTerm never auto-wraps.
-        let prefix_and_reserve = if self.caps.jediterm { 3 } else { 2 };
-        let text_budget = input_rule_width.saturating_sub(prefix_and_reserve);
+        let text_budget = crate::width::composer_text_width(input_rule_width, self.caps.jediterm);
 
         // Wrap input + locate cursor in wrapped layout.
         let ghost_active = self.input_buf.is_empty()
@@ -4194,9 +4544,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // bordered search box and sticky bottom hint. Their entry heights differ.
         let plugin_like = matches!(
             menu_kind,
-            super::MenuKind::Plugin
-                | super::MenuKind::SessionList
-                | super::MenuKind::DirectoryList
+            super::MenuKind::Plugin | super::MenuKind::SessionList | super::MenuKind::DirectoryList
         );
         let (menu_items, selected_in_view, actual_offset) = if let Some(m) = self.menu.as_ref() {
             let len = m.items.len();
@@ -4241,7 +4589,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                             && end >= 4
                             && end < len - hint_h
                         {
-                            Self::session_item_height(end)
+                            self.session_item_height(end, &m.items[end].1, rule_width)
                         } else if menu_kind == super::MenuKind::Plugin
                             && end >= 4
                             && end < len - hint_h
@@ -4281,7 +4629,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                                     && end >= 4
                                     && end < len - hint_h
                                 {
-                                    Self::session_item_height(end)
+                                    self.session_item_height(end, &m.items[end].1, rule_width)
                                 } else if menu_kind == super::MenuKind::Plugin
                                     && end >= 4
                                     && end < len - hint_h
@@ -4437,7 +4785,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         // return 2 here and this reservation would undercount the
                         // footer height — overlapping the goal/status rows onto
                         // the last card.
-                        Self::session_item_height(orig_idx)
+                        self.session_item_height(orig_idx, &m.items[orig_idx].1, rule_width)
                     } else if menu_kind == super::MenuKind::Plugin
                         && orig_idx >= 4
                         && orig_idx < m.items.len().saturating_sub(1)
@@ -4465,7 +4813,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // backed by real bytes survive), so we trust it directly here
         // and don't re-validate against `input_buf`.
         let attachment_rows = self.input_attachments.len();
-        let command_output_cells = self.build_command_output_rows();
+        let mut command_output_cells = self.build_command_output_rows();
         let command_output_rows = command_output_cells.len();
         let has_status = !self.status.model.is_empty()
             || !self.status.cwd.is_empty()
@@ -4501,31 +4849,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             0
         };
-        let pending_message_cells = self.build_pending_message_rows();
+        let mut pending_message_cells = self.build_pending_message_rows();
         let pending_message_rows = pending_message_cells.len();
-        let top_panel_rows = pending_message_rows + subtask_rows + todo_rows;
-        // Cap the input-box height so a long paste / typed text can't grow the
-        // footer past the screen (overflow). The full text stays in input_buf;
-        // we render a scrolling window that keeps the cursor row visible. The
-        // `[Pasted #N]` folding (insert_paste) already shrinks most big pastes;
-        // this is the backstop for the rest (unfolded single-line pastes,
-        // sub-threshold pastes, typed text). The goal/loop + todo rows are folded
-        // into the status-rows reservation so the input box height accounts for them.
-        let max_input_rows = Self::max_input_rows(
-            h,
-            attachment_rows,
-            menu_rows,
-            status_rows + goal_rows + top_panel_rows + approval_rows + command_output_rows,
-        );
-        let input_view_start = if lines.len() > max_input_rows {
-            cursor_row_in_middle
-                .saturating_sub(max_input_rows.saturating_sub(1))
-                .min(lines.len() - max_input_rows)
-        } else {
-            0
-        };
-        let middle_rows = (lines.len() - input_view_start).min(max_input_rows);
-        let cursor_row_in_middle = cursor_row_in_middle.saturating_sub(input_view_start);
         // When an approval panel is active, we replace the input box with the
         // approval panel (saves 2+ rows) and hide the status row.
         let approval_active = self.approval_active();
@@ -4545,17 +4870,45 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 .and_then(|m| m.items.get(2))
                 .map(|(name, _)| name == "Add Marketplace")
                 .unwrap_or(false);
-        let total_rows = self.footer_total_rows(
-            middle_rows,
-            command_output_rows,
-            attachment_rows,
-            menu_rows,
-            goal_rows,
-            top_panel_rows,
-            approval_rows,
-            status_rows,
-            hide_input_box,
-        );
+        let layout = FooterRows {
+            approval_active,
+            // Start with the useful composer height. `FooterRows::fit` removes
+            // transient chrome first, then scrolls the composer only if the
+            // physical terminal is still too short.
+            middle: lines.len().min(MAX_INPUT_ROWS),
+            command_output: command_output_rows,
+            attachment: attachment_rows,
+            menu: menu_rows,
+            goal: goal_rows,
+            pending: pending_message_rows,
+            subtask: subtask_rows,
+            todo: todo_rows,
+            approval: approval_rows,
+            status: status_rows,
+        }
+        .fit(h, hide_input_box);
+        let middle_rows = layout.middle;
+        let input_view_start = if lines.len() > middle_rows {
+            cursor_row_in_middle
+                .saturating_sub(middle_rows.saturating_sub(1))
+                .min(lines.len() - middle_rows)
+        } else {
+            0
+        };
+        let cursor_row_in_middle = cursor_row_in_middle.saturating_sub(input_view_start);
+        let command_output_rows = layout.command_output;
+        let attachment_rows = layout.attachment;
+        let menu_rows = layout.menu;
+        let goal_rows = layout.goal;
+        let pending_message_rows = layout.pending;
+        let subtask_rows = layout.subtask;
+        let todo_rows = layout.todo;
+        let top_panel_rows = layout.top_panel();
+        let approval_rows = layout.approval;
+        let status_rows = layout.status;
+        let total_rows = layout.total(hide_input_box);
+        command_output_cells.truncate(command_output_rows);
+        pending_message_cells.truncate(pending_message_rows);
         let pad_style = CellStyle::default();
         // Append-only: footer sits directly below the last body row,
         // not pinned to the screen bottom. The VISIBLE body count is
@@ -4580,7 +4933,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.status.search.as_ref(),
             shell,
         );
-        let middle_cells: Vec<Vec<Cell>> = lines[input_view_start..input_view_start + middle_rows]
+        let composer_cells = if !approval_active && !hide_input_box && !ghost_active {
+            composer_cell_bytes(
+                &self.input_buf,
+                &lines,
+                text_budget,
+                input_view_start..input_view_start.saturating_add(middle_rows),
+            )
+        } else {
+            Vec::new()
+        };
+        let mut middle_cells: Vec<Vec<Cell>> = lines
+            [input_view_start..input_view_start + middle_rows]
             .iter()
             .enumerate()
             .map(|(i, line)| {
@@ -4592,32 +4956,54 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 }
             })
             .collect();
+        if let Some(selection) = self
+            .interaction_publisher
+            .composer_selection()
+            .filter(|selection| &*selection.source == self.input_buf)
+        {
+            for cell in &composer_cells {
+                if selection.range.start < cell.source_end
+                    && cell.source_start < selection.range.end
+                {
+                    let relative_row = cell.row.saturating_sub(input_view_start);
+                    if let Some(painted) = middle_cells
+                        .get_mut(relative_row)
+                        .and_then(|row| row.get_mut(2 + cell.col))
+                    {
+                        painted.style.reverse = true;
+                    }
+                }
+            }
+        }
         // When the input is scrolled (windowed), show "+N more lines" on the
         // bottom rule so it's visible that content is hidden, not lost.
         let hidden_rows = lines.len() - middle_rows;
         let bot_rule = self.build_input_bot_rule(input_rule_width, hidden_rows, shell);
         let status_clone = self.status.clone();
-        let status_cells = if has_status && !hide_input_box {
+        let status_cells = if status_rows > 0 && !hide_input_box {
             Some(self.build_status_row(&status_clone, rule_width, shell))
         } else {
             None
         };
         // Goal and loop rows occupy the same slot (at most one is shown at a
         // time).  Goal takes priority if somehow both are set.
-        let goal_cells: Option<Vec<Cell>> = if let Some(g) = status_clone.goal.as_ref() {
+        let goal_cells: Option<Vec<Cell>> = if goal_rows == 0 {
+            None
+        } else if let Some(g) = status_clone.goal.as_ref() {
             Some(self.build_goal_row(g, rule_width))
         } else if let Some(ls) = status_clone.loop_status.as_ref() {
             Some(self.build_loop_row(ls, rule_width))
         } else {
             None
         };
-        let todo_cells: Vec<Vec<Cell>> = status_clone
+        let mut todo_cells: Vec<Vec<Cell>> = status_clone
             .todo
             .as_ref()
             .filter(|_| status_clone.subtasks.is_none())
             .map(|t| self.build_todo_rows(t, rule_width))
             .unwrap_or_default();
-        let subtask_cells: Vec<Vec<Cell>> = if approval_rows == 0 {
+        todo_cells.truncate(todo_rows);
+        let mut subtask_cells: Vec<Vec<Cell>> = if approval_rows == 0 {
             status_clone
                 .subtasks
                 .as_ref()
@@ -4626,10 +5012,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             Vec::new()
         };
+        subtask_cells.truncate(subtask_rows);
         // Modal panel cells: approval OR user_input OR round_cap_panel (mutually
         // exclusive; approval wins, then user_input, then round_cap_panel).
         // Drawn in the shared `approval_active` slot below.
-        let approval_cells: Vec<Vec<Cell>> = if let Some(p) = status_clone.approval.as_ref() {
+        let mut approval_cells: Vec<Vec<Cell>> = if let Some(p) = status_clone.approval.as_ref() {
             self.build_approval_rows(p, rule_width, w)
         } else if let Some(p) = status_clone.user_input.as_ref() {
             self.build_user_input_panel_view(p, rule_width, w, h)
@@ -4638,15 +5025,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             Vec::new()
         };
+        approval_cells.truncate(approval_rows);
         let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
         // `/resume` and `/cd` share the plugin manager's chrome/layout.
         let plugin_like = matches!(
             menu_kind,
-            super::MenuKind::Plugin
-                | super::MenuKind::SessionList
-                | super::MenuKind::DirectoryList
+            super::MenuKind::Plugin | super::MenuKind::SessionList | super::MenuKind::DirectoryList
         );
         let mut menu_cells: Vec<Vec<Cell>> = Vec::new();
+        let mut menu_hit_rows: Vec<(usize, usize, crate::render::interaction::HitTarget)> =
+            Vec::new();
+        let mut selected_menu_rows: Option<std::ops::Range<usize>> = None;
         let final_len = self.menu.as_ref().map(|m| m.items.len()).unwrap_or(0);
         let is_sticky = matches!(
             menu_kind,
@@ -4678,6 +5067,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     menu_cells.push(Vec::new());
                 }
             }
+            let cells_before_item = menu_cells.len();
 
             if menu_kind == super::MenuKind::Marketplace
                 && !is_add_url
@@ -4837,7 +5227,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 if orig_idx > crate::modals::session_picker::HEADER_ROWS {
                     menu_cells.push(Vec::new());
                 }
-                menu_cells.extend(self.build_session_menu_rows(name, desc, selected, rule_width));
+                menu_cells.extend(
+                    self.build_session_menu_rows(name, desc, selected, rule_width, orig_idx),
+                );
             } else if menu_kind == super::MenuKind::Plugin
                 && orig_idx >= 4
                 && orig_idx < final_len.saturating_sub(1)
@@ -4940,7 +5332,79 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     menu_cells.push(row);
                 }
             }
+            let item_end = menu_cells.len();
+            let item_start = if menu_kind == super::MenuKind::SessionList
+                && orig_idx > crate::modals::session_picker::HEADER_ROWS
+            {
+                cells_before_item.saturating_add(1)
+            } else {
+                cells_before_item
+            };
+            if selected && item_end > item_start {
+                selected_menu_rows = Some(item_start..item_end);
+            }
+            let target = match menu_kind {
+                super::MenuKind::SlashCommand
+                    if self.input_buf.starts_with('/')
+                        && !self.input_buf[1..].contains(char::is_whitespace) =>
+                {
+                    Some(crate::render::interaction::HitTarget::MenuItem { index: orig_idx })
+                }
+                super::MenuKind::DirectoryList
+                    if orig_idx >= crate::modals::dir_picker::DIR_HEADER_ROWS
+                        && orig_idx < final_len.saturating_sub(1) =>
+                {
+                    Some(crate::render::interaction::HitTarget::ModalItem {
+                        index: orig_idx - crate::modals::dir_picker::DIR_HEADER_ROWS,
+                    })
+                }
+                super::MenuKind::SessionList
+                    if orig_idx >= crate::modals::session_picker::HEADER_ROWS
+                        && orig_idx < final_len.saturating_sub(1) =>
+                {
+                    Some(crate::render::interaction::HitTarget::ModalItem {
+                        index: orig_idx - crate::modals::session_picker::HEADER_ROWS,
+                    })
+                }
+                _ => None,
+            };
+            if let Some(target) = target {
+                let height = item_end.saturating_sub(item_start);
+                if height > 0 {
+                    menu_hit_rows.push((item_start, height, target));
+                }
+            }
         }
+        let menu_window_start = selected_menu_rows
+            .as_ref()
+            .filter(|_| menu_rows > 0 && menu_cells.len() > menu_rows)
+            .map(|selected| {
+                if selected.end <= menu_rows {
+                    0
+                } else {
+                    selected
+                        .start
+                        .min(menu_cells.len().saturating_sub(menu_rows))
+                }
+            })
+            .unwrap_or(0);
+        menu_cells = menu_cells
+            .into_iter()
+            .skip(menu_window_start)
+            .take(menu_rows)
+            .collect();
+        menu_hit_rows.retain_mut(|(start, height, _)| {
+            let end = start.saturating_add(*height);
+            let window_end = menu_window_start.saturating_add(menu_rows);
+            let clipped_start = (*start).max(menu_window_start);
+            let clipped_end = end.min(window_end);
+            if clipped_start >= clipped_end {
+                return false;
+            }
+            *start = clipped_start - menu_window_start;
+            *height = clipped_end - clipped_start;
+            true
+        });
         // Attachment rows: `  └ [Image #N]` in muted gray, identical
         // visual treatment to the post-submit `UiLine::ImageAttachment`
         // echo. PAD_COL is the leading 2-space indent every body /
@@ -4949,6 +5413,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let attachment_cells: Vec<Vec<Cell>> = self
             .input_attachments
             .iter()
+            .take(attachment_rows)
             .map(|n| {
                 let mut row = Vec::new();
                 let pad = CellStyle::default();
@@ -4985,6 +5450,24 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.screen.draw_row(todo_top + i, 0, &padded);
         }
         let rules_top = footer_top + top_panel_rows;
+
+        if !approval_active && !hide_input_box && !ghost_active {
+            self.pending_interactions
+                .extend(composer_cells.iter().map(|cell| {
+                    crate::render::interaction::HitRegion {
+                        rect: crate::render::interaction::CellRect {
+                            row: (rules_top + 1 + cell.row.saturating_sub(input_view_start))
+                                .min(u16::MAX as usize) as u16,
+                            col: (2 + cell.col).min(u16::MAX as usize) as u16,
+                            height: 1,
+                            width: 1,
+                        },
+                        target: crate::render::interaction::HitTarget::ComposerByte {
+                            byte: cell.byte,
+                        },
+                    }
+                }));
+        }
 
         if hide_input_box {
             let mut border_rule = Vec::with_capacity(rule_width);
@@ -5069,11 +5552,25 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         let menu_top = attach_top + attachment_rows;
+        self.pending_interactions
+            .extend(
+                menu_hit_rows
+                    .into_iter()
+                    .map(
+                        |(relative_row, height, target)| crate::render::interaction::HitRegion {
+                            rect: crate::render::interaction::CellRect {
+                                row: (menu_top + relative_row).min(u16::MAX as usize) as u16,
+                                col: 0,
+                                height: height.min(u16::MAX as usize) as u16,
+                                width: w.min(u16::MAX as usize) as u16,
+                            },
+                            target,
+                        },
+                    ),
+            );
         let is_search_box_focused = matches!(
             menu_kind,
-            super::MenuKind::Plugin
-                | super::MenuKind::SessionList
-                | super::MenuKind::DirectoryList
+            super::MenuKind::Plugin | super::MenuKind::SessionList | super::MenuKind::DirectoryList
         ) && self
             .menu
             .as_ref()
@@ -5198,65 +5695,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
-    /// Single source of truth for the footer height formula so
-    /// `paint_footer`'s `total_rows` and `current_footer_rows` can never
-    /// drift.  Applies the approval-active suppression (input middle line +
-    /// bottom rule + status row are hidden while an approval panel is up)
-    /// then sums all the components.
-    fn footer_total_rows(
-        &self,
-        middle: usize,
-        command_output: usize,
-        attachment: usize,
-        menu: usize,
-        goal: usize,
-        todo: usize,
-        approval: usize,
-        status: usize,
-        hide_input_box: bool,
-    ) -> usize {
-        let approval_active = approval > 0;
-        let eff_middle = if approval_active || hide_input_box {
-            0
-        } else {
-            middle
-        };
-        let eff_bot_rule = if approval_active || hide_input_box {
-            0
-        } else {
-            1
-        };
-        let eff_status = if approval_active || hide_input_box {
-            0
-        } else {
-            status
-        };
-        let eff_top_rule = 1;
-        eff_top_rule
-            + eff_middle
-            + eff_bot_rule
-            + if approval_active || hide_input_box {
-                0
-            } else {
-                command_output
-            }
-            + attachment
-            + menu
-            + goal
-            + todo
-            + approval
-            + eff_status
-    }
-
     /// Footer total height — mirrors the computation inside
     /// `paint_footer` so `paint_body` knows where body_bottom lands.
     fn current_footer_rows(&self) -> usize {
         // Mirror paint_footer: input box is full-width (only "> " prefix), with
         // the same JediTerm last-column reserve so the wrapped ROW COUNT here
         // matches the actual render (else body_bottom is off by a row).
-        let prefix_and_reserve = if self.caps.jediterm { 3 } else { 2 };
         let screen_width = self.screen.width() as usize;
-        let text_budget = screen_width.saturating_sub(prefix_and_reserve);
+        let text_budget = crate::width::composer_text_width(screen_width, self.caps.jediterm);
         let rule_width = screen_width.saturating_sub(PAD_COL * 2);
         let safe = if self.input_buf.is_empty() {
             self.status
@@ -5311,17 +5757,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
             0
         };
         let pending_message_rows = self.build_pending_message_rows().len();
-        let top_panel_rows = pending_message_rows + subtask_rows + todo_rows;
         let attachment_rows = self.input_attachments.len();
         let command_output_rows = self.build_command_output_rows().len();
-        // Cap the input height (mirrors paint_footer) so a long paste / typed
-        // input can't make the footer exceed the screen.
-        let capped_middle = middle_rows.min(Self::max_input_rows(
-            h,
-            attachment_rows,
-            menu_rows,
-            status_rows + goal_rows + top_panel_rows + approval_rows + command_output_rows,
-        ));
+        let approval_active = self.approval_active();
         // 1 top rule + middle + 1 bot rule + attachments + menu + goal/loop + todo + approval + status.
         // (Spinner used to reserve a row here but now lives in body as
         // a live paragraph — see `push_or_update_live_spinner`.)
@@ -5335,33 +5773,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 | super::MenuKind::SessionList
                 | super::MenuKind::DirectoryList
         );
-        self.footer_total_rows(
-            capped_middle,
-            command_output_rows,
-            attachment_rows,
-            menu_rows,
-            goal_rows,
-            top_panel_rows,
-            approval_rows,
-            status_rows,
-            hide_input_box,
-        )
-    }
-
-    /// Max rows the input box may DISPLAY before scrolling internally. Bounds
-    /// the footer to leave the rule rows, any attachment/menu/status chrome,
-    /// and at least one body row — so the footer never exceeds the screen no
-    /// matter how long the input is. Also capped to `MAX_INPUT_ROWS` so a huge
-    /// paste can't take the whole screen on tall terminals.
-    fn max_input_rows(
-        h: usize,
-        attachment_rows: usize,
-        menu_rows: usize,
-        status_rows: usize,
-    ) -> usize {
-        // top rule + bot rule + chrome, plus one reserved body row.
-        let reserved = 2 + attachment_rows + menu_rows + status_rows + 1;
-        h.saturating_sub(reserved).min(MAX_INPUT_ROWS).max(1)
+        FooterRows {
+            approval_active,
+            middle: middle_rows.min(MAX_INPUT_ROWS),
+            command_output: command_output_rows,
+            attachment: attachment_rows,
+            menu: menu_rows,
+            goal: goal_rows,
+            pending: pending_message_rows,
+            subtask: subtask_rows,
+            todo: todo_rows,
+            approval: approval_rows,
+            status: status_rows,
+        }
+        .fit(h, hide_input_box)
+        .total(hide_input_box)
     }
 
     /// Build the transient Codex-style pending-message panel shown above the
@@ -5553,11 +5979,33 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// rows where prior footer cells lived — wiping the body row
     /// we just wrote there.
     fn paint_frame(&mut self) {
+        self.pending_interactions.clear();
+        self.pending_copy_runs.clear();
         self.paint_body_into_cells();
         self.paint_footer();
         // Overlay modal drawn on top of body+footer so the diff sees
         // the combined frame. When modal_overlay is None this is a no-op.
         if let Some(ref overlay) = self.modal_overlay {
+            let overlay_rect = crate::render::interaction::CellRect {
+                row: overlay.y,
+                col: overlay.x,
+                height: overlay.cells.len().min(u16::MAX as usize) as u16,
+                width: overlay
+                    .cells
+                    .iter()
+                    .map(Vec::len)
+                    .max()
+                    .unwrap_or(0)
+                    .min(u16::MAX as usize) as u16,
+            };
+            self.pending_interactions.retain(|region| {
+                !matches!(
+                    region.target,
+                    crate::render::interaction::HitTarget::TranscriptByte { .. }
+                ) || !region.rect.intersects(overlay_rect)
+            });
+            self.pending_copy_runs
+                .retain(|run| !run.rect.intersects(overlay_rect));
             for (dy, row) in overlay.cells.iter().enumerate() {
                 self.screen
                     .draw_row(overlay.y as usize + dy, overlay.x as usize, row);
@@ -5805,8 +6253,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // newest permanent tail visible beneath the pinned logical top. The
         // resulting middle omission is recorded by
         // `live_spinner_tail_compacted` and restored before any permanent push.
-        let mut rows: Vec<Vec<Cell>> = if permanent_visible <= permanent_slots {
-            self.body_lines[self.scrolled_off..permanent_end].to_vec()
+        let explicit_scroll_start = self
+            .body_scroll_start
+            .map(|start| start.min(display_total.saturating_sub(body_height)));
+        let mut visible_indices: Vec<usize> = if let Some(start) = explicit_scroll_start {
+            self.live_spinner_tail_compacted = false;
+            self.user_input_tail_compacted = false;
+            (start..start.saturating_add(body_height).min(display_total)).collect()
+        } else if permanent_visible <= permanent_slots {
+            (self.scrolled_off..permanent_end).collect()
         } else if permanent_slots == 0 {
             Vec::new()
         } else if transient_rows == 0 && !compact_for_user_input {
@@ -5814,7 +6269,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 .scrolled_off
                 .saturating_add(permanent_slots)
                 .min(permanent_end);
-            self.body_lines[self.scrolled_off..continuous_end].to_vec()
+            (self.scrolled_off..continuous_end).collect()
         } else {
             // Pin only physical row 0 (`body_lines[scrolled_off]`, required
             // for overflow-LF alignment) and draw the newest
@@ -5830,12 +6285,120 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let tail_slots = permanent_slots.saturating_sub(prefix_slots);
             let prefix_end = self.scrolled_off.saturating_add(prefix_slots);
             let tail_start = permanent_end.saturating_sub(tail_slots);
-            let mut visible = self.body_lines[self.scrolled_off..prefix_end].to_vec();
-            visible.extend_from_slice(&self.body_lines[tail_start..permanent_end]);
+            let mut visible: Vec<usize> = (self.scrolled_off..prefix_end).collect();
+            visible.extend(tail_start..permanent_end);
             visible
         };
-        if transient_rows > 0 {
-            rows.extend_from_slice(&self.body_lines[display_total - transient_rows..display_total]);
+        if transient_rows > 0 && explicit_scroll_start.is_none() {
+            visible_indices.extend(display_total - transient_rows..display_total);
+        }
+        let mut rows: Vec<Vec<Cell>> = visible_indices
+            .iter()
+            .map(|index| self.body_lines[*index].clone())
+            .collect();
+        // Copy-run hit regions only matter for VISIBLE rows. Map each visible body index
+        // to its painted row (O(viewport)) and restrict the scan to the runs whose
+        // body_index falls in the visible span — `body_copy_runs` is sorted ascending by
+        // body_index, so a `partition_point` bounds it. This keeps the two loops below
+        // O(visible runs) instead of O(entire scrollback × viewport) per frame, which was
+        // the dominant per-keystroke cost with a long transcript (up to ~5000 runs × the
+        // viewport, every 5ms frame while typing).
+        let visible_row_of: std::collections::HashMap<usize, usize> = visible_indices
+            .iter()
+            .enumerate()
+            .map(|(row, body_index)| (*body_index, row))
+            .collect();
+        debug_assert!(
+            self.body_copy_runs
+                .windows(2)
+                .all(|w| w[0].body_index <= w[1].body_index),
+            "body_copy_runs must stay sorted by body_index for partition_point"
+        );
+        let visible_run_slice = {
+            let lo = visible_indices.iter().copied().min().unwrap_or(0);
+            let hi = visible_indices.iter().copied().max().unwrap_or(0);
+            let start = self
+                .body_copy_runs
+                .partition_point(|run| run.body_index < lo);
+            let end = self
+                .body_copy_runs
+                .partition_point(|run| run.body_index <= hi);
+            start..end
+        };
+        for run in &self.body_copy_runs[visible_run_slice.clone()] {
+            let Some(&row) = visible_row_of.get(&run.body_index) else {
+                continue;
+            };
+            let width = crate::width::display_width(&run.text).max(1);
+            let rect = crate::render::interaction::CellRect {
+                row: row.min(u16::MAX as usize) as u16,
+                col: run.col.min(u16::MAX as usize) as u16,
+                height: 1,
+                width: width.min(u16::MAX as usize) as u16,
+            };
+            self.pending_copy_runs
+                .push(crate::render::interaction::CopyRun {
+                    id: run.id,
+                    rect,
+                    text: run.text.clone(),
+                    soft_wrap: run.soft_wrap,
+                    next_run_id: run.next_run_id,
+                });
+        }
+        let transcript_selection = self
+            .interaction_publisher
+            .projected_transcript_selection(&self.pending_copy_runs);
+        for run in &self.body_copy_runs[visible_run_slice.clone()] {
+            let Some(&row) = visible_row_of.get(&run.body_index) else {
+                continue;
+            };
+            let mut col = run.col;
+            for (byte, grapheme) in run.text.grapheme_indices(true) {
+                let cell_width = if grapheme == "\t" {
+                    crate::render::cell::SOFT_TAB_WIDTH
+                } else {
+                    crate::width::display_width(grapheme)
+                };
+                for offset in 0..cell_width.max(1) {
+                    if transcript_selection.as_ref().is_some_and(|selection| {
+                        let (start, end) = if (selection.anchor.run_id, selection.anchor.byte)
+                            <= (selection.head.run_id, selection.head.byte)
+                        {
+                            (selection.anchor, selection.head)
+                        } else {
+                            (selection.head, selection.anchor)
+                        };
+                        selection.run_ids.contains(&run.id)
+                            && (run.id, byte) < (end.run_id, end.byte)
+                            && (start.run_id, start.byte) < (run.id, byte + grapheme.len())
+                    }) {
+                        if let Some(cell) = rows
+                            .get_mut(row)
+                            .and_then(|cells| cells.get_mut(col + offset))
+                        {
+                            cell.style.reverse = true;
+                        }
+                    }
+                    self.pending_interactions
+                        .push(crate::render::interaction::HitRegion {
+                            rect: crate::render::interaction::CellRect {
+                                row: row.min(u16::MAX as usize) as u16,
+                                col: (col + offset).min(u16::MAX as usize) as u16,
+                                height: 1,
+                                width: 1,
+                            },
+                            target: crate::render::interaction::HitTarget::TranscriptByte {
+                                run_id: run.id,
+                                byte: if offset * 2 < cell_width.max(1) {
+                                    byte
+                                } else {
+                                    byte + grapheme.len()
+                                },
+                            },
+                        });
+                }
+                col += cell_width;
+            }
         }
         for (i, row) in rows.iter().enumerate() {
             let clipped = clip_cells_to_width(row, body_width);
@@ -5879,6 +6442,37 @@ impl<W: Write + Send> RetainedRenderer<W> {
         visible_len.min(cap) as u16
     }
 
+    fn body_scroll_bottom_start(&self) -> usize {
+        let body_height =
+            (self.screen.height() as usize).saturating_sub(self.current_footer_rows());
+        self.body_lines.len().saturating_sub(body_height)
+    }
+
+    fn set_body_scroll_start(&mut self, start: usize) {
+        let bottom = self.body_scroll_bottom_start();
+        let start = start.min(bottom);
+        let next = if start == bottom { None } else { Some(start) };
+        if self.body_scroll_start == next {
+            // TaskRenderer invalidates the old hit map before every queued
+            // viewport command. Even a clamped wheel/top/bottom request must
+            // therefore repaint once and republish the unchanged coordinates;
+            // returning silently here would leave pointer input fail-closed
+            // until some unrelated frame happens to render.
+            self.dirty = true;
+            self.flush_deferred();
+            return;
+        }
+        self.body_scroll_start = next;
+        if next.is_none() {
+            // Native append/LF continues while an explicit history view is
+            // pinned. Rejoin its retained live-tail projection at the bounded
+            // logical start without replaying any already-emitted row.
+            self.scrolled_off = self.scrolled_off.max(bottom);
+        }
+        self.dirty = true;
+        self.flush_deferred();
+    }
+
     /// 1-indexed row where the NEXT body emit would land. When the
     /// visible body still has room, this is `visible_body_len + 1`.
     /// Once the visible body fills the viewport, this saturates at the
@@ -5919,8 +6513,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // A legacy-conhost resize first rebuilds the retained model without
         // terminal I/O. A bounded physical-row suffix is emitted once after
         // the semantic replay completes.
-        if (self.replaying
-            && (self.caps.legacy_conhost || self.history_replay_max_rows.is_some()))
+        if (self.replaying && (self.caps.legacy_conhost || self.history_replay_max_rows.is_some()))
             || self.initial_history_replay_active
         {
             return;
@@ -6288,6 +6881,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if self.body_lines.len() > MAX_SCROLLBACK_ROWS {
             let drain = self.body_lines.len() - MAX_SCROLLBACK_ROWS;
             self.body_lines.drain(0..drain);
+            self.body_copy_runs.retain(|run| run.body_index >= drain);
+            for run in &mut self.body_copy_runs {
+                run.body_index -= drain;
+            }
             self.message_marks.retain(|m| m.line_idx >= drain);
             for m in self.message_marks.iter_mut() {
                 m.line_idx -= drain;
@@ -6299,11 +6896,57 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // to native scrollback once `body_lines` exceeds
             // MAX_SCROLLBACK_ROWS ≫ visible cap).
             self.scrolled_off = self.scrolled_off.saturating_sub(drain);
+            self.body_scroll_start = self
+                .body_scroll_start
+                .map(|start| start.saturating_sub(drain));
             // welcome_line_count is also a front-anchored index; keep
             // it consistent or `reflow_welcome_prefix.splice(0..wlc)`
             // would later splice over non-welcome rows.
             self.welcome_line_count = self.welcome_line_count.saturating_sub(drain);
         }
+        if self.body_scroll_start.is_some() {
+            // The eager append above must still feed the host's native
+            // scrollback, but its LF physically shifts the whole terminal.
+            // Repaint the explicitly pinned projection in the same render
+            // operation so streaming cannot visibly drag the user's history
+            // viewport or leave the footer one row out of place until the
+            // next heartbeat.
+            self.paint_frame();
+            self.flush_frame();
+        }
+    }
+
+    fn truncate_body_lines(&mut self, len: usize) {
+        self.body_lines.truncate(len);
+        self.body_copy_runs.retain(|run| run.body_index < len);
+    }
+
+    fn push_copyable_body_row(
+        &mut self,
+        row: Vec<Cell>,
+        text: String,
+        col: usize,
+        soft_wrap: bool,
+    ) {
+        self.push_body_row(row);
+        let Some(body_index) = self.body_lines.len().checked_sub(1) else {
+            return;
+        };
+        let id = self.next_copy_run_id;
+        self.next_copy_run_id = self.next_copy_run_id.saturating_add(1);
+        if let Some(previous) = self.body_copy_runs.last_mut().filter(|previous| {
+            previous.soft_wrap && previous.body_index.saturating_add(1) == body_index
+        }) {
+            previous.next_run_id = Some(id);
+        }
+        self.body_copy_runs.push(BodyCopyRun {
+            id,
+            body_index,
+            col,
+            text: Arc::from(text),
+            soft_wrap,
+            next_run_id: None,
+        });
     }
 
     /// Record the start of a new logical message in `message_marks`.
@@ -6411,7 +7054,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 remove,
                 self.scrolled_off
             );
-            self.body_lines.truncate(self.body_lines.len() - remove);
+            self.truncate_body_lines(self.body_lines.len() - remove);
             self.inflight_tool_rows = 0;
             if bottom_before_truncate > 0 && remove > 0 {
                 // Erase ALL terminal rows previously occupied by the
@@ -6542,12 +7185,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // trailing `\n` — that's a meaningful "give me a separator"
         // signal at the call site, not noise.
         for phys in text.split('\n') {
-            for chunk in crate::width::wrap_line_to_width(phys, w) {
+            let chunks = crate::width::wrap_line_to_width(phys, w);
+            let chunk_count = chunks.len();
+            for (index, chunk) in chunks.into_iter().enumerate() {
                 let mut row = Vec::new();
                 let pad = CellStyle::default();
                 push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
                 push_str_cells(&mut row, &chunk, style);
-                self.push_body_row(row);
+                self.push_copyable_body_row(
+                    row,
+                    chunk.to_string(),
+                    PAD_COL,
+                    index + 1 < chunk_count,
+                );
             }
         }
     }
@@ -6575,11 +7225,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         for phys in text.split('\n') {
             let mut style = CellStyle::default();
-            for chunk in crate::width::wrap_line_to_width(phys, w) {
+            let chunks = crate::width::wrap_line_to_width(phys, w);
+            let chunk_count = chunks.len();
+            for (index, chunk) in chunks.into_iter().enumerate() {
                 let mut row = Vec::new();
                 push_str_cells(&mut row, &" ".repeat(PAD_COL), &CellStyle::default());
                 style = crate::render::cell::push_str_cells_sgr(&mut row, &chunk, style);
-                self.push_body_row(row);
+                let text = crate::sanitize::scrub_controls(&chunk);
+                self.push_copyable_body_row(row, text, PAD_COL, index + 1 < chunk_count);
             }
         }
     }
@@ -6602,9 +7255,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         body: &str,
         body_style: &CellStyle,
     ) {
-        let rows = self.build_prefixed_rows(prefix, prefix_style, body, body_style, None);
-        for row in rows {
-            self.push_body_row(row);
+        let rows =
+            self.build_prefixed_rows_with_semantics(prefix, prefix_style, body, body_style, None);
+        for (row, soft_wrap, text) in rows {
+            self.push_copyable_body_row(row, text, 0, soft_wrap);
         }
     }
 
@@ -6624,6 +7278,20 @@ impl<W: Write + Send> RetainedRenderer<W> {
         body_style: &CellStyle,
         cont: Option<(&str, &CellStyle)>,
     ) -> Vec<Vec<Cell>> {
+        self.build_prefixed_rows_with_semantics(prefix, prefix_style, body, body_style, cont)
+            .into_iter()
+            .map(|(row, _, _)| row)
+            .collect()
+    }
+
+    fn build_prefixed_rows_with_semantics(
+        &self,
+        prefix: &str,
+        prefix_style: &CellStyle,
+        body: &str,
+        body_style: &CellStyle,
+        cont: Option<(&str, &CellStyle)>,
+    ) -> Vec<(Vec<Cell>, bool, String)> {
         // Downgrade decorative glyphs (the `●`/`▸` prefixes AND any glyphs in the body)
         // on non-unicode terminals — 1-col ASCII stand-ins keep prefix_w alignment.
         let u = self.caps.unicode_symbols;
@@ -6646,7 +7314,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 .into_iter()
                 .map(|c| c.to_string())
                 .collect();
-            for chunk in &chunks {
+            for (chunk_index, chunk) in chunks.iter().enumerate() {
                 let mut row = Vec::new();
                 if !first_emitted {
                     push_str_cells(&mut row, prefix, prefix_style);
@@ -6656,7 +7324,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     push_str_cells(&mut row, cp, cs);
                 }
                 push_str_cells(&mut row, chunk.as_str(), body_style);
-                rows.push(row);
+                let row_text = if rows.is_empty() {
+                    format!("{prefix}{chunk}")
+                } else {
+                    let (cp, _) = cont.unwrap_or((blank_pad.as_str(), &pad_style));
+                    format!("{cp}{chunk}")
+                };
+                rows.push((row, chunk_index + 1 < chunks.len(), row_text));
             }
         }
         rows
@@ -6834,15 +7508,31 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 return;
             }
         }
+        let semantic = crate::sanitize::scrub_controls(rendered);
+        let semantic_lines: Vec<Vec<String>> = semantic
+            .split('\n')
+            .map(|line| {
+                crate::width::wrap_line_to_width(line, w)
+                    .into_iter()
+                    .map(|chunk| chunk.to_string())
+                    .collect()
+            })
+            .collect();
         let lines_of_cells = parse_markdown_to_cells(rendered);
-        for line_cells in lines_of_cells {
+        for (line_index, line_cells) in lines_of_cells.into_iter().enumerate() {
             let chunks = wrap_cells_to_width(&line_cells, w);
-            for chunk in chunks {
+            let chunk_count = chunks.len();
+            for (index, chunk) in chunks.into_iter().enumerate() {
                 let mut row = Vec::new();
                 let pad = CellStyle::default();
                 push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
                 row.extend(chunk);
-                self.push_body_row(row);
+                let text = semantic_lines
+                    .get(line_index)
+                    .and_then(|line| line.get(index))
+                    .cloned()
+                    .unwrap_or_else(|| copy_text_from_body_row(&row).0);
+                self.push_copyable_body_row(row, text, PAD_COL, index + 1 < chunk_count);
             }
         }
     }
@@ -7239,7 +7929,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Drop pre-reflow body + all state derived from it; the replay
         // rebuilds every field from scratch at the new width.
         self.body_lines.clear();
+        self.body_copy_runs.clear();
         self.scrolled_off = 0;
+        self.body_scroll_start = None;
         self.welcome_line_count = 0;
         self.welcome_banner = None;
         self.message_marks.clear();
@@ -7388,7 +8080,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             "Subagents"
         };
-        let marker = if self.caps.unicode_symbols { "●" } else { "*" };
+        let marker = if self.caps.unicode_symbols {
+            "●"
+        } else {
+            "*"
+        };
         let header = if finished && terminal >= progress.total {
             format!(
                 "{marker} {kind} · {terminal}/{} finished · {failed} failed",
@@ -7474,11 +8170,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         (header_row, child_rows)
     }
 
-    fn render_agent_group(
-        &mut self,
-        progress: crate::render::SubtaskProgress,
-        finished: bool,
-    ) {
+    fn render_agent_group(&mut self, progress: crate::render::SubtaskProgress, finished: bool) {
         let projection_id = progress.call_id.clone();
         let (header, children) = self.agent_group_rows(&progress, finished);
         if self.frozen_agent_groups.contains(&projection_id) {
@@ -7580,6 +8272,30 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.live_agent_groups.clear();
         self.frozen_agent_groups.clear();
     }
+
+    fn disable_mouse_capture(&mut self) {
+        if self.caps.mouse_sgr {
+            if self.mouse_capture_enabled {
+                if self.out.write_all(b"\x1b[?1002l\x1b[?1006l").is_ok() {
+                    self.mouse_capture_enabled = false;
+                }
+            }
+        } else {
+            // Keep the pre-capability defensive reset byte-for-byte for all
+            // unsupported terminals and Gate 0 fixtures.
+            let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l");
+        }
+    }
+
+    fn enable_mouse_capture(&mut self) {
+        if self.caps.mouse_sgr && !self.mouse_capture_enabled {
+            // Mark ownership even if the best-effort write fails: a partial
+            // write may already have armed button-event tracking, so Drop
+            // must still emit the matching defensive disable sequence.
+            self.mouse_capture_enabled = true;
+            let _ = self.out.write_all(b"\x1b[?1002h\x1b[?1006h");
+        }
+    }
 }
 
 impl<W: Write + Send> Renderer for RetainedRenderer<W> {
@@ -7620,6 +8336,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // served its purpose — clear it so the user sees a clean input
                 // prompt, not a stale `⠋ Pondering…` row above the input box.
                 self.clear_live_spinner();
+                self.update_interaction_surface(&buf, menu.as_ref());
                 self.input_buf = buf;
                 self.input_cursor_byte = cursor_byte;
                 self.menu = menu;
@@ -7636,6 +8353,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 attachments,
             } => {
                 // Input box / status / menu still belong in the footer.
+                self.update_interaction_surface(&buf, menu.as_ref());
                 self.input_buf = buf;
                 self.input_cursor_byte = cursor_byte;
                 self.menu = menu;
@@ -7690,6 +8408,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // after this event, so mirror that state synchronously.
                 self.input_buf.clear();
                 self.input_cursor_byte = 0;
+                self.update_interaction_surface("", None);
                 self.menu = None;
                 self.input_attachments.clear();
                 self.dirty = true;
@@ -8654,9 +9373,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn shutdown(&mut self) {
-        // Disable mouse capture (button-event + SGR coordinates) so the
-        // terminal returns to default mouse behavior when atomcode exits.
-        let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l");
+        self.disable_mouse_capture();
         let _ = self.out.flush();
         // Drain any pending frame before exit so the user sees the
         // latest widget state (typically a final prompt or an error
@@ -8738,7 +9455,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // keeps the next render_diff from emitting a nested DECSET 2026 envelope.
         self.screen.set_sync_suppressed(self.in_sync_batch);
         self.body_lines.clear();
+        self.body_copy_runs.clear();
         self.scrolled_off = 0;
+        self.body_scroll_start = None;
         self.welcome_line_count = 0;
         // Fresh session (`/clear`, `/session`): forget the cached welcome banner
         // AND the rolled tip selection so the next welcome rolls new tips. (A
@@ -8847,26 +9566,25 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
     fn suspend_for_external(&mut self) {
         // Disable mouse capture so the external child process (OAuth browser,
-        // shell prompt, etc.) runs with a clean terminal state. Disable order:
-        // SGR first, then button-event. Mouse mode must be off before
-        // raw_mode is disabled, so the child process sees the terminal with
-        // mouse disabled.
-        let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l"); // Position cursor at the top of where the footer (input box +
-                                                               // status + menu) used to be, then clear from there to end of
-                                                               // screen. Without this, cursor stays wherever the last paint
-                                                               // left it — usually inside the footer area — and the child's
-                                                               // first stdout write lands ON TOP of footer rows, with later
-                                                               // writes scrolling existing body content up through the
-                                                               // overlap. Symptom: `/login`'s OAuth URL printed at row 1
-                                                               // overlapping prior scrollback ("Press ESC to cancelh lines?"
-                                                               // — our line glued onto an old conversation row).
-                                                               //
-                                                               // Sequence: release DECSTBM, CUP to (body_bottom+1, col 1),
-                                                               // ED 0 (cursor → end of screen), enable autowrap. After this
-                                                               // the child writes into a clean rectangle below the body,
-                                                               // and as it produces more lines the terminal scrolls naturally
-                                                               // (no scroll region active, autowrap on) — which is exactly
-                                                               // the cooked-mode shell experience users expect.
+        // shell prompt, etc.) runs with a clean terminal state. Mouse mode
+        // must be off before raw_mode is disabled, so the child process sees
+        // the terminal with mouse disabled.
+        self.disable_mouse_capture(); // Position cursor at the top of where the footer (input box +
+                                      // status + menu) used to be, then clear from there to end of
+                                      // screen. Without this, cursor stays wherever the last paint
+                                      // left it — usually inside the footer area — and the child's
+                                      // first stdout write lands ON TOP of footer rows, with later
+                                      // writes scrolling existing body content up through the
+                                      // overlap. Symptom: `/login`'s OAuth URL printed at row 1
+                                      // overlapping prior scrollback ("Press ESC to cancelh lines?"
+                                      // — our line glued onto an old conversation row).
+                                      //
+                                      // Sequence: release DECSTBM, CUP to (body_bottom+1, col 1),
+                                      // ED 0 (cursor → end of screen), enable autowrap. After this
+                                      // the child writes into a clean rectangle below the body,
+                                      // and as it produces more lines the terminal scrolls naturally
+                                      // (no scroll region active, autowrap on) — which is exactly
+                                      // the cooked-mode shell experience users expect.
         let body_bottom = self.body_bottom_row();
         let position_row = body_bottom.saturating_add(1);
         let seq = format!("\x1b[r\x1b[{};1H\x1b[J\x1b[?7h", position_row);
@@ -8966,14 +9684,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
         }
         let _ = self.out.flush();
-        // Mouse capture intentionally NOT re-enabled on resume. We deferred
-        // mouse wheel / cmd+drag selection / cmd+C copy to the terminal's
-        // native handling at startup (see with_writer comment), so resume
-        // must keep that contract — re-enabling here would suddenly steal
-        // wheel events back from the terminal after the user returned from
-        // an external subprocess. The matching disable in
-        // suspend_for_external is still emitted so any subprocess that
-        // somehow turned capture on during its run gets cleaned up here.
+        self.enable_mouse_capture();
         let _ = self.out.flush();
     }
 
@@ -8990,6 +9701,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // paint here.
         if self.dirty {
             let t0 = std::time::Instant::now();
+            let interaction_authority = self.interaction_publisher.worker_authority().unwrap_or((
+                self.interaction_publisher.current_epoch(),
+                self.interaction_surface_session,
+            ));
             let footer_rows = self.current_footer_rows();
             // Track footer_rows for diagnostic / resize code paths.
             // We DON'T call `screen.invalidate()` here — invalidate
@@ -9002,9 +9717,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             // patch against them → ghost text on screen). Letting
             // the real prev→current diff run produces the correct
             // erase patches naturally.
-            if footer_rows != self.last_painted_footer_rows {
-                self.last_painted_footer_rows = footer_rows;
-            }
             let has_status = !self.status.model.is_empty()
                 || !self.status.cwd.is_empty()
                 || self.status.hint.is_some();
@@ -9040,17 +9752,44 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             // (~1-2KB) incur 2-4 chunks. Still single-digit ms.
             const CHUNK: usize = 512;
             let mut offset = 0;
+            let mut frame_written = true;
             while offset < bytes.len() {
                 let end = (offset + CHUNK).min(bytes.len());
-                let _ = self.out.write_all(&bytes[offset..end]);
+                if self.out.write_all(&bytes[offset..end]).is_err() {
+                    frame_written = false;
+                    break;
+                }
                 if end < bytes.len() {
                     // Inter-chunk flush; the final-chunk flush is at
                     // the end of this method.
-                    let _ = self.out.flush();
+                    if self.out.flush().is_err() {
+                        frame_written = false;
+                        break;
+                    }
                 }
                 offset = end;
             }
-            self.dirty = false;
+            if frame_written {
+                frame_written = self.out.flush().is_ok();
+            }
+            if frame_written {
+                self.last_painted_footer_rows = footer_rows;
+                let _ = self.interaction_publisher.publish_frame_if_current(
+                    interaction_authority.0,
+                    interaction_authority.1,
+                    self.pending_interactions.clone(),
+                    self.pending_copy_runs.clone(),
+                );
+                self.dirty = false;
+            } else {
+                // `render_diff` already advanced its cell cache. Force the next
+                // successful retry to repaint the whole frame before publishing
+                // its hit map, because the terminal may have received no bytes
+                // or only a partial chunk.
+                self.screen.invalidate();
+                self.interaction_publisher.fail_closed();
+                self.dirty = true;
+            }
             // Diagnostic: count how many cells on the bot_rule row
             // (screen_h - 2, 0-indexed) actually hold '─'. bot_rule
             // sits at a constant absolute row regardless of middle
@@ -9081,34 +9820,38 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 t0.elapsed().as_micros()
             );
         }
-        let _ = self.out.flush();
+        if !self.dirty {
+            let _ = self.out.flush();
+        }
     }
 
-    fn scroll_body(&mut self, _delta: i32) {
-        // No-op by design. After the append-only refactor body rows
-        // live in the host terminal's native scrollback once they
-        // scroll off the visible region, so vertical navigation is the
-        // terminal's job.
-        //
-        // Mouse capture is now intentionally disabled at startup
-        // (see `with_writer`), so crossterm never emits Event::Mouse
-        // events on stdin and this method effectively never gets
-        // called from interactive use. The terminal handles wheel
-        // ticks directly — scrollback via plain wheel, native
-        // selection via drag, copy via cmd+C — which is the whole
-        // point of the trade-off.
-        //
-        // See regression test `retained_scroll_body_is_noop_to_preserve_native_scrollback`.
+    fn force_repaint(&mut self) {
+        // The host terminal may have dropped visible updates while unfocused,
+        // but our diff cache still describes the last frame as painted. Make
+        // the next diff cold-start from blank cells and emit the authoritative
+        // retained body/footer/modal projection immediately.
+        self.screen.invalidate();
+        self.dirty = true;
+        self.flush_deferred();
+    }
+
+    fn scroll_body(&mut self, delta: i32) {
+        let bottom = self.body_scroll_bottom_start();
+        let current = self.body_scroll_start.unwrap_or(bottom);
+        let next = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            current.saturating_add(delta as usize).min(bottom)
+        };
+        self.set_body_scroll_start(next);
     }
 
     fn scroll_body_to_top(&mut self) {
-        // No-op: terminal-native scrollback handles vertical navigation
-        // after the append-only refactor.
+        self.set_body_scroll_start(0);
     }
 
     fn scroll_body_to_bottom(&mut self) {
-        // No-op: terminal-native scrollback handles vertical navigation
-        // after the append-only refactor.
+        self.set_body_scroll_start(self.body_scroll_bottom_start());
     }
 
     fn scroll_to_prev_message(&mut self) {
@@ -9311,6 +10054,21 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let _ = self.out.flush();
         crate::tuix_trace!("RSZ", "done");
         self.last_painted_footer_rows = self.current_footer_rows();
+        // Publish the freshly-painted hit map under the current authority so
+        // pointer input isn't left fail-closed after a resize until some unrelated
+        // frame happens to render (mirrors `set_body_scroll_start`'s republish).
+        // `publish_frame_if_current` is authority-gated, so a resize that raced
+        // ahead (epoch already bumped again) still fails closed.
+        let interaction_authority = self.interaction_publisher.worker_authority().unwrap_or((
+            self.interaction_publisher.current_epoch(),
+            self.interaction_surface_session,
+        ));
+        let _ = self.interaction_publisher.publish_frame_if_current(
+            interaction_authority.0,
+            interaction_authority.1,
+            self.pending_interactions.clone(),
+            self.pending_copy_runs.clone(),
+        );
         self.dirty = false;
     }
 }
@@ -9343,9 +10101,14 @@ impl<W: Write + Send> Drop for RetainedRenderer<W> {
         // (DevEco/IDEA) that armed state turns every mouse move into input-box
         // gibberish, so a panic here must never push. Popping a level we never
         // pushed is a harmless no-op (empty kitty stack).
-        let _ = self
-            .out
-            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r");
+        if self.caps.mouse_sgr {
+            self.disable_mouse_capture();
+            let _ = self.out.write_all(b"\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r");
+        } else {
+            let _ = self
+                .out
+                .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[<1u\x1b[?25h\x1b[?7h\x1b[r");
+        }
         let _ = self.out.flush();
     }
 }
@@ -9445,6 +10208,108 @@ fn spinner_meta_suffix(label: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combined_footer_widgets_fit_short_terminal() {
+        let rows = FooterRows {
+            approval_active: false,
+            middle: 4,
+            command_output: 2,
+            attachment: 2,
+            menu: 4,
+            goal: 1,
+            pending: 3,
+            subtask: 7,
+            todo: 0,
+            approval: 0,
+            status: 1,
+        }
+        .fit(8, false);
+
+        assert!(rows.total(false) <= 8);
+        assert_eq!(rows.middle, 4, "composer rows are preserved first");
+        assert_eq!(rows.command_output, 0);
+        assert_eq!(rows.pending, 0);
+        assert_eq!(rows.subtask, 0);
+    }
+
+    #[test]
+    fn footer_budget_keeps_one_composer_row_at_minimum() {
+        let rows = FooterRows {
+            middle: 6,
+            menu: 10,
+            status: 1,
+            ..FooterRows::default()
+        }
+        .fit(3, false);
+
+        assert_eq!(rows.total(false), 3);
+        assert_eq!(rows.middle, 1);
+        assert_eq!(rows.menu, 0);
+    }
+
+    #[test]
+    fn approval_state_survives_when_tiny_screen_hides_all_modal_rows() {
+        let rows = FooterRows {
+            approval_active: true,
+            middle: 6,
+            approval: 3,
+            status: 1,
+            ..FooterRows::default()
+        }
+        .fit(1, false);
+
+        assert!(rows.approval_active);
+        assert_eq!(rows.approval, 0);
+        assert_eq!(rows.total(false), 1);
+    }
+
+    #[test]
+    fn combined_footer_paint_keeps_input_and_cursor_on_short_screen() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (mut renderer, _buf) = new_capturing(120, 40);
+        let mut status = status_basic();
+        status.pending_messages = (0..4).map(|i| format!("pending-{i}")).collect();
+        status.command_output = Some("usage one\nusage two".into());
+        status.subtasks = Some(SubtaskProgress {
+            call_id: "resize-run".into(),
+            completed: 0,
+            total: 4,
+            items: (0..4)
+                .map(|i| SubtaskItem {
+                    label: format!("worker#{i}"),
+                    description: "inspect the resized layout".into(),
+                    model: "test-model".into(),
+                    activity: "running".into(),
+                    started_at: None,
+                    output_tokens: 0,
+                    status: SubtaskStatus::Running,
+                })
+                .collect(),
+        });
+        let menu = MenuPayload {
+            items: (0..8)
+                .map(|i| (format!("/command-{i}"), "description".into()))
+                .collect(),
+            selected: 0,
+            kind: crate::render::MenuKind::SlashCommand,
+        };
+        renderer.render(UiLine::InputPrompt {
+            buf: "visible input".into(),
+            cursor_byte: "visible input".len(),
+            menu: Some(menu),
+            status,
+            attachments: vec![1, 2],
+        });
+        renderer.flush_deferred();
+        renderer.on_resize(50, 8);
+
+        assert!(renderer.current_footer_rows() <= 8);
+        let (row, col) = renderer.screen.peek_cursor().expect("composer cursor");
+        assert!((1..=8).contains(&row));
+        assert!((1..=50).contains(&col));
+    }
     use crate::render::{BadgeColour, ModeBadge};
     use crate::terminal::{EnvView, TerminalCaps};
     use std::sync::{
@@ -9541,8 +10406,14 @@ mod tests {
             100,
             true,
         );
-        assert!(row.contains("查询长沙未来30天的天气预报…"), "first line: {row}");
-        assert!(!row.contains("表格展示"), "details stay out of footer: {row}");
+        assert!(
+            row.contains("查询长沙未来30天的天气预报…"),
+            "first line: {row}"
+        );
+        assert!(
+            !row.contains("表格展示"),
+            "details stay out of footer: {row}"
+        );
         assert!(!row.contains('\n'), "footer preview is one line: {row}");
     }
 
@@ -9589,11 +10460,11 @@ mod tests {
         );
         assert!(!row.is_empty(), "paused row must be non-empty: {row}");
         assert!(row.contains("暂停"), "pause text present: {row}");
+        assert!(row.contains("继续对话即推进"), "resume hint present: {row}");
         assert!(
-            row.contains("继续对话即推进"),
-            "resume hint present: {row}"
+            row.contains("已达 5 轮"),
+            "round substitution locked: {row}"
         );
-        assert!(row.contains("已达 5 轮"), "round substitution locked: {row}");
     }
 
     #[test]
@@ -9776,6 +10647,904 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    struct SwitchableFailSink(Arc<std::sync::atomic::AtomicBool>);
+    impl Write for SwitchableFailSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.0.load(Ordering::Relaxed) {
+                Err(std::io::Error::other("frame write rejected"))
+            } else {
+                Ok(bytes.len())
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.0.load(Ordering::Relaxed) {
+                Err(std::io::Error::other("frame flush rejected"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn on_resize_republishes_pointer_hit_map_after_epoch_invalidation() {
+        // After a resize the epoch is invalidated (worker sets actionable=false)
+        // and on_resize repaints the frame. It must REPUBLISH the fresh hit map,
+        // else pointer input stays fail-closed until an unrelated frame renders —
+        // parity with the scroll path (set_body_scroll_start).
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            Vec::<u8>::new(),
+            caps_with_color(),
+            80,
+            24,
+            interactions.clone(),
+        );
+        renderer.render(UiLine::InputPrompt {
+            buf: "/h".into(),
+            cursor_byte: 2,
+            menu: Some(MenuPayload {
+                items: vec![("help".into(), "Show help".into())],
+                selected: 0,
+                kind: crate::render::MenuKind::SlashCommand,
+            }),
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+        assert!(
+            interactions.snapshot_actionable().is_some(),
+            "a flushed frame publishes its clickable coordinates"
+        );
+
+        // The pre-resize epoch bump fails pointer input closed until a republish.
+        interactions.invalidate();
+        assert!(
+            interactions.snapshot_actionable().is_none(),
+            "invalidation fails pointer input closed"
+        );
+
+        renderer.on_resize(100, 30);
+        assert!(
+            interactions.snapshot_actionable().is_some(),
+            "on_resize must republish the repainted hit map, not leave clicks dropped"
+        );
+    }
+
+    #[test]
+    fn interaction_generation_waits_for_a_successful_frame_write() {
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            SwitchableFailSink(fail.clone()),
+            caps_with_color(),
+            80,
+            24,
+            interactions.clone(),
+        );
+        renderer.render(UiLine::InputPrompt {
+            buf: "/h".into(),
+            cursor_byte: 2,
+            menu: Some(MenuPayload {
+                items: vec![("help".into(), "Show help".into())],
+                selected: 0,
+                kind: crate::render::MenuKind::SlashCommand,
+            }),
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+
+        renderer.flush_deferred();
+        let old_frame = interactions.snapshot();
+        assert_eq!(old_frame.generation, 1);
+
+        renderer.render(UiLine::InputPrompt {
+            buf: "/".into(),
+            cursor_byte: 1,
+            menu: Some(MenuPayload {
+                items: vec![
+                    ("help".into(), "Show help".into()),
+                    ("status".into(), "Show status".into()),
+                ],
+                selected: 1,
+                kind: crate::render::MenuKind::SlashCommand,
+            }),
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+
+        fail.store(true, Ordering::Relaxed);
+        renderer.flush_deferred();
+        let failed_frame = interactions.snapshot();
+        assert_eq!(failed_frame.generation, old_frame.generation);
+        assert_eq!(failed_frame.regions, old_frame.regions);
+        assert!(
+            interactions.snapshot_actionable().is_none(),
+            "a failed terminal write must fail pointer actions closed"
+        );
+
+        fail.store(false, Ordering::Relaxed);
+        renderer.flush_deferred();
+        let frame = interactions.snapshot();
+        assert_eq!(frame.generation, old_frame.generation + 1);
+        assert!(interactions.snapshot_actionable().is_some());
+        let status_region = frame
+            .regions
+            .iter()
+            .find(|region| {
+                region.target == crate::render::interaction::HitTarget::MenuItem { index: 1 }
+            })
+            .expect("second slash row has a hit region");
+        assert_eq!(
+            frame.hit(status_region.rect.row, status_region.rect.col),
+            Some(crate::render::interaction::HitTarget::MenuItem { index: 1 })
+        );
+    }
+
+    #[test]
+    fn interaction_rows_match_slash_and_session_card_painted_bounds() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            80,
+            30,
+            interactions.clone(),
+        );
+        renderer.render(UiLine::InputPrompt {
+            buf: "/".into(),
+            cursor_byte: 1,
+            menu: Some(MenuPayload {
+                items: vec![
+                    ("help".into(), String::new()),
+                    ("status".into(), String::new()),
+                ],
+                selected: 0,
+                kind: crate::render::MenuKind::SlashCommand,
+            }),
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+        let slash = interactions.snapshot();
+        let slash_regions: Vec<_> = slash
+            .regions
+            .iter()
+            .filter(|region| {
+                matches!(
+                    region.target,
+                    crate::render::interaction::HitTarget::MenuItem { .. }
+                )
+            })
+            .collect();
+        assert_eq!(slash_regions.len(), 2);
+        assert_eq!(slash_regions[0].rect.height, 1);
+        assert_eq!(slash_regions[1].rect.row, slash_regions[0].rect.row + 1);
+
+        renderer.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: Some(MenuPayload {
+                items: vec![
+                    ("Resume".into(), String::new()),
+                    (String::new(), String::new()),
+                    (String::new(), String::new()),
+                    (String::new(), String::new()),
+                    ("first".into(), "meta one".into()),
+                    ("second".into(), "meta two".into()),
+                    ("— hint —".into(), String::new()),
+                ],
+                selected: 4,
+                kind: crate::render::MenuKind::SessionList,
+            }),
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+        let session = interactions.snapshot();
+        let session_regions: Vec<_> = session
+            .regions
+            .iter()
+            .filter(|region| {
+                matches!(
+                    region.target,
+                    crate::render::interaction::HitTarget::ModalItem { .. }
+                )
+            })
+            .collect();
+        assert_eq!(session_regions.len(), 2);
+        assert_eq!(session_regions[0].rect.height, 2);
+        assert_eq!(session_regions[1].rect.height, 2);
+        assert_eq!(session_regions[1].rect.row, session_regions[0].rect.row + 3);
+    }
+
+    #[test]
+    fn wide_session_preview_hit_region_matches_all_painted_detail_rows() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            120,
+            40,
+            interactions.clone(),
+        );
+        renderer.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: Some(MenuPayload {
+                items: vec![
+                    ("Resume".into(), String::new()),
+                    (String::new(), String::new()),
+                    (String::new(), String::new()),
+                    (String::new(), String::new()),
+                    (
+                        "selected".into(),
+                        "meta\n/cwd\nprovider · model\none\ntwo\nthree\nfour\nfive\nsix".into(),
+                    ),
+                    ("— hint —".into(), String::new()),
+                ],
+                selected: 4,
+                kind: crate::render::MenuKind::SessionList,
+            }),
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+
+        let frame = interactions
+            .snapshot_actionable()
+            .expect("painted preview frame");
+        let region = frame
+            .regions
+            .iter()
+            .find(|region| {
+                region.target == crate::render::interaction::HitTarget::ModalItem { index: 0 }
+            })
+            .expect("selected preview card hit region");
+        assert_eq!(
+            region.rect.height, 10,
+            "title plus nine bounded detail rows"
+        );
+        assert_eq!(
+            frame.hit(region.rect.row + 9, region.rect.col),
+            Some(crate::render::interaction::HitTarget::ModalItem { index: 0 }),
+        );
+    }
+
+    #[test]
+    fn interaction_composer_maps_cjk_and_zwj_continuation_cells_to_utf8_boundaries() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            12,
+            24,
+            interactions.clone(),
+        );
+        let input = "a你👩‍💻z";
+        renderer.render(UiLine::InputPrompt {
+            buf: input.into(),
+            cursor_byte: input.len(),
+            menu: None,
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+
+        let frame = interactions
+            .snapshot_actionable()
+            .expect("painted composer frame");
+        let first = frame
+            .regions
+            .iter()
+            .find(|region| {
+                region.target == crate::render::interaction::HitTarget::ComposerByte { byte: 0 }
+            })
+            .expect("ASCII start cell");
+        let row = first.rect.row;
+        let col = first.rect.col;
+        assert_eq!(
+            frame.hit(row, col),
+            Some(crate::render::interaction::HitTarget::ComposerByte { byte: 0 })
+        );
+        assert_eq!(
+            frame.hit(row, col + 1),
+            Some(crate::render::interaction::HitTarget::ComposerByte { byte: 1 })
+        );
+        assert_eq!(
+            frame.hit(row, col + 2),
+            Some(crate::render::interaction::HitTarget::ComposerByte { byte: "a你".len() })
+        );
+        assert_eq!(
+            frame.hit(row, col + 3),
+            Some(crate::render::interaction::HitTarget::ComposerByte { byte: "a你".len() })
+        );
+        assert_eq!(
+            frame.hit(row, col + 4),
+            Some(crate::render::interaction::HitTarget::ComposerByte {
+                byte: "a你👩‍💻".len()
+            })
+        );
+        assert_eq!(
+            frame.hit(row, col + 5),
+            Some(crate::render::interaction::HitTarget::ComposerByte {
+                byte: "a你👩‍💻".len()
+            })
+        );
+        assert_eq!(
+            frame.hit(row, col + 6),
+            Some(crate::render::interaction::HitTarget::ComposerByte { byte: input.len() })
+        );
+    }
+
+    #[test]
+    fn interaction_composer_tab_cells_choose_the_nearest_byte_boundary() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            12,
+            24,
+            interactions.clone(),
+        );
+        let input = "\tz";
+        renderer.render(UiLine::InputPrompt {
+            buf: input.into(),
+            cursor_byte: input.len(),
+            menu: None,
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+
+        let frame = interactions
+            .snapshot_actionable()
+            .expect("painted composer frame");
+        let first = frame
+            .regions
+            .iter()
+            .find(|region| {
+                region.target == crate::render::interaction::HitTarget::ComposerByte { byte: 0 }
+            })
+            .expect("tab start cell");
+        let row = first.rect.row;
+        let col = first.rect.col;
+        assert_eq!(
+            frame.hit(row, col),
+            Some(crate::render::interaction::HitTarget::ComposerByte { byte: 0 })
+        );
+        assert_eq!(
+            frame.hit(row, col + 1),
+            Some(crate::render::interaction::HitTarget::ComposerByte { byte: 0 })
+        );
+        assert_eq!(
+            frame.hit(row, col + 2),
+            Some(crate::render::interaction::HitTarget::ComposerByte { byte: 1 })
+        );
+        assert_eq!(
+            frame.hit(row, col + 3),
+            Some(crate::render::interaction::HitTarget::ComposerByte { byte: 1 })
+        );
+    }
+
+    #[test]
+    fn interaction_transcript_copy_runs_preserve_semantics_and_exclude_chrome() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            12,
+            24,
+            interactions.clone(),
+        );
+        renderer.render(UiLine::AssistantText(
+            "abcdefghij\nhard\n  code\n你好👩‍💻\n".into(),
+        ));
+        renderer.render(UiLine::AssistantLineBreak);
+        renderer.render(UiLine::DiffLine {
+            added: true,
+            text: "added".into(),
+        });
+        renderer.render(UiLine::TurnSeparator {
+            label: "BORDER_SENTINEL".into(),
+        });
+        renderer.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "SPINNER_SENTINEL",
+            label: "STATUS_SENTINEL".into(),
+            status: StatusLine::default(),
+            menu: None,
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+
+        let frame = interactions
+            .snapshot_actionable()
+            .expect("painted transcript frame");
+        let runs: Vec<(&str, bool)> = frame
+            .copy_runs
+            .iter()
+            .map(|run| (&*run.text, run.soft_wrap))
+            .collect();
+        assert!(runs
+            .windows(2)
+            .any(|pair| pair == [("abcdefgh", true), ("ij", false)]));
+        assert!(runs.iter().any(|run| *run == ("hard", false)));
+        assert!(runs.iter().any(|run| *run == ("  code", false)));
+        assert!(runs.iter().any(|run| run.0.contains("你好")));
+        assert!(runs
+            .windows(2)
+            .any(|pair| { pair == [("       +", true), (" added", false)] }));
+        assert!(!runs.iter().any(|run| {
+            run.0.contains("SPINNER_SENTINEL")
+                || run.0.contains("STATUS_SENTINEL")
+                || run.0.contains("BORDER_SENTINEL")
+        }));
+    }
+
+    #[test]
+    fn interaction_modal_overlay_blocks_underlying_transcript_hits_and_copy_runs() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            20,
+            8,
+            interactions.clone(),
+        );
+        renderer.render(UiLine::AssistantText(
+            "first\nsecond\nUNDERLAY\nfourth\n".into(),
+        ));
+        renderer.render(UiLine::AssistantLineBreak);
+        renderer.render(UiLine::DiffPanel {
+            title: DiffPanelRow::new(vec![DiffPanelSpan::new("Diff", DiffPanelTone::Default)]),
+            rows: vec![DiffPanelRow::new(vec![DiffPanelSpan::new(
+                "overlay",
+                DiffPanelTone::Highlight,
+            )])],
+            footer: "Esc close".into(),
+            win_width: 20,
+            win_height: 6,
+        });
+        renderer.flush_deferred();
+
+        let overlay = renderer.modal_overlay.as_ref().expect("actual modal rect");
+        let top = overlay.y;
+        let bottom = overlay.y.saturating_add(overlay.cells.len() as u16);
+        let frame = interactions.snapshot_actionable().expect("modal frame");
+        assert!(
+            frame.copy_runs.iter().all(|run| {
+                run.rect.row.saturating_add(run.rect.height) <= top || run.rect.row >= bottom
+            }),
+            "semantic copy projection must not include rows hidden by the modal"
+        );
+        for row in top..bottom {
+            assert!(
+                !matches!(
+                    frame.hit(row, 1),
+                    Some(crate::render::interaction::HitTarget::TranscriptByte { .. })
+                ),
+                "modal row {row} must not click through to the transcript"
+            );
+        }
+    }
+
+    #[test]
+    fn interaction_compacted_projection_preserves_hidden_continuation_gap() {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            40,
+            20,
+            interactions.clone(),
+        );
+        let status = status_basic();
+        renderer.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        let capacity = 20usize.saturating_sub(renderer.current_footer_rows());
+        for index in 0..capacity {
+            let text = match index {
+                0 => "A",
+                1 => "B",
+                _ if index + 1 == capacity => "C",
+                _ => "middle",
+            };
+            let mut row = Vec::new();
+            push_str_cells(&mut row, text, &CellStyle::default());
+            renderer.push_copyable_body_row(row, text.into(), 0, index == 0);
+        }
+        let mut modal_status = status;
+        modal_status.user_input = Some(crate::render::UserInputPanelView {
+            header: "Choose".into(),
+            question: "Continue?".into(),
+            mode: UserInputMode::Text,
+            options: Vec::new(),
+            cursor: 0,
+            checked: Vec::new(),
+            text: String::new(),
+            text_cursor_byte: 0,
+            custom_text: String::new(),
+            custom_text_cursor_byte: 0,
+            custom: false,
+            scroll_offset: 0,
+            batch: None,
+        });
+        renderer.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: modal_status,
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+
+        assert!(renderer.user_input_tail_compacted);
+        let frame = interactions.snapshot_actionable().expect("compacted frame");
+        let first = frame.copy_runs.first().expect("pinned prefix");
+        let second = frame.copy_runs.get(1).expect("visible tail after gap");
+        assert_eq!(&*first.text, "A");
+        assert_ne!(&*second.text, "B", "continuation must be hidden by fixture");
+        assert_ne!(
+            first.next_run_id,
+            Some(second.id),
+            "published projection must expose that A and the visible tail are not adjacent"
+        );
+    }
+
+    #[test]
+    fn interaction_transcript_selection_reverses_cjk_and_zwj_continuation_cells() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            20,
+            24,
+            interactions.clone(),
+        );
+        renderer.render(UiLine::AssistantText("a你👩‍💻b".into()));
+        renderer.render(UiLine::AssistantLineBreak);
+        renderer.flush_deferred();
+        let first = interactions
+            .snapshot_actionable()
+            .expect("first transcript frame");
+        let run = first
+            .copy_runs
+            .iter()
+            .find(|run| &*run.text == "a你👩‍💻b")
+            .expect("semantic assistant run")
+            .clone();
+        let suffix = run.text.rfind('b').expect("suffix boundary");
+        interactions.set_transcript_selection(Some(
+            crate::render::interaction::TranscriptSelection {
+                anchor: crate::render::interaction::SemanticEndpoint {
+                    run_id: run.id,
+                    byte: 1,
+                },
+                head: crate::render::interaction::SemanticEndpoint {
+                    run_id: run.id,
+                    byte: suffix,
+                },
+                run_ids: vec![run.id].into(),
+            },
+        ));
+        renderer.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+
+        let cells = renderer.screen.prev_cells_for_test();
+        let row = run.rect.row as usize;
+        let col = run.rect.col as usize;
+        assert!(!cells[row][col].style.reverse, "ASCII prefix unchanged");
+        assert!(cells[row][col + 1].style.reverse, "CJK lead selected");
+        assert!(
+            cells[row][col + 2].style.reverse,
+            "CJK continuation selected"
+        );
+        assert!(cells[row][col + 3].style.reverse, "ZWJ lead selected");
+        assert!(
+            cells[row][col + 4].style.reverse,
+            "ZWJ continuation selected"
+        );
+        assert!(!cells[row][col + 5].style.reverse, "ASCII suffix unchanged");
+    }
+
+    #[test]
+    fn interaction_composer_uses_the_actual_soft_wrap_and_trailing_padding() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            8,
+            24,
+            interactions.clone(),
+        );
+        let input = "abcd你z";
+        renderer.render(UiLine::InputPrompt {
+            buf: input.into(),
+            cursor_byte: input.len(),
+            menu: None,
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+
+        let frame = interactions
+            .snapshot_actionable()
+            .expect("painted composer frame");
+        let z_byte = "abcd你".len();
+        let z = frame
+            .regions
+            .iter()
+            .filter(|region| {
+                region.target
+                    == crate::render::interaction::HitTarget::ComposerByte { byte: z_byte }
+            })
+            .max_by_key(|region| region.rect.row)
+            .expect("soft-wrapped z cell");
+        let first_row = frame
+            .regions
+            .iter()
+            .find(|region| {
+                region.target == crate::render::interaction::HitTarget::ComposerByte { byte: 0 }
+            })
+            .expect("first composer cell")
+            .rect
+            .row;
+        assert_eq!(z.rect.row, first_row + 1);
+        assert_eq!(z.rect.col, 2);
+        assert_eq!(
+            frame.hit(z.rect.row, z.rect.col + 1),
+            Some(crate::render::interaction::HitTarget::ComposerByte { byte: input.len() }),
+            "padding after the wrapped tail places the cursor at buffer end"
+        );
+    }
+
+    #[test]
+    fn interaction_composer_maps_final_hard_newline_blank_row_but_not_prior_padding() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            12,
+            24,
+            interactions.clone(),
+        );
+        let input = "a\n";
+        renderer.render(UiLine::InputPrompt {
+            buf: input.into(),
+            cursor_byte: input.len(),
+            menu: None,
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+
+        let frame = interactions
+            .snapshot_actionable()
+            .expect("painted composer frame");
+        let a = frame
+            .regions
+            .iter()
+            .find(|region| {
+                region.target == crate::render::interaction::HitTarget::ComposerByte { byte: 0 }
+            })
+            .expect("first hard line glyph");
+        let blank_row = frame
+            .regions
+            .iter()
+            .filter(|region| {
+                region.target
+                    == crate::render::interaction::HitTarget::ComposerByte { byte: input.len() }
+            })
+            .map(|region| region.rect.row)
+            .max()
+            .expect("final blank hard line row");
+        let blank = frame
+            .regions
+            .iter()
+            .filter(|region| {
+                region.rect.row == blank_row
+                    && region.target
+                        == crate::render::interaction::HitTarget::ComposerByte { byte: input.len() }
+            })
+            .min_by_key(|region| region.rect.col)
+            .expect("final blank hard line padding");
+        assert_eq!(blank.rect.row, a.rect.row + 1);
+        assert_eq!(blank.rect.col, 2);
+        assert_eq!(frame.hit(a.rect.row, a.rect.col + 1), None);
+    }
+
+    #[test]
+    fn interaction_composer_bounds_published_cells_for_a_long_windowed_input() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            80,
+            24,
+            interactions.clone(),
+        );
+        let input = "0123456789".repeat(10_000);
+        renderer.render(UiLine::InputPrompt {
+            buf: input.clone(),
+            cursor_byte: input.len(),
+            menu: None,
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+
+        let composer_regions = interactions
+            .snapshot_actionable()
+            .expect("painted composer frame")
+            .regions
+            .iter()
+            .filter(|region| {
+                matches!(
+                    region.target,
+                    crate::render::interaction::HitTarget::ComposerByte { .. }
+                )
+            })
+            .count();
+        assert!(
+            composer_regions <= 80 * 24,
+            "published composer cells must stay bounded by the visible screen: {composer_regions}"
+        );
+    }
+
+    #[test]
+    fn interaction_composer_selection_reverses_only_the_selected_grapheme_cells() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let input = "a你👩‍💻b";
+        let suffix = input.rfind('b').expect("suffix boundary");
+        interactions.set_composer_selection(input, Some(1..suffix));
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            20,
+            24,
+            interactions.clone(),
+        );
+        renderer.render(UiLine::InputPrompt {
+            buf: input.into(),
+            cursor_byte: suffix,
+            menu: None,
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        renderer.flush_deferred();
+
+        let frame = interactions
+            .snapshot_actionable()
+            .expect("painted composer frame");
+        let a = frame
+            .regions
+            .iter()
+            .find(|region| {
+                region.target == crate::render::interaction::HitTarget::ComposerByte { byte: 0 }
+            })
+            .expect("a cell");
+        let cells = renderer.screen.prev_cells_for_test();
+        let row = a.rect.row as usize;
+        let col = a.rect.col as usize;
+        assert!(
+            !cells[row][col].style.reverse,
+            "ASCII prefix stays unchanged"
+        );
+        assert!(cells[row][col + 1].style.reverse, "CJK lead cell selected");
+        assert!(
+            cells[row][col + 2].style.reverse,
+            "CJK continuation selected"
+        );
+        assert!(cells[row][col + 3].style.reverse, "ZWJ lead cell selected");
+        assert!(
+            cells[row][col + 4].style.reverse,
+            "ZWJ continuation selected"
+        );
+        assert!(
+            !cells[row][col + 5].style.reverse,
+            "ASCII suffix stays unchanged"
+        );
+    }
+
+    #[test]
+    fn interaction_does_not_publish_reduced_semantics_for_slash_submenus() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            80,
+            24,
+            interactions.clone(),
+        );
+        for buffer in ["/skills ", "/effort "] {
+            renderer.render(UiLine::InputPrompt {
+                buf: buffer.into(),
+                cursor_byte: buffer.len(),
+                menu: Some(MenuPayload {
+                    items: vec![("choice".into(), "submenu item".into())],
+                    selected: 0,
+                    kind: crate::render::MenuKind::SlashCommand,
+                }),
+                status: StatusLine::default(),
+                attachments: Vec::new(),
+            });
+            renderer.flush_deferred();
+            assert!(
+                interactions
+                    .snapshot()
+                    .regions
+                    .iter()
+                    .all(|region| !matches!(
+                        region.target,
+                        crate::render::interaction::HitTarget::MenuItem { .. }
+                    )),
+                "submenu {buffer:?} must not expose the top-level-only click semantic"
+            );
+        }
+    }
+
+    #[test]
+    fn interaction_surface_session_survives_selection_redraw_but_not_close_reopen() {
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            80,
+            24,
+            interactions.clone(),
+        );
+        let menu = |selected| MenuPayload {
+            items: vec![
+                ("help".into(), "Show help".into()),
+                ("status".into(), "Show status".into()),
+            ],
+            selected,
+            kind: crate::render::MenuKind::SlashCommand,
+        };
+        let prompt = |menu| UiLine::InputPrompt {
+            buf: "/".into(),
+            cursor_byte: 1,
+            menu,
+            status: StatusLine::default(),
+            attachments: Vec::new(),
+        };
+
+        renderer.render(prompt(Some(menu(0))));
+        renderer.flush_deferred();
+        let first = interactions.snapshot().surface_session;
+
+        renderer.render(prompt(Some(menu(1))));
+        renderer.flush_deferred();
+        assert_eq!(
+            interactions.snapshot().surface_session,
+            first,
+            "selection-only redraw keeps the click-confirm session"
+        );
+
+        renderer.render(prompt(None));
+        renderer.render(prompt(Some(menu(0))));
+        renderer.flush_deferred();
+        assert!(
+            interactions.snapshot().surface_session > first,
+            "close/reopen must create a fresh session even when coalesced before paint"
+        );
     }
 
     /// Writer that tracks every individual `write` call — for tests
@@ -10071,6 +11840,34 @@ mod tests {
                 .flatten()
                 .all(|cell| cell.ch != '\x1b' && cell.ch != '['),
             "SGR must become cell style, never visible text"
+        );
+    }
+
+    #[test]
+    fn force_repaint_emits_unchanged_retained_projection() {
+        let (mut r, output) = new_capturing(80, 24);
+        r.render(UiLine::InputPrompt {
+            buf: "focus recovery".into(),
+            cursor_byte: "focus recovery".len(),
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        output.lock().unwrap().clear();
+
+        // With no state change, the ordinary deferred flush emits no patch.
+        r.flush_deferred();
+        assert!(output.lock().unwrap().is_empty());
+
+        // Focus recovery must re-emit the authoritative frame even though its
+        // logical state still matches the renderer's previous-frame cache.
+        r.force_repaint();
+        let bytes = output.lock().unwrap();
+        assert!(!bytes.is_empty(), "focus recovery must emit a fresh frame");
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("focus recovery"),
+            "fresh frame must include the retained input text"
         );
     }
 
@@ -10648,7 +12445,7 @@ mod tests {
         r.caps.unicode_symbols = true;
         let row = r.build_top_rule_with_context(
             80,
-            Some("release/v5.0.6"),
+            Some("release/v5.0.7"),
             Some(crate::render::HistoryPosition {
                 current: 999,
                 total: 1000,
@@ -10662,7 +12459,7 @@ mod tests {
             .map(|cell| cell.ch)
             .collect();
         assert!(visible.contains("History 999/1000"), "{visible:?}");
-        assert!(visible.contains("release/v5.0.6"), "{visible:?}");
+        assert!(visible.contains("release/v5.0.7"), "{visible:?}");
     }
 
     #[test]
@@ -10708,7 +12505,8 @@ mod tests {
         let (mut r, _counter) = new_counting(80, 24);
         r.caps.colors = true;
         r.caps.unicode_symbols = true;
-        let long_query = "a very long search query that definitely overflows the badge budget".to_string();
+        let long_query =
+            "a very long search query that definitely overflows the badge budget".to_string();
         let row = r.build_top_rule_with_context(
             40,
             None,
@@ -10743,23 +12541,51 @@ mod tests {
         // the two paginator fit-loops and the footer `menu_rows` reservation —
         // share this helper, so they can never disagree with the render loop.
         let h0 = crate::modals::session_picker::HEADER_ROWS;
-        assert_eq!(RetainedRenderer::<CountingSink>::session_item_height(h0), 2);
-        assert_eq!(
-            RetainedRenderer::<CountingSink>::session_item_height(h0 + 1),
-            3
+        let (r, _counter) = new_counting(80, 24);
+        assert_eq!(r.session_item_height(h0, "meta", 80), 2);
+        assert_eq!(r.session_item_height(h0 + 1, "meta", 80), 3);
+        assert_eq!(r.session_item_height(h0 + 5, "meta", 80), 3);
+    }
+
+    #[test]
+    fn plugin_menu_markers_fall_back_to_ascii_without_unicode_symbols() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.unicode_symbols = false;
+
+        let selected = r.build_plugin_menu_rows("[Add model]", "", true, 70);
+        let selected_text: String = selected[0]
+            .iter()
+            .filter(|cell| cell.width > 0)
+            .map(|cell| cell.ch)
+            .collect();
+        assert!(selected_text.starts_with("> "), "{selected_text:?}");
+        assert!(selected_text.contains("[Add model]"), "{selected_text:?}");
+        assert!(!selected_text.contains('▸'), "{selected_text:?}");
+
+        let installed = r.build_plugin_menu_rows("model", "scope (installed)", false, 70);
+        let installed_text: String = installed[0]
+            .iter()
+            .filter(|cell| cell.width > 0)
+            .map(|cell| cell.ch)
+            .collect();
+        assert!(
+            installed_text.starts_with("  * model"),
+            "{installed_text:?}"
         );
-        assert_eq!(
-            RetainedRenderer::<CountingSink>::session_item_height(h0 + 5),
-            3
-        );
+        assert!(!installed_text.contains('✓'), "{installed_text:?}");
     }
 
     #[test]
     fn directory_menu_row_places_current_label_after_path_in_muted() {
         let (mut r, _c) = new_counting(80, 24);
         r.caps.colors = true;
-        let row =
-            r.build_menu_row("~/proj", "current", false, 70, crate::render::MenuKind::DirectoryList);
+        let row = r.build_menu_row(
+            "~/proj",
+            "current",
+            false,
+            70,
+            crate::render::MenuKind::DirectoryList,
+        );
         let cells: Vec<(char, bool)> = row
             .iter()
             .filter(|c| c.width > 0)
@@ -10768,7 +12594,10 @@ mod tests {
         let s: String = cells.iter().map(|(c, _)| *c).collect();
         // The "current" label sits right after the path (2-space gap), not right-aligned
         // to the far edge.
-        assert!(s.contains("~/proj  current"), "label adjacent to path: {s:?}");
+        assert!(
+            s.contains("~/proj  current"),
+            "label adjacent to path: {s:?}"
+        );
         let idx = s.find("current").expect("current label present");
         // The label is muted (faint); the path is not.
         for (ch, faint) in &cells[idx..idx + "current".len()] {
@@ -10784,7 +12613,7 @@ mod tests {
         // Selected row: PAD_COL spaces, then `▸ `, then the title. So col 2 is
         // the marker and col 4 is the first title glyph — flush with the search
         // box's `│` border (col 2) and its text (col 4).
-        let rows = r.build_session_menu_rows("Xtitle", "9 msgs", true, 70);
+        let rows = r.build_session_menu_rows("Xtitle", "9 msgs", true, 70, 4);
         let title = &rows[0];
         assert_eq!(title[0].ch, ' ');
         assert_eq!(title[1].ch, ' ');
@@ -10794,9 +12623,40 @@ mod tests {
         let meta = &rows[1];
         assert_eq!(meta[4].ch, '9', "metadata aligns with the title at col 4");
         // Unselected row: no marker, but the title still lands at col 4.
-        let rows_u = r.build_session_menu_rows("Xtitle", "9 msgs", false, 70);
+        let rows_u = r.build_session_menu_rows("Xtitle", "9 msgs", false, 70, 4);
         assert_eq!(rows_u[0][2].ch, ' ', "no marker when unselected");
         assert_eq!(rows_u[0][4].ch, 'X', "unselected title also at col 4");
+    }
+
+    #[test]
+    fn session_preview_expands_only_inside_wide_selected_card() {
+        let (r, _counter) = new_counting(120, 40);
+        let desc = "12 messages · now\n/workspace/project\nprovider · model\nline 1\nline 2\nline 3\nline 4\nline 5\nline 6";
+
+        let wide = r.build_session_menu_rows("Selected", desc, true, 116, 4);
+        assert_eq!(
+            wide.len(),
+            10,
+            "title + metadata + cwd/model + six excerpts"
+        );
+        let visible = |row: &[Cell]| {
+            row.iter()
+                .filter(|cell| cell.width > 0)
+                .map(|cell| cell.ch)
+                .collect::<String>()
+        };
+        assert!(visible(&wide[2]).contains("/workspace/project"));
+        assert!(visible(&wide[3]).contains("provider · model"));
+        assert!(visible(&wide[9]).contains("line 6"));
+
+        let narrow = r.build_session_menu_rows("Selected", desc, true, 76, 4);
+        assert_eq!(
+            narrow.len(),
+            2,
+            "narrow card stays byte-for-byte list shaped"
+        );
+        assert!(visible(&narrow[1]).contains("12 messages · now"));
+        assert!(!visible(&narrow[1]).contains("provider"));
     }
 
     /// `None` session_name keeps the top rule pristine — no reverse
@@ -11527,12 +13387,7 @@ mod tests {
             "capturing terminal should enable brand color"
         );
         for name in ["Task", "Team"] {
-            r.render_inflight_tool(
-                "⠋",
-                name,
-                "3 subtasks",
-                " · thinking… (57s · ↑ 715 tokens)",
-            );
+            r.render_inflight_tool("⠋", name, "3 subtasks", " · thinking… (57s · ↑ 715 tokens)");
 
             let row = r
                 .body_lines
@@ -12047,8 +13902,13 @@ mod tests {
         let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
         let status = status_basic();
         r.render(UiLine::StreamingBox {
-            buf: String::new(), cursor_byte: 0, frame: "⠋".into(), label: "Pondering".into(),
-            menu: None, status: status.clone(), attachments: Vec::new(),
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋".into(),
+            label: "Pondering".into(),
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         for i in 0..25 {
@@ -12057,28 +13917,48 @@ mod tests {
         r.flush_deferred();
         // Multi-row Bash inflight strip (command + blank + Running row).
         r.render(UiLine::ToolCallInFlight {
-            id: "c1".into(), name: "Bash".into(), detail: "echo hi".into(), hint: None,
+            id: "c1".into(),
+            name: "Bash".into(),
+            detail: "echo hi".into(),
+            hint: None,
         });
-        r.render(UiLine::Spinner { frame: "⠙".into(), label: "Running · 1s".into() });
+        r.render(UiLine::Spinner {
+            frame: "⠙".into(),
+            label: "Running · 1s".into(),
+        });
         r.flush_deferred();
-        assert!(r.inflight_tool_rows >= 3, "expected multi-row strip, got {}", r.inflight_tool_rows);
+        assert!(
+            r.inflight_tool_rows >= 3,
+            "expected multi-row strip, got {}",
+            r.inflight_tool_rows
+        );
         drain_into_vterm(&buf, &mut vterm);
         // Stream permanent rows while overflowing, re-ticking the strip each time.
         for i in 0..6 {
             r.render(UiLine::CommandOutput(format!("STREAM{:02}\n", i)));
-            r.render(UiLine::Spinner { frame: "⠹".into(), label: format!("Running · {i}s") });
+            r.render(UiLine::Spinner {
+                frame: "⠹".into(),
+                label: format!("Running · {i}s"),
+            });
             r.flush_deferred();
             drain_into_vterm(&buf, &mut vterm);
         }
         // Every FILL row must appear exactly once across scrollback+viewport (no dup/loss).
-        let all: Vec<String> = vterm.scrollback_texts().into_iter()
+        let all: Vec<String> = vterm
+            .scrollback_texts()
+            .into_iter()
             .chain((0..24).map(|row| vterm.row_text(row).trim_end().to_string()))
             .collect();
         for i in 0..25 {
             let tag = format!("FILL{:02}", i);
             let n = all.iter().filter(|l| l.contains(&tag)).count();
-            assert_eq!(n, 1, "{tag} appeared {n} times (dup/loss)\nSCROLLBACK:\n{}\nSCREEN:\n{}",
-                vterm.scrollback_texts().join("\n"), vterm.dump());
+            assert_eq!(
+                n,
+                1,
+                "{tag} appeared {n} times (dup/loss)\nSCROLLBACK:\n{}\nSCREEN:\n{}",
+                vterm.scrollback_texts().join("\n"),
+                vterm.dump()
+            );
         }
     }
 
@@ -13574,14 +15454,19 @@ mod tests {
             .flatten()
             .filter(|c| c.ch != ' ')
             .collect();
-        assert!(!dark_cells.is_empty(), "muted line rendered no visible cells");
+        assert!(
+            !dark_cells.is_empty(),
+            "muted line rendered no visible cells"
+        );
         assert!(
             dark_cells.iter().all(|c| c.style.fg == Some(Color::Grey)),
             "dark-theme muted must be Color::Grey (legible), got {:?}",
             dark_cells.iter().map(|c| c.style.fg).collect::<Vec<_>>(),
         );
         assert!(
-            dark_cells.iter().all(|c| c.style.fg != Some(Color::DarkGrey)),
+            dark_cells
+                .iter()
+                .all(|c| c.style.fg != Some(Color::DarkGrey)),
             "dark-theme muted must NOT be DarkGrey (SGR 90 collapses into the bg)",
         );
 
@@ -16597,7 +18482,10 @@ mod tests {
             .iter()
             .map(|cell| cell.ch)
             .collect::<String>();
-        assert!(running_text.contains("tokens"), "token metadata must survive clipping");
+        assert!(
+            running_text.contains("tokens"),
+            "token metadata must survive clipping"
+        );
         assert!(running_text.contains('↑'), "token marker must stay visible");
         assert!(
             r.body_lines[group.child_indices[1]]
@@ -16607,7 +18495,9 @@ mod tests {
             "pending Agent rows are still active work and must not be muted"
         );
 
-        r.render(UiLine::CommandOutput("parent task remains visible\n".into()));
+        r.render(UiLine::CommandOutput(
+            "parent task remains visible\n".into(),
+        ));
         assert!(
             r.live_agent_groups.contains_key("team:runtime"),
             "foreign output must not freeze Agent block"
@@ -16667,7 +18557,10 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(body.contains("2/2 finished"), "resize replay keeps frozen Agent block");
+        assert!(
+            body.contains("2/2 finished"),
+            "resize replay keeps frozen Agent block"
+        );
     }
 
     #[test]
@@ -16768,8 +18661,7 @@ mod tests {
         use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
 
         let (mut r, _buf) = new_capturing(120, 30);
-        for (call_id, label) in [("call-task-1", "task-agent"), ("team:run-1", "team-agent")]
-        {
+        for (call_id, label) in [("call-task-1", "task-agent"), ("team:run-1", "team-agent")] {
             r.render(UiLine::AgentGroup {
                 progress: SubtaskProgress {
                     call_id: call_id.into(),
@@ -16802,7 +18694,10 @@ mod tests {
         assert_eq!(sealed, 2);
 
         r.reflow_body_to_current_width();
-        assert!(r.live_agent_groups.is_empty(), "sealed history must not become live again");
+        assert!(
+            r.live_agent_groups.is_empty(),
+            "sealed history must not become live again"
+        );
     }
 
     #[test]
@@ -16883,7 +18778,11 @@ mod tests {
             progress: progress.clone(),
             finished: false,
         });
-        assert_eq!(r.body_lines.len(), body_len, "frozen updates must not append");
+        assert_eq!(
+            r.body_lines.len(),
+            body_len,
+            "frozen updates must not append"
+        );
 
         progress.items[0].status = SubtaskStatus::Completed;
         progress.completed = 1;
@@ -17078,6 +18977,7 @@ mod tests {
             detail: "worker scope".into(),
             options: vec!["Allow".into(), "Deny".into()],
             selected: 0,
+            note: None,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -17110,6 +19010,7 @@ mod tests {
                 "Deny".into(),
             ],
             selected: 0,
+            note: None,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -17149,6 +19050,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn approval_panel_renders_advisory_note() {
+        let (mut r, buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let mut status = status_basic();
+        status.approval = Some(crate::render::ApprovalPanelView {
+            tool: "Bash".into(),
+            detail: "curl -H 'Authorization: Bearer x' https://y".into(),
+            options: vec!["Allow once".into(), "Deny".into()],
+            selected: 0,
+            note: Some("may send credentials to the provider".into()),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let dump = vterm.dump();
+        assert!(
+            vterm.any_row(|r| r.contains("may send credentials to the provider")),
+            "advisory note must render\n{dump}"
+        );
+    }
+
     // request_user_input panel: the question header + a mode-specific body
     // render, in the same modal slot as approval (replacing the input box).
     #[test]
@@ -17173,7 +19103,9 @@ mod tests {
                 cursor: 0,
                 checked: vec![false, false, false],
                 text: String::new(),
+                text_cursor_byte: 0,
                 custom_text: String::new(),
+                custom_text_cursor_byte: 0,
                 custom: true,
                 scroll_offset: 0,
                 batch: None,
@@ -17255,7 +19187,9 @@ mod tests {
                 cursor: 0,
                 checked: vec![true, false, true],
                 text: String::new(),
+                text_cursor_byte: 0,
                 custom_text: "Zig".into(),
+                custom_text_cursor_byte: 0,
                 custom: true,
                 scroll_offset: 0,
                 batch: None,
@@ -17273,7 +19207,7 @@ mod tests {
             drain_into_vterm(&buf, &mut vterm);
             let dump = vterm.dump();
             assert!(
-                vterm.any_row(|r| r.contains("[x] 1. Streaming")),
+                vterm.any_row(|r| r.contains("[\u{2713}] 1. Streaming")),
                 "Streaming checked\n{dump}"
             );
             assert!(
@@ -17285,7 +19219,7 @@ mod tests {
                 "Tool use unchecked\n{dump}"
             );
             assert!(
-                vterm.any_row(|r| r.contains("[x] 3. Zig")),
+                vterm.any_row(|r| r.contains("[\u{2713}] 3. Zig")),
                 "custom-answer row: checkbox + number + typed text (no 'Other' word)\n{dump}"
             );
             assert!(
@@ -17318,7 +19252,9 @@ mod tests {
                 cursor: 0,
                 checked: vec![],
                 text: "atomcode".into(),
+                text_cursor_byte: "atomcode".len(),
                 custom_text: String::new(),
+                custom_text_cursor_byte: 0,
                 custom: true,
                 scroll_offset: 0,
                 batch: None,
@@ -17327,10 +19263,7 @@ mod tests {
             let rows = r.build_user_input_rows(&view, 78, 80);
             assert_eq!(rows.len(), 8);
             assert!(
-                rows.rows
-                    .iter()
-                    .flatten()
-                    .all(|cell| !cell.style.reverse),
+                rows.rows.iter().flatten().all(|cell| !cell.style.reverse),
                 "text input must not use a full-width reverse-video strip"
             );
             for width in 0..5 {
@@ -17371,8 +19304,7 @@ mod tests {
                 "question header\n{dump}"
             );
             assert!(
-                vterm
-                    .any_row(|r| r.contains("atomcode") && (r.contains("❯") || r.contains(">"))),
+                vterm.any_row(|r| r.contains("atomcode") && (r.contains("❯") || r.contains(">"))),
                 "text input row\n{dump}"
             );
         }
@@ -17397,7 +19329,9 @@ mod tests {
             cursor: 2, // the custom-answer row (after the 2 options)
             checked: vec![false, false, false],
             text: String::new(),
-            custom_text: String::new(), // empty → placeholder shown
+            text_cursor_byte: 0,
+            custom_text: String::new(),
+            custom_text_cursor_byte: 0, // empty → placeholder shown
             custom: true,
             scroll_offset: 0,
             batch: None,
@@ -17429,6 +19363,51 @@ mod tests {
     }
 
     #[test]
+    fn active_custom_answer_keeps_trailing_input_visible() {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+
+        let (r, _) = new_capturing(40, 20);
+        let view = crate::render::UserInputPanelView {
+            header: "Confirm".into(),
+            question: "Choose".into(),
+            mode: UserInputMode::Single,
+            options: vec![("Default".into(), None)],
+            cursor: 1,
+            checked: vec![false, false],
+            text: String::new(),
+            text_cursor_byte: 0,
+            custom_text: "abcdefghijklmnopqrstuvwxyz0123456789".into(),
+            custom_text_cursor_byte: "abcdefghijklmnopqrstuvwxyz0123456789".len(),
+            custom: true,
+            scroll_offset: 0,
+            batch: None,
+        };
+
+        let rows = r.build_user_input_rows(&view, 24, 40).rows;
+        let text = rows
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .find(|text| text.contains("456789"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "input tail row missing: {:?}",
+                    rows.iter()
+                        .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            text.contains('…'),
+            "leading content should be elided: {text}"
+        );
+        assert!(
+            text.contains("456789"),
+            "input tail should remain visible: {text}"
+        );
+        assert!(text.ends_with('│'), "caret should follow tail: {text}");
+    }
+
+    #[test]
     fn empty_text_answer_cursor_renders_before_the_placeholder() {
         use atomcode_capabilities::tools::request_user_input::UserInputMode;
 
@@ -17444,7 +19423,9 @@ mod tests {
             cursor: 0,
             checked: Vec::new(),
             text: String::new(),
+            text_cursor_byte: 0,
             custom_text: String::new(),
+            custom_text_cursor_byte: 0,
             custom: false,
             scroll_offset: 0,
             batch: None,
@@ -17492,30 +19473,44 @@ mod tests {
             cursor: 1,
             checked: vec![false; 4],
             text: String::new(),
+                text_cursor_byte: 0,
             custom_text: String::new(),
+                custom_text_cursor_byte: 0,
             custom: true,
             scroll_offset: 0,
             batch: None,
         };
 
         let full = r.build_user_input_rows(&view, 40, 42);
-        let full_dump = full.iter()
+        let full_dump = full
+            .iter()
             .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
-            .collect::<Vec<_>>().join("\n");
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(full.len() > 11);
-        assert!(full_dump.contains("directly?")
-            && full_dump.contains("intentionally long label")
-            && full_dump.contains("draft checkpoint.")
-            && full_dump.contains("taking full-file snapshots."),
-            "wrapped text lost its tail:\n{full_dump}");
+        assert!(
+            full_dump.contains("directly?")
+                && full_dump.contains("intentionally long label")
+                && full_dump.contains("draft checkpoint.")
+                && full_dump.contains("taking full-file snapshots."),
+            "wrapped text lost its tail:\n{full_dump}"
+        );
 
         let fitted = r.build_user_input_panel_view(&view, 40, 42, 12);
-        let dump = fitted.iter()
+        let dump = fitted
+            .iter()
             .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
-            .collect::<Vec<_>>().join("\n");
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(fitted.len() <= 11);
-        assert!(dump.contains("Python snapshot"), "cursor option missing:\n{dump}");
-        assert!(dump.contains("hidden lines"), "overflow was silently clipped:\n{dump}");
+        assert!(
+            dump.contains("Python snapshot"),
+            "cursor option missing:\n{dump}"
+        );
+        assert!(
+            dump.contains("hidden lines"),
+            "overflow was silently clipped:\n{dump}"
+        );
 
         let mut scrollable = view.clone();
         scrollable.options[1].1 = Some(
@@ -17567,7 +19562,9 @@ mod tests {
             cursor: 0,
             checked: vec![false, false, false],
             text: String::new(),
+            text_cursor_byte: 0,
             custom_text: String::new(),
+            custom_text_cursor_byte: 0,
             custom: true,
             scroll_offset: 0,
             batch,
@@ -17642,7 +19639,10 @@ mod tests {
             compact_sub_dump.contains("提交前确认"),
             "review title:\n{sub_dump}"
         );
-        assert!(sub_dump.contains("Which auth?"), "question shown:\n{sub_dump}");
+        assert!(
+            sub_dump.contains("Which auth?"),
+            "question shown:\n{sub_dump}"
+        );
         assert!(sub_dump.contains("OAuth"), "answer shown:\n{sub_dump}");
         assert!(
             compact_sub_dump.contains("未回答"),
@@ -17721,6 +19721,7 @@ mod tests {
                 "Deny".into(),
             ],
             selected: 0,
+            note: None,
         };
         status.approval = Some(panel.clone());
         r.render(UiLine::InputPrompt {
@@ -17785,6 +19786,16 @@ mod tests {
             panel.options.len() + 2,
             "row count must be header + options + hint"
         );
+        // 5b. An advisory note adds exactly one row (must track build_approval_rows).
+        let with_note = crate::render::ApprovalPanelView {
+            note: Some("⚠ warn".into()),
+            ..panel.clone()
+        };
+        assert_eq!(
+            r.approval_panel_row_count(&with_note),
+            r.build_approval_rows(&with_note, 60, 80).len(),
+            "row count must match rendered rows when a note is present"
+        );
     }
 
     /// Step 1 digit keys: `accel_index` falls back for y/a/n; digit routing is
@@ -17816,6 +19827,7 @@ mod tests {
             ],
             selected: 0,
             cache_key: String::new(),
+            note: None,
         };
         // Digit routing: index = (c as usize) - ('1' as usize).
         // '1' → idx 0 → AllowOnce
@@ -18670,6 +20682,81 @@ mod tests {
         );
     }
 
+    /// Regression: a web-search summary containing CJK prose plus long English
+    /// identifiers used to draw a full Unicode box right up to the Windows
+    /// PowerShell/ConPTY edge. Hosts that painted ambiguous box glyphs wide then
+    /// wrapped/overwrote the row, making the start of the answer look truncated.
+    #[test]
+    fn retained_web_search_summary_table_stays_inside_viewport_without_box_borders() {
+        let width = 72u16;
+        let (mut r, _buf) = new_capturing(width, 24);
+        r.render(UiLine::ToolCall {
+            name: "web_search".into(),
+            detail: "Agora CLI multi-agent debate terminal moderator consensus github".into(),
+        });
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: "sources: github.com, npmjs.com +2".into(),
+            diff_stats: None,
+        });
+        r.render(UiLine::AssistantText(
+            "汇总结果如下：\n\
+             | 项目 | 定位 | 状态 |\n\
+             | --- | --- | --- |\n\
+             | Agora CLI multi-agent debate | terminal moderator and consensus workflow | 已验证 |\n\
+             | another-long-project-identifier | coordinates several independent agents | 可用 |\n\
+             以上信息已完整保留。\n"
+                .into(),
+        ));
+
+        let lines: Vec<String> = r
+            .body_lines
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect())
+            .collect();
+        assert!(
+            r.body_lines
+                .iter()
+                .all(|row| row.len() <= usize::from(width)),
+            "retained row exceeded viewport {width}: {lines:#?}"
+        );
+        let visible = lines.join("\n");
+        let compact_visible = visible.replace(' ', "");
+        let rules: Vec<&str> = lines
+            .iter()
+            .map(|line| line.trim())
+            .filter(|line| {
+                line.len() >= 3
+                    && line
+                        .chars()
+                        .all(|ch| matches!(ch, '━' | '─' | '=' | '-' | ' '))
+            })
+            .collect();
+        assert!(
+            rules.iter().any(|line| line.contains("  ")),
+            "segmented table rule missing: {lines:#?}"
+        );
+        assert!(
+            rules.iter().any(|line| !line.contains(' ')),
+            "top or bottom table boundary missing: {lines:#?}"
+        );
+        assert!(
+            rules
+                .iter()
+                .all(|line| crate::width::display_width(line) < usize::from(width)),
+            "table rules consumed the right-side guard: {rules:?}"
+        );
+        assert!(compact_visible.contains("汇总结果如下"));
+        assert!(visible.contains("Agora CLI"));
+        assert!(visible.contains("another-long-project-iden"));
+        assert!(visible.contains("tifier"));
+        assert!(compact_visible.contains("以上信息已完整保留"));
+        assert!(
+            !visible.contains('│') && !visible.contains('┼'),
+            "ambiguous-width vertical box glyph leaked: {visible}"
+        );
+    }
+
     #[test]
     fn retained_message_marks_decremented_on_drain() {
         let (mut r, _buf) = new_capturing(80, 24);
@@ -18868,50 +20955,103 @@ mod tests {
         );
     }
 
-    /// Pins the Issue-1 contract: when a mouse-wheel tick reaches
-    /// `RetainedRenderer::scroll_body`, it must do nothing. We
-    /// receive the event because `?1002h` (enabled for drag
-    /// selection) consumes wheel ticks from the SGR mouse stream,
-    /// but acting on the event would only shift OUR cell grid — the
-    /// host terminal's scrollback would still be unreachable. The
-    /// user-facing scrollback path is the terminal-level Shift+wheel
-    /// / Cmd+↑ bypass, which the terminal resolves BEFORE the event
-    /// hits our stdin.
-    ///
-    /// Regression guard: a future change that wires this method up
-    /// to body movement would silently break "Shift+wheel scrolls
-    /// the terminal" because the body would also jump, and would
-    /// pollute scrollback because emit-side LFs would push stale
-    /// rows into history.
     #[test]
-    fn retained_scroll_body_is_noop_to_preserve_native_scrollback() {
+    fn retained_scroll_body_moves_bounded_history_and_new_rows_do_not_steal_view() {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let sink = CapturingSink(buf.clone());
         let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
-        // Seed enough body content that any naive scroll attempt
-        // would have something to emit (we want to assert that even
-        // with rows present, scroll_body writes nothing).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
         for i in 0..40 {
-            r.render(UiLine::User(format!("L{}", i)));
+            r.render(UiLine::Error(format!("history-{i:02}")));
         }
         r.flush_deferred();
-        // Capture the byte count right BEFORE the wheel arrives so
-        // anything emitted by the wheel call shows up as a delta.
+        let painted = |renderer: &RetainedRenderer<CapturingSink>| {
+            renderer
+                .screen
+                .prev_cells_for_test()
+                .iter()
+                .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+        let bottom = painted(&r);
         let before = buf.lock().unwrap().len();
-        // Simulate a few wheel ticks in each direction.
-        r.scroll_body(-3);
-        r.scroll_body(3);
-        r.scroll_body(-1);
-        r.scroll_body(1);
-        let after = buf.lock().unwrap().len();
-        assert_eq!(
-            before,
-            after,
-            "scroll_body must NOT write any bytes — wheel scroll belongs to the \
-             terminal's native scrollback via Shift+wheel / Cmd+↑. Emitted {} \
-             unexpected bytes.",
-            after - before
+        r.scroll_body(-6);
+        let historical = painted(&r);
+        assert_ne!(
+            historical, bottom,
+            "wheel-up must change the painted viewport"
         );
+        assert!(
+            buf.lock().unwrap().len() > before,
+            "wheel-up must emit a frame"
+        );
+
+        buf.lock().unwrap().clear();
+        let appended = 30;
+        for i in 0..appended {
+            r.render(UiLine::Error(format!("pinned-native-{i:02}")));
+            assert_eq!(
+                painted(&r),
+                historical,
+                "native append must immediately restore the pinned viewport: {i}"
+            );
+        }
+        r.flush_deferred();
+        assert_eq!(
+            painted(&r),
+            historical,
+            "streamed/new history must not steal an explicitly scrolled viewport"
+        );
+        let native = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        for i in 0..appended {
+            assert!(
+                native.contains(&format!("pinned-native-{i:02}")),
+                "every row appended while pinned must still enter native scrollback: {i}"
+            );
+        }
+        assert!(
+            native.bytes().filter(|byte| *byte == b'\n').count() >= appended,
+            "each appended row must preserve the append-only LF authority"
+        );
+
+        r.scroll_body(10_000);
+        let returned = painted(&r);
+        assert!(
+            returned.iter().any(|row| row.contains("pinned-native-29")),
+            "wheel-down must clamp to and reveal the newest tail"
+        );
+
+        let epoch = r.interaction_publisher.invalidate();
+        assert!(r.interaction_publisher.set_worker_authority(epoch, 99));
+        r.scroll_body(10_000);
+        assert!(
+            r.interaction_publisher.snapshot_actionable().is_some(),
+            "a clamped no-op wheel event must repaint and republish current hit coordinates"
+        );
+    }
+
+    #[test]
+    fn retained_scroll_view_clamps_when_retained_history_prefix_is_drained() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.body_lines = vec![Vec::new(); MAX_SCROLLBACK_ROWS];
+        r.scrolled_off = 20;
+        r.body_scroll_start = Some(1);
+        // This fixture isolates front-index drain bookkeeping; suppress the
+        // live native-scrollback catch-up that a real retained history has
+        // already completed before it can reach the retention cap.
+        r.initial_history_replay_active = true;
+
+        r.push_body_row(Vec::new());
+
+        assert_eq!(r.body_lines.len(), MAX_SCROLLBACK_ROWS);
+        assert_eq!(r.body_scroll_start, Some(0));
+        assert_eq!(r.scrolled_off, 19);
     }
 
     /// Contract inverted from the original `retained_drag_selection_
@@ -19989,11 +22129,15 @@ mod tests {
         }
 
         assert_eq!(
-            after, 1,
+            after,
+            1,
             "ToolCallResult must produce exactly ONE ● EditFile row, got {}. body_lines has {} total rows.\n{:?}",
             after,
             r.body_lines.len(),
-            r.body_lines.iter().map(|row| row.iter().map(|c| c.ch).collect::<String>()).collect::<Vec<_>>()
+            r.body_lines
+                .iter()
+                .map(|row| row.iter().map(|c| c.ch).collect::<String>())
+                .collect::<Vec<_>>()
         );
 
         // Verify the └ result row is immediately after the ● row
@@ -21117,10 +23261,14 @@ mod tests {
         assert!(!out.contains("history-row-0"), "old prefix leaked: {out:?}");
         assert!(out.contains("history-row-9"), "newest row missing: {out:?}");
         assert!(r.body_lines.len() > 3, "retained model must stay complete");
-        let semantic_text = r.body_log.iter().filter_map(|line| match line {
-            UiLine::CommandOutput(text) => Some(text.as_str()),
-            _ => None,
-        }).collect::<String>();
+        let semantic_text = r
+            .body_log
+            .iter()
+            .filter_map(|line| match line {
+                UiLine::CommandOutput(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
         assert!(semantic_text.contains("history-row-0"));
         assert!(semantic_text.contains("history-row-9"));
         assert_eq!(r.body_lines.len().saturating_sub(r.scrolled_off), 3);
@@ -21139,8 +23287,14 @@ mod tests {
         r.on_resize(41, 12);
 
         let out = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
-        assert!(!out.contains("resize-history-0"), "old prefix leaked: {out:?}");
-        assert!(out.contains("resize-history-9"), "newest row missing: {out:?}");
+        assert!(
+            !out.contains("resize-history-0"),
+            "old prefix leaked: {out:?}"
+        );
+        assert!(
+            out.contains("resize-history-9"),
+            "newest row missing: {out:?}"
+        );
         assert_eq!(r.body_lines.len().saturating_sub(r.scrolled_off), 3);
     }
 
@@ -21330,7 +23484,10 @@ mod tests {
 
         let out_bytes = buf.lock().unwrap().clone();
         let out = String::from_utf8_lossy(&out_bytes);
-        assert!(out.contains("\x1b[2J\x1b[H"), "legacy resize must use ED2: {out:?}");
+        assert!(
+            out.contains("\x1b[2J\x1b[H"),
+            "legacy resize must use ED2: {out:?}"
+        );
         let cleared_rows = (1..=(new_h as usize))
             .filter(|row| {
                 let needle = format!("\x1b[{};1H\x1b[K", row);
@@ -21818,7 +23975,9 @@ mod tests {
             cursor: 0,
             checked: vec![false; 3],
             text: String::new(),
+            text_cursor_byte: 0,
             custom_text: String::new(),
+            custom_text_cursor_byte: 0,
             custom: true,
             scroll_offset: 0,
             batch: None,
@@ -21896,7 +24055,9 @@ mod tests {
             cursor: 0,
             checked: Vec::new(),
             text: String::new(),
+            text_cursor_byte: 0,
             custom_text: String::new(),
+            custom_text_cursor_byte: 0,
             custom: false,
             scroll_offset: 0,
             batch: None,
@@ -22189,6 +24350,7 @@ mod tests {
                 "Deny".into(),
             ],
             selected: 0,
+            note: None,
         });
 
         r.render(UiLine::InputPrompt {
@@ -22276,9 +24438,11 @@ mod tests {
                     .chars()
                     .all(|c| c == '─' || c == '-' || c == ' ');
             // two_above should NOT be a rule (would mean bot_rule still drawn)
-            assert!(!is_also_rule,
+            assert!(
+                !is_also_rule,
                 "bot_rule must not appear during approval; row {} looks like a second rule: {:?}\n{dump}",
-                two_above, two_above_text);
+                two_above, two_above_text
+            );
         }
     }
 
@@ -22400,6 +24564,7 @@ mod tests {
             detail: "cmd".into(),
             options: vec!["Allow once".into(), "Always allow".into(), "Deny".into()],
             selected: 0,
+            note: None,
         });
 
         r.render(UiLine::InputPrompt {

@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.0.6</span>
+    <span class="dhdr-ver">v5.0.7</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -97,7 +97,7 @@ base_url = "https://api.deepseek.com/v1"
 context_window = 64000</code></pre>
       <p>这个配置已经可以启动 atomcode 并与 DeepSeek 对话。</p>
       <div class="callout callout-info">
-        <strong>v5.0.6 的 Provider 管理</strong>
+        <strong>v5.0.7 的 Provider 管理</strong>
         <p>推荐直接运行 <code>/provider</code>：先添加供应商账号，再在该账号下添加一个或多个模型。供应商共用协议、Base URL 和 API Key；模型分别保存名称、上下文窗口等参数。旧版 <code>[providers.*]</code> 配置仍可继续使用，AtomCode 会自动兼容。</p>
       </div>
 
@@ -111,6 +111,7 @@ context_window = 64000</code></pre>
           <tr><td><code>default_workdir</code></td><td>string?</td><td>默认工作目录。用 <code>/cd</code> 切换目录时自动写回这里,下次启动恢复</td></tr>
           <tr><td><code>providers</code></td><td>table</td><td>provider 名到 <a href="#provider-config">ProviderConfig</a> 的映射</td></tr>
           <tr><td><code>vision_preprocessor_provider</code></td><td>string?</td><td>当主 provider 不支持图片但用户 attach 了图时,把图片转交给这里指定的 provider 做 OCR / 描述,结果以文本形式 splice 给主模型。详见 <a href="#vision-preprocessor">视觉预处理器</a></td></tr>
+          <tr><td><code>init_prompt_file</code></td><td>string?</td><td>追加到内置 <code>/init</code> 提示词后的 UTF-8 文件。相对路径基于 <code>$ATOMCODE_HOME</code> 解析，最大 64 KiB；也可以在 <code>/config</code> 中编辑。</td></tr>
         </tbody>
       </table>
 
@@ -127,6 +128,7 @@ context_window = 64000</code></pre>
           <tr><td><code>base_url</code></td><td>string</td><td>是</td><td>API 基地址,需指向实际接口。例:<code>https://api.deepseek.com/v1</code>、<code>http://localhost:11434</code></td></tr>
           <tr><td><code>context_window</code></td><td>integer</td><td>否</td><td>模型上下文窗口(tokens),默认 64000。<code>ollama</code> 默认 8000</td></tr>
           <tr><td><code>max_tokens</code></td><td>integer?</td><td>否</td><td>单次响应的最大输出 token 数。留空则使用 <code>context_window / 4</code></td></tr>
+          <tr><td><code>retry_max_attempts</code></td><td>integer?</td><td>否</td><td>Provider OPEN 重试循环的总尝试次数；显式设置后也会限制由 kernel 接管的 HTTP 429 恢复次数（均包含首次请求）。留空时保留原有默认策略（adapter 3 次及 kernel 的限流保护策略）；设为 1 可关闭 adapter 层及 429 自动重试，且取值不得小于 1。使用账号/模型新配置结构时，应写在 <code>[models."..."]</code> 模型配置中，因为重试策略属于模型行为。</td></tr>
           <tr><td><code>system_prompt</code></td><td>string?</td><td>否</td><td>覆盖默认系统提示。大多数场景不需要</td></tr>
           <tr><td><code>user_agent</code></td><td>string?</td><td>否</td><td>覆盖 HTTP 请求的 User-Agent,当上游接口屏蔽通用 UA 时使用</td></tr>
         </tbody>
@@ -304,7 +306,7 @@ base_url = "https://api.siliconflow.cn/v1"</code></pre>
       <h2>编辑配置的三种方式</h2>
       <ul>
         <li><strong>手动编辑</strong> —— 直接用你喜欢的编辑器打开 <code>~/.atomcode/config.toml</code>。</li>
-        <li><strong>TUI 内 <code>/config</code></strong> —— 在 atomcode 内部直接调用默认编辑器打开配置文件。</li>
+        <li><strong>TUI 内 <code>/config</code></strong> —— 可直接搜索和修改安全配置。其中动态的“最大重试次数（当前模型）”会把 <code>retry_max_attempts</code> 写入当前模型；连续按两次 Delete 可恢复默认值。</li>
         <li><strong>TUI 内 <code>/provider</code></strong> —— 交互式管理供应商账号及其模型，改动会自动落盘。</li>
       </ul>
 
