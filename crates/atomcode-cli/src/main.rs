@@ -2968,6 +2968,7 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
         match e {
             HookEvent::PreToolUse => "PreToolUse",
             HookEvent::PostToolUse => "PostToolUse",
+            HookEvent::PostToolUseFailure => "PostToolUseFailure",
             HookEvent::SessionStart => "SessionStart",
             HookEvent::SessionEnd => "SessionEnd",
             HookEvent::UserPromptSubmit => "UserPromptSubmit",
@@ -3075,6 +3076,10 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                         HookEvent::PostToolUse => serde_json::json!({
                             "session_id": sid, "hook_event_name": "PostToolUse", "cwd": cwd_s,
                             "tool_name": "bash", "tool_response": "hello\n",
+                        }),
+                        HookEvent::PostToolUseFailure => serde_json::json!({
+                            "session_id": sid, "hook_event_name": "PostToolUseFailure", "cwd": cwd_s,
+                            "tool_name": "bash", "tool_response": "command failed\n",
                         }),
                         HookEvent::UserPromptSubmit => serde_json::json!({
                             "session_id": sid, "hook_event_name": "UserPromptSubmit",
