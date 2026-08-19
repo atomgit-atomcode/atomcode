@@ -466,6 +466,11 @@ export function Sidebar({
     flatLoadedRef.current = false;
     const load = viewMode === 'workspace'
       ? (async () => {
+          // 先重置 loaded/failed 标记再启动目标 bucket：若目标先于 getProjects
+          // 完成，其「重新标记」不会被随后才执行的清空抹掉；各 bucket 完成后
+          // 自行重新标记，过期「已加载」不能抑制展开/切换时的必要拉取。
+          setLoadedProjects(new Set());
+          setFailedProjects(new Set());
           // 目标 bucket 不等 getProjects：立即开始加载，避免切换作用域后先出现
           // 空窗、再延迟出「加载中」的闪动；但保留该 promise，让本次 load 的
           // 收尾等它落定，避免其迟到响应在失败清空列表后又回灌会话。
@@ -487,10 +492,6 @@ export function Sidebar({
           setSessions((current) =>
             current.filter((session) => !session.project_hash || hashes.has(session.project_hash)),
           );
-          // 每次重载重置 loaded/failed 标记，由各 bucket 完成后重新标记：过期
-          // 的「已加载」不能抑制展开/切换时的必要拉取。
-          setLoadedProjects(new Set());
-          setFailedProjects(new Set());
           const normalizedCwd = (cwd || '').replace(/\/+$/, '');
           const currentHash = projectHash || nextProjects.find(
             (project) => project.working_dir.replace(/\/+$/, '') === normalizedCwd,
@@ -546,10 +547,14 @@ export function Sidebar({
     // 列表已成功加载过时无需重载，跳过以避免整表刷新闪动；reloadKey 变化或
     // 上次加载失败（flatLoadedRef 为 false）时仍走重载/重试。
     if (scopeChanged && !reloadKeyChanged && viewMode === 'flat' && flatLoadedRef.current) return;
-    // 纯作用域切换（projectHash 变化）且目标 bucket 已加载过：直接展开已有
-    // 数据，跳过整表重载 —— 否则每次点击其他项目的会话都会清空列表重刷。
+    // workspace 纯作用域切换（projectHash 变化）且目标 bucket 已加载过：直接
+    // 展开已有数据，跳过整表重载 —— 否则每次点击其他项目的会话都会清空列表
+    // 重刷。flat 模式不走这里（loadedProjects 可能是 workspace 时期的旧值，
+    // 且列表全局性由上面的 flatLoadedRef 路径决定）。
     if (
       scopeChanged &&
+      !reloadKeyChanged &&
+      viewMode === 'workspace' &&
       projectHash != null &&
       loadedProjectsRef.current.has(projectHash)
     ) {
