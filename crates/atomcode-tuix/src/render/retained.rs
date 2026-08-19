@@ -943,6 +943,31 @@ fn clip_cells_to_width(cells: &[Cell], max_cols: usize) -> Vec<Cell> {
     out
 }
 
+/// Paint one cell as part of a text selection (mouse-drag in the transcript
+/// / composer): a SOLID theme-aware selection background that REPLACES the
+/// cell's own bg while PRESERVING its fg — matches Claude Code's alt-screen
+/// selection and native terminal selection.
+///
+/// SGR-7 reverse (the previous approach) swapped fg/bg per cell, which
+/// fragmented into a different bg stripe for every distinct fg colour once
+/// markdown / inline-code colours were inside the selection. A single solid
+/// bg keeps the highlight uniform while the original fg stays legible.
+///
+/// Falls back to reverse video when colours are disabled (NO_COLOR etc.) —
+/// reverse is an attribute, not a colour, so it still renders on monochrome
+/// terminals.
+fn paint_selected_cell(cell: &mut Cell, colors: bool) {
+    if colors {
+        cell.style.bg = Some(super::theme::selection_bg_for_current_theme());
+        // A cell that somehow already carried reverse would re-swap fg/bg on
+        // top of the solid bg and look wrong; clear it like Claude Code's
+        // overlay does (strips existing inverse before applying the bg).
+        cell.style.reverse = false;
+    } else {
+        cell.style.reverse = true;
+    }
+}
+
 /// Cell-based wrap: splits a cell sequence into chunks whose sum
 /// of `cell.width` stays ≤ `max_cols`. Continuation cells (width 0)
 /// travel with their preceding real cell — the combined "grapheme"
@@ -4970,7 +4995,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         .get_mut(relative_row)
                         .and_then(|row| row.get_mut(2 + cell.col))
                     {
-                        painted.style.reverse = true;
+                        paint_selected_cell(painted, self.caps.colors);
                     }
                 }
             }
@@ -6376,7 +6401,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                             .get_mut(row)
                             .and_then(|cells| cells.get_mut(col + offset))
                         {
-                            cell.style.reverse = true;
+                            paint_selected_cell(cell, self.caps.colors);
                         }
                     }
                     self.pending_interactions
@@ -11203,7 +11228,13 @@ mod tests {
     }
 
     #[test]
-    fn interaction_transcript_selection_reverses_cjk_and_zwj_continuation_cells() {
+    fn interaction_transcript_selection_paints_solid_bg_on_cjk_and_zwj_continuation_cells() {
+        // The selection bg resolves the process-wide theme `MODE` (a global
+        // AtomicU8). Pin it dark under the theme lock so a parallel
+        // theme-switching test can't flip MODE between the render (which
+        // bakes SELECTION_BG_DARK into the cells) and the assertion.
+        let _theme = crate::highlight::theme::test_lock();
+        crate::highlight::theme::set_theme_mode(false);
         let interactions = crate::render::interaction::InteractionPublisher::default();
         let mut renderer = RetainedRenderer::with_writer_and_interactions(
             CountingSink(Arc::new(AtomicU64::new(0))),
@@ -11250,18 +11281,35 @@ mod tests {
         let cells = renderer.screen.prev_cells_for_test();
         let row = run.rect.row as usize;
         let col = run.rect.col as usize;
-        assert!(!cells[row][col].style.reverse, "ASCII prefix unchanged");
-        assert!(cells[row][col + 1].style.reverse, "CJK lead selected");
+        let selection_bg = crate::render::theme::selection_bg_for_current_theme();
         assert!(
-            cells[row][col + 2].style.reverse,
-            "CJK continuation selected"
+            cells[row][col].style.bg.is_none(),
+            "ASCII prefix unchanged"
         );
-        assert!(cells[row][col + 3].style.reverse, "ZWJ lead selected");
+        assert_eq!(
+            cells[row][col + 1].style.bg,
+            Some(selection_bg),
+            "CJK lead selected with solid bg"
+        );
+        assert_eq!(
+            cells[row][col + 2].style.bg,
+            Some(selection_bg),
+            "CJK continuation selected with solid bg"
+        );
+        assert_eq!(
+            cells[row][col + 3].style.bg,
+            Some(selection_bg),
+            "ZWJ lead selected with solid bg"
+        );
+        assert_eq!(
+            cells[row][col + 4].style.bg,
+            Some(selection_bg),
+            "ZWJ continuation selected with solid bg"
+        );
         assert!(
-            cells[row][col + 4].style.reverse,
-            "ZWJ continuation selected"
+            cells[row][col + 5].style.bg.is_none(),
+            "ASCII suffix unchanged"
         );
-        assert!(!cells[row][col + 5].style.reverse, "ASCII suffix unchanged");
     }
 
     #[test]
@@ -11409,7 +11457,13 @@ mod tests {
     }
 
     #[test]
-    fn interaction_composer_selection_reverses_only_the_selected_grapheme_cells() {
+    fn interaction_composer_selection_paints_solid_bg_only_on_the_selected_grapheme_cells() {
+        // The selection bg resolves the process-wide theme `MODE` (a global
+        // AtomicU8). Pin it dark under the theme lock so a parallel
+        // theme-switching test can't flip MODE between the render (which
+        // bakes SELECTION_BG_DARK into the cells) and the assertion.
+        let _theme = crate::highlight::theme::test_lock();
+        crate::highlight::theme::set_theme_mode(false);
         let interactions = crate::render::interaction::InteractionPublisher::default();
         let input = "a你👩‍💻b";
         let suffix = input.rfind('b').expect("suffix boundary");
@@ -11443,22 +11497,33 @@ mod tests {
         let cells = renderer.screen.prev_cells_for_test();
         let row = a.rect.row as usize;
         let col = a.rect.col as usize;
+        let selection_bg = crate::render::theme::selection_bg_for_current_theme();
         assert!(
-            !cells[row][col].style.reverse,
+            cells[row][col].style.bg.is_none(),
             "ASCII prefix stays unchanged"
         );
-        assert!(cells[row][col + 1].style.reverse, "CJK lead cell selected");
-        assert!(
-            cells[row][col + 2].style.reverse,
-            "CJK continuation selected"
+        assert_eq!(
+            cells[row][col + 1].style.bg,
+            Some(selection_bg),
+            "CJK lead cell selected with solid bg"
         );
-        assert!(cells[row][col + 3].style.reverse, "ZWJ lead cell selected");
-        assert!(
-            cells[row][col + 4].style.reverse,
-            "ZWJ continuation selected"
+        assert_eq!(
+            cells[row][col + 2].style.bg,
+            Some(selection_bg),
+            "CJK continuation selected with solid bg"
+        );
+        assert_eq!(
+            cells[row][col + 3].style.bg,
+            Some(selection_bg),
+            "ZWJ lead cell selected with solid bg"
+        );
+        assert_eq!(
+            cells[row][col + 4].style.bg,
+            Some(selection_bg),
+            "ZWJ continuation selected with solid bg"
         );
         assert!(
-            !cells[row][col + 5].style.reverse,
+            cells[row][col + 5].style.bg.is_none(),
             "ASCII suffix stays unchanged"
         );
     }
