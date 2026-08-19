@@ -254,60 +254,53 @@ fn scan_argv_for_lang() -> Option<String> {
     None
 }
 
-/// Scan the config file (default path only) for the `language` field.
-/// Returns `None` if the config file does not exist, cannot be parsed, or
-/// has no `language` key. This is a lightweight pre-parse -- the full config
-/// is loaded later in `run()` after clap has parsed CLI flags.
-fn scan_config_language() -> Option<atomcode_tuix::i18n::Locale> {
-    let path = atomcode_config::config::Config::default_path();
-    if !path.exists() {
-        return None;
-    }
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
-    let cfg: atomcode_config::config::Config = match toml::from_str(&content) {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
-    cfg.language
+/// Lightweight pre-parse of the default config path only, BEFORE clap renders
+/// `--help` and BEFORE the authoritative `Config` load in `run()`. Resolves
+/// the three fields that clap `--help` localisation needs: `language` (for
+/// locale) and `brand_name` / `oauth_provider_name` (for `{brand}` / `{oauth}`
+/// placeholder substitution in help text).
+///
+/// Single read + parse of the default config file — not three independent
+/// scans. Env overrides (`ATOMCODE_BRAND_NAME` / `ATOMCODE_OAUTH_PROVIDER_NAME`)
+/// are honoured so a `--help` launched under those env vars renders the
+/// env-chosen brand, matching the post-load behaviour. Never an error path:
+/// any read/parse failure falls back to defaults, matching the per-field
+/// helpers it replaces.
+struct PreScanConfig {
+    language: Option<atomcode_tuix::i18n::Locale>,
+    brand_name: String,
+    oauth_provider_name: String,
 }
 
-/// Scan the config file (default path only) for the `[ui] brand_name` and
-/// `oauth_provider_name` fields, so clap `--help` (rendered before the full
-/// `Config` load in `run()`) already shows the distribution's brand.
-///
-/// Mirrors [`scan_config_language`] in scope and precedence: a lightweight
-/// pre-parse of the default config path only, never an error path. Env
-/// overrides (`ATOMCODE_BRAND_NAME` / `ATOMCODE_OAUTH_PROVIDER_NAME`) are
-/// also honoured so a `--help` launched under those env vars renders the
-/// env-chosen brand, matching the post-load behaviour.
-fn scan_config_brand() -> (String, String) {
-    let default = atomcode_config::config::UiConfig::default();
-    let mut brand = default.brand_name;
-    let mut oauth = default.oauth_provider_name;
+fn scan_config_pre() -> PreScanConfig {
+    let ui_default = atomcode_config::config::UiConfig::default();
+    let mut result = PreScanConfig {
+        language: None,
+        brand_name: ui_default.brand_name,
+        oauth_provider_name: ui_default.oauth_provider_name,
+    };
     let path = atomcode_config::config::Config::default_path();
     if path.exists() {
         if let Ok(content) = std::fs::read_to_string(&path) {
             if let Ok(cfg) = toml::from_str::<atomcode_config::config::Config>(&content) {
-                brand = cfg.ui.brand_name;
-                oauth = cfg.ui.oauth_provider_name;
+                result.language = cfg.language;
+                result.brand_name = cfg.ui.brand_name;
+                result.oauth_provider_name = cfg.ui.oauth_provider_name;
             }
         }
     }
     // Env overrides take precedence, matching apply_env_overrides in the full load.
     if let Ok(v) = std::env::var("ATOMCODE_BRAND_NAME") {
         if !v.trim().is_empty() {
-            brand = v;
+            result.brand_name = v;
         }
     }
     if let Ok(v) = std::env::var("ATOMCODE_OAUTH_PROVIDER_NAME") {
         if !v.trim().is_empty() {
-            oauth = v;
+            result.oauth_provider_name = v;
         }
     }
-    (brand, oauth)
+    result
 }
 
 /// Build the top-level clap Command with i18n-localised about and help text.
@@ -1292,23 +1285,26 @@ async fn run() -> Result<i32> {
     // the locale first (from --lang flag, env vars, or config) so that
     // the i18n system is ready when clap calls our dynamic about/help closures.
     let pre_lang = scan_argv_for_lang();
-    // Also read config language field so --help respects /language setting.
-    let pre_config_lang = scan_config_language();
+    // Single pre-scan of the default config path: resolves language (for
+    // locale) AND brand/oauth names (for --help placeholder substitution)
+    // in one read + parse, not three independent scans.
+    let pre_scan = scan_config_pre();
     let pre_locale =
-        atomcode_tuix::i18n::resolve_initial_locale(pre_lang.as_deref(), pre_config_lang);
+        atomcode_tuix::i18n::resolve_initial_locale(pre_lang.as_deref(), pre_scan.language);
     atomcode_tuix::i18n::set_locale(pre_locale);
-
-    // Settle the brand/OAuth names from config (or env) BEFORE clap renders
-    // --help, so the localised help text shows the distribution's brand, not
-    // the upstream default. Mirrors the pre-locale scan above.
-    let (pre_brand, pre_oauth) = scan_config_brand();
-    atomcode_config::i18n::set_brand(&pre_brand, &pre_oauth);
 
     // Build the clap Command with i18n-injected about/help text, then parse.
     // Check if --help or -h was requested by scanning argv.
     // If so, render the i18n-localised help via our custom Command and exit.
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
+        // --help renders BEFORE the authoritative Config load, so settle the
+        // brand from the pre-scan (default config path + env) just for this
+        // branch. The normal launch path does NOT call set_brand here — it
+        // waits for the authoritative Config load in run() so --config
+        // / --seed-config custom paths surface the real brand, not the
+        // default-path pre-scan value.
+        atomcode_config::i18n::set_brand(&pre_scan.brand_name, &pre_scan.oauth_provider_name);
         let help_cmd = build_i18n_command();
         help_cmd
             .try_get_matches_from(std::env::args_os())

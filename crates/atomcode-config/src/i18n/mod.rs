@@ -905,4 +905,37 @@ mod tests {
         assert!(!en.contains("{oauth}"), "en leaked oauth placeholder: {en}");
         assert!(!zh.contains("{oauth}"), "zh leaked oauth placeholder: {zh}");
     }
+
+    /// The authoritative `set_brand` call (from the full `Config` load) MUST
+    /// override an earlier pre-scan value. This is the --config / --seed-config
+    /// correctness contract: the pre-scan reads only the default config path,
+    /// so a custom config's brand must win when the authoritative load settles.
+    #[test]
+    fn authoritative_set_brand_overrides_pre_scan() {
+        let _g = test_lock();
+        // Simulate the pre-scan (default config path sees "AtomCode").
+        set_brand("AtomCode", "AtomGit OAuth");
+        // Simulate the authoritative load from a custom config with "LongCode".
+        set_brand("LongCode", "OA OAuth");
+        let en = t_with(Locale::En, Msg::OnboardingPanelTitle);
+        assert_eq!(en, "LongCode", "authoritative brand did not override pre-scan: {en}");
+        // Restore upstream default so no other test sees "LongCode".
+        set_brand("AtomCode", "AtomGit OAuth");
+    }
+
+    /// A first-run scenario (no config file yet) must still render the upstream
+    /// default brand, not a bare `{brand}` token or an empty string. This is
+    /// the --seed-config path: Config::default() applies env overrides, so an
+    /// env-set brand surfaces even without a config file.
+    #[test]
+    fn first_run_no_config_renders_env_brand() {
+        let _g = test_lock();
+        // Simulate Config::default() path: no config, env override applied.
+        set_brand("EnvBrand", "EnvOAuth");
+        let en = t_with(Locale::En, Msg::WelcomeBannerLine1);
+        assert!(en.contains("EnvBrand"), "env brand not rendered on first-run: {en}");
+        assert!(!en.contains("{brand}"), "first-run leaked placeholder: {en}");
+        // Restore upstream default.
+        set_brand("AtomCode", "AtomGit OAuth");
+    }
 }
