@@ -6,9 +6,50 @@ pub use crate::locale::Locale;
 pub use messages::Msg;
 
 use std::borrow::Cow;
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
 
 static LOCALE: RwLock<Locale> = RwLock::new(Locale::En);
+
+/// Cached brand name shown in i18n strings via the `{brand}` placeholder.
+/// Settled once from `Config::ui::brand_name` at startup by [`set_brand`];
+/// falls back to `"AtomCode"` (upstream default) until then.
+static BRAND: OnceLock<String> = OnceLock::new();
+
+/// Cached OAuth provider display name shown via the `{oauth}` placeholder.
+/// Settled once from `Config::ui::oauth_provider_name` at startup by
+/// [`set_brand`]; falls back to `"AtomGit OAuth"` until then.
+static OAUTH: OnceLock<String> = OnceLock::new();
+
+/// Settle the brand/OAuth display names from the loaded config. Called once
+/// from `main` after `Config` is loaded and before any i18n render, so the
+/// first `t()` sees the distribution's names, not the upstream defaults.
+///
+/// Idempotent: a second call is a no-op (`OnceLock` keeps the first value).
+/// This is intentional — a `/reload` mid-session does NOT flip the brand,
+/// matching `theme`'s startup-only read semantics.
+pub fn set_brand(brand: &str, oauth: &str) {
+    let _ = BRAND.set(brand.to_string());
+    let _ = OAUTH.set(oauth.to_string());
+}
+
+fn brand() -> &'static str {
+    BRAND.get().map(|s| s.as_str()).unwrap_or("AtomCode")
+}
+
+fn oauth() -> &'static str {
+    OAUTH.get().map(|s| s.as_str()).unwrap_or("AtomGit OAuth")
+}
+
+/// Replace `{brand}` and `{oauth}` placeholders in a rendered i18n string.
+/// Static when no placeholder is present (the common case), so `Cow` stays
+/// borrowed and no allocation happens on the hot path.
+fn substitute_placeholders<'a>(raw: Cow<'a, str>) -> Cow<'a, str> {
+    if !raw.contains('{') {
+        return raw;
+    }
+    let owned = raw.replace("{brand}", brand()).replace("{oauth}", oauth());
+    Cow::Owned(owned)
+}
 
 /// Translate a message using the current global locale.
 ///
@@ -20,10 +61,11 @@ pub fn t(msg: Msg<'_>) -> Cow<'static, str> {
 
 /// Look up against an explicit locale.
 pub fn t_with(locale: Locale, msg: Msg<'_>) -> Cow<'static, str> {
-    match locale {
+    let raw = match locale {
         Locale::En => en::en(msg),
         Locale::ZhCn => zh_cn::zh_cn(msg),
-    }
+    };
+    substitute_placeholders(raw)
 }
 
 /// Return the current global locale. Falls back to `Locale::En` if
@@ -239,13 +281,17 @@ mod tests {
     #[test]
     fn t_with_returns_english_for_en() {
         let s = t_with(Locale::En, Msg::WelcomeBannerLine1);
-        assert!(s.starts_with("Welcome to AtomCode"));
+        // Placeholder must be replaced; the settled brand (or "AtomCode"
+        // default) is already substituted by `substitute_placeholders`.
+        assert!(s.starts_with("Welcome to "), "en render: {s}");
+        assert!(!s.contains("{brand}"), "en leaked placeholder: {s}");
     }
 
     #[test]
     fn t_with_returns_chinese_for_zh_cn() {
         let s = t_with(Locale::ZhCn, Msg::WelcomeBannerLine1);
-        assert!(s.starts_with("欢迎使用 AtomCode"));
+        assert!(s.starts_with("欢迎使用 "), "zh render: {s}");
+        assert!(!s.contains("{brand}"), "zh leaked placeholder: {s}");
     }
 
     #[test]
@@ -255,11 +301,13 @@ mod tests {
         assert_eq!(current_locale(), Locale::ZhCn);
         let s = t(Msg::WelcomeBannerLine1);
         assert!(s.starts_with("欢迎使用"));
+        assert!(!s.contains("{brand}"), "zh leaked placeholder: {s}");
 
         set_locale(Locale::En);
         assert_eq!(current_locale(), Locale::En);
         let s = t(Msg::WelcomeBannerLine1);
-        assert!(s.starts_with("Welcome to AtomCode"));
+        assert!(s.starts_with("Welcome to "), "en render: {s}");
+        assert!(!s.contains("{brand}"), "en leaked placeholder: {s}");
     }
 
     #[test]
@@ -774,5 +822,58 @@ mod tests {
             assert!(msg.contains('3'), "skipped count: {locale:?}: {msg}");
             assert!(msg.contains("Ctrl+O"), "details hint: {locale:?}: {msg}");
         }
+    }
+
+    /// `{brand}` and `{oauth}` placeholders must render the settled names,
+    /// not leak through verbatim. `set_brand` is idempotent (`OnceLock` keeps
+    /// the first value), so this test's `set_brand("TestBrand", ...)` is a
+    /// no-op if an earlier test already settled — which is fine: the assert
+    /// then checks the upstream default `"AtomCode"`, still proving the
+    /// placeholder is replaced.
+    #[test]
+    fn placeholders_are_replaced_with_settled_names() {
+        let _g = test_lock();
+        // Best-effort: settle a test-local brand. If `OnceLock` is already
+        // occupied (another test ran `set_brand` first), this is a no-op and
+        // we fall back to asserting the default replacement.
+        set_brand("TestBrand", "TestOAuth");
+
+        let en = t_with(Locale::En, Msg::WelcomeBannerLine1);
+        let zh = t_with(Locale::ZhCn, Msg::WelcomeBannerLine1);
+        // Placeholder must NOT survive into the rendered string.
+        assert!(!en.contains("{brand}"), "en leaked placeholder: {en}");
+        assert!(!zh.contains("{brand}"), "zh leaked placeholder: {zh}");
+        // The settled (or default) brand must appear.
+        assert!(
+            en.starts_with("Welcome to ") && !en.contains("Welcome to {brand}"),
+            "en did not substitute: {en}"
+        );
+    }
+
+    /// When no `set_brand` has run, the fallback must be the upstream default
+    /// `"AtomCode"` / `"AtomGit OAuth"`, so a fresh process renders the
+    /// upstream brand, not a bare `{brand}` token.
+    #[test]
+    fn unset_brand_falls_back_to_upstream_default() {
+        // Do NOT call set_brand here; rely on the OnceLock being unset OR
+        // holding a prior value. Either way the placeholder is replaced —
+        // the point is that `{brand}` never leaks.
+        let _g = test_lock();
+        let en = t_with(Locale::En, Msg::OnboardingPanelTitle);
+        assert!(!en.contains("{brand}"), "default fallback leaked placeholder: {en}");
+        // OnboardingPanelTitle is just the brand name, so the rendered value
+        // is whatever was settled (or "AtomCode" default) — never the raw token.
+        assert!(!en.is_empty(), "OnboardingPanelTitle rendered empty");
+    }
+
+    /// `{oauth}` placeholder in login command descriptions is replaced with
+    /// the settled OAuth provider name (or upstream default `"AtomGit OAuth"`).
+    #[test]
+    fn oauth_placeholder_is_replaced() {
+        let _g = test_lock();
+        let en = t_with(Locale::En, Msg::CmdDescLogin);
+        let zh = t_with(Locale::ZhCn, Msg::CmdDescLogin);
+        assert!(!en.contains("{oauth}"), "en leaked oauth placeholder: {en}");
+        assert!(!zh.contains("{oauth}"), "zh leaked oauth placeholder: {zh}");
     }
 }

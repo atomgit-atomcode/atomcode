@@ -1695,6 +1695,17 @@ async fn run() -> Result<i32> {
         atomcode_tuix::i18n::set_locale(locale);
     }
 
+    // ── i18n brand/OAuth names ──
+    // Settle the distribution's brand + OAuth provider display names into the
+    // i18n placeholder cache BEFORE any `t()` render, so the first visible
+    // string (e.g. the Welcome banner) already shows the configured brand.
+    // Idempotent (`OnceLock` keeps the first value); a mid-session `/reload`
+    // does NOT flip the brand, matching `theme`'s startup-only semantics.
+    atomcode_config::i18n::set_brand(
+        &config.ui.brand_name,
+        &config.ui.oauth_provider_name,
+    );
+
     // ── Plugin marketplace bootstrap + post-upgrade refresh ──
     //
     // Two best-effort hooks (auto-install default skills marketplace

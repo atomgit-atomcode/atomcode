@@ -441,6 +441,18 @@ pub struct UiConfig {
     /// configured row cap intact so re-enabling restores the previous limit.
     #[serde(default = "default_true")]
     pub truncate_resumed_history: bool,
+    /// User-visible brand name shown in i18n strings. Default `"AtomCode"`.
+    /// A distribution sets this to its own name (e.g. `"LongCode"`) so i18n
+    /// renders its brand without each `Msg` variant gaining a fork branch.
+    /// Env `ATOMCODE_BRAND_NAME` overrides when set. Read once at startup,
+    /// like `theme`, so a change takes effect on restart.
+    #[serde(default = "default_brand_name")]
+    pub brand_name: String,
+    /// OAuth provider display name shown in login messages. Default
+    /// `"AtomGit OAuth"`. A distribution sets this to its own name (e.g.
+    /// `"OA OAuth"`) via config or env `ATOMCODE_OAUTH_PROVIDER_NAME`.
+    #[serde(default = "default_oauth_provider_name")]
+    pub oauth_provider_name: String,
 }
 
 impl Default for UiConfig {
@@ -452,8 +464,24 @@ impl Default for UiConfig {
             terminal_status_glyph: default_terminal_status_glyph(),
             history_replay_max_rows: None,
             truncate_resumed_history: true,
+            brand_name: default_brand_name(),
+            oauth_provider_name: default_oauth_provider_name(),
         }
     }
+}
+
+/// Default brand name shown in i18n strings. Upstream keeps `"AtomCode"`;
+/// a distribution overrides via config `[ui] brand_name` or env
+/// `ATOMCODE_BRAND_NAME`.
+fn default_brand_name() -> String {
+    "AtomCode".to_string()
+}
+
+/// Default OAuth provider display name shown in login messages. Upstream
+/// keeps `"AtomGit OAuth"`; a distribution overrides via config
+/// `[ui] oauth_provider_name` or env `ATOMCODE_OAUTH_PROVIDER_NAME`.
+fn default_oauth_provider_name() -> String {
+    "AtomGit OAuth".to_string()
 }
 
 /// UI colour palette selector.
@@ -1457,6 +1485,22 @@ fn migrate_legacy_lsp_default(cfg: &mut Config) {
     }
 }
 
+/// Apply environment overrides for `[ui]` display fields that a distribution
+/// sets per-build via env rather than config.toml. Each key overrides only
+/// when set AND non-empty, matching `default_home`'s precedence rule.
+fn apply_env_overrides(cfg: &mut Config) {
+    if let Ok(v) = std::env::var("ATOMCODE_BRAND_NAME") {
+        if !v.trim().is_empty() {
+            cfg.ui.brand_name = v;
+        }
+    }
+    if let Ok(v) = std::env::var("ATOMCODE_OAUTH_PROVIDER_NAME") {
+        if !v.trim().is_empty() {
+            cfg.ui.oauth_provider_name = v;
+        }
+    }
+}
+
 /// Compatibility migration for configs written while the ordinary coding-turn
 /// default was 200 rounds. Setup/config persistence serialized that default,
 /// so changing [`CodingConfig::default`] alone would leave existing installs on
@@ -1811,7 +1855,7 @@ impl Config {
         let mut config: Config = toml::from_str(content)
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
         migrate_legacy_lsp_default(&mut config);
-        migrate_legacy_coding_round_default(&mut config);
+        apply_env_overrides(&mut config);
         Ok(config)
     }
 
@@ -1849,7 +1893,7 @@ impl Config {
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
         config.quarantined_providers = quarantined;
         migrate_legacy_lsp_default(&mut config);
-        migrate_legacy_coding_round_default(&mut config);
+        apply_env_overrides(&mut config);
         if config
             .quarantined_providers
             .contains_key(&config.default_provider)

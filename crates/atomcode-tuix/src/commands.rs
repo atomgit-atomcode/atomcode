@@ -130,7 +130,7 @@ pub fn command_display_name(canonical: &str) -> String {
 }
 
 const BUILTIN_COMMANDS: &[Command] = &[
-    Command { name: "login",   desc: "Sign in with AtomGit OAuth and claim CodingPlan models", needs_args: false, hidden: false },
+    Command { name: "login",   desc: "Sign in with {oauth} and claim CodingPlan models", needs_args: false, hidden: false },
     // needs_args=true so selecting it only completes to `/webui ` (does NOT
     // launch) — lets the user append a subcommand (stop / lan / --host <addr>)
     // before Enter. A bare `/webui ` + Enter still launches on 127.0.0.1.
