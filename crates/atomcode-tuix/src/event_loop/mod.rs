@@ -21,6 +21,7 @@ pub(crate) mod loop_ctrl;
 pub(crate) mod loop_parse;
 pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
+pub(crate) mod pointer_select;
 pub(crate) mod ui_event;
 pub(crate) mod usage_monitor;
 use commands::{execute_slash_command, format_rate_limited_line};
@@ -8950,6 +8951,9 @@ pub struct App {
     /// Flushed on newline or when buffer exceeds threshold.
     pub reasoning_buffer: String,
     transcript_selection: Option<TranscriptSelectionState>,
+    /// Last primary mouse press, for double/triple-click detection. See
+    /// `pointer_select::next_click`.
+    pointer_click: Option<pointer_select::ClickRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -9074,6 +9078,7 @@ impl App {
             setup_pending: false,
             reasoning_buffer: String::new(),
             transcript_selection: None,
+            pointer_click: None,
         }
     }
 }
@@ -12462,6 +12467,7 @@ fn handle_transcript_pointer(
     event: PointerEvent,
     frame: &crate::render::interaction::InteractionFrame,
     target: Option<crate::render::interaction::HitTarget>,
+    click_count: u8,
 ) -> TranscriptPointerRoute {
     use crate::render::interaction::{HitTarget, SemanticEndpoint};
     if event.shift || event.button != Some(crate::input::PointerButton::Primary) {
@@ -12474,8 +12480,67 @@ fn handle_transcript_pointer(
     match event.kind {
         PointerKind::Down => {
             let Some(endpoint) = endpoint else {
+                // Bare primary click OFF any transcript text dismisses an
+                // existing selection (standard editor/terminal behavior — the
+                // old code left it stuck highlighted). Only CONSUME the click
+                // (Redraw, to repaint the highlight away) when it lands on
+                // truly empty space (`target` None) where nothing else would
+                // handle it. When it lands on an interactive target
+                // (composer/menu/modal — a non-transcript hit), clear the
+                // selection but return `Ignored` so that target still receives
+                // the click and repaints itself; consuming it here would swallow
+                // the first menu/modal/composer click after a selection.
+                if selection.is_some() {
+                    *selection = None;
+                    publish_transcript_selection(None, publisher);
+                    return match target {
+                        None => TranscriptPointerRoute::Redraw,
+                        Some(_) => TranscriptPointerRoute::Ignored,
+                    };
+                }
                 return TranscriptPointerRoute::Ignored;
             };
+            // Double-click selects the WORD, triple-click the LINE — select and
+            // copy immediately, reusing the drag-Up `Copy` route (no drag).
+            if click_count >= 2 {
+                let (anchor, head) = if click_count == 2 {
+                    match frame.copy_runs.iter().find(|run| run.id == endpoint.run_id) {
+                        Some(run) => {
+                            let (start, end) =
+                                pointer_select::word_bounds(&run.text, endpoint.byte);
+                            (
+                                SemanticEndpoint { run_id: endpoint.run_id, byte: start },
+                                SemanticEndpoint { run_id: endpoint.run_id, byte: end },
+                            )
+                        }
+                        None => (endpoint, endpoint),
+                    }
+                } else {
+                    match pointer_select::line_run_span(&frame.copy_runs, endpoint.run_id) {
+                        Some((first, last)) => (
+                            SemanticEndpoint { run_id: frame.copy_runs[first].id, byte: 0 },
+                            SemanticEndpoint {
+                                run_id: frame.copy_runs[last].id,
+                                byte: frame.copy_runs[last].text.len(),
+                            },
+                        ),
+                        None => (endpoint, endpoint),
+                    }
+                };
+                *selection = Some(TranscriptSelectionState {
+                    generation: frame.generation,
+                    surface_session: frame.surface_session,
+                    anchor,
+                    head,
+                    surviving_run_ids: frame.copy_runs.iter().map(|run| run.id).collect(),
+                    dragging: false,
+                });
+                publish_transcript_selection(selection.as_ref(), publisher);
+                let surviving_runs: Vec<_> = frame.copy_runs.iter().cloned().collect();
+                return extract_transcript_selection(&surviving_runs, anchor, head)
+                    .filter(|text| !text.is_empty())
+                    .map_or(TranscriptPointerRoute::Redraw, TranscriptPointerRoute::Copy);
+            }
             *selection = Some(TranscriptSelectionState {
                 generation: frame.generation,
                 surface_session: frame.surface_session,
@@ -12617,12 +12682,38 @@ fn handle_pointer_hit(
     frame: &crate::render::interaction::InteractionFrame,
 ) -> Result<()> {
     let target = frame.hit(event.row, event.col);
+    // A scroll shifts transcript content UNDER the cell grid, so a press at the
+    // same (row, col) after scrolling is a different glyph — drop the last-click
+    // record so it can't be misread as a double/triple click.
+    if matches!(event.kind, PointerKind::Scroll(_)) {
+        app.pointer_click = None;
+    }
+    // Classify multi-clicks on primary presses (double = word, triple = line).
+    // `Instant::now()` lives here at the impure boundary; the pure logic is in
+    // `pointer_select::next_click`.
+    let click_count = if event.kind == PointerKind::Down
+        && event.button == Some(crate::input::PointerButton::Primary)
+        && !event.shift
+    {
+        let record = pointer_select::next_click(
+            app.pointer_click,
+            std::time::Instant::now(),
+            event.row,
+            event.col,
+            pointer_select::MULTI_CLICK_WINDOW,
+        );
+        app.pointer_click = Some(record);
+        record.count
+    } else {
+        1
+    };
     let transcript_route = handle_transcript_pointer(
         &mut app.transcript_selection,
         &ctx.interaction_publisher,
         event,
         frame,
         target,
+        click_count,
     );
     if apply_transcript_pointer_route(app, ctx, renderer, transcript_route)? {
         return Ok(());
@@ -13122,6 +13213,10 @@ fn handle_input(
             if let Some(selection) = app.transcript_selection.as_mut() {
                 selection.dragging = false;
             }
+            // A reflow moves transcript content under the cell grid, so a click
+            // at the same (row, col) after a resize is a different glyph — drop
+            // the last-click record so it can't be misread as a multi-click.
+            app.pointer_click = None;
             // Coalesce burst-fired SIGWINCH events. gnome-terminal /
             // alacritty / iTerm2 send a Resize per pixel during a
             // window drag — a 200ms drag fires 30+ events. Without
@@ -13779,6 +13874,7 @@ mod tests {
                     run_id: 100,
                     byte: 0
                 }),
+                1,
             ),
             super::TranscriptPointerRoute::Handled
         );
@@ -13794,6 +13890,7 @@ mod tests {
                     run_id: 101,
                     byte: 5
                 }),
+                1,
             ),
             super::TranscriptPointerRoute::Redraw
         );
@@ -13814,6 +13911,7 @@ mod tests {
                 run_id: 999,
                 byte: 3,
             }),
+            1,
         );
         assert_eq!(result, super::TranscriptPointerRoute::Copy("old-a".into()));
         assert!(!format!("{result:?}").contains("NEW"));
@@ -13827,6 +13925,7 @@ mod tests {
                     run_id: 999,
                     byte: 3
                 }),
+                1,
             ),
             super::TranscriptPointerRoute::Ignored,
             "one completed gesture copies exactly once"
@@ -13845,6 +13944,7 @@ mod tests {
                 pointer(PointerKind::Down, Some(PointerButton::Primary), false),
                 &first,
                 Some(HitTarget::TranscriptByte { run_id: 1, byte: 0 }),
+                1,
             ),
             super::TranscriptPointerRoute::Handled
         );
@@ -13856,11 +13956,133 @@ mod tests {
                 pointer(PointerKind::Up, Some(PointerButton::Primary), false),
                 &next,
                 Some(HitTarget::TranscriptByte { run_id: 1, byte: 9 }),
+                1,
             ),
             super::TranscriptPointerRoute::Handled
         );
         assert!(selection.is_none());
         assert!(publisher.transcript_selection().is_none());
+    }
+
+    #[test]
+    fn transcript_double_click_selects_the_word_and_copies() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let frame = transcript_frame(1, 5, vec![copy_run(1, "hello world", false)]);
+        let mut selection = None;
+        let route = super::handle_transcript_pointer(
+            &mut selection,
+            &publisher,
+            pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+            &frame,
+            // byte 7 lands inside "world"
+            Some(HitTarget::TranscriptByte { run_id: 1, byte: 7 }),
+            2, // double-click
+        );
+        assert_eq!(route, super::TranscriptPointerRoute::Copy("world".into()));
+        assert!(
+            publisher.transcript_selection().is_some(),
+            "the selected word must be published so it highlights"
+        );
+    }
+
+    #[test]
+    fn transcript_triple_click_selects_the_whole_soft_wrapped_line_and_copies() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        // run 1 soft-wraps into run 2 (copy_run sets next_run_id = Some(2)):
+        // together they are one logical line "foo bar" (no newline between).
+        let frame = transcript_frame(1, 5, vec![copy_run(1, "foo ", true), copy_run(2, "bar", false)]);
+        let mut selection = None;
+        let route = super::handle_transcript_pointer(
+            &mut selection,
+            &publisher,
+            pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+            &frame,
+            Some(HitTarget::TranscriptByte { run_id: 1, byte: 1 }),
+            3, // triple-click
+        );
+        assert_eq!(route, super::TranscriptPointerRoute::Copy("foo bar".into()));
+    }
+
+    #[test]
+    fn transcript_click_on_empty_area_clears_an_existing_selection() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let frame = transcript_frame(1, 5, vec![copy_run(1, "hello", false)]);
+        let mut selection = None;
+        // Seed a selection with a normal single-click drag start.
+        super::handle_transcript_pointer(
+            &mut selection,
+            &publisher,
+            pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+            &frame,
+            Some(HitTarget::TranscriptByte { run_id: 1, byte: 0 }),
+            1,
+        );
+        assert!(selection.is_some(), "precondition: a selection exists");
+        // A bare click on empty space (no hit target) dismisses it.
+        let route = super::handle_transcript_pointer(
+            &mut selection,
+            &publisher,
+            pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+            &frame,
+            None,
+            1,
+        );
+        assert_eq!(route, super::TranscriptPointerRoute::Redraw);
+        assert!(selection.is_none(), "selection cleared");
+        assert!(publisher.transcript_selection().is_none());
+    }
+
+    #[test]
+    fn transcript_click_on_interactive_target_clears_selection_without_consuming() {
+        // Regression guard: dismissing a selection must NOT consume the click
+        // when it lands on an interactive target (menu/modal/composer) — that
+        // target still needs to receive it. Only truly-empty clicks consume.
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let frame = transcript_frame(1, 5, vec![copy_run(1, "hello", false)]);
+        let mut selection = None;
+        super::handle_transcript_pointer(
+            &mut selection,
+            &publisher,
+            pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+            &frame,
+            Some(HitTarget::TranscriptByte { run_id: 1, byte: 0 }),
+            1,
+        );
+        assert!(selection.is_some(), "precondition: a selection exists");
+        let route = super::handle_transcript_pointer(
+            &mut selection,
+            &publisher,
+            pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+            &frame,
+            Some(HitTarget::MenuItem { index: 0 }),
+            1,
+        );
+        assert_eq!(
+            route,
+            super::TranscriptPointerRoute::Ignored,
+            "the menu click must NOT be swallowed by the dismiss"
+        );
+        assert!(selection.is_none(), "selection is still dismissed");
+    }
+
+    #[test]
+    fn transcript_click_off_text_with_no_selection_stays_ignored_for_the_composer() {
+        // With NO transcript selection active, a click that lands on the
+        // composer must fall through to `Ignored` so the composer positions its
+        // own cursor — the dismiss branch must not steal ordinary composer
+        // clicks.
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let frame = transcript_frame(1, 5, vec![copy_run(1, "hello", false)]);
+        let mut selection = None;
+        let route = super::handle_transcript_pointer(
+            &mut selection,
+            &publisher,
+            pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+            &frame,
+            Some(HitTarget::ComposerByte { byte: 3 }),
+            1,
+        );
+        assert_eq!(route, super::TranscriptPointerRoute::Ignored);
     }
 
     #[test]
@@ -13926,6 +14148,7 @@ mod tests {
                     run_id: 100,
                     byte: 0
                 }),
+                1,
             ),
             super::TranscriptPointerRoute::Handled
         );
@@ -13939,6 +14162,7 @@ mod tests {
                     run_id: 101,
                     byte: "old-b".len(),
                 }),
+                1,
             ),
             super::TranscriptPointerRoute::Redraw
         );
