@@ -9650,7 +9650,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // ── Terminal input ──
             maybe = ctx.input_rx.recv() => {
                 let Some(ev) = maybe else { break };
+                // Collapse a burst of drag-selection moves so the transcript
+                // repaints once per batch instead of once per queued Drag event.
+                let (ev, trailing) = coalesce_drag_events(ev, &mut ctx.input_rx);
                 handle_input(&mut app, &mut ctx, renderer, ev)?;
+                if let Some(trailing) = trailing {
+                    handle_input(&mut app, &mut ctx, renderer, trailing)?;
+                }
             }
 
             // ── Version-check wake ──
@@ -10071,7 +10077,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // ── Terminal input ──
             maybe = ctx.input_rx.recv() => {
                 let Some(ev) = maybe else { break };
+                // Collapse a burst of drag-selection moves so the transcript
+                // repaints once per batch instead of once per queued Drag event.
+                let (ev, trailing) = coalesce_drag_events(ev, &mut ctx.input_rx);
                 handle_input(&mut app, &mut ctx, renderer, ev)?;
+                if let Some(trailing) = trailing {
+                    handle_input(&mut app, &mut ctx, renderer, trailing)?;
+                }
             }
 
             // ── Version-check wake ──
@@ -13083,6 +13095,35 @@ fn cancel_unactionable_pointer_release(
     cancel
 }
 
+/// Collapse a burst of drag-selection moves before dispatch. A fast mouse drag
+/// fires dozens of `Drag` events, and each one triggers a FULL transcript
+/// repaint (`redraw_idle_plain`) to update the selection highlight — the
+/// reported "拖到最后越来越卡". Mirroring the resize coalescing, drain the leading
+/// run of consecutive `Drag` events already queued in `input_rx` and keep only
+/// the LATEST, so the transcript repaints once per batch instead of once per
+/// event. Returns the (possibly collapsed) event to dispatch, plus the first
+/// non-`Drag` event that ended the run — dispatch it NEXT to preserve ordering
+/// (e.g. the mouse-`Up` that finishes the drag, or a `Down` starting a fresh
+/// gesture). Non-drag / non-pointer events pass straight through.
+fn coalesce_drag_events(
+    ev: InputEvent,
+    input_rx: &mut mpsc::UnboundedReceiver<InputEvent>,
+) -> (InputEvent, Option<InputEvent>) {
+    if !matches!(&ev, InputEvent::Pointer(p) if p.kind == PointerKind::Drag) {
+        return (ev, None);
+    }
+    let mut latest = ev;
+    while let Ok(next) = input_rx.try_recv() {
+        match next {
+            InputEvent::Pointer(p) if p.kind == PointerKind::Drag => {
+                latest = InputEvent::Pointer(p);
+            }
+            other => return (latest, Some(other)),
+        }
+    }
+    (latest, None)
+}
+
 fn handle_input(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -13712,6 +13753,68 @@ mod tests {
             control: false,
             alt: false,
         }
+    }
+
+    fn drag_at(row: u16) -> crate::input::InputEvent {
+        let mut p = pointer(PointerKind::Drag, Some(PointerButton::Primary), false);
+        p.row = row;
+        crate::input::InputEvent::Pointer(p)
+    }
+    fn pointer_ev(kind: PointerKind) -> crate::input::InputEvent {
+        crate::input::InputEvent::Pointer(pointer(kind, Some(PointerButton::Primary), false))
+    }
+
+    #[test]
+    fn coalesce_drag_collapses_run_to_latest_and_keeps_trailing_up() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(drag_at(2)).unwrap();
+        tx.send(drag_at(3)).unwrap();
+        tx.send(pointer_ev(PointerKind::Up)).unwrap();
+        // Start from the first drag; the queued drags collapse to the latest (row 3),
+        // and the Up that ends the run is returned as the trailing event.
+        let (ev, trailing) = super::coalesce_drag_events(drag_at(1), &mut rx);
+        match ev {
+            crate::input::InputEvent::Pointer(p) => {
+                assert_eq!(p.kind, PointerKind::Drag);
+                assert_eq!(p.row, 3, "kept the newest drag position");
+            }
+            _ => panic!("expected a Drag"),
+        }
+        match trailing {
+            Some(crate::input::InputEvent::Pointer(p)) => assert_eq!(p.kind, PointerKind::Up),
+            other => panic!("expected trailing Up, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "queue fully drained");
+    }
+
+    #[test]
+    fn coalesce_stops_at_a_new_gesture_down() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(pointer_ev(PointerKind::Down)).unwrap(); // a fresh gesture, not part of the drag
+        let (ev, trailing) = super::coalesce_drag_events(drag_at(1), &mut rx);
+        assert!(matches!(ev, crate::input::InputEvent::Pointer(p) if p.kind == PointerKind::Drag));
+        match trailing {
+            Some(crate::input::InputEvent::Pointer(p)) => assert_eq!(p.kind, PointerKind::Down),
+            other => panic!("a Down must end the run and be preserved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coalesce_single_drag_with_empty_queue_is_unchanged() {
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ev, trailing) = super::coalesce_drag_events(drag_at(5), &mut rx);
+        assert!(trailing.is_none());
+        assert!(matches!(ev, crate::input::InputEvent::Pointer(p) if p.row == 5));
+    }
+
+    #[test]
+    fn coalesce_leaves_non_drag_events_untouched() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(drag_at(9)).unwrap(); // must NOT be consumed for a non-drag input
+        let (ev, trailing) = super::coalesce_drag_events(pointer_ev(PointerKind::Down), &mut rx);
+        assert!(matches!(ev, crate::input::InputEvent::Pointer(p) if p.kind == PointerKind::Down));
+        assert!(trailing.is_none());
+        assert!(rx.try_recv().is_ok(), "a non-drag input must not drain the queue");
     }
 
     fn pointer_interaction() -> InteractionFrame {
