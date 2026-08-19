@@ -6,38 +6,61 @@ pub use crate::locale::Locale;
 pub use messages::Msg;
 
 use std::borrow::Cow;
-use std::sync::{OnceLock, RwLock};
+use std::sync::RwLock;
 
 static LOCALE: RwLock<Locale> = RwLock::new(Locale::En);
 
 /// Cached brand name shown in i18n strings via the `{brand}` placeholder.
-/// Settled once from `Config::ui::brand_name` at startup by [`set_brand`];
+/// Settled from `Config::ui::brand_name` at startup by [`set_brand`];
 /// falls back to `"AtomCode"` (upstream default) until then.
-static BRAND: OnceLock<String> = OnceLock::new();
+///
+/// `RwLock` (not `OnceLock`) so the authoritative `Config` load can override
+/// the lightweight pre-scan value used for clap `--help` rendering. The
+/// pre-scan reads only the default config path; a `--config <custom>` or
+/// `--seed-config` first-run must still surface the real brand, so the
+/// later authoritative `set_brand` call wins. Writes are serial and rare
+/// (two per launch), reads are the hot path through `substitute_placeholders`.
+static BRAND: RwLock<String> = RwLock::new(String::new());
 
 /// Cached OAuth provider display name shown via the `{oauth}` placeholder.
-/// Settled once from `Config::ui::oauth_provider_name` at startup by
-/// [`set_brand`]; falls back to `"AtomGit OAuth"` until then.
-static OAUTH: OnceLock<String> = OnceLock::new();
+/// Same write-twice / read-hot pattern as [`BRAND`].
+static OAUTH: RwLock<String> = RwLock::new(String::new());
 
-/// Settle the brand/OAuth display names from the loaded config. Called once
-/// from `main` after `Config` is loaded and before any i18n render, so the
-/// first `t()` sees the distribution's names, not the upstream defaults.
+/// Settle the brand/OAuth display names from the loaded config. Called twice
+/// from `main`: once with a pre-scan value before clap `--help` (so localised
+/// help shows the distribution's brand), then again with the authoritative
+/// `Config` value after load — the second call OVERWRITES the first, so
+/// `--config <custom>` / `--seed-config` paths surface the real brand, not
+/// the default-path pre-scan.
 ///
-/// Idempotent: a second call is a no-op (`OnceLock` keeps the first value).
-/// This is intentional — a `/reload` mid-session does NOT flip the brand,
-/// matching `theme`'s startup-only read semantics.
+/// A mid-session `/reload` DOES flip the brand (last write wins). This is
+/// intentional — the pre-scan is best-effort, the authoritative load must
+/// be able to correct it, and `/reload` is an explicit user action.
 pub fn set_brand(brand: &str, oauth: &str) {
-    let _ = BRAND.set(brand.to_string());
-    let _ = OAUTH.set(oauth.to_string());
+    if let Ok(mut guard) = BRAND.write() {
+        *guard = brand.to_string();
+    }
+    if let Ok(mut guard) = OAUTH.write() {
+        *guard = oauth.to_string();
+    }
 }
 
-fn brand() -> &'static str {
-    BRAND.get().map(|s| s.as_str()).unwrap_or("AtomCode")
+fn brand() -> String {
+    BRAND
+        .read()
+        .map(|g| g.clone())
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "AtomCode".to_string())
 }
 
-fn oauth() -> &'static str {
-    OAUTH.get().map(|s| s.as_str()).unwrap_or("AtomGit OAuth")
+fn oauth() -> String {
+    OAUTH
+        .read()
+        .map(|g| g.clone())
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "AtomGit OAuth".to_string())
 }
 
 /// Replace `{brand}` and `{oauth}` placeholders in a rendered i18n string.
@@ -51,7 +74,7 @@ pub fn substitute_placeholders<'a>(raw: Cow<'a, str>) -> Cow<'a, str> {
     if !raw.contains('{') {
         return raw;
     }
-    let owned = raw.replace("{brand}", brand()).replace("{oauth}", oauth());
+    let owned = raw.replace("{brand}", &brand()).replace("{oauth}", &oauth());
     Cow::Owned(owned)
 }
 
@@ -837,9 +860,10 @@ mod tests {
     #[test]
     fn placeholders_are_replaced_with_settled_names() {
         let _g = test_lock();
-        // Best-effort: settle a test-local brand. If `OnceLock` is already
-        // occupied (another test ran `set_brand` first), this is a no-op and
-        // we fall back to asserting the default replacement.
+        // Settle a test-local brand. RwLock (last write wins) so this IS
+        // observable, not a no-op like the old OnceLock. We restore the
+        // upstream default at the end so this test does not pollute the
+        // process-level cache for subsequent tests (test ordering independence).
         set_brand("TestBrand", "TestOAuth");
 
         let en = t_with(Locale::En, Msg::WelcomeBannerLine1);
@@ -847,11 +871,12 @@ mod tests {
         // Placeholder must NOT survive into the rendered string.
         assert!(!en.contains("{brand}"), "en leaked placeholder: {en}");
         assert!(!zh.contains("{brand}"), "zh leaked placeholder: {zh}");
-        // The settled (or default) brand must appear.
-        assert!(
-            en.starts_with("Welcome to ") && !en.contains("Welcome to {brand}"),
-            "en did not substitute: {en}"
-        );
+        // The settled brand must appear (RwLock last-write-wins guarantees this).
+        assert!(en.contains("TestBrand"), "en did not use settled brand: {en}");
+        assert!(zh.contains("TestBrand"), "zh did not use settled brand: {zh}");
+
+        // Restore upstream default so no other test sees "TestBrand".
+        set_brand("AtomCode", "AtomGit OAuth");
     }
 
     /// When no `set_brand` has run, the fallback must be the upstream default
