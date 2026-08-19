@@ -364,6 +364,7 @@ export function App() {
         activeSessionId={sessionId}
         onSelect={handleSelectSession}
         onNew={handleNewSession}
+        onNewInProject={handlePickCwd}
         open={sidebarOpen}
         collapsed={sidebarCollapsed}
         onToggleCollapse={() => setSidebarCollapsed((c) => !c)}

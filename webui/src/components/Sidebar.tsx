@@ -24,6 +24,10 @@ interface SidebarProps {
   activeSessionId: string | null;
   onSelect: (session: SessionMetaWithProject) => void;
   onNew: () => void;
+  /** Start a new session in a SPECIFIC project's working directory (the per-row
+   *  `+` in the workspace tree). Wired to the same "switch cwd + open" path as
+   *  the project switcher. */
+  onNewInProject?: (workingDir: string) => void;
   /** Open a specific settings dialog (theme / language / model). */
   onOpenSettings: (section: SettingsSection) => void;
   /** Mobile drawer open state */
@@ -315,6 +319,7 @@ export function Sidebar({
   activeSessionId,
   onSelect,
   onNew,
+  onNewInProject,
   onOpenSettings,
   open,
   collapsed,
@@ -1445,7 +1450,18 @@ export function Sidebar({
                 >
                   <span class="sidebar-project-icon"><FolderIcon /></span>
                   <span class="sidebar-project-name">{project.name || dirName(project.working_dir)}</span>
-                  <span class="sidebar-project-count">{project.session_count}</span>
+                  <span class="sidebar-project-count">({project.session_count})</span>
+                </button>
+                <button
+                  class="sidebar-project-new"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onNewInProject?.(project.working_dir);
+                  }}
+                  title={t('sidebar.newInProject')}
+                  aria-label={t('sidebar.newInProject')}
+                >
+                  <PlusIcon />
                 </button>
               </div>
               {expanded && (
