@@ -410,6 +410,15 @@ export function Sidebar({
   // switch. Workspace mode loads only expanded project buckets.
   const loadEpochRef = useRef(0);
   const projectRequestRef = useRef(new Map<string, number>());
+  // 纯作用域切换（projectHash 变化）且目标 bucket 已加载过时，跳过整表重载：
+  // 直接展开已有数据，避免每次点击其他项目的会话都清空列表重刷闪动。
+  const previousProjectHashRef = useRef(projectHash);
+  const previousReloadKeyRef = useRef(reloadKey);
+  const loadedProjectsRef = useRef(loadedProjects);
+  loadedProjectsRef.current = loadedProjects;
+  // flat 模式的全局列表成功加载过才允许跳过作用域切换的重载：加载失败时保留
+  // 「下次切换即重试」的路径。
+  const flatLoadedRef = useRef(false);
 
   function replaceProjectSessions(hash: string, list: SessionMetaWithProject[]) {
     setSessions((current) => [
@@ -454,10 +463,34 @@ export function Sidebar({
     const epoch = ++loadEpochRef.current;
     setLoading(true);
     setLoadingProjects(new Set());
+    flatLoadedRef.current = false;
     const load = viewMode === 'workspace'
-      ? getProjects().then(async (nextProjects) => {
-          if (epoch !== loadEpochRef.current) return [];
+      ? (async () => {
+          // 目标 bucket 不等 getProjects：立即开始加载，避免切换作用域后先出现
+          // 空窗、再延迟出「加载中」的闪动；但保留该 promise，让本次 load 的
+          // 收尾等它落定，避免其迟到响应在失败清空列表后又回灌会话。
+          const target = projectHash ? loadProjectBucket(projectHash, epoch) : Promise.resolve();
+          let nextProjects: ProjectInfo[];
+          try {
+            nextProjects = await getProjects();
+          } catch (error) {
+            // getProjects 失败：先让在途的目标 bucket 落定（其写入随后会被下方
+            // .catch 清空），保证 load 结束时没有在途 bucket。
+            await target.catch(() => {});
+            throw error;
+          }
+          if (epoch !== loadEpochRef.current) return null;
           setProjects(nextProjects);
+          // 清理已不存在的项目 bucket，但不整表清空 —— 可见列表保持原样就地
+          // 更新，避免重载/删除时整表刷新闪动。
+          const hashes = new Set(nextProjects.map((project) => project.hash));
+          setSessions((current) =>
+            current.filter((session) => !session.project_hash || hashes.has(session.project_hash)),
+          );
+          // 每次重载重置 loaded/failed 标记，由各 bucket 完成后重新标记：过期
+          // 的「已加载」不能抑制展开/切换时的必要拉取。
+          setLoadedProjects(new Set());
+          setFailedProjects(new Set());
           const normalizedCwd = (cwd || '').replace(/\/+$/, '');
           const currentHash = projectHash || nextProjects.find(
             (project) => project.working_dir.replace(/\/+$/, '') === normalizedCwd,
@@ -469,18 +502,22 @@ export function Sidebar({
             'workspace',
             [currentHash, ...retainedExpanded],
           );
-          setSessions([]);
-          setLoadedProjects(new Set());
-          setFailedProjects(new Set());
-          await Promise.all(projectScopes.map((hash) => loadProjectBucket(hash, epoch)));
+          const started = projectHash ? new Set([projectHash]) : new Set<string>();
+          await Promise.all([
+            target,
+            ...projectScopes
+              .filter((hash) => !started.has(hash))
+              .map((hash) => loadProjectBucket(hash, epoch)),
+          ]);
           return null;
-        })
+        })()
       : listSessions();
     load
       .then((list) => {
         if (epoch !== loadEpochRef.current) return; // superseded by a newer load
         if (list === null) return;
         setSessions(list);
+        flatLoadedRef.current = true;
         // 回合落盘后这次刷新会带出已自动命名的当前会话 → 回传给 App 更新标题头。
         if (activeSessionId) {
           const found = list.find((s) => s.id === activeSessionId);
@@ -501,6 +538,26 @@ export function Sidebar({
   }
 
   useEffect(() => {
+    const scopeChanged = projectHash !== previousProjectHashRef.current;
+    const reloadKeyChanged = reloadKey !== previousReloadKeyRef.current;
+    previousProjectHashRef.current = projectHash;
+    previousReloadKeyRef.current = reloadKey;
+    // flat 模式的列表是全局的（/sessions，不按项目过滤）—— 纯作用域切换且
+    // 列表已成功加载过时无需重载，跳过以避免整表刷新闪动；reloadKey 变化或
+    // 上次加载失败（flatLoadedRef 为 false）时仍走重载/重试。
+    if (scopeChanged && !reloadKeyChanged && viewMode === 'flat' && flatLoadedRef.current) return;
+    // 纯作用域切换（projectHash 变化）且目标 bucket 已加载过：直接展开已有
+    // 数据，跳过整表重载 —— 否则每次点击其他项目的会话都会清空列表重刷。
+    if (
+      scopeChanged &&
+      projectHash != null &&
+      loadedProjectsRef.current.has(projectHash)
+    ) {
+      // 使在途加载失效，避免旧响应覆盖已展开的 bucket。
+      loadEpochRef.current += 1;
+      setLoading(false);
+      return;
+    }
     loadSessions();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reloadKey, viewMode, projectHash]);
@@ -524,7 +581,17 @@ export function Sidebar({
     const container = sessionListBodyRef.current;
     const item = activeSessionItemRef.current;
     if (!container || !item || !container.contains(item)) return;
-    item.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+    // 用户刚点开的行必然在可视区内：仅在行确实滚出容器可视区时才滚动，且用
+    // nearest（最小滚动量）而非 center —— 否则每次点击都会把整列平滑滚动到
+    // 居中，看起来像整表刷新闪动。外部切换（TUI /resume、live 事件）时行可能
+    // 在屏幕外，此时仍会定位到可见位置。
+    const containerRect = container.getBoundingClientRect();
+    const itemRect = item.getBoundingClientRect();
+    const visible =
+      itemRect.top >= containerRect.top && itemRect.bottom <= containerRect.bottom;
+    if (!visible) {
+      item.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
+    }
     pendingCenterSessionIdRef.current = null;
   }, [activeSessionId, collapsed, loading, sessions, expandedProjects]);
 

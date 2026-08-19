@@ -114,11 +114,6 @@ interface Message {
   ts?: number;
   /** Browser-local correlation for an optimistic /live submission. Never persisted. */
   pendingSteerId?: string;
-  /** Browser-local: set once any text/reasoning/tool event has touched this
-   *  assistant message. Reasoning content is not rendered, so `parts` alone
-   *  cannot prove output activity — this flag lets the first reasoning delta
-   *  clear the three-dot waiting indicator. Never persisted. */
-  outputStarted?: boolean;
 }
 
 interface QueuedMessage {
@@ -2124,14 +2119,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         break;
 
       case 'reasoning':
-        // 推理内容当前不渲染（沿用既有行为），但首个推理事件即视为输出
-        // 活动：清除三点 waiting，恢复流式光标。
-        setMessages((prev) => {
-          if (prev.length === 0) return prev;
-          const last = prev[prev.length - 1];
-          if (last.role !== 'assistant' || last.outputStarted) return prev;
-          return [...prev.slice(0, -1), { ...last, outputStarted: true }];
-        });
+        // 推理内容不渲染（沿用既有行为）；三点 loading 覆盖整个回合，
+        // 推理事件不再切换闪烁光标。
         break;
 
       case 'tool_start': {
@@ -3806,9 +3795,8 @@ function AssistantMessageView({
     text.includes('[Error:') ||
     text.includes('[Connection error:');
   const streaming = isLast && busy;
-  // 三点 loading：busy 且 assistant 气泡尚无任何可见输出。首个文本 / 推理 /
-  // 工具事件到达即消失——文本/工具使 parts 非空，推理事件置 outputStarted。
-  const waiting = streaming && msg.parts.length === 0 && !msg.outputStarted;
+  // 三点 loading 覆盖整个回合：思考（无可见输出）和文本输出阶段都显示，
+  // 直到回合结束（busy 变 false）才消失。不再使用闪烁光标。
   // 终条且简短（无工具、单行）时，去掉多余 of "时间线末端"橙点，只留一个起始点。
   const terse =
     isLast && !streaming && !messageHasTools(msg) && !text.includes('\n');
@@ -3816,7 +3804,6 @@ function AssistantMessageView({
   const cls =
     'timeline-message ' +
     dotClass +
-    (streaming ? ' dot-blink' : '') +
     (isLast ? ' is-last' : '') +
     (terse ? ' is-terse' : '') +
     (isActiveSearchMatch ? ' is-active-search-match' : '');
@@ -3861,21 +3848,25 @@ function AssistantMessageView({
       {isError ? (
         <div class="error-message-content">
           {highlightText(text, search)}
-          {streaming && <span class="streaming-cursor" />}
+          {streaming && (
+            <span class="waiting-dots" role="status" aria-label={t('chat.waiting')}>
+              <span class="waiting-dot" />
+              <span class="waiting-dot" />
+              <span class="waiting-dot" />
+            </span>
+          )}
         </div>
       ) : (
         <>
           {/* Segments in chronological order: text→tool→text→tool,
               matching the TUI. Consecutive tools share one tool-list. */}
           {renderAssistantParts(msg.parts, search)}
-          {waiting ? (
+          {streaming && (
             <span class="waiting-dots" role="status" aria-label={t('chat.waiting')}>
               <span class="waiting-dot" />
               <span class="waiting-dot" />
               <span class="waiting-dot" />
             </span>
-          ) : (
-            streaming && <span class="streaming-cursor" />
           )}
         </>
       )}
