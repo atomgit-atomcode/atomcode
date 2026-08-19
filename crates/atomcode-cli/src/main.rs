@@ -274,6 +274,42 @@ fn scan_config_language() -> Option<atomcode_tuix::i18n::Locale> {
     cfg.language
 }
 
+/// Scan the config file (default path only) for the `[ui] brand_name` and
+/// `oauth_provider_name` fields, so clap `--help` (rendered before the full
+/// `Config` load in `run()`) already shows the distribution's brand.
+///
+/// Mirrors [`scan_config_language`] in scope and precedence: a lightweight
+/// pre-parse of the default config path only, never an error path. Env
+/// overrides (`ATOMCODE_BRAND_NAME` / `ATOMCODE_OAUTH_PROVIDER_NAME`) are
+/// also honoured so a `--help` launched under those env vars renders the
+/// env-chosen brand, matching the post-load behaviour.
+fn scan_config_brand() -> (String, String) {
+    let default = atomcode_config::config::UiConfig::default();
+    let mut brand = default.brand_name;
+    let mut oauth = default.oauth_provider_name;
+    let path = atomcode_config::config::Config::default_path();
+    if path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(cfg) = toml::from_str::<atomcode_config::config::Config>(&content) {
+                brand = cfg.ui.brand_name;
+                oauth = cfg.ui.oauth_provider_name;
+            }
+        }
+    }
+    // Env overrides take precedence, matching apply_env_overrides in the full load.
+    if let Ok(v) = std::env::var("ATOMCODE_BRAND_NAME") {
+        if !v.trim().is_empty() {
+            brand = v;
+        }
+    }
+    if let Ok(v) = std::env::var("ATOMCODE_OAUTH_PROVIDER_NAME") {
+        if !v.trim().is_empty() {
+            oauth = v;
+        }
+    }
+    (brand, oauth)
+}
+
 /// Build the top-level clap Command with i18n-localised about and help text.
 /// This replaces the default Cli::parse() flow so that --help output
 /// respects the current locale (set by scan_argv_for_lang above).
@@ -1261,6 +1297,12 @@ async fn run() -> Result<i32> {
     let pre_locale =
         atomcode_tuix::i18n::resolve_initial_locale(pre_lang.as_deref(), pre_config_lang);
     atomcode_tuix::i18n::set_locale(pre_locale);
+
+    // Settle the brand/OAuth names from config (or env) BEFORE clap renders
+    // --help, so the localised help text shows the distribution's brand, not
+    // the upstream default. Mirrors the pre-locale scan above.
+    let (pre_brand, pre_oauth) = scan_config_brand();
+    atomcode_config::i18n::set_brand(&pre_brand, &pre_oauth);
 
     // Build the clap Command with i18n-injected about/help text, then parse.
     // Check if --help or -h was requested by scanning argv.

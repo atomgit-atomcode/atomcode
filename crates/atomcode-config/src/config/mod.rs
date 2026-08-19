@@ -597,7 +597,7 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
+        let mut cfg = Self {
             default_provider: String::new(),
             evaluator_provider: None,
             default_workdir: None,
@@ -626,7 +626,13 @@ impl Default for Config {
             offline_mode: offline::OfflineMode::default(),
             offline_note: None,
             quarantined_providers: std::collections::BTreeMap::new(),
-        }
+        };
+        // Honour env overrides for [ui] display fields even on the default
+        // fallback path (no config file / parse failure), so a distribution
+        // launched without a config still renders its env-chosen brand.
+        // Mirrors apply_env_overrides() used on the parsed path.
+        apply_env_overrides(&mut cfg);
+        cfg
     }
 }
 
@@ -1855,6 +1861,7 @@ impl Config {
         let mut config: Config = toml::from_str(content)
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
         migrate_legacy_lsp_default(&mut config);
+        migrate_legacy_coding_round_default(&mut config);
         apply_env_overrides(&mut config);
         Ok(config)
     }
@@ -1893,6 +1900,7 @@ impl Config {
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
         config.quarantined_providers = quarantined;
         migrate_legacy_lsp_default(&mut config);
+        migrate_legacy_coding_round_default(&mut config);
         apply_env_overrides(&mut config);
         if config
             .quarantined_providers
