@@ -5887,6 +5887,15 @@ pub struct FsOpenRequest {
     pub session_id: Option<String>,
 }
 
+/// Resolve a file to open: canonicalize (resolving `..` / symlinks) and require
+/// the result to be an existing regular file. Deliberately matches the agent's
+/// `open_file` reach — a turn can legitimately write files outside the session
+/// workspace (the agent tools do not enforce containment), and those same files
+/// appear as openable artifacts in the WebUI. The launcher
+/// (`open_local_path`) only opens the system GUI opener and never returns file
+/// contents, so relaxing the old workspace-containment check weakens no data
+/// boundary. Directories and URLs are still refused, and relative paths
+/// resolve against `root` (the owning session's working directory).
 fn resolve_workspace_file(root: &std::path::Path, requested: &str) -> std::io::Result<PathBuf> {
     let requested = PathBuf::from(requested.trim());
     if requested.as_os_str().is_empty() {
@@ -5902,10 +5911,10 @@ fn resolve_workspace_file(root: &std::path::Path, requested: &str) -> std::io::R
         root.join(requested)
     };
     let target = std::fs::canonicalize(unresolved)?;
-    if !target.starts_with(&root) || !target.is_file() {
+    if !target.is_file() {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "only regular files inside the current working directory can be opened",
+            std::io::ErrorKind::InvalidInput,
+            "only regular files can be opened",
         ));
     }
     Ok(target)
@@ -5941,10 +5950,12 @@ fn resolve_session_workspace_file(
     resolve_workspace_file(&root, requested)
 }
 
-/// Open a generated file from the WebUI. This is deliberately narrower than
-/// the agent's `open_file` tool: HTTP callers may open only an existing regular
-/// file under the daemon's current workspace, after symlinks and `..` are
-/// resolved. The endpoint never accepts URLs or directories.
+/// Open a generated file from the WebUI. Like the agent's `open_file` tool, this
+/// launches the default GUI opener for any existing regular file (`..` and
+/// symlinks are resolved first); relative paths resolve against the owning
+/// session's working directory, so files a turn wrote outside that directory
+/// stay openable. The endpoint never accepts URLs or directories, and it never
+/// returns file contents — only the opener's status message.
 async fn fs_open(
     State(state): State<AppState>,
     Json(req): Json<FsOpenRequest>,
@@ -6504,7 +6515,7 @@ mod fs_list_tests {
     }
 
     #[test]
-    fn workspace_file_resolution_accepts_files_and_rejects_escape_or_directory() {
+    fn workspace_file_resolution_accepts_files_and_rejects_directories() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
@@ -6515,21 +6526,23 @@ mod fs_list_tests {
             resolve_workspace_file(&workspace, "artifact.md").unwrap(),
             std::fs::canonicalize(workspace.join("artifact.md")).unwrap()
         );
+        // Files outside the workspace stay openable: a turn may legitimately
+        // write paths outside the session working directory, and those same
+        // files surface as artifacts in the WebUI.
         assert_eq!(
-            resolve_workspace_file(&workspace, "../outside.md")
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::PermissionDenied
+            resolve_workspace_file(&workspace, "../outside.md").unwrap(),
+            std::fs::canonicalize(temp.path().join("outside.md")).unwrap()
         );
+        // Directories are still refused — only regular files can be opened.
         assert_eq!(
             resolve_workspace_file(&workspace, ".").unwrap_err().kind(),
-            std::io::ErrorKind::PermissionDenied
+            std::io::ErrorKind::InvalidInput
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn workspace_file_resolution_rejects_symlink_escape() {
+    fn workspace_file_resolution_follows_symlinks_to_regular_files() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
@@ -6539,11 +6552,11 @@ mod fs_list_tests {
         std::fs::write(&outside, "no").unwrap();
         symlink(&outside, workspace.join("link.md")).unwrap();
 
+        // Symlinks resolve to their real target; a regular file reachable
+        // through a link (even outside the workspace) is openable.
         assert_eq!(
-            resolve_workspace_file(&workspace, "link.md")
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::PermissionDenied
+            resolve_workspace_file(&workspace, "link.md").unwrap(),
+            std::fs::canonicalize(&outside).unwrap()
         );
     }
 
