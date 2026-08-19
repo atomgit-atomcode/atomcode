@@ -23805,6 +23805,16 @@ fn handle_runtime_event(
                 renderer.flush();
                 return;
             }
+            // The selection was leased by another live runtime, so a copy was
+            // forked to resume in its place (mirrors `--continue`). Notify the
+            // user once the switch actually lands.
+            let fork_notice = prepared.forked_from.as_deref().map(|source_id| {
+                crate::i18n::t(crate::i18n::Msg::SessionBusyForked {
+                    source_id,
+                    fork_id: prepared.view.meta.id.as_str(),
+                })
+                .into_owned()
+            });
             let project_bucket = prepared.project_bucket;
             let session = match Session::from_catalog_view(prepared.view) {
                 Ok(session) => session,
@@ -23834,6 +23844,10 @@ fn handle_runtime_event(
                 ));
                 renderer.flush();
                 return;
+            }
+            if let Some(notice) = fork_notice {
+                renderer.render(UiLine::CommandOutput(notice));
+                renderer.flush();
             }
             ctx.pending_session_resume = Some(PendingSessionResume {
                 project_bucket,

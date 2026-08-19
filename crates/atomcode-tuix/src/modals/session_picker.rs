@@ -284,7 +284,7 @@ impl SessionPicker {
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(15),
                 tokio::task::spawn_blocking(move || {
-                    atomcode_daemon::legacy_convert::prepare_catalog_session_resume_in_project(
+                    atomcode_daemon::legacy_convert::prepare_catalog_session_resume_or_fork_in_project(
                         &preparation.project_bucket,
                         &preparation.session_id,
                     )

@@ -3330,6 +3330,7 @@ mod tests {
             root.path(),
             &bucket1,
             "session-in-proj2",
+            false,
         )
         .unwrap();
         assert!(res1.is_none());
