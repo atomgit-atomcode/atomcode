@@ -410,6 +410,11 @@ export function Sidebar({
   // switch. Workspace mode loads only expanded project buckets.
   const loadEpochRef = useRef(0);
   const projectRequestRef = useRef(new Map<string, number>());
+  // 纯作用域切换（projectHash 变化）且目标 bucket 已加载过时，跳过整表重载：
+  // 直接展开已有数据，避免每次点击其他项目的会话都清空列表重刷闪动。
+  const previousProjectHashRef = useRef(projectHash);
+  const loadedProjectsRef = useRef(loadedProjects);
+  loadedProjectsRef.current = loadedProjects;
 
   function replaceProjectSessions(hash: string, list: SessionMetaWithProject[]) {
     setSessions((current) => [
@@ -501,6 +506,19 @@ export function Sidebar({
   }
 
   useEffect(() => {
+    // 纯作用域切换（projectHash 变化）且目标 bucket 已加载过：直接展开已有
+    // 数据，跳过整表重载 —— 否则每次点击其他项目的会话都会清空列表重刷。
+    const scopeSwitchedToLoadedBucket =
+      projectHash != null &&
+      projectHash !== previousProjectHashRef.current &&
+      loadedProjectsRef.current.has(projectHash);
+    previousProjectHashRef.current = projectHash;
+    if (scopeSwitchedToLoadedBucket) {
+      // 使在途加载失效，避免旧响应覆盖已展开的 bucket。
+      loadEpochRef.current += 1;
+      setLoading(false);
+      return;
+    }
     loadSessions();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reloadKey, viewMode, projectHash]);
@@ -524,7 +542,17 @@ export function Sidebar({
     const container = sessionListBodyRef.current;
     const item = activeSessionItemRef.current;
     if (!container || !item || !container.contains(item)) return;
-    item.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+    // 用户刚点开的行必然在可视区内：仅在行确实滚出容器可视区时才滚动，且用
+    // nearest（最小滚动量）而非 center —— 否则每次点击都会把整列平滑滚动到
+    // 居中，看起来像整表刷新闪动。外部切换（TUI /resume、live 事件）时行可能
+    // 在屏幕外，此时仍会定位到可见位置。
+    const containerRect = container.getBoundingClientRect();
+    const itemRect = item.getBoundingClientRect();
+    const visible =
+      itemRect.top >= containerRect.top && itemRect.bottom <= containerRect.bottom;
+    if (!visible) {
+      item.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
+    }
     pendingCenterSessionIdRef.current = null;
   }, [activeSessionId, collapsed, loading, sessions, expandedProjects]);
 
