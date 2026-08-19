@@ -652,7 +652,7 @@ Use tables for structured data. Tables MUST use `|`-pipe markdown form. NEVER pr
 Match the user's language. If the user writes in Chinese, respond in Chinese. If in English, respond in English.
 
 ## CONTENT-TRANSFORMATION:
-When the user asks you to translate, format, convert, rewrite, or otherwise transform their input into output content (NOT summarize, NOT explain), output every line of the result in full. NEVER use placeholders like `...`, `(rest unchanged)`, `(其余省略)`, `(continue similarly)`, or `/* ... */` to skip content the user asked you to produce — these are bugs, not brevity. For large output, do NOT dump the whole result in one response or one `write_file` call: a single response is capped at a few thousand output tokens, so a giant one-shot write is silently truncated mid-content and the work is lost. Instead produce it INCREMENTALLY — write the first section with `write_file`, then append each following section with `edit_file` (anchor the old-string on the tail of what you have already written), section by section across as many turns as it takes, until the entire result is on disk; then confirm the file is complete. The brevity rule in OUTPUT applies to your commentary on the work, not to the transformed content itself.
+When you produce a large amount of output content — whether TRANSFORMING the user's input (translate, format, convert, rewrite) OR GENERATING a new file or a large block of code FROM SCRATCH (NOT summarizing, NOT explaining) — output every line of the result in full. NEVER use placeholders like `...`, `(rest unchanged)`, `(其余省略)`, `(continue similarly)`, or `/* ... */` to skip content the user asked you to produce — these are bugs, not brevity. For large output, do NOT dump the whole result in one response or one `write_file` call: a single response is capped at a few thousand output tokens, so a giant one-shot write is silently truncated mid-content and the work is lost. Instead produce it INCREMENTALLY — write the first section with `write_file`, then append each following section with `edit_file` (anchor the old-string on the tail of what you have already written), section by section across as many turns as it takes, until the entire result is on disk; then confirm the file is complete. This applies equally to writing a large source file from scratch: create it with an initial `write_file`, then grow it with successive `edit_file` appends rather than emitting the whole file in one response. The brevity rule in OUTPUT applies to your commentary on the work, not to the transformed content itself.
 
 ## CHINESE CODE SUPPORT:
 When working with Chinese codebases: Chinese comments and Chinese/Pinyin variable names are valid identifiers — understand and preserve them. Use Unicode-aware patterns when searching for Chinese content. In new code prefer English identifiers, but preserve existing Chinese naming conventions.";
@@ -1280,6 +1280,15 @@ mod tests {
         assert!(
             p.contains("edit_file"),
             "the incremental path must name edit_file for appending sections"
+        );
+        // The steering must ALSO cover GENERATING a large file / large block of
+        // code FROM SCRATCH, not only transforming existing INPUT — a
+        // from-scratch code-gen dump hits the same output-token cap and
+        // truncates mid-content (the observed `g1_engine.cpp` failure). Guard
+        // the broadened trigger so nobody narrows it back to "transform input".
+        assert!(
+            p.contains("from scratch"),
+            "large from-scratch generation must also be steered to incremental writes: {p}"
         );
         // The old, harmful advice ("write it to a file with write_file" as the
         // escape hatch for over-budget output) must be gone — a single write_file

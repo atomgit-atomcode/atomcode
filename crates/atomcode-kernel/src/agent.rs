@@ -230,6 +230,20 @@ const TRUNCATION_RESUME_NUDGE: &str =
      where you left off, writing the remaining content INCREMENTALLY to a file (append the \
      next section with edit_file) rather than re-emitting it all in one response.";
 
+/// Synthetic tool-result text for a tool call that was cut off at the OUTPUT-token
+/// limit (`finish_reason=length`) before its arguments finished streaming. The
+/// recorded arguments are partial (e.g. truncated JSON) and unsafe to run, so the
+/// kernel refuses to execute the call and feeds this back instead — coaching the
+/// model to split the work rather than re-emit the same oversized payload. Mirrors
+/// oh-my-pi's defensive handling of length-truncated tool calls.
+const TRUNCATED_TOOLCALL_COACH: &str =
+    "Tool call not executed: the assistant hit its output-token limit \
+     (finish_reason=length) before the arguments finished streaming, so the recorded \
+     arguments are truncated and unsafe to run. Do NOT retry by re-emitting the same \
+     large payload — split the work into smaller calls (for write_file/edit_file: write \
+     the first chunk, then append the rest with successive edit_file calls; for a large \
+     file, create it then grow it section by section).";
+
 // Provider adapters can emit these placeholder strings when no usable reasoning
 // was captured. Keep the neutral kernel cleanup list aligned with adapter output.
 const REASONING_FILLER_MARKERS: &[&str] = &[
@@ -3227,6 +3241,34 @@ impl RunningAgent {
                     continue;
                 }
 
+                // ── OUTPUT-TRUNCATION GUARD (finish_reason=length) ──
+                // The response was cut at the OUTPUT-token limit WHILE emitting
+                // tool calls, so the trailing call's arguments may be partial
+                // (e.g. truncated JSON) — running them is unsafe (a half-written
+                // `bash` command, or a `write_file` with a cut-off body). Do NOT
+                // execute ANY call in this batch (we don't guess which one is the
+                // cut-off tail; safety over precision, matching oh-my-pi). Pair
+                // each FRESH id with an is_error result so the payload stays
+                // API-valid (every tool_use id → exactly one tool_result),
+                // coaching the model to split the work. Placed AFTER the same-id
+                // skip gate so a duplicated id never gets two results.
+                // `terminate_turn: false` lets the round loop continue so the
+                // model retries incrementally; the existing `max_rounds` cap and
+                // repeat-signature fuse bound any livelock.
+                if truncated {
+                    result_ids.insert(call.id.clone());
+                    plans.push(CallPlan::Result {
+                        result: ToolResult {
+                            call_id: call.id,
+                            content: TRUNCATED_TOOLCALL_COACH.into(),
+                            is_error: true,
+                            images: vec![],
+                        },
+                        terminate_turn: false,
+                    });
+                    continue;
+                }
+
                 // A hard policy denial suppresses every other call in the same
                 // model-emitted batch. Pair each id with an explicit result, but
                 // do not allow sibling side effects to run before termination.
@@ -4516,10 +4558,36 @@ mod internal_continuation_compaction_tests {
     use crate::message::CompactionPlan;
     use crate::stream::{StreamEvent, TokenUsage};
     use crate::testkit::{MockProvider, ObservingTurnEndHook};
-    use crate::tool::ToolRegistry;
+    use crate::tool::{Tool, ToolCall, ToolContext, ToolRegistry, ToolResult};
     use async_trait::async_trait;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    /// Records whether `execute` ran, so a test can assert a truncated tool
+    /// call was NOT executed with its (possibly incomplete) arguments.
+    struct RecordingTool(Arc<AtomicBool>);
+
+    #[async_trait]
+    impl Tool for RecordingTool {
+        fn name(&self) -> &str {
+            "rec"
+        }
+        fn description(&self) -> &str {
+            "records execution"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
+            self.0.store(true, Ordering::Relaxed);
+            ToolResult {
+                call_id: String::new(),
+                content: "ran".into(),
+                is_error: false,
+                images: vec![],
+            }
+        }
+    }
 
     struct ContinueTwiceHook(Mutex<u8>);
 
@@ -4765,6 +4833,76 @@ mod internal_continuation_compaction_tests {
         assert!(calls[1]
             .iter()
             .any(|(role, text)| role == "User" && text.contains("Output limit hit")));
+    }
+
+    #[tokio::test]
+    async fn truncated_tool_call_is_not_executed_and_coaches_to_split() {
+        // A tool call cut off at the OUTPUT-token limit (finish_reason=length)
+        // may carry incomplete/unsafe arguments (partial JSON). The kernel must
+        // NOT execute it; instead it pairs the call with an is_error tool_result
+        // (API validity: every tool_use id needs exactly one result) whose text
+        // coaches the model to split the work, then lets the turn continue so
+        // the model retries incrementally. Mirrors oh-my-pi's defensive design.
+        let executed = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "c1".into(),
+                    name: "rec".into(),
+                    // Deliberately incomplete JSON — the args were truncated.
+                    arguments: "{\"path\":\"big.cpp\",\"content\":\"truncated mid".into(),
+                }),
+                StreamEvent::Done { truncated: true },
+            ],
+            vec![
+                StreamEvent::TextDelta("ok, splitting into chunks".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+        ]));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(RecordingTool(executed.clone())));
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(reg.mount(&["rec"]))
+            .build()
+            .spawn();
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "write a big file".into(),
+                images: vec![],
+            })
+            .unwrap();
+
+        let mut coach: Option<(bool, String)> = None;
+        while let Some(ev) = handle.events.recv().await {
+            if let AgentEvent::ToolResult { result } = &ev {
+                if result.call_id == "c1" {
+                    coach = Some((result.is_error, result.content.clone()));
+                }
+            }
+            if matches!(ev, AgentEvent::TurnComplete { .. }) {
+                break;
+            }
+        }
+        handle.commands.send(AgentCommand::Shutdown).unwrap();
+        let _ = handle.task.await;
+
+        assert!(
+            !executed.load(Ordering::Relaxed),
+            "a tool call truncated at the output limit must NOT execute (args may be incomplete/unsafe)"
+        );
+        let (is_err, content) =
+            coach.expect("the truncated call must still get exactly one tool_result");
+        assert!(is_err, "the synthetic result must be an error: {content}");
+        assert!(
+            content.contains("finish_reason=length"),
+            "coach must name the cause: {content}"
+        );
+        assert!(
+            content.to_lowercase().contains("split"),
+            "coach must tell the model to split the work: {content}"
+        );
     }
 }
 
