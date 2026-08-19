@@ -3021,6 +3021,8 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
             HookEvent::SessionStart => "SessionStart",
             HookEvent::SessionEnd => "SessionEnd",
             HookEvent::UserPromptSubmit => "UserPromptSubmit",
+            HookEvent::Stop => "Stop",
+            HookEvent::StopFailure => "StopFailure",
         }
     }
 
@@ -3139,6 +3141,16 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                         }),
                         HookEvent::SessionEnd => serde_json::json!({
                             "session_id": sid, "hook_event_name": "SessionEnd", "cwd": cwd_s,
+                        }),
+                        HookEvent::Stop => serde_json::json!({
+                            "session_id": sid, "transcript_path": null,
+                            "hook_event_name": "Stop", "stop_hook_active": false,
+                            "stop_reason": "Stopped", "cwd": cwd_s,
+                        }),
+                        HookEvent::StopFailure => serde_json::json!({
+                            "session_id": sid, "transcript_path": null,
+                            "hook_event_name": "StopFailure", "stop_hook_active": false,
+                            "stop_reason": "ProviderError", "cwd": cwd_s,
                         }),
                     };
                     let start = std::time::Instant::now();

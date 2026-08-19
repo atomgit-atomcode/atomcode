@@ -832,6 +832,13 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         // hook can correlate its events with the session. Empty for non-persistent runs.
         if let Some(b) = &session {
             cc = cc.with_session_id(b.id.as_str());
+            // CC `transcript_path` = the session's append-only JSONL transcript, so a
+            // Stop/StopFailure hook can open the finished turn's full record. The path
+            // resolves even before the file is written; unresolvable (session dir gone)
+            // → left `None` → the payload carries `null`, never a wedge.
+            if let Ok(p) = b.manager.jsonl_path(&b.id) {
+                cc = cc.with_transcript_path(p.to_string_lossy().into_owned());
+            }
         }
         if cc.is_empty() {
             None

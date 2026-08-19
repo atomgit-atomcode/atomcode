@@ -182,9 +182,12 @@ atomcode plugin marketplace remove|update|list</code></pre>
           <tr><td><code>PostToolUse</code></td><td>After a tool call</td><td>Audit, side effects</td></tr>
           <tr><td><code>SessionStart</code></td><td>Session startup</td><td>Warm-up, logging</td></tr>
           <tr><td><code>SessionEnd</code></td><td>Session end</td><td>Cleanup, archiving</td></tr>
+          <tr><td><code>Stop</code></td><td>Turn ended — normal stop, safety fuse, user cancel, or rate-limit pause</td><td>Notify the plugin the turn has ended; trigger follow-up actions</td></tr>
+          <tr><td><code>StopFailure</code></td><td>Turn ended because of an API/provider error (stream failure / timeout)</td><td>Notify the plugin the turn failed; alert / log</td></tr>
           <tr><td><code>Notification</code></td><td>System notification</td><td>Forward to external alert channels</td></tr>
         </tbody>
       </table>
+      <p>Every turn end fires <strong>exactly one</strong> of <code>Stop</code> / <code>StopFailure</code> — never both, never none. <code>StopFailure</code> is reserved for turns that ended <em>because of</em> an API/provider failure; a tool error mid-turn does <strong>not</strong> fire it (the turn continues and ends with its real terminal instead). The stdin payload carries <code>hook_event_name</code>, <code>session_id</code>, <code>cwd</code>, the session's <code>transcript_path</code> (the append-only JSONL transcript, <code>null</code> for non-persistent runs), a CC-style <code>stop_hook_active</code> flag (true when <em>another</em> terminal hook is configured and fires alongside — use it to avoid a Stop hook recursively re-triggering itself), and a kernel <code>stop_reason</code> (e.g. <code>Stopped</code>, <code>ProviderError</code>, <code>Timeout</code>, <code>Cancelled</code>) so a hook can refine the outcome without parsing anything else.
 
       <h3>Default-directory auto-discovery</h3>
       <p>A plugin's assets are discovered from default directories automatically — no need to declare them in <code>plugin.json</code>:</p>
@@ -261,7 +264,7 @@ help me verify Qwen3 adaptation on Ascend</code></pre>
 
       <h2>Known limits</h2>
       <ul>
-        <li><strong>Unsupported CC events</strong>: <code>Stop</code> / <code>PreCompact</code> / <code>SubagentStop</code> are silently skipped.</li>
+        <li><strong>Unsupported CC events</strong>: <code>PreCompact</code> / <code>SubagentStop</code> are silently skipped.</li>
         <li><strong>Multi-line indented JSON output</strong>: when a hook prints with <code>print(json.dumps(..., indent=2))</code>, the last line is <code>}</code>, which our last-line JSON parser fails on — falling back to plain-text injection. Functionally it still works (the LLM still reads the content) but it's not on the structured path. Hook authors should use single-line <code>json.dumps(...)</code> output.</li>
         <li><strong>Strict skill-name validation</strong>: <code>[a-z0-9_-]</code>, matching CC. Skill names with <code>/</code> or mixed case are skipped.</li>
       </ul>
