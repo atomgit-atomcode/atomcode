@@ -460,9 +460,21 @@ export function Sidebar({
     setLoading(true);
     setLoadingProjects(new Set());
     const load = viewMode === 'workspace'
-      ? getProjects().then(async (nextProjects) => {
-          if (epoch !== loadEpochRef.current) return [];
+      ? (async () => {
+          // 目标 bucket 不等 getProjects：立即开始加载，避免切换作用域后先出现
+          // 空窗、再延迟出「加载中」的闪动。
+          if (projectHash) void loadProjectBucket(projectHash, epoch);
+          const nextProjects = await getProjects();
+          if (epoch !== loadEpochRef.current) return null;
           setProjects(nextProjects);
+          // 清理已不存在的项目 bucket，但不整表清空 —— 可见列表保持原样就地
+          // 更新，避免重载/删除时整表刷新闪动。
+          const hashes = new Set(nextProjects.map((project) => project.hash));
+          setSessions((current) =>
+            current.filter((session) => !session.project_hash || hashes.has(session.project_hash)),
+          );
+          setLoadedProjects((current) => new Set([...current].filter((hash) => hashes.has(hash))));
+          setFailedProjects((current) => new Set([...current].filter((hash) => hashes.has(hash))));
           const normalizedCwd = (cwd || '').replace(/\/+$/, '');
           const currentHash = projectHash || nextProjects.find(
             (project) => project.working_dir.replace(/\/+$/, '') === normalizedCwd,
@@ -474,12 +486,14 @@ export function Sidebar({
             'workspace',
             [currentHash, ...retainedExpanded],
           );
-          setSessions([]);
-          setLoadedProjects(new Set());
-          setFailedProjects(new Set());
-          await Promise.all(projectScopes.map((hash) => loadProjectBucket(hash, epoch)));
+          const started = projectHash ? new Set([projectHash]) : new Set<string>();
+          await Promise.all(
+            projectScopes
+              .filter((hash) => !started.has(hash))
+              .map((hash) => loadProjectBucket(hash, epoch)),
+          );
           return null;
-        })
+        })()
       : listSessions();
     load
       .then((list) => {
@@ -506,14 +520,18 @@ export function Sidebar({
   }
 
   useEffect(() => {
+    const scopeChanged = projectHash !== previousProjectHashRef.current;
+    previousProjectHashRef.current = projectHash;
+    // flat 模式的列表是全局的（/sessions，不按项目过滤）—— 切换项目作用域
+    // 不需要重载列表，跳过以避免整表刷新闪动。
+    if (scopeChanged && viewMode === 'flat') return;
     // 纯作用域切换（projectHash 变化）且目标 bucket 已加载过：直接展开已有
     // 数据，跳过整表重载 —— 否则每次点击其他项目的会话都会清空列表重刷。
-    const scopeSwitchedToLoadedBucket =
+    if (
+      scopeChanged &&
       projectHash != null &&
-      projectHash !== previousProjectHashRef.current &&
-      loadedProjectsRef.current.has(projectHash);
-    previousProjectHashRef.current = projectHash;
-    if (scopeSwitchedToLoadedBucket) {
+      loadedProjectsRef.current.has(projectHash)
+    ) {
       // 使在途加载失效，避免旧响应覆盖已展开的 bucket。
       loadEpochRef.current += 1;
       setLoading(false);
