@@ -454,7 +454,15 @@ export function Sidebar({
       if (epoch !== loadEpochRef.current || projectRequestRef.current.get(hash) !== request) return;
       setFailedProjects((current) => new Set(current).add(hash));
     } finally {
-      if (epoch === loadEpochRef.current && projectRequestRef.current.get(hash) === request) {
+      // Clear THIS load's spinner whenever it is still the latest request for
+      // the hash — even if a newer `loadSessions` bumped the epoch. The epoch
+      // bump correctly orphans the DATA write above (stale sessions must not
+      // overwrite a re-scoped view), but gating the spinner-clear on it too
+      // left a permanent "加载中" zombie on any bucket whose expand got
+      // superseded by a reload (the reported stuck-loading rows). A newer
+      // request for the SAME hash still supersedes this cleanup (it owns the
+      // spinner), so only the genuinely-latest request clears it.
+      if (projectRequestRef.current.get(hash) === request) {
         setLoadingProjects((current) => {
           const next = new Set(current);
           next.delete(hash);
