@@ -1799,7 +1799,7 @@ impl Config {
     /// for seeds and writes. Interactive startup uses the diagnostics so one
     /// malformed `[providers.<name>]` table cannot silently disappear.
     pub fn load_with_diagnostics(path: &Path) -> Result<(Self, Vec<String>)> {
-        // Pricing support was retired after v5.0.6. Clean only those known
+        // Pricing support was retired after v5.0.7. Clean only those known
         // legacy tables; keep startup readable when the file is read-only.
         let _ = crate::store::ConfigStore::new(path).remove_legacy_pricing();
         let content = std::fs::read_to_string(path)
