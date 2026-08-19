@@ -43,7 +43,11 @@ fn oauth() -> &'static str {
 /// Replace `{brand}` and `{oauth}` placeholders in a rendered i18n string.
 /// Static when no placeholder is present (the common case), so `Cow` stays
 /// borrowed and no allocation happens on the hot path.
-fn substitute_placeholders<'a>(raw: Cow<'a, str>) -> Cow<'a, str> {
+///
+/// Public so sibling crates (tuix `BUILTIN_COMMANDS` static fallback descs)
+/// can run the same substitution on their own non-`Msg` strings, keeping the
+/// fallback path consistent with the `t_with()` render path.
+pub fn substitute_placeholders<'a>(raw: Cow<'a, str>) -> Cow<'a, str> {
     if !raw.contains('{') {
         return raw;
     }

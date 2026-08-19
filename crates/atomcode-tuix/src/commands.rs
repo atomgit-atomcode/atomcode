@@ -65,7 +65,9 @@ impl CommandRegistry {
             .unwrap_or(6);
         let mut out = t(Msg::HelpAvailableCommands).into_owned();
         for c in self.commands.iter().filter(|c| !c.hidden) {
-            let desc = cmd_desc_i18n(c.name).unwrap_or_else(|| c.desc.into());
+            let desc = cmd_desc_i18n(c.name).unwrap_or_else(|| {
+                atomcode_config::i18n::substitute_placeholders(c.desc.into())
+            });
             out.push_str(&format!(
                 "    /{:<width$}  {}\n",
                 c.name,
@@ -140,7 +142,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "setup",      desc: "First run: install recommender skill + run it. Extra text forwarded as a steering hint", needs_args: true, hidden: false },
     Command { name: "resume",  desc: "Resume a previous session", needs_args: false, hidden: false },
     Command { name: "rename",  desc: "Rename current session", needs_args: true, hidden: false },
-    Command { name: "logout",  desc: "Sign out of AtomGit", needs_args: false, hidden: false },
+    Command { name: "logout",  desc: "Sign out", needs_args: false, hidden: false },
     Command { name: "whoami",  desc: "Show current logged-in user", needs_args: false, hidden: false },
     Command { name: "model",   desc: "Switch provider / model", needs_args: false, hidden: false },
     Command { name: "provider", desc: "Manage providers (add / edit / delete)", needs_args: false, hidden: false },
@@ -198,7 +200,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "keys",    desc: "Show keyboard shortcuts", needs_args: false, hidden: false },
     Command { name: "language", desc: "Switch display and commit language", needs_args: false, hidden: false },
     Command { name: "welcome", desc: "Re-run the onboarding wizard", needs_args: false, hidden: false },
-    Command { name: "quit",    desc: "Exit AtomCode", needs_args: false, hidden: false },
+    Command { name: "quit",    desc: "Exit {brand}", needs_args: false, hidden: false },
     // Gateway entry that opens a second-level palette listing all
     // user-invocable skills. needs_args=true so Enter rewrites the
     // buffer to `/skills ` and lets the sub-mode menu render the
@@ -223,7 +225,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "view",    desc: "View file content in an overlay modal", needs_args: true, hidden: false },
     Command { name: "todo",    desc: "Show the todo list; /todo add <task> appends one, /todo clear wipes it", needs_args: false, hidden: false },
     Command { name: "schedule", desc: "List scheduled tasks and next run times", needs_args: false, hidden: false },
-    Command { name: "desktop", desc: "Open the AtomCode desktop app (or show the download link)", needs_args: false, hidden: false },
+    Command { name: "desktop", desc: "Open the {brand} desktop app (or show the download link)", needs_args: false, hidden: false },
 ];
 
 /// Look up the i18n translation for a built-in command description.
@@ -321,7 +323,10 @@ pub fn complete_commands(
                 name: cmd.name.to_string(),
                 description: cmd_desc_i18n(cmd.name)
                     .map(|cow| cow.into_owned())
-                    .unwrap_or_else(|| cmd.desc.to_string()),
+                    .unwrap_or_else(|| {
+                        atomcode_config::i18n::substitute_placeholders(cmd.desc.into())
+                            .into_owned()
+                    }),
                 is_custom: false,
             });
         }
