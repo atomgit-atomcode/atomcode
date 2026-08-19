@@ -3925,7 +3925,9 @@ pub struct LoopCtx {
     /// TurnComplete (30s cooldown). Read on every redraw to construct
     /// the right-aligned usage hint when usage_percent ≥ 80% and the
     /// current model is on a CodingPlan provider.
-    pub usage_slot: std::sync::Arc<std::sync::Mutex<Option<atomcode_codingplan::types::UsageInfo>>>,
+    pub usage_slot: std::sync::Arc<
+        std::sync::Mutex<Option<(atomcode_codingplan::types::UsageInfo, std::time::Instant)>>,
+    >,
     /// Last time `usage_monitor::spawn_check` was invoked. Used to
     /// enforce `usage_monitor::USAGE_COOLDOWN` on TurnComplete-triggered
     /// refreshes. `None` = no check has run yet this session.

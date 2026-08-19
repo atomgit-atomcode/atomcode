@@ -16,7 +16,7 @@
 // Severity: 80–95% → Info (dim), > 95% → Warning (red).
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use atomcode_codingplan::types::UsageInfo;
 use tokio::sync::mpsc;
@@ -39,7 +39,11 @@ pub const USAGE_COOLDOWN: Duration = Duration::from_secs(30);
 /// are silently dropped — `slot` keeps its previous value. The caller's
 /// cooldown clock still advances on failure to avoid retry storms during
 /// extended outages.
-pub fn spawn_check(slot: Arc<Mutex<Option<UsageInfo>>>, wake_tx: mpsc::Sender<()>) {
+///
+/// The stored `Instant` is the fetch time; `build_usage_hint` uses it with
+/// `UsageInfo::seconds_until_reset` to expire the cached value once its
+/// rolling window has elapsed (see there for why this is timezone-immune).
+pub fn spawn_check(slot: Arc<Mutex<Option<(UsageInfo, Instant)>>>, wake_tx: mpsc::Sender<()>) {
     tokio::spawn(async move {
         // Blocking client lives on a spawn_blocking thread so the tokio
         // runtime worker pool stays free. Mirrors `monitor::spawn_check`.
@@ -57,7 +61,7 @@ pub fn spawn_check(slot: Arc<Mutex<Option<UsageInfo>>>, wake_tx: mpsc::Sender<()
         };
 
         if let Ok(mut s) = slot.lock() {
-            *s = Some(info);
+            *s = Some((info, Instant::now()));
         }
         let _ = wake_tx.try_send(());
     });
@@ -72,14 +76,14 @@ pub fn spawn_check(slot: Arc<Mutex<Option<UsageInfo>>>, wake_tx: mpsc::Sender<()
 ///     fetches have failed)
 ///   - `usage_percent < 80.0`
 pub fn build_usage_hint(
-    slot: &Arc<Mutex<Option<UsageInfo>>>,
+    slot: &Arc<Mutex<Option<(UsageInfo, Instant)>>>,
     current_provider: &str,
 ) -> Option<(String, HintSeverity)> {
     if !crate::event_loop::monitor::is_codingplan_provider(current_provider) {
         return None;
     }
-    let info = slot.lock().ok()?.as_ref()?.clone();
-    build_usage_hint_from_info(&info)
+    let (info, fetched_at) = slot.lock().ok()?.as_ref()?.clone();
+    build_usage_hint_from_info(&info, fetched_at.elapsed().as_secs() as i64)
 }
 
 /// Pure helper: takes a concrete `UsageInfo` and returns the formatted
@@ -92,11 +96,32 @@ pub fn build_usage_hint(
 ///   - `ATOMCODE_USAGE_DEBUG_PERCENT=N` overrides the live percent with
 ///     `N`, so you can preview the Info ↔ Warning severity boundary
 ///     and the 100% form without ever crossing the real threshold.
-fn build_usage_hint_from_info(info: &UsageInfo) -> Option<(String, HintSeverity)> {
-    let raw_percent = std::env::var("ATOMCODE_USAGE_DEBUG_PERCENT")
+fn build_usage_hint_from_info(
+    info: &UsageInfo,
+    elapsed_since_fetch_secs: i64,
+) -> Option<(String, HintSeverity)> {
+    let debug_percent = std::env::var("ATOMCODE_USAGE_DEBUG_PERCENT")
         .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(info.usage_percent);
+        .and_then(|v| v.parse::<f64>().ok());
+
+    // Staleness guard: `seconds_until_reset` is the time-to-reset captured at
+    // fetch. Once that many seconds have elapsed since the fetch, the rolling
+    // window has rolled over and the cached percent is stale. The slot only
+    // refetches at startup / provider-switch / post-turn, so an idle user past
+    // the reset time would otherwise keep seeing a stale "Token使用量 95%，…
+    // 重置于 13:36" forever. Comparing elapsed vs a relative duration is
+    // timezone-immune (unlike parsing the absolute `reset_at`, whose wall-clock
+    // timezone the server never localises to the client). Guard on `> 0` so
+    // placeholder/blank responses that report `0` don't suppress instantly.
+    // Skipped when a debug percent is forced (preview must show).
+    if debug_percent.is_none()
+        && info.seconds_until_reset > 0
+        && elapsed_since_fetch_secs >= info.seconds_until_reset
+    {
+        return None;
+    }
+
+    let raw_percent = debug_percent.unwrap_or(info.usage_percent);
 
     let threshold = std::env::var("ATOMCODE_USAGE_DEBUG_THRESHOLD")
         .ok()
@@ -146,9 +171,14 @@ mod tests {
         }
     }
 
-    fn slot_with(info: Option<UsageInfo>) -> Arc<Mutex<Option<UsageInfo>>> {
-        Arc::new(Mutex::new(info))
+    fn slot_with(info: Option<UsageInfo>) -> Arc<Mutex<Option<(UsageInfo, Instant)>>> {
+        Arc::new(Mutex::new(info.map(|i| (i, Instant::now()))))
     }
+
+    /// Elapsed-seconds argument for the "just fetched" case: the existing
+    /// fixtures use `seconds_until_reset: 0`, so the staleness guard (gated
+    /// on `> 0`) never fires regardless — `0` here just reads clearly.
+    const FRESH: i64 = 0;
 
     #[test]
     fn no_hint_when_not_codingplan_provider() {
@@ -158,20 +188,20 @@ mod tests {
 
     #[test]
     fn no_hint_when_slot_empty() {
-        let slot: Arc<Mutex<Option<UsageInfo>>> = slot_with(None);
+        let slot = slot_with(None);
         assert!(build_usage_hint(&slot, "AtomGit").is_none());
     }
 
     #[test]
     fn no_hint_below_threshold_79_9() {
         let info = mk_info(79.9, 5, "14:30");
-        assert!(build_usage_hint_from_info(&info).is_none());
+        assert!(build_usage_hint_from_info(&info, FRESH).is_none());
     }
 
     #[test]
     fn hint_at_exactly_80_percent_info_severity() {
         let info = mk_info(80.0, 5, "14:30");
-        let (text, sev) = build_usage_hint_from_info(&info).expect("Some");
+        let (text, sev) = build_usage_hint_from_info(&info, FRESH).expect("Some");
         assert_eq!(sev, HintSeverity::Info);
         assert!(text.contains("80%"));
         assert!(text.contains("5小时"));
@@ -181,21 +211,21 @@ mod tests {
     #[test]
     fn hint_at_94_percent_still_info() {
         let info = mk_info(94.6, 5, "14:30");
-        let (_, sev) = build_usage_hint_from_info(&info).expect("Some");
+        let (_, sev) = build_usage_hint_from_info(&info, FRESH).expect("Some");
         assert_eq!(sev, HintSeverity::Info);
     }
 
     #[test]
     fn hint_at_95_percent_warning_severity() {
         let info = mk_info(95.0, 5, "14:30");
-        let (_, sev) = build_usage_hint_from_info(&info).expect("Some");
+        let (_, sev) = build_usage_hint_from_info(&info, FRESH).expect("Some");
         assert_eq!(sev, HintSeverity::Warning);
     }
 
     #[test]
     fn hint_at_100_percent_warning() {
         let info = mk_info(100.0, 5, "14:30");
-        let (text, sev) = build_usage_hint_from_info(&info).expect("Some");
+        let (text, sev) = build_usage_hint_from_info(&info, FRESH).expect("Some");
         assert_eq!(sev, HintSeverity::Warning);
         assert!(text.contains("100%"));
     }
@@ -203,21 +233,61 @@ mod tests {
     #[test]
     fn hint_format_matches_spec_template() {
         let info = mk_info(87.4, 5, "20:32");
-        let (text, _) = build_usage_hint_from_info(&info).expect("Some");
+        let (text, _) = build_usage_hint_from_info(&info, FRESH).expect("Some");
         assert_eq!(text, "Token使用量 87%，5小时滚动窗口 重置于 20:32");
     }
 
     #[test]
     fn hint_omits_reset_when_display_empty() {
         let info = mk_info(85.0, 5, "");
-        let (text, _) = build_usage_hint_from_info(&info).expect("Some");
+        let (text, _) = build_usage_hint_from_info(&info, FRESH).expect("Some");
         assert_eq!(text, "Token使用量 85%，5小时滚动窗口");
     }
 
     #[test]
     fn hint_uses_dynamic_window_hours() {
         let info = mk_info(85.0, 1, "14:30");
-        let (text, _) = build_usage_hint_from_info(&info).expect("Some");
+        let (text, _) = build_usage_hint_from_info(&info, FRESH).expect("Some");
         assert!(text.contains("1小时"), "got: {}", text);
+    }
+
+    // --- Staleness guard: the reported bug — hint lingers after the window
+    // resets because an idle user triggers no refetch. Once the elapsed time
+    // since fetch reaches `seconds_until_reset`, the cached percent is expired.
+
+    #[test]
+    fn no_hint_when_window_has_elapsed_past_reset() {
+        let mut info = mk_info(95.0, 5, "13:36");
+        info.seconds_until_reset = 300;
+        // 301s since fetch → one second past the window reset → stale.
+        assert!(build_usage_hint_from_info(&info, 301).is_none());
+    }
+
+    #[test]
+    fn no_hint_exactly_at_reset_moment() {
+        let mut info = mk_info(95.0, 5, "13:36");
+        info.seconds_until_reset = 300;
+        // Elapsed == seconds_until_reset: the window has rolled over.
+        assert!(build_usage_hint_from_info(&info, 300).is_none());
+    }
+
+    #[test]
+    fn hint_shown_before_reset_time() {
+        let mut info = mk_info(95.0, 5, "13:36");
+        info.seconds_until_reset = 300;
+        // One second short of reset → still the live window.
+        let (text, _) = build_usage_hint_from_info(&info, 299).expect("Some");
+        assert!(text.contains("95%"));
+        assert!(text.contains("13:36"));
+    }
+
+    #[test]
+    fn zero_seconds_until_reset_never_suppresses() {
+        // Placeholder/blank responses report `seconds_until_reset: 0`; the
+        // `> 0` guard must keep them from being suppressed instantly even
+        // when a large elapsed is reported.
+        let mut info = mk_info(95.0, 5, "13:36");
+        info.seconds_until_reset = 0;
+        assert!(build_usage_hint_from_info(&info, 99_999).is_some());
     }
 }
