@@ -1011,6 +1011,68 @@ fn copy_text_from_body_row(row: &[Cell]) -> (String, usize) {
     (text, col)
 }
 
+/// Leading gutter glyphs that anchor a tool block (`● bash`, `└ cmd`,
+/// `⎿ [elapsed…]`, …). Stripped from a tool row's COPY text so a drag copy
+/// carries the command/output, not the decorative anchor.
+const TOOL_GUTTER_GLYPHS: &[char] = &['●', '└', '⎿', '↳', '✓', '▸'];
+
+/// ASCII stand-ins the gutter glyphs downgrade to on non-unicode terminals
+/// (`●`→`*`, `└`/`⎿`→`` ` ``, `▸`/`↳`→`>` — see `glyph::ascii_for`). These chars
+/// are COMMON in real output (`* item`, `> quote`), so they are only treated as
+/// a gutter at COL 0 (a header row); tool output is always PAD-indented, never
+/// col 0, so a real `* …` stdout line is never mis-stripped.
+const TOOL_GUTTER_ASCII: &[char] = &['*', '`', '>'];
+
+/// Copyable text + start col for a TOOL row. Like [`copy_text_from_body_row`]
+/// but ALSO skips a leading gutter glyph + space, so copying a selected tool
+/// block yields `bash` / `cargo build …` rather than `● bash` / `└ cargo …`.
+/// The PAD-space check runs FIRST, so PAD-indented output lines (which never
+/// carry a gutter) are unaffected; the gutter branch only fires on a row that
+/// literally starts with one of [`TOOL_GUTTER_GLYPHS`] followed by a space.
+fn copy_text_from_tool_row(row: &[Cell]) -> (String, usize) {
+    // 1. Skip a leading PAD of spaces (output / continuation indent). Any
+    //    indentation BEYOND the pad is meaningful output and is preserved.
+    let mut col = if row
+        .get(..PAD_COL)
+        .is_some_and(|prefix| prefix.iter().all(|cell| cell.width == 1 && cell.ch == ' '))
+    {
+        PAD_COL
+    } else {
+        0
+    };
+    // 2. Then skip a gutter glyph (`● ` / `└ ` / `⎿ ` chrome anchor) — but
+    //    ONLY when it is immediately followed by a space. The space requirement
+    //    keeps real box-drawing output (`└── file`) intact while still stripping
+    //    the `└ [exit: 0]` result gutter, whether the gutter sits at col 0
+    //    (header) or after the pad (result line).
+    let allow_ascii_gutter = col == 0;
+    let is_gutter = |ch: char| {
+        TOOL_GUTTER_GLYPHS.contains(&ch) || (allow_ascii_gutter && TOOL_GUTTER_ASCII.contains(&ch))
+    };
+    if row.get(col).is_some_and(|cell| is_gutter(cell.ch)) {
+        let mut index = col + 1;
+        while row.get(index).is_some_and(|cell| cell.width == 0) {
+            index += 1; // width-2 glyph's continuation cell
+        }
+        if row.get(index).is_some_and(|cell| cell.ch == ' ') {
+            while row.get(index).is_some_and(|cell| cell.ch == ' ') {
+                index += 1;
+            }
+            col = index;
+        }
+    }
+    let end = row
+        .iter()
+        .rposition(|cell| cell.width > 0 && cell.ch != ' ')
+        .map_or(col, |index| index + 1);
+    let text = row[col.min(end)..end]
+        .iter()
+        .filter(|cell| cell.width > 0)
+        .map(|cell| cell.ch)
+        .collect();
+    (text, col)
+}
+
 fn apply_sgr(params: &str, style: &mut CellStyle) {
     // `\x1b[m` (empty params) is treated as SGR 0 per ECMA-48.
     let parts: Vec<&str> = if params.is_empty() {
@@ -1725,7 +1787,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             &detail_style,
         );
         for row in rows {
-            self.push_body_row(row);
+            self.push_copyable_tool_row(row);
         }
     }
 
@@ -6974,6 +7036,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
         });
     }
 
+    /// Push a TOOL-block row (header / command / output) as COPYABLE, deriving
+    /// its copy text from the rendered cells via [`copy_text_from_tool_row`]
+    /// (strips the pad + a leading gutter glyph). Without this a drag selection
+    /// spanning a tool block silently drops it — the reported "选中不全，缺少
+    /// bash 的内容". A row that derives to empty text (a blank/spacer) falls back
+    /// to the non-copyable push so blanks never become zero-width copy runs.
+    fn push_copyable_tool_row(&mut self, row: Vec<Cell>) {
+        let (text, col) = copy_text_from_tool_row(&row);
+        if text.is_empty() {
+            self.push_body_row(row);
+        } else {
+            self.push_copyable_body_row(row, text, col, false);
+        }
+    }
+
     /// Record the start of a new logical message in `message_marks`.
     /// The mark's `line_idx` is set to the CURRENT length of `body_lines`
     /// (i.e. the index the NEXT `push_body_row` will occupy).
@@ -7139,7 +7216,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     &body_str,
                 );
                 for row in rows {
-                    self.push_body_row(row);
+                    self.push_copyable_tool_row(row);
                 }
             }
         }
@@ -8256,11 +8333,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.mark_message(crate::render::MarkKind::ToolCall);
         self.last_mark_was_assistant = false;
         self.push_body_row(Vec::new());
-        self.push_body_row(header);
+        self.push_copyable_tool_row(header);
         let header_idx = self.body_lines.len() - 1;
         let mut child_indices = Vec::with_capacity(children.len());
         for child in children {
-            self.push_body_row(child);
+            self.push_copyable_tool_row(child);
             child_indices.push(self.body_lines.len() - 1);
         }
         if !finished {
@@ -8684,14 +8761,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let screen_w = self.screen.width();
                 let header_row =
                     build_one_row(&header, &header_style, screen_w, self.caps.unicode_symbols);
-                self.push_body_row(header_row);
+                self.push_copyable_tool_row(header_row);
                 let header_idx = self.body_lines.len() - 1;
 
                 let mut child_indices: std::collections::HashMap<String, usize> =
                     std::collections::HashMap::new();
                 for c in &children {
                     let row = self.build_group_child_row(&c.text, &muted);
-                    self.push_body_row(row);
+                    self.push_copyable_tool_row(row);
                     child_indices.insert(c.call_id.clone(), self.body_lines.len() - 1);
                 }
                 self.live_group = Some(LiveGroup {
@@ -8796,7 +8873,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     self.screen.width(),
                     self.caps.unicode_symbols,
                 );
-                self.push_body_row(row);
+                self.push_copyable_tool_row(row);
             }
             UiLine::AgentGroup { progress, finished } => {
                 self.render_agent_group(progress, finished);
@@ -8868,7 +8945,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                             &body_str,
                         );
                         for row in rows {
-                            self.push_body_row(row);
+                            self.push_copyable_tool_row(row);
                         }
                     }
                 }
@@ -9026,7 +9103,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                                 push_str_cells(&mut row, ")", &summary_style);
                             }
                         }
-                        self.push_body_row(row);
+                        self.push_copyable_tool_row(row);
                         first_visual = false;
                     }
                 }
@@ -11055,6 +11132,52 @@ mod tests {
     }
 
     #[test]
+    fn copy_text_from_tool_row_strips_pad_and_gutter_glyph() {
+        fn row(s: &str) -> Vec<Cell> {
+            let mut r = Vec::new();
+            push_str_cells(&mut r, s, &CellStyle::default());
+            r
+        }
+        // Gutter glyph + space at col 0 is stripped → the command text alone.
+        assert_eq!(copy_text_from_tool_row(&row("● bash")).0, "bash");
+        assert_eq!(copy_text_from_tool_row(&row("└ cargo build")).0, "cargo build");
+        assert_eq!(
+            copy_text_from_tool_row(&row("⎿ [elapsed: 0.0s] (4 lines)")).0,
+            "[elapsed: 0.0s] (4 lines)"
+        );
+        // A non-bash tool header with no gutter-space still copies its content
+        // (whole row from col 0 when there is no leading gutter).
+        assert_eq!(
+            copy_text_from_tool_row(&row("read_file(path)")).0,
+            "read_file(path)"
+        );
+        // PAD-indented output: only the pad is stripped; indentation BEYOND the
+        // pad (meaningful output structure) is preserved.
+        assert_eq!(copy_text_from_tool_row(&row("  stdout")).0, "stdout");
+        assert_eq!(copy_text_from_tool_row(&row("    nested")).0, "  nested");
+        // A gutter AFTER the pad (the result line `  └ [exit: 0]`) is stripped too.
+        assert_eq!(copy_text_from_tool_row(&row("  └ [exit: 0]")).0, "[exit: 0]");
+        // But a box-drawing glyph NOT followed by a space (real tree output) is
+        // preserved — the space requirement guards it.
+        assert_eq!(copy_text_from_tool_row(&row("  └── file.rs")).0, "└── file.rs");
+        // Non-unicode terminal: the gutter downgrades to an ASCII stand-in
+        // (`● `→`* `, `▸ `→`> `, `└ `→`` ` ``). At col 0 (a header row) it is
+        // still stripped.
+        assert_eq!(copy_text_from_tool_row(&row("* bash")).0, "bash");
+        assert_eq!(copy_text_from_tool_row(&row("> read_file")).0, "read_file");
+        assert_eq!(copy_text_from_tool_row(&row("` [exit: 0]")).0, "[exit: 0]");
+        // But those same ASCII chars are common in real OUTPUT — after the pad
+        // (never col 0) they are NOT treated as a gutter and stay intact.
+        assert_eq!(copy_text_from_tool_row(&row("  * bullet")).0, "* bullet");
+        assert_eq!(copy_text_from_tool_row(&row("  > quote")).0, "> quote");
+        // Trailing spaces trimmed.
+        assert_eq!(copy_text_from_tool_row(&row("● bash   ")).0, "bash");
+        // Blank / spacer rows derive to empty (caller keeps them non-copyable).
+        assert_eq!(copy_text_from_tool_row(&row("   ")).0, "");
+        assert_eq!(copy_text_from_tool_row(&[]).0, "");
+    }
+
+    #[test]
     fn interaction_transcript_copy_runs_preserve_semantics_and_exclude_chrome() {
         let interactions = crate::render::interaction::InteractionPublisher::default();
         let mut renderer = RetainedRenderer::with_writer_and_interactions(
@@ -11108,6 +11231,52 @@ mod tests {
                 || run.0.contains("STATUS_SENTINEL")
                 || run.0.contains("BORDER_SENTINEL")
         }));
+    }
+
+    #[test]
+    fn interaction_tool_blocks_are_copyable_without_gutter_chrome() {
+        // Regression: a drag selection spanning a bash tool block used to drop
+        // it entirely (tool rows weren't copy runs) — "选中不全，缺少 bash 的内容".
+        // Now the command + result ARE copy runs, with the ●/└/⎿ gutter glyphs
+        // stripped from the copied text.
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            60,
+            24,
+            interactions.clone(),
+        );
+        renderer.render(UiLine::ToolCall {
+            name: "bash".into(),
+            detail: "echo hello".into(),
+        });
+        renderer.render(UiLine::ToolResult {
+            success: true,
+            summary: "[exit: 0] (1 line)".into(),
+            diff_stats: None,
+        });
+        renderer.flush_deferred();
+
+        let frame = interactions
+            .snapshot_actionable()
+            .expect("painted transcript frame");
+        let texts: Vec<&str> = frame.copy_runs.iter().map(|run| &*run.text).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("echo hello")),
+            "the bash command must be copyable: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("exit: 0")),
+            "the tool result must be copyable: {texts:?}"
+        );
+        // Gutter chrome glyphs must not leak into the copied text.
+        assert!(
+            texts
+                .iter()
+                .all(|t| !t.starts_with('●') && !t.starts_with('└') && !t.starts_with('⎿')),
+            "gutter glyphs must be stripped from copy text: {texts:?}"
+        );
     }
 
     #[test]
