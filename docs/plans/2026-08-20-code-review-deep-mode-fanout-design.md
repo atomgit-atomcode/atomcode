@@ -189,9 +189,74 @@ Orchestration seam:
 The existing single-agent tests must remain green unchanged (default path
 untouched).
 
-## Phase 2 (reserved, not in v1)
+## Phase 2 — adversarial verify pass (approved 2026-08-20; implemented separately)
 
-Adversarial verify pass over the merged findings: one refute-biased skeptic per
-finding (or per cluster), majority-refute drops it. Surface as an extended
-`depth` value (e.g. `"deep+verify"`); the orchestrator leaves a post-merge hook
-so this slots in without restructuring.
+Phase 1 (above) raises recall via dimension fan-out. Phase 2 adds a precision
+layer: an opt-in verify pass that culls false positives from the merged findings.
+
+### Trigger
+
+`depth` gains a third value `"deep+verify"`. `is_deep()` is true for both `deep`
+and `deep+verify`; a new `wants_verify()` is true only for `deep+verify`. The
+schema enum grows to `["single", "deep", "deep+verify"]`. `/review deep+verify
+[scope]` maps in `commands.rs` (the `deep+verify` keyword is matched before
+`deep`). `single` and `deep` are unchanged.
+
+### Where it runs
+
+Between the deep merge (merge → scope-filter → sort) and the render. Each
+surviving `MergedFinding` gets **one** verify agent; kept/dropped is decided,
+then the survivors render.
+
+### Verify agent — reuse, zero new tools
+
+A verify agent is another `build_review_agent_with` reviewer with a verifier
+`persona_append` lens and a single-finding task: "Here is ONE candidate finding
+from a prior review: <finding>. Using the DIFF (authoritative) and read-only
+tools, decide whether it is a real defect introduced by these changes. If real —
+or if you are unsure — call `report_finding` to re-report it (you may refine it).
+Report nothing ONLY when you are confident it is a false positive / not
+introduced by this diff / already handled, and explain why."
+
+- **Keep signal = that verify agent's `report_finding` sink is non-empty.** This
+  reuses the existing sink + assembly; no new tool or verdict type.
+- **Single vote biased toward KEEP:** unsure ⇒ re-report ⇒ keep. Only a
+  confident refutation drops a finding, so a lone hesitant skeptic never nukes a
+  real finding.
+- The kept entry is the **original** `MergedFinding` (preserving accumulated
+  dimension tags); the re-report is used only as a yes/no signal.
+- **Fail-open:** a verify agent that errors or is cancelled keeps its finding —
+  a verify failure must never drop a possibly-real finding.
+
+### Concurrency / cancellation
+
+Verify agents (one per surviving finding, usually single digits) run under a
+bounded `tokio::task::JoinSet` (concurrency cap, e.g. 6). Each carries
+`ctx.cancel` in its `tokio::select!`, same as the dimension agents.
+
+### Reporting
+
+Survivors render as today; the summary gains one line: `verify: dropped K of M
+candidate finding(s)`.
+
+### Cost
+
+`deep+verify` agent count = 4 dimensions + K surviving findings. Opt-in and
+concurrency-capped. `deep` (no verify) is unaffected.
+
+### Code organization (Phase 2)
+
+- `fanout.rs`: split `finalize_deep_review` into reusable pieces —
+  `merge_deep_findings(outcomes, changed_paths) -> (Vec<MergedFinding>, deduped)`,
+  `dimension_coverage(outcomes) -> (completed, failed)`, and
+  `render_deep_result(..., verify_dropped: Option<usize>)`; `finalize_deep_review`
+  delegates to them (its output for `verify_dropped = None` is byte-identical, so
+  Phase-1 tests stay green). Add a verifier lens const and a bounded
+  `run_verify(n, cap, verify_one) -> Vec<bool>` keep-mask runner.
+- `review_tool.rs`: `Args::wants_verify()`, the schema enum value, and a
+  `deep+verify` branch that runs `merge_deep_findings` → `run_verify` (building
+  one verify agent per finding) → `render_deep_result(..., Some(dropped))`.
+- `commands.rs`: map the `deep+verify` keyword.
+
+Not in Phase 2: multi-vote panels, per-cluster verify, verifying only high
+priority — all deferred; the single-vote design is the agreed starting point.
