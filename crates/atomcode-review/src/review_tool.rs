@@ -665,22 +665,26 @@ fn fnv1a64(first: &[u8], second: &[u8]) -> u64 {
 
 /// Loose path match between a diff's changed-file path and a finding's `file_path` (which a
 /// model may give relative, `./`-prefixed, or absolute). Suffix match covers all three.
-fn paths_match(changed: &str, finding: &str) -> bool {
+pub(crate) fn paths_match(changed: &str, finding: &str) -> bool {
     let c = changed.trim_start_matches("./");
     let f = finding.trim_start_matches("./");
     c == f || f.ends_with(c) || c.ends_with(f)
 }
 
+/// Priority ascending (`P0` most severe) then confidence descending. Shared with
+/// deep-mode merge ordering.
+pub(crate) fn cmp_finding(a: &Finding, b: &Finding) -> std::cmp::Ordering {
+    a.priority.cmp(&b.priority).then(
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal),
+    )
+}
+
 /// Sort by priority ascending (`P0` most severe) then confidence descending. `Px` strings
 /// sort lexically in severity order, so a plain string compare is correct.
 fn sort_findings(findings: &mut [Finding]) {
-    findings.sort_by(|a, b| {
-        a.priority.cmp(&b.priority).then(
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        )
-    });
+    findings.sort_by(|a, b| cmp_finding(a, b));
 }
 
 fn render_findings(findings: &[Finding], changed_files: usize) -> String {

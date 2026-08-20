@@ -4,6 +4,7 @@
 
 use std::cmp::Ordering;
 
+use crate::review_tool::{cmp_finding, paths_match};
 use crate::Finding;
 
 /// One review lens. `lens` is appended to the base reviewer persona via
@@ -133,6 +134,120 @@ fn outranks(candidate: &Finding, current: &Finding) -> bool {
     }
 }
 
+/// Result of running one dimension reviewer. `completed` is true only on a clean
+/// finish (agent stopped, no error); a cancelled/errored dimension still
+/// contributes whatever findings it already reported.
+pub struct DimensionOutcome {
+    pub dimension: &'static str,
+    pub findings: Vec<Finding>,
+    pub completed: bool,
+    pub error: Option<String>,
+}
+
+/// Merge → scope-filter → sort → render the deep-review outcomes. Returns
+/// `(is_error, rendered)`. `is_error` is true only when NO dimension completed
+/// cleanly (a fully failed fan-out); a partial run renders its findings and notes
+/// coverage.
+pub fn finalize_deep_review(
+    outcomes: &[DimensionOutcome],
+    changed_files: usize,
+    changed_paths: &[String],
+) -> (bool, String) {
+    // Feed merge in stable dimension order regardless of completion order.
+    let per_dim: Vec<(&'static str, Vec<Finding>)> = REVIEW_DIMENSIONS
+        .iter()
+        .filter_map(|d| {
+            outcomes
+                .iter()
+                .find(|o| o.dimension == d.id)
+                .map(|o| (d.id, o.findings.clone()))
+        })
+        .collect();
+    let raw_total: usize = per_dim.iter().map(|(_, v)| v.len()).sum();
+    let mut merged = merge_findings(per_dim);
+    merged.retain(|m| {
+        changed_paths
+            .iter()
+            .any(|cf| paths_match(cf, &m.finding.file_path))
+    });
+    merged.sort_by(|a, b| cmp_finding(&a.finding, &b.finding));
+    let deduped = raw_total.saturating_sub(merged.len());
+
+    let completed: Vec<&'static str> = REVIEW_DIMENSIONS
+        .iter()
+        .filter(|d| outcomes.iter().any(|o| o.dimension == d.id && o.completed))
+        .map(|d| d.id)
+        .collect();
+    let failed: Vec<&'static str> = REVIEW_DIMENSIONS
+        .iter()
+        .filter(|d| outcomes.iter().any(|o| o.dimension == d.id && !o.completed))
+        .map(|d| d.id)
+        .collect();
+
+    let is_error = completed.is_empty();
+    let rendered = render_deep(&merged, changed_files, &completed, &failed, deduped, is_error);
+    (is_error, rendered)
+}
+
+fn render_deep(
+    merged: &[MergedFinding],
+    changed_files: usize,
+    completed: &[&str],
+    failed: &[&str],
+    deduped: usize,
+    is_error: bool,
+) -> String {
+    let total_dims = REVIEW_DIMENSIONS.len();
+    let mut out = String::new();
+    if is_error {
+        out.push_str(&format!(
+            "Deep review incomplete — every dimension failed (0/{total_dims}). \
+             Coverage is not reliable.\n"
+        ));
+    } else if merged.is_empty() {
+        out.push_str(&format!(
+            "Deep review complete — no issues found across {changed_files} changed file(s) \
+             ({}/{total_dims} dimensions completed).\n",
+            completed.len()
+        ));
+    } else {
+        out.push_str(&format!(
+            "Deep review: {} finding(s) across {changed_files} changed file(s) · \
+             {}/{total_dims} dimensions completed",
+            merged.len(),
+            completed.len()
+        ));
+        if deduped > 0 {
+            out.push_str(&format!(" · deduped {deduped}"));
+        }
+        out.push('\n');
+    }
+    if !failed.is_empty() {
+        out.push_str(&format!("Failed dimensions: {}\n", failed.join(", ")));
+    }
+    for (i, m) in merged.iter().enumerate() {
+        let f = &m.finding;
+        out.push_str(&format!(
+            "\n{}. [{} · conf {:.2}] {}:{}-{} · dims: {}\n   {}\n",
+            i + 1,
+            f.priority,
+            f.confidence,
+            f.file_path,
+            f.line_start,
+            f.line_end,
+            m.dimensions.join(","),
+            f.title.trim()
+        ));
+        if !f.body.trim().is_empty() {
+            out.push_str(&format!("   {}\n", f.body.trim().replace('\n', "\n   ")));
+        }
+        if !f.suggestion.trim().is_empty() {
+            out.push_str(&format!("   ↳ fix: {}\n", f.suggestion.trim().replace('\n', "\n   ")));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +313,65 @@ mod tests {
         ]);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].finding.confidence, 0.9);
+    }
+
+    fn outcome(dim: &'static str, completed: bool, findings: Vec<Finding>) -> DimensionOutcome {
+        DimensionOutcome {
+            dimension: dim,
+            findings,
+            completed,
+            error: (!completed).then(|| "boom".to_string()),
+        }
+    }
+
+    #[test]
+    fn finalize_merges_filters_to_changed_files_and_sorts() {
+        let outcomes = vec![
+            outcome("correctness", true, vec![f("P2", 0.7, "a.rs", 5, 6, "clone in loop")]),
+            outcome("security", true, vec![
+                f("P0", 0.9, "a.rs", 1, 1, "hardcoded secret"),
+                f("P1", 0.8, "not_changed.rs", 1, 1, "ignored"),
+            ]),
+        ];
+        let (is_error, out) = finalize_deep_review(&outcomes, 1, &["a.rs".to_string()]);
+        assert!(!is_error);
+        // P0 sorts before P2; the non-changed-file finding is dropped.
+        let p0 = out.find("hardcoded secret").unwrap();
+        let p2 = out.find("clone in loop").unwrap();
+        assert!(p0 < p2, "P0 must render before P2:\n{out}");
+        assert!(!out.contains("ignored"), "off-scope finding filtered:\n{out}");
+        assert!(out.contains("2/4"), "dimension completion summary:\n{out}");
+    }
+
+    #[test]
+    fn finalize_flags_error_only_when_no_dimension_completed() {
+        let all_failed = vec![
+            outcome("correctness", false, vec![]),
+            outcome("security", false, vec![]),
+            outcome("performance", false, vec![]),
+            outcome("tests_contracts", false, vec![]),
+        ];
+        let (is_error, out) = finalize_deep_review(&all_failed, 1, &["a.rs".to_string()]);
+        assert!(is_error, "every dimension failed → hard error");
+        assert!(out.contains("incomplete") || out.contains("0/4"), "{out}");
+
+        let one_ok = vec![
+            outcome("correctness", true, vec![]),
+            outcome("security", false, vec![]),
+            outcome("performance", false, vec![]),
+            outcome("tests_contracts", false, vec![]),
+        ];
+        let (is_error, _) = finalize_deep_review(&one_ok, 1, &["a.rs".to_string()]);
+        assert!(!is_error, "one clean dimension → partial but not a hard error");
+    }
+
+    #[test]
+    fn finalize_tags_findings_with_contributing_dimensions() {
+        let outcomes = vec![
+            outcome("correctness", true, vec![f("P1", 0.8, "a.rs", 3, 4, "bad unwrap")]),
+            outcome("security", true, vec![f("P1", 0.8, "a.rs", 3, 4, "bad unwrap")]),
+        ];
+        let (_, out) = finalize_deep_review(&outcomes, 1, &["a.rs".to_string()]);
+        assert!(out.contains("correctness") && out.contains("security"), "dims tagged:\n{out}");
     }
 }
