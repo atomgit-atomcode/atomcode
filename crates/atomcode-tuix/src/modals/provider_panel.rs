@@ -60,18 +60,70 @@ struct AddForm {
     cursor_byte: usize,
 }
 
-/// The `PRESETS` index of the custom `openai-compatible` / `anthropic-compatible`
-/// protocol preset — the only two the add form offers (fully-custom provider).
-fn compat_preset_idx(anthropic: bool) -> usize {
-    let id = if anthropic {
-        "anthropic-compatible"
-    } else {
-        "openai-compatible"
-    };
+/// Protocol presets the fully-custom add/edit form cycles through with `←/→`,
+/// in display order. Each id resolves to a real `PRESETS` entry: the two generic
+/// `*-compatible` custom endpoints plus the keyless local `ollama` preset.
+const CYCLE_PROTOCOL_IDS: [&str; 3] = ["openai-compatible", "anthropic-compatible", "ollama"];
+
+/// `PRESETS` index for a preset id (falls back to the first entry).
+fn preset_idx_by_id(id: &str) -> usize {
     provider_preset::PRESETS
         .iter()
         .position(|p| p.id == id)
         .unwrap_or(0)
+}
+
+/// The `PRESETS` index of the protocol-toggle preset matching a stored account's
+/// wire protocol — so opening an existing account starts the toggle on the right
+/// choice (and an Ollama account shows as Ollama, not OpenAI). Also seeds a fresh
+/// add-form on its OpenAI default.
+fn protocol_preset_idx(ty: provider_preset::ProviderType) -> usize {
+    preset_idx_by_id(match ty {
+        provider_preset::ProviderType::Anthropic => "anthropic-compatible",
+        provider_preset::ProviderType::Ollama => "ollama",
+        provider_preset::ProviderType::OpenAi => "openai-compatible",
+    })
+}
+
+/// Human protocol label shown next to the `←/→` toggle. Derived from the wire
+/// protocol (exhaustive) so a new `ProviderType` can't silently mislabel.
+fn protocol_label(ty: provider_preset::ProviderType) -> &'static str {
+    match ty {
+        provider_preset::ProviderType::Anthropic => "Anthropic",
+        provider_preset::ProviderType::Ollama => "Ollama",
+        provider_preset::ProviderType::OpenAi => "OpenAI",
+    }
+}
+
+/// Next protocol id in the toggle cycle (`forward` picks direction; wraps). An id
+/// outside the cycle restarts at the first entry.
+fn cycle_protocol_id(current_id: &str, forward: bool) -> &'static str {
+    let len = CYCLE_PROTOCOL_IDS.len();
+    let cur = CYCLE_PROTOCOL_IDS
+        .iter()
+        .position(|id| *id == current_id)
+        .unwrap_or(0);
+    let next = if forward {
+        (cur + 1) % len
+    } else {
+        (cur + len - 1) % len
+    };
+    CYCLE_PROTOCOL_IDS[next]
+}
+
+/// Move `preset_idx` to the next protocol in the cycle. When landing on a preset
+/// that ships a default endpoint (only Ollama does) and `base_url` is still
+/// blank, offer that endpoint as a convenience. A value the user typed — or one
+/// an existing account was opened with — is NEVER overwritten or cleared, so no
+/// edit can silently lose an endpoint.
+fn cycle_protocol(preset_idx: &mut usize, base_url: &mut String, forward: bool) {
+    let next_id = cycle_protocol_id(provider_preset::PRESETS[*preset_idx].id, forward);
+    *preset_idx = preset_idx_by_id(next_id);
+    if base_url.trim().is_empty() {
+        if let Some(url) = provider_preset::PRESETS[*preset_idx].default_base_url {
+            *base_url = url.to_string();
+        }
+    }
 }
 
 impl AddForm {
@@ -79,7 +131,7 @@ impl AddForm {
     fn new() -> Self {
         Self {
             name: String::new(),
-            preset_idx: compat_preset_idx(false),
+            preset_idx: protocol_preset_idx(provider_preset::ProviderType::OpenAi),
             base_url: String::new(),
             api_key: String::new(),
             focus: FormField::Name,
@@ -89,11 +141,7 @@ impl AddForm {
 
     /// Human protocol label for the toggle.
     fn protocol_label(&self) -> &'static str {
-        if self.preset().id == "anthropic-compatible" {
-            "Anthropic"
-        } else {
-            "OpenAI"
-        }
+        protocol_label(self.preset().provider_type)
     }
 
     fn preset(&self) -> &'static provider_preset::ProviderPreset {
@@ -131,11 +179,10 @@ impl AddForm {
         }
     }
 
-    fn cycle_preset(&mut self, _forward: bool) {
-        // Only two protocols (OpenAI-compatible ↔ Anthropic-compatible), so both
-        // directions toggle. Neither ships a default endpoint — keep base_url.
-        let to_anthropic = self.preset().id == "openai-compatible";
-        self.preset_idx = compat_preset_idx(to_anthropic);
+    fn cycle_preset(&mut self, forward: bool) {
+        // OpenAI-compatible → Anthropic-compatible → Ollama → … (see cycle_protocol,
+        // which also manages Ollama's auto-filled local endpoint).
+        cycle_protocol(&mut self.preset_idx, &mut self.base_url, forward);
         if !self.fields().contains(&self.focus) {
             self.focus = FormField::Name;
         }
@@ -193,11 +240,7 @@ impl EditForm {
     }
 
     fn protocol_label(&self) -> &'static str {
-        if self.preset().id == "anthropic-compatible" {
-            "Anthropic"
-        } else {
-            "OpenAI"
-        }
+        protocol_label(self.preset().provider_type)
     }
 
     /// Field sequence. A gateway-locked account only exposes base_url.
@@ -236,15 +279,13 @@ impl EditForm {
         }
     }
 
-    fn cycle_preset(&mut self, _forward: bool) {
+    fn cycle_preset(&mut self, forward: bool) {
         if self.vendor_locked || self.protocol_locked {
             return; // managed/curated vendor — protocol not editable
         }
-        // Only two choices (OpenAI-compatible ↔ Anthropic-compatible), so both
-        // directions just toggle. Neither ships a default endpoint, so base_url
-        // stays as the user typed it.
-        let to_anthropic = self.preset().id == "openai-compatible";
-        self.preset_idx = compat_preset_idx(to_anthropic);
+        // OpenAI-compatible → Anthropic-compatible → Ollama → … (see cycle_protocol,
+        // which also manages Ollama's auto-filled local endpoint).
+        cycle_protocol(&mut self.preset_idx, &mut self.base_url, forward);
         if !self.fields().contains(&self.focus) {
             self.focus = FormField::Preset;
         }
@@ -1086,14 +1127,11 @@ impl ProviderPanel {
                 .and_then(|preset| preset.default_base_url)
                 .map(str::to_string)
         });
-        // Map the stored provider to a protocol toggle (OpenAI/Anthropic
-        // compatible). original == preset so a no-op edit leaves the real stored
-        // provider (e.g. "deepseek"/"openai") untouched (see save_edit's guard).
-        let anthropic = matches!(
-            provider_preset::preset_or_compatible(&provider).provider_type,
-            provider_preset::ProviderType::Anthropic
-        );
-        let preset_idx = compat_preset_idx(anthropic);
+        // Map the stored provider to a protocol toggle (OpenAI/Anthropic/Ollama).
+        // original == preset so a no-op edit leaves the real stored provider
+        // (e.g. "deepseek"/"openai"/"ollama") untouched (see save_edit's guard).
+        let preset_idx =
+            protocol_preset_idx(provider_preset::preset_or_compatible(&provider).provider_type);
         let vendor_locked = config.account_is_codingplan_managed(id);
         EditForm {
             id: id.to_string(),
@@ -2360,12 +2398,135 @@ mod tests {
         );
         assert!(f.base_url.is_empty());
         assert_eq!(f.protocol_label(), "OpenAI");
-        // ←→ toggles between the two protocols only (never a vendor list).
+        // ←→ cycles OpenAI → Anthropic → Ollama → OpenAI (never a vendor list).
         f.cycle_preset(true);
         assert_eq!(f.protocol_label(), "Anthropic");
         assert_eq!(f.preset().id, "anthropic-compatible");
         f.cycle_preset(true);
+        assert_eq!(f.protocol_label(), "Ollama");
+        assert_eq!(f.preset().id, "ollama");
+        f.cycle_preset(true);
         assert_eq!(f.protocol_label(), "OpenAI");
+        assert_eq!(f.preset().id, "openai-compatible");
+    }
+
+    #[test]
+    fn add_form_protocol_toggle_cycles_backward() {
+        let mut f = AddForm::new(); // OpenAI
+        f.cycle_preset(false);
+        assert_eq!(f.preset().id, "ollama");
+        f.cycle_preset(false);
+        assert_eq!(f.preset().id, "anthropic-compatible");
+        f.cycle_preset(false);
+        assert_eq!(f.preset().id, "openai-compatible");
+    }
+
+    #[test]
+    fn add_form_ollama_offers_local_endpoint_and_hides_api_key() {
+        let mut f = AddForm::new();
+        f.cycle_preset(true); // Anthropic
+        f.cycle_preset(true); // Ollama
+        assert_eq!(f.preset().id, "ollama");
+        // Local, keyless: auto-fill the well-known endpoint and drop the key field.
+        assert_eq!(f.base_url, "http://localhost:11434");
+        assert!(
+            !f.fields().contains(&FormField::ApiKey),
+            "Ollama is keyless local"
+        );
+        // The field is never silently wiped when cycling away — the value stays
+        // visible and editable (auto-fill only ever fills a blank field).
+        f.cycle_preset(true); // OpenAI
+        assert_eq!(f.preset().id, "openai-compatible");
+        assert_eq!(f.base_url, "http://localhost:11434");
+    }
+
+    #[test]
+    fn cycle_never_overwrites_or_clears_an_existing_base_url() {
+        // Editing an account with a pre-filled endpoint: cycling the protocol
+        // must never clobber or clear the URL the account already has — auto-fill
+        // is a convenience for a blank field only, so no save loses data.
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "acc": { "provider": "openai", "base_url": "https://mirror/v1" } }
+        }))
+        .unwrap();
+        let mut edit = ProviderPanel::open_edit(&cfg, "acc");
+        assert_eq!(edit.base_url, "https://mirror/v1");
+        edit.cycle_preset(true); // Anthropic
+        assert_eq!(edit.base_url, "https://mirror/v1");
+        edit.cycle_preset(true); // Ollama — field non-empty, no auto-fill, no clear
+        assert_eq!(edit.preset().id, "ollama");
+        assert_eq!(edit.base_url, "https://mirror/v1");
+        edit.cycle_preset(true); // OpenAI — still intact
+        assert_eq!(edit.base_url, "https://mirror/v1");
+    }
+
+    #[test]
+    fn editing_ollama_account_and_cycling_away_keeps_the_default_endpoint() {
+        // An existing Ollama account with no override shows the default endpoint
+        // on open. Cycling the protocol away must NOT wipe that pre-filled value
+        // (open_edit's default is indistinguishable from a within-session
+        // auto-fill by string, so clearing on a match loses the endpoint).
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "local": { "provider": "ollama" } }
+        }))
+        .unwrap();
+        let mut edit = ProviderPanel::open_edit(&cfg, "local");
+        assert_eq!(edit.base_url, "http://localhost:11434");
+        edit.cycle_preset(true); // Ollama → OpenAI
+        assert_eq!(edit.preset().id, "openai-compatible");
+        assert_eq!(
+            edit.base_url, "http://localhost:11434",
+            "cycling away must not clear the account's shown endpoint"
+        );
+    }
+
+    #[test]
+    fn add_form_ollama_keeps_user_typed_base_url() {
+        let mut f = AddForm::new();
+        f.base_url = "http://box:11434".into();
+        f.cycle_preset(true); // Anthropic
+        f.cycle_preset(true); // Ollama
+        assert_eq!(f.preset().id, "ollama");
+        assert_eq!(
+            f.base_url, "http://box:11434",
+            "must not clobber a user-typed endpoint"
+        );
+        // A user-typed endpoint survives cycling away, too.
+        f.cycle_preset(true); // OpenAI
+        assert_eq!(f.base_url, "http://box:11434");
+    }
+
+    #[test]
+    fn edit_form_protocol_toggle_reaches_ollama() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "acc": { "provider": "openai" } }
+        }))
+        .unwrap();
+        let mut edit = ProviderPanel::open_edit(&cfg, "acc");
+        assert_eq!(edit.protocol_label(), "OpenAI");
+        edit.cycle_preset(true); // Anthropic
+        edit.cycle_preset(true); // Ollama
+        assert_eq!(edit.protocol_label(), "Ollama");
+        assert_eq!(edit.preset().id, "ollama");
+    }
+
+    #[test]
+    fn open_edit_of_ollama_account_shows_ollama_and_noop_keeps_provider() {
+        let mut cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "local": { "provider": "ollama" } }
+        }))
+        .unwrap();
+        let edit = ProviderPanel::open_edit(&cfg, "local");
+        assert_eq!(edit.protocol_label(), "Ollama");
+        assert_eq!(
+            edit.preset_idx, edit.original_preset_idx,
+            "a no-op edit must not rewrite the stored provider"
+        );
+        ProviderPanel::apply_account_edit(&edit, &mut cfg);
+        assert_eq!(
+            cfg.provider_accounts.get("local").unwrap().provider,
+            "ollama"
+        );
     }
 
     #[test]
@@ -2723,8 +2884,8 @@ mod tests {
             id: "account".into(),
             is_legacy: false,
             materialize_provider: None,
-            preset_idx: compat_preset_idx(false),
-            original_preset_idx: compat_preset_idx(false),
+            preset_idx: protocol_preset_idx(provider_preset::ProviderType::OpenAi),
+            original_preset_idx: protocol_preset_idx(provider_preset::ProviderType::OpenAi),
             vendor_locked: false,
             protocol_locked: false,
             api_key: String::new(),
