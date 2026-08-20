@@ -89,15 +89,10 @@ pub fn merge_findings(per_dim: Vec<(&'static str, Vec<Finding>)>) -> Vec<MergedF
 }
 
 fn is_duplicate(a: &Finding, b: &Finding) -> bool {
-    same_file(&a.file_path, &b.file_path)
+    // Reuse review_tool's boundary-aware path matcher instead of a second copy.
+    paths_match(&a.file_path, &b.file_path)
         && ranges_overlap(a.line_start, a.line_end, b.line_start, b.line_end)
         && titles_similar(&a.title, &b.title)
-}
-
-fn same_file(a: &str, b: &str) -> bool {
-    let na = a.trim_start_matches("./");
-    let nb = b.trim_start_matches("./");
-    na == nb || na.ends_with(nb) || nb.ends_with(na)
 }
 
 fn ranges_overlap(a0: u32, a1: u32, b0: u32, b1: u32) -> bool {
@@ -176,13 +171,15 @@ pub fn merge_deep_findings(
         .collect();
     let raw_total: usize = per_dim.iter().map(|(_, v)| v.len()).sum();
     let mut merged = merge_findings(per_dim);
+    // Count dedup collapses BEFORE the scope-filter, so `deduped` reflects only
+    // cross-dimension merges — not findings dropped for being outside the diff.
+    let deduped = raw_total.saturating_sub(merged.len());
     merged.retain(|m| {
         changed_paths
             .iter()
             .any(|cf| paths_match(cf, &m.finding.file_path))
     });
     merged.sort_by(|a, b| cmp_finding(&a.finding, &b.finding));
-    let deduped = raw_total.saturating_sub(merged.len());
     (merged, deduped)
 }
 
@@ -301,10 +298,14 @@ pub const VERIFY_CONCURRENCY: usize = 6;
 pub const VERIFY_LENS: &str = "\n\n## This review's task: VERIFY ONE CANDIDATE FINDING\n\
 You are checking a single candidate finding from a prior review pass. Using the DIFF as the \
 authoritative source (plus read-only tools for context), decide whether it is a REAL defect \
-INTRODUCED by these changes. If it is real — OR if you are unsure — call `report_finding` to \
-re-report it (you may refine its wording). Report NOTHING only when you are confident it is a \
-false positive, is not introduced by this diff, or is already handled, and briefly say why. Do \
-not hunt for new, unrelated issues.";
+INTRODUCED by these changes.\n\
+- To KEEP it (it is real, OR you are unsure): call `report_finding` re-reporting THE SAME issue \
+at the SAME file and an overlapping line range (you may refine the wording). Keeping is the \
+default whenever you are not certain.\n\
+- To DROP it: call `report_finding` for NOTHING, and briefly state why it is a false positive, \
+not introduced by this diff, or already handled.\n\
+Report only about THIS candidate — do not hunt for new, unrelated issues, and do not report a \
+different finding (an unrelated report will not count as keeping this one).";
 
 /// Build the single-finding task text handed to a verify agent: the candidate,
 /// the per-language rules, and the authoritative DIFF.
@@ -321,6 +322,22 @@ pub fn render_verify_task(f: &Finding, rules: &str, annotated: &str) -> String {
         f.title.trim(),
         f.body.trim(),
     )
+}
+
+/// The keep signal for the verify pass: true when the verify agent re-reported a
+/// finding that CORRESPONDS to the candidate (same file, overlapping line range).
+/// Requiring correspondence — not merely a non-empty sink — stops a verifier that
+/// wandered off and reported an unrelated issue from spuriously keeping this one.
+pub fn verify_reconfirms(candidate: &Finding, reported: &[Finding]) -> bool {
+    reported.iter().any(|r| {
+        paths_match(&candidate.file_path, &r.file_path)
+            && ranges_overlap(
+                candidate.line_start,
+                candidate.line_end,
+                r.line_start,
+                r.line_end,
+            )
+    })
 }
 
 /// Run up to `cap` verify checks concurrently over `n` items; return a keep-mask
@@ -420,6 +437,57 @@ mod tests {
             suggestion: String::new(),
             suggested_code: String::new(),
         }
+    }
+
+    #[test]
+    fn deduped_counts_only_cross_dimension_collapses_not_scope_drops() {
+        // Two dims report the same in-scope finding (1 real dedup) + one dim reports
+        // a distinct OUT-OF-scope finding (a scope drop, NOT a dedup).
+        let outcomes = vec![
+            DimensionOutcome {
+                dimension: "correctness",
+                findings: vec![
+                    f("P1", 0.8, "a.rs", 10, 12, "unwrap"),
+                    f("P2", 0.7, "vendor/dep.rs", 1, 2, "off-scope"),
+                ],
+                completed: true,
+                error: None,
+            },
+            DimensionOutcome {
+                dimension: "security",
+                findings: vec![f("P1", 0.9, "a.rs", 10, 12, "unwrap")],
+                completed: true,
+                error: None,
+            },
+        ];
+        let (merged, deduped) = merge_deep_findings(&outcomes, &["a.rs".to_string()]);
+        assert_eq!(merged.len(), 1, "only the in-scope survivor remains");
+        assert_eq!(
+            deduped, 1,
+            "exactly one cross-dimension duplicate collapsed; the off-scope finding is a scope drop, not a dedup"
+        );
+    }
+
+    #[test]
+    fn verify_reconfirms_only_a_matching_relocatable_finding() {
+        let candidate = f("P1", 0.9, "a.rs", 10, 12, "unchecked unwrap");
+        // Same file + overlapping range (title may differ) → reconfirmed → keep.
+        assert!(verify_reconfirms(
+            &candidate,
+            &[f("P1", 0.8, "a.rs", 10, 14, "null deref")]
+        ));
+        // A report for a different file does NOT reconfirm → drop.
+        assert!(!verify_reconfirms(
+            &candidate,
+            &[f("P2", 0.5, "other.rs", 10, 12, "unrelated")]
+        ));
+        // A report at a non-overlapping range does NOT reconfirm → drop.
+        assert!(!verify_reconfirms(
+            &candidate,
+            &[f("P1", 0.8, "a.rs", 90, 92, "unrelated hunk")]
+        ));
+        // No report at all → not reconfirmed → drop.
+        assert!(!verify_reconfirms(&candidate, &[]));
     }
 
     #[test]

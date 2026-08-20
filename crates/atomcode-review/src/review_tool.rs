@@ -37,7 +37,8 @@ use crate::config::ReviewAgentConfig;
 use crate::diff::annotate_diff_line_numbers;
 use crate::fanout::{
     dimension_coverage, merge_deep_findings, render_deep_result, render_verify_task, run_deep_review,
-    run_verify, DimensionOutcome, REVIEW_DIMENSIONS, VERIFY_CONCURRENCY, VERIFY_LENS,
+    run_verify, verify_reconfirms, DimensionOutcome, REVIEW_DIMENSIONS, VERIFY_CONCURRENCY,
+    VERIFY_LENS,
 };
 use crate::impact_plan::render_review_impact_plan;
 use crate::rules::{changed_files_from_diff, render_rules_section};
@@ -582,15 +583,16 @@ impl Tool for ReviewTool {
         let (completed, failed) = dimension_coverage(&outcomes);
         let mut verify_dropped = None;
         if a.wants_verify() && !merged.is_empty() {
-            // One verify agent per finding, capped. Keep a finding when its
-            // verify agent re-reports it (or fails open on error/cancel).
-            let inputs: Vec<String> = merged
-                .iter()
-                .map(|m| render_verify_task(&m.finding, &rules, &annotated))
-                .collect();
+            // One verify agent per finding, capped. Keep a finding when its verify
+            // agent re-reports a corresponding finding (or fails open on error/cancel).
+            // Snapshot only the candidate findings (cheap Finding clones); the task —
+            // which embeds the whole diff — is rendered lazily inside each closure, so
+            // at most `VERIFY_CONCURRENCY` copies of the diff are live at once.
+            let candidates: Vec<Finding> = merged.iter().map(|m| m.finding.clone()).collect();
             let keep = run_verify(merged.len(), VERIFY_CONCURRENCY, |i| {
                 let provider = provider.clone();
-                let vtask = inputs[i].clone();
+                let candidate = candidates[i].clone();
+                let vtask = render_verify_task(&candidate, &rules, &annotated);
                 let mut cfg = make_cfg();
                 let cancel = ctx.cancel.clone();
                 async move {
@@ -602,9 +604,14 @@ impl Tool for ReviewTool {
                             (outcome.stop, outcome.error)
                         }
                     };
-                    // Fail-open: keep on error/cancel; else keep iff the verifier re-reported.
+                    // Fail-open: keep on error/cancel; else keep iff the verifier
+                    // re-reported a finding corresponding to THIS candidate.
                     let clean = stop == StopReason::Stopped && run_error.is_none();
-                    let kept = if clean { !report.findings().is_empty() } else { true };
+                    let kept = if clean {
+                        verify_reconfirms(&candidate, &report.findings())
+                    } else {
+                        true
+                    };
                     (i, kept)
                 }
             })
@@ -760,11 +767,21 @@ fn fnv1a64(first: &[u8], second: &[u8]) -> u64 {
 }
 
 /// Loose path match between a diff's changed-file path and a finding's `file_path` (which a
-/// model may give relative, `./`-prefixed, or absolute). Suffix match covers all three.
+/// model may give relative, `./`-prefixed, or absolute). Equal, or one is a suffix of the
+/// other AT a path-segment (`/`) boundary — so a bare `a.rs` still matches `crates/x/a.rs`,
+/// but `lib.rs` does NOT falsely match `mylib.rs`.
 pub(crate) fn paths_match(changed: &str, finding: &str) -> bool {
     let c = changed.trim_start_matches("./");
     let f = finding.trim_start_matches("./");
-    c == f || f.ends_with(c) || c.ends_with(f)
+    c == f || suffix_at_boundary(c, f) || suffix_at_boundary(f, c)
+}
+
+/// True when `short` is a suffix of `long` ending on a `/` segment boundary
+/// (`crates/x/a.rs` vs `a.rs`), never a mid-segment suffix (`mylib.rs` vs `lib.rs`).
+fn suffix_at_boundary(long: &str, short: &str) -> bool {
+    long.len() > short.len()
+        && long.ends_with(short)
+        && long.as_bytes()[long.len() - short.len() - 1] == b'/'
 }
 
 /// Priority ascending (`P0` most severe) then confidence descending. Shared with
@@ -930,6 +947,11 @@ mod tests {
         assert!(paths_match("src/a.rs", "./src/a.rs"));
         assert!(paths_match("src/a.rs", "/abs/repo/src/a.rs"));
         assert!(!paths_match("src/a.rs", "src/b.rs"));
+        // Basename leniency stays: a bare filename matches at a path segment boundary.
+        assert!(paths_match("crates/x/a.rs", "a.rs"));
+        // But a suffix that is NOT at a `/` boundary must NOT match (no false positive).
+        assert!(!paths_match("src/mylib.rs", "lib.rs"));
+        assert!(!paths_match("ab.rs", "b.rs"));
     }
 
     #[test]
