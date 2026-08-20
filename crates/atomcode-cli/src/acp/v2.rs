@@ -270,7 +270,7 @@ pub fn event_to_update(ev: &AgentEvent, message_id: &str) -> Option<SessionUpdat
                 .title(call.name.clone())
                 .kind(tool_kind(&call.name))
                 .status(ToolCallStatus::InProgress)
-                .raw_input(serde_json::from_str::<serde_json::Value>(&call.arguments).ok()),
+                .raw_input(crate::acp::replay::raw_input_from_arguments(&call.arguments)),
         )),
         AgentEvent::ToolResult { result } => {
             let status = if result.is_error {
@@ -356,7 +356,7 @@ fn replay_entries_to_v2_updates(
                         .title(name.clone())
                         .kind(tool_kind(name))
                         .status(ToolCallStatus::InProgress)
-                        .raw_input(serde_json::from_str::<serde_json::Value>(arguments).ok()),
+                        .raw_input(crate::acp::replay::raw_input_from_arguments(arguments)),
                 ));
                 if let Some((content, is_error)) = result {
                     let status = if *is_error {
@@ -983,8 +983,9 @@ fn prompt_text_v2(req: &PromptRequest) -> (String, Vec<ImageContent>) {
 /// Convert client-injected v2 `mcpServers` into coding MCP configs.
 ///
 /// Mirrors the v1 helper in [`crate::acp::mcp::acp_mcp_server_configs`]:
-/// stdio servers (the protocol-baseline transport) are connected; transports
-/// this agent does not advertise (`http`, MCP-over-ACP `acp`, and unknown
+/// stdio servers (the protocol-baseline transport) and HTTP servers (advertised
+/// via `mcp_capabilities.http` in [`agent_capabilities`]) are connected;
+/// transports this agent does not advertise (MCP-over-ACP `acp`, and unknown
 /// `other` transports) are returned in the ignored list for logging.
 fn v2_mcp_server_configs(mcp_servers: &[McpServer]) -> (Vec<McpServerConfig>, Vec<String>) {
     let mut configs = Vec::new();
@@ -1023,7 +1024,31 @@ fn v2_mcp_server_configs(mcp_servers: &[McpServer]) -> (Vec<McpServerConfig>, Ve
                     auto_approve: Vec::new(),
                 });
             }
-            McpServer::Http(h) => ignored.push(h.name.clone()),
+            McpServer::Http(h) => {
+                // Advertised via `mcp_capabilities.http` (see `agent_capabilities`).
+                // Map to the coding MCP HTTP transport; the client supplies the
+                // URL + headers and is the trust boundary (source=Driver). The
+                // ACP `McpServer::Http` shape carries no auth metadata, so `auth`
+                // stays `None` (unauthenticated HTTP endpoint). Kept in lockstep
+                // with the v1 twin in `crate::acp::mcp::acp_mcp_server_configs`.
+                configs.push(McpServerConfig {
+                    name: h.name.clone(),
+                    disabled: false,
+                    config: McpTransportConfig::Http {
+                        url: h.url.clone(),
+                        headers: h
+                            .headers
+                            .iter()
+                            .map(|e| (e.name.clone(), e.value.clone()))
+                            .collect(),
+                        auth: None,
+                        timeout_ms: None,
+                    },
+                    source: McpConfigSource::Driver,
+                    trust: false,
+                    auto_approve: Vec::new(),
+                });
+            }
             // `Acp` (MCP-over-ACP) is feature-gated upstream and this agent
             // does not advertise it; unknown `other` transports keep their raw
             // type discriminator so the client can see what was not connected.
@@ -1078,6 +1103,54 @@ mod tests {
     fn text_content(u: &V2Update) -> String {
         let v = serde_json::to_value(u).unwrap();
         v["content"][0]["text"].as_str().unwrap_or("").to_string()
+    }
+
+    /// v2 advertises `mcp_capabilities.http`, so client-injected HTTP MCP
+    /// servers must be CONNECTED (not silently dropped), staying in lockstep
+    /// with the v1 twin `acp_mcp_server_configs`.
+    #[test]
+    fn v2_mcp_server_configs_connects_stdio_and_http() {
+        use agent_client_protocol::schema::v2::{HttpHeader, McpServerHttp, McpServerStdio};
+        // An unadvertised `Other` transport lands in `ignored`; the untagged
+        // `OtherMcpServer` is non-exhaustive so we materialize it via JSON.
+        let other: McpServer =
+            serde_json::from_value(serde_json::json!({"type": "sse", "name": "events"})).unwrap();
+        let servers = vec![
+            McpServer::Stdio(McpServerStdio::new("fs", "/usr/bin/fs-server")),
+            McpServer::Http(
+                McpServerHttp::new("api", "https://api.example.com/mcp")
+                    .headers(vec![HttpHeader::new("Authorization", "Bearer t")]),
+            ),
+            other,
+        ];
+        let (configs, ignored) = v2_mcp_server_configs(&servers);
+        assert_eq!(
+            configs.len(),
+            2,
+            "stdio (baseline) + advertised http are connected"
+        );
+        assert_eq!(
+            ignored,
+            vec!["sse".to_string()],
+            "only the unadvertised `other` transport is ignored"
+        );
+        let http = configs
+            .iter()
+            .find(|c| c.name == "api")
+            .expect("http server connected");
+        match &http.config {
+            McpTransportConfig::Http { url, headers, auth, .. } => {
+                assert_eq!(url, "https://api.example.com/mcp");
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Bearer t")
+                );
+                assert!(auth.is_none(), "ACP McpServer::Http carries no auth metadata");
+            }
+            other => panic!("expected Http transport, got {other:?}"),
+        }
+        assert_eq!(http.source, McpConfigSource::Driver);
+        assert!(!http.trust, "client-injected server routes through kernel approval");
     }
 
     /// Persist a native session (meta + snapshot + presentation) under a
@@ -1345,6 +1418,57 @@ mod tests {
         assert_eq!(second["toolCallId"], "call-1");
         assert_eq!(second["status"], "completed");
         assert_eq!(second["content"][0]["content"]["text"], "file list");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn replay_pairs_duplicate_tool_call_ids_by_order_not_last_wins() {
+        use crate::acp::replay::{build_replay_entries, ReplayEntry};
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        // Two tool calls that reuse the SAME id (weak/gateway models do this;
+        // an empty id would collide identically). Each has its own result echo.
+        let call_a = atomcode_kernel::tool::ToolCall {
+            id: "dup".into(),
+            name: "bash".into(),
+            arguments: r#"{"cmd":"a"}"#.into(),
+        };
+        let call_b = atomcode_kernel::tool::ToolCall {
+            id: "dup".into(),
+            name: "bash".into(),
+            arguments: r#"{"cmd":"b"}"#.into(),
+        };
+        let assistant = Message::assistant("running", vec![call_a, call_b]);
+        let mut result_a = Message::user("output-A");
+        result_a.tool_call_id = Some("dup".into());
+        let mut result_b = Message::user("output-B");
+        result_b.tool_call_id = Some("dup".into());
+        persist_replay_session(
+            &home,
+            cwd.path(),
+            "sdup",
+            vec![assistant, result_a, result_b],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let entries = build_replay_entries("sdup", cwd.path()).unwrap();
+        let tool_results: Vec<Option<String>> = entries
+            .iter()
+            .filter_map(|e| match e {
+                ReplayEntry::ToolCall { result, .. } => {
+                    Some(result.as_ref().map(|(t, _)| t.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        // The first call must resolve to the first result and the second to the
+        // second — NOT both to the last ("output-B"), which is what a single
+        // last-wins map would produce.
+        assert_eq!(
+            tool_results,
+            vec![Some("output-A".to_string()), Some("output-B".to_string())]
+        );
     }
 
     #[test]

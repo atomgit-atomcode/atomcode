@@ -18,7 +18,7 @@
 //! presentation entries anchored at a pruned/missing turn are dropped
 //! best-effort instead of failing the whole replay.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
 
 use atomcode_capabilities::reminder::is_system_reminder;
@@ -54,6 +54,22 @@ pub enum ReplayEntry {
         /// Recorded result, if one was persisted: `(content, is_error)`.
         result: Option<(String, bool)>,
     },
+}
+
+/// Build the `rawInput` value for a `tool_call` update from a persisted/live
+/// arguments string. Parses as JSON when possible; when the string is not valid
+/// JSON (e.g. truncated or salvaged args from a weak model), the raw string is
+/// passed through as a JSON string value rather than dropped to `null`, so the
+/// client still sees what the tool was called with. An empty/whitespace-only
+/// arguments string yields `None` (no raw input).
+pub fn raw_input_from_arguments(arguments: &str) -> Option<serde_json::Value> {
+    if arguments.trim().is_empty() {
+        return None;
+    }
+    Some(
+        serde_json::from_str::<serde_json::Value>(arguments)
+            .unwrap_or_else(|_| serde_json::Value::String(arguments.to_string())),
+    )
 }
 
 /// Load the persisted native aggregate and project it to a neutral, ordered
@@ -98,13 +114,22 @@ pub fn build_replay_entries(
     }
 
     // Tool results are hidden as standalone conversation entries, but they
-    // carry the recorded outcome of each call. Pair them up front so the
-    // assistant `ToolCall` entries below resolve by `tool_call_id` regardless
-    // of when the result message appears in the snapshot.
-    let mut tool_results: HashMap<&str, (&str, bool)> = HashMap::new();
+    // carry the recorded outcome of each call. Pair them up front, keyed by
+    // `tool_call_id`. Ids are provider-supplied and NOT guaranteed globally
+    // unique within a session — weak/gateway models can reuse an id across
+    // turns or emit an empty id — so results are queued FIFO per id (not a
+    // single value that a later duplicate would overwrite). A linear transcript
+    // records each result right after its call, so popping the front for each
+    // call in conversation order pairs the Nth `id` call with the Nth `id`
+    // result. Without this, two calls sharing an id (or several empty-id calls)
+    // would all resolve to the last result, misattributing tool output.
+    let mut tool_results: HashMap<&str, VecDeque<(&str, bool)>> = HashMap::new();
     for message in &loaded.snapshot.messages {
         if let Some(id) = &message.tool_call_id {
-            tool_results.insert(id.as_str(), (message.text.as_str(), message.is_error));
+            tool_results
+                .entry(id.as_str())
+                .or_default()
+                .push_back((message.text.as_str(), message.is_error));
         }
     }
 
@@ -148,9 +173,13 @@ pub fn build_replay_entries(
                             id: call.id.clone(),
                             name: call.name.clone(),
                             arguments: call.arguments.clone(),
+                            // Consume this id's next result in order, so
+                            // duplicate/empty ids pair by position instead of
+                            // all collapsing onto the last result.
                             result: tool_results
-                                .get(call.id.as_str())
-                                .map(|(text, is_error)| (text.to_string(), *is_error)),
+                                .get_mut(call.id.as_str())
+                                .and_then(|q| q.pop_front())
+                                .map(|(text, is_error)| (text.to_string(), is_error)),
                         });
                     }
                 }
@@ -187,5 +216,32 @@ fn push_presentation_entries(
                 text: entry.text.clone(),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_input_parses_json_and_passes_through_non_json() {
+        // Valid JSON object → parsed structurally.
+        assert_eq!(
+            raw_input_from_arguments(r#"{"cmd":"ls"}"#),
+            Some(serde_json::json!({"cmd": "ls"}))
+        );
+        // Non-JSON (truncated/salvaged weak-model args) → preserved as a string
+        // instead of dropped to null.
+        assert_eq!(
+            raw_input_from_arguments(r#"{"cmd":"ls"#),
+            Some(serde_json::Value::String(r#"{"cmd":"ls"#.to_string()))
+        );
+        assert_eq!(
+            raw_input_from_arguments("not json at all"),
+            Some(serde_json::Value::String("not json at all".to_string()))
+        );
+        // Empty/whitespace → no raw input.
+        assert_eq!(raw_input_from_arguments(""), None);
+        assert_eq!(raw_input_from_arguments("   "), None);
     }
 }

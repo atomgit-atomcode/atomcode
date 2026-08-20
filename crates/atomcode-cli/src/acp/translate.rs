@@ -56,7 +56,7 @@ pub fn event_to_update(ev: &AgentEvent, message_id: Option<&str>) -> Option<Sess
             AcpToolCall::new(ToolCallId::new(call.id.clone()), call.name.clone())
                 .kind(tool_kind(&call.name))
                 .status(ToolCallStatus::InProgress)
-                .raw_input(serde_json::from_str::<serde_json::Value>(&call.arguments).ok()),
+                .raw_input(crate::acp::replay::raw_input_from_arguments(&call.arguments)),
         )),
         AgentEvent::ToolResult { result } => {
             let status = if result.is_error {
