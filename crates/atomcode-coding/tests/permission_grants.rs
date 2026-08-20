@@ -32,6 +32,7 @@ async fn always_allow_grants_survive_reassembly() {
         skill_dirs: Some(vec![project.path().join("skills")]),
         plugin_skill_dirs: Vec::new(),
         mcp: false,
+        extra_mcp_servers: Vec::new(),
         memory: false,
         web: false,
         review: false,

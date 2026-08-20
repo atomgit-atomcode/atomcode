@@ -149,6 +149,13 @@ fn is_wide_emoji_symbol(ch: char) -> bool {
         // badge over-reserve a cell, leaving a stale-glyph residual after ⏸.
         (0x23CF, 0x23CF),
         (0x23E9, 0x23F3),
+        // Circled numbers ①–⑳ (U+2460–U+2473) are East Asian Ambiguous:
+        // `unicode-width` reports 1, but every GUI terminal with a CJK font
+        // paints them as a 2-cell fullwidth glyph. Undercounting by 1 cell
+        // makes the following glyph overwrite the circle's right half (the
+        // `③的` overlap). Widen them, matching the host. The markdown
+        // circled-list synthetic separator stays valid as a visual gap.
+        (0x2460, 0x2473),
         (0x24C2, 0x24C2),
         (0x25AA, 0x25AB),
         (0x25B6, 0x25B6),
@@ -875,6 +882,23 @@ mod tests {
     #[test]
     fn emoji_width_is_two() {
         assert_eq!(display_width("👍"), 2);
+    }
+
+    #[test]
+    fn circled_numbers_are_width_two() {
+        // U+2460–U+2473 (①–⑳) are East Asian Ambiguous: `unicode-width` reports
+        // 1, but GUI terminals with a CJK font paint them as a 2-cell fullwidth
+        // glyph. Undercounting overlaps the following glyph (e.g. `③的`).
+        assert_eq!(cell_char_width('①'), Some(2));
+        assert_eq!(cell_char_width('②'), Some(2));
+        assert_eq!(cell_char_width('③'), Some(2));
+        assert_eq!(cell_char_width('⑩'), Some(2));
+        assert_eq!(cell_char_width('⑳'), Some(2));
+        assert_eq!(display_width("③的"), 4); // 2 + 2
+        assert_eq!(display_width("①②③"), 6); // each 2 cols
+        // Ⓜ stays wide (pre-existing), and a plain ASCII digit stays narrow.
+        assert_eq!(cell_char_width('Ⓜ'), Some(2));
+        assert_eq!(cell_char_width('3'), Some(1));
     }
 
     #[test]

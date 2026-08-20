@@ -8836,6 +8836,7 @@ mod tests {
                 skill_dirs: Some(Vec::new()),
                 plugin_skill_dirs: Vec::new(),
                 mcp: false,
+                extra_mcp_servers: Vec::new(),
                 memory: false,
                 web: false,
                 review: false,

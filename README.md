@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-5.0.7-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-5.0.8-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS%20PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -87,16 +87,16 @@ Automation:
 
 Connect to any LLM that supports OpenAI's function-calling API:
 
-| Provider | Function Calling | Tested Models |
-|----------|:---:|---|
-| Claude (Anthropic) | Yes | Claude Sonnet 4.5/4.6, Opus 4.6 |
-| OpenAI | Yes | GPT-4o, GPT-4.1 |
-| DeepSeek | Yes | DeepSeek V3, DeepSeek R1, DeepSeek V4 |
-| Zhipu (GLM) | Yes | GLM-4, GLM-5, GLM-5.2 |
-| Qwen (Alibaba) | Yes | Qwen-Plus, Qwen-Max |
-| SiliconFlow | Yes | Various open models |
-| Ollama (local) | Partial | Llama 3, Qwen2, etc. |
-| Any OpenAI-compatible API | Yes | — |
+| Provider                  | Function Calling | Tested Models                         |
+| ------------------------- | :--------------: | ------------------------------------- |
+| Claude (Anthropic)        |       Yes        | Claude Sonnet 4.5/4.6, Opus 4.6       |
+| OpenAI                    |       Yes        | GPT-4o, GPT-4.1                       |
+| DeepSeek                  |       Yes        | DeepSeek V3, DeepSeek R1, DeepSeek V4 |
+| Zhipu (GLM)               |       Yes        | GLM-4, GLM-5, GLM-5.2                 |
+| Qwen (Alibaba)            |       Yes        | Qwen-Plus, Qwen-Max                   |
+| SiliconFlow               |       Yes        | Various open models                   |
+| Ollama (local)            |     Partial      | Llama 3, Qwen2, etc.                  |
+| Any OpenAI-compatible API |       Yes        | —                                     |
 
 ### Sessions & Login
 
@@ -152,11 +152,61 @@ See [Permission Model](./docs/security/permission-model.md) for the full design 
 
 ## Installation
 
-### From Source (recommended)
+### Official Installation Script (recommended)
+
+For Windows PowerShell users:
+
+```powershell
+irm https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts/install.ps1 | iex
+```
+
+For Linux / macOS / WSL / MSYS / Git-Bash / HarmonyOS PC users:
+
+```bash
+curl -fsSL https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts/install.sh | sh
+```
+
+Both scripts download the official prebuilt binary for the latest release
+(auto-detected from the AtomGit API), install it, and add it to your `PATH`.
+As official builds they include the request signer, so `/login` can claim the
+free CodingPlan models (see "About the official CodingPlan" below).
+
+Environment variable overrides: `ATOMCODE_VERSION` pins a release tag,
+`ATOMCODE_PREFIX` picks the install directory (see the script headers for
+details).
+
+### From Source
 
 ```bash
 git clone https://atomgit.com/atomgit_atomcode/atomcode.git
 cd atomcode
+```
+
+#### WebUI build (required for the webui feature — runs before the Rust build)
+
+The `atomcode webui` browser UI is embedded into the binary from `webui/dist/`,
+which is gitignored (not committed). The Rust build needs no Node.js toolchain
+and succeeds without it, but a binary built without `webui/dist/` serves
+`webui not built` for every webui page. To get a working webui, build the
+frontend before the Rust build:
+
+```bash
+cd webui
+npm ci
+# for Windows MSYS / Git Bash users, run
+# `PATH="/c/Program Files/nodejs:$PATH" npm run build`
+# to use the system-installed Node.js.
+npm run build    # outputs webui/dist/, embedded by the next Rust build
+cd ..
+```
+
+Skip this step if you don't use the webui. The release scripts build the
+frontend automatically before `cargo build`. After rebuilding the frontend,
+force a daemon recompile so the new bundle is re-embedded (`cargo clean -p
+atomcode-daemon`) — cargo does not track changes under `webui/dist/`. Then
+build and install:
+
+```bash
 cargo install --path crates/atomcode-cli --locked
 ```
 
@@ -168,10 +218,28 @@ in your `PATH`.
 To compile without installing, run:
 
 ```bash
-cargo build --release
+# Builds only the CLI package (`atomcode`) — skips the standalone
+# `atomcode-daemon` binary and other workspace members
+cargo build --release -p atomcode
 ```
 
 and the binary will be generated at `target/release/atomcode`.
+
+### About the official CodingPlan (closed-source signer)
+
+`crates/atomcode-codingplan-crypto/` in this repository is an open-source
+placeholder. The real request-signing implementation is closed-source and is
+only overlaid by the official release pipeline, so a self-built binary cannot
+sign requests to AtomCode's official service. Binaries installed via the
+official installer above (or the package managers below) are official builds
+and include the signer. In practice this means:
+
+- `/login` cannot claim the official **free CodingPlan models** in self-built
+  binaries. Signing is kept closed-source to prevent the free plan from being
+  abused outside official builds.
+- Connecting your **own API providers** is unaffected: any provider configured
+  under `providers.*` in `~/.atomcode/config.toml` (DeepSeek, OpenAI, or any
+  OpenAI-compatible endpoint) works without the signer.
 
 ### Package Managers
 
@@ -212,7 +280,9 @@ input and `Shift+Tab` cycles execution mode.
 ### Requirements
 
 - Rust 1.88+ (for building; older Cargo versions cannot parse the current lockfile)
-- An API key from any supported provider (or an AtomGit account for `/login`)
+- An API key from any supported provider (or an AtomGit account for `/login`;
+  the free CodingPlan models require an official build — see "About the official
+  CodingPlan" above)
 
 ### Permissions — don't run with `sudo`
 
@@ -364,6 +434,7 @@ Then just type what you want:
 | `Ctrl+V / Ctrl+Alt+V` | Paste text or image from clipboard (Windows can also use `/paste`) |
 
 > **Terminal compatibility for newline chords:**
+>
 > - `Shift+Enter` and `Ctrl+Enter` need a terminal that speaks the Kitty keyboard protocol — kitty, WezTerm, Alacritty, iTerm2 ≥3.5, Windows Terminal ≥1.21. Older terminals (and Windows, where atomcode doesn't enable the protocol) collapse them to plain `Enter` (which sends the message) — use `\` + `Enter`, which works everywhere.
 > - AtomCode enables the Kitty keyboard protocol only for known-compatible terminals. Generic web terminals such as JumpServer use legacy key reporting by default. Set `ATOMCODE_KITTY=1` to force it on or `ATOMCODE_KITTY=0` to force it off.
 > - `Alt+Enter` works at the byte level on most terminals, but **Windows Terminal binds it to "toggle full screen" by default** — remove that binding under Settings → Actions to free it up.
@@ -371,6 +442,7 @@ Then just type what you want:
 
 > **Pasting images on Windows:**
 > Windows Terminal and conhost bind `Ctrl+V` to their own `paste` action, which only forwards `CF_UNICODETEXT` from the clipboard — an image-only clipboard sends nothing, so the in-app `Ctrl+V` handler never fires. Two ways out:
+>
 > 1. Use **`/paste`** — the slash command pulls the clipboard image and attaches it as `[Image #N]`. Works in every terminal, including Windows Terminal, PowerShell 7, conhost, and git bash. The TUI's bottom-right hint on Windows says `Image in clipboard · /paste` automatically.
 > 2. If you want `Ctrl+V` muscle memory: open Windows Terminal `settings.json` (`Ctrl+,` → "Open JSON file") and either delete the `{ "command": "paste", "keys": "ctrl+v" }` entry under `"actions"`, or rebind it to `ctrl+shift+v`. After a restart, `Ctrl+V` passes through to atomcode.
 >
@@ -378,15 +450,15 @@ Then just type what you want:
 
 ### Navigation
 
-| Key | Action |
-|-----|--------|
-| `Shift+Up/Down` | Scroll chat one line |
-| `PageUp/PageDown` | Scroll chat 10 lines |
-| `Alt+Up/Down` | Jump to previous / next message |
-| `Ctrl+Up/Down` | Jump to previous / next user message |
-| Empty input + `Home/End` | Jump to top / bottom of conversation |
-| `Ctrl+Shift+C` | Copy selection |
-| `Ctrl+C` | Cancel operation (double-tap to exit) |
+| Key                      | Action                                |
+| ------------------------ | ------------------------------------- |
+| `Shift+Up/Down`          | Scroll chat one line                  |
+| `PageUp/PageDown`        | Scroll chat 10 lines                  |
+| `Alt+Up/Down`            | Jump to previous / next message       |
+| `Ctrl+Up/Down`           | Jump to previous / next user message  |
+| Empty input + `Home/End` | Jump to top / bottom of conversation  |
+| `Ctrl+Shift+C`           | Copy selection                        |
+| `Ctrl+C`                 | Cancel operation (double-tap to exit) |
 
 ### Slash Commands
 
@@ -394,70 +466,70 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 
 **Sessions & workspace**
 
-| Command | Action |
-|---------|--------|
-| `/resume` | Resume or switch session |
-| `/session` | Start a new session |
-| `/rename <name>` | Rename the current session |
-| `/clear` | Start a new conversation (clears context + screen) |
-| `/bg` | Background current session; subcommands: `/bg list`, `/bg <N>`, `/bg drop <N>`, `/bg help` |
-| `/background <task>` | Compatibility alias: start a one-shot task in a `/bg` slot |
-| `/cd` | Change working directory and start a new session |
-| `/worktree` | Git worktree isolation (`create` / `list` / `done` / `cleanup`) |
-| `/webui` | Launch the browser webui (subcommands: `stop`, `lan`, `--host <addr>`) |
-| `/sync` | Attach to the live webui session (`/sync off` to detach) |
+| Command              | Action                                                                                     |
+| -------------------- | ------------------------------------------------------------------------------------------ |
+| `/resume`            | Resume or switch session                                                                   |
+| `/session`           | Start a new session                                                                        |
+| `/rename <name>`     | Rename the current session                                                                 |
+| `/clear`             | Start a new conversation (clears context + screen)                                         |
+| `/bg`                | Background current session; subcommands: `/bg list`, `/bg <N>`, `/bg drop <N>`, `/bg help` |
+| `/background <task>` | Compatibility alias: start a one-shot task in a `/bg` slot                                 |
+| `/cd`                | Change working directory and start a new session                                           |
+| `/worktree`          | Git worktree isolation (`create` / `list` / `done` / `cleanup`)                            |
+| `/webui`             | Launch the browser webui (subcommands: `stop`, `lan`, `--host <addr>`)                     |
+| `/sync`              | Attach to the live webui session (`/sync off` to detach)                                   |
 
 **Modes, autonomy & review**
 
-| Command | Action |
-|---------|--------|
-| `/plan` | Switch to Plan mode (read-only exploration) |
-| `/build` | Switch to Build mode (full execution) |
-| `/goal <text>` | Set a completion goal — the agent loops autonomously until it's met |
-| `/review` | Code review the current changes (`/review` · `/review staged` · `/review <base>`) |
-| `/think` | Control extended thinking (on / off / budget N) |
-| `/effort` | DeepSeek reasoning effort control (high / max / off) |
+| Command        | Action                                                                            |
+| -------------- | --------------------------------------------------------------------------------- |
+| `/plan`        | Switch to Plan mode (read-only exploration)                                       |
+| `/build`       | Switch to Build mode (full execution)                                             |
+| `/goal <text>` | Set a completion goal — the agent loops autonomously until it's met               |
+| `/review`      | Code review the current changes (`/review` · `/review staged` · `/review <base>`) |
+| `/think`       | Control extended thinking (on / off / budget N)                                   |
+| `/effort`      | DeepSeek reasoning effort control (high / max / off)                              |
 
 **Providers & account**
 
-| Command | Action |
-|---------|--------|
-| `/model` | Switch model / provider |
-| `/provider` | Manage providers (add / edit / delete) |
-| `/proxy` | Switch outbound proxy mode |
-| `/login` | Sign in with AtomGit OAuth and claim CodingPlan free models |
-| `/logout` | Sign out of AtomGit |
-| `/whoami` | Show the current logged-in user |
-| `/status` | Show login status and model info |
+| Command     | Action                                                      |
+| ----------- | ----------------------------------------------------------- |
+| `/model`    | Switch model / provider                                     |
+| `/provider` | Manage providers (add / edit / delete)                      |
+| `/proxy`    | Switch outbound proxy mode                                  |
+| `/login`    | Sign in with AtomGit OAuth and claim CodingPlan free models |
+| `/logout`   | Sign out of AtomGit                                         |
+| `/whoami`   | Show the current logged-in user                             |
+| `/status`   | Show login status and model info                            |
 
 **Files, edits & context**
 
-| Command | Action |
-|---------|--------|
-| `/diff` | Show git diff of current changes |
-| `/undo` | Undo a turn's file edits (`/undo` or `/undo N`) |
-| `/view <filepath>` | View file content in an overlay modal |
-| `/paste` | Attach an image from the clipboard (Windows fallback for Ctrl+V) |
-| `/copy` | Copy a code block from the last reply (`/copy`, `/copy N`, `/copy all`) |
-| `/cost` | Show token usage for this session |
-| `/context` | Show the context budget breakdown |
-| `/compact` | Compact conversation history |
+| Command            | Action                                                                  |
+| ------------------ | ----------------------------------------------------------------------- |
+| `/diff`            | Show git diff of current changes                                        |
+| `/undo`            | Undo a turn's file edits (`/undo` or `/undo N`)                         |
+| `/view <filepath>` | View file content in an overlay modal                                   |
+| `/paste`           | Attach an image from the clipboard (Windows fallback for Ctrl+V)        |
+| `/copy`            | Copy a code block from the last reply (`/copy`, `/copy N`, `/copy all`) |
+| `/cost`            | Show token usage for this session                                       |
+| `/context`         | Show the context budget breakdown                                       |
+| `/compact`         | Compact conversation history                                            |
 
 **Memory**
 
-| Command | Action |
-|---------|--------|
+| Command            | Action                                              |
+| ------------------ | --------------------------------------------------- |
 | `/remember <fact>` | Save a fact to memory (`--global` for all projects) |
-| `/forget <query>` | Remove matching memories |
-| `/memory` | Show all saved memories |
+| `/forget <query>`  | Remove matching memories                            |
+| `/memory`          | Show all saved memories                             |
 
 **Extensions**
 
-| Command | Action |
-|---------|--------|
-| `/mcp` | MCP server status (subcommands: `reload`, `tools`, `login`, `logout`) |
+| Command   | Action                                                                |
+| --------- | --------------------------------------------------------------------- |
+| `/mcp`    | MCP server status (subcommands: `reload`, `tools`, `login`, `logout`) |
 | `/plugin` | Plugin marketplace (`marketplace` / `install` / `uninstall` / `list`) |
-| `/skills` | Browse loaded skills |
+| `/skills` | Browse loaded skills                                                  |
 
 **Project & system**
 
@@ -493,11 +565,11 @@ Beyond built-ins and plugin commands, you can define your own slash commands as 
 
 **Locations** (lowest to highest priority):
 
-| Location | Scope |
-|---------|-------|
-| `$ATOMCODE_HOME/commands/` (default `~/.atomcode/commands/`) | Global — applies to every project |
-| `<project>/.atomcode/commands/` | Project-level — overrides same-named global commands |
-| `plugins/<name>/commands/` | Plugin-contributed — installed via `/plugin install` |
+| Location                                                     | Scope                                                |
+| ------------------------------------------------------------ | ---------------------------------------------------- |
+| `$ATOMCODE_HOME/commands/` (default `~/.atomcode/commands/`) | Global — applies to every project                    |
+| `<project>/.atomcode/commands/`                              | Project-level — overrides same-named global commands |
+| `plugins/<name>/commands/`                                   | Plugin-contributed — installed via `/plugin install` |
 
 **File format:**
 
@@ -519,11 +591,11 @@ Cover: function signature & parameters, core business logic, data flow & side ef
 - **`description`** — Optional. Shown in Tab completion.
 - **`args`** — Optional. Controls argument expectation and UX:
 
-  | Value | Menu Enter | Empty-arg submit |
-  |-------|-----------|------------------|
-  | `none` (default) | Execute immediately | Accepted (substitutes `""`) |
-  | `optional` | Complete to `/name `, wait for input | Accepted |
-  | `required` | Complete to `/name `, wait for input | Rejected with error message |
+  | Value            | Menu Enter                           | Empty-arg submit            |
+  | ---------------- | ------------------------------------ | --------------------------- |
+  | `none` (default) | Execute immediately                  | Accepted (substitutes `""`) |
+  | `optional`       | Complete to `/name `, wait for input | Accepted                    |
+  | `required`       | Complete to `/name `, wait for input | Rejected with error message |
 
   The template variable `$ARGUMENTS` / `${ARGUMENTS}` is always replaced with whatever the user types after the command name (empty string if nothing is typed).
 
@@ -697,13 +769,13 @@ Contributions are welcome! AtomCode is in active development.
 
 ### Branch Naming
 
-| Prefix | Purpose |
-|--------|---------|
-| `feat/` | New feature |
-| `fix/` | Bug fix |
+| Prefix      | Purpose                               |
+| ----------- | ------------------------------------- |
+| `feat/`     | New feature                           |
+| `fix/`      | Bug fix                               |
 | `refactor/` | Code refactoring (no behavior change) |
-| `docs/` | Documentation only |
-| `chore/` | Build, CI, tooling changes |
+| `docs/`     | Documentation only                    |
+| `chore/`    | Build, CI, tooling changes            |
 
 ### Guidelines
 
@@ -736,6 +808,7 @@ Don't know Rust? No problem! There are many ways to contribute without writing R
 Every contribution, code or not, makes AtomCode better for everyone. When in doubt, open an Issue or start a Discussion!
 
 ## Community
+
 ---
 
 Scan the QR code below with WeChat to join the AtomCode community group — share feedback, report issues, and talk to other users and maintainers:
@@ -745,6 +818,7 @@ Scan the QR code below with WeChat to join the AtomCode community group — shar
 </p>
 
 ## Donate
+
 ---
 
 ☕ AtomCode is free, and the Coding Plan is free too. If it's saved you a bit of time, consider buying the author a coffee — it keeps us motivated to keep making it better.

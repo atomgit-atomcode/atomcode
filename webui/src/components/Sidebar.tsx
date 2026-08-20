@@ -24,6 +24,10 @@ interface SidebarProps {
   activeSessionId: string | null;
   onSelect: (session: SessionMetaWithProject) => void;
   onNew: () => void;
+  /** Start a new session in a SPECIFIC project's working directory (the per-row
+   *  `+` in the workspace tree). Wired to the same "switch cwd + open" path as
+   *  the project switcher. */
+  onNewInProject?: (workingDir: string) => void;
   /** Open a specific settings dialog (theme / language / model). */
   onOpenSettings: (section: SettingsSection) => void;
   /** Mobile drawer open state */
@@ -315,6 +319,7 @@ export function Sidebar({
   activeSessionId,
   onSelect,
   onNew,
+  onNewInProject,
   onOpenSettings,
   open,
   collapsed,
@@ -449,7 +454,15 @@ export function Sidebar({
       if (epoch !== loadEpochRef.current || projectRequestRef.current.get(hash) !== request) return;
       setFailedProjects((current) => new Set(current).add(hash));
     } finally {
-      if (epoch === loadEpochRef.current && projectRequestRef.current.get(hash) === request) {
+      // Clear THIS load's spinner whenever it is still the latest request for
+      // the hash — even if a newer `loadSessions` bumped the epoch. The epoch
+      // bump correctly orphans the DATA write above (stale sessions must not
+      // overwrite a re-scoped view), but gating the spinner-clear on it too
+      // left a permanent "加载中" zombie on any bucket whose expand got
+      // superseded by a reload (the reported stuck-loading rows). A newer
+      // request for the SAME hash still supersedes this cleanup (it owns the
+      // spinner), so only the genuinely-latest request clears it.
+      if (projectRequestRef.current.get(hash) === request) {
         setLoadingProjects((current) => {
           const next = new Set(current);
           next.delete(hash);
@@ -1445,7 +1458,18 @@ export function Sidebar({
                 >
                   <span class="sidebar-project-icon"><FolderIcon /></span>
                   <span class="sidebar-project-name">{project.name || dirName(project.working_dir)}</span>
-                  <span class="sidebar-project-count">{project.session_count}</span>
+                  <span class="sidebar-project-count">({project.session_count})</span>
+                </button>
+                <button
+                  class="sidebar-project-new"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onNewInProject?.(project.working_dir);
+                  }}
+                  title={t('sidebar.newInProject')}
+                  aria-label={t('sidebar.newInProject')}
+                >
+                  <PlusIcon />
                 </button>
               </div>
               {expanded && (

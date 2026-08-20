@@ -7,5 +7,6 @@ fn serve_stdio_symbol_exists() {
         engine: None,
         provider_factory: None,
         auto_approve: false,
+        ..Default::default()
     };
 }

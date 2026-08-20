@@ -1809,7 +1809,9 @@ mod tests {
         assert!(screen.contains("┌─"), "top border missing: {screen}");
         assert!(screen.contains("└─"), "bottom border missing: {screen}");
         // Brand title, step header, key copy.
-        assert!(screen.contains("AtomCode"));
+        // Brand name is the settled `{brand}` (or "AtomCode" default) — never
+        // the raw placeholder token.
+        assert!(!screen.contains("{brand}"), "leaked placeholder: {screen}");
         assert!(screen.contains("Step 1/3 · Welcome"));
         assert!(screen.contains("Press Enter to continue"));
     }
@@ -1928,7 +1930,7 @@ mod tests {
         assert!(joined.contains("按 Enter 继续"));
         assert!(joined.contains("Ctrl+C 可随时退出"));
         // Brand title stays English on purpose.
-        assert!(joined.contains("AtomCode"));
+        assert!(!joined.contains("{brand}"), "leaked placeholder: {joined}");
     }
 
     // ── ASCII fallback (Windows legacy conhost / LANG=C / TERM=dumb) ──

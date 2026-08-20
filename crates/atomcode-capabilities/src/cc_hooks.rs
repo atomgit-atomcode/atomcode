@@ -9,7 +9,8 @@
 //!
 //! ONE [`CCExternalHooks`] instance implements BOTH traits — register it as a
 //! lifecycle hook AND as a tool middleware (it carries the same loaded config):
-//! - [`LifecycleHooks`]: `session_start` / `session_end` / `user_prompt_submit`
+//! - [`LifecycleHooks`]: `session_start` / `session_end` / `user_prompt_submit`,
+//!   plus `turn_complete` (mapped to the CC `Stop` / `StopFailure` terminal events)
 //! - [`ToolMiddleware`]: `before` (PreToolUse) / `after` (PostToolUse)
 //!
 //! SCOPE (M2a): user (`$ATOMCODE_HOME/hooks.json`) + project (`<root>/.hooks.json`).
@@ -35,7 +36,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 
-use atomcode_kernel::hook::LifecycleHooks;
+use atomcode_kernel::event::StopReason;
+use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::Conversation;
 use atomcode_kernel::middleware::{AfterOutcome, BeforeOutcome, ToolMiddleware};
 use atomcode_kernel::request::RequestCtx;
@@ -47,14 +49,22 @@ use crate::tools::{request_approval_decision, PermissionDecision, APPROVAL_KIND}
 
 /// The lifecycle events this port surfaces. A subset of CC's full surface — the
 /// high-value events real plugins use. (PreCompact / subagent / batch etc. need
-/// new kernel seams and are out of scope here.)
+/// new kernel seams and are out of scope here.) `Stop` / `StopFailure` cover the
+/// turn-terminal pair: every turn end fires EXACTLY ONE of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEvent {
     PreToolUse,
     PostToolUse,
+    /// Fired when a tool call FAILS (`ToolResult.is_error`), so a plugin can tell
+    /// "tool succeeded" (`PostToolUse`) apart from "tool failed" (`PostToolUseFailure`).
+    PostToolUseFailure,
     SessionStart,
     SessionEnd,
     UserPromptSubmit,
+    /// Turn ended (normal stop, safety fuses, user cancel, rate-limit pause).
+    Stop,
+    /// Turn ended because of an API/provider failure (`ProviderError` / `Timeout`).
+    StopFailure,
 }
 
 impl HookEvent {
@@ -65,9 +75,12 @@ impl HookEvent {
         Some(match name {
             "PreToolUse" | "pre_tool_use" => HookEvent::PreToolUse,
             "PostToolUse" | "post_tool_use" => HookEvent::PostToolUse,
+            "PostToolUseFailure" | "post_tool_use_failure" => HookEvent::PostToolUseFailure,
             "SessionStart" | "session_start" => HookEvent::SessionStart,
             "SessionEnd" | "session_end" => HookEvent::SessionEnd,
             "UserPromptSubmit" | "user_prompt_submit" => HookEvent::UserPromptSubmit,
+            "Stop" | "stop" => HookEvent::Stop,
+            "StopFailure" | "stop_failure" => HookEvent::StopFailure,
             _ => return None,
         })
     }
@@ -77,9 +90,12 @@ impl HookEvent {
         match self {
             HookEvent::PreToolUse => "PreToolUse",
             HookEvent::PostToolUse => "PostToolUse",
+            HookEvent::PostToolUseFailure => "PostToolUseFailure",
             HookEvent::SessionStart => "SessionStart",
             HookEvent::SessionEnd => "SessionEnd",
             HookEvent::UserPromptSubmit => "UserPromptSubmit",
+            HookEvent::Stop => "Stop",
+            HookEvent::StopFailure => "StopFailure",
         }
     }
 }
@@ -88,7 +104,7 @@ impl HookEvent {
 #[derive(Debug, Clone)]
 pub struct HookConfig {
     pub event: HookEvent,
-    /// Tool-name matcher (`PreToolUse`/`PostToolUse` only). `None`/`"*"` = all;
+    /// Tool-name matcher (`PreToolUse`/`PostToolUse`/`PostToolUseFailure`). `None`/`"*"` = all;
     /// `"foo_*"` = prefix; otherwise exact.
     pub matcher: Option<String>,
     pub command: String,
@@ -462,24 +478,33 @@ pub struct CCExternalHooks {
     /// CC `session_id` stamped into every payload. Empty when the agent has no
     /// persistent session (the driver supplies it via [`with_session_id`]).
     session_id: String,
-    /// Whether any PostToolUse hook is configured — gates the call→tool bookkeeping
-    /// below so the (common) no-PostToolUse path allocates nothing.
+    /// CC `transcript_path` — the session's append-only JSONL transcript file,
+    /// when the driver persists one. `None` for one-shot runs (the Stop /
+    /// StopFailure payload then carries `null`).
+    transcript_path: Option<String>,
+    /// Whether any PostToolUse / PostToolUseFailure hook is configured — gates the
+    /// call→tool bookkeeping below so the (common) no-PostToolUse path allocates
+    /// nothing.
     has_post_tool_hooks: bool,
-    /// `tool_call_id → tool_name`, populated by `before` so PostToolUse `after` (which
-    /// the kernel does not hand a tool name) can honor tool-name matchers. An entry is
-    /// recorded only for a call that will RUN (gate ≠ Deny) and removed by `after`, so
-    /// the map never outlives a turn's in-flight calls.
+    /// `tool_call_id → tool_name`, populated by `before` so PostToolUse /
+    /// PostToolUseFailure `after` (which the kernel does not hand a tool name) can
+    /// honor tool-name matchers. An entry is recorded only for a call that will RUN
+    /// (gate ≠ Deny) and removed by `after`, so the map never outlives a turn's
+    /// in-flight calls.
     call_tools: Mutex<HashMap<String, String>>,
 }
 
 impl CCExternalHooks {
     /// Build from an explicit hook list (used by tests + a future plugin source).
     pub fn new(hooks: Vec<HookConfig>, cwd: impl Into<String>) -> Self {
-        let has_post_tool_hooks = hooks.iter().any(|h| h.event == HookEvent::PostToolUse);
+        let has_post_tool_hooks = hooks.iter().any(|h| {
+            matches!(h.event, HookEvent::PostToolUse | HookEvent::PostToolUseFailure)
+        });
         Self {
             hooks,
             cwd: cwd.into(),
             session_id: String::new(),
+            transcript_path: None,
             has_post_tool_hooks,
             call_tools: Mutex::new(HashMap::new()),
         }
@@ -512,6 +537,14 @@ impl CCExternalHooks {
         self
     }
 
+    /// Stamp the CC `transcript_path` (the session's append-only JSONL transcript,
+    /// resolved by the driver). Builder-style; leave unset for one-shot runs — the
+    /// Stop / StopFailure payload then carries `null`.
+    pub fn with_transcript_path(mut self, path: impl Into<String>) -> Self {
+        self.transcript_path = Some(path.into());
+        self
+    }
+
     /// True when no hooks are configured — callers skip registration so the
     /// common no-hooks path adds zero overhead.
     pub fn is_empty(&self) -> bool {
@@ -526,6 +559,17 @@ impl CCExternalHooks {
             })
             .collect()
     }
+}
+
+/// CC `StopFailure` fires when a turn ends BECAUSE of an API/provider failure;
+/// every other terminal (normal stop, safety fuses, user cancel, rate-limit
+/// pause) is a plain `Stop`. ProviderError + Timeout are the "API 出错" terminals
+/// the issue asks to surface. Tool errors mid-turn NEVER map here — the kernel
+/// routes those to `on_error` and the turn continues (it ends with a real
+/// terminal reason instead), so a failed tool call must not light the failure
+/// lamp for a turn that then completes normally.
+fn stop_is_failure(reason: &StopReason) -> bool {
+    matches!(reason, StopReason::ProviderError | StopReason::Timeout)
 }
 
 /// PostToolUse matcher resolution: when we know the tool name (the usual case — `before`
@@ -647,6 +691,39 @@ impl LifecycleHooks for CCExternalHooks {
         .to_string();
         // Observation only — fire all matching hooks concurrently and ignore output.
         let matched = self.matching(HookEvent::SessionEnd, None);
+        futures::future::join_all(matched.iter().map(|h| run_command_hook(h, &payload))).await;
+    }
+
+    /// CC's turn-terminal pair: EVERY turn end fires EXACTLY ONE of `Stop` /
+    /// `StopFailure`. The kernel funnels every terminal (normal stop, safety
+    /// fuses, provider error, stream timeout, cancel) through this single hook,
+    /// so a plugin sees the turn's true outcome — never a stale or missing event.
+    /// `StopFailure` (the "API 出错" signal) is reserved for a turn that ended
+    /// BECAUSE of a provider/stream failure; everything else is a plain `Stop`.
+    /// The payload also carries the kernel `stop_reason` so a plugin can refine
+    /// (e.g. tell a user cancel from a fuse trip) without parsing anything else.
+    async fn turn_complete(&self, _convo: &Conversation, reason: &StopReason, _ctx: &TurnCtx) {
+        let event = if stop_is_failure(reason) {
+            HookEvent::StopFailure
+        } else {
+            HookEvent::Stop
+        };
+        let matched = self.matching(event, None);
+        // CC parity: `stop_hook_active` tells a terminal hook whether ANOTHER
+        // Stop/StopFailure hook is configured and will fire alongside it — the
+        // recursion-suppression flag CC hooks use (a Stop hook that triggers a
+        // new prompt checks it to avoid re-entering itself).
+        let stop_hook_active = matched.len() > 1;
+        let payload = serde_json::json!({
+            "session_id": self.session_id,
+            "transcript_path": self.transcript_path,
+            "hook_event_name": event.cc_name(),
+            "stop_hook_active": stop_hook_active,
+            "stop_reason": format!("{reason:?}"),
+            "cwd": self.cwd,
+        })
+        .to_string();
+        // Observation only — fire all matching hooks concurrently and ignore output.
         futures::future::join_all(matched.iter().map(|h| run_command_hook(h, &payload))).await;
     }
 }
@@ -778,9 +855,10 @@ impl ToolMiddleware for CCExternalHooks {
         if matches!(gate, BeforeOutcome::Ask { .. }) {
             gate = self.resolve_ask(call, rt).await;
         }
-        // Remember this call's tool name for PostToolUse `after` (kernel hands it no tool
-        // name), but ONLY for a call that will actually run — a Deny here means the tool is
-        // blocked, so its PostToolUse must not fire. `after` removes the entry.
+        // Remember this call's tool name for PostToolUse / PostToolUseFailure `after`
+        // (kernel hands it no tool name), but ONLY for a call that will actually run — a
+        // Deny here means the tool is blocked, so its post-tool hook must not fire.
+        // `after` removes the entry.
         if self.has_post_tool_hooks && !gate.is_deny() {
             if let Ok(mut m) = self.call_tools.lock() {
                 m.insert(call.id.clone(), call.name.clone());
@@ -791,27 +869,36 @@ impl ToolMiddleware for CCExternalHooks {
 
     async fn after(&self, result: &mut ToolResult) -> AfterOutcome {
         // Recover the tool name `before` stashed for this call_id (kernel doesn't thread
-        // it into `after`), so PostToolUse tool-name matchers are honored. Absent ⇒ the
-        // call never ran our `before` (e.g. denied earlier) ⇒ only all-tools hooks fire.
+        // it into `after`), so PostToolUse / PostToolUseFailure tool-name matchers are
+        // honored. Absent ⇒ the call never ran our `before` (e.g. denied earlier) ⇒ only
+        // all-tools hooks fire.
         let tool_name = self
             .call_tools
             .lock()
             .ok()
             .and_then(|mut m| m.remove(&result.call_id));
+        // A failed tool call (`is_error`) fires PostToolUseFailure instead of
+        // PostToolUse, so a plugin can branch on success vs failure — but the payload
+        // and the rewrite/block semantics stay identical for both.
+        let event = if result.is_error {
+            HookEvent::PostToolUseFailure
+        } else {
+            HookEvent::PostToolUse
+        };
         let payload = serde_json::json!({
             "session_id": self.session_id,
-            "hook_event_name": HookEvent::PostToolUse.cc_name(),
+            "hook_event_name": event.cc_name(),
             "tool_name": tool_name,
             "tool_response": result.content,
             "cwd": self.cwd,
         })
         .to_string();
         // SEQUENTIAL so the last `updatedToolOutput` rewrite of `result.content` wins
-        // deterministically (the per-tool path typically has 0-1 PostToolUse hooks, so
-        // there is little to gain from the session_*-style concurrency here).
+        // deterministically (the per-tool path typically has 0-1 hooks, so there is
+        // little to gain from the session_*-style concurrency here).
         let mut outcome = AfterOutcome::Proceed;
         for hook in self.hooks.iter().filter(|h| {
-            h.event == HookEvent::PostToolUse && post_tool_matches(&h.matcher, tool_name.as_deref())
+            h.event == event && post_tool_matches(&h.matcher, tool_name.as_deref())
         }) {
             let Some((_code, stdout, _stderr)) = run_command_hook(hook, &payload).await else {
                 continue;
@@ -831,7 +918,7 @@ impl ToolMiddleware for CCExternalHooks {
                         reason: d
                             .reason
                             .clone()
-                            .unwrap_or_else(|| "blocked by PostToolUse hook".into()),
+                            .unwrap_or_else(|| "blocked by hook".into()),
                     };
                 }
             }
@@ -874,7 +961,18 @@ mod tests {
             HookEvent::parse("UserPromptSubmit"),
             Some(HookEvent::UserPromptSubmit)
         );
+        assert_eq!(HookEvent::parse("Stop"), Some(HookEvent::Stop));
+        assert_eq!(HookEvent::parse("stop"), Some(HookEvent::Stop));
+        assert_eq!(
+            HookEvent::parse("StopFailure"),
+            Some(HookEvent::StopFailure)
+        );
+        assert_eq!(
+            HookEvent::parse("stop_failure"),
+            Some(HookEvent::StopFailure)
+        );
         assert_eq!(HookEvent::parse("nonsense"), None);
+        assert_eq!(HookEvent::parse("SubagentStop"), None);
     }
 
     #[test]
@@ -931,10 +1029,174 @@ mod tests {
         assert_eq!(h2.event, HookEvent::PostToolUse);
         assert_eq!(h2.timeout_ms, 10_000);
 
+        // Stop / StopFailure are supported plugin hook events (both spellings).
+        let h3 = HookConfig::from_plugin_spec("Stop", None, "x".into(), None, "/p".into()).unwrap();
+        assert_eq!(h3.event, HookEvent::Stop);
+        let h4 = HookConfig::from_plugin_spec("stop_failure", None, "x".into(), None, "/p".into())
+            .unwrap();
+        assert_eq!(h4.event, HookEvent::StopFailure);
+
         // Unsupported event → None (caller skips it).
         assert!(
             HookConfig::from_plugin_spec("PreCompact", None, "x".into(), None, "/p".into())
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn stop_vs_stop_failure_terminal_mapping() {
+        // API/provider failure terminals → StopFailure ("API 出错" lamp).
+        assert!(stop_is_failure(&StopReason::ProviderError));
+        assert!(stop_is_failure(&StopReason::Timeout));
+        // Every other terminal → plain Stop.
+        for reason in [
+            StopReason::Stopped,
+            StopReason::MaxRounds,
+            StopReason::MaxContinuations,
+            StopReason::RepeatLoop,
+            StopReason::ToolLoopDetected,
+            StopReason::Cancelled,
+            StopReason::PromptRejected,
+            StopReason::PolicyDenied,
+            StopReason::RateLimited,
+        ] {
+            assert!(!stop_is_failure(&reason), "{reason:?} must map to Stop");
+        }
+    }
+
+    /// End-to-end: `turn_complete` dispatches EXACTLY ONE terminal event — `Stop`
+    /// on a normal stop, `StopFailure` on an API/provider failure. Each hook greps
+    /// its own stdin for its `hook_event_name` and touches a marker file when it
+    /// fires, so we observe which subscriber ran.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn turn_complete_dispatches_stop_vs_stop_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().replace('\'', "'\\''");
+        let stop_marker = dir.path().join("stop-fired");
+        let failure_marker = dir.path().join("failure-fired");
+        let stop_marker_s = stop_marker.to_string_lossy().replace('\'', "'\\''");
+        let failure_marker_s = failure_marker.to_string_lossy().replace('\'', "'\\''");
+        let hook = |event: HookEvent, marker: &str, name: &str| HookConfig {
+            event,
+            matcher: None,
+            command: format!(
+                "cd '{cwd}' && grep -q '\"hook_event_name\":\"{name}\"' && touch '{marker}'"
+            ),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        let cc = CCExternalHooks::new(
+            vec![
+                hook(HookEvent::Stop, &stop_marker_s, "Stop"),
+                hook(HookEvent::StopFailure, &failure_marker_s, "StopFailure"),
+            ],
+            "/tmp",
+        );
+        let ctx = TurnCtx {
+            session_id: None,
+            turn_id: 1,
+            request_id: 1,
+            round: 1,
+            max_rounds: None,
+            cache_epoch: 0,
+            context_window: 0,
+            used_tokens: 0,
+        };
+        let convo = Conversation::new();
+
+        // Normal terminal → ONLY the Stop hook fires.
+        cc.turn_complete(&convo, &StopReason::Stopped, &ctx).await;
+        assert!(stop_marker.exists(), "Stop hook must fire on a normal stop");
+        assert!(
+            !failure_marker.exists(),
+            "StopFailure must NOT fire on a normal stop"
+        );
+
+        // Provider-error terminal → ONLY the StopFailure hook fires.
+        let _ = std::fs::remove_file(&stop_marker);
+        cc.turn_complete(&convo, &StopReason::ProviderError, &ctx)
+            .await;
+        assert!(
+            failure_marker.exists(),
+            "StopFailure hook must fire on a provider error"
+        );
+        assert!(
+            !stop_marker.exists(),
+            "Stop must NOT fire on a provider error"
+        );
+    }
+
+    /// CC Stop/StopFailure payload parity: the payload carries the driver-resolved
+    /// `transcript_path`, and `stop_hook_active` tells a terminal hook whether ANOTHER
+    /// terminal hook is configured and fires alongside it (the recursion-suppression
+    /// flag CC hooks use).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn turn_complete_payload_alignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().replace('\'', "'\\''");
+        let transcript = dir.path().join("session.jsonl");
+        let transcript_s = transcript.to_string_lossy().replace('\'', "'\\''");
+        let marker = |name: &str| {
+            let p = dir.path().join(name);
+            (p.clone(), p.to_string_lossy().replace('\'', "'\\''"))
+        };
+        let ctx = TurnCtx {
+            session_id: None,
+            turn_id: 1,
+            request_id: 1,
+            round: 1,
+            max_rounds: None,
+            cache_epoch: 0,
+            context_window: 0,
+            used_tokens: 0,
+        };
+        let convo = Conversation::new();
+
+        // 1) A lone terminal hook sees the transcript path AND `stop_hook_active:false`.
+        let (m1, m1_s) = marker("payload-ok");
+        let single = HookConfig {
+            event: HookEvent::Stop,
+            matcher: None,
+            command: format!(
+                "cd '{cwd}' && grep -q '\"transcript_path\":\"{transcript_s}\"' \
+                 && grep -q '\"stop_hook_active\":false' && touch '{m1_s}'"
+            ),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        CCExternalHooks::new(vec![single], "/tmp")
+            .with_transcript_path(transcript_s.clone())
+            .turn_complete(&convo, &StopReason::Stopped, &ctx)
+            .await;
+        assert!(
+            m1.exists(),
+            "payload must carry transcript_path + stop_hook_active:false"
+        );
+
+        // 2) TWO terminal hooks: BOTH see `stop_hook_active:true` (recursion flag).
+        let (m_a, m_a_s) = marker("a-ok");
+        let (m_b, m_b_s) = marker("b-ok");
+        let hook = |marker_s: &str| HookConfig {
+            event: HookEvent::Stop,
+            matcher: None,
+            command: format!(
+                "cd '{cwd}' && grep -q '\"stop_hook_active\":true' && touch '{marker_s}'"
+            ),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        CCExternalHooks::new(vec![hook(&m_a_s), hook(&m_b_s)], "/tmp")
+            .turn_complete(&convo, &StopReason::Stopped, &ctx)
+            .await;
+        assert!(
+            m_a.exists(),
+            "first of two hooks must see stop_hook_active:true"
+        );
+        assert!(
+            m_b.exists(),
+            "second of two hooks must see stop_hook_active:true"
         );
     }
 
@@ -1406,6 +1668,66 @@ mod tests {
         assert_eq!(
             result.content, "orig",
             "matcher 'bash' must NOT fire for tool grep"
+        );
+    }
+
+    /// PostToolUseFailure: a FAILED tool call (`is_error`) fires the failure event
+    /// instead of PostToolUse, so a plugin can tell success from failure. Both
+    /// events share the same payload/rewrite semantics.
+    #[tokio::test]
+    async fn failed_tool_fires_post_tool_use_failure() {
+        let ok_hook = HookConfig {
+            event: HookEvent::PostToolUse,
+            matcher: None,
+            command: r#"echo '{"hookSpecificOutput":{"updatedToolOutput":"OK-REWRITE"}}'"#.into(),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        let fail_hook = HookConfig {
+            event: HookEvent::PostToolUseFailure,
+            matcher: None,
+            command: r#"echo '{"hookSpecificOutput":{"updatedToolOutput":"FAIL-REWRITE"}}'"#.into(),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        let cc = CCExternalHooks::new(vec![ok_hook, fail_hook], "/tmp");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let rt = RequestCtx::new(tx, Some(Duration::from_millis(50)));
+        let tool: Arc<dyn Tool> = Arc::new(atomcode_kernel::testkit::EchoTool);
+
+        // A SUCCESSFUL call: only the PostToolUse hook may rewrite.
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        let _ = cc.before(&mut call, &tool, &rt).await;
+        let mut ok = ToolResult {
+            call_id: "1".into(),
+            content: "orig".into(),
+            is_error: false,
+            images: vec![],
+        };
+        cc.after(&mut ok).await;
+        assert_eq!(ok.content, "OK-REWRITE", "success must fire PostToolUse, not PostToolUseFailure");
+
+        // A FAILED call: only the PostToolUseFailure hook may rewrite.
+        let mut call = ToolCall {
+            id: "2".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        let _ = cc.before(&mut call, &tool, &rt).await;
+        let mut failed = ToolResult {
+            call_id: "2".into(),
+            content: "orig".into(),
+            is_error: true,
+            images: vec![],
+        };
+        cc.after(&mut failed).await;
+        assert_eq!(
+            failed.content, "FAIL-REWRITE",
+            "failed call must fire PostToolUseFailure, not PostToolUse"
         );
     }
 

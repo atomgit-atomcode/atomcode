@@ -73,6 +73,11 @@ pub struct PreparedCatalogSessionResume {
     pub project_bucket: String,
     pub view: CatalogSessionView,
     pub lease: SessionLease,
+    /// Set to the original session id when the selection was leased by another
+    /// live runtime and we forked a copy instead (see
+    /// [`prepare_catalog_session_resume_or_fork_in_project`]). `None` for an
+    /// in-place resume of the selected session.
+    pub forked_from: Option<String>,
 }
 
 impl From<ConvertedLegacySession> for CatalogSessionView {
@@ -1347,6 +1352,25 @@ pub fn prepare_catalog_session_resume_in_project(
         &SessionManager::sessions_root(),
         project_bucket,
         id,
+        false,
+    )
+}
+
+/// Interactive-`/resume` variant of
+/// [`prepare_catalog_session_resume_in_project`]. If the selected session is
+/// leased by another live runtime, fork a native copy and resume that instead
+/// of failing with `SessionInUse` — mirroring the CLI `--continue` behaviour.
+/// The returned resume carries `forked_from = Some(original_id)` so callers can
+/// tell the user a copy was made.
+pub fn prepare_catalog_session_resume_or_fork_in_project(
+    project_bucket: &str,
+    id: &str,
+) -> anyhow::Result<Option<PreparedCatalogSessionResume>> {
+    prepare_catalog_session_resume_in_project_root(
+        &SessionManager::sessions_root(),
+        project_bucket,
+        id,
+        true,
     )
 }
 
@@ -1379,13 +1403,19 @@ pub(crate) fn prepare_catalog_session_resume_any_project_in_root(
             presentation: outcome.presentation,
         },
         lease,
+        forked_from: None,
     }))
 }
 
+/// Shared implementation for the exact-bucket resume prepare. With
+/// `fork_on_busy = false` a `SessionInUse` propagates (the webui/importer
+/// behaviour); with `true` the interactive `/resume` forks a native copy of the
+/// busy session instead (see [`prepare_catalog_session_resume_or_fork_in_project`]).
 pub(crate) fn prepare_catalog_session_resume_in_project_root(
     sessions_root: &std::path::Path,
     project_bucket: &str,
     id: &str,
+    fork_on_busy: bool,
 ) -> anyhow::Result<Option<PreparedCatalogSessionResume>> {
     validate_project_bucket(project_bucket)?;
     let scan = SessionManager::scan_catalog(sessions_root);
@@ -1405,17 +1435,50 @@ pub(crate) fn prepare_catalog_session_resume_in_project_root(
         return Ok(None);
     };
     let manager = SessionManager::with_root(sessions_root.join(project_bucket));
-    let lease = manager.acquire_lease(id)?;
-    let outcome = converge_session(&manager, &lease)?;
-    Ok(Some(PreparedCatalogSessionResume {
-        project_bucket: entry.project_bucket.clone(),
-        view: CatalogSessionView {
-            snapshot: outcome.snapshot,
-            meta: outcome.meta,
-            presentation: outcome.presentation,
-        },
-        lease,
-    }))
+    match manager.acquire_lease(id) {
+        Ok(lease) => {
+            let outcome = converge_session(&manager, &lease)?;
+            Ok(Some(PreparedCatalogSessionResume {
+                project_bucket: entry.project_bucket.clone(),
+                view: CatalogSessionView {
+                    snapshot: outcome.snapshot,
+                    meta: outcome.meta,
+                    presentation: outcome.presentation,
+                },
+                lease,
+                forked_from: None,
+            }))
+        }
+        Err(busy @ SessionStoreError::SessionInUse { .. }) if fork_on_busy => {
+            // `fork_native_session` reads the committed native state the owning
+            // runtime already wrote, so a session that is genuinely in use
+            // (hence converged) forks cleanly. But if we catch the owner mid
+            // legacy→native convergence — its intent meta is still `Legacy`, or
+            // it just deleted the session — the fork read fails with
+            // `OwnershipConflict`/`NotFound`. Degrade those to the familiar
+            // "in use" error (the pre-fork behaviour) rather than leaking an
+            // internal error; the user can retry once convergence settles.
+            let fork_id = uuid::Uuid::new_v4().to_string();
+            match manager.fork_native_session(
+                id,
+                &fork_id,
+                atomcode_capabilities::session::now_ms(),
+            ) {
+                Ok((forked, lease)) => Ok(Some(PreparedCatalogSessionResume {
+                    project_bucket: entry.project_bucket.clone(),
+                    view: forked.into(),
+                    lease,
+                    forked_from: Some(id.to_string()),
+                })),
+                Err(
+                    SessionStoreError::OwnershipConflict { .. }
+                    | SessionStoreError::NotFound { .. },
+                ) => Err(busy.into()),
+                Err(error) => Err(error.into()),
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn load_catalog_session_view_in_project_root(
@@ -2071,7 +2134,7 @@ mod tests {
         }
 
         let prepared =
-            prepare_catalog_session_resume_in_project_root(root.path(), first_bucket, id)
+            prepare_catalog_session_resume_in_project_root(root.path(), first_bucket, id, false)
                 .unwrap()
                 .unwrap();
 
@@ -2089,6 +2152,118 @@ mod tests {
         assert!(first.acquire_lease(id).is_ok());
     }
 
+    /// When the selected session is leased by another live runtime, the
+    /// fork-aware prepare path (used by the interactive `/resume`) forks a copy
+    /// instead of failing with `SessionInUse` — mirroring `--continue`.
+    #[test]
+    fn prepared_resume_forks_when_session_busy() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "busy-id";
+        let bucket = "5555555555555555";
+        let manager = SessionManager::with_root(root.path().join(bucket));
+
+        // Commit a native session and KEEP its lease held — simulates another
+        // live runtime that already owns this session.
+        let held_lease = manager.acquire_lease(id).unwrap();
+        let snapshot =
+            atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user("original")]);
+        let mut meta = SessionMeta::new(id, "/proj", 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 1;
+        manager
+            .commit_native_import(
+                &held_lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+
+        // The plain prepare path cannot acquire the busy lease.
+        assert!(matches!(
+            manager.acquire_lease(id),
+            Err(atomcode_capabilities::session::SessionStoreError::SessionInUse { .. })
+        ));
+
+        // The fork-aware path forks instead of erroring.
+        let prepared =
+            prepare_catalog_session_resume_in_project_root(root.path(), bucket, id, true)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(prepared.forked_from.as_deref(), Some(id));
+        assert_ne!(prepared.view.meta.id, id);
+        assert_eq!(prepared.view.snapshot.messages[0].text, "original");
+        // The original session stays owned by its runtime; only the fork moved.
+        assert!(matches!(
+            manager.acquire_lease(id),
+            Err(atomcode_capabilities::session::SessionStoreError::SessionInUse { .. })
+        ));
+        drop(held_lease);
+    }
+
+    /// With no contention the fork-aware path behaves exactly like the plain
+    /// prepare: it resumes the selected session in place, no fork.
+    #[test]
+    fn prepared_resume_or_fork_resumes_in_place_when_free() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "free-id";
+        let bucket = "6666666666666666";
+        let manager = SessionManager::with_root(root.path().join(bucket));
+        let lease = manager.acquire_lease(id).unwrap();
+        let snapshot =
+            atomcode_kernel::message::SessionSnapshot::new(vec![KernelMessage::user("hi")]);
+        let mut meta = SessionMeta::new(id, "/proj", 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 1;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        drop(lease);
+
+        let prepared =
+            prepare_catalog_session_resume_in_project_root(root.path(), bucket, id, true)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(prepared.forked_from, None);
+        assert_eq!(prepared.view.meta.id, id);
+    }
+
+    /// A session that is leased but not yet native (owner mid-convergence) cannot
+    /// be forked; the fork-aware path degrades to the familiar "in use" error
+    /// rather than leaking `OwnershipConflict`/`NotFound`.
+    #[test]
+    fn prepared_resume_or_fork_reports_busy_when_source_not_forkable() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = "7777777777777777";
+        let manager = SessionManager::with_root(root.path().join(bucket));
+        // Legacy-only on disk (appears in the catalog, no native meta yet)...
+        let legacy = full_legacy_session();
+        std::fs::create_dir_all(manager.root()).unwrap();
+        std::fs::write(
+            manager.legacy_path(&legacy.id).unwrap(),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        // ...and another runtime is holding its lease (mid-convergence).
+        let held = manager.acquire_lease(&legacy.id).unwrap();
+
+        let error =
+            prepare_catalog_session_resume_in_project_root(root.path(), bucket, &legacy.id, true)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("in use"),
+            "expected a busy error, got: {error}"
+        );
+        drop(held);
+    }
+
     #[test]
     fn prepared_resume_repairs_out_of_range_legacy_boundary_before_lease_transfer() {
         let root = tempfile::tempdir().unwrap();
@@ -2104,7 +2279,7 @@ mod tests {
         .unwrap();
 
         let prepared =
-            prepare_catalog_session_resume_in_project_root(root.path(), bucket, &legacy.id)
+            prepare_catalog_session_resume_in_project_root(root.path(), bucket, &legacy.id, false)
                 .unwrap()
                 .unwrap();
 
@@ -2136,7 +2311,7 @@ mod tests {
         .unwrap();
 
         let prepared =
-            prepare_catalog_session_resume_in_project_root(root.path(), bucket, &legacy.id)
+            prepare_catalog_session_resume_in_project_root(root.path(), bucket, &legacy.id, false)
                 .unwrap()
                 .unwrap();
 

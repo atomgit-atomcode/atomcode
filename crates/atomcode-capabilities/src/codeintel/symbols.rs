@@ -95,17 +95,26 @@ pub fn extract_symbol(source: &str, lang: Lang, name: &str) -> Option<Symbol> {
 /// symbol's signature line annotated with its line range. `None` when the language is
 /// unsupported or no symbols are found (the caller, e.g. `read_file`, then falls back to
 /// a normal read). Lets a large file be outlined instead of dumped.
-pub fn skeleton(path: &Path, source: &str) -> Option<String> {
+/// `display_path` is the path string the model passed to `read_file` (not the
+/// resolved absolute path); it is echoed once in the header so the per-symbol
+/// recovery calls stay copy-ready without the model hunting for the path.
+pub fn skeleton(path: &Path, source: &str, display_path: &str) -> Option<String> {
     let lang = Lang::detect(path)?;
     let syms = extract_symbols(source, lang)?;
     if syms.is_empty() {
         return None;
     }
     let lines: Vec<&str> = source.lines().collect();
+    // Name the file + the full-shape call ONCE (path repeated per symbol would bloat a
+    // large skeleton past the artifact cap). Each symbol line then carries only the exact
+    // `offset=…, limit=…` to slot in — so the model jumps precisely instead of guessing.
     let mut out = format!(
-        "[File skeleton: {} lines, {} symbols. Read a symbol with read_symbol, or a line range with read_file offset/limit.]\n",
+        "[File skeleton: {} lines, {} symbols in {display_path}. Jump to any symbol with \
+         read_file(file_path=\"{display_path}\", offset, limit) using the offset/limit shown \
+         on its line — do NOT guess ranges. Or read_symbol(file_path=\"{display_path}\", \
+         symbol=\"<name>\").]\n",
         lines.len(),
-        syms.len()
+        syms.len(),
     );
     // Leading import/use/include lines — cheap, high-value context.
     let mut shown_import = false;
@@ -134,9 +143,12 @@ pub fn skeleton(path: &Path, source: &str) -> Option<String> {
             sig = sig.chars().take(SIG_MAX).collect::<String>() + "…";
         }
         let n = s.end_line.saturating_sub(s.start_line) + 1;
+        // Values only, NOT a `read_file(...)`-shaped string: the call shape (with the
+        // required file_path) is in the header once. A fake-complete per-line call would
+        // tempt a weak model to copy it verbatim and hit "missing file_path".
         out.push_str(&format!(
-            "{:>6}| {}  // L{}-{} ({} lines)\n",
-            s.start_line, sig, s.start_line, s.end_line, n
+            "{:>6}| {}  // L{}-{} → offset={}, limit={}\n",
+            s.start_line, sig, s.start_line, s.end_line, s.start_line, n
         ));
     }
     Some(out)
@@ -186,7 +198,7 @@ mod tests {
     fn skeleton_truncates_pathological_signature() {
         let long = "x".repeat(5000);
         let src = format!("fn f(/* {long} */) {{}}\n");
-        let sk = skeleton(std::path::Path::new("a.rs"), &src).expect("skeleton");
+        let sk = skeleton(std::path::Path::new("a.rs"), &src, "a.rs").expect("skeleton");
         assert!(sk.contains("File skeleton"), "{}", &sk[..sk.len().min(120)]);
         assert!(sk.contains('…'), "long signature must be truncated");
         assert!(
@@ -198,9 +210,26 @@ mod tests {
     #[test]
     fn skeleton_none_for_symbolless_source() {
         // pure comments → no symbols → None (caller falls back to a normal read)
-        assert!(skeleton(std::path::Path::new("a.rs"), "// just\n// comments\n").is_none());
+        assert!(skeleton(std::path::Path::new("a.rs"), "// just\n// comments\n", "a.rs").is_none());
         // unsupported language → None
-        assert!(skeleton(std::path::Path::new("a.unknownext"), "anything").is_none());
+        assert!(skeleton(std::path::Path::new("a.unknownext"), "anything", "a.unknownext").is_none());
+    }
+
+    #[test]
+    fn skeleton_emits_copy_ready_recovery_call_per_symbol() {
+        // Regression for "skeleton makes the model guess ranges": each symbol line must
+        // carry an exact, copy-ready read_file(offset,limit), and the header must name the
+        // file (path once, to stay compact) so the model doesn't hunt for it.
+        let src = "struct Foo {\n    x: i32,\n}\n\nfn bar(a: i32) -> i32 {\n    a + 1\n}\n";
+        let sk = skeleton(std::path::Path::new("a.rs"), src, "src/a.rs").expect("skeleton");
+        // Header names the file + the full-shape call once.
+        assert!(sk.contains("src/a.rs"), "header must name the file: {sk}");
+        assert!(sk.contains("read_file"), "header must show the recovery call: {sk}");
+        // `bar` spans L5-7 → offset=5, limit=3 (7-5+1). Exact, not a guess.
+        assert!(
+            sk.contains("offset=5, limit=3"),
+            "missing exact per-symbol recovery values: {sk}"
+        );
     }
 
     #[test]

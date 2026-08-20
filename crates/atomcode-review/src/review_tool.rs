@@ -42,6 +42,12 @@ pub(crate) struct ReviewProgressHook {
     progress: ProgressSink,
     round: AtomicU32,
     max_rounds: AtomicU32,
+    /// Running count of `report_finding` calls the reviewer has made so far, so
+    /// the activity line shows the review accumulating results ("2 findings")
+    /// instead of a static "thinking" — the user's "can't tell what it's doing"
+    /// complaint. Counts CALLS, not deduped findings, so it may slightly exceed
+    /// the final report count; fine for a live progress hint.
+    findings: AtomicU32,
 }
 
 impl ReviewProgressHook {
@@ -50,20 +56,21 @@ impl ReviewProgressHook {
             progress,
             round: AtomicU32::new(0),
             max_rounds: AtomicU32::new(0),
+            findings: AtomicU32::new(0),
         }
     }
 
-    fn round_label(&self) -> Option<String> {
-        let round = self.round.load(Ordering::Relaxed);
-        if round == 0 {
-            return None;
-        }
-        let max = self.max_rounds.load(Ordering::Relaxed);
-        Some(if max == 0 {
-            format!("round {round}")
-        } else {
-            format!("round {round}/{max}")
-        })
+    /// Emit the current activity line: `review · round N/M · K findings · <tail>`,
+    /// carrying the live round + running finding count around whatever the
+    /// reviewer is doing right now (`tail`).
+    fn emit(&self, tail: &str) {
+        let line = review_activity_line(
+            self.round.load(Ordering::Relaxed),
+            self.max_rounds.load(Ordering::Relaxed),
+            self.findings.load(Ordering::Relaxed),
+            tail,
+        );
+        self.progress.emit(format!("{REVIEW_ACTIVITY_MARKER}{line}"));
     }
 }
 
@@ -73,23 +80,56 @@ impl LifecycleHooks for ReviewProgressHook {
         self.round.store(ctx.round, Ordering::Relaxed);
         self.max_rounds
             .store(ctx.max_rounds.unwrap_or(0), Ordering::Relaxed);
-        let round = self.round_label().unwrap_or_else(|| "round".to_string());
-        self.progress.emit(format!(
-            "{REVIEW_ACTIVITY_MARKER}review · {round} · thinking"
-        ));
+        self.emit("thinking");
     }
 
     async fn on_model_response(&self, response: &mut Message) {
+        // Accumulate findings from THIS round's calls before building the line,
+        // so a round that reports the 2nd finding shows "2 findings".
+        let reported = response
+            .tool_calls
+            .iter()
+            .filter(|call| call.name == "report_finding")
+            .count() as u32;
+        if reported > 0 {
+            self.findings.fetch_add(reported, Ordering::Relaxed);
+        }
         let Some(call) = response.tool_calls.first() else {
             return;
         };
-        let activity = summarize_review_tool_call(&call.name, &call.arguments);
-        let detail = self
-            .round_label()
-            .map_or(activity.clone(), |round| format!("{round} · {activity}"));
-        self.progress
-            .emit(format!("{REVIEW_ACTIVITY_MARKER}review · {detail}"));
+        let tail = if call.name == "report_finding" {
+            "reporting finding".to_string()
+        } else {
+            summarize_review_tool_call(&call.name, &call.arguments)
+        };
+        self.emit(&tail);
     }
+}
+
+/// Build the ephemeral review activity line (the text AFTER the marker):
+/// `review · round N/M · K findings · <tail>`. `round`==0 omits the round
+/// segment (not started); `max_rounds`==0 renders `round N` (no total);
+/// `findings`==0 omits the count; the count is pluralized. An empty `tail`
+/// is dropped so there is never a dangling separator.
+fn review_activity_line(round: u32, max_rounds: u32, findings: u32, tail: &str) -> String {
+    let mut segments = vec!["review".to_string()];
+    if round > 0 {
+        segments.push(if max_rounds > 0 {
+            format!("round {round}/{max_rounds}")
+        } else {
+            format!("round {round}")
+        });
+    }
+    if findings > 0 {
+        segments.push(format!(
+            "{findings} finding{}",
+            if findings == 1 { "" } else { "s" }
+        ));
+    }
+    if !tail.is_empty() {
+        segments.push(tail.to_string());
+    }
+    segments.join(" · ")
 }
 
 fn summarize_review_tool_call(name: &str, arguments: &str) -> String {
@@ -753,6 +793,38 @@ mod tests {
     }
 
     #[test]
+    fn review_activity_line_composes_round_findings_and_tail() {
+        // No round yet, no findings → bare marker text + tail.
+        assert_eq!(review_activity_line(0, 0, 0, "thinking"), "review · thinking");
+        // Round without a known max.
+        assert_eq!(
+            review_activity_line(3, 0, 0, "thinking"),
+            "review · round 3 · thinking"
+        );
+        // Round with max.
+        assert_eq!(
+            review_activity_line(3, 8, 0, "thinking"),
+            "review · round 3/8 · thinking"
+        );
+        // Singular finding.
+        assert_eq!(
+            review_activity_line(3, 8, 1, "thinking"),
+            "review · round 3/8 · 1 finding · thinking"
+        );
+        // Plural findings + a tool tail.
+        assert_eq!(
+            review_activity_line(3, 8, 2, "read_file · a.rs"),
+            "review · round 3/8 · 2 findings · read_file · a.rs"
+        );
+        // Empty tail collapses cleanly (no trailing separator).
+        assert_eq!(review_activity_line(0, 0, 0, ""), "review");
+        assert_eq!(
+            review_activity_line(2, 5, 4, ""),
+            "review · round 2/5 · 4 findings"
+        );
+    }
+
+    #[test]
     fn paths_match_handles_relative_and_absolute() {
         assert!(paths_match("src/a.rs", "src/a.rs"));
         assert!(paths_match("src/a.rs", "./src/a.rs"));
@@ -920,6 +992,80 @@ mod tests {
         assert_eq!(
             seen.lock().unwrap().last().map(String::as_str),
             Some("\u{1e}review · round 4 · read_file · src/compaction.rs")
+        );
+    }
+
+    #[tokio::test]
+    async fn review_progress_accumulates_and_surfaces_finding_count() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let capture = seen.clone();
+        let hook = ReviewProgressHook::new(ProgressSink::new(Arc::new(move |message| {
+            capture.lock().unwrap().push(message);
+        })));
+        LifecycleHooks::pre_request(
+            &hook,
+            &mut Vec::new(),
+            &TurnCtx {
+                round: 2,
+                max_rounds: Some(8),
+                ..Default::default()
+            },
+        )
+        .await;
+        // Round 2 reports one finding.
+        let mut r2 = Message::assistant(
+            "",
+            vec![ToolCall {
+                id: "f1".into(),
+                name: "report_finding".into(),
+                arguments: r#"{"title":"unwrap"}"#.into(),
+            }],
+        );
+        LifecycleHooks::on_model_response(&hook, &mut r2).await;
+        assert_eq!(
+            seen.lock().unwrap().last().map(String::as_str),
+            Some("\u{1e}review · round 2/8 · 1 finding · reporting finding"),
+            "the reported finding is counted and the tool tail reads cleanly"
+        );
+
+        // A later round keeps thinking — the accumulated count persists.
+        LifecycleHooks::pre_request(
+            &hook,
+            &mut Vec::new(),
+            &TurnCtx {
+                round: 3,
+                max_rounds: Some(8),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            seen.lock().unwrap().last().map(String::as_str),
+            Some("\u{1e}review · round 3/8 · 1 finding · thinking"),
+            "the running finding count carries across rounds, even while thinking"
+        );
+
+        // A round that reports two more findings bumps the running total to 3.
+        let mut r4 = Message::assistant(
+            "",
+            vec![
+                ToolCall {
+                    id: "f2".into(),
+                    name: "report_finding".into(),
+                    arguments: r#"{"title":"a"}"#.into(),
+                },
+                ToolCall {
+                    id: "f3".into(),
+                    name: "report_finding".into(),
+                    arguments: r#"{"title":"b"}"#.into(),
+                },
+            ],
+        );
+        LifecycleHooks::on_model_response(&hook, &mut r4).await;
+        assert_eq!(
+            seen.lock().unwrap().last().map(String::as_str),
+            Some("\u{1e}review · round 3/8 · 3 findings · reporting finding"),
+            "multiple findings in one round accumulate and pluralize"
         );
     }
 

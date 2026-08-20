@@ -163,6 +163,19 @@ pub const PRESETS: &[ProviderPreset] = &[
         model_source: ModelSource::Manual,
     },
     ProviderPreset {
+        // Zhipu's coding-plan endpoint: same account / `ZHIPUAI_API_KEY`, but the
+        // `/api/coding/paas/v4` base URL (billed under the GLM coding plan) rather
+        // than the token-based `/api/paas/v4`. A separate preset so it is one-click
+        // selectable instead of a manual base-url override.
+        id: "zhipu-coding",
+        display_name: "Zhipu Coding Plan",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some("https://open.bigmodel.cn/api/coding/paas/v4"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: Some("ZHIPUAI_API_KEY"),
+        model_source: ModelSource::Manual,
+    },
+    ProviderPreset {
         id: "moonshot",
         display_name: "Moonshot",
         provider_type: ProviderType::OpenAi,
@@ -271,6 +284,7 @@ mod tests {
             "deepseek",
             "longcat",
             "zhipu",
+            "zhipu-coding",
             "moonshot",
             "minimax",
             "siliconflow",
@@ -293,6 +307,24 @@ mod tests {
         for p in PRESETS {
             assert!(seen.insert(p.id), "duplicate preset id: {}", p.id);
         }
+    }
+
+    #[test]
+    fn zhipu_variants_split_token_and_coding_endpoints() {
+        // The token provider keeps the `/api/paas/v4` base; the coding-plan
+        // provider is a distinct preset on `/api/coding/paas/v4`, sharing the
+        // same OpenAI-compatible type and `ZHIPUAI_API_KEY`.
+        let token = preset("zhipu").expect("zhipu preset");
+        assert_eq!(token.default_base_url, Some("https://open.bigmodel.cn/api/paas/v4"));
+
+        let coding = preset("zhipu-coding").expect("zhipu-coding preset");
+        assert_eq!(coding.display_name, "Zhipu Coding Plan");
+        assert_eq!(coding.provider_type, ProviderType::OpenAi);
+        assert_eq!(
+            coding.default_base_url,
+            Some("https://open.bigmodel.cn/api/coding/paas/v4")
+        );
+        assert_eq!(coding.api_key_env, token.api_key_env, "same ZHIPUAI_API_KEY");
     }
 
     #[test]
