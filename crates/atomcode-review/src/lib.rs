@@ -57,4 +57,8 @@ pub use rules::{changed_files_from_diff, is_low_signal_file, render_rules_sectio
 /// Re-exported so a driver (CLI) can read findings without depending on
 /// `atomcode-capabilities` directly.
 pub use atomcode_capabilities::tools::{Finding, ReportFindingTool};
-pub use fanout::{ReviewDimension, REVIEW_DIMENSIONS};
+pub use fanout::{
+    dimension_coverage, finalize_deep_review, merge_deep_findings, render_deep_result,
+    render_verify_task, run_verify, DimensionOutcome, MergedFinding, ReviewDimension,
+    REVIEW_DIMENSIONS, VERIFY_CONCURRENCY, VERIFY_LENS,
+};

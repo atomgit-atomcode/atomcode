@@ -153,7 +153,18 @@ pub fn finalize_deep_review(
     changed_files: usize,
     changed_paths: &[String],
 ) -> (bool, String) {
-    // Feed merge in stable dimension order regardless of completion order.
+    let (merged, deduped) = merge_deep_findings(outcomes, changed_paths);
+    let (completed, failed) = dimension_coverage(outcomes);
+    render_deep_result(&merged, changed_files, &completed, &failed, deduped, None)
+}
+
+/// Merge → scope-filter → sort the fan-out outcomes into the deduped survivor
+/// set, plus the count collapsed by dedup. Shared by the deep and deep+verify
+/// paths.
+pub fn merge_deep_findings(
+    outcomes: &[DimensionOutcome],
+    changed_paths: &[String],
+) -> (Vec<MergedFinding>, usize) {
     let per_dim: Vec<(&'static str, Vec<Finding>)> = REVIEW_DIMENSIONS
         .iter()
         .filter_map(|d| {
@@ -172,20 +183,49 @@ pub fn finalize_deep_review(
     });
     merged.sort_by(|a, b| cmp_finding(&a.finding, &b.finding));
     let deduped = raw_total.saturating_sub(merged.len());
+    (merged, deduped)
+}
 
-    let completed: Vec<&'static str> = REVIEW_DIMENSIONS
+/// Completed vs failed dimension ids, in table order. A dimension absent from
+/// `outcomes` counts as neither — but never enters `completed`, so `is_error`
+/// stays correct.
+pub fn dimension_coverage(
+    outcomes: &[DimensionOutcome],
+) -> (Vec<&'static str>, Vec<&'static str>) {
+    let completed = REVIEW_DIMENSIONS
         .iter()
         .filter(|d| outcomes.iter().any(|o| o.dimension == d.id && o.completed))
         .map(|d| d.id)
         .collect();
-    let failed: Vec<&'static str> = REVIEW_DIMENSIONS
+    let failed = REVIEW_DIMENSIONS
         .iter()
         .filter(|d| outcomes.iter().any(|o| o.dimension == d.id && !o.completed))
         .map(|d| d.id)
         .collect();
+    (completed, failed)
+}
 
+/// Render the merged (post-verify, if any) survivor set. `verify_dropped` adds a
+/// "verify dropped K" note when `Some`. Returns `(is_error, rendered)`;
+/// `is_error` is true only when no dimension completed cleanly.
+pub fn render_deep_result(
+    merged: &[MergedFinding],
+    changed_files: usize,
+    completed: &[&str],
+    failed: &[&str],
+    deduped: usize,
+    verify_dropped: Option<usize>,
+) -> (bool, String) {
     let is_error = completed.is_empty();
-    let rendered = render_deep(&merged, changed_files, &completed, &failed, deduped, is_error);
+    let rendered = render_deep(
+        merged,
+        changed_files,
+        completed,
+        failed,
+        deduped,
+        is_error,
+        verify_dropped,
+    );
     (is_error, rendered)
 }
 
@@ -196,18 +236,23 @@ fn render_deep(
     failed: &[&str],
     deduped: usize,
     is_error: bool,
+    verify_dropped: Option<usize>,
 ) -> String {
     let total_dims = REVIEW_DIMENSIONS.len();
+    let verify_note = match verify_dropped {
+        Some(k) => format!(" · verify dropped {k}"),
+        None => String::new(),
+    };
     let mut out = String::new();
     if is_error {
         out.push_str(&format!(
             "Deep review incomplete — every dimension failed (0/{total_dims}). \
-             Coverage is not reliable.\n"
+             Coverage is not reliable.{verify_note}\n"
         ));
     } else if merged.is_empty() {
         out.push_str(&format!(
             "Deep review complete — no issues found across {changed_files} changed file(s) \
-             ({}/{total_dims} dimensions completed).\n",
+             ({}/{total_dims} dimensions completed){verify_note}.\n",
             completed.len()
         ));
     } else {
@@ -220,6 +265,7 @@ fn render_deep(
         if deduped > 0 {
             out.push_str(&format!(" · deduped {deduped}"));
         }
+        out.push_str(&verify_note);
         out.push('\n');
     }
     if !failed.is_empty() {
@@ -246,6 +292,65 @@ fn render_deep(
         }
     }
     out
+}
+
+/// Concurrency cap for the verify pass (one agent per surviving finding).
+pub const VERIFY_CONCURRENCY: usize = 6;
+
+/// Persona lens appended to the base reviewer persona for a verify agent.
+pub const VERIFY_LENS: &str = "\n\n## This review's task: VERIFY ONE CANDIDATE FINDING\n\
+You are checking a single candidate finding from a prior review pass. Using the DIFF as the \
+authoritative source (plus read-only tools for context), decide whether it is a REAL defect \
+INTRODUCED by these changes. If it is real — OR if you are unsure — call `report_finding` to \
+re-report it (you may refine its wording). Report NOTHING only when you are confident it is a \
+false positive, is not introduced by this diff, or is already handled, and briefly say why. Do \
+not hunt for new, unrelated issues.";
+
+/// Build the single-finding task text handed to a verify agent: the candidate,
+/// the per-language rules, and the authoritative DIFF.
+pub fn render_verify_task(f: &Finding, rules: &str, annotated: &str) -> String {
+    format!(
+        "Verify the following single candidate finding from a prior review.\n\n\
+         CANDIDATE FINDING:\n\
+         - [{} · conf {:.2}] {}:{}-{}\n  {}\n  {}\n\n{rules}\n\n=== DIFF ===\n{annotated}",
+        f.priority,
+        f.confidence,
+        f.file_path,
+        f.line_start,
+        f.line_end,
+        f.title.trim(),
+        f.body.trim(),
+    )
+}
+
+/// Run up to `cap` verify checks concurrently over `n` items; return a keep-mask
+/// in index order. `verify_one(i)` yields `(i, keep)`. The default is `true`
+/// (fail-open): a panicked/aborted verify task leaves its finding kept.
+pub async fn run_verify<F, Fut>(n: usize, cap: usize, verify_one: F) -> Vec<bool>
+where
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = (usize, bool)> + Send + 'static,
+{
+    let cap = cap.max(1);
+    let mut keep = vec![true; n];
+    let mut set = tokio::task::JoinSet::new();
+    let mut next = 0usize;
+    while next < n && set.len() < cap {
+        set.spawn(verify_one(next));
+        next += 1;
+    }
+    while let Some(joined) = set.join_next().await {
+        if let Ok((i, kept)) = joined {
+            if i < n {
+                keep[i] = kept;
+            }
+        }
+        if next < n {
+            set.spawn(verify_one(next));
+            next += 1;
+        }
+    }
+    keep
 }
 
 /// Run every dimension concurrently and collect their outcomes in `dims` order.
@@ -407,6 +512,46 @@ mod tests {
         ];
         let (_, out) = finalize_deep_review(&outcomes, 1, &["a.rs".to_string()]);
         assert!(out.contains("correctness") && out.contains("security"), "dims tagged:\n{out}");
+    }
+
+    #[test]
+    fn finalize_output_is_unchanged_after_the_split() {
+        // The no-verify path must be byte-identical to Phase 1's behavior.
+        let outcomes = vec![
+            DimensionOutcome { dimension: "correctness", findings: vec![f("P1", 0.8, "a.rs", 3, 4, "bad unwrap")], completed: true, error: None },
+            DimensionOutcome { dimension: "security", findings: vec![], completed: true, error: None },
+            DimensionOutcome { dimension: "performance", findings: vec![], completed: false, error: Some("boom".into()) },
+            DimensionOutcome { dimension: "tests_contracts", findings: vec![], completed: true, error: None },
+        ];
+        let (err_a, out_a) = finalize_deep_review(&outcomes, 1, &["a.rs".to_string()]);
+        let (merged, deduped) = merge_deep_findings(&outcomes, &["a.rs".to_string()]);
+        let (completed, failed) = dimension_coverage(&outcomes);
+        let (err_b, out_b) = render_deep_result(&merged, 1, &completed, &failed, deduped, None);
+        assert_eq!((err_a, out_a), (err_b, out_b), "finalize must equal its decomposed form with verify_dropped=None");
+    }
+
+    #[test]
+    fn render_deep_result_notes_verify_dropped() {
+        let merged = vec![]; // all survivors culled
+        let (_e, out) = render_deep_result(&merged, 1, &["correctness"], &[], 0, Some(2));
+        assert!(out.contains("verify"), "verify note present: {out}");
+        assert!(out.contains('2'), "dropped count present: {out}");
+    }
+
+    #[tokio::test]
+    async fn run_verify_applies_keep_mask_in_order_with_a_small_cap() {
+        // Keep evens, drop odds; cap < n exercises the refill path.
+        let keep = run_verify(5, 2, |i| async move { (i, i % 2 == 0) }).await;
+        assert_eq!(keep, vec![true, false, true, false, true]);
+    }
+
+    #[test]
+    fn verify_task_embeds_the_candidate_and_diff() {
+        let finding = f("P1", 0.9, "a.rs", 10, 12, "unchecked unwrap");
+        let task = render_verify_task(&finding, "RULES-HERE", "DIFF-HERE");
+        assert!(task.contains("unchecked unwrap") && task.contains("a.rs:10-12"));
+        assert!(task.contains("RULES-HERE") && task.contains("DIFF-HERE"));
+        assert!(task.to_lowercase().contains("verify"));
     }
 
     #[tokio::test]
