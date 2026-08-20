@@ -124,6 +124,20 @@ impl Palette {
     /// 256-colour (not truecolor) keeps parity with the MODE/SHELL usage and stays
     /// portable across terminals.
     pub const PLAN: Color = Color::AnsiValue(208);
+
+    /// Text-selection highlight background (mouse-drag selection in the
+    /// transcript / composer). Claude Code-style: a SOLID bg that REPLACES
+    /// the cell's own bg while PRESERVING its fg — matches native terminal
+    /// selection. (SGR-7 reverse, the previous approach, swapped fg/bg per
+    /// cell and fragmented into a different bg stripe for every distinct fg
+    /// colour once markdown / inline-code colours were in the selection.)
+    ///
+    /// Dark → deep blue `AnsiValue(24)` (≈`#005F87`, close to VS Code's
+    /// dark selection blue); light fgs stay readable on it.
+    pub const SELECTION_BG_DARK: Color = Color::AnsiValue(24);
+    /// Light → pale blue `AnsiValue(153)` (≈`#AFD7FF`, the classic light
+    /// selection blue); dark fgs stay readable on it.
+    pub const SELECTION_BG_LIGHT: Color = Color::AnsiValue(153);
 }
 
 /// Resolve the muted shade for the active palette.
@@ -197,6 +211,22 @@ pub fn diff_remove_for_current_theme() -> Color {
         Palette::DIFF_REMOVE_LIGHT
     } else {
         Palette::DIFF_REMOVE_DARK
+    }
+}
+
+/// Resolve the text-selection highlight background for the active palette.
+///
+/// Light theme → `SELECTION_BG_LIGHT` (pale blue — dark fgs stay readable).
+/// Dark theme  → `SELECTION_BG_DARK`  (deep blue — light fgs stay readable).
+///
+/// Solid bg (not SGR-7 reverse) matches Claude Code's alt-screen selection:
+/// the cell's fg is preserved, so markdown / inline-code colours inside the
+/// selection stay legible instead of fragmenting into per-fg bg stripes.
+pub fn selection_bg_for_current_theme() -> Color {
+    if md_theme::is_light_for_render() {
+        Palette::SELECTION_BG_LIGHT
+    } else {
+        Palette::SELECTION_BG_DARK
     }
 }
 
@@ -377,6 +407,24 @@ mod tests {
             Palette::BRAND,
             "shell must not be the red brand magenta"
         );
+        md_theme::set_theme_mode(false); // restore default
+    }
+
+    #[test]
+    fn selection_bg_switches_with_theme() {
+        let _theme = md_theme::test_lock();
+        // Text selection must paint a SOLID theme-aware bg (Claude Code
+        // style) — deep blue on dark so light fgs stay readable, pale blue
+        // on light so dark fgs stay readable. Distinct shades, else the
+        // split is pointless.
+        md_theme::set_theme_mode(false); // dark
+        assert_eq!(selection_bg_for_current_theme(), Palette::SELECTION_BG_DARK);
+        md_theme::set_theme_mode(true); // light
+        assert_eq!(
+            selection_bg_for_current_theme(),
+            Palette::SELECTION_BG_LIGHT
+        );
+        assert_ne!(Palette::SELECTION_BG_LIGHT, Palette::SELECTION_BG_DARK);
         md_theme::set_theme_mode(false); // restore default
     }
 

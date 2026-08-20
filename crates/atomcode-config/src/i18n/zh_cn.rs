@@ -4,7 +4,7 @@ use std::borrow::Cow;
 pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
         Msg::WelcomeBannerLine1 =>
-            "欢迎使用 AtomCode，请选择一项开始：".into(),
+            "欢迎使用 {brand}，请选择一项开始：".into(),
         Msg::WelcomeBannerLine2 =>
             "（↑↓ 切换，Enter 确认，Esc 跳过）".into(),
         Msg::WelcomeOptionCodingPlan => "配置 CodingPlan".into(),
@@ -24,7 +24,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::NetworkConnectHint =>
             "网络连接失败。若浏览器能打开，可能是代理/防火墙差异：用 /proxy 配置代理或设置 HTTPS_PROXY，或在浏览器打开上面的登录链接完成扫码。可按 Esc 跳过，稍后 /login 重试。".into(),
         Msg::CpSetupHeader =>
-            "  AtomCode CodingPlan 配置：\n\n".into(),
+            "  {brand} CodingPlan 配置：\n\n".into(),
         Msg::CpLoggedIn { who, username, email } =>
             format!("  ✓ 已登录：{} ({}，{})\n", who, username, email).into(),
         Msg::CpStepSkipped { reason } =>
@@ -88,11 +88,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpStatusFetchFailed { error } =>
             format!("  ⚠ 状态获取失败（非致命） — {}\n", error).into(),
         Msg::CpOfficialBuildRequired => Cow::Borrowed(
-            "此功能需要官方 AtomCode 构建，请前往 \
+            "此功能需要官方 {brand} 构建，请前往 \
              https://atomgit.com/atomgit_atomcode/atomcode/releases 下载安装。",
         ),
         Msg::CpAuthRequired => Cow::Borrowed(
-            "未登录 AtomCode CodingPlan。请运行 /login 完成登录后再发送请求。",
+            "未登录 {brand} CodingPlan。请运行 /login 完成登录后再发送请求。",
         ),
         Msg::CpSignStaleClockSkew => Cow::Borrowed(
             "请求被服务端拒绝：签名时间戳已过期。请校准本地系统时间（NTP 同步）后重试。",
@@ -101,10 +101,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "请求多次被识别为重放，请重新运行命令。",
         ),
         Msg::CpSignVersionTooOld => Cow::Borrowed(
-            "当前 AtomCode 版本过旧，已不兼容 CodingPlan。请升级 AtomCode 后继续使用。",
+            "当前 {brand} 版本过旧，已不兼容 CodingPlan。请升级 {brand} 后继续使用。",
         ),
         Msg::CpUpgradeRequired => Cow::Borrowed(
-            "需要升级才能继续使用 CodingPlan，请前往官方发布页安装最新版 AtomCode。",
+            "需要升级才能继续使用 CodingPlan，请前往官方发布页安装最新版 {brand}。",
         ),
 
         Msg::ErrUnsupportedLocale { input } =>
@@ -128,7 +128,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusClipboardImageHintSlash =>
             "剪贴板有图片 · /paste 粘贴".into(),
         Msg::StatusWebuiHint =>
-            "提示：使用 /webui 在浏览器中打开 AtomCode".into(),
+            "提示：使用 /webui 在浏览器中打开 {brand}".into(),
 
         // ── /status 命令主体 ──
         Msg::StatusBody { model, dir, config } =>
@@ -216,7 +216,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     鼠标滚轮                         滚动聊天区
     鼠标拖选                         选择文本
     Shift+鼠标拖选                   使用终端原生文本选择
-    Ctrl+Shift+C                     复制 AtomCode 选区
+    Ctrl+Shift+C                     复制 {brand} 选区
 
   ── 流程控制 ──
     Esc                              清空输入 / 关闭弹层 / 取消当前操作
@@ -406,7 +406,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ToolBlockedBySecurityPolicy =>
             "安全策略已阻止工具调用：凭据不能通过通用 shell 参数、临时文件或环境变量传递".into(),
         Msg::PolicyRecoveryHeader => "需要安全决策".into(),
-        Msg::PolicyRecoveryQuestion => "凭据操作已被拦截，AtomCode 下一步应如何处理？".into(),
+        Msg::PolicyRecoveryQuestion => "凭据操作已被拦截，{brand} 下一步应如何处理？".into(),
         Msg::PolicyRecoveryComplete => "我已在外部完成".into(),
         Msg::PolicyRecoveryCompleteDesc => "确认外部操作已完成，不自动调用模型".into(),
         Msg::PolicyRecoverySkip => "跳过该步骤".into(),
@@ -415,7 +415,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PolicyRecoveryInstructionsDesc => "仅展示本地固定指引和占位符".into(),
         Msg::PolicyRecoveryEnd => "结束任务".into(),
         Msg::PolicyRecoveryEndDesc => "关闭本次介入，不调用模型".into(),
-        Msg::PolicyRecoverySafeInstructions => "安全手动路径：\n  1. 打开一个由你控制的独立终端。\n  2. 使用服务官方登录流程或凭据感知的专用工具。\n  3. 在该终端完成认证操作；不要把密钥粘贴到 AtomCode。\n  4. 返回这里并选择“我已在外部完成”。\nAtomCode 不会重构或展示刚才被拒绝的命令。".into(),
+        Msg::PolicyRecoverySafeInstructions => "安全手动路径：\n  1. 打开一个由你控制的独立终端。\n  2. 使用服务官方登录流程或凭据感知的专用工具。\n  3. 在该终端完成认证操作；不要把密钥粘贴到 {brand}。\n  4. 返回这里并选择“我已在外部完成”。\n{brand} 不会重构或展示刚才被拒绝的命令。".into(),
         Msg::PolicyRecoveryCompletedLocally => "已确认认证步骤在外部完成。为避免重新生成敏感命令，本次恢复未调用模型；你可以继续提交不涉及凭据的任务。".into(),
         Msg::PolicyRecoverySkippedLocally => "已跳过需要访问凭据的步骤。为避免重新生成敏感命令，本次恢复未调用模型；你可以继续提交其他安全任务。".into(),
         Msg::PolicyRecoverySubmitError => "无法提交安全恢复选择，请重试。".into(),
@@ -935,7 +935,7 @@ Msg::PluginActionBackDesc => "返回已安装插件列表".into(),
         Msg::PluginReloadDone { skills, warnings } =>
             format!("插件已重新加载：{skills} 个 skill，{warnings} 个警告").into(),
         Msg::PluginGitNotFound =>
-            "💡 当前环境未安装 git 或 git 不在 PATH 中，插件市场自动安装和自动更新已禁用。请安装 git（macOS 可执行 `xcode-select --install`，Ubuntu 可执行 `sudo apt install git`）后重启 AtomCode。".into(),
+            "💡 当前环境未安装 git 或 git 不在 PATH 中，插件市场自动安装和自动更新已禁用。请安装 git（macOS 可执行 `xcode-select --install`，Ubuntu 可执行 `sudo apt install git`）后重启 {brand}。".into(),
         Msg::PluginMarketplaceAdded { name, commit, count, plugins } =>
             format!(
                 "✓ 已添加 marketplace `{name}`（commit {commit}，共 {count} 个插件）\n  \
@@ -958,8 +958,8 @@ Msg::CmdDescSetup =>
 "扫描项目、安装种子文件并运行 setup skill [hooks|mcp|skills|all]".into(),
         Msg::CmdDescResume => "恢复上次会话".into(),
         Msg::CmdDescRename => "重命名当前会话".into(),
-        Msg::CmdDescLogin => "使用 AtomGit OAuth 登录并领取 CodingPlan 模型".into(),
-        Msg::CmdDescLogout => "退出 AtomGit 登录".into(),
+        Msg::CmdDescLogin => "使用 {oauth} 登录并领取 CodingPlan 模型".into(),
+        Msg::CmdDescLogout => "退出登录".into(),
         Msg::CmdDescWhoami => "显示当前登录用户".into(),
         Msg::CmdDescModel => "设置默认 Provider / 模型，并切换当前会话".into(),
         Msg::CmdDescProvider => "管理 Provider（添加、编辑、删除、设为全局默认）".into(),
@@ -993,7 +993,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescHelp => "显示帮助".into(),
         Msg::CmdDescKeys => "显示键盘快捷键".into(),
         Msg::CmdDescLanguage => "切换显示语言".into(),
-        Msg::CmdDescQuit => "退出 AtomCode".into(),
+        Msg::CmdDescQuit => "退出 {brand}".into(),
         Msg::CmdDescSkills => "浏览已加载的技能".into(),
         Msg::CmdDescPlugin => "插件市场（子命令：marketplace, install, uninstall, reload, list）".into(),
         Msg::CmdDescPaste => "从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口）".into(),
@@ -1022,17 +1022,17 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescTeam => "显示或控制 Team Agent 进度面板".into(),
         Msg::CmdDescSchedule => "查看定时任务列表和下次运行时间".into(),
         Msg::CmdDescDesktop =>
-            "打开 AtomCode 桌面端（已安装则启动，否则显示下载地址）".into(),
+            "打开 {brand} 桌面端（已安装则启动，否则显示下载地址）".into(),
         Msg::DesktopOpening { name, path } =>
             format!("正在打开 {}…\n  {}\n", name, path).into(),
         Msg::DesktopNotInstalled { url } =>
-            format!("未检测到 AtomCode 桌面端。下载安装：\n  {}\n", url).into(),
+            format!("未检测到 {{brand}} 桌面端。下载安装：\n  {}\n", url).into(),
         Msg::DesktopLaunchFailed { path, err } =>
             format!("找到了应用但启动失败：{}\n  {}\n", err, path).into(),
         Msg::TodoNoList => "当前无任务清单（模型尚未创建 todo）。".into(),
         Msg::TodoListHeader => "当前任务清单:".into(),
         Msg::TodoAddUsage => "用法：/todo add <任务描述>".into(),
-        Msg::GuideMenuHeader => "📖 AtomCode 使用指南 — 输入 /guide <问题> 提问".into(),
+        Msg::GuideMenuHeader => "📖 {brand} 使用指南 — 输入 /guide <问题> 提问".into(),
         Msg::GuideMenuTopics => "常用话题：".into(),
         Msg::GuideMenuGettingStarted => "怎么开始使用          首次安装、登录、配置".into(),
         Msg::GuideMenuSwitchModel => "怎么设置默认模型       /model /provider 操作".into(),
@@ -1072,7 +1072,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::OnboardingStepHeaderWelcome => "第 1/3 步 · 欢迎".into(),
         Msg::OnboardingStepHeaderLanguage => "第 2/3 步 · 语言".into(),
         Msg::OnboardingStepHeaderSetup => "第 3/3 步 · 配置".into(),
-        Msg::OnboardingPanelTitle => "AtomCode".into(),
+        Msg::OnboardingPanelTitle => "{brand}".into(),
         Msg::OnboardingIntroVersionLine { v } =>
             format!("版本 {v}  ·  在终端里运行的 AI 编程代理").into(),
         Msg::OnboardingIntroBullet1 =>
@@ -1218,7 +1218,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             "[headless] --dangerously-skip-permissions：所有工具调用将自动批准".into(),
 
         Msg::AdminWarningBanner =>
-            "\x1b[33m\u{26a0} 警告：正在以管理员权限运行。\n   模型可能可以访问系统文件。\n   建议改用普通权限、并在受限的工作目录中运行 AtomCode。\x1b[39m\n".into(),
+            "\x1b[33m\u{26a0} 警告：正在以管理员权限运行。\n   模型可能可以访问系统文件。\n   建议改用普通权限、并在受限的工作目录中运行 {brand}。\x1b[39m\n".into(),
         Msg::AdminWarningHeadless =>
             "[warning] 正在以管理员权限运行 — 模型可能可以访问系统文件。".into(),
 
@@ -1275,8 +1275,8 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::BgTaskNoSummary => "任务完成（无摘要文本）。".into(),
         // ── CLI atomcode --help i18n ──
         Msg::CliAbout => "终端中的 AI 编程助手".into(),
-        Msg::CliAboutLogin => "通过 AtomGit OAuth 登录并领取 CodingPlan 模型".into(),
-        Msg::CliAboutLogout => "退出 AtomCode 登录".into(),
+        Msg::CliAboutLogin => "通过 {oauth} 登录并领取 CodingPlan 模型".into(),
+        Msg::CliAboutLogout => "退出登录".into(),
         Msg::CliAboutStatus => "查看当前登录状态".into(),
         Msg::CliAboutUpgrade => "就地升级 atomcode 到最新发布版本".into(),
         Msg::CliAboutRollback => "回退到上一个版本（与 .bak 交换）".into(),
@@ -1285,7 +1285,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CliAboutWebui => "启动本地浏览器 webui".into(),
         Msg::CliAboutTelemetry => "遥测控制".into(),
         Msg::CliAboutPlugin => "管理技能/命令插件".into(),
-        Msg::CliAboutUninstall => "卸载 AtomCode：移除二进制文件、PATH 编辑和数据".into(),
+        Msg::CliAboutUninstall => "卸载 {brand}：移除二进制文件、PATH 编辑和数据".into(),
         Msg::CliAboutSetup => "安装种子文件（技能/命令/钩子/MCP）到 ~/.atomcode/".into(),
         Msg::CliAboutHooks => "管理钩子（列表、测试、启用/禁用）".into(),
         Msg::CliAboutHooksList => "列出所有已加载钩子及其状态".into(),

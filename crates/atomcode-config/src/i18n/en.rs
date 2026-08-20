@@ -4,7 +4,7 @@ use std::borrow::Cow;
 pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
         Msg::WelcomeBannerLine1 =>
-            "Welcome to AtomCode. Pick an option to get started:".into(),
+            "Welcome to {brand}. Pick an option to get started:".into(),
         Msg::WelcomeBannerLine2 =>
             "(↑↓ to navigate, Enter to confirm, Esc to skip)".into(),
         Msg::WelcomeOptionCodingPlan => "Set up CodingPlan".into(),
@@ -24,7 +24,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::NetworkConnectHint =>
             "Network connect failed. If this works in a browser you may be behind a proxy/firewall: configure a proxy with /proxy or set HTTPS_PROXY, or open the login URL above in a browser to finish. Press Esc to skip and /login later.".into(),
         Msg::CpSetupHeader =>
-            "  AtomCode CodingPlan setup:\n\n".into(),
+            "  {brand} CodingPlan setup:\n\n".into(),
         Msg::CpLoggedIn { who, username, email } =>
             format!("  ✓ Logged in as {} ({}, {})\n", who, username, email).into(),
         Msg::CpStepSkipped { reason } =>
@@ -99,11 +99,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpStatusFetchFailed { error } =>
             format!("  ⚠ Status fetch failed (non-fatal) — {}\n", error).into(),
         Msg::CpOfficialBuildRequired => Cow::Borrowed(
-            "This feature requires the official AtomCode build. Download it from \
+            "This feature requires the official {brand} build. Download it from \
              https://atomgit.com/atomgit_atomcode/atomcode/releases.",
         ),
         Msg::CpAuthRequired => Cow::Borrowed(
-            "Not signed in to AtomCode CodingPlan. Run /login to sign in \
+            "Not signed in to {brand} CodingPlan. Run /login to sign in \
              before sending a request.",
         ),
         Msg::CpSignStaleClockSkew => Cow::Borrowed(
@@ -114,12 +114,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "Request was repeatedly flagged as a replay. Please try the command again.",
         ),
         Msg::CpSignVersionTooOld => Cow::Borrowed(
-            "AtomCode is out of date and no longer compatible with CodingPlan. \
-             Please upgrade AtomCode to continue.",
+            "{brand} is out of date and no longer compatible with CodingPlan. \
+             Please upgrade {brand} to continue.",
         ),
         Msg::CpUpgradeRequired => Cow::Borrowed(
             "An upgrade is required to continue using CodingPlan. \
-             Please install the latest AtomCode from the official releases.",
+             Please install the latest {brand} from the official releases.",
         ),
 
         Msg::ErrUnsupportedLocale { input } =>
@@ -143,7 +143,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusClipboardImageHintSlash =>
             "Image in clipboard · /paste".into(),
         Msg::StatusWebuiHint =>
-            "Tips: Use /webui to open AtomCode in your browser".into(),
+            "Tips: Use /webui to open {brand} in your browser".into(),
 
         // ── /status command body ──
         Msg::StatusBody { model, dir, config } =>
@@ -231,7 +231,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Mouse wheel                      Scroll the chat area
     Mouse drag                       Select text
     Shift+mouse drag                 Use the terminal's native selection
-    Ctrl+Shift+C                     Copy the AtomCode selection
+    Ctrl+Shift+C                     Copy the {brand} selection
 
   ── Control flow ──
     Esc                              Clear input / close modal / cancel action
@@ -429,7 +429,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ToolBlockedBySecurityPolicy =>
             "Tool call blocked by security policy: credentials cannot be passed through generic shell arguments, temporary files, or environment variables".into(),
         Msg::PolicyRecoveryHeader => "Security decision required".into(),
-        Msg::PolicyRecoveryQuestion => "The credential operation was blocked. What should AtomCode do next?".into(),
+        Msg::PolicyRecoveryQuestion => "The credential operation was blocked. What should {brand} do next?".into(),
         Msg::PolicyRecoveryComplete => "I completed it externally".into(),
         Msg::PolicyRecoveryCompleteDesc => "Acknowledge external completion without calling the model".into(),
         Msg::PolicyRecoverySkip => "Skip this step".into(),
@@ -438,7 +438,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PolicyRecoveryInstructionsDesc => "Show fixed local guidance with placeholders only".into(),
         Msg::PolicyRecoveryEnd => "End task".into(),
         Msg::PolicyRecoveryEndDesc => "Close this intervention without calling the model".into(),
-        Msg::PolicyRecoverySafeInstructions => "Safe manual path:\n  1. Open a separate terminal you control.\n  2. Use the service's documented login flow or a credential-aware typed tool.\n  3. Complete the authenticated operation there; do not paste the secret into AtomCode.\n  4. Return here and choose ‘I completed it externally’.\nAtomCode intentionally does not reconstruct or display the rejected command.".into(),
+        Msg::PolicyRecoverySafeInstructions => "Safe manual path:\n  1. Open a separate terminal you control.\n  2. Use the service's documented login flow or a credential-aware typed tool.\n  3. Complete the authenticated operation there; do not paste the secret into {brand}.\n  4. Return here and choose ‘I completed it externally’.\n{brand} intentionally does not reconstruct or display the rejected command.".into(),
         Msg::PolicyRecoveryCompletedLocally => "External completion acknowledged. To avoid regenerating sensitive commands, recovery did not call the model; you may now submit a task that does not involve credentials.".into(),
         Msg::PolicyRecoverySkippedLocally => "The credential-dependent step was skipped. To avoid regenerating sensitive commands, recovery did not call the model; you may now submit another safe task.".into(),
         Msg::PolicyRecoverySubmitError => "Could not submit the security recovery decision. Please retry.".into(),
@@ -961,7 +961,7 @@ Msg::PluginMgrInstallingLabel => "Installing…".into(),
         Msg::PluginReloadDone { skills, warnings } =>
             format!("Plugins reloaded: {skills} skill(s), {warnings} warning(s)").into(),
         Msg::PluginGitNotFound =>
-            "💡 git is not installed or not on PATH. Plugin marketplace auto-install and auto-update are disabled. Install git (e.g. `xcode-select --install` on macOS, `sudo apt install git` on Ubuntu) and restart AtomCode.".into(),
+            "💡 git is not installed or not on PATH. Plugin marketplace auto-install and auto-update are disabled. Install git (e.g. `xcode-select --install` on macOS, `sudo apt install git` on Ubuntu) and restart {brand}.".into(),
         Msg::PluginMarketplaceAdded { name, commit, count, plugins } =>
             format!(
                 "✓ marketplace `{name}` added at {commit} ({count} plugins)\n  \
@@ -984,8 +984,8 @@ Msg::CmdDescSetup =>
 "Scan project, install seeds, and run setup skill [hooks|mcp|skills|all]".into(),
         Msg::CmdDescResume => "Resume a previous session".into(),
         Msg::CmdDescRename => "Rename current session".into(),
-        Msg::CmdDescLogin => "Sign in with AtomGit OAuth and claim CodingPlan models".into(),
-        Msg::CmdDescLogout => "Sign out of AtomGit".into(),
+        Msg::CmdDescLogin => "Sign in with {oauth} and claim CodingPlan models".into(),
+        Msg::CmdDescLogout => "Sign out".into(),
         Msg::CmdDescWhoami => "Show current logged-in user".into(),
         Msg::CmdDescModel =>
             "Set the default provider / model and switch this session".into(),
@@ -1021,7 +1021,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescHelp => "Show this help".into(),
         Msg::CmdDescKeys => "Show keyboard shortcuts".into(),
         Msg::CmdDescLanguage => "Switch display language".into(),
-        Msg::CmdDescQuit => "Exit AtomCode".into(),
+        Msg::CmdDescQuit => "Exit {brand}".into(),
         Msg::CmdDescSkills => "Browse loaded skills".into(),
         Msg::CmdDescPlugin => "Plugin marketplace (subcommands: marketplace, install, uninstall, reload, list)".into(),
         Msg::CmdDescPaste => "Attach an image from the clipboard (Windows fallback for Ctrl+V)".into(),
@@ -1050,17 +1050,17 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescTeam => "Show or control the Team Agent progress panel".into(),
         Msg::CmdDescSchedule => "List scheduled tasks and next run times".into(),
         Msg::CmdDescDesktop =>
-            "Open the AtomCode desktop app (launch it if installed, else show the download link)".into(),
+            "Open the {brand} desktop app (launch it if installed, else show the download link)".into(),
         Msg::DesktopOpening { name, path } =>
             format!("Opening {}…\n  {}\n", name, path).into(),
         Msg::DesktopNotInstalled { url } =>
-            format!("AtomCode desktop app not found. Download & install:\n  {}\n", url).into(),
+            format!("{{brand}} desktop app not found. Download & install:\n  {}\n", url).into(),
         Msg::DesktopLaunchFailed { path, err } =>
             format!("Found the app but couldn't launch it: {}\n  {}\n", err, path).into(),
         Msg::TodoNoList => "No task list yet (the model hasn't created todos).".into(),
         Msg::TodoListHeader => "Current tasks:".into(),
         Msg::TodoAddUsage => "Usage: /todo add <task description>".into(),
-        Msg::GuideMenuHeader => "📖 AtomCode Guide — type /guide <question>".into(),
+        Msg::GuideMenuHeader => "📖 {brand} Guide — type /guide <question>".into(),
         Msg::GuideMenuTopics => "Common topics:".into(),
         Msg::GuideMenuGettingStarted => "Getting started          First install, login, config".into(),
         Msg::GuideMenuSwitchModel => "Set default model        /model /provider usage".into(),
@@ -1100,7 +1100,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::OnboardingStepHeaderWelcome => "Step 1/3 · Welcome".into(),
         Msg::OnboardingStepHeaderLanguage => "Step 2/3 · Language".into(),
         Msg::OnboardingStepHeaderSetup => "Step 3/3 · Setup".into(),
-        Msg::OnboardingPanelTitle => "AtomCode".into(),
+        Msg::OnboardingPanelTitle => "{brand}".into(),
         Msg::OnboardingIntroVersionLine { v } =>
             format!("Version {v}  ·  AI coding agent in your terminal").into(),
         Msg::OnboardingIntroBullet1 =>
@@ -1311,8 +1311,8 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::BgTaskNoSummary => "Task completed (no summary text).".into(),
         // -- CLI atomcode --help i18n --
         Msg::CliAbout => "AI coding assistant in your terminal".into(),
-        Msg::CliAboutLogin => "Sign in with AtomGit OAuth and claim CodingPlan models in one flow".into(),
-        Msg::CliAboutLogout => "Logout from AtomCode".into(),
+        Msg::CliAboutLogin => "Sign in with {oauth} and claim CodingPlan models in one flow".into(),
+        Msg::CliAboutLogout => "Sign out".into(),
         Msg::CliAboutStatus => "Show current login status".into(),
         Msg::CliAboutUpgrade => "Upgrade atomcode in-place to the latest released version".into(),
         Msg::CliAboutRollback => "Roll back to the previous version (swap with .bak on disk)".into(),
@@ -1321,7 +1321,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CliAboutWebui => "Start the local browser webui".into(),
         Msg::CliAboutTelemetry => "Telemetry controls".into(),
         Msg::CliAboutPlugin => "Manage skill/command plugins".into(),
-        Msg::CliAboutUninstall => "Uninstall AtomCode: remove the binary, PATH edit, and data".into(),
+        Msg::CliAboutUninstall => "Uninstall {brand}: remove the binary, PATH edit, and data".into(),
         Msg::CliAboutSetup => "Install seed files (skills/commands/hooks/MCP) to ~/.atomcode/".into(),
         Msg::CliAboutHooks => "Manage hooks (list, test, enable/disable)".into(),
         Msg::CliAboutHooksList => "List all loaded hooks with their status".into(),

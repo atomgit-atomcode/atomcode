@@ -21,6 +21,7 @@ pub(crate) mod loop_ctrl;
 pub(crate) mod loop_parse;
 pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
+pub(crate) mod pointer_select;
 pub(crate) mod ui_event;
 pub(crate) mod usage_monitor;
 use commands::{execute_slash_command, format_rate_limited_line};
@@ -3924,7 +3925,9 @@ pub struct LoopCtx {
     /// TurnComplete (30s cooldown). Read on every redraw to construct
     /// the right-aligned usage hint when usage_percent ≥ 80% and the
     /// current model is on a CodingPlan provider.
-    pub usage_slot: std::sync::Arc<std::sync::Mutex<Option<atomcode_codingplan::types::UsageInfo>>>,
+    pub usage_slot: std::sync::Arc<
+        std::sync::Mutex<Option<(atomcode_codingplan::types::UsageInfo, std::time::Instant)>>,
+    >,
     /// Last time `usage_monitor::spawn_check` was invoked. Used to
     /// enforce `usage_monitor::USAGE_COOLDOWN` on TurnComplete-triggered
     /// refreshes. `None` = no check has run yet this session.
@@ -8950,6 +8953,9 @@ pub struct App {
     /// Flushed on newline or when buffer exceeds threshold.
     pub reasoning_buffer: String,
     transcript_selection: Option<TranscriptSelectionState>,
+    /// Last primary mouse press, for double/triple-click detection. See
+    /// `pointer_select::next_click`.
+    pointer_click: Option<pointer_select::ClickRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -9074,6 +9080,7 @@ impl App {
             setup_pending: false,
             reasoning_buffer: String::new(),
             transcript_selection: None,
+            pointer_click: None,
         }
     }
 }
@@ -9643,7 +9650,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // ── Terminal input ──
             maybe = ctx.input_rx.recv() => {
                 let Some(ev) = maybe else { break };
+                // Collapse a burst of drag-selection moves so the transcript
+                // repaints once per batch instead of once per queued Drag event.
+                let (ev, trailing) = coalesce_drag_events(ev, &mut ctx.input_rx);
                 handle_input(&mut app, &mut ctx, renderer, ev)?;
+                if let Some(trailing) = trailing {
+                    handle_input(&mut app, &mut ctx, renderer, trailing)?;
+                }
             }
 
             // ── Version-check wake ──
@@ -10064,7 +10077,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // ── Terminal input ──
             maybe = ctx.input_rx.recv() => {
                 let Some(ev) = maybe else { break };
+                // Collapse a burst of drag-selection moves so the transcript
+                // repaints once per batch instead of once per queued Drag event.
+                let (ev, trailing) = coalesce_drag_events(ev, &mut ctx.input_rx);
                 handle_input(&mut app, &mut ctx, renderer, ev)?;
+                if let Some(trailing) = trailing {
+                    handle_input(&mut app, &mut ctx, renderer, trailing)?;
+                }
             }
 
             // ── Version-check wake ──
@@ -12462,6 +12481,7 @@ fn handle_transcript_pointer(
     event: PointerEvent,
     frame: &crate::render::interaction::InteractionFrame,
     target: Option<crate::render::interaction::HitTarget>,
+    click_count: u8,
 ) -> TranscriptPointerRoute {
     use crate::render::interaction::{HitTarget, SemanticEndpoint};
     if event.shift || event.button != Some(crate::input::PointerButton::Primary) {
@@ -12474,8 +12494,67 @@ fn handle_transcript_pointer(
     match event.kind {
         PointerKind::Down => {
             let Some(endpoint) = endpoint else {
+                // Bare primary click OFF any transcript text dismisses an
+                // existing selection (standard editor/terminal behavior — the
+                // old code left it stuck highlighted). Only CONSUME the click
+                // (Redraw, to repaint the highlight away) when it lands on
+                // truly empty space (`target` None) where nothing else would
+                // handle it. When it lands on an interactive target
+                // (composer/menu/modal — a non-transcript hit), clear the
+                // selection but return `Ignored` so that target still receives
+                // the click and repaints itself; consuming it here would swallow
+                // the first menu/modal/composer click after a selection.
+                if selection.is_some() {
+                    *selection = None;
+                    publish_transcript_selection(None, publisher);
+                    return match target {
+                        None => TranscriptPointerRoute::Redraw,
+                        Some(_) => TranscriptPointerRoute::Ignored,
+                    };
+                }
                 return TranscriptPointerRoute::Ignored;
             };
+            // Double-click selects the WORD, triple-click the LINE — select and
+            // copy immediately, reusing the drag-Up `Copy` route (no drag).
+            if click_count >= 2 {
+                let (anchor, head) = if click_count == 2 {
+                    match frame.copy_runs.iter().find(|run| run.id == endpoint.run_id) {
+                        Some(run) => {
+                            let (start, end) =
+                                pointer_select::word_bounds(&run.text, endpoint.byte);
+                            (
+                                SemanticEndpoint { run_id: endpoint.run_id, byte: start },
+                                SemanticEndpoint { run_id: endpoint.run_id, byte: end },
+                            )
+                        }
+                        None => (endpoint, endpoint),
+                    }
+                } else {
+                    match pointer_select::line_run_span(&frame.copy_runs, endpoint.run_id) {
+                        Some((first, last)) => (
+                            SemanticEndpoint { run_id: frame.copy_runs[first].id, byte: 0 },
+                            SemanticEndpoint {
+                                run_id: frame.copy_runs[last].id,
+                                byte: frame.copy_runs[last].text.len(),
+                            },
+                        ),
+                        None => (endpoint, endpoint),
+                    }
+                };
+                *selection = Some(TranscriptSelectionState {
+                    generation: frame.generation,
+                    surface_session: frame.surface_session,
+                    anchor,
+                    head,
+                    surviving_run_ids: frame.copy_runs.iter().map(|run| run.id).collect(),
+                    dragging: false,
+                });
+                publish_transcript_selection(selection.as_ref(), publisher);
+                let surviving_runs: Vec<_> = frame.copy_runs.iter().cloned().collect();
+                return extract_transcript_selection(&surviving_runs, anchor, head)
+                    .filter(|text| !text.is_empty())
+                    .map_or(TranscriptPointerRoute::Redraw, TranscriptPointerRoute::Copy);
+            }
             *selection = Some(TranscriptSelectionState {
                 generation: frame.generation,
                 surface_session: frame.surface_session,
@@ -12617,12 +12696,34 @@ fn handle_pointer_hit(
     frame: &crate::render::interaction::InteractionFrame,
 ) -> Result<()> {
     let target = frame.hit(event.row, event.col);
+    // (Scroll resets `pointer_click` in the ScrollContinue branch of
+    // `handle_input`, before this fn — scroll never reaches here.)
+    // Classify multi-clicks on primary presses (double = word, triple = line).
+    // `Instant::now()` lives here at the impure boundary; the pure logic is in
+    // `pointer_select::next_click`.
+    let click_count = if event.kind == PointerKind::Down
+        && event.button == Some(crate::input::PointerButton::Primary)
+        && !event.shift
+    {
+        let record = pointer_select::next_click(
+            app.pointer_click,
+            std::time::Instant::now(),
+            event.row,
+            event.col,
+            pointer_select::MULTI_CLICK_WINDOW,
+        );
+        app.pointer_click = Some(record);
+        record.count
+    } else {
+        1
+    };
     let transcript_route = handle_transcript_pointer(
         &mut app.transcript_selection,
         &ctx.interaction_publisher,
         event,
         frame,
         target,
+        click_count,
     );
     if apply_transcript_pointer_route(app, ctx, renderer, transcript_route)? {
         return Ok(());
@@ -12994,6 +13095,35 @@ fn cancel_unactionable_pointer_release(
     cancel
 }
 
+/// Collapse a burst of drag-selection moves before dispatch. A fast mouse drag
+/// fires dozens of `Drag` events, and each one triggers a FULL transcript
+/// repaint (`redraw_idle_plain`) to update the selection highlight — the
+/// reported "拖到最后越来越卡". Mirroring the resize coalescing, drain the leading
+/// run of consecutive `Drag` events already queued in `input_rx` and keep only
+/// the LATEST, so the transcript repaints once per batch instead of once per
+/// event. Returns the (possibly collapsed) event to dispatch, plus the first
+/// non-`Drag` event that ended the run — dispatch it NEXT to preserve ordering
+/// (e.g. the mouse-`Up` that finishes the drag, or a `Down` starting a fresh
+/// gesture). Non-drag / non-pointer events pass straight through.
+fn coalesce_drag_events(
+    ev: InputEvent,
+    input_rx: &mut mpsc::UnboundedReceiver<InputEvent>,
+) -> (InputEvent, Option<InputEvent>) {
+    if !matches!(&ev, InputEvent::Pointer(p) if p.kind == PointerKind::Drag) {
+        return (ev, None);
+    }
+    let mut latest = ev;
+    while let Ok(next) = input_rx.try_recv() {
+        match next {
+            InputEvent::Pointer(p) if p.kind == PointerKind::Drag => {
+                latest = InputEvent::Pointer(p);
+            }
+            other => return (latest, Some(other)),
+        }
+    }
+    (latest, None)
+}
+
 fn handle_input(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -13095,6 +13225,12 @@ fn handle_input(
         }
         InputEvent::Pointer(pointer) => {
             if preflight == PointerPreflightRoute::ScrollContinue {
+                // A scroll shifts transcript content UNDER the cell grid, so a
+                // press at the same (row, col) afterward is a different glyph —
+                // drop the last-click record so it can't be misread as a
+                // double/triple click. Scroll is routed here (ScrollContinue),
+                // bypassing `handle_pointer_hit`, so the reset must live here.
+                app.pointer_click = None;
                 apply_pointer_event(pointer, renderer);
             } else {
                 if let Some(interaction) = interaction.as_deref() {
@@ -13122,6 +13258,10 @@ fn handle_input(
             if let Some(selection) = app.transcript_selection.as_mut() {
                 selection.dragging = false;
             }
+            // A reflow moves transcript content under the cell grid, so a click
+            // at the same (row, col) after a resize is a different glyph — drop
+            // the last-click record so it can't be misread as a multi-click.
+            app.pointer_click = None;
             // Coalesce burst-fired SIGWINCH events. gnome-terminal /
             // alacritty / iTerm2 send a Resize per pixel during a
             // window drag — a 200ms drag fires 30+ events. Without
@@ -13615,6 +13755,68 @@ mod tests {
         }
     }
 
+    fn drag_at(row: u16) -> crate::input::InputEvent {
+        let mut p = pointer(PointerKind::Drag, Some(PointerButton::Primary), false);
+        p.row = row;
+        crate::input::InputEvent::Pointer(p)
+    }
+    fn pointer_ev(kind: PointerKind) -> crate::input::InputEvent {
+        crate::input::InputEvent::Pointer(pointer(kind, Some(PointerButton::Primary), false))
+    }
+
+    #[test]
+    fn coalesce_drag_collapses_run_to_latest_and_keeps_trailing_up() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(drag_at(2)).unwrap();
+        tx.send(drag_at(3)).unwrap();
+        tx.send(pointer_ev(PointerKind::Up)).unwrap();
+        // Start from the first drag; the queued drags collapse to the latest (row 3),
+        // and the Up that ends the run is returned as the trailing event.
+        let (ev, trailing) = super::coalesce_drag_events(drag_at(1), &mut rx);
+        match ev {
+            crate::input::InputEvent::Pointer(p) => {
+                assert_eq!(p.kind, PointerKind::Drag);
+                assert_eq!(p.row, 3, "kept the newest drag position");
+            }
+            _ => panic!("expected a Drag"),
+        }
+        match trailing {
+            Some(crate::input::InputEvent::Pointer(p)) => assert_eq!(p.kind, PointerKind::Up),
+            other => panic!("expected trailing Up, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "queue fully drained");
+    }
+
+    #[test]
+    fn coalesce_stops_at_a_new_gesture_down() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(pointer_ev(PointerKind::Down)).unwrap(); // a fresh gesture, not part of the drag
+        let (ev, trailing) = super::coalesce_drag_events(drag_at(1), &mut rx);
+        assert!(matches!(ev, crate::input::InputEvent::Pointer(p) if p.kind == PointerKind::Drag));
+        match trailing {
+            Some(crate::input::InputEvent::Pointer(p)) => assert_eq!(p.kind, PointerKind::Down),
+            other => panic!("a Down must end the run and be preserved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coalesce_single_drag_with_empty_queue_is_unchanged() {
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ev, trailing) = super::coalesce_drag_events(drag_at(5), &mut rx);
+        assert!(trailing.is_none());
+        assert!(matches!(ev, crate::input::InputEvent::Pointer(p) if p.row == 5));
+    }
+
+    #[test]
+    fn coalesce_leaves_non_drag_events_untouched() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(drag_at(9)).unwrap(); // must NOT be consumed for a non-drag input
+        let (ev, trailing) = super::coalesce_drag_events(pointer_ev(PointerKind::Down), &mut rx);
+        assert!(matches!(ev, crate::input::InputEvent::Pointer(p) if p.kind == PointerKind::Down));
+        assert!(trailing.is_none());
+        assert!(rx.try_recv().is_ok(), "a non-drag input must not drain the queue");
+    }
+
     fn pointer_interaction() -> InteractionFrame {
         InteractionFrame {
             generation: 1,
@@ -13779,6 +13981,7 @@ mod tests {
                     run_id: 100,
                     byte: 0
                 }),
+                1,
             ),
             super::TranscriptPointerRoute::Handled
         );
@@ -13794,6 +13997,7 @@ mod tests {
                     run_id: 101,
                     byte: 5
                 }),
+                1,
             ),
             super::TranscriptPointerRoute::Redraw
         );
@@ -13814,6 +14018,7 @@ mod tests {
                 run_id: 999,
                 byte: 3,
             }),
+            1,
         );
         assert_eq!(result, super::TranscriptPointerRoute::Copy("old-a".into()));
         assert!(!format!("{result:?}").contains("NEW"));
@@ -13827,6 +14032,7 @@ mod tests {
                     run_id: 999,
                     byte: 3
                 }),
+                1,
             ),
             super::TranscriptPointerRoute::Ignored,
             "one completed gesture copies exactly once"
@@ -13845,6 +14051,7 @@ mod tests {
                 pointer(PointerKind::Down, Some(PointerButton::Primary), false),
                 &first,
                 Some(HitTarget::TranscriptByte { run_id: 1, byte: 0 }),
+                1,
             ),
             super::TranscriptPointerRoute::Handled
         );
@@ -13856,11 +14063,133 @@ mod tests {
                 pointer(PointerKind::Up, Some(PointerButton::Primary), false),
                 &next,
                 Some(HitTarget::TranscriptByte { run_id: 1, byte: 9 }),
+                1,
             ),
             super::TranscriptPointerRoute::Handled
         );
         assert!(selection.is_none());
         assert!(publisher.transcript_selection().is_none());
+    }
+
+    #[test]
+    fn transcript_double_click_selects_the_word_and_copies() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let frame = transcript_frame(1, 5, vec![copy_run(1, "hello world", false)]);
+        let mut selection = None;
+        let route = super::handle_transcript_pointer(
+            &mut selection,
+            &publisher,
+            pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+            &frame,
+            // byte 7 lands inside "world"
+            Some(HitTarget::TranscriptByte { run_id: 1, byte: 7 }),
+            2, // double-click
+        );
+        assert_eq!(route, super::TranscriptPointerRoute::Copy("world".into()));
+        assert!(
+            publisher.transcript_selection().is_some(),
+            "the selected word must be published so it highlights"
+        );
+    }
+
+    #[test]
+    fn transcript_triple_click_selects_the_whole_soft_wrapped_line_and_copies() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        // run 1 soft-wraps into run 2 (copy_run sets next_run_id = Some(2)):
+        // together they are one logical line "foo bar" (no newline between).
+        let frame = transcript_frame(1, 5, vec![copy_run(1, "foo ", true), copy_run(2, "bar", false)]);
+        let mut selection = None;
+        let route = super::handle_transcript_pointer(
+            &mut selection,
+            &publisher,
+            pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+            &frame,
+            Some(HitTarget::TranscriptByte { run_id: 1, byte: 1 }),
+            3, // triple-click
+        );
+        assert_eq!(route, super::TranscriptPointerRoute::Copy("foo bar".into()));
+    }
+
+    #[test]
+    fn transcript_click_on_empty_area_clears_an_existing_selection() {
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let frame = transcript_frame(1, 5, vec![copy_run(1, "hello", false)]);
+        let mut selection = None;
+        // Seed a selection with a normal single-click drag start.
+        super::handle_transcript_pointer(
+            &mut selection,
+            &publisher,
+            pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+            &frame,
+            Some(HitTarget::TranscriptByte { run_id: 1, byte: 0 }),
+            1,
+        );
+        assert!(selection.is_some(), "precondition: a selection exists");
+        // A bare click on empty space (no hit target) dismisses it.
+        let route = super::handle_transcript_pointer(
+            &mut selection,
+            &publisher,
+            pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+            &frame,
+            None,
+            1,
+        );
+        assert_eq!(route, super::TranscriptPointerRoute::Redraw);
+        assert!(selection.is_none(), "selection cleared");
+        assert!(publisher.transcript_selection().is_none());
+    }
+
+    #[test]
+    fn transcript_click_on_interactive_target_clears_selection_without_consuming() {
+        // Regression guard: dismissing a selection must NOT consume the click
+        // when it lands on an interactive target (menu/modal/composer) — that
+        // target still needs to receive it. Only truly-empty clicks consume.
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let frame = transcript_frame(1, 5, vec![copy_run(1, "hello", false)]);
+        let mut selection = None;
+        super::handle_transcript_pointer(
+            &mut selection,
+            &publisher,
+            pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+            &frame,
+            Some(HitTarget::TranscriptByte { run_id: 1, byte: 0 }),
+            1,
+        );
+        assert!(selection.is_some(), "precondition: a selection exists");
+        let route = super::handle_transcript_pointer(
+            &mut selection,
+            &publisher,
+            pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+            &frame,
+            Some(HitTarget::MenuItem { index: 0 }),
+            1,
+        );
+        assert_eq!(
+            route,
+            super::TranscriptPointerRoute::Ignored,
+            "the menu click must NOT be swallowed by the dismiss"
+        );
+        assert!(selection.is_none(), "selection is still dismissed");
+    }
+
+    #[test]
+    fn transcript_click_off_text_with_no_selection_stays_ignored_for_the_composer() {
+        // With NO transcript selection active, a click that lands on the
+        // composer must fall through to `Ignored` so the composer positions its
+        // own cursor — the dismiss branch must not steal ordinary composer
+        // clicks.
+        let publisher = crate::render::interaction::InteractionPublisher::default();
+        let frame = transcript_frame(1, 5, vec![copy_run(1, "hello", false)]);
+        let mut selection = None;
+        let route = super::handle_transcript_pointer(
+            &mut selection,
+            &publisher,
+            pointer(PointerKind::Down, Some(PointerButton::Primary), false),
+            &frame,
+            Some(HitTarget::ComposerByte { byte: 3 }),
+            1,
+        );
+        assert_eq!(route, super::TranscriptPointerRoute::Ignored);
     }
 
     #[test]
@@ -13926,6 +14255,7 @@ mod tests {
                     run_id: 100,
                     byte: 0
                 }),
+                1,
             ),
             super::TranscriptPointerRoute::Handled
         );
@@ -13939,6 +14269,7 @@ mod tests {
                     run_id: 101,
                     byte: "old-b".len(),
                 }),
+                1,
             ),
             super::TranscriptPointerRoute::Redraw
         );
@@ -23474,6 +23805,16 @@ fn handle_runtime_event(
                 renderer.flush();
                 return;
             }
+            // The selection was leased by another live runtime, so a copy was
+            // forked to resume in its place (mirrors `--continue`). Notify the
+            // user once the switch actually lands.
+            let fork_notice = prepared.forked_from.as_deref().map(|source_id| {
+                crate::i18n::t(crate::i18n::Msg::SessionBusyForked {
+                    source_id,
+                    fork_id: prepared.view.meta.id.as_str(),
+                })
+                .into_owned()
+            });
             let project_bucket = prepared.project_bucket;
             let session = match Session::from_catalog_view(prepared.view) {
                 Ok(session) => session,
@@ -23503,6 +23844,10 @@ fn handle_runtime_event(
                 ));
                 renderer.flush();
                 return;
+            }
+            if let Some(notice) = fork_notice {
+                renderer.render(UiLine::CommandOutput(notice));
+                renderer.flush();
             }
             ctx.pending_session_resume = Some(PendingSessionResume {
                 project_bucket,

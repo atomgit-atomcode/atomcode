@@ -75,6 +75,82 @@ fn continuation_footer(
     }
 }
 
+/// Render one 1-based numbered line for the model (`<n>\t<content>\n`), truncating a
+/// pathologically long line to `MAX_LINE_LEN` chars. Shared by the single-range and
+/// multi-range paths so both prefix line numbers and truncate identically.
+fn render_line(n: usize, line: &str) -> String {
+    if line.chars().count() > MAX_LINE_LEN {
+        let head: String = line.chars().take(MAX_LINE_LEN).collect();
+        format!("{n}\t{head}... (line truncated to {MAX_LINE_LEN} chars)\n")
+    } else {
+        format!("{n}\t{line}\n")
+    }
+}
+
+/// Read several disjoint line windows in ONE call — collapses what would otherwise be
+/// N sequential paginated reads. Ranges render in the order given (no merge/dedup: the
+/// caller asked for exactly these), each under a `[Lines a-b]` header, ALL sharing the
+/// single `MAX_READ_OUTPUT_BYTES` budget so the combined result stays as bounded as a
+/// normal page (keeps the per-turn output small — important for prompt-cache/cold-start).
+/// When the budget runs out, the still-unshown ranges are reported so the model can
+/// re-request them.
+fn render_multi_range(file_path: &str, text: &str, total: usize, ranges: &[RangeArg]) -> String {
+    // Keep content under a cap that reserves room for the trailing "budget reached" line,
+    // so the whole result (content + summary) stays within MAX_READ_OUTPUT_BYTES.
+    const SUMMARY_RESERVE: usize = 160;
+    let content_cap = MAX_READ_OUTPUT_BYTES.saturating_sub(SUMMARY_RESERVE);
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = format!("[Multi-range read of {file_path} ({total} lines total).]\n");
+    let mut shown = 0usize;
+    let mut budget_hit = false;
+    for r in ranges {
+        let start = r.offset.unwrap_or(1).max(1);
+        let start_idx = start - 1;
+        if start_idx >= total {
+            out.push_str(&format!(
+                "\n[Lines {start}-… : beyond end of file ({total} lines total)]\n"
+            ));
+            shown += 1;
+            continue;
+        }
+        let limit = r.limit.unwrap_or(DEFAULT_READ_LIMIT).max(1);
+        let end_idx = start_idx.saturating_add(limit).min(total);
+        let header = format!("\n[Lines {start}-{end_idx}]\n");
+
+        // Build the window body first; commit header + body together only if at least one
+        // line fits, so the budget never leaves a bare header with no content behind (and a
+        // content-less window is never counted as "shown").
+        let mut body = String::new();
+        for (i, line) in lines.iter().enumerate().take(end_idx).skip(start_idx) {
+            let rendered = render_line(i + 1, line);
+            if out.len() + header.len() + body.len() + rendered.len() > content_cap {
+                budget_hit = true;
+                break;
+            }
+            body.push_str(&rendered);
+        }
+        if body.is_empty() {
+            // Not even the first line fit → report overflow instead of an empty section.
+            budget_hit = true;
+            break;
+        }
+        out.push_str(&header);
+        out.push_str(&body);
+        shown += 1;
+        if budget_hit {
+            break;
+        }
+    }
+    if budget_hit && shown < ranges.len() {
+        out.push_str(&format!(
+            "\n[Output budget reached; {shown} of {} ranges shown. Re-request the remaining ranges.]\n",
+            ranges.len()
+        ));
+    }
+    out
+}
+
 /// Cap on an image read back to a vision model: base64 inflates ~33% and every image
 /// costs ~1600 tokens, so refuse an oversized one (it would blow the result-size cap /
 /// context) and fall back to the binary-text hint. Generous enough for book covers,
@@ -99,6 +175,16 @@ fn image_media_type(path: &std::path::Path) -> Option<&'static str> {
     })
 }
 
+/// One window in a multi-range read. Same lenient numeric handling as the top-level
+/// `offset`/`limit` (weak models emit `"10"` / `10.0`).
+#[derive(Deserialize)]
+struct RangeArg {
+    #[serde(default, deserialize_with = "lenient_usize")]
+    offset: Option<usize>,
+    #[serde(default, deserialize_with = "lenient_usize")]
+    limit: Option<usize>,
+}
+
 #[derive(Deserialize)]
 struct Args {
     file_path: String,
@@ -106,6 +192,10 @@ struct Args {
     offset: Option<usize>,
     #[serde(default, deserialize_with = "lenient_usize")]
     limit: Option<usize>,
+    /// Optional multiple windows in one call; when present and non-empty it takes
+    /// precedence over `offset`/`limit` and over the large-file skeleton.
+    #[serde(default)]
+    ranges: Option<Vec<RangeArg>>,
 }
 
 /// Deserialize a usize that weak models may send as a float or a string (`50`, `"50"`,
@@ -176,8 +266,10 @@ impl Tool for ReadFileTool {
          budget may return fewer. When a result shows a continuation offset, continue from \
          that offset instead of rereading line 1. Use `offset` (1-based start line) and \
          `limit` (max lines) when a larger relevant window is needed; avoid many tiny \
-         overlapping reads. If the path is a directory its entries are listed instead. \
-         Relative paths resolve against the working directory."
+         overlapping reads. To grab several disjoint windows at once (e.g. multiple \
+         symbols listed in a skeleton), pass `ranges` instead of paginating. If the path \
+         is a directory its entries are listed instead. Relative paths resolve against \
+         the working directory."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -194,6 +286,18 @@ impl Tool for ReadFileTool {
                     "minimum": 1,
                     "default": DEFAULT_READ_LIMIT,
                     "description": "Maximum lines to read. Defaults to 300; the output byte budget may return fewer."
+                },
+                "ranges": {
+                    "type": "array",
+                    "description": "Read several disjoint line windows in ONE call instead of paginating. Each item is {offset, limit}. Takes precedence over top-level offset/limit and over the large-file skeleton. Prefer this when you already know the ranges (e.g. from a skeleton's per-symbol offset/limit). All windows share one output budget.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "offset": { "type": "integer", "minimum": 1, "description": "Start line, 1-based" },
+                            "limit": { "type": "integer", "minimum": 1, "description": "Max lines for this window" }
+                        },
+                        "required": ["offset"]
+                    }
                 }
             },
             "required": ["file_path"]
@@ -214,7 +318,11 @@ impl Tool for ReadFileTool {
                 ))
             }
         };
-        if a.limit == Some(0) {
+        // Only enforce the top-level `limit` when it actually governs the read — a
+        // multi-range request ignores top-level offset/limit (per-window limits are
+        // coerced to ≥1 in render_multi_range), so it must not be rejected here.
+        let has_ranges = a.ranges.as_deref().is_some_and(|r| !r.is_empty());
+        if !has_ranges && a.limit == Some(0) {
             return err("read_file: `limit` must be at least 1.");
         }
         let path = resolve_path(&a.file_path, &ctx.working_dir);
@@ -319,12 +427,19 @@ impl Tool for ReadFileTool {
         // on line pointers than on the bounded source bytes themselves.
         let total = text.lines().count();
 
+        // Multi-range: several disjoint windows in one call (collapses N paginated reads).
+        // Checked BEFORE the skeleton branch so an explicit ranges request always reads
+        // content, and before the single-range slice so it takes precedence.
+        if let Some(ranges) = a.ranges.as_deref().filter(|r| !r.is_empty()) {
+            return ok(render_multi_range(&a.file_path, &text, total, ranges));
+        }
+
         // codeintel enrichment: outline a large CODE file as a symbol skeleton instead of
         // dumping it (cross-capability composition; only when codeintel is compiled in).
         // A given offset/limit means the model wants a specific range, so skip it.
         #[cfg(feature = "codeintel")]
         if a.offset.is_none() && a.limit.is_none() && total > SKELETON_THRESHOLD {
-            if let Some(skel) = crate::codeintel::skeleton(&path, text.as_ref()) {
+            if let Some(skel) = crate::codeintel::skeleton(&path, text.as_ref(), &a.file_path) {
                 return ok(skel);
             }
         }
@@ -348,12 +463,7 @@ impl Tool for ReadFileTool {
             .enumerate()
         {
             let n = start + i;
-            let rendered = if line.chars().count() > MAX_LINE_LEN {
-                let head: String = line.chars().take(MAX_LINE_LEN).collect();
-                format!("{n}\t{head}... (line truncated to {MAX_LINE_LEN} chars)\n")
-            } else {
-                format!("{n}\t{line}\n")
-            };
+            let rendered = render_line(n, line);
             let candidate_end = start_idx + i + 1;
             let footer_len = if candidate_end < total {
                 continuation_footer(&a.file_path, start, candidate_end, total, page_limit).len()
@@ -537,6 +647,105 @@ mod tests {
         let args: Args =
             serde_json::from_str(r#"{"file_path":"x","offset":4503599627370495.0}"#).unwrap();
         assert_eq!(args.offset, Some(4_503_599_627_370_495));
+    }
+
+    fn ten_lines() -> String {
+        (1..=10)
+            .map(|n| format!("l{n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
+    #[test]
+    fn multi_range_renders_disjoint_windows_in_order() {
+        let text = ten_lines();
+        let total = text.lines().count();
+        let ranges = vec![
+            RangeArg { offset: Some(2), limit: Some(2) },
+            RangeArg { offset: Some(7), limit: Some(1) },
+        ];
+        let out = render_multi_range("a.txt", &text, total, &ranges);
+        assert!(out.contains("[Lines 2-3]"), "{out}");
+        assert!(out.contains("2\tl2") && out.contains("3\tl3"), "{out}");
+        assert!(out.contains("[Lines 7-7]") && out.contains("7\tl7"), "{out}");
+        // only the requested windows — unrequested lines are absent
+        assert!(!out.contains("1\tl1") && !out.contains("5\tl5"), "{out}");
+        // rendered in request order
+        assert!(out.find("[Lines 2-3]") < out.find("[Lines 7-7]"), "{out}");
+    }
+
+    #[test]
+    fn multi_range_reports_out_of_bounds_window_gracefully() {
+        let text = ten_lines();
+        let out = render_multi_range(
+            "a.txt",
+            &text,
+            10,
+            &[RangeArg { offset: Some(99), limit: Some(3) }],
+        );
+        assert!(out.contains("beyond end of file"), "{out}");
+    }
+
+    #[test]
+    fn multi_range_shares_one_output_budget() {
+        // Many wide ranges must not exceed the single-page byte cap; overflow is reported.
+        let text = (1..=5000)
+            .map(|n| format!("{n}: {}", "x".repeat(200)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let total = text.lines().count();
+        let ranges: Vec<RangeArg> = (1..=50)
+            .map(|k| RangeArg { offset: Some(k * 50), limit: Some(20) })
+            .collect();
+        let out = render_multi_range("big.txt", &text, total, &ranges);
+        assert!(out.len() <= MAX_READ_OUTPUT_BYTES, "exceeded budget: {}", out.len());
+        assert!(out.contains("Output budget reached"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn ranges_take_precedence_over_a_zero_top_level_limit() {
+        // A multi-range read ignores top-level offset/limit, so `limit:0` must NOT be
+        // rejected when `ranges` is present (precedence honored).
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let r = ReadFileTool::default()
+            .execute(
+                r#"{"file_path":"a.txt","limit":0,"ranges":[{"offset":2,"limit":1}]}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("2\ttwo"), "{}", r.content);
+        // top-level limit:0 alone still errors (no ranges)
+        let r0 = ReadFileTool::default()
+            .execute(r#"{"file_path":"a.txt","limit":0}"#, &ctx(d.path()))
+            .await;
+        assert!(r0.is_error && r0.content.contains("at least 1"), "{}", r0.content);
+    }
+
+    #[tokio::test]
+    async fn ranges_param_reads_multiple_windows_and_bypasses_skeleton() {
+        let d = tempfile::tempdir().unwrap();
+        // >300 code symbols → a plain read would return a skeleton; ranges must bypass it.
+        let body = (1..=400)
+            .map(|n| format!("fn f{n}() {{}}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(d.path().join("a.rs"), &body).unwrap();
+        let r = ReadFileTool::default()
+            .execute(
+                r#"{"file_path":"a.rs","ranges":[{"offset":10,"limit":2},{"offset":300,"limit":1}]}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("10\tfn f10()"), "{}", r.content);
+        assert!(r.content.contains("300\tfn f300()"), "{}", r.content);
+        assert!(!r.content.contains("File skeleton"), "ranges must bypass skeleton: {}", r.content);
+        // an unrequested line must not appear
+        assert!(!r.content.contains("200\tfn f200()"), "{}", r.content);
     }
 
     #[tokio::test]

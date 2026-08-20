@@ -316,10 +316,17 @@ impl TerminalCaps {
             && (!in_ssh || env.force_mouse_sgr == Some(true));
         let clipboard_passthrough = (!in_tmux || tmux_passthrough)
             && (!in_ssh || env.force_osc52_clipboard == Some(true));
-        let mouse_sgr = capability_safe
-            && known_protocol_emulator
-            && env.force_mouse_sgr != Some(false)
-            && mouse_passthrough;
+        // Mouse capture is OPT-IN: OFF by default (even on the allowlist) so
+        // terminal-native mouse selection/copy/paste/double-click stay intact
+        // and behave consistently across every terminal. Set `ATOMCODE_MOUSE_SGR=1`
+        // (force == Some(true)) to re-enable atomcode's app-level mouse
+        // selection (word double-click, clean cross-chrome copy, click-to-cursor).
+        // `capability_safe` still hard-blocks dumb/jediterm/legacy even when
+        // forced; `mouse_passthrough` keeps tmux/ssh safe. `known_protocol_emulator`
+        // no longer gates it — an explicit opt-in is the user's responsibility.
+        // (OSC52 keyboard-copy below is UNCHANGED: still allowlist-default-on.)
+        let mouse_sgr =
+            capability_safe && env.force_mouse_sgr == Some(true) && mouse_passthrough;
         let osc52_clipboard = capability_safe
             && known_protocol_emulator
             && env.force_osc52_clipboard != Some(false)
@@ -486,7 +493,11 @@ mod tests {
                     kitty_window_id: Some("1".into()),
                     ..env()
                 },
-                mouse_sgr: true,
+                // Mouse capture is now OPT-IN (ATOMCODE_MOUSE_SGR=1): off by
+                // default even on the allowlist, so terminal-native mouse
+                // selection/copy/paste stays intact. OSC52 keyboard-copy is
+                // unchanged (still on for the allowlist).
+                mouse_sgr: false,
                 osc52_clipboard: true,
                 tmux_passthrough: false,
             },
@@ -496,7 +507,11 @@ mod tests {
                     wezterm_version: Some("20240203".into()),
                     ..env()
                 },
-                mouse_sgr: true,
+                // Mouse capture is now OPT-IN (ATOMCODE_MOUSE_SGR=1): off by
+                // default even on the allowlist, so terminal-native mouse
+                // selection/copy/paste stays intact. OSC52 keyboard-copy is
+                // unchanged (still on for the allowlist).
+                mouse_sgr: false,
                 osc52_clipboard: true,
                 tmux_passthrough: false,
             },
@@ -506,7 +521,11 @@ mod tests {
                     term_program: Some("iTerm.app".into()),
                     ..env()
                 },
-                mouse_sgr: true,
+                // Mouse capture is now OPT-IN (ATOMCODE_MOUSE_SGR=1): off by
+                // default even on the allowlist, so terminal-native mouse
+                // selection/copy/paste stays intact. OSC52 keyboard-copy is
+                // unchanged (still on for the allowlist).
+                mouse_sgr: false,
                 osc52_clipboard: true,
                 tmux_passthrough: false,
             },
@@ -517,7 +536,11 @@ mod tests {
                     wt_session: Some("session".into()),
                     ..env()
                 },
-                mouse_sgr: true,
+                // Mouse capture is now OPT-IN (ATOMCODE_MOUSE_SGR=1): off by
+                // default even on the allowlist, so terminal-native mouse
+                // selection/copy/paste stays intact. OSC52 keyboard-copy is
+                // unchanged (still on for the allowlist).
+                mouse_sgr: false,
                 osc52_clipboard: true,
                 tmux_passthrough: false,
             },
@@ -697,9 +720,42 @@ mod tests {
                 term: Some(term.into()),
                 ..env()
             });
-            assert!(caps.mouse_sgr, "{term:?} is allowlisted");
+            // Mouse capture is opt-in (ATOMCODE_MOUSE_SGR=1) — OFF by default
+            // even on the allowlist, so native mouse selection stays. OSC52
+            // keyboard-copy remains allowlisted-on.
+            assert!(!caps.mouse_sgr, "{term:?}: mouse capture is opt-in, off by default");
             assert!(caps.osc52_clipboard, "{term:?} is allowlisted");
         }
+    }
+
+    #[test]
+    fn mouse_capture_is_opt_in_via_force_only() {
+        // Default (no ATOMCODE_MOUSE_SGR): an allowlisted terminal does NOT
+        // capture the mouse — native selection/copy/paste is preserved.
+        let default_kitty = TerminalCaps::from_env(EnvView {
+            kitty_window_id: Some("1".into()),
+            ..env()
+        });
+        assert!(!default_kitty.mouse_sgr, "default: mouse capture off");
+        assert!(default_kitty.osc52_clipboard, "osc52 unaffected by the flip");
+
+        // Opt-in: ATOMCODE_MOUSE_SGR=1 (force = Some(true)) turns app-level
+        // mouse capture back on, even without an allowlist match (the user
+        // takes responsibility); still gated by capability_safe.
+        let opted_in = TerminalCaps::from_env(EnvView {
+            term: Some("xterm-256color".into()),
+            force_mouse_sgr: Some(true),
+            ..env()
+        });
+        assert!(opted_in.mouse_sgr, "explicit opt-in re-enables capture");
+
+        // capability_safe still hard-blocks opt-in on a dumb/degraded terminal.
+        let opted_in_dumb = TerminalCaps::from_env(EnvView {
+            term: Some("dumb".into()),
+            force_mouse_sgr: Some(true),
+            ..env()
+        });
+        assert!(!opted_in_dumb.mouse_sgr, "capability_safe overrides opt-in on dumb");
     }
 
     // Regression: a Windows user reported that arrow keys couldn't navigate

@@ -128,6 +128,7 @@ async fn full_assembly_wire_prefix_is_cacheable_across_turns() {
         skill_dirs: Some(vec![project.path().join("skills")]),
         plugin_skill_dirs: Vec::new(),
         mcp: false,
+        extra_mcp_servers: Vec::new(),
         memory: true,
         web: false,
         review: false,
@@ -218,6 +219,7 @@ async fn tool_block_and_system_are_deterministic_across_independent_assemblies()
         skill_dirs: Some(vec![project.path().join("skills")]),
         plugin_skill_dirs: Vec::new(),
         mcp: false,
+        extra_mcp_servers: Vec::new(),
         memory: true,
         web: true, // include web tools too — more tools = a stronger ordering check
         review: false,

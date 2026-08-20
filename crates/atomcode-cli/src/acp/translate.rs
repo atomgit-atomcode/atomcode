@@ -1,6 +1,6 @@
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, SessionUpdate, TextContent, ToolCall as AcpToolCall, ToolCallId,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    ContentBlock, ContentChunk, MessageId, SessionUpdate, TextContent, ToolCall as AcpToolCall,
+    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use atomcode_kernel::event::AgentEvent;
 
@@ -33,14 +33,25 @@ pub fn tool_kind(name: &str) -> ToolKind {
     }
 }
 
-pub fn event_to_update(ev: &AgentEvent) -> Option<SessionUpdate> {
+/// Translate one kernel event to an optional v1 `session/update`.
+///
+/// `message_id` (v1-optional, per the protocol) is stamped onto message and
+/// thought chunks: chunks sharing one id belong to the same message, a changed
+/// id starts a new one. The caller allocates one id per LLM output round and
+/// advances it at every kernel `Usage` event (see
+/// [`crate::acp::dispatch::run_prompt_turn`]), so one model response's stream
+/// is one message — the same convention the v2 chain already uses.
+pub fn event_to_update(ev: &AgentEvent, message_id: Option<&str>) -> Option<SessionUpdate> {
+    let msg = message_id.map(MessageId::new);
     match ev {
-        AgentEvent::TextDelta(s) => Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
-            ContentBlock::Text(TextContent::new(s.clone())),
-        ))),
-        AgentEvent::Reasoning(s) => Some(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
-            ContentBlock::Text(TextContent::new(s.clone())),
-        ))),
+        AgentEvent::TextDelta(s) => Some(SessionUpdate::AgentMessageChunk(
+            ContentChunk::new(ContentBlock::Text(TextContent::new(s.clone())))
+                .message_id(msg.clone()),
+        )),
+        AgentEvent::Reasoning(s) => Some(SessionUpdate::AgentThoughtChunk(
+            ContentChunk::new(ContentBlock::Text(TextContent::new(s.clone())))
+                .message_id(msg.clone()),
+        )),
         AgentEvent::ToolStarted { call } => Some(SessionUpdate::ToolCall(
             AcpToolCall::new(ToolCallId::new(call.id.clone()), call.name.clone())
                 .kind(tool_kind(&call.name))
@@ -53,6 +64,12 @@ pub fn event_to_update(ev: &AgentEvent) -> Option<SessionUpdate> {
             } else {
                 ToolCallStatus::Completed
             };
+            // The protocol's `diff` content block (structured old/new text)
+            // is NOT emitted here: the kernel `ToolResult` carries only a
+            // string `content`, with no structured old/new pair, so there is
+            // nothing to map. Edit tools render their changes as text in the
+            // result; a true `diff` block needs an event-side structure first
+            // (tracked as a later-phase item in the ACP roadmap).
             let content: ToolCallContent = result.content.clone().into();
             let fields = ToolCallUpdateFields::new()
                 .status(status)
@@ -62,11 +79,22 @@ pub fn event_to_update(ev: &AgentEvent) -> Option<SessionUpdate> {
                 fields,
             )))
         }
-        AgentEvent::PolicyIntervention { .. } => {
-            Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                ContentBlock::Text(TextContent::new(POLICY_INTERVENTION_NOTICE.to_string())),
+        AgentEvent::PolicyIntervention { .. } => Some(SessionUpdate::AgentMessageChunk(
+            ContentChunk::new(ContentBlock::Text(TextContent::new(
+                POLICY_INTERVENTION_NOTICE.to_string(),
             )))
-        }
+            .message_id(msg),
+        )),
+        // `used` and `size` are the protocol-required, non-null token counts.
+        // `cost` (optional) is deliberately NOT populated: the kernel
+        // `MessageMeta` carries token usage but no price, and there is no
+        // pricing table on this path — fabricating a currency amount would be
+        // misleading. See `commands.rs::usage_text` ("cost requires a pricing
+        // table") for the same stance on the text side.
+        AgentEvent::Usage(meta) => Some(SessionUpdate::UsageUpdate(UsageUpdate::new(
+            u64::from(meta.used_tokens),
+            u64::from(meta.ctx_window),
+        ))),
         _ => None,
     }
 }
@@ -104,21 +132,57 @@ mod tests {
 
     #[test]
     fn text_delta_maps_to_agent_message_chunk() {
-        let u = event_to_update(&AgentEvent::TextDelta("hi".into())).unwrap();
+        let u = event_to_update(&AgentEvent::TextDelta("hi".into()), None).unwrap();
         assert_eq!(tag(&u), "agent_message_chunk");
         let v = serde_json::to_value(&u).unwrap();
         assert_eq!(v["content"]["text"], "hi");
     }
 
     #[test]
+    fn message_id_is_stamped_on_message_and_thought_chunks() {
+        let u = event_to_update(&AgentEvent::TextDelta("hi".into()), Some("m1")).unwrap();
+        let v = serde_json::to_value(&u).unwrap();
+        assert_eq!(v["messageId"], "m1");
+        assert_eq!(v["sessionUpdate"], "agent_message_chunk");
+
+        let u = event_to_update(&AgentEvent::Reasoning("why".into()), Some("m1")).unwrap();
+        let v = serde_json::to_value(&u).unwrap();
+        assert_eq!(v["messageId"], "m1");
+        assert_eq!(v["sessionUpdate"], "agent_thought_chunk");
+    }
+
+    #[test]
     fn reasoning_maps_to_agent_thought_chunk() {
-        let u = event_to_update(&AgentEvent::Reasoning("why".into())).unwrap();
+        let u = event_to_update(&AgentEvent::Reasoning("why".into()), None).unwrap();
         assert_eq!(tag(&u), "agent_thought_chunk");
     }
 
     #[test]
-    fn usage_has_no_update() {
-        assert!(event_to_update(&AgentEvent::TurnStarted).is_none());
+    fn usage_maps_to_session_usage_update() {
+        let meta = atomcode_kernel::message::MessageMeta {
+            tokens: atomcode_kernel::stream::TokenUsage {
+                prompt: 100,
+                completion: 50,
+                cached: 0,
+            },
+            elapsed_ms: 100,
+            reasoning_elapsed_ms: 10,
+            ctx_window: 200_000,
+            used_tokens: 4_200,
+            utilization: 0.02,
+            round: 1,
+            turn_id: 1,
+            request_id: 1,
+            provider_response_id: None,
+            provider_model: None,
+            session_id: None,
+            finish_reason: "stop".into(),
+        };
+        let u = event_to_update(&AgentEvent::Usage(meta), None).unwrap();
+        assert_eq!(tag(&u), "usage_update");
+        let v = serde_json::to_value(&u).unwrap();
+        assert_eq!(v["used"], 4200);
+        assert_eq!(v["size"], 200_000);
     }
 
     #[test]
@@ -126,7 +190,7 @@ mod tests {
         let event = AgentEvent::PolicyIntervention {
             intervention: atomcode_kernel::event::PolicyIntervention::credential_shell_blocked(),
         };
-        let update = event_to_update(&event).expect("policy recovery notice");
+        let update = event_to_update(&event, None).expect("policy recovery notice");
         let value = serde_json::to_value(update).unwrap();
         let text = value["content"]["text"].as_str().unwrap();
         assert!(text.contains("separate terminal"));
@@ -142,7 +206,7 @@ mod tests {
             name: "bash".into(),
             arguments: "{}".into(),
         };
-        let u = event_to_update(&AgentEvent::ToolStarted { call }).unwrap();
+        let u = event_to_update(&AgentEvent::ToolStarted { call }, None).unwrap();
         let v = serde_json::to_value(&u).unwrap();
         assert_eq!(v["sessionUpdate"], "tool_call");
         assert_eq!(v["toolCallId"], "c1");
@@ -158,7 +222,7 @@ mod tests {
             is_error: false,
             images: vec![],
         };
-        let u = event_to_update(&AgentEvent::ToolResult { result }).unwrap();
+        let u = event_to_update(&AgentEvent::ToolResult { result }, None).unwrap();
         let v = serde_json::to_value(&u).unwrap();
         assert_eq!(v["sessionUpdate"], "tool_call_update");
         assert_eq!(v["toolCallId"], "c1");

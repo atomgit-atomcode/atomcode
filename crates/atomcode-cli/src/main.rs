@@ -8,6 +8,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -254,24 +255,53 @@ fn scan_argv_for_lang() -> Option<String> {
     None
 }
 
-/// Scan the config file (default path only) for the `language` field.
-/// Returns `None` if the config file does not exist, cannot be parsed, or
-/// has no `language` key. This is a lightweight pre-parse -- the full config
-/// is loaded later in `run()` after clap has parsed CLI flags.
-fn scan_config_language() -> Option<atomcode_tuix::i18n::Locale> {
+/// Lightweight pre-parse of the default config path only, BEFORE clap renders
+/// `--help` and BEFORE the authoritative `Config` load in `run()`. Resolves
+/// the three fields that clap `--help` localisation needs: `language` (for
+/// locale) and `brand_name` / `oauth_provider_name` (for `{brand}` / `{oauth}`
+/// placeholder substitution in help text).
+///
+/// Single read + parse of the default config file — not three independent
+/// scans. Env overrides (`ATOMCODE_BRAND_NAME` / `ATOMCODE_OAUTH_PROVIDER_NAME`)
+/// are honoured so a `--help` launched under those env vars renders the
+/// env-chosen brand, matching the post-load behaviour. Never an error path:
+/// any read/parse failure falls back to defaults, matching the per-field
+/// helpers it replaces.
+struct PreScanConfig {
+    language: Option<atomcode_tuix::i18n::Locale>,
+    brand_name: String,
+    oauth_provider_name: String,
+}
+
+fn scan_config_pre() -> PreScanConfig {
+    let ui_default = atomcode_config::config::UiConfig::default();
+    let mut result = PreScanConfig {
+        language: None,
+        brand_name: ui_default.brand_name,
+        oauth_provider_name: ui_default.oauth_provider_name,
+    };
     let path = atomcode_config::config::Config::default_path();
-    if !path.exists() {
-        return None;
+    if path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(cfg) = toml::from_str::<atomcode_config::config::Config>(&content) {
+                result.language = cfg.language;
+                result.brand_name = cfg.ui.brand_name;
+                result.oauth_provider_name = cfg.ui.oauth_provider_name;
+            }
+        }
     }
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
-    let cfg: atomcode_config::config::Config = match toml::from_str(&content) {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
-    cfg.language
+    // Env overrides take precedence, matching apply_env_overrides in the full load.
+    if let Ok(v) = std::env::var("ATOMCODE_BRAND_NAME") {
+        if !v.trim().is_empty() {
+            result.brand_name = v;
+        }
+    }
+    if let Ok(v) = std::env::var("ATOMCODE_OAUTH_PROVIDER_NAME") {
+        if !v.trim().is_empty() {
+            result.oauth_provider_name = v;
+        }
+    }
+    result
 }
 
 /// Build the top-level clap Command with i18n-localised about and help text.
@@ -1256,10 +1286,12 @@ async fn run() -> Result<i32> {
     // the locale first (from --lang flag, env vars, or config) so that
     // the i18n system is ready when clap calls our dynamic about/help closures.
     let pre_lang = scan_argv_for_lang();
-    // Also read config language field so --help respects /language setting.
-    let pre_config_lang = scan_config_language();
+    // Single pre-scan of the default config path: resolves language (for
+    // locale) AND brand/oauth names (for --help placeholder substitution)
+    // in one read + parse, not three independent scans.
+    let pre_scan = scan_config_pre();
     let pre_locale =
-        atomcode_tuix::i18n::resolve_initial_locale(pre_lang.as_deref(), pre_config_lang);
+        atomcode_tuix::i18n::resolve_initial_locale(pre_lang.as_deref(), pre_scan.language);
     atomcode_tuix::i18n::set_locale(pre_locale);
 
     // Build the clap Command with i18n-injected about/help text, then parse.
@@ -1267,6 +1299,13 @@ async fn run() -> Result<i32> {
     // If so, render the i18n-localised help via our custom Command and exit.
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
+        // --help renders BEFORE the authoritative Config load, so settle the
+        // brand from the pre-scan (default config path + env) just for this
+        // branch. The normal launch path does NOT call set_brand here — it
+        // waits for the authoritative Config load in run() so --config
+        // / --seed-config custom paths surface the real brand, not the
+        // default-path pre-scan value.
+        atomcode_config::i18n::set_brand(&pre_scan.brand_name, &pre_scan.oauth_provider_name);
         let help_cmd = build_i18n_command();
         help_cmd
             .try_get_matches_from(std::env::args_os())
@@ -1574,6 +1613,148 @@ async fn run() -> Result<i32> {
                 let engine = atomcode::acp::engine::EngineConfig::from_coding_config(
                     runtime_cfg.agent_config(),
                 );
+                // Session config option catalog (`session/set_config_option`):
+                // a `mode` select over the kernel execution modes, a
+                // `reasoning_effort` select mirroring the TUI `/effort` ladder,
+                // and a `model` select over the configured model catalog. The
+                // resolvers re-resolve a selected value into a kernel config for
+                // the live runtime's provider reload.
+                use agent_client_protocol::schema::v1::{
+                    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+                };
+                let session_config_options: Vec<SessionConfigOption> = {
+                    let mut options: Vec<SessionConfigOption> = Vec::new();
+                    // Execution mode: always available, same ids/names as the
+                    // `modes` advertised in the session setup response.
+                    let modes = atomcode::acp::options::session_modes();
+                    options.push(
+                        SessionConfigOption::select(
+                            atomcode::acp::options::MODE_CONFIG_ID,
+                            "Mode",
+                            atomcode_coding::RuntimeMode::Build.wire(),
+                            modes
+                                .iter()
+                                .map(|m| {
+                                    SessionConfigSelectOption::new(
+                                        m.id.0.as_ref().to_string(),
+                                        m.name.clone(),
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .category(SessionConfigOptionCategory::Mode),
+                    );
+                    // Reasoning effort: always available; the active provider
+                    // adapter decides whether the tier has an effect.
+                    let current_effort = config
+                        .effective_model_selection()
+                        .and_then(|sel| config.provider_config_for_selection(&sel))
+                        .and_then(|provider| provider.reasoning_effort.clone())
+                        .unwrap_or_else(|| "off".to_string());
+                    let effort_tiers: [(&str, &str); 3] = [
+                        ("off", "Off (API default)"),
+                        ("high", "High"),
+                        ("max", "Max"),
+                    ];
+                    options.push(
+                        SessionConfigOption::select(
+                            atomcode::acp::options::REASONING_EFFORT_CONFIG_ID,
+                            "Reasoning effort",
+                            current_effort,
+                            effort_tiers
+                                .into_iter()
+                                .map(|(value, name)| {
+                                    SessionConfigSelectOption::new(
+                                        value.to_string(),
+                                        name.to_string(),
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .category(SessionConfigOptionCategory::ThoughtLevel),
+                    );
+                    // Model selector: only when a model catalog is configured.
+                    let mut ids: Vec<String> = config.logical_models().keys().cloned().collect();
+                    ids.sort();
+                    if !ids.is_empty() {
+                        let current = config
+                            .effective_model_selection()
+                            .filter(|id| ids.contains(id))
+                            .unwrap_or_else(|| ids[0].clone());
+                        options.push(
+                            SessionConfigOption::select(
+                                atomcode::acp::options::MODEL_CONFIG_ID,
+                                "Model",
+                                current,
+                                ids.into_iter()
+                                    .map(|id| SessionConfigSelectOption::new(id.clone(), id))
+                                    .collect::<Vec<_>>(),
+                            )
+                            .category(SessionConfigOptionCategory::Model),
+                        );
+                    }
+                    options
+                };
+                let session_model_resolver: Option<Arc<atomcode::acp::SessionModelResolver>> =
+                    if config.logical_models().is_empty() {
+                        None
+                    } else {
+                        let base = config.clone();
+                        let provider = cli.provider.clone();
+                        let dir = working_dir.clone();
+                        let skip = cli.dangerously_skip_permissions;
+                        let resolver: Arc<atomcode::acp::SessionModelResolver> = Arc::new(
+                            move |model: &str| -> Option<atomcode_coding::CodingAgentConfig> {
+                                let mut cfg = base.clone();
+                                cfg.default_model = Some(model.to_string());
+                                let runtime = runtime_config_from(
+                                    &cfg,
+                                    &dir,
+                                    provider.as_deref(),
+                                    None,
+                                    skip,
+                                    true,
+                                );
+                                if runtime.model.is_empty() {
+                                    return None;
+                                }
+                                Some(runtime.agent_config())
+                            },
+                        );
+                        Some(resolver)
+                    };
+                let session_effort_resolver: Option<Arc<atomcode::acp::SessionModelResolver>> =
+                    Some({
+                        let base = config.clone();
+                        let provider = cli.provider.clone();
+                        let dir = working_dir.clone();
+                        let skip = cli.dangerously_skip_permissions;
+                        let resolver: Arc<atomcode::acp::SessionModelResolver> = Arc::new(
+                            move |effort: &str| -> Option<atomcode_coding::CodingAgentConfig> {
+                                let mut cfg = base.clone();
+                                let selection = cfg.effective_model_selection()?;
+                                cfg.update_selection_reasoning(&selection, |fields| {
+                                    *fields.reasoning_effort = match effort {
+                                        "off" => None,
+                                        other => Some(other.to_string()),
+                                    };
+                                });
+                                let runtime = runtime_config_from(
+                                    &cfg,
+                                    &dir,
+                                    provider.as_deref(),
+                                    None,
+                                    skip,
+                                    true,
+                                );
+                                if runtime.model.is_empty() {
+                                    return None;
+                                }
+                                Some(runtime.agent_config())
+                            },
+                        );
+                        resolver
+                    });
                 // Flush telemetry before the long-running stdio loop.
                 telemetry
                     .shutdown(std::time::Duration::from_millis(500))
@@ -1582,6 +1763,9 @@ async fn run() -> Result<i32> {
                     engine: Some(engine),
                     provider_factory: Some(provider_factory),
                     auto_approve,
+                    session_config_options,
+                    session_model_resolver,
+                    session_effort_resolver,
                 })
                 .await
                 .map(|_| 0);
@@ -1694,6 +1878,17 @@ async fn run() -> Result<i32> {
             atomcode_tuix::i18n::resolve_initial_locale(cli.lang.as_deref(), config.language);
         atomcode_tuix::i18n::set_locale(locale);
     }
+
+    // ── i18n brand/OAuth names ──
+    // Settle the distribution's brand + OAuth provider display names into the
+    // i18n placeholder cache BEFORE any `t()` render, so the first visible
+    // string (e.g. the Welcome banner) already shows the configured brand.
+    // Idempotent (`OnceLock` keeps the first value); a mid-session `/reload`
+    // does NOT flip the brand, matching `theme`'s startup-only semantics.
+    atomcode_config::i18n::set_brand(
+        &config.ui.brand_name,
+        &config.ui.oauth_provider_name,
+    );
 
     // ── Plugin marketplace bootstrap + post-upgrade refresh ──
     //
@@ -2968,9 +3163,12 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
         match e {
             HookEvent::PreToolUse => "PreToolUse",
             HookEvent::PostToolUse => "PostToolUse",
+            HookEvent::PostToolUseFailure => "PostToolUseFailure",
             HookEvent::SessionStart => "SessionStart",
             HookEvent::SessionEnd => "SessionEnd",
             HookEvent::UserPromptSubmit => "UserPromptSubmit",
+            HookEvent::Stop => "Stop",
+            HookEvent::StopFailure => "StopFailure",
         }
     }
 
@@ -3076,6 +3274,10 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                             "session_id": sid, "hook_event_name": "PostToolUse", "cwd": cwd_s,
                             "tool_name": "bash", "tool_response": "hello\n",
                         }),
+                        HookEvent::PostToolUseFailure => serde_json::json!({
+                            "session_id": sid, "hook_event_name": "PostToolUseFailure", "cwd": cwd_s,
+                            "tool_name": "bash", "tool_response": "command failed\n",
+                        }),
                         HookEvent::UserPromptSubmit => serde_json::json!({
                             "session_id": sid, "hook_event_name": "UserPromptSubmit",
                             "cwd": cwd_s, "prompt": "test prompt",
@@ -3085,6 +3287,16 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                         }),
                         HookEvent::SessionEnd => serde_json::json!({
                             "session_id": sid, "hook_event_name": "SessionEnd", "cwd": cwd_s,
+                        }),
+                        HookEvent::Stop => serde_json::json!({
+                            "session_id": sid, "transcript_path": null,
+                            "hook_event_name": "Stop", "stop_hook_active": false,
+                            "stop_reason": "Stopped", "cwd": cwd_s,
+                        }),
+                        HookEvent::StopFailure => serde_json::json!({
+                            "session_id": sid, "transcript_path": null,
+                            "hook_event_name": "StopFailure", "stop_hook_active": false,
+                            "stop_reason": "ProviderError", "cwd": cwd_s,
                         }),
                     };
                     let start = std::time::Instant::now();
@@ -3739,10 +3951,10 @@ mod tests {
     use super::{
         apply_cli_runtime_overrides, atomcode_log_path, close_thinking_chunk,
         format_thinking_chunk, format_verbose_tool_chunk, headless_completion_exit_code,
-        headless_completion_notify_reason, is_completion_invocation, merge_startup_notices,
-        interactive_provider_bootstrap, print_shell_completion, resolve_working_dir,
-        runtime_config_from,
-        should_fork_busy_continue, truncate_log_line, Cli, Commands, DEFAULT_LOG_DIRECTIVES,
+        headless_completion_notify_reason, interactive_provider_bootstrap,
+        is_completion_invocation, merge_startup_notices, print_shell_completion,
+        resolve_working_dir, runtime_config_from, should_fork_busy_continue, truncate_log_line,
+        Cli, Commands, DEFAULT_LOG_DIRECTIVES,
     };
     use clap::Parser;
     use clap_complete::Shell;
@@ -3948,8 +4160,14 @@ mod tests {
             "#,
         )
         .unwrap();
-        let runtime_cfg =
-            runtime_config_from(&config, std::path::Path::new("/tmp"), None, None, false, true);
+        let runtime_cfg = runtime_config_from(
+            &config,
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            true,
+        );
 
         assert!(config.providers.is_empty(), "legacy table stays empty");
         assert_eq!(
@@ -3998,8 +4216,14 @@ mod tests {
             "#,
         )
         .unwrap();
-        let runtime_cfg =
-            runtime_config_from(&config, std::path::Path::new("/tmp"), None, None, false, true);
+        let runtime_cfg = runtime_config_from(
+            &config,
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            true,
+        );
 
         assert_eq!(runtime_cfg.model, "fallback-model");
         assert_eq!(

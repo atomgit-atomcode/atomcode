@@ -77,7 +77,11 @@ impl Tool for UseSkillTool {
         };
         let arguments = a.arguments.unwrap_or_default();
         // expand may run `!`cmd`` shell blocks → keep off the async runtime.
-        match tokio::task::spawn_blocking(move || skill.expand(&arguments, "")).await {
+        // Use `expand_for_injection` (not `expand`) so a directory-style skill's
+        // install-path `<system-reminder>` rides along — otherwise the model, invoking
+        // a skill that bundles `scripts/`/`references/`, has to re-search the working
+        // directory for those files. Matches the user `$skill` path.
+        match tokio::task::spawn_blocking(move || skill.expand_for_injection(&arguments, "")).await {
             Ok(content) => ok(content),
             Err(_) => err("use_skill: expansion task failed"),
         }
@@ -152,6 +156,51 @@ mod tests {
             .await;
         assert!(!r.is_error, "{}", r.content);
         assert_eq!(r.content, "Hello world!");
+    }
+
+    #[tokio::test]
+    async fn use_skill_directory_skill_includes_install_path_reminder() {
+        // A directory-style skill (source file `SKILL.md`) can bundle `scripts/` /
+        // `references/`. When the MODEL invokes it, the expansion must carry the
+        // install-path `<system-reminder>` so the model resolves bundled files against
+        // the skill dir instead of searching the working directory. Regression for the
+        // gap where `use_skill` used `expand()` (no note) while only the user `$`-path
+        // used `expand_for_injection()`.
+        let plugin = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let skills_dir = plugin.path().join("skills");
+        std::fs::create_dir_all(skills_dir.join("bundle")).unwrap();
+        std::fs::write(
+            skills_dir.join("bundle").join("SKILL.md"),
+            "---\ndescription: has bundled scripts\n---\nRun scripts/go.sh\n",
+        )
+        .unwrap();
+        let mut reg = SkillRegistry::new();
+        reg.load_dir(&skills_dir, None);
+
+        let tool = UseSkillTool::new(Arc::new(reg));
+        let r = tool.execute(r#"{"name":"bundle"}"#, &ctx()).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("Run scripts/go.sh"), "body missing: {}", r.content);
+        assert!(
+            r.content.contains("This skill is installed at:"),
+            "install-path reminder missing — model would re-search cwd for bundled files: {}",
+            r.content
+        );
+    }
+
+    #[tokio::test]
+    async fn use_skill_single_file_skill_omits_install_path_reminder() {
+        // Single-file `.md` skills share a skills folder, so the install-path note would
+        // point at the wrong (shared) dir — it must stay omitted. Guards the fix from
+        // over-applying to loose skills.
+        let tool = UseSkillTool::new(registry_with(&[("loose", "just a body")]));
+        let r = tool.execute(r#"{"name":"loose"}"#, &ctx()).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            !r.content.contains("installed at:"),
+            "single-file skill must not get the install-path note: {}",
+            r.content
+        );
     }
 
     #[tokio::test]

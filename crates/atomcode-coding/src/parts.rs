@@ -23,7 +23,7 @@ use std::sync::Arc;
 use atomcode_capabilities::cc_hooks::{CCExternalHooks, HookConfig};
 use atomcode_capabilities::codeintel::register_codeintel_tools;
 use atomcode_capabilities::datalog::DatalogHook;
-use atomcode_capabilities::mcp::{self, McpConnectEvent, McpRegistry};
+use atomcode_capabilities::mcp::{self, McpConnectEvent, McpRegistry, McpServerConfig};
 use atomcode_capabilities::memory::MemoryHook;
 use atomcode_capabilities::session::snapshot::SnapshotPersistenceStatus;
 use atomcode_capabilities::session::{
@@ -118,6 +118,12 @@ pub struct PrepareOptions {
     pub plugin_skill_dirs: Vec<(PathBuf, String)>,
     /// Connect MCP servers from `<working_dir>/.mcp.json` (+ global config).
     pub mcp: bool,
+    /// Driver-supplied MCP servers connected alongside config servers — e.g.
+    /// ACP client-injected `mcpServers` from `session/new`. Entries must use
+    /// `McpConfigSource::Driver`: they bypass the project trust gate because
+    /// the injecting driver is the trust boundary. Ignored when `mcp` is
+    /// false (no registry is created).
+    pub extra_mcp_servers: Vec<McpServerConfig>,
     /// Inject `memory.md` (global + project) at session start. KEEP THIS CONSISTENT
     /// across resumes of one session: the injected block is persisted in the
     /// snapshot, and only a registered MemoryHook reconciles/removes it on resume —
@@ -148,6 +154,7 @@ impl Default for PrepareOptions {
             skill_dirs: None,
             plugin_skill_dirs: Vec::new(),
             mcp: true,
+            extra_mcp_servers: Vec::new(),
             memory: true,
             web: true,
             review: true,
@@ -333,9 +340,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     let request_user_input_enabled =
         opts.request_user_input && crate::persona::request_user_input_switch_enabled();
     let todo_enabled = crate::persona::todo_switch_enabled_for(cfg.todo.enabled);
-    let subagents_enabled = opts.subagents.resolve(
-        std::env::var("ATOMCODE_SUBAGENT").ok().as_deref(),
-    );
+    let subagents_enabled = opts
+        .subagents
+        .resolve(std::env::var("ATOMCODE_SUBAGENT").ok().as_deref());
     if !todo_enabled {
         names.retain(|name| name != "todowrite");
     }
@@ -426,34 +433,33 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         max_concurrent: subagent_max_concurrent,
         ..Default::default()
     });
-    let subagent_provider: Option<SharedReviewProvider> =
-        if subagents_enabled {
-            use atomcode_capabilities::tools::TaskTool;
+    let subagent_provider: Option<SharedReviewProvider> = if subagents_enabled {
+        use atomcode_capabilities::tools::TaskTool;
 
-            let slot: SharedReviewProvider = Arc::new(std::sync::RwLock::new(None));
+        let slot: SharedReviewProvider = Arc::new(std::sync::RwLock::new(None));
 
-            // Child subagent tool registry (mount a subset per type).
-            let mut child_reg = atomcode_kernel::tool::ToolRegistry::new();
-            atomcode_capabilities::tools::register_coding_tools_with_vision(&mut child_reg, false);
-            let child_reg = Arc::new(child_reg);
+        // Child subagent tool registry (mount a subset per type).
+        let mut child_reg = atomcode_kernel::tool::ToolRegistry::new();
+        atomcode_capabilities::tools::register_coding_tools_with_vision(&mut child_reg, false);
+        let child_reg = Arc::new(child_reg);
 
-            let explore_names: Vec<String> = ["read_file", "grep", "glob", "list_directory"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            let worker_names: Vec<String> = [
-                "read_file",
-                "edit_file",
-                "write_file",
-                "bash",
-                "grep",
-                "glob",
-                "search_replace",
-                "list_directory",
-            ]
+        let explore_names: Vec<String> = ["read_file", "grep", "glob", "list_directory"]
             .iter()
             .map(|s| s.to_string())
             .collect();
+        let worker_names: Vec<String> = [
+            "read_file",
+            "edit_file",
+            "write_file",
+            "bash",
+            "grep",
+            "glob",
+            "search_replace",
+            "list_directory",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
 
             let reg_e = child_reg.clone();
             let reg_w = child_reg.clone();
@@ -625,9 +631,10 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     let (mcp_registry, mcp_connect_rx) = if opts.mcp {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         (
-            Some(Arc::new(McpRegistry::from_config_background_with_events(
+            Some(Arc::new(McpRegistry::from_config_background_with_extra(
                 &cfg.working_dir,
                 Some(event_tx),
+                opts.extra_mcp_servers.clone(),
             ))),
             Some(event_rx),
         )
@@ -832,6 +839,13 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         // hook can correlate its events with the session. Empty for non-persistent runs.
         if let Some(b) = &session {
             cc = cc.with_session_id(b.id.as_str());
+            // CC `transcript_path` = the session's append-only JSONL transcript, so a
+            // Stop/StopFailure hook can open the finished turn's full record. The path
+            // resolves even before the file is written; unresolvable (session dir gone)
+            // → left `None` → the payload carries `null`, never a wedge.
+            if let Ok(p) = b.manager.jsonl_path(&b.id) {
+                cc = cc.with_transcript_path(p.to_string_lossy().into_owned());
+            }
         }
         if cc.is_empty() {
             None
@@ -2101,8 +2115,22 @@ mod tests {
             Message::assistant("I am model-a", vec![]),
         ]);
 
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true, true);
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-c"), true, true, true, true);
+        reconcile_coding_persona(
+            &mut snapshot,
+            &agent_config("model-b"),
+            true,
+            true,
+            true,
+            true,
+        );
+        reconcile_coding_persona(
+            &mut snapshot,
+            &agent_config("model-c"),
+            true,
+            true,
+            true,
+            true,
+        );
 
         assert!(snapshot.messages[0]
             .text
@@ -2249,6 +2277,7 @@ mod tests {
             skill_dirs: Some(vec![]),
             plugin_skill_dirs: Vec::new(),
             mcp: true,
+            extra_mcp_servers: Vec::new(),
             memory: false,
             web: false,
             review: false,
@@ -2318,6 +2347,7 @@ mod tests {
             skill_dirs: Some(vec![]),
             plugin_skill_dirs: Vec::new(),
             mcp: false,
+            extra_mcp_servers: Vec::new(),
             memory: false,
             web: false,
             review: false,
