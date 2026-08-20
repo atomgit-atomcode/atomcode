@@ -5672,13 +5672,14 @@ mod buffer_tests {
 
     #[test]
     fn review_activity_marker_is_ephemeral_for_code_review() {
-        let chunk = "\u{1e}review · round 3 · read_file · compaction.rs";
+        // New activity format: no `round N`, a stage label in deep mode.
+        let chunk = "\u{1e}review [security] · read_file · compaction.rs";
 
         let activity = ephemeral_tool_activity(Some("CodeReview"), chunk);
 
         assert_eq!(
             activity,
-            Some("review · round 3 · read_file · compaction.rs")
+            Some("review [security] · read_file · compaction.rs")
         );
     }
 

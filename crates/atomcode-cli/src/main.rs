@@ -4077,8 +4077,8 @@ mod tests {
     #[test]
     fn verbose_tool_chunk_strips_ephemeral_activity_marker() {
         assert_eq!(
-            format_verbose_tool_chunk("\u{1e}review · round 2 · read_file"),
-            "[progress] review · round 2 · read_file\n"
+            format_verbose_tool_chunk("\u{1e}review · 2 findings · read_file"),
+            "[progress] review · 2 findings · read_file\n"
         );
     }
 
