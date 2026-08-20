@@ -89,10 +89,19 @@ pub(super) fn dispatch_rewind(state: &UiState, ctx: &LoopCtx, renderer: &mut dyn
 /// effect. `/review <base>` now consistently means the committed `<base>..HEAD` range.
 fn review_prompt(arg: &str) -> String {
     let arg = arg.trim();
-    // A leading `deep` keyword (alone or before a scope) opts into deep mode.
-    let (deep, scope) = match arg.strip_prefix("deep") {
-        Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => (true, rest.trim()),
-        _ => (false, arg),
+    // A leading `deep+verify` or `deep` keyword (alone or before a scope) sets depth.
+    let (depth, scope): (Option<&str>, &str) = if let Some(rest) = arg
+        .strip_prefix("deep+verify")
+        .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+    {
+        (Some("deep+verify"), rest.trim())
+    } else if let Some(rest) = arg
+        .strip_prefix("deep")
+        .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+    {
+        (Some("deep"), rest.trim())
+    } else {
+        (None, arg)
     };
     let scope_json = if scope.is_empty() {
         r#"{"kind":"working_tree"}"#.to_string()
@@ -104,10 +113,9 @@ fn review_prompt(arg: &str) -> String {
             base = serde_json::to_string(scope).expect("serializing a string cannot fail")
         )
     };
-    let args = if deep {
-        format!(r#"{{"scope":{scope_json},"depth":"deep"}}"#)
-    } else {
-        format!(r#"{{"scope":{scope_json}}}"#)
+    let args = match depth {
+        Some(d) => format!(r#"{{"scope":{scope_json},"depth":"{d}"}}"#),
+        None => format!(r#"{{"scope":{scope_json}}}"#),
     };
     format!(
         "Review the requested changes: call the `code_review` tool with {args}, then give me a \
@@ -7838,6 +7846,25 @@ mod tests {
         // Plain scope carries NO depth (default single).
         assert!(!review_prompt("").contains("depth"));
         assert!(!review_prompt("staged").contains("depth"));
+    }
+
+    #[test]
+    fn review_prompt_deep_verify_sets_depth_and_keeps_scope() {
+        let wt = review_prompt("deep+verify");
+        assert!(wt.contains(r#""scope":{"kind":"working_tree"}"#), "{wt}");
+        assert!(wt.contains(r#""depth":"deep+verify""#), "{wt}");
+
+        let st = review_prompt("deep+verify staged");
+        assert!(st.contains(r#""scope":{"kind":"staged"}"#), "{st}");
+        assert!(st.contains(r#""depth":"deep+verify""#), "{st}");
+
+        let rng = review_prompt("deep+verify main");
+        assert!(rng.contains(r#""scope":{"kind":"range","base":"main","head":"HEAD"}"#), "{rng}");
+        assert!(rng.contains(r#""depth":"deep+verify""#), "{rng}");
+
+        // Plain `deep` still maps to depth "deep" (not deep+verify).
+        let d = review_prompt("deep");
+        assert!(d.contains(r#""depth":"deep""#) && !d.contains("deep+verify"), "{d}");
     }
 
     #[test]
