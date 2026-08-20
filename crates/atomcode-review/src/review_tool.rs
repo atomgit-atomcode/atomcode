@@ -33,7 +33,10 @@ use serde_json::json;
 
 use crate::config::ReviewAgentConfig;
 use crate::diff::annotate_diff_line_numbers;
-use crate::fanout::{finalize_deep_review, run_deep_review, DimensionOutcome, REVIEW_DIMENSIONS};
+use crate::fanout::{
+    dimension_coverage, merge_deep_findings, render_deep_result, render_verify_task, run_deep_review,
+    run_verify, DimensionOutcome, REVIEW_DIMENSIONS, VERIFY_CONCURRENCY, VERIFY_LENS,
+};
 use crate::impact_plan::render_review_impact_plan;
 use crate::rules::{changed_files_from_diff, render_rules_section};
 use crate::{build_review_agent_with, Finding};
@@ -307,7 +310,14 @@ impl Args {
     fn is_deep(&self) -> bool {
         self.depth
             .as_deref()
-            .map(|d| d.eq_ignore_ascii_case("deep"))
+            .map(|d| d.eq_ignore_ascii_case("deep") || d.eq_ignore_ascii_case("deep+verify"))
+            .unwrap_or(false)
+    }
+
+    fn wants_verify(&self) -> bool {
+        self.depth
+            .as_deref()
+            .map(|d| d.eq_ignore_ascii_case("deep+verify"))
             .unwrap_or(false)
     }
 
@@ -436,7 +446,7 @@ impl Tool for ReviewTool {
                 },
                 "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional repo-relative path filters." },
                 "confirm_scope": { "type": "string", "description": "Opaque token from a preflight. Pass only after explicit user confirmation." },
-                "depth": { "type": "string", "enum": ["single", "deep"], "description": "Review depth. `deep` fans out one reviewer per concern dimension (correctness/security/performance/tests) and merges findings; omit for the default single reviewer." }
+                "depth": { "type": "string", "enum": ["single", "deep", "deep+verify"], "description": "Review depth. `deep` fans out one reviewer per concern dimension (correctness/security/performance/tests) and merges findings; `deep+verify` additionally runs one verify pass per finding to cull false positives; omit for the default single reviewer." }
             }
         })
     }
@@ -564,7 +574,46 @@ impl Tool for ReviewTool {
         })
         .await;
 
-        let (is_error, content) = finalize_deep_review(&outcomes, files.len(), &files);
+        // Merge the fan-out outcomes; optionally cull false positives with a
+        // single verify pass per surviving finding.
+        let (mut merged, deduped) = merge_deep_findings(&outcomes, &files);
+        let (completed, failed) = dimension_coverage(&outcomes);
+        let mut verify_dropped = None;
+        if a.wants_verify() && !merged.is_empty() {
+            // One verify agent per finding, capped. Keep a finding when its
+            // verify agent re-reports it (or fails open on error/cancel).
+            let inputs: Vec<String> = merged
+                .iter()
+                .map(|m| render_verify_task(&m.finding, &rules, &annotated))
+                .collect();
+            let keep = run_verify(merged.len(), VERIFY_CONCURRENCY, |i| {
+                let provider = provider.clone();
+                let vtask = inputs[i].clone();
+                let mut cfg = make_cfg();
+                let cancel = ctx.cancel.clone();
+                async move {
+                    cfg = cfg.with_persona_append(VERIFY_LENS);
+                    let (agent, report) = build_review_agent_with(&cfg, provider);
+                    let (stop, run_error) = tokio::select! {
+                        _ = cancel.cancelled() => (StopReason::Cancelled, Some("cancelled by user".to_string())),
+                        outcome = agent.run_to_completion(vtask, AutoRespond::AllowAll) => {
+                            (outcome.stop, outcome.error)
+                        }
+                    };
+                    // Fail-open: keep on error/cancel; else keep iff the verifier re-reported.
+                    let clean = stop == StopReason::Stopped && run_error.is_none();
+                    let kept = if clean { !report.findings().is_empty() } else { true };
+                    (i, kept)
+                }
+            })
+            .await;
+            let before = merged.len();
+            let mut mask = keep.into_iter();
+            merged.retain(|_| mask.next().unwrap_or(true));
+            verify_dropped = Some(before - merged.len());
+        }
+        let (is_error, content) =
+            render_deep_result(&merged, files.len(), &completed, &failed, deduped, verify_dropped);
         if is_error { err(content) } else { ok(content) }
     }
 }
@@ -1442,6 +1491,46 @@ mod tests {
         assert!(!s.is_deep());
         let explicit: Args = serde_json::from_str(r#"{"depth":"single"}"#).unwrap();
         assert!(!explicit.is_deep());
+    }
+
+    #[test]
+    fn args_parse_deep_verify_depth() {
+        let v: Args = serde_json::from_str(r#"{"depth":"deep+verify"}"#).unwrap();
+        assert!(v.is_deep(), "deep+verify still counts as deep (fans out)");
+        assert!(v.wants_verify());
+        let d: Args = serde_json::from_str(r#"{"depth":"deep"}"#).unwrap();
+        assert!(d.is_deep() && !d.wants_verify());
+        let s: Args = serde_json::from_str("{}").unwrap();
+        assert!(!s.is_deep() && !s.wants_verify());
+    }
+
+    #[tokio::test]
+    async fn deep_verify_keeps_a_confirmed_finding() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = repo_with_working_tree_change();
+        let provider: SharedReviewProvider =
+            Arc::new(RwLock::new(Some(Arc::new(ScriptedReviewProvider))));
+        let tool = ReviewTool::new(
+            provider,
+            ReviewToolConfig { model: "mock-model".into(), ..Default::default() },
+        );
+        let ctx = ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            cancel: Default::default(),
+            progress: ProgressSink::noop(),
+            requester: None,
+        };
+
+        let res = tool.execute(r#"{"depth":"deep+verify"}"#, &ctx).await;
+
+        // 4 dimensions report the same finding → merged to 1; each finding's
+        // verify agent (ScriptedReviewProvider) re-reports it → kept, dropped 0.
+        assert!(!res.is_error, "deep+verify should succeed: {}", res.content);
+        assert!(res.content.contains("Deep review"), "deep header: {}", res.content);
+        assert!(res.content.contains("verify dropped 0"), "verify note, nothing culled: {}", res.content);
+        assert!(res.content.contains("1 finding"), "the confirmed finding survives: {}", res.content);
     }
 
     #[tokio::test]
