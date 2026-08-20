@@ -2,6 +2,10 @@
 //! per concern lens, merged into a single deduped finding set. See
 //! docs/plans/2026-08-20-code-review-deep-mode-fanout-design.md.
 
+use std::cmp::Ordering;
+
+use crate::Finding;
+
 /// One review lens. `lens` is appended to the base reviewer persona via
 /// `ReviewAgentConfig::with_persona_append`, biasing focus without replacing the
 /// shared reviewer instructions.
@@ -50,6 +54,85 @@ pub const REVIEW_DIMENSIONS: &[ReviewDimension] = &[
     },
 ];
 
+/// A finding that survived dedup, tagged with every dimension that reported it.
+pub struct MergedFinding {
+    pub finding: Finding,
+    pub dimensions: Vec<&'static str>,
+}
+
+/// Collapse per-dimension findings into a deduped set. Two findings are the same
+/// issue when they touch the same file, their line ranges overlap, and their
+/// titles are similar. On a collision the higher-priority (then higher-confidence)
+/// finding's content is kept and every contributing dimension is credited.
+pub fn merge_findings(per_dim: Vec<(&'static str, Vec<Finding>)>) -> Vec<MergedFinding> {
+    let mut merged: Vec<MergedFinding> = Vec::new();
+    for (dim, findings) in per_dim {
+        for finding in findings {
+            match merged.iter_mut().find(|m| is_duplicate(&m.finding, &finding)) {
+                Some(existing) => {
+                    if !existing.dimensions.contains(&dim) {
+                        existing.dimensions.push(dim);
+                    }
+                    if outranks(&finding, &existing.finding) {
+                        existing.finding = finding;
+                    }
+                }
+                None => merged.push(MergedFinding {
+                    finding,
+                    dimensions: vec![dim],
+                }),
+            }
+        }
+    }
+    merged
+}
+
+fn is_duplicate(a: &Finding, b: &Finding) -> bool {
+    same_file(&a.file_path, &b.file_path)
+        && ranges_overlap(a.line_start, a.line_end, b.line_start, b.line_end)
+        && titles_similar(&a.title, &b.title)
+}
+
+fn same_file(a: &str, b: &str) -> bool {
+    let na = a.trim_start_matches("./");
+    let nb = b.trim_start_matches("./");
+    na == nb || na.ends_with(nb) || nb.ends_with(na)
+}
+
+fn ranges_overlap(a0: u32, a1: u32, b0: u32, b1: u32) -> bool {
+    a0 <= b1 && b0 <= a1
+}
+
+/// Title similarity by token-set Jaccard (≥ 0.5), case/punctuation-insensitive.
+/// Empty token sets fall back to trimmed case-insensitive equality.
+fn titles_similar(a: &str, b: &str) -> bool {
+    let ta = title_tokens(a);
+    let tb = title_tokens(b);
+    if ta.is_empty() || tb.is_empty() {
+        return a.trim().eq_ignore_ascii_case(b.trim());
+    }
+    let inter = ta.iter().filter(|t| tb.contains(*t)).count();
+    let union = ta.len() + tb.len() - inter;
+    union > 0 && (inter as f32 / union as f32) >= 0.5
+}
+
+fn title_tokens(s: &str) -> std::collections::BTreeSet<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Priority ascending (`P0` most severe), then confidence descending.
+fn outranks(candidate: &Finding, current: &Finding) -> bool {
+    match candidate.priority.cmp(&current.priority) {
+        Ordering::Less => true,
+        Ordering::Greater => false,
+        Ordering::Equal => candidate.confidence > current.confidence,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +152,51 @@ mod tests {
                 d.id
             );
         }
+    }
+
+    fn f(priority: &str, conf: f32, file: &str, ls: u32, le: u32, title: &str) -> Finding {
+        Finding {
+            title: title.into(),
+            body: String::new(),
+            priority: priority.into(),
+            confidence: conf,
+            file_path: file.into(),
+            line_start: ls,
+            line_end: le,
+            suggestion: String::new(),
+            suggested_code: String::new(),
+        }
+    }
+
+    #[test]
+    fn merge_dedups_same_file_overlapping_range_and_similar_title() {
+        let merged = merge_findings(vec![
+            ("correctness", vec![f("P1", 0.8, "a.rs", 10, 12, "unchecked unwrap on None")]),
+            ("security", vec![f("P2", 0.6, "a.rs", 11, 15, "unwrap on None value")]),
+        ]);
+        assert_eq!(merged.len(), 1, "overlapping near-duplicate collapses");
+        // Higher-priority (P1) content wins; both dimensions are credited.
+        assert_eq!(merged[0].finding.priority, "P1");
+        assert_eq!(merged[0].dimensions, vec!["correctness", "security"]);
+    }
+
+    #[test]
+    fn merge_keeps_distinct_findings() {
+        let merged = merge_findings(vec![
+            ("correctness", vec![f("P1", 0.8, "a.rs", 10, 12, "unchecked unwrap")]),
+            ("performance", vec![f("P2", 0.7, "a.rs", 90, 92, "needless clone in loop")]),
+            ("security", vec![f("P1", 0.9, "b.rs", 10, 12, "unchecked unwrap")]),
+        ]);
+        assert_eq!(merged.len(), 3, "different range or file are not duplicates");
+    }
+
+    #[test]
+    fn merge_prefers_higher_confidence_when_priority_ties() {
+        let merged = merge_findings(vec![
+            ("correctness", vec![f("P2", 0.5, "a.rs", 1, 1, "same bug title")]),
+            ("security", vec![f("P2", 0.9, "a.rs", 1, 1, "same bug title")]),
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].finding.confidence, 0.9);
     }
 }
