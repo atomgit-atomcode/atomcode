@@ -11,9 +11,11 @@
 //! reuses the host's already-built, possibly request-SIGNED provider and can reach a
 //! signing gateway (the exact case `atomcode-clix`'s `review` subcommand has to refuse).
 //!
-//! Deep mode: passing `{"depth":"deep"}` fans out one read-only reviewer per
-//! concern dimension (see `crate::fanout`) and merges/dedups their findings; the
-//! default single-reviewer path is unchanged.
+//! Deep mode: `{"depth":"deep"}` fans out one read-only reviewer per concern
+//! dimension (see `crate::fanout`) and merges/dedups their findings;
+//! `{"depth":"deep+verify"}` additionally runs one verify pass per finding to
+//! cull false positives (single vote, biased toward keep). The default
+//! single-reviewer path is unchanged.
 
 use std::path::Path;
 use std::process::Command;
