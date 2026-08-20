@@ -767,7 +767,7 @@ fn render_table_rule(col_widths: &[usize], preferred: char, caps: TerminalCaps) 
     let width = col_widths.iter().sum::<usize>()
         + TABLE_CELL_PADDING * 2 * col_widths.len()
         + TABLE_COLUMN_GAP * col_widths.len().saturating_sub(1);
-    let rule = stable_table_rule_char(preferred).to_string().repeat(width);
+    let rule = stable_table_rule_char(preferred, caps).to_string().repeat(width);
     if caps.colors {
         format!("{}{}{}", theme::md_border_open(), rule, theme::MD_MUTED_CLOSE)
     } else {
@@ -775,19 +775,26 @@ fn render_table_rule(col_widths: &[usize], preferred: char, caps: TerminalCaps) 
     }
 }
 
-/// Prefer Codex's Unicode rules where their width is reliable. Windows console
-/// hosts (including WSL sessions rendered by Windows Terminal) have historically
-/// disagreed with Unicode's East Asian Ambiguous width for box-drawing glyphs;
-/// use invariant-width ASCII there and whenever the configured width model says
-/// the preferred glyph occupies more than one cell.
-fn stable_table_rule_char(preferred: char) -> char {
-    let windows_console = cfg!(windows)
-        || std::env::var_os("WSL_DISTRO_NAME").is_some()
-        || std::env::var_os("WSL_INTEROP").is_some();
-    if windows_console || crate::width::cell_char_width(preferred).unwrap_or(1) != 1 {
-        if preferred == '━' { '=' } else { '-' }
-    } else {
+/// Pick the box-drawing rule glyph only when the terminal can actually render it,
+/// else fall back to invariant-width ASCII. Two independent gates:
+///
+/// 1. `caps.unicode_symbols` — the SAME capability that governs every other
+///    decorative glyph (`❯`, `◆`, box-drawing corners). It is on for modern
+///    emulators (Windows Terminal via `WT_SESSION`, any `TERM_PROGRAM`, UTF-8
+///    locales) and off for legacy Windows conhost, `TERM=dumb`, POSIX/`C`
+///    locales, and `ATOMCODE_ASCII=1`. Gating tables on this (instead of a blunt
+///    `cfg!(windows)`) lets a modern Windows Terminal show `━`/`─` like macOS,
+///    while legacy conhost still drops to `=`/`-` so it never renders `□` tofu.
+/// 2. Width safety — even on a Unicode-capable host, a glyph our width model
+///    scores at ≠1 cell would desync column alignment, so force ASCII there too.
+fn stable_table_rule_char(preferred: char, caps: TerminalCaps) -> char {
+    let width_safe = crate::width::cell_char_width(preferred).unwrap_or(1) == 1;
+    if caps.unicode_symbols && width_safe {
         preferred
+    } else if preferred == '━' {
+        '='
+    } else {
+        '-'
     }
 }
 
@@ -1732,6 +1739,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn table_rule_char_follows_unicode_symbols_capability() {
+        // A Unicode-capable terminal (modern engine + UTF-8 locale) keeps the
+        // box-drawing rules — the same `unicode_symbols` gate that governs ❯/◆.
+        let uni = TerminalCaps::from_env(EnvView {
+            is_stdout_tty: true,
+            term: Some("xterm-256color".to_string()),
+            lang: Some("en_US.UTF-8".to_string()),
+            ..Default::default()
+        });
+        assert!(uni.unicode_symbols, "UTF-8 xterm must be unicode-capable");
+        // Width model must also agree the glyph is one cell (true on the test host).
+        if crate::width::cell_char_width('━') == Some(1) {
+            assert_eq!(stable_table_rule_char('━', uni), '━');
+            assert_eq!(stable_table_rule_char('─', uni), '─');
+        }
+        // A host that can't render Unicode symbols (legacy conhost / POSIX locale /
+        // ATOMCODE_ASCII / dumb) must drop to invariant-width ASCII — no □ tofu.
+        let ascii = TerminalCaps::from_env(EnvView {
+            is_stdout_tty: true,
+            term: Some("xterm".to_string()),
+            lang: Some("C".to_string()),
+            ..Default::default()
+        });
+        assert!(!ascii.unicode_symbols, "C locale must force ASCII fallback");
+        assert_eq!(stable_table_rule_char('━', ascii), '=');
+        assert_eq!(stable_table_rule_char('─', ascii), '-');
+    }
+
     /// Regression for issue #708: Markdown tables with CJK characters must
     /// have aligned borders regardless of whether East Asian Ambiguous
     /// box-drawing glyphs (`│` `─` `┌` etc.) render at width 1 or 2.
@@ -2387,8 +2423,8 @@ mod tests {
             7,
             "outer boundaries, header, continuous rules, and two data rows:\n{out}"
         );
-        let header_rule = stable_table_rule_char('━');
-        let body_rule = stable_table_rule_char('─');
+        let header_rule = stable_table_rule_char('━', plain_caps());
+        let body_rule = stable_table_rule_char('─', plain_caps());
         // Three heavy continuous rules now: top boundary, header separator, and
         // bottom boundary — the header separator shares the solid boundary style.
         assert_eq!(
