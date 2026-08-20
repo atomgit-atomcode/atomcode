@@ -1218,7 +1218,16 @@ fn visit_circled_list_separator_offsets(line: &str, mut visit: impl FnMut(usize)
                 .peek()
                 .is_some_and(|(_, next)| is_list_label_char(*next))
         {
-            visit(index + ch.len_utf8());
+            // The synthetic space bridges a 1-cell circled glyph to the next
+            // label on fonts that paint these circles narrow (the original
+            // Windows "：①Rust" touch). When the host paints the circled
+            // number as a 2-cell fullwidth glyph (CJK fonts, iTerm2/etc.),
+            // the glyph's own second cell already provides visual separation;
+            // an extra space would double it to `①  Rust`. Match the
+            // renderer's width model so spacing is added only when needed.
+            if crate::width::cell_char_width(ch) == Some(1) {
+                visit(index + ch.len_utf8());
+            }
         }
         previous = Some(ch);
     }
@@ -1458,6 +1467,22 @@ mod tests {
             lang: Some("en_US.UTF-8".to_string()),
             ..Default::default()
         })
+    }
+
+    /// The synthetic separator the circled-list spacing inserts between a
+    /// circled number and its label, under THIS host's width model. Circled
+    /// digits ①–⑳ are widened to 2 cells on emoji-capable terminals (macOS
+    /// GUI terms, Windows Terminal), where the glyph's own second cell already
+    /// separates it from the following label — so no extra space is added.
+    /// On legacy narrow-font hosts (bare conhost) they stay 1 cell and the
+    /// original spacing rule inserts a space. Tests must not hard-code one
+    /// behavior or they break on the other platform.
+    fn circled_sep() -> &'static str {
+        if crate::width::cell_char_width('①') == Some(1) {
+            " "
+        } else {
+            ""
+        }
     }
 
     // Collect the rendered output of feeding `lines` one-by-one, then finalize.
@@ -1807,12 +1832,17 @@ mod tests {
 
     #[test]
     fn circled_list_numbers_gain_visual_spacing_at_prose_boundaries() {
+        // The spacing rule is width-aware: a 1-cell circled glyph (legacy
+        // narrow-font hosts) gets a synthetic space, a 2-cell glyph (emoji-
+        // capable terminals) already separates itself. `circled_sep()`
+        // resolves which applies on the host running the tests.
+        let sep = circled_sep();
         assert_eq!(
             render_inline_line("现在批量落地：①Rust 修复 ②前端修复", plain_caps()),
-            "现在批量落地：① Rust 修复 ② 前端修复"
+            format!("现在批量落地：①{sep}Rust 修复 ②{sep}前端修复")
         );
-        assert_eq!(render_inline_line("③Task", plain_caps()), "③ Task");
-        assert_eq!(render_inline_line("⑳版本", plain_caps()), "⑳ 版本");
+        assert_eq!(render_inline_line("③Task", plain_caps()), format!("③{sep}Task"));
+        assert_eq!(render_inline_line("⑳版本", plain_caps()), format!("⑳{sep}版本"));
     }
 
     #[test]
@@ -1830,16 +1860,17 @@ mod tests {
     #[test]
     fn circled_list_spacing_maps_composer_cursor_without_mutating_source() {
         let source = "①Rust、②前端";
+        let sep = circled_sep();
 
         let (display, cursor_after_first_label) =
             normalize_circled_list_spacing_with_cursor(source, '①'.len_utf8());
-        assert_eq!(display, "① Rust、② 前端");
-        assert_eq!(cursor_after_first_label, '①'.len_utf8() + 1);
+        assert_eq!(display, format!("①{sep}Rust、②{sep}前端"));
+        assert_eq!(cursor_after_first_label, '①'.len_utf8() + sep.len());
 
         let (display, cursor_at_end) =
             normalize_circled_list_spacing_with_cursor(source, source.len());
-        assert_eq!(display, "① Rust、② 前端");
-        assert_eq!(cursor_at_end, source.len() + 2);
+        assert_eq!(display, format!("①{sep}Rust、②{sep}前端"));
+        assert_eq!(cursor_at_end, source.len() + 2 * sep.len());
         assert_eq!(source, "①Rust、②前端");
     }
 
@@ -1855,27 +1886,31 @@ mod tests {
     fn circled_list_display_cursor_maps_back_to_source_boundary() {
         let source = "①Rust";
         let after_label = '①'.len_utf8();
+        let sep = circled_sep();
 
-        // Both sides of the synthetic separator represent the same source
-        // insertion point. Later display positions account for that extra byte.
+        // With a synthetic separator (width-1 hosts) both sides of it map to
+        // the same source insertion point, and later display positions account
+        // for the extra byte. Without one (width-2 hosts) the display
+        // projection is byte-identical to the source, so cursors map 1:1.
         assert_eq!(
             source_cursor_from_circled_list_display_cursor(source, after_label),
             after_label
         );
         assert_eq!(
-            source_cursor_from_circled_list_display_cursor(source, after_label + 1),
+            source_cursor_from_circled_list_display_cursor(source, after_label + sep.len()),
             after_label
         );
         assert_eq!(
-            source_cursor_from_circled_list_display_cursor(source, source.len() + 1),
+            source_cursor_from_circled_list_display_cursor(source, source.len() + sep.len()),
             source.len()
         );
     }
 
     #[test]
     fn circled_list_spacing_keeps_inline_code_styled_content_unchanged() {
+        let sep = circled_sep();
         let rendered = render_inline_line("说明：①Rust，代码 `②前端`", caps());
-        assert!(rendered.contains("说明：① Rust，代码 "));
+        assert!(rendered.contains(&format!("说明：①{sep}Rust，代码 ")));
         assert!(rendered.contains(&format!(
             "{}②前端{}",
             theme::md_inline_code_open(),
@@ -1885,15 +1920,17 @@ mod tests {
 
     #[test]
     fn circled_list_spacing_is_included_in_table_width_measurement() {
+        let sep = circled_sep();
         assert_eq!(
             strip_md_for_width("说明：①Rust ②前端"),
-            "说明：① Rust ② 前端"
+            format!("说明：①{sep}Rust ②{sep}前端")
         );
         assert_eq!(strip_md_for_width("`①Rust` 第①章"), "①Rust 第①章");
     }
 
     #[test]
     fn circled_list_spacing_keeps_table_borders_aligned() {
+        let sep = circled_sep();
         let rows = vec![
             "| 项目 | 状态 |".to_string(),
             "| --- | --- |".to_string(),
@@ -1908,11 +1945,11 @@ mod tests {
             .collect();
 
         assert!(
-            out.contains("① Rust"),
+            out.contains(&format!("①{sep}Rust")),
             "first label was not normalized: {out}"
         );
         assert!(
-            out.contains("② 前端"),
+            out.contains(&format!("②{sep}前端")),
             "second label was not normalized: {out}"
         );
         assert!(
@@ -1923,6 +1960,7 @@ mod tests {
 
     #[test]
     fn circled_list_spacing_survives_narrow_table_fallback() {
+        let sep = circled_sep();
         let rows = vec![
             "| 项目 | 很长的状态说明 |".to_string(),
             "| --- | --- |".to_string(),
@@ -1932,11 +1970,11 @@ mod tests {
         let out = flush_aligned_table_with_width(&rows, plain_caps(), 20);
 
         assert!(
-            out.contains("① Rust"),
+            out.contains(&format!("①{sep}Rust")),
             "first label was not normalized: {out}"
         );
         assert!(
-            out.contains("② 前端"),
+            out.contains(&format!("②{sep}前端")),
             "second label was not normalized: {out}"
         );
     }

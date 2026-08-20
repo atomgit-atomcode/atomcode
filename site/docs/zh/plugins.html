@@ -182,9 +182,12 @@ atomcode plugin marketplace remove|update|list</code></pre>
           <tr><td><code>PostToolUse</code></td><td>工具调用后</td><td>审计、副作用</td></tr>
           <tr><td><code>SessionStart</code></td><td>session 启动</td><td>预热、记录</td></tr>
           <tr><td><code>SessionEnd</code></td><td>session 结束</td><td>清理、归档</td></tr>
+          <tr><td><code>Stop</code></td><td>回合结束——正常停止、安全熔断、用户取消或限流暂停</td><td>通知插件回合已结束;触发后续动作</td></tr>
+          <tr><td><code>StopFailure</code></td><td>回合因 API/provider 错误(流失败/超时)而结束</td><td>通知插件回合失败;告警 / 记录</td></tr>
           <tr><td><code>Notification</code></td><td>系统通知</td><td>转发外部告警通道</td></tr>
         </tbody>
       </table>
+      <p>每个回合结束时都会触发 <strong>且仅触发一个</strong> <code>Stop</code>/<code>StopFailure</code>——不会两个都触发,也不会都不触发。<code>StopFailure</code> 只保留给<em>因为</em> API/provider 失败而结束的回合;回合中途的工具报错<strong>不会</strong>触发它(回合会继续,以真实的终态结束)。stdin payload 携带 <code>hook_event_name</code>、<code>session_id</code>、<code>cwd</code>、会话的 <code>transcript_path</code>(append-only JSONL 会话记录,非持久化运行为 <code>null</code>)、CC 风格的 <code>stop_hook_active</code> 标志(当<em>另有</em>一个终态 hook 配置并会同场触发时为 true——用它可以避免 Stop hook 递归地重新触发自己),以及 kernel 的 <code>stop_reason</code>(如 <code>Stopped</code>、<code>ProviderError</code>、<code>Timeout</code>、<code>Cancelled</code>),hook 无需再解析其他内容即可区分具体结果。
 
       <h3>默认目录自动发现</h3>
       <p>plugin 的资产目录无需在 <code>plugin.json</code> 中逐一声明——loader 会按以下规则自动下钻:</p>
@@ -260,7 +263,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
 
       <h2>已知限制</h2>
       <ul>
-        <li><strong>不支持的 CC 事件</strong>:<code>Stop</code> / <code>PreCompact</code> / <code>SubagentStop</code> 当前会被静默跳过。</li>
+        <li><strong>不支持的 CC 事件</strong>:<code>PreCompact</code> / <code>SubagentStop</code> 当前会被静默跳过。</li>
         <li><strong>多行 indent JSON 输出</strong>:hook 用 <code>print(json.dumps(..., indent=2))</code> 输出多行 JSON 时,最后一行是 <code>}</code>,我们的最后一行 JSON parser 会失败,回退到纯文本注入。功能上没问题(LLM 仍能读到内容),但不是结构化路径。建议 hook 作者用单行 <code>json.dumps(...)</code> 输出。</li>
         <li><strong>Skill 名校验严格</strong>:<code>[a-z0-9_-]</code>,与 CC 一致。带 <code>/</code> 或大小写混合的 skill 名会被 skip。</li>
       </ul>

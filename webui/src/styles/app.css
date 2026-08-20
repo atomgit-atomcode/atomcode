@@ -1530,21 +1530,46 @@ body {
 }
 .sidebar-project-retry:hover { text-decoration: underline; }
 .sidebar-project-name {
-  flex: 1;
+  /* Shrink (with ellipsis) but don't grow, so the count sits right after the
+     name — `atomcode (1135)` — instead of being pushed to the far right. */
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .sidebar-project-count {
+  /* Plain muted `(N)` right after the name, not a pill. */
   flex-shrink: 0;
-  min-width: 18px;
-  text-align: center;
-  padding: 1px 7px;
-  border-radius: 999px;
-  background: var(--app-command-menu-hover-background);
   color: var(--app-tertiary-foreground);
   font-size: 0.75rem;
+}
+/* Per-row "new session in this project's dir" action, revealed on row hover. */
+.sidebar-project-new {
+  width: 26px;
+  height: 34px;
+  flex: 0 0 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: var(--corner-radius-small);
+  background: transparent;
+  color: var(--app-tertiary-foreground);
+  cursor: pointer;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 120ms ease;
+}
+.sidebar-project-row:hover .sidebar-project-new,
+.sidebar-project-new:focus-visible {
+  opacity: 1;
+  visibility: visible;
+}
+.sidebar-project-new:hover {
+  background: var(--app-list-hover-background);
+  color: var(--app-primary-foreground);
 }
 .sidebar-project-sessions { padding-left: 18px; }
 .session-group-label {

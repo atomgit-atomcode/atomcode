@@ -300,6 +300,17 @@ export function App() {
     openNewSession(path || undefined);
   }
 
+  // The per-project "+" in the workspace tree: open a new session in that
+  // project's dir WITHOUT clearing projectHash. Clearing it (as handlePickCwd
+  // does) makes the sidebar's expanded-groups effect collapse the tree for a
+  // beat; here openNewSession's response re-pins projectHash directly, so an
+  // already-expanded project stays open.
+  function handleNewInProject(path: string) {
+    setSidebarOpen(false);
+    setCwd(path);
+    openNewSession(path || undefined);
+  }
+
   // 当从外部（TUI `/cd` 等）收到工作目录变更通知时：
   // 更新 cwd 并拉取最新的项目信息以更新 projectHash。
   function handleCwdChanged(newCwd: string) {
@@ -364,6 +375,7 @@ export function App() {
         activeSessionId={sessionId}
         onSelect={handleSelectSession}
         onNew={handleNewSession}
+        onNewInProject={handleNewInProject}
         open={sidebarOpen}
         collapsed={sidebarCollapsed}
         onToggleCollapse={() => setSidebarCollapsed((c) => !c)}

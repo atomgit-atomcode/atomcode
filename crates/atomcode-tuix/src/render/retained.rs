@@ -943,6 +943,31 @@ fn clip_cells_to_width(cells: &[Cell], max_cols: usize) -> Vec<Cell> {
     out
 }
 
+/// Paint one cell as part of a text selection (mouse-drag in the transcript
+/// / composer): a SOLID theme-aware selection background that REPLACES the
+/// cell's own bg while PRESERVING its fg — matches Claude Code's alt-screen
+/// selection and native terminal selection.
+///
+/// SGR-7 reverse (the previous approach) swapped fg/bg per cell, which
+/// fragmented into a different bg stripe for every distinct fg colour once
+/// markdown / inline-code colours were inside the selection. A single solid
+/// bg keeps the highlight uniform while the original fg stays legible.
+///
+/// Falls back to reverse video when colours are disabled (NO_COLOR etc.) —
+/// reverse is an attribute, not a colour, so it still renders on monochrome
+/// terminals.
+fn paint_selected_cell(cell: &mut Cell, colors: bool) {
+    if colors {
+        cell.style.bg = Some(super::theme::selection_bg_for_current_theme());
+        // A cell that somehow already carried reverse would re-swap fg/bg on
+        // top of the solid bg and look wrong; clear it like Claude Code's
+        // overlay does (strips existing inverse before applying the bg).
+        cell.style.reverse = false;
+    } else {
+        cell.style.reverse = true;
+    }
+}
+
 /// Cell-based wrap: splits a cell sequence into chunks whose sum
 /// of `cell.width` stays ≤ `max_cols`. Continuation cells (width 0)
 /// travel with their preceding real cell — the combined "grapheme"
@@ -974,6 +999,83 @@ fn copy_text_from_body_row(row: &[Cell]) -> (String, usize) {
     } else {
         0
     };
+    let end = row
+        .iter()
+        .rposition(|cell| cell.width > 0 && cell.ch != ' ')
+        .map_or(col, |index| index + 1);
+    let text = row[col.min(end)..end]
+        .iter()
+        .filter(|cell| cell.width > 0)
+        .map(|cell| cell.ch)
+        .collect();
+    (text, col)
+}
+
+/// A failed tool result the agent typically recovers from on the very next
+/// turn — rendered in the muted WARNING colour rather than the alarming ERROR
+/// red, so a transient hiccup does not read like a real, attention-needed
+/// failure. Two recoverable shapes:
+///   * bash exit-code failures (`[elapsed: … exit: N …]`, e.g. a rejected
+///     `git push` the agent retries with `git pull --rebase`);
+///   * `edit_file` misses (`old_string not found` / stale read / multiple
+///     matches) — all end with "The file was NOT modified" and nothing was
+///     changed, so the agent just re-reads and retries with the exact text.
+/// Real ERROR-red is reserved for tool-DISPATCH failures (bad JSON args,
+/// unknown tool) that need human attention.
+fn is_recoverable_tool_failure(success: bool, summary: &str) -> bool {
+    !success && (summary.starts_with("[elapsed:") || summary.contains("The file was NOT modified"))
+}
+
+/// Leading gutter glyphs that anchor a tool block (`● bash`, `└ cmd`,
+/// `⎿ [elapsed…]`, …). Stripped from a tool row's COPY text so a drag copy
+/// carries the command/output, not the decorative anchor.
+const TOOL_GUTTER_GLYPHS: &[char] = &['●', '└', '⎿', '↳', '✓', '▸'];
+
+/// ASCII stand-ins the gutter glyphs downgrade to on non-unicode terminals
+/// (`●`→`*`, `└`/`⎿`→`` ` ``, `▸`/`↳`→`>` — see `glyph::ascii_for`). These chars
+/// are COMMON in real output (`* item`, `> quote`), so they are only treated as
+/// a gutter at COL 0 (a header row); tool output is always PAD-indented, never
+/// col 0, so a real `* …` stdout line is never mis-stripped.
+const TOOL_GUTTER_ASCII: &[char] = &['*', '`', '>'];
+
+/// Copyable text + start col for a TOOL row. Like [`copy_text_from_body_row`]
+/// but ALSO skips a leading gutter glyph + space, so copying a selected tool
+/// block yields `bash` / `cargo build …` rather than `● bash` / `└ cargo …`.
+/// The PAD-space check runs FIRST, so PAD-indented output lines (which never
+/// carry a gutter) are unaffected; the gutter branch only fires on a row that
+/// literally starts with one of [`TOOL_GUTTER_GLYPHS`] followed by a space.
+fn copy_text_from_tool_row(row: &[Cell]) -> (String, usize) {
+    // 1. Skip a leading PAD of spaces (output / continuation indent). Any
+    //    indentation BEYOND the pad is meaningful output and is preserved.
+    let mut col = if row
+        .get(..PAD_COL)
+        .is_some_and(|prefix| prefix.iter().all(|cell| cell.width == 1 && cell.ch == ' '))
+    {
+        PAD_COL
+    } else {
+        0
+    };
+    // 2. Then skip a gutter glyph (`● ` / `└ ` / `⎿ ` chrome anchor) — but
+    //    ONLY when it is immediately followed by a space. The space requirement
+    //    keeps real box-drawing output (`└── file`) intact while still stripping
+    //    the `└ [exit: 0]` result gutter, whether the gutter sits at col 0
+    //    (header) or after the pad (result line).
+    let allow_ascii_gutter = col == 0;
+    let is_gutter = |ch: char| {
+        TOOL_GUTTER_GLYPHS.contains(&ch) || (allow_ascii_gutter && TOOL_GUTTER_ASCII.contains(&ch))
+    };
+    if row.get(col).is_some_and(|cell| is_gutter(cell.ch)) {
+        let mut index = col + 1;
+        while row.get(index).is_some_and(|cell| cell.width == 0) {
+            index += 1; // width-2 glyph's continuation cell
+        }
+        if row.get(index).is_some_and(|cell| cell.ch == ' ') {
+            while row.get(index).is_some_and(|cell| cell.ch == ' ') {
+                index += 1;
+            }
+            col = index;
+        }
+    }
     let end = row
         .iter()
         .rposition(|cell| cell.width > 0 && cell.ch != ' ')
@@ -1700,7 +1802,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             &detail_style,
         );
         for row in rows {
-            self.push_body_row(row);
+            self.push_copyable_tool_row(row);
         }
     }
 
@@ -4970,7 +5072,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         .get_mut(relative_row)
                         .and_then(|row| row.get_mut(2 + cell.col))
                     {
-                        painted.style.reverse = true;
+                        paint_selected_cell(painted, self.caps.colors);
                     }
                 }
             }
@@ -6376,7 +6478,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                             .get_mut(row)
                             .and_then(|cells| cells.get_mut(col + offset))
                         {
-                            cell.style.reverse = true;
+                            paint_selected_cell(cell, self.caps.colors);
                         }
                     }
                     self.pending_interactions
@@ -6949,6 +7051,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
         });
     }
 
+    /// Push a TOOL-block row (header / command / output) as COPYABLE, deriving
+    /// its copy text from the rendered cells via [`copy_text_from_tool_row`]
+    /// (strips the pad + a leading gutter glyph). Without this a drag selection
+    /// spanning a tool block silently drops it — the reported "选中不全，缺少
+    /// bash 的内容". A row that derives to empty text (a blank/spacer) falls back
+    /// to the non-copyable push so blanks never become zero-width copy runs.
+    fn push_copyable_tool_row(&mut self, row: Vec<Cell>) {
+        let (text, col) = copy_text_from_tool_row(&row);
+        if text.is_empty() {
+            self.push_body_row(row);
+        } else {
+            self.push_copyable_body_row(row, text, col, false);
+        }
+    }
+
     /// Record the start of a new logical message in `message_marks`.
     /// The mark's `line_idx` is set to the CURRENT length of `body_lines`
     /// (i.e. the index the NEXT `push_body_row` will occupy).
@@ -7114,7 +7231,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     &body_str,
                 );
                 for row in rows {
-                    self.push_body_row(row);
+                    self.push_copyable_tool_row(row);
                 }
             }
         }
@@ -8231,11 +8348,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.mark_message(crate::render::MarkKind::ToolCall);
         self.last_mark_was_assistant = false;
         self.push_body_row(Vec::new());
-        self.push_body_row(header);
+        self.push_copyable_tool_row(header);
         let header_idx = self.body_lines.len() - 1;
         let mut child_indices = Vec::with_capacity(children.len());
         for child in children {
-            self.push_body_row(child);
+            self.push_copyable_tool_row(child);
             child_indices.push(self.body_lines.len() - 1);
         }
         if !finished {
@@ -8659,14 +8776,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let screen_w = self.screen.width();
                 let header_row =
                     build_one_row(&header, &header_style, screen_w, self.caps.unicode_symbols);
-                self.push_body_row(header_row);
+                self.push_copyable_tool_row(header_row);
                 let header_idx = self.body_lines.len() - 1;
 
                 let mut child_indices: std::collections::HashMap<String, usize> =
                     std::collections::HashMap::new();
                 for c in &children {
                     let row = self.build_group_child_row(&c.text, &muted);
-                    self.push_body_row(row);
+                    self.push_copyable_tool_row(row);
                     child_indices.insert(c.call_id.clone(), self.body_lines.len() - 1);
                 }
                 self.live_group = Some(LiveGroup {
@@ -8771,7 +8888,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     self.screen.width(),
                     self.caps.unicode_symbols,
                 );
-                self.push_body_row(row);
+                self.push_copyable_tool_row(row);
             }
             UiLine::AgentGroup { progress, finished } => {
                 self.render_agent_group(progress, finished);
@@ -8843,7 +8960,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                             &body_str,
                         );
                         for row in rows {
-                            self.push_body_row(row);
+                            self.push_copyable_tool_row(row);
                         }
                     }
                 }
@@ -8913,10 +9030,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let error_header = self.style_bold(Role::Error);
                 let warn_header = self.style_bold(Role::Warning);
                 let safe = scrub_controls(&summary);
-                // Discriminate before `safe` is moved into body_str.
-                // Bash exit-code failures always start with the
-                // `format_exit_marker` prefix from bash.rs:578.
-                let is_exit_code_failure = !success && safe.starts_with("[elapsed:");
+                // Discriminate before `safe` is moved into body_str. A
+                // recoverable failure (bash exit-code, or an `edit_file` miss
+                // that left the file unmodified) is painted WARNING-yellow, not
+                // ERROR-red — the agent self-heals it next turn. See
+                // `is_recoverable_tool_failure`.
+                let is_recoverable_failure = is_recoverable_tool_failure(success, &safe);
                 let body_str = if success {
                     safe
                 } else {
@@ -8965,7 +9084,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     // shouldn't fade to default mid-sentence).
                     let line_style = if line_idx == 0 {
                         if !success {
-                            if is_exit_code_failure {
+                            if is_recoverable_failure {
                                 &warn_header
                             } else {
                                 &error_header
@@ -9001,7 +9120,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                                 push_str_cells(&mut row, ")", &summary_style);
                             }
                         }
-                        self.push_body_row(row);
+                        self.push_copyable_tool_row(row);
                         first_visual = false;
                     }
                 }
@@ -11030,6 +11149,80 @@ mod tests {
     }
 
     #[test]
+    fn recoverable_tool_failures_are_warned_not_errored() {
+        // Bash exit-code failure — the agent retries next turn → WARNING (yellow).
+        assert!(is_recoverable_tool_failure(
+            false,
+            "[elapsed: 0.1s, exit: 1] (2 lines)"
+        ));
+        // edit_file misses all end with "The file was NOT modified" and change
+        // nothing → recoverable, so they must not read as red hard failures.
+        assert!(is_recoverable_tool_failure(
+            false,
+            "edit_file: old_string not found in /a.py. The file was NOT modified. \
+             The closest current line starts at line 453: \"...\""
+        ));
+        assert!(is_recoverable_tool_failure(
+            false,
+            "edit_file: /a.py changed after it was read. The file was NOT modified. Re-read it"
+        ));
+        // A real tool-DISPATCH failure needs attention → stays ERROR-red.
+        assert!(!is_recoverable_tool_failure(
+            false,
+            "Error: invalid JSON arguments for tool"
+        ));
+        // Success is never a failure, regardless of the text.
+        assert!(!is_recoverable_tool_failure(true, "[elapsed: 0.0s, exit: 0]"));
+        assert!(!is_recoverable_tool_failure(true, "x The file was NOT modified"));
+    }
+
+    #[test]
+    fn copy_text_from_tool_row_strips_pad_and_gutter_glyph() {
+        fn row(s: &str) -> Vec<Cell> {
+            let mut r = Vec::new();
+            push_str_cells(&mut r, s, &CellStyle::default());
+            r
+        }
+        // Gutter glyph + space at col 0 is stripped → the command text alone.
+        assert_eq!(copy_text_from_tool_row(&row("● bash")).0, "bash");
+        assert_eq!(copy_text_from_tool_row(&row("└ cargo build")).0, "cargo build");
+        assert_eq!(
+            copy_text_from_tool_row(&row("⎿ [elapsed: 0.0s] (4 lines)")).0,
+            "[elapsed: 0.0s] (4 lines)"
+        );
+        // A non-bash tool header with no gutter-space still copies its content
+        // (whole row from col 0 when there is no leading gutter).
+        assert_eq!(
+            copy_text_from_tool_row(&row("read_file(path)")).0,
+            "read_file(path)"
+        );
+        // PAD-indented output: only the pad is stripped; indentation BEYOND the
+        // pad (meaningful output structure) is preserved.
+        assert_eq!(copy_text_from_tool_row(&row("  stdout")).0, "stdout");
+        assert_eq!(copy_text_from_tool_row(&row("    nested")).0, "  nested");
+        // A gutter AFTER the pad (the result line `  └ [exit: 0]`) is stripped too.
+        assert_eq!(copy_text_from_tool_row(&row("  └ [exit: 0]")).0, "[exit: 0]");
+        // But a box-drawing glyph NOT followed by a space (real tree output) is
+        // preserved — the space requirement guards it.
+        assert_eq!(copy_text_from_tool_row(&row("  └── file.rs")).0, "└── file.rs");
+        // Non-unicode terminal: the gutter downgrades to an ASCII stand-in
+        // (`● `→`* `, `▸ `→`> `, `└ `→`` ` ``). At col 0 (a header row) it is
+        // still stripped.
+        assert_eq!(copy_text_from_tool_row(&row("* bash")).0, "bash");
+        assert_eq!(copy_text_from_tool_row(&row("> read_file")).0, "read_file");
+        assert_eq!(copy_text_from_tool_row(&row("` [exit: 0]")).0, "[exit: 0]");
+        // But those same ASCII chars are common in real OUTPUT — after the pad
+        // (never col 0) they are NOT treated as a gutter and stay intact.
+        assert_eq!(copy_text_from_tool_row(&row("  * bullet")).0, "* bullet");
+        assert_eq!(copy_text_from_tool_row(&row("  > quote")).0, "> quote");
+        // Trailing spaces trimmed.
+        assert_eq!(copy_text_from_tool_row(&row("● bash   ")).0, "bash");
+        // Blank / spacer rows derive to empty (caller keeps them non-copyable).
+        assert_eq!(copy_text_from_tool_row(&row("   ")).0, "");
+        assert_eq!(copy_text_from_tool_row(&[]).0, "");
+    }
+
+    #[test]
     fn interaction_transcript_copy_runs_preserve_semantics_and_exclude_chrome() {
         let interactions = crate::render::interaction::InteractionPublisher::default();
         let mut renderer = RetainedRenderer::with_writer_and_interactions(
@@ -11083,6 +11276,52 @@ mod tests {
                 || run.0.contains("STATUS_SENTINEL")
                 || run.0.contains("BORDER_SENTINEL")
         }));
+    }
+
+    #[test]
+    fn interaction_tool_blocks_are_copyable_without_gutter_chrome() {
+        // Regression: a drag selection spanning a bash tool block used to drop
+        // it entirely (tool rows weren't copy runs) — "选中不全，缺少 bash 的内容".
+        // Now the command + result ARE copy runs, with the ●/└/⎿ gutter glyphs
+        // stripped from the copied text.
+        let interactions = crate::render::interaction::InteractionPublisher::default();
+        let mut renderer = RetainedRenderer::with_writer_and_interactions(
+            CountingSink(Arc::new(AtomicU64::new(0))),
+            caps_with_color(),
+            60,
+            24,
+            interactions.clone(),
+        );
+        renderer.render(UiLine::ToolCall {
+            name: "bash".into(),
+            detail: "echo hello".into(),
+        });
+        renderer.render(UiLine::ToolResult {
+            success: true,
+            summary: "[exit: 0] (1 line)".into(),
+            diff_stats: None,
+        });
+        renderer.flush_deferred();
+
+        let frame = interactions
+            .snapshot_actionable()
+            .expect("painted transcript frame");
+        let texts: Vec<&str> = frame.copy_runs.iter().map(|run| &*run.text).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("echo hello")),
+            "the bash command must be copyable: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("exit: 0")),
+            "the tool result must be copyable: {texts:?}"
+        );
+        // Gutter chrome glyphs must not leak into the copied text.
+        assert!(
+            texts
+                .iter()
+                .all(|t| !t.starts_with('●') && !t.starts_with('└') && !t.starts_with('⎿')),
+            "gutter glyphs must be stripped from copy text: {texts:?}"
+        );
     }
 
     #[test]
@@ -11203,7 +11442,13 @@ mod tests {
     }
 
     #[test]
-    fn interaction_transcript_selection_reverses_cjk_and_zwj_continuation_cells() {
+    fn interaction_transcript_selection_paints_solid_bg_on_cjk_and_zwj_continuation_cells() {
+        // The selection bg resolves the process-wide theme `MODE` (a global
+        // AtomicU8). Pin it dark under the theme lock so a parallel
+        // theme-switching test can't flip MODE between the render (which
+        // bakes SELECTION_BG_DARK into the cells) and the assertion.
+        let _theme = crate::highlight::theme::test_lock();
+        crate::highlight::theme::set_theme_mode(false);
         let interactions = crate::render::interaction::InteractionPublisher::default();
         let mut renderer = RetainedRenderer::with_writer_and_interactions(
             CountingSink(Arc::new(AtomicU64::new(0))),
@@ -11250,18 +11495,35 @@ mod tests {
         let cells = renderer.screen.prev_cells_for_test();
         let row = run.rect.row as usize;
         let col = run.rect.col as usize;
-        assert!(!cells[row][col].style.reverse, "ASCII prefix unchanged");
-        assert!(cells[row][col + 1].style.reverse, "CJK lead selected");
+        let selection_bg = crate::render::theme::selection_bg_for_current_theme();
         assert!(
-            cells[row][col + 2].style.reverse,
-            "CJK continuation selected"
+            cells[row][col].style.bg.is_none(),
+            "ASCII prefix unchanged"
         );
-        assert!(cells[row][col + 3].style.reverse, "ZWJ lead selected");
+        assert_eq!(
+            cells[row][col + 1].style.bg,
+            Some(selection_bg),
+            "CJK lead selected with solid bg"
+        );
+        assert_eq!(
+            cells[row][col + 2].style.bg,
+            Some(selection_bg),
+            "CJK continuation selected with solid bg"
+        );
+        assert_eq!(
+            cells[row][col + 3].style.bg,
+            Some(selection_bg),
+            "ZWJ lead selected with solid bg"
+        );
+        assert_eq!(
+            cells[row][col + 4].style.bg,
+            Some(selection_bg),
+            "ZWJ continuation selected with solid bg"
+        );
         assert!(
-            cells[row][col + 4].style.reverse,
-            "ZWJ continuation selected"
+            cells[row][col + 5].style.bg.is_none(),
+            "ASCII suffix unchanged"
         );
-        assert!(!cells[row][col + 5].style.reverse, "ASCII suffix unchanged");
     }
 
     #[test]
@@ -11409,7 +11671,13 @@ mod tests {
     }
 
     #[test]
-    fn interaction_composer_selection_reverses_only_the_selected_grapheme_cells() {
+    fn interaction_composer_selection_paints_solid_bg_only_on_the_selected_grapheme_cells() {
+        // The selection bg resolves the process-wide theme `MODE` (a global
+        // AtomicU8). Pin it dark under the theme lock so a parallel
+        // theme-switching test can't flip MODE between the render (which
+        // bakes SELECTION_BG_DARK into the cells) and the assertion.
+        let _theme = crate::highlight::theme::test_lock();
+        crate::highlight::theme::set_theme_mode(false);
         let interactions = crate::render::interaction::InteractionPublisher::default();
         let input = "a你👩‍💻b";
         let suffix = input.rfind('b').expect("suffix boundary");
@@ -11443,22 +11711,33 @@ mod tests {
         let cells = renderer.screen.prev_cells_for_test();
         let row = a.rect.row as usize;
         let col = a.rect.col as usize;
+        let selection_bg = crate::render::theme::selection_bg_for_current_theme();
         assert!(
-            !cells[row][col].style.reverse,
+            cells[row][col].style.bg.is_none(),
             "ASCII prefix stays unchanged"
         );
-        assert!(cells[row][col + 1].style.reverse, "CJK lead cell selected");
-        assert!(
-            cells[row][col + 2].style.reverse,
-            "CJK continuation selected"
+        assert_eq!(
+            cells[row][col + 1].style.bg,
+            Some(selection_bg),
+            "CJK lead cell selected with solid bg"
         );
-        assert!(cells[row][col + 3].style.reverse, "ZWJ lead cell selected");
-        assert!(
-            cells[row][col + 4].style.reverse,
-            "ZWJ continuation selected"
+        assert_eq!(
+            cells[row][col + 2].style.bg,
+            Some(selection_bg),
+            "CJK continuation selected with solid bg"
+        );
+        assert_eq!(
+            cells[row][col + 3].style.bg,
+            Some(selection_bg),
+            "ZWJ lead cell selected with solid bg"
+        );
+        assert_eq!(
+            cells[row][col + 4].style.bg,
+            Some(selection_bg),
+            "ZWJ continuation selected with solid bg"
         );
         assert!(
-            !cells[row][col + 5].style.reverse,
+            cells[row][col + 5].style.bg.is_none(),
             "ASCII suffix stays unchanged"
         );
     }
@@ -20111,12 +20390,20 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        // Circled digits are width-aware: width-1 hosts (legacy narrow fonts)
+        // insert a synthetic space after the label, width-2 hosts (emoji-
+        // capable terminals) already separate via the glyph's second cell.
+        let sep = if crate::width::cell_char_width('①') == Some(1) { " " } else { "" };
         assert!(
-            visible.contains("如果是 ① Rust、② 前端：属于模型没加空格，无需修 TUI。"),
-            "committed user echo should space compact circled labels: {visible:?}"
+            visible.contains(&format!("如果是 ①{sep}Rust、②{sep}前端：属于模型没加空格，无需修 TUI。")),
+            "committed user echo should use the width-aware circled-label spacing: {visible:?}"
         );
-        assert!(!visible.contains("①Rust"));
-        assert!(!visible.contains("②前端"));
+        // On width-1 hosts the synthetic space must appear; on width-2 hosts
+        // the glyph's own second cell provides the gap (no extra space byte).
+        if sep == " " {
+            assert!(!visible.contains("①Rust"));
+            assert!(!visible.contains("②前端"));
+        }
     }
 
     /// History recall restores source text into the live composer rather than
