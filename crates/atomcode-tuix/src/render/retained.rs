@@ -20345,12 +20345,20 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        // Circled digits are width-aware: width-1 hosts (legacy narrow fonts)
+        // insert a synthetic space after the label, width-2 hosts (emoji-
+        // capable terminals) already separate via the glyph's second cell.
+        let sep = if crate::width::cell_char_width('①') == Some(1) { " " } else { "" };
         assert!(
-            visible.contains("如果是 ① Rust、② 前端：属于模型没加空格，无需修 TUI。"),
-            "committed user echo should space compact circled labels: {visible:?}"
+            visible.contains(&format!("如果是 ①{sep}Rust、②{sep}前端：属于模型没加空格，无需修 TUI。")),
+            "committed user echo should use the width-aware circled-label spacing: {visible:?}"
         );
-        assert!(!visible.contains("①Rust"));
-        assert!(!visible.contains("②前端"));
+        // On width-1 hosts the synthetic space must appear; on width-2 hosts
+        // the glyph's own second cell provides the gap (no extra space byte).
+        if sep == " " {
+            assert!(!visible.contains("①Rust"));
+            assert!(!visible.contains("②前端"));
+        }
     }
 
     /// History recall restores source text into the live composer rather than
