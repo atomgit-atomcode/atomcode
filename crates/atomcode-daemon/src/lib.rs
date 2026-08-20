@@ -6311,6 +6311,14 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/auth/logout", post(api_auth::auth_logout))
         // CodingPlan API (P0)
         .route("/codingplan/setup", post(api_codingplan::codingplan_setup))
+        .route(
+            "/codingplan/usage/summary",
+            get(api_codingplan::codingplan_usage_summary),
+        )
+        .route(
+            "/codingplan/usage/daily",
+            get(api_codingplan::codingplan_usage_daily),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_token::require_webui_token,
@@ -6406,6 +6414,8 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         println!("  DELETE /auth/login/:login_id           - Cancel login session");
         println!("  POST   /auth/logout                    - Logout");
         println!("  POST   /codingplan/setup               - Run CodingPlan setup");
+        println!("  GET    /codingplan/usage/summary       - CodingPlan quota summary");
+        println!("  GET    /codingplan/usage/daily         - CodingPlan daily usage");
         println!("\nChange directory body:");
         println!("  {{\"path\": \"/path/to/project\"}}  or {{\"path\": \"-\"}} to go back");
         println!("\nChat request body:");
