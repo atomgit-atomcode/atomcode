@@ -10,6 +10,10 @@
 //! [`SharedReviewProvider`]) rather than constructed fresh from a config — so the reviewer
 //! reuses the host's already-built, possibly request-SIGNED provider and can reach a
 //! signing gateway (the exact case `atomcode-clix`'s `review` subcommand has to refuse).
+//!
+//! Deep mode: passing `{"depth":"deep"}` fans out one read-only reviewer per
+//! concern dimension (see `crate::fanout`) and merges/dedups their findings; the
+//! default single-reviewer path is unchanged.
 
 use std::path::Path;
 use std::process::Command;
@@ -29,6 +33,7 @@ use serde_json::json;
 
 use crate::config::ReviewAgentConfig;
 use crate::diff::annotate_diff_line_numbers;
+use crate::fanout::{finalize_deep_review, run_deep_review, DimensionOutcome, REVIEW_DIMENSIONS};
 use crate::impact_plan::render_review_impact_plan;
 use crate::rules::{changed_files_from_diff, render_rules_section};
 use crate::{build_review_agent_with, Finding};
@@ -264,6 +269,11 @@ struct Args {
     /// the user explicitly accepts the displayed scope.
     #[serde(default)]
     confirm_scope: Option<String>,
+    /// Review depth. `"deep"` fans out one read-only reviewer per concern
+    /// dimension and merges their findings; absent / `"single"` runs the default
+    /// single reviewer. Unknown values fall back to single.
+    #[serde(default)]
+    depth: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -294,6 +304,13 @@ enum ReviewScope {
 }
 
 impl Args {
+    fn is_deep(&self) -> bool {
+        self.depth
+            .as_deref()
+            .map(|d| d.eq_ignore_ascii_case("deep"))
+            .unwrap_or(false)
+    }
+
     fn review_scope(&self) -> Result<ReviewScope, String> {
         if self.scope.is_some() && (self.base.is_some() || self.staged) {
             return Err("`scope` cannot be combined with legacy `base` or `staged`".into());
@@ -418,7 +435,8 @@ impl Tool for ReviewTool {
                     "description": "Explicit mutually-exclusive review scope. Omit for working-tree changes."
                 },
                 "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional repo-relative path filters." },
-                "confirm_scope": { "type": "string", "description": "Opaque token from a preflight. Pass only after explicit user confirmation." }
+                "confirm_scope": { "type": "string", "description": "Opaque token from a preflight. Pass only after explicit user confirmation." },
+                "depth": { "type": "string", "enum": ["single", "deep"], "description": "Review depth. `deep` fans out one reviewer per concern dimension (correctness/security/performance/tests) and merges findings; omit for the default single reviewer." }
             }
         })
     }
@@ -486,41 +504,68 @@ impl Tool for ReviewTool {
             Some(p) => p,
             None => return err("code_review: review provider is not wired (internal error)"),
         };
-        let mut cfg = ReviewAgentConfig::new("", "", &self.cfg.model, &ctx.working_dir);
-        cfg.context_window = self.cfg.context_window;
-        cfg.stream_timeout = self.cfg.stream_timeout;
-        cfg.request_timeout = self.cfg.request_timeout;
-        cfg.max_rounds = self.max_rounds;
-        cfg.max_turn_duration = self.max_turn_duration;
-        cfg.tool_loop_policy = self.tool_loop_policy;
-        cfg.progress = Some(ctx.progress.clone());
-        // Pin tools to the changed-file set of this scoped review (same as clix).
-        cfg.review_paths = files.clone();
-        let (agent, report) = build_review_agent_with(&cfg, provider);
 
-        // 4. Run the reviewer to completion, honoring the host turn's cancellation. Dropping
-        //    the run future (on cancel) cancels the spawned child agent.
-        let (stop, run_error) = tokio::select! {
-            _ = ctx.cancel.cancelled() => (StopReason::Cancelled, Some("cancelled by user".to_string())),
-            outcome = agent.run_to_completion(task, AutoRespond::AllowAll) => {
-                (outcome.stop, outcome.error)
-            }
+        // Shared per-agent config seed (both paths).
+        let make_cfg = || {
+            let mut cfg = ReviewAgentConfig::new("", "", &self.cfg.model, &ctx.working_dir);
+            cfg.context_window = self.cfg.context_window;
+            cfg.stream_timeout = self.cfg.stream_timeout;
+            cfg.request_timeout = self.cfg.request_timeout;
+            cfg.max_rounds = self.max_rounds;
+            cfg.max_turn_duration = self.max_turn_duration;
+            cfg.tool_loop_policy = self.tool_loop_policy;
+            cfg.progress = Some(ctx.progress.clone());
+            cfg.review_paths = files.clone();
+            cfg
         };
 
-        // 5. Scope-filter to changed files, sort (priority then confidence), render.
-        let mut findings = report.findings();
-        findings.retain(|f| files.iter().any(|cf| paths_match(cf, &f.file_path)));
-        sort_findings(&mut findings);
-        if stop == StopReason::Stopped && run_error.is_none() {
-            ok(render_findings(&findings, files.len()))
-        } else {
-            err(render_incomplete_review(
-                &findings,
-                files.len(),
-                stop,
-                run_error.as_deref(),
-            ))
+        if !a.is_deep() {
+            // --- single-agent path (unchanged behavior) ---
+            let (agent, report) = build_review_agent_with(&make_cfg(), provider);
+            let (stop, run_error) = tokio::select! {
+                _ = ctx.cancel.cancelled() => (StopReason::Cancelled, Some("cancelled by user".to_string())),
+                outcome = agent.run_to_completion(task, AutoRespond::AllowAll) => {
+                    (outcome.stop, outcome.error)
+                }
+            };
+            let mut findings = report.findings();
+            findings.retain(|f| files.iter().any(|cf| paths_match(cf, &f.file_path)));
+            sort_findings(&mut findings);
+            return if stop == StopReason::Stopped && run_error.is_none() {
+                ok(render_findings(&findings, files.len()))
+            } else {
+                err(render_incomplete_review(&findings, files.len(), stop, run_error.as_deref()))
+            };
         }
+
+        // --- deep fan-out path ---
+        let outcomes = run_deep_review(REVIEW_DIMENSIONS, |dim| {
+            // Clone everything so each dimension future is Send + 'static.
+            let provider = provider.clone();
+            let task = task.clone();
+            let mut cfg = make_cfg();
+            let cancel = ctx.cancel.clone();
+            async move {
+                cfg = cfg.with_persona_append(dim.lens);
+                let (agent, report) = build_review_agent_with(&cfg, provider);
+                let (stop, run_error) = tokio::select! {
+                    _ = cancel.cancelled() => (StopReason::Cancelled, Some("cancelled by user".to_string())),
+                    outcome = agent.run_to_completion(task, AutoRespond::AllowAll) => {
+                        (outcome.stop, outcome.error)
+                    }
+                };
+                DimensionOutcome {
+                    dimension: dim.id,
+                    findings: report.findings(),
+                    completed: stop == StopReason::Stopped && run_error.is_none(),
+                    error: run_error,
+                }
+            }
+        })
+        .await;
+
+        let (is_error, content) = finalize_deep_review(&outcomes, files.len(), &files);
+        if is_error { err(content) } else { ok(content) }
     }
 }
 
@@ -1386,6 +1431,59 @@ mod tests {
                 .iter()
                 .any(|message| message == "\u{1e}review · analyzing 1 file(s)"),
             "progress must expose the pre-review phase: {progress:?}"
+        );
+    }
+
+    #[test]
+    fn args_parse_depth_field() {
+        let d: Args = serde_json::from_str(r#"{"depth":"deep"}"#).unwrap();
+        assert!(d.is_deep());
+        let s: Args = serde_json::from_str("{}").unwrap();
+        assert!(!s.is_deep());
+        let explicit: Args = serde_json::from_str(r#"{"depth":"single"}"#).unwrap();
+        assert!(!explicit.is_deep());
+    }
+
+    #[tokio::test]
+    async fn deep_review_fans_out_and_dedups_across_dimensions() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = repo_with_working_tree_change();
+        let provider: SharedReviewProvider =
+            Arc::new(RwLock::new(Some(Arc::new(ScriptedReviewProvider))));
+        let tool = ReviewTool::new(
+            provider,
+            ReviewToolConfig {
+                model: "mock-model".into(),
+                ..Default::default()
+            },
+        );
+        let ctx = ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            cancel: Default::default(),
+            progress: ProgressSink::noop(),
+            requester: None,
+        };
+
+        let res = tool.execute(r#"{"depth":"deep"}"#, &ctx).await;
+
+        assert!(!res.is_error, "deep review should succeed: {}", res.content);
+        assert!(
+            res.content.contains("Deep review"),
+            "deep header present: {}",
+            res.content
+        );
+        // All four dimensions report the same finding → merged to ONE.
+        assert!(
+            res.content.contains("1 finding(s)") || res.content.contains("1 finding"),
+            "identical findings across dimensions must dedup to one: {}",
+            res.content
+        );
+        assert!(
+            res.content.contains("dims:"),
+            "merged finding is tagged with its dimensions: {}",
+            res.content
         );
     }
 
