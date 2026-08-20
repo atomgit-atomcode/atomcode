@@ -1011,6 +1011,21 @@ fn copy_text_from_body_row(row: &[Cell]) -> (String, usize) {
     (text, col)
 }
 
+/// A failed tool result the agent typically recovers from on the very next
+/// turn — rendered in the muted WARNING colour rather than the alarming ERROR
+/// red, so a transient hiccup does not read like a real, attention-needed
+/// failure. Two recoverable shapes:
+///   * bash exit-code failures (`[elapsed: … exit: N …]`, e.g. a rejected
+///     `git push` the agent retries with `git pull --rebase`);
+///   * `edit_file` misses (`old_string not found` / stale read / multiple
+///     matches) — all end with "The file was NOT modified" and nothing was
+///     changed, so the agent just re-reads and retries with the exact text.
+/// Real ERROR-red is reserved for tool-DISPATCH failures (bad JSON args,
+/// unknown tool) that need human attention.
+fn is_recoverable_tool_failure(success: bool, summary: &str) -> bool {
+    !success && (summary.starts_with("[elapsed:") || summary.contains("The file was NOT modified"))
+}
+
 /// Leading gutter glyphs that anchor a tool block (`● bash`, `└ cmd`,
 /// `⎿ [elapsed…]`, …). Stripped from a tool row's COPY text so a drag copy
 /// carries the command/output, not the decorative anchor.
@@ -9015,10 +9030,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let error_header = self.style_bold(Role::Error);
                 let warn_header = self.style_bold(Role::Warning);
                 let safe = scrub_controls(&summary);
-                // Discriminate before `safe` is moved into body_str.
-                // Bash exit-code failures always start with the
-                // `format_exit_marker` prefix from bash.rs:578.
-                let is_exit_code_failure = !success && safe.starts_with("[elapsed:");
+                // Discriminate before `safe` is moved into body_str. A
+                // recoverable failure (bash exit-code, or an `edit_file` miss
+                // that left the file unmodified) is painted WARNING-yellow, not
+                // ERROR-red — the agent self-heals it next turn. See
+                // `is_recoverable_tool_failure`.
+                let is_recoverable_failure = is_recoverable_tool_failure(success, &safe);
                 let body_str = if success {
                     safe
                 } else {
@@ -9067,7 +9084,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     // shouldn't fade to default mid-sentence).
                     let line_style = if line_idx == 0 {
                         if !success {
-                            if is_exit_code_failure {
+                            if is_recoverable_failure {
                                 &warn_header
                             } else {
                                 &error_header
@@ -11129,6 +11146,34 @@ mod tests {
             frame.hit(row, col + 3),
             Some(crate::render::interaction::HitTarget::ComposerByte { byte: 1 })
         );
+    }
+
+    #[test]
+    fn recoverable_tool_failures_are_warned_not_errored() {
+        // Bash exit-code failure — the agent retries next turn → WARNING (yellow).
+        assert!(is_recoverable_tool_failure(
+            false,
+            "[elapsed: 0.1s, exit: 1] (2 lines)"
+        ));
+        // edit_file misses all end with "The file was NOT modified" and change
+        // nothing → recoverable, so they must not read as red hard failures.
+        assert!(is_recoverable_tool_failure(
+            false,
+            "edit_file: old_string not found in /a.py. The file was NOT modified. \
+             The closest current line starts at line 453: \"...\""
+        ));
+        assert!(is_recoverable_tool_failure(
+            false,
+            "edit_file: /a.py changed after it was read. The file was NOT modified. Re-read it"
+        ));
+        // A real tool-DISPATCH failure needs attention → stays ERROR-red.
+        assert!(!is_recoverable_tool_failure(
+            false,
+            "Error: invalid JSON arguments for tool"
+        ));
+        // Success is never a failure, regardless of the text.
+        assert!(!is_recoverable_tool_failure(true, "[elapsed: 0.0s, exit: 0]"));
+        assert!(!is_recoverable_tool_failure(true, "x The file was NOT modified"));
     }
 
     #[test]
