@@ -248,6 +248,40 @@ fn render_deep(
     out
 }
 
+/// Run every dimension concurrently and collect their outcomes in `dims` order.
+/// `run_one` builds and drives one dimension's reviewer; it must return a
+/// `Send + 'static` future (the production runner clones everything it needs).
+pub async fn run_deep_review<F, Fut>(
+    dims: &'static [ReviewDimension],
+    run_one: F,
+) -> Vec<DimensionOutcome>
+where
+    F: Fn(&'static ReviewDimension) -> Fut,
+    Fut: std::future::Future<Output = DimensionOutcome> + Send + 'static,
+{
+    let mut set = tokio::task::JoinSet::new();
+    for dim in dims {
+        set.spawn(run_one(dim));
+    }
+    let mut collected: Vec<DimensionOutcome> = Vec::with_capacity(dims.len());
+    while let Some(joined) = set.join_next().await {
+        if let Ok(outcome) = joined {
+            collected.push(outcome);
+        }
+        // A panicked/aborted task is simply absent; finalize treats a missing
+        // dimension as not-completed (it never appears in `completed`).
+    }
+    // Return in stable dimension order regardless of completion order.
+    dims.iter()
+        .filter_map(|d| {
+            collected
+                .iter()
+                .position(|o| o.dimension == d.id)
+                .map(|i| collected.remove(i))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +407,24 @@ mod tests {
         ];
         let (_, out) = finalize_deep_review(&outcomes, 1, &["a.rs".to_string()]);
         assert!(out.contains("correctness") && out.contains("security"), "dims tagged:\n{out}");
+    }
+
+    #[tokio::test]
+    async fn run_deep_review_runs_all_dimensions_and_preserves_order() {
+        let outcomes = run_deep_review(REVIEW_DIMENSIONS, |dim| {
+            let id = dim.id;
+            async move {
+                DimensionOutcome {
+                    dimension: id,
+                    findings: vec![f("P2", 0.7, "a.rs", 1, 1, id)],
+                    completed: true,
+                    error: None,
+                }
+            }
+        })
+        .await;
+        let ids: Vec<_> = outcomes.iter().map(|o| o.dimension).collect();
+        assert_eq!(ids, ["correctness", "security", "performance", "tests_contracts"]);
+        assert!(outcomes.iter().all(|o| o.completed && o.findings.len() == 1));
     }
 }
