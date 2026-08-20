@@ -88,24 +88,30 @@ pub(super) fn dispatch_rewind(state: &UiState, ctx: &LoopCtx, renderer: &mut dyn
 /// legacy top-level `base` form whose diff included the working tree as an accidental side
 /// effect. `/review <base>` now consistently means the committed `<base>..HEAD` range.
 fn review_prompt(arg: &str) -> String {
-    let scope = arg.trim();
-    if scope.is_empty() {
-        return "Review my current uncommitted changes: call the `code_review` tool with \
-                {\"scope\":{\"kind\":\"working_tree\"}}, then give me a concise summary of \
-                its findings."
-            .to_string();
-    }
-    if scope.eq_ignore_ascii_case("staged") {
-        return "Review my staged changes: call the `code_review` tool with \
-                {\"scope\":{\"kind\":\"staged\"}}, then give me a concise summary of its \
-                findings."
-            .to_string();
-    }
+    let arg = arg.trim();
+    // A leading `deep` keyword (alone or before a scope) opts into deep mode.
+    let (deep, scope) = match arg.strip_prefix("deep") {
+        Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => (true, rest.trim()),
+        _ => (false, arg),
+    };
+    let scope_json = if scope.is_empty() {
+        r#"{"kind":"working_tree"}"#.to_string()
+    } else if scope.eq_ignore_ascii_case("staged") {
+        r#"{"kind":"staged"}"#.to_string()
+    } else {
+        format!(
+            r#"{{"kind":"range","base":{base},"head":"HEAD"}}"#,
+            base = serde_json::to_string(scope).expect("serializing a string cannot fail")
+        )
+    };
+    let args = if deep {
+        format!(r#"{{"scope":{scope_json},"depth":"deep"}}"#)
+    } else {
+        format!(r#"{{"scope":{scope_json}}}"#)
+    };
     format!(
-        "Review the requested committed range: call the `code_review` tool with \
-         {{\"scope\":{{\"kind\":\"range\",\"base\":{base},\"head\":\"HEAD\"}}}}, then give \
-         me a concise summary of its findings.",
-        base = serde_json::to_string(scope).expect("serializing a string cannot fail")
+        "Review the requested changes: call the `code_review` tool with {args}, then give me a \
+         concise summary of its findings."
     )
 }
 
@@ -7810,6 +7816,28 @@ mod tests {
         let prompt = review_prompt("odd\"ref");
         assert!(prompt.contains(r#""base":"odd\"ref""#));
         assert!(!prompt.contains("`odd\"ref..HEAD`"));
+    }
+
+    #[test]
+    fn review_prompt_deep_adds_depth_and_keeps_scope() {
+        // `deep` alone → working-tree + depth.
+        let wt = review_prompt("deep");
+        assert!(wt.contains(r#""scope":{"kind":"working_tree"}"#), "{wt}");
+        assert!(wt.contains(r#""depth":"deep""#), "{wt}");
+
+        // `deep staged` → staged + depth.
+        let st = review_prompt("deep staged");
+        assert!(st.contains(r#""scope":{"kind":"staged"}"#), "{st}");
+        assert!(st.contains(r#""depth":"deep""#), "{st}");
+
+        // `deep <ref>` → range + depth.
+        let rng = review_prompt("deep main");
+        assert!(rng.contains(r#""scope":{"kind":"range","base":"main","head":"HEAD"}"#), "{rng}");
+        assert!(rng.contains(r#""depth":"deep""#), "{rng}");
+
+        // Plain scope carries NO depth (default single).
+        assert!(!review_prompt("").contains("depth"));
+        assert!(!review_prompt("staged").contains("depth"));
     }
 
     #[test]
