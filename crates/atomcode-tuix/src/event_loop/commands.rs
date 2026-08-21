@@ -3301,8 +3301,15 @@ fn execute_slash_command_impl(
                 }
                 Ok(status) => {
                     let mut txt = t(Msg::McpServersHeader).into_owned();
-                    for (name, server_status) in status.servers {
+                    let blocked = count_blocked_untrusted(&status.servers);
+                    for (name, server_status) in &status.servers {
                         txt.push_str(&format!("    {}  {}\n", name, server_status));
+                    }
+                    // When any project-source server is withheld, surface how to
+                    // unblock it — the raw `blocked: untrusted project` lines never
+                    // mention that `/mcp trust` exists.
+                    if blocked > 0 {
+                        txt.push_str(&t(Msg::McpBlockedTrustHint { count: blocked }));
                     }
                     renderer.render(UiLine::CommandOutput(txt));
                 }
@@ -6422,6 +6429,17 @@ pub(crate) enum McpSub {
     Untrust,
 }
 
+/// Count servers withheld because the project is untrusted. Drives the
+/// `/mcp trust` discoverability hint appended to the status listing.
+pub(crate) fn count_blocked_untrusted(
+    servers: &[(String, atomcode_capabilities::mcp::ServerStatus)],
+) -> usize {
+    servers
+        .iter()
+        .filter(|(_, s)| matches!(s, atomcode_capabilities::mcp::ServerStatus::BlockedUntrusted))
+        .count()
+}
+
 /// Parse the argument string following `/mcp` into a known subcommand.
 /// Returns `None` for unrecognised inputs (which fall through to status display).
 pub(crate) fn parse_mcp_subcommand(sub: &str) -> Option<McpSub> {
@@ -9111,7 +9129,29 @@ mod todo_command_tests {
 
 #[cfg(test)]
 mod mcp_subcommand_tests {
-    use super::{parse_mcp_subcommand, McpSub};
+    use super::{count_blocked_untrusted, parse_mcp_subcommand, McpSub};
+    use atomcode_capabilities::mcp::ServerStatus;
+
+    #[test]
+    fn count_blocked_untrusted_counts_only_withheld() {
+        let servers = vec![
+            ("a".to_string(), ServerStatus::Connected),
+            ("b".to_string(), ServerStatus::BlockedUntrusted),
+            ("c".to_string(), ServerStatus::Failed("boom".to_string())),
+            ("d".to_string(), ServerStatus::BlockedUntrusted),
+            ("e".to_string(), ServerStatus::Connecting),
+        ];
+        assert_eq!(count_blocked_untrusted(&servers), 2);
+    }
+
+    #[test]
+    fn count_blocked_untrusted_zero_when_all_trusted() {
+        let servers = vec![
+            ("a".to_string(), ServerStatus::Connected),
+            ("b".to_string(), ServerStatus::Disconnected),
+        ];
+        assert_eq!(count_blocked_untrusted(&servers), 0);
+    }
 
     #[test]
     fn mcp_trust_subcommands_recognized() {

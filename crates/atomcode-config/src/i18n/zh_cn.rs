@@ -721,6 +721,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  用法：/mcp tools <服务器名>\n  示例：/mcp tools filesystem\n".into(),
         Msg::McpServersHeader =>
             "  MCP 服务器：\n".into(),
+        Msg::McpBlockedTrustHint { count } =>
+            format!(
+                "  有 {count} 个服务器因本项目未被信任而被拦截。\n  运行 /mcp trust 可加载本项目的 MCP 服务器。\n"
+            ).into(),
         Msg::McpReloadFailed { error } =>
             format!("MCP 重载失败：无法加载 .mcp.json / $ATOMCODE_HOME/mcp.json：{:#}", error).into(),
         // /mcp login / logout

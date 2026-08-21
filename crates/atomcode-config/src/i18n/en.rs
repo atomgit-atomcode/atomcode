@@ -746,6 +746,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  Usage: /mcp tools <server>\n  Example: /mcp tools filesystem\n".into(),
         Msg::McpServersHeader =>
             "  MCP Servers:\n".into(),
+        Msg::McpBlockedTrustHint { count } =>
+            format!(
+                "  {count} server(s) blocked because this project is untrusted.\n  Run /mcp trust to load this project's MCP servers.\n"
+            ).into(),
         Msg::McpReloadFailed { error } =>
             format!("mcp reload failed: failed to load .mcp.json / $ATOMCODE_HOME/mcp.json: {:#}", error).into(),
         // /mcp login / logout

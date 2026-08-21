@@ -843,6 +843,11 @@ pub enum Msg<'a> {
     McpClearedNoServers,
     McpToolsUsage,
     McpServersHeader,
+    /// Discoverability hint appended to `/mcp` status when one or more
+    /// project-source servers are withheld because the project is untrusted.
+    McpBlockedTrustHint {
+        count: usize,
+    },
     McpReloadFailed {
         error: &'a str,
     },
