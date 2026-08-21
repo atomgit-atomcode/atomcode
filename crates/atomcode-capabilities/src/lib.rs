@@ -147,6 +147,12 @@ pub mod setup;
 #[cfg(feature = "tools")]
 pub mod tools;
 
+/// External-agent subagent drivers: drive Claude Code / Codex as named subagent
+/// tools. Backend-neutral contract + CLI adapters. See
+/// `docs/plans/2026-08-21-external-agent-subagent-drivers-spec.md`.
+#[cfg(feature = "tools")]
+pub mod subagent;
+
 /// AtomGit REST tools (repo / pull-request / issue). Opt-in `atomgit` feature.
 #[cfg(feature = "atomgit")]
 pub mod atomgit;
