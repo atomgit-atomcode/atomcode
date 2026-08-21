@@ -8170,6 +8170,20 @@ mod tool_format_tests {
     }
 
     #[test]
+    fn format_tool_detail_external_subagent_shows_prompt_first_line() {
+        let args = r#"{"prompt":"Dead-code audit of the workspace\nfull details follow"}"#;
+        assert_eq!(
+            format_tool_detail("subagent_codex", args),
+            "Dead-code audit of the workspace"
+        );
+        // Skips leading blank lines; truncates long first lines.
+        let long = format!("{{\"prompt\":\"\\n\\n{}\"}}", "x".repeat(200));
+        let detail = format_tool_detail("subagent_claude_review", &long);
+        assert!(detail.starts_with('x') && detail.ends_with('…'));
+        assert!(detail.chars().count() <= 101);
+    }
+
+    #[test]
     fn format_tool_detail_edit_file_omits_old_string_preview() {
         let args = r#"{"file_path":"/abs/path/to/test.txt","old_string":"4","new_string":"1888"}"#;
         assert_eq!(format_tool_detail("edit_file", args), "test.txt");
@@ -28910,6 +28924,18 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
                 Some(arr) if !arr.is_empty() => format!("{} subtasks", arr.len()),
                 _ => String::new(),
             }
+        }
+        name if name.starts_with("subagent_") => {
+            // External-agent subagent (subagent_codex / subagent_claude_code…):
+            // show the first line of the delegated prompt so the row reads
+            // "SubagentCodex(<task>) · Running · …" WHILE the agent runs, instead
+            // of a bare "SubagentCodex" with no hint of what it is doing.
+            get_str("prompt")
+                .map(|p| {
+                    let first = p.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+                    crate::width::truncate_with_ellipsis(first, 100)
+                })
+                .unwrap_or_default()
         }
         _ => {
             // For MCP tools (name starts with mcp__), render the

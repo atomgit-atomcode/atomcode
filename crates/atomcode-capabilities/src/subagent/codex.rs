@@ -106,6 +106,10 @@ fn codex_argv(
     let mut argv = vec![
         "exec".to_string(),
         "--skip-git-repo-check".to_string(),
+        // JSONL events on stdout so we can stream meaningful activity (commands
+        // run, searches, edits) while codex works, instead of a bare spinner.
+        // The final answer still comes from the `-o` file (schema-stable).
+        "--json".to_string(),
         "--cd".to_string(),
         cwd.display().to_string(),
     ];
@@ -154,6 +158,55 @@ fn result(output: String, stop_reason: SubagentStopReason) -> SubagentResult {
     SubagentResult { output, stop_reason }
 }
 
+/// Turn one `codex exec --json` JSONL event line into a human progress line, or
+/// `None` to skip it. Each thread item emits exactly once (at the phase where
+/// its useful field is populated) to avoid started+completed duplicates; the
+/// final `agent_message` is skipped (it is the answer, read from the `-o` file).
+/// Defensive: any unparseable/unknown line yields `None`.
+fn codex_activity_from_json_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let ev = v.get("type")?.as_str()?;
+    if ev == "error" {
+        let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("");
+        return Some(format!("codex error: {}", clip(msg, 120)));
+    }
+    if ev != "item.started" && ev != "item.completed" {
+        return None;
+    }
+    let item = v.get("item")?;
+    let itype = item.get("type")?.as_str()?;
+    let s = |k: &str| item.get(k).and_then(|x| x.as_str()).unwrap_or("");
+    match (ev, itype) {
+        ("item.started", "command_execution") => Some(format!("$ {}", clip(s("command"), 120))),
+        ("item.started", "web_search") => Some(format!("web search: {}", clip(s("query"), 80))),
+        ("item.started", "mcp_tool_call") => Some(format!("mcp: {}", s("tool"))),
+        ("item.completed", "file_change") => {
+            let n = item
+                .get("changes")
+                .and_then(|c| c.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            Some(format!("edited {n} file(s)"))
+        }
+        ("item.completed", "reasoning") => Some("thinking…".to_string()),
+        _ => None,
+    }
+}
+
+/// Truncate on a char boundary with an ellipsis.
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 #[async_trait]
 impl SubagentBackend for CodexBackend {
     fn name(&self) -> &str {
@@ -182,11 +235,14 @@ impl SubagentBackend for CodexBackend {
         // Prompt on stdin (not argv): avoids flag mis-parse and `ps` exposure.
         child.write_stdin_and_close(req.prompt.clone());
 
-        // Stream stdout as best-effort activity; the authoritative final answer
-        // comes from the `-o` file, so nothing here needs to parse stdout.
+        // Parse the `--json` JSONL stream into meaningful activity lines (commands,
+        // searches, edits, thinking); the authoritative final answer comes from
+        // the `-o` file. Unparseable lines are skipped.
         let (outcome, stderr_tail) =
             drain_and_wait(&mut child, self.timeout, &req.cancel, |line| {
-                req.emit(SubagentEvent::Activity(line));
+                if let Some(activity) = codex_activity_from_json_line(&line) {
+                    req.emit(SubagentEvent::Activity(activity));
+                }
             })
             .await
             .map_err(|e| SubagentError::SpawnFailed(e.to_string()))?;
@@ -221,6 +277,7 @@ mod tests {
         );
         assert_eq!(argv[0], "exec");
         assert!(argv.contains(&"--skip-git-repo-check".to_string()));
+        assert!(argv.contains(&"--json".to_string()));
         assert!(argv.windows(2).any(|w| w == ["--cd", "/proj"]));
         assert!(argv.windows(2).any(|w| w == ["--sandbox", "read-only"]));
         assert!(argv.windows(2).any(|w| w == ["-o", "/tmp/out.txt"]));
@@ -263,9 +320,55 @@ mod tests {
         }
     }
 
-    // Stub `codex`: a shell script that parses `-o <file>`, writes a final
-    // message there, prints progress to stdout, and exits 0 — no real Codex,
-    // no network. Verifies the full spawn → drain → capture path.
+    #[test]
+    fn activity_parses_json_events_and_skips_noise() {
+        // command_execution starts → "$ cmd".
+        assert_eq!(
+            codex_activity_from_json_line(
+                r#"{"type":"item.started","item":{"id":"1","type":"command_execution","command":"cargo check"}}"#
+            ),
+            Some("$ cargo check".to_string())
+        );
+        // web_search / file_change / reasoning.
+        assert_eq!(
+            codex_activity_from_json_line(
+                r#"{"type":"item.started","item":{"type":"web_search","query":"dead code"}}"#
+            ),
+            Some("web search: dead code".to_string())
+        );
+        assert_eq!(
+            codex_activity_from_json_line(
+                r#"{"type":"item.completed","item":{"type":"file_change","changes":[{},{}]}}"#
+            ),
+            Some("edited 2 file(s)".to_string())
+        );
+        assert_eq!(
+            codex_activity_from_json_line(
+                r#"{"type":"item.completed","item":{"type":"reasoning","text":"…"}}"#
+            ),
+            Some("thinking…".to_string())
+        );
+        // agent_message (the final answer) is NOT emitted as activity.
+        assert_eq!(
+            codex_activity_from_json_line(
+                r#"{"type":"item.completed","item":{"type":"agent_message","text":"done"}}"#
+            ),
+            None
+        );
+        // turn/thread noise + non-JSON → skipped; errors surface.
+        assert_eq!(
+            codex_activity_from_json_line(r#"{"type":"turn.started"}"#),
+            None
+        );
+        assert_eq!(codex_activity_from_json_line("not json"), None);
+        assert_eq!(codex_activity_from_json_line("  "), None);
+        assert!(codex_activity_from_json_line(r#"{"type":"error","message":"boom"}"#)
+            .unwrap()
+            .contains("boom"));
+    }
+
+    // Stub `codex`: emits `--json` JSONL events + writes the `-o` final message,
+    // exits 0 — no real Codex, no network. Verifies spawn → JSONL parse → capture.
     #[cfg(unix)]
     #[tokio::test]
     async fn run_captures_output_from_stub_codex() {
@@ -275,14 +378,14 @@ mod tests {
         std::fs::write(
             &stub,
             r#"#!/bin/sh
-echo "progress: thinking"
+printf '{"type":"item.started","item":{"type":"command_execution","command":"ls crates"}}\n'
 out=""
 while [ $# -gt 0 ]; do
   if [ "$1" = "-o" ]; then shift; out="$1"; fi
   shift
 done
 printf 'STUB FINAL ANSWER' > "$out"
-echo "progress: done"
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"STUB FINAL ANSWER"}}\n'
 exit 0
 "#,
         )
@@ -307,7 +410,16 @@ exit 0
         assert_eq!(res.stop_reason, SubagentStopReason::Completed);
         assert_eq!(res.output, "STUB FINAL ANSWER");
         let activity = seen.lock().unwrap().clone();
-        assert!(activity.iter().any(|l| l.contains("thinking")), "streamed activity: {activity:?}");
+        // The command_execution event became a "$ ls crates" activity line; the
+        // agent_message (final answer) was NOT echoed as activity.
+        assert!(
+            activity.iter().any(|l| l == "$ ls crates"),
+            "streamed activity: {activity:?}"
+        );
+        assert!(
+            !activity.iter().any(|l| l.contains("STUB FINAL ANSWER")),
+            "final answer must not be streamed as activity: {activity:?}"
+        );
     }
 
     #[cfg(unix)]
