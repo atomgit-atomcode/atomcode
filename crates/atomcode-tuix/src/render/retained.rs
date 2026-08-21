@@ -1613,6 +1613,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
+    /// Theme-paired style for committed user-message rows.
+    ///
+    /// Codex derives a subtle message background by blending against the
+    /// terminal's reported RGB value. AtomCode currently retains only the
+    /// startup light/dark classification, so `PanelBg` is the stable 256-color
+    /// equivalent and `PanelFg` supplies a readable foreground when automatic
+    /// background probing is unavailable (notably on Windows).
+    fn style_user_message_panel(&self) -> CellStyle {
+        CellStyle {
+            fg: role(self.caps, Role::PanelFg),
+            bg: role(self.caps, Role::PanelBg),
+            bold: false,
+            reverse: false,
+            faint: false,
+        }
+    }
+
     /// Theme-aware muting via SGR 2 (faint). Renders the role's fg
     /// at ~50% intensity so secondary text reads as "subordinate"
     /// without picking a fixed gray that may collide with the user's
@@ -8132,24 +8149,61 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.last_mark_was_assistant = false;
         let safe = scrub_controls(text);
         let display = crate::markdown::normalize_circled_list_spacing(&safe);
-        // Keep the committed echo visually continuous with the composer: the
-        // accent chevron identifies the user turn, while text and continuation
-        // rows retain the terminal background. Paste placeholders are still
-        // expanded before this point. Circled list labels receive the same
-        // display-only spacing as Markdown; neither transform alters the
-        // payload or history model.
-        let accent = self.style_bold(Role::Accent);
-        let text_style = CellStyle::default();
-        self.push_body_prefixed(
+        // Match Codex's user-cell treatment: the entire committed message row
+        // gets a subtle theme-aware background. Explicit paired foregrounds
+        // keep the text readable on terminals where OSC 11 probing is absent.
+        // Circled-list normalization remains display-only and does not alter
+        // the payload or history model.
+        let panel = self.style_user_message_panel();
+        if panel.bg.is_none() {
+            let accent = self.style_bold(Role::Accent);
+            self.push_body_prefixed(
+                self.caps.prompt_chevron(),
+                &accent,
+                display.as_ref(),
+                &CellStyle::default(),
+            );
+            let muted = self.style_for(Role::Muted);
+            for n in attachments {
+                self.push_body_text(&format!("└ [Image #{}]", n), &muted);
+            }
+            self.push_body_row(Vec::new());
+            self.md_state.reset();
+            return;
+        }
+        let mut accent = self.style_bold(Role::Accent);
+        accent.bg = panel.bg;
+        let width = (self.screen.width() as usize).saturating_sub(PAD_COL);
+        let continuation = " ".repeat(crate::width::display_width(self.caps.prompt_chevron()));
+        let rows = self.build_prefixed_rows_with_semantics(
             self.caps.prompt_chevron(),
             &accent,
             display.as_ref(),
-            &text_style,
+            &panel,
+            Some((continuation.as_str(), &panel)),
         );
+        for (mut row, soft_wrap, text) in rows {
+            Self::pad_row_to_width(&mut row, width, panel.clone());
+            self.push_copyable_body_row(row, text, 0, soft_wrap);
+        }
 
-        let muted = self.style_for(Role::Muted);
+        let mut muted = self.style_for(Role::Muted);
+        muted.bg = panel.bg;
         for n in attachments {
-            self.push_body_text(&format!("└ [Image #{}]", n), &muted);
+            let indent = " ".repeat(PAD_COL);
+            let mut rows = self.build_prefixed_rows(
+                indent.as_str(),
+                &panel,
+                &format!("└ [Image #{}]", n),
+                &muted,
+                Some((indent.as_str(), &panel)),
+            );
+            for row in &mut rows {
+                Self::pad_row_to_width(row, width, panel.clone());
+            }
+            for row in rows {
+                self.push_body_row(row);
+            }
         }
         self.push_body_row(Vec::new());
         self.md_state.reset();
@@ -20347,28 +20401,35 @@ mod tests {
         }
     }
 
-    /// Committed user text keeps the terminal foreground/background used by
-    /// the composer; only the prompt marker carries the accent colour.
+    /// Committed user text uses the foreground/background pair selected for
+    /// the active light or dark theme.
     #[test]
-    fn retained_user_message_keeps_composer_text_style() {
-        let (mut r, _buf) = new_capturing(80, 24);
-        r.caps.colors = true;
-        r.render(UiLine::User("hello".into()));
+    fn retained_user_message_uses_theme_paired_panel_style() {
+        let _theme = crate::highlight::theme::test_lock();
+        for light in [false, true] {
+            crate::highlight::theme::set_theme_mode(light);
+            let (mut r, _buf) = new_capturing(80, 24);
+            r.caps.colors = true;
+            r.render(UiLine::User("hello".into()));
 
-        let row = r
-            .body_lines
-            .iter()
-            .find(|row| {
-                row.iter()
-                    .map(|c| c.ch)
-                    .collect::<String>()
-                    .contains("hello")
-            })
-            .expect("user text row present");
-        for cell in row.iter().filter(|cell| cell.ch.is_alphabetic()) {
-            assert_eq!(cell.style.fg, None, "user text must inherit terminal fg");
-            assert_eq!(cell.style.bg, None, "user text must inherit terminal bg");
+            let expected_fg = crate::render::theme::role(r.caps, Role::PanelFg);
+            let expected_bg = crate::render::theme::role(r.caps, Role::PanelBg);
+            let row = r
+                .body_lines
+                .iter()
+                .find(|row| {
+                    row.iter()
+                        .map(|c| c.ch)
+                        .collect::<String>()
+                        .contains("hello")
+                })
+                .expect("user text row present");
+            for cell in row.iter().filter(|cell| cell.ch.is_alphabetic()) {
+                assert_eq!(cell.style.fg, expected_fg, "light={light}");
+                assert_eq!(cell.style.bg, expected_bg, "light={light}");
+            }
         }
+        crate::highlight::theme::set_theme_mode(false);
     }
 
     /// Directly pasted circled list labels receive a display-only separator
@@ -20445,9 +20506,12 @@ mod tests {
     /// `❯` on the first row and a plain equal-width indent on continuation rows.
     #[test]
     fn retained_multiline_user_message_matches_composer_indent() {
+        let _theme = crate::highlight::theme::test_lock();
+        crate::highlight::theme::set_theme_mode(false);
         let (mut r, _buf) = new_capturing(80, 24);
         r.caps.colors = true;
         r.render(UiLine::User("first line\nsecond line".into()));
+        let expected_bg = crate::render::theme::role(r.caps, Role::PanelBg);
 
         let mut saw_chevron = false;
         let mut saw_continuation = false;
@@ -20471,8 +20535,8 @@ mod tests {
                     head.ch
                 );
                 assert_eq!(
-                    head.style.bg, None,
-                    "continuation indent must not paint a panel"
+                    head.style.bg, expected_bg,
+                    "continuation indent must keep the user-message panel background"
                 );
             }
         }
@@ -20483,10 +20547,13 @@ mod tests {
     }
 
     #[test]
-    fn retained_user_message_does_not_switch_to_panel_background() {
+    fn retained_user_message_paints_panel_to_the_row_edge() {
+        let _theme = crate::highlight::theme::test_lock();
+        crate::highlight::theme::set_theme_mode(false);
         let (mut r, _buf) = new_capturing(80, 24);
         r.caps.colors = true;
         r.render(UiLine::User("hello".into()));
+        let expected_bg = crate::render::theme::role(r.caps, Role::PanelBg);
 
         // Locate the content row (the one carrying the user's text).
         let idx = r
@@ -20502,8 +20569,8 @@ mod tests {
 
         let content = &r.body_lines[idx];
         assert!(
-            content.iter().all(|c| c.style.bg.is_none()),
-            "committed user rows must keep the composer background, got {:?}",
+            content.iter().all(|c| c.style.bg == expected_bg),
+            "committed user rows must carry the theme panel background, got {:?}",
             content.iter().map(|c| c.style.bg).collect::<Vec<_>>()
         );
         let below = &r.body_lines[idx + 1];
