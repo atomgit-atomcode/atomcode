@@ -17,6 +17,8 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
+pub mod proc;
+
 /// Which external agent a backend drives. Parsed from the `kind` field of an
 /// `[[subagent.external]]` config entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
