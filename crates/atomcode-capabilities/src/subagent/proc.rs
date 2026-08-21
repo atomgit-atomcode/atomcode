@@ -31,8 +31,9 @@ pub const STDERR_TAIL_CAP: usize = 2000;
 /// Grace to reap the child AFTER both its pipes have closed. Once stdout+stderr
 /// hit EOF the process is exiting; this bounds the wait for the exit status
 /// WITHOUT re-arming the full run timeout (which would let a wedged post-close
-/// child stall for up to ~2× the configured ceiling).
-const POST_DRAIN_GRACE: Duration = Duration::from_secs(10);
+/// child stall for up to ~2× the configured ceiling). Generous enough for a
+/// normal teardown (flush the `-o` file, reap the agent's own subprocesses).
+const POST_DRAIN_GRACE: Duration = Duration::from_secs(30);
 
 /// Whether the child gets a writable stdin pipe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +100,10 @@ pub struct ManagedChild {
     /// PID captured at spawn: the pgroup leader on Unix, the `taskkill /T`
     /// fallback root on Windows.
     pid: Option<u32>,
+    /// The child was already reaped by a completed `wait()`. Once true, the pid
+    /// is freed and the OS may recycle it, so `Drop` must NOT `killpg` it (that
+    /// could SIGKILL an unrelated recycled process group).
+    reaped: bool,
     #[cfg(windows)]
     job: Option<crate::process_utils::JobHandle>,
 }
@@ -155,6 +160,7 @@ impl ManagedChild {
         Ok(Self {
             child,
             pid,
+            reaped: false,
             #[cfg(windows)]
             job,
         })
@@ -190,7 +196,11 @@ impl ManagedChild {
 
     /// Wait for the child to exit (no timeout, no cancel).
     pub async fn wait(&mut self) -> std::io::Result<ExitStatus> {
-        self.child.wait().await
+        let status = self.child.wait().await;
+        if status.is_ok() {
+            self.reaped = true;
+        }
+        status
     }
 
     /// Write `data` to the child's stdin and close it (EOF), off-task so a large
@@ -222,7 +232,12 @@ impl ManagedChild {
                 Ok(WaitOutcome::Cancelled)
             }
             res = tokio::time::timeout(timeout, self.child.wait()) => match res {
-                Ok(status) => Ok(WaitOutcome::Exited(status?)),
+                Ok(Ok(status)) => {
+                    // Child reaped: mark it so Drop won't killpg a possibly-recycled pid.
+                    self.reaped = true;
+                    Ok(WaitOutcome::Exited(status))
+                }
+                Ok(Err(e)) => Err(e),
                 Err(_elapsed) => {
                     self.kill_tree();
                     Ok(WaitOutcome::TimedOut)
@@ -313,7 +328,15 @@ pub fn push_tail(tail: &mut String, line: &str) {
 /// Best-effort and idempotent (killpg ESRCH / a closed job handle are ignored).
 impl Drop for ManagedChild {
     fn drop(&mut self) {
-        self.kill_tree();
+        // Only reap the tree if the child was NOT already reaped by a completed
+        // wait(): after reaping, the pid is freed and the OS may recycle its pgid,
+        // so a `killpg` here could SIGKILL an unrelated group. On the un-reaped
+        // drop path (future dropped without cancel/timeout), the pid is still ours
+        // and killpg correctly reaps the setsid grandchildren `kill_on_drop` alone
+        // would orphan. Best-effort and idempotent.
+        if !self.reaped {
+            self.kill_tree();
+        }
     }
 }
 

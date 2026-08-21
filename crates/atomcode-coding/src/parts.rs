@@ -240,8 +240,12 @@ pub fn resolve_external_subagents(
     allow_dangerous_context: bool,
 ) -> Vec<atomcode_capabilities::subagent::ExternalSubagentProfile> {
     let mut out = external_subagent_profiles(&sub.external, allow_dangerous_context);
+    // Reserve EVERY explicitly-named instance — including entries that were
+    // dropped for being disabled or having an unknown kind — so a `/config`
+    // convenience switch never silently overrides (or resurrects) an explicit
+    // `[[subagent.external]]` the user named the same thing.
     let mut names: std::collections::HashSet<String> =
-        out.iter().map(|p| p.name.clone()).collect();
+        sub.external.iter().map(|e| e.name.clone()).collect();
     let builtins = [
         (
             "codex",
@@ -273,12 +277,11 @@ fn builtin_external_profile(
     level: &str,
 ) -> Option<atomcode_capabilities::subagent::ExternalSubagentProfile> {
     use atomcode_capabilities::subagent::{ExternalSubagentProfile, PermissionMode};
-    let permission = match level.trim() {
-        "read-only" => PermissionMode::ReadOnly,
-        "accept-edits" => PermissionMode::AcceptEdits,
-        "auto" => PermissionMode::Auto,
-        _ => return None, // "off" / "" / unknown
-    };
+    // Reuse the single permission parser (normalizes case + `_`→`-`, so
+    // `Read-Only`/`readonly`/`accept_edits` all work like the explicit path).
+    // `off`/`""`/unknown → None; `bypass` is never offered via the switch.
+    let permission =
+        PermissionMode::from_config_str(level).filter(|p| !p.is_dangerous())?;
     Some(ExternalSubagentProfile {
         name: name.to_string(),
         kind,
@@ -2145,6 +2148,29 @@ mod tests {
         // off + no explicit → nothing.
         let empty = resolve_external_subagents(&SubAgentConfig::default(), true);
         assert!(empty.is_empty());
+
+        // Off-spelling level still parses (reuses from_config_str normalization).
+        let mut sub = SubAgentConfig::default();
+        sub.codex = "Read_Only".into();
+        let p = resolve_external_subagents(&sub, true);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].permission, PermissionMode::ReadOnly);
+
+        // An explicitly DISABLED codex entry suppresses the switch (the name is
+        // reserved even though the disabled entry itself doesn't mount).
+        let mut sub = SubAgentConfig::default();
+        sub.codex = "read-only".into();
+        sub.external = vec![ExternalSubagentConfig {
+            name: "codex".into(),
+            kind: "codex".into(),
+            model: None,
+            permission: Some("auto".into()),
+            allow_dangerous: false,
+            timeout_secs: None,
+            enabled: false,
+        }];
+        let p = resolve_external_subagents(&sub, true);
+        assert!(p.is_empty(), "disabled explicit codex blocks the built-in switch");
     }
 
     fn agent_config(model: &str) -> CodingAgentConfig {
