@@ -28,6 +28,12 @@ use super::SubagentError;
 /// Keep at most this many bytes of stderr for a failure message.
 pub const STDERR_TAIL_CAP: usize = 2000;
 
+/// Grace to reap the child AFTER both its pipes have closed. Once stdout+stderr
+/// hit EOF the process is exiting; this bounds the wait for the exit status
+/// WITHOUT re-arming the full run timeout (which would let a wedged post-close
+/// child stall for up to ~2× the configured ceiling).
+const POST_DRAIN_GRACE: Duration = Duration::from_secs(10);
+
 /// Whether the child gets a writable stdin pipe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StdinMode {
@@ -187,6 +193,19 @@ impl ManagedChild {
         self.child.wait().await
     }
 
+    /// Write `data` to the child's stdin and close it (EOF), off-task so a large
+    /// prompt can't deadlock against the caller draining stdout. No-op if stdin
+    /// was not piped ([`StdinMode::Piped`]).
+    pub fn write_stdin_and_close(&mut self, data: String) {
+        if let Some(mut stdin) = self.child.stdin.take() {
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let _ = stdin.write_all(data.as_bytes()).await;
+                let _ = stdin.shutdown().await;
+            });
+        }
+    }
+
     /// Race the child's exit against `timeout` and `cancel`. On either, the whole
     /// tree is killed and the corresponding outcome is returned; otherwise the
     /// natural exit status is returned. `cancel` is checked with `biased`
@@ -257,8 +276,9 @@ pub async fn drain_and_wait<F: FnMut(String)>(
             },
         }
     }
-    // Pipes closed → the process is exiting; still honor cancel/timeout.
-    let outcome = child.wait_or_kill(timeout, cancel).await?;
+    // Pipes closed → the process is exiting; reap with a short grace (not the
+    // full timeout again) while still honoring cancel.
+    let outcome = child.wait_or_kill(POST_DRAIN_GRACE, cancel).await?;
     Ok((outcome, stderr_tail))
 }
 
@@ -282,6 +302,18 @@ pub fn push_tail(tail: &mut String, line: &str) {
             idx += 1;
         }
         *tail = tail.split_off(idx);
+    }
+}
+
+/// RAII backstop: if the `ManagedChild` is dropped WITHOUT going through
+/// cancel/timeout (e.g. the kernel drops the tool's execute future during a
+/// shutdown/abort rather than firing the cancel token), reap the WHOLE tree.
+/// `kill_on_drop` alone only reaps the direct child, orphaning the setsid-pgroup
+/// grandchildren the driven agent spawned — exactly what this exists to prevent.
+/// Best-effort and idempotent (killpg ESRCH / a closed job handle are ignored).
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        self.kill_tree();
     }
 }
 

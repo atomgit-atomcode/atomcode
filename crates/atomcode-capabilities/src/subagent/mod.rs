@@ -269,6 +269,10 @@ pub enum SubagentError {
     NonZeroExit { code: Option<i32>, stderr_tail: String },
     /// The agent's output stream/protocol could not be parsed.
     ProtocolError(String),
+    /// The agent ran to exit but reported its OWN failure (e.g. Claude Code
+    /// `is_error: true` — max turns, execution error). Distinct from a
+    /// driver-level failure: the process worked, the agent could not finish.
+    AgentError(String),
     /// `Bypass` was requested in a context that forbids it.
     DangerousModeRefused,
 }
@@ -286,6 +290,7 @@ impl fmt::Display for SubagentError {
                 code.map(|c| c.to_string()).unwrap_or_else(|| "signal".into())
             ),
             Self::ProtocolError(e) => write!(f, "external agent protocol error: {e}"),
+            Self::AgentError(e) => write!(f, "external agent reported failure: {e}"),
             Self::DangerousModeRefused => {
                 f.write_str("bypass permission mode is not allowed in this context")
             }

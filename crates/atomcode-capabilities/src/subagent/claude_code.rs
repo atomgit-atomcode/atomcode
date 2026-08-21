@@ -88,8 +88,11 @@ fn permission_mode_flag(permission: PermissionMode) -> &'static str {
 }
 
 /// Build the `claude` argument vector (excludes the program itself). The agent
-/// runs in the process cwd (set on the child), so no directory flag is needed.
-fn claude_argv(permission: PermissionMode, model: Option<&str>, prompt: &str) -> Vec<String> {
+/// runs in the process cwd (set on the child). The prompt is NOT an argument: it
+/// is piped on stdin (claude reads it with the default `text` input format), so
+/// a prompt beginning with `-` can't be mis-parsed as a flag and never appears
+/// in `ps`.
+fn claude_argv(permission: PermissionMode, model: Option<&str>) -> Vec<String> {
     let mut argv = vec![
         "-p".to_string(),
         "--output-format".to_string(),
@@ -105,26 +108,44 @@ fn claude_argv(permission: PermissionMode, model: Option<&str>, prompt: &str) ->
         argv.push("--model".to_string());
         argv.push(model.to_string());
     }
-    // Prompt LAST as the positional argument.
-    argv.push(prompt.to_string());
     argv
 }
 
-/// Extract the assistant's final text from the `claude --output-format json`
-/// result object. Falls back to the raw buffer when the payload cannot be parsed
+/// The parsed outcome of a `claude --output-format json` result object.
+struct ClaudeOutcome {
+    /// The assistant's final text (or a best-effort fallback).
+    text: String,
+    /// The agent reported its own failure (`is_error: true`).
+    is_error: bool,
+}
+
+/// Parse the single `claude --output-format json` result object. Extracts the
+/// `result` string and the `is_error` flag; falls back to the raw buffer for the
+/// text when the payload cannot be parsed or `result` is absent/non-string
 /// (defensive against schema drift — never drop the output entirely).
-fn parse_result(buf: &str) -> String {
+fn parse_result(buf: &str) -> ClaudeOutcome {
     let trimmed = buf.trim();
     if trimmed.is_empty() {
-        return String::new();
+        return ClaudeOutcome { text: String::new(), is_error: false };
     }
     match serde_json::from_str::<serde_json::Value>(trimmed) {
-        Ok(v) => v
-            .get("result")
-            .and_then(|r| r.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| trimmed.to_string()),
-        Err(_) => trimmed.to_string(),
+        Ok(v) => {
+            let is_error = v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
+            let text = v
+                .get("result")
+                .and_then(|r| r.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    // No string `result`: prefer the subtype (e.g. error_max_turns)
+                    // over dumping the whole JSON envelope at the model.
+                    v.get("subtype")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| trimmed.to_string())
+                });
+            ClaudeOutcome { text, is_error }
+        }
+        Err(_) => ClaudeOutcome { text: trimmed.to_string(), is_error: false },
     }
 }
 
@@ -152,9 +173,12 @@ impl SubagentBackend for ClaudeCodeBackend {
         if self.permission.is_dangerous() && !self.allow_dangerous {
             return Err(SubagentError::DangerousModeRefused);
         }
-        let argv = claude_argv(self.permission, self.model.as_deref(), &req.prompt);
-        let spec = ChildSpec::new(&self.program, &req.cwd).args(argv);
+        let argv = claude_argv(self.permission, self.model.as_deref());
+        let mut spec = ChildSpec::new(&self.program, &req.cwd).args(argv);
+        spec.stdin = super::proc::StdinMode::Piped;
         let mut child = ManagedChild::spawn(spec)?;
+        // Prompt on stdin (not argv): avoids flag mis-parse and `ps` exposure.
+        child.write_stdin_and_close(req.prompt.clone());
 
         // `--output-format json` emits a single result object; buffer stdout and
         // parse at the end (do NOT stream raw JSON as activity).
@@ -168,15 +192,24 @@ impl SubagentBackend for ClaudeCodeBackend {
 
         match outcome {
             WaitOutcome::Exited(status) if status.success() => {
-                Ok(result(parse_result(&buf), SubagentStopReason::Completed))
+                let parsed = parse_result(&buf);
+                // claude can exit 0 yet report its own failure (is_error): surface
+                // it as an agent-level error, not a successful completion.
+                if parsed.is_error {
+                    Err(SubagentError::AgentError(parsed.text))
+                } else {
+                    Ok(result(parsed.text, SubagentStopReason::Completed))
+                }
             }
             WaitOutcome::Exited(status) => Err(SubagentError::NonZeroExit {
                 code: status.code(),
                 stderr_tail,
             }),
-            WaitOutcome::TimedOut => Ok(result(parse_result(&buf), SubagentStopReason::Timeout)),
+            WaitOutcome::TimedOut => {
+                Ok(result(parse_result(&buf).text, SubagentStopReason::Timeout))
+            }
             WaitOutcome::Cancelled => {
-                Ok(result(parse_result(&buf), SubagentStopReason::Cancelled))
+                Ok(result(parse_result(&buf).text, SubagentStopReason::Cancelled))
             }
         }
     }
@@ -189,41 +222,50 @@ mod tests {
 
     #[test]
     fn argv_read_only_uses_plan_mode() {
-        let argv = claude_argv(PermissionMode::ReadOnly, None, "fix it");
+        let argv = claude_argv(PermissionMode::ReadOnly, None);
         assert!(argv.windows(2).any(|w| w == ["-p", "--output-format"]));
         assert!(argv.windows(2).any(|w| w == ["--output-format", "json"]));
         assert!(argv.windows(2).any(|w| w == ["--permission-mode", "plan"]));
-        assert_eq!(argv.last().unwrap(), "fix it", "prompt is the last positional");
+        // Prompt is piped on stdin, never an argument.
+        assert!(!argv.iter().any(|a| a == "fix it"));
         assert!(!argv.contains(&"--dangerously-skip-permissions".to_string()));
     }
 
     #[test]
     fn argv_modes_map_correctly() {
-        assert!(claude_argv(PermissionMode::AcceptEdits, None, "x")
+        assert!(claude_argv(PermissionMode::AcceptEdits, None)
             .windows(2)
             .any(|w| w == ["--permission-mode", "acceptEdits"]));
-        assert!(claude_argv(PermissionMode::Auto, None, "x")
+        assert!(claude_argv(PermissionMode::Auto, None)
             .windows(2)
             .any(|w| w == ["--permission-mode", "auto"]));
     }
 
     #[test]
     fn argv_bypass_uses_skip_permissions_not_mode() {
-        let argv = claude_argv(PermissionMode::Bypass, Some("opus"), "x");
+        let argv = claude_argv(PermissionMode::Bypass, Some("opus"));
         assert!(argv.contains(&"--dangerously-skip-permissions".to_string()));
         assert!(!argv.contains(&"--permission-mode".to_string()));
         assert!(argv.windows(2).any(|w| w == ["--model", "opus"]));
     }
 
     #[test]
-    fn parse_result_extracts_result_field_and_falls_back() {
-        let json = r#"{"type":"result","subtype":"success","result":"THE ANSWER","is_error":false}"#;
-        assert_eq!(parse_result(json), "THE ANSWER");
-        // Non-JSON → raw passthrough (never drop output).
-        assert_eq!(parse_result("plain text out"), "plain text out");
-        // JSON without a result field → raw passthrough.
-        assert_eq!(parse_result(r#"{"type":"system"}"#), r#"{"type":"system"}"#);
-        assert_eq!(parse_result("   "), "");
+    fn parse_result_extracts_result_and_error_flag() {
+        let ok = parse_result(
+            r#"{"type":"result","subtype":"success","result":"THE ANSWER","is_error":false}"#,
+        );
+        assert_eq!(ok.text, "THE ANSWER");
+        assert!(!ok.is_error);
+        // is_error true with a null result → surfaces the subtype, flags error,
+        // does NOT dump the raw JSON envelope.
+        let e = parse_result(r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":null}"#);
+        assert!(e.is_error);
+        assert_eq!(e.text, "error_max_turns");
+        // Non-JSON → raw passthrough, not an error.
+        let raw = parse_result("plain text out");
+        assert_eq!(raw.text, "plain text out");
+        assert!(!raw.is_error);
+        assert_eq!(parse_result("   ").text, "");
     }
 
     #[tokio::test]
@@ -258,6 +300,27 @@ mod tests {
         let res = backend.run(run).await.unwrap();
         assert_eq!(res.stop_reason, SubagentStopReason::Completed);
         assert_eq!(res.output, "CLAUDE ANSWER");
+    }
+
+    // claude exits 0 but reports is_error → surfaced as AgentError, not Completed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_maps_is_error_to_agent_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("claude-agenterr.sh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nprintf '{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true,\"result\":null}'\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let backend =
+            ClaudeCodeBackend::new("cc-agenterr", PermissionMode::ReadOnly).with_program(&stub);
+        match backend.run(SubagentRun::new("x", dir.path())).await {
+            Err(SubagentError::AgentError(msg)) => assert!(msg.contains("error_max_turns")),
+            other => panic!("expected AgentError, got {other:?}"),
+        }
     }
 
     #[cfg(unix)]

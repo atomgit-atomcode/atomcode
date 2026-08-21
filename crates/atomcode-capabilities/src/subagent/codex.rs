@@ -93,13 +93,15 @@ fn sandbox_for(permission: PermissionMode) -> &'static str {
     }
 }
 
-/// Build the `codex exec` argument vector (excludes the program itself).
+/// Build the `codex exec` argument vector (excludes the program itself). The
+/// prompt is NOT an argument: it is piped on stdin (codex reads instructions
+/// from stdin when no positional prompt is given), so a prompt beginning with
+/// `-` can't be mis-parsed as a flag and the prompt never appears in `ps`.
 fn codex_argv(
     permission: PermissionMode,
     model: Option<&str>,
     cwd: &Path,
     out_file: &Path,
-    prompt: &str,
 ) -> Vec<String> {
     let mut argv = vec![
         "exec".to_string(),
@@ -119,8 +121,6 @@ fn codex_argv(
     }
     argv.push("-o".to_string());
     argv.push(out_file.display().to_string());
-    // Prompt LAST as the positional argument.
-    argv.push(prompt.to_string());
     argv
 }
 
@@ -175,15 +175,12 @@ impl SubagentBackend for CodexBackend {
             return Err(SubagentError::DangerousModeRefused);
         }
         let out = TempOutput::new();
-        let argv = codex_argv(
-            self.permission,
-            self.model.as_deref(),
-            &req.cwd,
-            &out.path,
-            &req.prompt,
-        );
-        let spec = ChildSpec::new(&self.program, &req.cwd).args(argv);
+        let argv = codex_argv(self.permission, self.model.as_deref(), &req.cwd, &out.path);
+        let mut spec = ChildSpec::new(&self.program, &req.cwd).args(argv);
+        spec.stdin = super::proc::StdinMode::Piped;
         let mut child = ManagedChild::spawn(spec)?;
+        // Prompt on stdin (not argv): avoids flag mis-parse and `ps` exposure.
+        child.write_stdin_and_close(req.prompt.clone());
 
         // Stream stdout as best-effort activity; the authoritative final answer
         // comes from the `-o` file, so nothing here needs to parse stdout.
@@ -221,21 +218,21 @@ mod tests {
             None,
             Path::new("/proj"),
             Path::new("/tmp/out.txt"),
-            "fix it",
         );
         assert_eq!(argv[0], "exec");
         assert!(argv.contains(&"--skip-git-repo-check".to_string()));
         assert!(argv.windows(2).any(|w| w == ["--cd", "/proj"]));
         assert!(argv.windows(2).any(|w| w == ["--sandbox", "read-only"]));
         assert!(argv.windows(2).any(|w| w == ["-o", "/tmp/out.txt"]));
-        assert_eq!(argv.last().unwrap(), "fix it", "prompt is the last positional");
+        // Prompt is piped on stdin, never an argument.
+        assert!(!argv.iter().any(|a| a == "fix it"));
         assert!(!argv.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
     }
 
     #[test]
     fn argv_accept_edits_and_auto_map_to_workspace_write() {
         for perm in [PermissionMode::AcceptEdits, PermissionMode::Auto] {
-            let argv = codex_argv(perm, None, Path::new("/p"), Path::new("/o"), "x");
+            let argv = codex_argv(perm, None, Path::new("/p"), Path::new("/o"));
             assert!(
                 argv.windows(2).any(|w| w == ["--sandbox", "workspace-write"]),
                 "{perm:?} → workspace-write"
@@ -250,7 +247,6 @@ mod tests {
             Some("gpt-5-codex"),
             Path::new("/p"),
             Path::new("/o"),
-            "x",
         );
         assert!(argv.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
         assert!(!argv.contains(&"--sandbox".to_string()));

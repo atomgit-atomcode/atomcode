@@ -54,8 +54,12 @@ pub fn build_backend(profile: &ExternalSubagentProfile) -> Box<dyn SubagentBacke
     }
 }
 
-/// Whether an executable named `bin` is found on `PATH`. Bare probe (no spawn):
+/// Whether an EXECUTABLE named `bin` is found on `PATH`. Bare probe (no spawn):
 /// scans `PATH` entries for a matching file (and, on Windows, common extensions).
+/// On Unix the file must also have an execute bit — a plain data file named
+/// `codex`/`claude` (e.g. a not-yet-`chmod`ed download) is not a runnable agent,
+/// so it is rejected here rather than surfacing as a spawn `Permission denied`
+/// only when the model first calls the tool.
 pub fn binary_on_path(bin: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
@@ -66,11 +70,22 @@ pub fn binary_on_path(bin: &str) -> bool {
         &[""]
     };
     std::env::split_paths(&path).any(|dir| {
-        exts.iter().any(|ext| {
-            let candidate = dir.join(format!("{bin}{ext}"));
-            candidate.is_file()
-        })
+        exts.iter().any(|ext| is_executable_file(&dir.join(format!("{bin}{ext}"))))
     })
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    // On Windows executability is implied by the extension (probed above).
+    path.is_file()
 }
 
 /// A named external-agent instance mounted as a kernel tool.
@@ -238,6 +253,7 @@ pub fn register_external_subagent_tools(
     profiles: &[ExternalSubagentProfile],
 ) -> Vec<String> {
     let mut registered = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for profile in profiles {
         if !binary_on_path(profile.kind.binary()) {
             eprintln!(
@@ -250,7 +266,19 @@ pub fn register_external_subagent_tools(
         }
         let backend = build_backend(profile);
         let tool = ExternalSubagentTool::new(backend, profile.permission);
-        registered.push(tool.name().to_string());
+        let tool_name = tool.name().to_string();
+        // Two profiles whose names sanitize to the same tool id would silently
+        // overwrite in the registry (BTreeMap::insert) — the later one winning
+        // with a possibly different permission posture. Refuse the collision.
+        if !seen.insert(tool_name.clone()) {
+            eprintln!(
+                "subagent: `{}` → tool `{tool_name}` collides with an earlier profile; skipped \
+                 (rename to a distinct instance name)",
+                profile.name
+            );
+            continue;
+        }
+        registered.push(tool_name);
         registry.register(std::sync::Arc::new(tool));
     }
     registered
