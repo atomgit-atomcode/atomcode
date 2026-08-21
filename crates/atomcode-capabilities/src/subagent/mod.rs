@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
+pub mod codex;
 pub mod proc;
 
 /// Which external agent a backend drives. Parsed from the `kind` field of an
@@ -142,16 +143,16 @@ pub enum SubagentEvent {
 /// (the final [`SubagentResult`] still carries the full output).
 pub type EventSink = Box<dyn Fn(SubagentEvent) + Send + Sync>;
 
-/// One delegated run: the prompt to hand the external agent, where to run it,
-/// and how much autonomy it gets. Backends are one-shot in Phase 1 — no
-/// multi-turn continuation (that is Phase 4, Codex app-server).
+/// One delegated run: the prompt to hand the external agent and where to run it.
+/// The permission posture is a property of the named backend instance (from its
+/// config profile), NOT of the individual call, so it lives on the backend, not
+/// here. Backends are one-shot in Phase 1 — no multi-turn continuation (that is
+/// Phase 4, Codex app-server).
 pub struct SubagentRun {
     /// The task prompt handed to the external agent.
     pub prompt: String,
     /// Working directory the agent runs in.
     pub cwd: PathBuf,
-    /// Non-interactive permission posture.
-    pub permission: PermissionMode,
     /// Optional tool allowlist (only honored when the backend advertises
     /// `capabilities().tool_filter`).
     pub tool_filter: Option<Vec<String>>,
@@ -162,12 +163,11 @@ pub struct SubagentRun {
 }
 
 impl SubagentRun {
-    /// Minimal constructor for a read-only, no-streaming run.
+    /// Minimal constructor for a no-streaming run.
     pub fn new(prompt: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
         Self {
             prompt: prompt.into(),
             cwd: cwd.into(),
-            permission: PermissionMode::ReadOnly,
             tool_filter: None,
             cancel: CancellationToken::new(),
             on_event: None,
@@ -187,7 +187,6 @@ impl fmt::Debug for SubagentRun {
         f.debug_struct("SubagentRun")
             .field("prompt_len", &self.prompt.len())
             .field("cwd", &self.cwd)
-            .field("permission", &self.permission)
             .field("tool_filter", &self.tool_filter)
             .field("has_event_sink", &self.on_event.is_some())
             .finish()
@@ -318,9 +317,8 @@ mod tests {
     }
 
     #[test]
-    fn run_helpers_default_read_only_and_emit_is_optional() {
+    fn run_helpers_defaults_and_emit_is_optional() {
         let run = SubagentRun::new("do the thing", "/tmp/proj");
-        assert_eq!(run.permission, PermissionMode::ReadOnly);
         assert!(run.tool_filter.is_none());
         assert!(run.on_event.is_none());
         // emit with no sink is a no-op (must not panic).
