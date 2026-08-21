@@ -5778,9 +5778,20 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // so hiding the caret would leave the user typing blind — the
         // "no cursor while replying" bug.
         //
+        // A Task fan-out (`status.subtasks`) has the SAME two-caret problem as
+        // `inflight_tool`: the fixed liveness panel + child terminal lines repaint
+        // continuously (token ticks, in-place AGENT-group rewrites, body pushes),
+        // each a raw write that strands the caret at a child row until the next
+        // ~5ms re-park — so a visible caret is perceived as blinking on a child
+        // row. Suppress it ONLY while the composer is empty: an empty box means
+        // the user is watching, not typing, so there is no caret to lose; the
+        // moment they start a type-ahead message the caret returns (preserving the
+        // "editable during streaming" behavior the live spinner deliberately keeps).
+        let subtask_fanout_idle = self.status.subtasks.is_some() && self.input_buf.is_empty();
         // When approval is active or a plugin modal without text input is open,
         // hide the caret (user navigates with ↑↓/Enter/Tab).
         let suppress_cursor = self.inflight_tool.is_some()
+            || subtask_fanout_idle
             || approval_active
             || self.diff_overlay_active
             || (hide_input_box && !is_add_url && !is_search_box_focused);
@@ -14467,6 +14478,66 @@ mod tests {
             vterm.cursor_visible(),
             "terminal cursor must be visible again after the inflight tool \
              commits — `inflight_tool.is_none()` flips the gate back"
+        );
+    }
+
+    /// Regression: during a Task fan-out the live subagent panel + child rows
+    /// repaint continuously, stranding the (visible) hardware caret on a child
+    /// row — the user saw a caret blinking mid-panel. Fix: suppress the caret
+    /// while a subtask panel is active AND the composer is empty (watching, not
+    /// typing); it returns the moment a type-ahead draft is entered.
+    #[test]
+    fn retained_subtask_fanout_hides_idle_cursor_but_shows_it_while_typing() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+        let subtasks = || SubtaskProgress {
+            call_id: "call-task".into(),
+            completed: 0,
+            total: 2,
+            items: vec![SubtaskItem {
+                label: "explorer#1".into(),
+                description: "dead code: kernel".into(),
+                model: "deepseek-v4-flash".into(),
+                activity: "analyzing".into(),
+                started_at: Some(std::time::Instant::now()),
+                output_tokens: 1000,
+                status: SubtaskStatus::Running,
+            }],
+        };
+
+        // Empty composer while a fan-out runs → caret suppressed.
+        let (mut r, buf) = new_capturing(100, 24);
+        let mut status = status_basic();
+        status.subtasks = Some(subtasks());
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        let mut vterm = crate::test_term::VirtualTerminal::new(100, 24);
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(
+            !vterm.cursor_visible(),
+            "caret must be hidden while a subtask fan-out repaints and the composer is empty"
+        );
+
+        // The user starts a type-ahead draft → caret returns.
+        let mut status = status_basic();
+        status.subtasks = Some(subtasks());
+        r.render(UiLine::InputPrompt {
+            buf: "queued follow-up".into(),
+            cursor_byte: "queued follow-up".len(),
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(
+            vterm.cursor_visible(),
+            "caret must reappear once the user types a type-ahead draft during the fan-out"
         );
     }
 
