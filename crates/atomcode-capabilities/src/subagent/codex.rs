@@ -197,6 +197,23 @@ fn codex_activity_from_json_line(line: &str) -> Option<String> {
     }
 }
 
+/// Extract the final `agent_message` text from a `codex exec --json` line, if
+/// this line is one. Used as a FALLBACK for the `-o` file: if `-o` is empty
+/// (older codex, `--json` interaction, or a crash before it flushed), the last
+/// agent message from the stream is still the answer instead of a silent empty
+/// result. Returns `None` for any other line.
+fn codex_final_message_from_json_line(line: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if v.get("type")?.as_str()? != "item.completed" {
+        return None;
+    }
+    let item = v.get("item")?;
+    if item.get("type")?.as_str()? != "agent_message" {
+        return None;
+    }
+    item.get("text").and_then(|t| t.as_str()).map(str::to_string)
+}
+
 /// Truncate on a char boundary with an ellipsis.
 fn clip(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -236,27 +253,44 @@ impl SubagentBackend for CodexBackend {
         child.write_stdin_and_close(req.prompt.clone());
 
         // Parse the `--json` JSONL stream into meaningful activity lines (commands,
-        // searches, edits, thinking); the authoritative final answer comes from
-        // the `-o` file. Unparseable lines are skipped.
+        // searches, edits, thinking) AND capture the last agent_message as a
+        // fallback answer. The authoritative final answer comes from the `-o`
+        // file; the captured message covers the case where `-o` is empty.
+        // Unparseable lines are skipped.
+        let mut final_msg = String::new();
         let (outcome, stderr_tail) =
             drain_and_wait(&mut child, self.timeout, &req.cancel, |line| {
                 if let Some(activity) = codex_activity_from_json_line(&line) {
                     req.emit(SubagentEvent::Activity(activity));
                 }
+                if let Some(msg) = codex_final_message_from_json_line(&line) {
+                    final_msg = msg;
+                }
             })
             .await
             .map_err(|e| SubagentError::SpawnFailed(e.to_string()))?;
 
+        // `-o` file first (schema-stable); fall back to the streamed agent_message
+        // so a missing/empty `-o` never yields a silently empty answer.
+        let output = |captured: &str| {
+            let o = out.read();
+            if o.trim().is_empty() {
+                captured.to_string()
+            } else {
+                o
+            }
+        };
+
         match outcome {
             WaitOutcome::Exited(status) if status.success() => {
-                Ok(result(out.read(), SubagentStopReason::Completed))
+                Ok(result(output(&final_msg), SubagentStopReason::Completed))
             }
             WaitOutcome::Exited(status) => Err(SubagentError::NonZeroExit {
                 code: status.code(),
                 stderr_tail,
             }),
-            WaitOutcome::TimedOut => Ok(result(out.read(), SubagentStopReason::Timeout)),
-            WaitOutcome::Cancelled => Ok(result(out.read(), SubagentStopReason::Cancelled)),
+            WaitOutcome::TimedOut => Ok(result(output(&final_msg), SubagentStopReason::Timeout)),
+            WaitOutcome::Cancelled => Ok(result(output(&final_msg), SubagentStopReason::Cancelled)),
         }
     }
 }
@@ -367,6 +401,30 @@ mod tests {
             .contains("boom"));
     }
 
+    #[test]
+    fn final_message_extracts_only_agent_message_completed() {
+        assert_eq!(
+            codex_final_message_from_json_line(
+                r#"{"type":"item.completed","item":{"type":"agent_message","text":"the answer"}}"#
+            ),
+            Some("the answer".to_string())
+        );
+        // Not an agent_message / not completed / not JSON → None.
+        assert_eq!(
+            codex_final_message_from_json_line(
+                r#"{"type":"item.completed","item":{"type":"reasoning","text":"x"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            codex_final_message_from_json_line(
+                r#"{"type":"item.started","item":{"type":"agent_message","text":"x"}}"#
+            ),
+            None
+        );
+        assert_eq!(codex_final_message_from_json_line("not json"), None);
+    }
+
     // Stub `codex`: emits `--json` JSONL events + writes the `-o` final message,
     // exits 0 — no real Codex, no network. Verifies spawn → JSONL parse → capture.
     #[cfg(unix)]
@@ -420,6 +478,31 @@ exit 0
             !activity.iter().any(|l| l.contains("STUB FINAL ANSWER")),
             "final answer must not be streamed as activity: {activity:?}"
         );
+    }
+
+    // Stub that emits an agent_message via JSONL but writes NO `-o` file → the
+    // streamed message is the fallback answer (no silent-empty result).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_falls_back_to_stream_when_output_file_is_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("codex-noout.sh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nprintf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"FALLBACK ANSWER\"}}\\n'\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let backend = CodexBackend::new("codex-noout", PermissionMode::ReadOnly)
+            .with_program(&stub)
+            .with_timeout(Duration::from_secs(10));
+        let res = backend
+            .run(SubagentRun::new("x", dir.path()))
+            .await
+            .unwrap();
+        assert_eq!(res.stop_reason, SubagentStopReason::Completed);
+        assert_eq!(res.output, "FALLBACK ANSWER");
     }
 
     #[cfg(unix)]
