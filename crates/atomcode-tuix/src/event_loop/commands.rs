@@ -311,6 +311,47 @@ mod bg_live_guard_tests {
     use crate::state::{UiPhase, UiState};
 
     #[test]
+    fn take_marker_matched_images_keeps_only_surviving_markers() {
+        use atomcode_kernel::message::ImageContent;
+        let mut state = UiState::new();
+        state.pending_images = vec![
+            ImageContent {
+                media_type: "image/png".into(),
+                data: "AAA".into(),
+            },
+            ImageContent {
+                media_type: "image/png".into(),
+                data: "BBB".into(),
+            },
+        ];
+        state.pending_image_markers = vec![1, 2];
+        state.pending_image_hashes = vec![0x1111, 0x2222];
+        // Only marker #2 survives in the objective text.
+        let images = super::take_marker_matched_images(&mut state, "trend of [Image #2]");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data, "BBB");
+        // Pending fully drained — nothing lingers onto the next message.
+        assert!(state.pending_images.is_empty());
+        assert!(state.pending_image_markers.is_empty());
+        assert!(state.pending_image_hashes.is_empty());
+    }
+
+    #[test]
+    fn take_marker_matched_images_drops_all_when_no_marker() {
+        use atomcode_kernel::message::ImageContent;
+        let mut state = UiState::new();
+        state.pending_images = vec![ImageContent {
+            media_type: "image/png".into(),
+            data: "AAA".into(),
+        }];
+        state.pending_image_markers = vec![1];
+        state.pending_image_hashes = vec![0x1111];
+        let images = super::take_marker_matched_images(&mut state, "no marker here");
+        assert!(images.is_empty());
+        assert!(state.pending_images.is_empty(), "still drained");
+    }
+
+    #[test]
     fn live_binding_blocks_only_foreground_bg_switches() {
         assert!(ensure_bg_foreground_switch_allowed(true, false, false).is_err());
         assert!(ensure_bg_foreground_switch_allowed(false, false, false).is_ok());
@@ -825,14 +866,39 @@ pub(crate) fn submit_agent_turn(ctx: &LoopCtx, state: &mut UiState, text: String
     }
 }
 
-fn submit_agent_text(ctx: &LoopCtx, text: String) -> bool {
+fn submit_agent_input(ctx: &LoopCtx, input: atomcode_coding::UserInput) -> bool {
     if ctx.live_binding.is_some() {
-        atomcode_daemon::native_live::submit(atomcode_coding::UserInput::from(text)).is_ok()
+        atomcode_daemon::native_live::submit(input).is_ok()
     } else {
         ctx.runtime
-            .dispatch(atomcode_coding::DriverCommand::Submit(text.into()))
+            .dispatch(atomcode_coding::DriverCommand::Submit(input))
             .is_ok()
     }
+}
+
+fn submit_agent_text(ctx: &LoopCtx, text: String) -> bool {
+    submit_agent_input(ctx, atomcode_coding::UserInput::from(text))
+}
+
+/// Drain the pasted images whose `[Image #N]` marker still appears in
+/// `marker_source`, mirroring the normal-message submit filter (a deleted
+/// marker drops its image). The matched images leave `pending_images` (so they
+/// don't linger onto the next message); unmatched pasted images are dropped the
+/// same way the message path drops a marker the user deleted. Used by
+/// image-aware slash arms (`/goal`) that submit their own turn.
+fn take_marker_matched_images(
+    state: &mut UiState,
+    marker_source: &str,
+) -> Vec<atomcode_kernel::message::ImageContent> {
+    let pending = std::mem::take(&mut state.pending_images);
+    let markers = std::mem::take(&mut state.pending_image_markers);
+    let _hashes = std::mem::take(&mut state.pending_image_hashes);
+    pending
+        .into_iter()
+        .zip(markers)
+        .filter(|(_, n)| marker_source.contains(&format!("[Image #{}]", n)))
+        .map(|(img, _)| img)
+        .collect()
 }
 
 /// Fire one iteration of a fixed-interval `/loop`.
@@ -3513,6 +3579,10 @@ fn execute_slash_command_impl(
                     // (Empty input is unreachable here — `head` would be ""
                     // and the `"" | "status"` arm above would have matched.)
                     let condition = trimmed.to_owned();
+                    // Attach any pasted reference images whose `[Image #N]`
+                    // marker survived in the objective text — the goal's first
+                    // turn submits with them (a text-only model captions via VL).
+                    let images = take_marker_matched_images(state, arg);
                     if ctx
                         .runtime
                         .dispatch(atomcode_coding::DriverCommand::StartGoal(condition.clone()))
@@ -3546,7 +3616,18 @@ fn execute_slash_command_impl(
                             renderer.flush();
                         }
                     }
-                    if submit_agent_text(ctx, condition) {
+                    let submitted = if images.is_empty() {
+                        submit_agent_text(ctx, condition)
+                    } else {
+                        submit_agent_input(
+                            ctx,
+                            atomcode_coding::UserInput {
+                                text: condition,
+                                images,
+                            },
+                        )
+                    };
+                    if submitted {
                         state.on_submit();
                     }
                 }

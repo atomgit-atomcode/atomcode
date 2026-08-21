@@ -88,6 +88,31 @@ fn submit_foreground_runtime(ctx: &LoopCtx, input: atomcode_coding::UserInput) -
     }
 }
 
+/// The slash commands that ONLY switch agent mode (`/plan`, `/build`, `/auto`),
+/// as opposed to content commands. Returns the mode each selects.
+fn mode_setter_mode(cmd: &str) -> Option<crate::state::AgentMode> {
+    match cmd {
+        "plan" => Some(crate::state::AgentMode::Plan),
+        "build" => Some(crate::state::AgentMode::Build),
+        "auto" => Some(crate::state::AgentMode::Auto),
+        _ => None,
+    }
+}
+
+/// Decide whether a mode-setter submission carries trailing content that should
+/// be forwarded as a normal message after switching mode. `Some(mode)` when
+/// `cmd` is a mode-setter AND `arg` has non-whitespace residual (text and/or an
+/// `[Image #N]` marker); `None` for a bare toggle (`/plan` alone) or any
+/// non-mode-setter. Pure so the forward decision is unit-testable.
+fn mode_setter_residual_message(cmd: &str, arg: &str) -> Option<crate::state::AgentMode> {
+    let mode = mode_setter_mode(cmd)?;
+    if arg.trim().is_empty() {
+        None
+    } else {
+        Some(mode)
+    }
+}
+
 fn reload_runtime_provider(ctx: &LoopCtx) -> Result<(), atomcode_coding::RuntimeUnavailable> {
     reload_runtime_provider_from(ctx, &ctx.config)
 }
@@ -7723,6 +7748,39 @@ mod menu_tests {
         assert_eq!(notice.len(), 1, "expected one cache-miss notice");
         assert!(notice[0].contains("[Image #3]"));
         assert!(notice[0].contains("缓存"));
+    }
+
+    #[test]
+    fn mode_setter_mode_identifies_toggle_commands() {
+        use crate::state::AgentMode;
+        assert!(matches!(super::mode_setter_mode("plan"), Some(AgentMode::Plan)));
+        assert!(matches!(super::mode_setter_mode("build"), Some(AgentMode::Build)));
+        assert!(matches!(super::mode_setter_mode("auto"), Some(AgentMode::Auto)));
+        assert!(super::mode_setter_mode("goal").is_none());
+        assert!(super::mode_setter_mode("plans").is_none());
+    }
+
+    #[test]
+    fn mode_setter_forwards_residual_only_when_present() {
+        use crate::state::AgentMode;
+        // Residual text or an [Image #N] marker → forward after switching mode.
+        assert!(matches!(
+            super::mode_setter_residual_message("plan", "分析趋势"),
+            Some(AgentMode::Plan)
+        ));
+        assert!(matches!(
+            super::mode_setter_residual_message("plan", "[Image #1]"),
+            Some(AgentMode::Plan)
+        ));
+        assert!(matches!(
+            super::mode_setter_residual_message("build", "fix"),
+            Some(AgentMode::Build)
+        ));
+        // Bare toggle → no forward.
+        assert!(super::mode_setter_residual_message("plan", "").is_none());
+        assert!(super::mode_setter_residual_message("plan", "   ").is_none());
+        // Non-mode-setter never forwards.
+        assert!(super::mode_setter_residual_message("goal", "x").is_none());
     }
 
     #[test]
@@ -16162,7 +16220,7 @@ fn handle_idle_key(
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
             }
         }
-        BufferResult::Commit(line) => {
+        BufferResult::Commit(mut line) => {
             if provider_transition_pending(ctx) && !provider_transition_allows_idle_commit(&line) {
                 renderer.render(UiLine::Error(
                     crate::i18n::t(crate::i18n::Msg::CmdProviderReloading).into_owned(),
@@ -16257,6 +16315,20 @@ fn handle_idle_key(
                 }
                 // Not a known skill: fall through so `$foo` is sent as a
                 // normal message (e.g. "$5 budget" keeps working).
+            }
+            // A mode-setter slash (`/plan`/`/build`/`/auto`) carrying trailing
+            // content: switch mode NOW, then rewrite `line` to the residual so it
+            // flows through the normal message path below — with its pending
+            // images and full VL/echo/queue machinery — instead of the toggle
+            // swallowing the image+text. A bare `/plan` (no residual) is left
+            // untouched and falls through to the plain toggle in the slash arm.
+            if let Some((mode, residual)) = parse_slash_line(&line).and_then(|(cmd, arg)| {
+                mode_setter_residual_message(cmd, arg)
+                    .filter(|_| ctx.commands.find(cmd).is_some())
+                    .map(|mode| (mode, arg.to_string()))
+            }) {
+                set_agent_mode(app, ctx, renderer, mode);
+                line = residual;
             }
             // Only treat `/name …` as a slash command when `name` is
             // actually registered. Unrecognised `/foo …` (e.g. the user
@@ -16513,6 +16585,14 @@ fn handle_idle_key(
                             // has entered the first condition. The first TUI
                             // text submit is therefore the Goal condition.
                             app.state.goal_armed = false;
+                            // This branch already drained `pending_images` into
+                            // the local `images`; restore the marker-matched ones
+                            // so the /goal arm re-attaches them to the objective
+                            // turn — parity with a direct `/goal <cond> [Image #N]`
+                            // (the block returns below, so `images`/`kept_markers`
+                            // are unused past here on this path).
+                            app.state.pending_images = images;
+                            app.state.pending_image_markers = kept_markers;
                             execute_slash_command(
                                 "goal",
                                 &expanded,
