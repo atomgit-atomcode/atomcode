@@ -20,6 +20,45 @@ use tokio_util::sync::CancellationToken;
 pub mod claude_code;
 pub mod codex;
 pub mod proc;
+pub mod tool;
+
+use std::time::Duration;
+
+/// A configured external-agent instance (`[[subagent.external]]` profile). Each
+/// enabled profile builds one [`SubagentBackend`] and registers one named
+/// subagent tool. Deserialization of the config layer is T1.6; this is the
+/// resolved, backend-neutral shape the assembly layer consumes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalSubagentProfile {
+    /// Instance name, e.g. `"codex-primary"`. Source of the tool name.
+    pub name: String,
+    /// Which external agent to drive.
+    pub kind: SubagentKind,
+    /// Optional model override passed to the agent.
+    pub model: Option<String>,
+    /// Non-interactive permission posture (defaults to `ReadOnly` at the config
+    /// layer when the field is absent).
+    pub permission: PermissionMode,
+    /// Whether `Bypass` is permitted for this instance. The config/assembly layer
+    /// forces this `false` in non-interactive/scheduled contexts.
+    pub allow_dangerous: bool,
+    /// Overall wall-clock ceiling for one delegated run. `None` → adapter default.
+    pub timeout: Option<Duration>,
+}
+
+impl ExternalSubagentProfile {
+    /// A minimal profile (read-only, no model/timeout override).
+    pub fn new(name: impl Into<String>, kind: SubagentKind) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            model: None,
+            permission: PermissionMode::ReadOnly,
+            allow_dangerous: false,
+            timeout: None,
+        }
+    }
+}
 
 /// Which external agent a backend drives. Parsed from the `kind` field of an
 /// `[[subagent.external]]` config entry.

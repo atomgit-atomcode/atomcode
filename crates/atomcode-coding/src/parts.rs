@@ -124,6 +124,11 @@ pub struct PrepareOptions {
     /// the injecting driver is the trust boundary. Ignored when `mcp` is
     /// false (no registry is created).
     pub extra_mcp_servers: Vec<McpServerConfig>,
+    /// External-agent subagent instances (`[[subagent.external]]` profiles) to
+    /// mount as named `subagent_<name>` tools. Each drives Claude Code / Codex as
+    /// a subagent. A profile whose binary is missing on PATH is skipped. Empty =
+    /// none. Independent of `subagents` (which gates the in-process `task`/`team`).
+    pub external_subagents: Vec<atomcode_capabilities::subagent::ExternalSubagentProfile>,
     /// Inject `memory.md` (global + project) at session start. KEEP THIS CONSISTENT
     /// across resumes of one session: the injected block is persisted in the
     /// snapshot, and only a registered MemoryHook reconciles/removes it on resume —
@@ -155,6 +160,7 @@ impl Default for PrepareOptions {
             plugin_skill_dirs: Vec::new(),
             mcp: true,
             extra_mcp_servers: Vec::new(),
+            external_subagents: Vec::new(),
             memory: true,
             web: true,
             review: true,
@@ -357,6 +363,16 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     );
     if atomcode_capabilities::codeintel::register_lsp_tool(&mut registry, &cfg.lsp) {
         names.push("lsp".into());
+    }
+
+    // External-agent subagents (Claude Code / Codex as named subagent tools).
+    // Each enabled profile whose binary is present on PATH mounts one tool.
+    if !opts.external_subagents.is_empty() {
+        let mounted = atomcode_capabilities::subagent::tool::register_external_subagent_tools(
+            &mut registry,
+            &opts.external_subagents,
+        );
+        names.extend(mounted);
     }
 
     #[cfg(feature = "atomgit")]
