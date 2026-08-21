@@ -926,6 +926,14 @@ impl NativeLiveWireProjector {
                         )
                     },
                 },
+                Kernel::OutputTruncationRecovery {
+                    attempt,
+                    max_attempts,
+                } => LiveWireEvent::Warning {
+                    message: format!(
+                        "output limit reached; automatically continuing ({attempt}/{max_attempts})"
+                    ),
+                },
                 Kernel::RateLimited {
                     reset_at_display,
                     reset_label,

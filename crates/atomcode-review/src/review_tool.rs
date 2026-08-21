@@ -10,6 +10,12 @@
 //! [`SharedReviewProvider`]) rather than constructed fresh from a config — so the reviewer
 //! reuses the host's already-built, possibly request-SIGNED provider and can reach a
 //! signing gateway (the exact case `atomcode-clix`'s `review` subcommand has to refuse).
+//!
+//! Deep mode: `{"depth":"deep"}` fans out one read-only reviewer per concern
+//! dimension (see `crate::fanout`) and merges/dedups their findings;
+//! `{"depth":"deep+verify"}` additionally runs one verify pass per finding to
+//! cull false positives (single vote, biased toward keep). The default
+//! single-reviewer path is unchanged.
 
 use std::path::Path;
 use std::process::Command;
@@ -29,6 +35,11 @@ use serde_json::json;
 
 use crate::config::ReviewAgentConfig;
 use crate::diff::annotate_diff_line_numbers;
+use crate::fanout::{
+    dimension_coverage, merge_deep_findings, render_deep_result, render_verify_task, run_deep_review,
+    run_verify, verify_reconfirms, DimensionOutcome, REVIEW_DIMENSIONS, VERIFY_CONCURRENCY,
+    VERIFY_LENS,
+};
 use crate::impact_plan::render_review_impact_plan;
 use crate::rules::{changed_files_from_diff, render_rules_section};
 use crate::{build_review_agent_with, Finding};
@@ -40,8 +51,10 @@ pub const REVIEW_ACTIVITY_MARKER: char = '\u{1e}';
 
 pub(crate) struct ReviewProgressHook {
     progress: ProgressSink,
-    round: AtomicU32,
-    max_rounds: AtomicU32,
+    /// Optional stage label — the deep-mode dimension id (e.g. `security`) or
+    /// `verify` — shown in the activity line so concurrent reviewers are
+    /// distinguishable. `None` for the single reviewer.
+    label: Option<String>,
     /// Running count of `report_finding` calls the reviewer has made so far, so
     /// the activity line shows the review accumulating results ("2 findings")
     /// instead of a static "thinking" — the user's "can't tell what it's doing"
@@ -51,22 +64,22 @@ pub(crate) struct ReviewProgressHook {
 }
 
 impl ReviewProgressHook {
-    pub(crate) fn new(progress: ProgressSink) -> Self {
+    pub(crate) fn new(progress: ProgressSink, label: Option<String>) -> Self {
         Self {
             progress,
-            round: AtomicU32::new(0),
-            max_rounds: AtomicU32::new(0),
+            label,
             findings: AtomicU32::new(0),
         }
     }
 
-    /// Emit the current activity line: `review · round N/M · K findings · <tail>`,
-    /// carrying the live round + running finding count around whatever the
-    /// reviewer is doing right now (`tail`).
+    /// Emit the current activity line: `review[ [label]] · K findings · <tail>`,
+    /// carrying the stage label + running finding count around whatever the
+    /// reviewer is doing right now (`tail`). The round/round-cap is deliberately
+    /// not shown — it read as noise (`round 3/200`) without telling the user what
+    /// the review was actually doing.
     fn emit(&self, tail: &str) {
         let line = review_activity_line(
-            self.round.load(Ordering::Relaxed),
-            self.max_rounds.load(Ordering::Relaxed),
+            self.label.as_deref(),
             self.findings.load(Ordering::Relaxed),
             tail,
         );
@@ -76,10 +89,7 @@ impl ReviewProgressHook {
 
 #[async_trait]
 impl LifecycleHooks for ReviewProgressHook {
-    async fn pre_request(&self, _messages: &mut Vec<Message>, ctx: &TurnCtx) {
-        self.round.store(ctx.round, Ordering::Relaxed);
-        self.max_rounds
-            .store(ctx.max_rounds.unwrap_or(0), Ordering::Relaxed);
+    async fn pre_request(&self, _messages: &mut Vec<Message>, _ctx: &TurnCtx) {
         self.emit("thinking");
     }
 
@@ -107,19 +117,17 @@ impl LifecycleHooks for ReviewProgressHook {
 }
 
 /// Build the ephemeral review activity line (the text AFTER the marker):
-/// `review · round N/M · K findings · <tail>`. `round`==0 omits the round
-/// segment (not started); `max_rounds`==0 renders `round N` (no total);
-/// `findings`==0 omits the count; the count is pluralized. An empty `tail`
-/// is dropped so there is never a dangling separator.
-fn review_activity_line(round: u32, max_rounds: u32, findings: u32, tail: &str) -> String {
-    let mut segments = vec!["review".to_string()];
-    if round > 0 {
-        segments.push(if max_rounds > 0 {
-            format!("round {round}/{max_rounds}")
-        } else {
-            format!("round {round}")
-        });
-    }
+/// `review[ [label]] · K findings · <tail>`. An optional stage `label`
+/// (deep-mode dimension id, or `verify`) is shown in brackets so concurrent
+/// reviewers are distinguishable; `findings`==0 omits the count (pluralized
+/// otherwise); an empty `tail` is dropped so there is never a dangling
+/// separator. The round/round-cap is intentionally NOT shown.
+fn review_activity_line(label: Option<&str>, findings: u32, tail: &str) -> String {
+    let head = match label.filter(|l| !l.is_empty()) {
+        Some(label) => format!("review [{label}]"),
+        None => "review".to_string(),
+    };
+    let mut segments = vec![head];
     if findings > 0 {
         segments.push(format!(
             "{findings} finding{}",
@@ -264,6 +272,11 @@ struct Args {
     /// the user explicitly accepts the displayed scope.
     #[serde(default)]
     confirm_scope: Option<String>,
+    /// Review depth. `"deep"` fans out one read-only reviewer per concern
+    /// dimension and merges their findings; absent / `"single"` runs the default
+    /// single reviewer. Unknown values fall back to single.
+    #[serde(default)]
+    depth: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -294,6 +307,20 @@ enum ReviewScope {
 }
 
 impl Args {
+    fn is_deep(&self) -> bool {
+        self.depth
+            .as_deref()
+            .map(|d| d.eq_ignore_ascii_case("deep") || d.eq_ignore_ascii_case("deep+verify"))
+            .unwrap_or(false)
+    }
+
+    fn wants_verify(&self) -> bool {
+        self.depth
+            .as_deref()
+            .map(|d| d.eq_ignore_ascii_case("deep+verify"))
+            .unwrap_or(false)
+    }
+
     fn review_scope(&self) -> Result<ReviewScope, String> {
         if self.scope.is_some() && (self.base.is_some() || self.staged) {
             return Err("`scope` cannot be combined with legacy `base` or `staged`".into());
@@ -402,7 +429,10 @@ impl Tool for ReviewTool {
          findings (correctness > security > reliability). Resolve only the requested scope, \
          then invoke this tool without pre-reviewing the diff. Large scopes return a preflight \
          instead of starting; only echo `confirm_scope` after the user explicitly accepts that \
-         exact scope. Runs a separate reviewer agent and never modifies files."
+         exact scope. Runs a separate reviewer agent and never modifies files. Choose `depth` by \
+         the change's risk and size (see the `depth` parameter): default to `single`; escalate to \
+         `deep`/`deep+verify` only for substantive, risky, or security-sensitive changes, or when \
+         the user asks for a thorough/careful review."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -418,7 +448,8 @@ impl Tool for ReviewTool {
                     "description": "Explicit mutually-exclusive review scope. Omit for working-tree changes."
                 },
                 "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional repo-relative path filters." },
-                "confirm_scope": { "type": "string", "description": "Opaque token from a preflight. Pass only after explicit user confirmation." }
+                "confirm_scope": { "type": "string", "description": "Opaque token from a preflight. Pass only after explicit user confirmation." },
+                "depth": { "type": "string", "enum": ["single", "deep", "deep+verify"], "description": "Review depth — choose by the change's risk/scope. `single` (default, omit): routine or low-risk edits (docs, formatting, small localized fixes, config). `deep`: substantive multi-file / logic changes, refactors, or concurrency — fans out one reviewer per concern dimension (correctness/security/performance/tests) and merges findings. `deep+verify`: high-risk, security-sensitive, or correctness-critical changes, or when the user asks for a thorough/high-confidence review — additionally runs one verify pass per finding to cull false positives. `deep`/`deep+verify` cost several× more, so escalate only when warranted." }
             }
         })
     }
@@ -486,41 +517,115 @@ impl Tool for ReviewTool {
             Some(p) => p,
             None => return err("code_review: review provider is not wired (internal error)"),
         };
-        let mut cfg = ReviewAgentConfig::new("", "", &self.cfg.model, &ctx.working_dir);
-        cfg.context_window = self.cfg.context_window;
-        cfg.stream_timeout = self.cfg.stream_timeout;
-        cfg.request_timeout = self.cfg.request_timeout;
-        cfg.max_rounds = self.max_rounds;
-        cfg.max_turn_duration = self.max_turn_duration;
-        cfg.tool_loop_policy = self.tool_loop_policy;
-        cfg.progress = Some(ctx.progress.clone());
-        // Pin tools to the changed-file set of this scoped review (same as clix).
-        cfg.review_paths = files.clone();
-        let (agent, report) = build_review_agent_with(&cfg, provider);
 
-        // 4. Run the reviewer to completion, honoring the host turn's cancellation. Dropping
-        //    the run future (on cancel) cancels the spawned child agent.
-        let (stop, run_error) = tokio::select! {
-            _ = ctx.cancel.cancelled() => (StopReason::Cancelled, Some("cancelled by user".to_string())),
-            outcome = agent.run_to_completion(task, AutoRespond::AllowAll) => {
-                (outcome.stop, outcome.error)
-            }
+        // Shared per-agent config seed (both paths).
+        let make_cfg = || {
+            let mut cfg = ReviewAgentConfig::new("", "", &self.cfg.model, &ctx.working_dir);
+            cfg.context_window = self.cfg.context_window;
+            cfg.stream_timeout = self.cfg.stream_timeout;
+            cfg.request_timeout = self.cfg.request_timeout;
+            cfg.max_rounds = self.max_rounds;
+            cfg.max_turn_duration = self.max_turn_duration;
+            cfg.tool_loop_policy = self.tool_loop_policy;
+            cfg.progress = Some(ctx.progress.clone());
+            cfg.review_paths = files.clone();
+            cfg
         };
 
-        // 5. Scope-filter to changed files, sort (priority then confidence), render.
-        let mut findings = report.findings();
-        findings.retain(|f| files.iter().any(|cf| paths_match(cf, &f.file_path)));
-        sort_findings(&mut findings);
-        if stop == StopReason::Stopped && run_error.is_none() {
-            ok(render_findings(&findings, files.len()))
-        } else {
-            err(render_incomplete_review(
-                &findings,
-                files.len(),
-                stop,
-                run_error.as_deref(),
-            ))
+        if !a.is_deep() {
+            // --- single-agent path (unchanged behavior) ---
+            let (agent, report) = build_review_agent_with(&make_cfg(), provider);
+            let (stop, run_error) = tokio::select! {
+                _ = ctx.cancel.cancelled() => (StopReason::Cancelled, Some("cancelled by user".to_string())),
+                outcome = agent.run_to_completion(task, AutoRespond::AllowAll) => {
+                    (outcome.stop, outcome.error)
+                }
+            };
+            let mut findings = report.findings();
+            findings.retain(|f| files.iter().any(|cf| paths_match(cf, &f.file_path)));
+            sort_findings(&mut findings);
+            return if stop == StopReason::Stopped && run_error.is_none() {
+                ok(render_findings(&findings, files.len()))
+            } else {
+                err(render_incomplete_review(&findings, files.len(), stop, run_error.as_deref()))
+            };
         }
+
+        // --- deep fan-out path ---
+        let outcomes = run_deep_review(REVIEW_DIMENSIONS, |dim| {
+            // Clone everything so each dimension future is Send + 'static.
+            let provider = provider.clone();
+            let task = task.clone();
+            let mut cfg = make_cfg();
+            let cancel = ctx.cancel.clone();
+            async move {
+                cfg.progress_label = Some(dim.id.to_string());
+                cfg = cfg.with_persona_append(dim.lens);
+                let (agent, report) = build_review_agent_with(&cfg, provider);
+                let (stop, run_error) = tokio::select! {
+                    _ = cancel.cancelled() => (StopReason::Cancelled, Some("cancelled by user".to_string())),
+                    outcome = agent.run_to_completion(task, AutoRespond::AllowAll) => {
+                        (outcome.stop, outcome.error)
+                    }
+                };
+                DimensionOutcome {
+                    dimension: dim.id,
+                    findings: report.findings(),
+                    completed: stop == StopReason::Stopped && run_error.is_none(),
+                    error: run_error,
+                }
+            }
+        })
+        .await;
+
+        // Merge the fan-out outcomes; optionally cull false positives with a
+        // single verify pass per surviving finding.
+        let (mut merged, deduped) = merge_deep_findings(&outcomes, &files);
+        let (completed, failed) = dimension_coverage(&outcomes);
+        let mut verify_dropped = None;
+        if a.wants_verify() && !merged.is_empty() {
+            // One verify agent per finding, capped. Keep a finding when its verify
+            // agent re-reports a corresponding finding (or fails open on error/cancel).
+            // Snapshot only the candidate findings (cheap Finding clones); the task —
+            // which embeds the whole diff — is rendered lazily inside each closure, so
+            // at most `VERIFY_CONCURRENCY` copies of the diff are live at once.
+            let candidates: Vec<Finding> = merged.iter().map(|m| m.finding.clone()).collect();
+            let keep = run_verify(merged.len(), VERIFY_CONCURRENCY, |i| {
+                let provider = provider.clone();
+                let candidate = candidates[i].clone();
+                let vtask = render_verify_task(&candidate, &rules, &annotated);
+                let mut cfg = make_cfg();
+                let cancel = ctx.cancel.clone();
+                async move {
+                    cfg.progress_label = Some("verify".to_string());
+                    cfg = cfg.with_persona_append(VERIFY_LENS);
+                    let (agent, report) = build_review_agent_with(&cfg, provider);
+                    let (stop, run_error) = tokio::select! {
+                        _ = cancel.cancelled() => (StopReason::Cancelled, Some("cancelled by user".to_string())),
+                        outcome = agent.run_to_completion(vtask, AutoRespond::AllowAll) => {
+                            (outcome.stop, outcome.error)
+                        }
+                    };
+                    // Fail-open: keep on error/cancel; else keep iff the verifier
+                    // re-reported a finding corresponding to THIS candidate.
+                    let clean = stop == StopReason::Stopped && run_error.is_none();
+                    let kept = if clean {
+                        verify_reconfirms(&candidate, &report.findings())
+                    } else {
+                        true
+                    };
+                    (i, kept)
+                }
+            })
+            .await;
+            let before = merged.len();
+            let mut mask = keep.into_iter();
+            merged.retain(|_| mask.next().unwrap_or(true));
+            verify_dropped = Some(before - merged.len());
+        }
+        let (is_error, content) =
+            render_deep_result(&merged, files.len(), &completed, &failed, deduped, verify_dropped);
+        if is_error { err(content) } else { ok(content) }
     }
 }
 
@@ -664,23 +769,37 @@ fn fnv1a64(first: &[u8], second: &[u8]) -> u64 {
 }
 
 /// Loose path match between a diff's changed-file path and a finding's `file_path` (which a
-/// model may give relative, `./`-prefixed, or absolute). Suffix match covers all three.
-fn paths_match(changed: &str, finding: &str) -> bool {
+/// model may give relative, `./`-prefixed, or absolute). Equal, or one is a suffix of the
+/// other AT a path-segment (`/`) boundary — so a bare `a.rs` still matches `crates/x/a.rs`,
+/// but `lib.rs` does NOT falsely match `mylib.rs`.
+pub(crate) fn paths_match(changed: &str, finding: &str) -> bool {
     let c = changed.trim_start_matches("./");
     let f = finding.trim_start_matches("./");
-    c == f || f.ends_with(c) || c.ends_with(f)
+    c == f || suffix_at_boundary(c, f) || suffix_at_boundary(f, c)
+}
+
+/// True when `short` is a suffix of `long` ending on a `/` segment boundary
+/// (`crates/x/a.rs` vs `a.rs`), never a mid-segment suffix (`mylib.rs` vs `lib.rs`).
+fn suffix_at_boundary(long: &str, short: &str) -> bool {
+    long.len() > short.len()
+        && long.ends_with(short)
+        && long.as_bytes()[long.len() - short.len() - 1] == b'/'
+}
+
+/// Priority ascending (`P0` most severe) then confidence descending. Shared with
+/// deep-mode merge ordering.
+pub(crate) fn cmp_finding(a: &Finding, b: &Finding) -> std::cmp::Ordering {
+    a.priority.cmp(&b.priority).then(
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal),
+    )
 }
 
 /// Sort by priority ascending (`P0` most severe) then confidence descending. `Px` strings
 /// sort lexically in severity order, so a plain string compare is correct.
 fn sort_findings(findings: &mut [Finding]) {
-    findings.sort_by(|a, b| {
-        a.priority.cmp(&b.priority).then(
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        )
-    });
+    findings.sort_by(|a, b| cmp_finding(a, b));
 }
 
 fn render_findings(findings: &[Finding], changed_files: usize) -> String {
@@ -793,35 +912,31 @@ mod tests {
     }
 
     #[test]
-    fn review_activity_line_composes_round_findings_and_tail() {
-        // No round yet, no findings → bare marker text + tail.
-        assert_eq!(review_activity_line(0, 0, 0, "thinking"), "review · thinking");
-        // Round without a known max.
+    fn review_activity_line_composes_label_findings_and_tail() {
+        // No label, no findings → bare marker text + tail (round is never shown).
+        assert_eq!(review_activity_line(None, 0, "thinking"), "review · thinking");
+        // Singular finding, no label.
         assert_eq!(
-            review_activity_line(3, 0, 0, "thinking"),
-            "review · round 3 · thinking"
+            review_activity_line(None, 1, "thinking"),
+            "review · 1 finding · thinking"
         );
-        // Round with max.
+        // Plural findings + a tool tail (which file it read).
         assert_eq!(
-            review_activity_line(3, 8, 0, "thinking"),
-            "review · round 3/8 · thinking"
+            review_activity_line(None, 2, "read_file · a.rs"),
+            "review · 2 findings · read_file · a.rs"
         );
-        // Singular finding.
+        // A deep-mode stage label appears in brackets so concurrent agents differ.
         assert_eq!(
-            review_activity_line(3, 8, 1, "thinking"),
-            "review · round 3/8 · 1 finding · thinking"
+            review_activity_line(Some("security"), 2, "read_file · a.rs"),
+            "review [security] · 2 findings · read_file · a.rs"
         );
-        // Plural findings + a tool tail.
         assert_eq!(
-            review_activity_line(3, 8, 2, "read_file · a.rs"),
-            "review · round 3/8 · 2 findings · read_file · a.rs"
+            review_activity_line(Some("verify"), 0, "thinking"),
+            "review [verify] · thinking"
         );
-        // Empty tail collapses cleanly (no trailing separator).
-        assert_eq!(review_activity_line(0, 0, 0, ""), "review");
-        assert_eq!(
-            review_activity_line(2, 5, 4, ""),
-            "review · round 2/5 · 4 findings"
-        );
+        // Empty tail / empty label collapse cleanly (no dangling separator).
+        assert_eq!(review_activity_line(None, 0, ""), "review");
+        assert_eq!(review_activity_line(Some(""), 4, ""), "review · 4 findings");
     }
 
     #[test]
@@ -830,6 +945,11 @@ mod tests {
         assert!(paths_match("src/a.rs", "./src/a.rs"));
         assert!(paths_match("src/a.rs", "/abs/repo/src/a.rs"));
         assert!(!paths_match("src/a.rs", "src/b.rs"));
+        // Basename leniency stays: a bare filename matches at a path segment boundary.
+        assert!(paths_match("crates/x/a.rs", "a.rs"));
+        // But a suffix that is NOT at a `/` boundary must NOT match (no false positive).
+        assert!(!paths_match("src/mylib.rs", "lib.rs"));
+        assert!(!paths_match("ab.rs", "b.rs"));
     }
 
     #[test]
@@ -933,14 +1053,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_progress_hook_emits_round_activity() {
+    async fn review_progress_hook_emits_thinking_without_a_round() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let capture = seen.clone();
-        let hook = ReviewProgressHook::new(atomcode_kernel::tool::ProgressSink::new(Arc::new(
-            move |message| {
+        let hook = ReviewProgressHook::new(
+            atomcode_kernel::tool::ProgressSink::new(Arc::new(move |message| {
                 capture.lock().unwrap().push(message);
-            },
-        )));
+            })),
+            None,
+        );
 
         atomcode_kernel::hook::LifecycleHooks::pre_request(
             &hook,
@@ -953,31 +1074,24 @@ mod tests {
         )
         .await;
 
+        // No `round 3/…` noise — just what the review is doing.
         assert_eq!(
             seen.lock().unwrap().as_slice(),
-            &[format!(
-                "{REVIEW_ACTIVITY_MARKER}review · round 3 · thinking"
-            )]
+            &[format!("{REVIEW_ACTIVITY_MARKER}review · thinking")]
         );
     }
 
     #[tokio::test]
-    async fn review_progress_tool_activity_keeps_current_round() {
+    async fn review_progress_tool_activity_shows_file_and_stage_label() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let capture = seen.clone();
-        let hook = ReviewProgressHook::new(ProgressSink::new(Arc::new(move |message| {
-            capture.lock().unwrap().push(message);
-        })));
-        LifecycleHooks::pre_request(
-            &hook,
-            &mut Vec::new(),
-            &TurnCtx {
-                round: 4,
-                max_rounds: None,
-                ..Default::default()
-            },
-        )
-        .await;
+        // A deep-mode dimension agent labels its activity so it is distinguishable.
+        let hook = ReviewProgressHook::new(
+            ProgressSink::new(Arc::new(move |message| {
+                capture.lock().unwrap().push(message);
+            })),
+            Some("security".to_string()),
+        );
         let mut response = Message::assistant(
             "",
             vec![ToolCall {
@@ -991,7 +1105,7 @@ mod tests {
 
         assert_eq!(
             seen.lock().unwrap().last().map(String::as_str),
-            Some("\u{1e}review · round 4 · read_file · src/compaction.rs")
+            Some("\u{1e}review [security] · read_file · src/compaction.rs")
         );
     }
 
@@ -999,9 +1113,12 @@ mod tests {
     async fn review_progress_accumulates_and_surfaces_finding_count() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let capture = seen.clone();
-        let hook = ReviewProgressHook::new(ProgressSink::new(Arc::new(move |message| {
-            capture.lock().unwrap().push(message);
-        })));
+        let hook = ReviewProgressHook::new(
+            ProgressSink::new(Arc::new(move |message| {
+                capture.lock().unwrap().push(message);
+            })),
+            None,
+        );
         LifecycleHooks::pre_request(
             &hook,
             &mut Vec::new(),
@@ -1012,7 +1129,7 @@ mod tests {
             },
         )
         .await;
-        // Round 2 reports one finding.
+        // A round reports one finding.
         let mut r2 = Message::assistant(
             "",
             vec![ToolCall {
@@ -1024,7 +1141,7 @@ mod tests {
         LifecycleHooks::on_model_response(&hook, &mut r2).await;
         assert_eq!(
             seen.lock().unwrap().last().map(String::as_str),
-            Some("\u{1e}review · round 2/8 · 1 finding · reporting finding"),
+            Some("\u{1e}review · 1 finding · reporting finding"),
             "the reported finding is counted and the tool tail reads cleanly"
         );
 
@@ -1041,7 +1158,7 @@ mod tests {
         .await;
         assert_eq!(
             seen.lock().unwrap().last().map(String::as_str),
-            Some("\u{1e}review · round 3/8 · 1 finding · thinking"),
+            Some("\u{1e}review · 1 finding · thinking"),
             "the running finding count carries across rounds, even while thinking"
         );
 
@@ -1064,7 +1181,7 @@ mod tests {
         LifecycleHooks::on_model_response(&hook, &mut r4).await;
         assert_eq!(
             seen.lock().unwrap().last().map(String::as_str),
-            Some("\u{1e}review · round 3/8 · 3 findings · reporting finding"),
+            Some("\u{1e}review · 3 findings · reporting finding"),
             "multiple findings in one round accumulate and pluralize"
         );
     }
@@ -1382,6 +1499,122 @@ mod tests {
                 .iter()
                 .any(|message| message == "\u{1e}review · analyzing 1 file(s)"),
             "progress must expose the pre-review phase: {progress:?}"
+        );
+    }
+
+    #[test]
+    fn args_parse_depth_field() {
+        let d: Args = serde_json::from_str(r#"{"depth":"deep"}"#).unwrap();
+        assert!(d.is_deep());
+        let s: Args = serde_json::from_str("{}").unwrap();
+        assert!(!s.is_deep());
+        let explicit: Args = serde_json::from_str(r#"{"depth":"single"}"#).unwrap();
+        assert!(!explicit.is_deep());
+    }
+
+    #[test]
+    fn depth_schema_guides_when_to_escalate() {
+        let provider: SharedReviewProvider = Arc::new(RwLock::new(None));
+        let tool = ReviewTool::new(provider, ReviewToolConfig::default());
+        let schema = tool.parameters_schema();
+        let depth_desc = schema["properties"]["depth"]["description"]
+            .as_str()
+            .expect("depth description");
+        // The guidance says WHEN to pick each depth (by risk/scope), not just what
+        // they do — so the model can self-select instead of always defaulting.
+        assert!(depth_desc.contains("risk"), "{depth_desc}");
+        assert!(depth_desc.contains("security"), "{depth_desc}");
+        assert!(
+            depth_desc.contains("thorough") || depth_desc.contains("high-confidence"),
+            "{depth_desc}"
+        );
+        // Cost caution keeps a weak model from over-escalating.
+        assert!(depth_desc.contains("escalate only when warranted"), "{depth_desc}");
+        // The tool description also points at depth selection.
+        assert!(tool.description().contains("depth"));
+        assert!(tool.description().contains("escalate"));
+    }
+
+    #[test]
+    fn args_parse_deep_verify_depth() {
+        let v: Args = serde_json::from_str(r#"{"depth":"deep+verify"}"#).unwrap();
+        assert!(v.is_deep(), "deep+verify still counts as deep (fans out)");
+        assert!(v.wants_verify());
+        let d: Args = serde_json::from_str(r#"{"depth":"deep"}"#).unwrap();
+        assert!(d.is_deep() && !d.wants_verify());
+        let s: Args = serde_json::from_str("{}").unwrap();
+        assert!(!s.is_deep() && !s.wants_verify());
+    }
+
+    #[tokio::test]
+    async fn deep_verify_keeps_a_confirmed_finding() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = repo_with_working_tree_change();
+        let provider: SharedReviewProvider =
+            Arc::new(RwLock::new(Some(Arc::new(ScriptedReviewProvider))));
+        let tool = ReviewTool::new(
+            provider,
+            ReviewToolConfig { model: "mock-model".into(), ..Default::default() },
+        );
+        let ctx = ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            cancel: Default::default(),
+            progress: ProgressSink::noop(),
+            requester: None,
+        };
+
+        let res = tool.execute(r#"{"depth":"deep+verify"}"#, &ctx).await;
+
+        // 4 dimensions report the same finding → merged to 1; each finding's
+        // verify agent (ScriptedReviewProvider) re-reports it → kept, dropped 0.
+        assert!(!res.is_error, "deep+verify should succeed: {}", res.content);
+        assert!(res.content.contains("Deep review"), "deep header: {}", res.content);
+        assert!(res.content.contains("verify dropped 0"), "verify note, nothing culled: {}", res.content);
+        assert!(res.content.contains("1 finding"), "the confirmed finding survives: {}", res.content);
+    }
+
+    #[tokio::test]
+    async fn deep_review_fans_out_and_dedups_across_dimensions() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = repo_with_working_tree_change();
+        let provider: SharedReviewProvider =
+            Arc::new(RwLock::new(Some(Arc::new(ScriptedReviewProvider))));
+        let tool = ReviewTool::new(
+            provider,
+            ReviewToolConfig {
+                model: "mock-model".into(),
+                ..Default::default()
+            },
+        );
+        let ctx = ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            cancel: Default::default(),
+            progress: ProgressSink::noop(),
+            requester: None,
+        };
+
+        let res = tool.execute(r#"{"depth":"deep"}"#, &ctx).await;
+
+        assert!(!res.is_error, "deep review should succeed: {}", res.content);
+        assert!(
+            res.content.contains("Deep review"),
+            "deep header present: {}",
+            res.content
+        );
+        // All four dimensions report the same finding → merged to ONE.
+        assert!(
+            res.content.contains("1 finding(s)") || res.content.contains("1 finding"),
+            "identical findings across dimensions must dedup to one: {}",
+            res.content
+        );
+        assert!(
+            res.content.contains("dims:"),
+            "merged finding is tagged with its dimensions: {}",
+            res.content
         );
     }
 

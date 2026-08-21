@@ -165,6 +165,7 @@ pub fn coding_persona(model: &str, todo_enabled: bool, request_user_input_enable
         request_user_input_enabled,
         true,
         subagent_delegation_enabled(),
+        false,
     )
 }
 
@@ -181,6 +182,7 @@ pub fn coding_persona_with_language(
         request_user_input_enabled,
         true,
         subagent_delegation_enabled(),
+        false,
     )
 }
 
@@ -191,6 +193,7 @@ pub(crate) fn coding_persona_with_capabilities(
     request_user_input_enabled: bool,
     review_enabled: bool,
     subagents_enabled: bool,
+    external_subagents_enabled: bool,
 ) -> String {
     let commit_language = commit_language_guidance(preferred_language);
     #[allow(unused_mut)] // `mut` is only used under `cfg(windows)` below.
@@ -274,6 +277,13 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     if subagents_enabled {
         p.push_str(SUBAGENT_DELEGATION);
         p.push_str(TEAM_DELEGATION);
+    }
+    // External-agent delegation — gated on external subagent tools actually being
+    // mounted (a configured `[[subagent.external]]` whose binary is present), for
+    // the same reason as the `task` block: nudging toward an unmounted tool
+    // provokes a phantom call.
+    if external_subagents_enabled {
+        p.push_str(EXTERNAL_SUBAGENT_DELEGATION);
     }
     if review_enabled {
         p.push_str(CODE_REVIEW_USAGE);
@@ -559,6 +569,17 @@ Do not duplicate the same work locally while a Team run is active. Worker roles 
 declared non-overlapping scopes and cannot run Bash; you remain responsible for reviewing changes \
 and running final verification. Prefer the synchronous `task` tool when one bounded batch must \
 finish and return all results before you continue.";
+
+/// Natural-language routing for external-agent subagents. Surfaced only when a
+/// `subagent_<name>` tool is actually mounted (a configured `[[subagent.external]]`).
+const EXTERNAL_SUBAGENT_DELEGATION: &str = "\n\n## EXTERNAL AGENT SUBAGENTS:\n\
+One or more `subagent_<name>` tools may be available: each delegates a self-contained task to \
+an external coding agent (e.g. Codex, Claude Code) running in a SEPARATE process with NO access \
+to this conversation. Use one for a well-scoped subtask you want a second agent to handle; pass \
+ONE detailed, standalone `prompt` that includes all needed context (paths, constraints, acceptance \
+criteria). Treat the returned text as that agent's final answer and verify it yourself before \
+relying on it. Prefer the in-project tools for ordinary work; reach for an external subagent only \
+when its distinct capability is the point.";
 
 /// Natural-language routing for the read-only review specialization. The tool description
 /// alone is not strong enough for every supported model: some otherwise answer a review
@@ -1692,9 +1713,21 @@ mod tests {
 
     #[test]
     fn persona_omits_review_routing_when_the_tool_is_not_mounted() {
-        let persona = coding_persona_with_capabilities("glm-5.2", None, true, false, false, true);
+        let persona =
+            coding_persona_with_capabilities("glm-5.2", None, true, false, false, true, false);
         assert!(!persona.contains("## CODE REVIEW:"));
         assert!(!persona.contains("`code_review` tool is available"));
+    }
+
+    #[test]
+    fn external_subagent_delegation_is_gated_on_the_mount_flag() {
+        let on =
+            coding_persona_with_capabilities("glm-5.2", None, true, false, false, false, true);
+        assert!(on.contains("## EXTERNAL AGENT SUBAGENTS:"));
+        assert!(on.contains("subagent_<name>"));
+        let off =
+            coding_persona_with_capabilities("glm-5.2", None, true, false, false, false, false);
+        assert!(!off.contains("## EXTERNAL AGENT SUBAGENTS:"));
     }
 
     #[test]

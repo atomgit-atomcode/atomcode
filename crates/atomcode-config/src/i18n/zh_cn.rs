@@ -1391,6 +1391,15 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         )
         .into(),
         Msg::StreamRecoverySucceeded => "✓ 已从流中断处恢复".into(),
+        Msg::OutputTruncationRunning { attempt, max_attempts } =>
+            format!("输出达到上限，正在自动续写（{attempt}/{max_attempts}）").into(),
+        Msg::OutputTruncationHeader => "输出达到上限".into(),
+        Msg::OutputTruncationQuestion =>
+            "模型的单次输出达到上限，自动续写仍未完成。下一步如何处理？".into(),
+        Msg::OutputTruncationContinue => "继续完成".into(),
+        Msg::OutputTruncationContinueDesc => "从已保留的内容继续，并改用分段写入".into(),
+        Msg::OutputTruncationStop => "停止".into(),
+        Msg::OutputTruncationStopDesc => "保留当前已生成的内容并结束回合".into(),
         Msg::ConhostScrollHint =>
             "提示：经典 Windows 控制台功能受限——任务执行中无法上滚查看历史，字符与吉祥物也会降级显示。\
              换用 \x1b[1;96mWindows Terminal\x1b[0m 体验更佳。"

@@ -124,6 +124,11 @@ pub struct PrepareOptions {
     /// the injecting driver is the trust boundary. Ignored when `mcp` is
     /// false (no registry is created).
     pub extra_mcp_servers: Vec<McpServerConfig>,
+    /// External-agent subagent instances (`[[subagent.external]]` profiles) to
+    /// mount as named `subagent_<name>` tools. Each drives Claude Code / Codex as
+    /// a subagent. A profile whose binary is missing on PATH is skipped. Empty =
+    /// none. Independent of `subagents` (which gates the in-process `task`/`team`).
+    pub external_subagents: Vec<atomcode_capabilities::subagent::ExternalSubagentProfile>,
     /// Inject `memory.md` (global + project) at session start. KEEP THIS CONSISTENT
     /// across resumes of one session: the injected block is persisted in the
     /// snapshot, and only a registered MemoryHook reconciles/removes it on resume —
@@ -155,6 +160,7 @@ impl Default for PrepareOptions {
             plugin_skill_dirs: Vec::new(),
             mcp: true,
             extra_mcp_servers: Vec::new(),
+            external_subagents: Vec::new(),
             memory: true,
             web: true,
             review: true,
@@ -163,6 +169,65 @@ impl Default for PrepareOptions {
             rate_limit_source: None,
         }
     }
+}
+
+/// Convert `[[subagent.external]]` config entries into resolved
+/// [`ExternalSubagentProfile`]s for [`PrepareOptions::external_subagents`].
+///
+/// Disabled entries and entries with an unknown `kind` are skipped (with a
+/// warning). An unknown `permission` falls back to `read-only`. The dangerous
+/// `bypass` mode survives ONLY when the profile opts in (`allow_dangerous`) AND
+/// the caller's context permits it (`allow_dangerous_context`, false for
+/// non-interactive/headless/scheduled runs); otherwise it is downgraded to
+/// `read-only` — the fail-closed default.
+pub fn external_subagent_profiles(
+    configs: &[atomcode_config::config::ExternalSubagentConfig],
+    allow_dangerous_context: bool,
+) -> Vec<atomcode_capabilities::subagent::ExternalSubagentProfile> {
+    use atomcode_capabilities::subagent::{ExternalSubagentProfile, PermissionMode, SubagentKind};
+    let mut out = Vec::new();
+    for c in configs {
+        if !c.enabled {
+            continue;
+        }
+        let Some(kind) = SubagentKind::from_config_str(&c.kind) else {
+            eprintln!(
+                "subagent: skipping external agent `{}` — unknown kind `{}`",
+                c.name, c.kind
+            );
+            continue;
+        };
+        let mut permission = match &c.permission {
+            Some(p) => PermissionMode::from_config_str(p).unwrap_or_else(|| {
+                eprintln!(
+                    "subagent: `{}` has unknown permission `{p}`; using read-only",
+                    c.name
+                );
+                PermissionMode::ReadOnly
+            }),
+            None => PermissionMode::ReadOnly,
+        };
+        // Bypass double-guard: honored only if the profile opts in AND the
+        // context permits. Otherwise downgrade to the fail-closed default.
+        let allow_dangerous = c.allow_dangerous && allow_dangerous_context;
+        if permission.is_dangerous() && !allow_dangerous {
+            eprintln!(
+                "subagent: `{}` requested bypass without allowance in this context; \
+                 downgrading to read-only",
+                c.name
+            );
+            permission = PermissionMode::ReadOnly;
+        }
+        out.push(ExternalSubagentProfile {
+            name: c.name.clone(),
+            kind,
+            model: c.model.clone(),
+            permission,
+            allow_dangerous,
+            timeout: c.timeout_secs.map(std::time::Duration::from_secs),
+        });
+    }
+    out
 }
 
 /// The session identity + persistence wiring, allocated ONCE by [`prepare`] —
@@ -208,6 +273,10 @@ pub struct CodingParts {
     /// reassembly must not advertise a tool absent from the mounted catalog.
     todo_enabled: bool,
     request_user_input_enabled: bool,
+    /// At least one external-agent subagent tool (`subagent_<name>`) is mounted;
+    /// drives the persona's external-delegation guidance (kept in sync on model
+    /// swap via `reconcile_coding_persona`).
+    has_external_subagents: bool,
     mcp_tool_names: Arc<std::sync::RwLock<Vec<String>>>,
     mounted_tools: Option<MountedTools>,
     mounted_tools_publisher: Option<MountedToolsPublisher>,
@@ -358,6 +427,20 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     if atomcode_capabilities::codeintel::register_lsp_tool(&mut registry, &cfg.lsp) {
         names.push("lsp".into());
     }
+
+    // External-agent subagents (Claude Code / Codex as named subagent tools).
+    // Each enabled profile whose binary is present on PATH mounts one tool.
+    let has_external_subagents = if opts.external_subagents.is_empty() {
+        false
+    } else {
+        let mounted = atomcode_capabilities::subagent::tool::register_external_subagent_tools(
+            &mut registry,
+            &opts.external_subagents,
+        );
+        let any = !mounted.is_empty();
+        names.extend(mounted);
+        any
+    };
 
     #[cfg(feature = "atomgit")]
     crate::assemble::register_atomgit_capabilities(&mut registry, &mut names)
@@ -895,6 +978,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         tool_names: names,
         todo_enabled,
         request_user_input_enabled,
+        has_external_subagents,
         mcp_tool_names,
         mounted_tools: None,
         mounted_tools_publisher: None,
@@ -1355,6 +1439,7 @@ pub fn assemble(
                     parts.request_user_input_enabled,
                     parts.review_provider.is_some(),
                     parts.subagent_provider.is_some(),
+                    parts.has_external_subagents,
                 );
                 b.resume = Some(snap);
             }
@@ -1476,6 +1561,7 @@ pub fn assemble(
             parts.request_user_input_enabled,
             parts.review_provider.is_some(),
             parts.subagent_provider.is_some(),
+            parts.has_external_subagents,
         ))
         // Repair model-produced arguments before any observer or policy gate reads them.
         // Approval must inspect the same bytes that the tool executes.
@@ -1752,6 +1838,7 @@ pub fn assemble(
             parts.request_user_input_enabled,
             parts.review_provider.is_some(),
             parts.subagent_provider.is_some(),
+                    parts.has_external_subagents,
         );
         builder = builder.resume(snapshot);
     }
@@ -1836,6 +1923,7 @@ fn reconcile_coding_persona(
     request_user_input_enabled: bool,
     review_enabled: bool,
     subagents_enabled: bool,
+    external_subagents_enabled: bool,
 ) {
     let persona = coding_persona_with_capabilities(
         &cfg.model,
@@ -1844,6 +1932,7 @@ fn reconcile_coding_persona(
         request_user_input_enabled,
         review_enabled,
         subagents_enabled,
+        external_subagents_enabled,
     );
     let is_persona = |message: &Message| {
         message.role == Role::System && message.text.starts_with(ATOMCODE_PERSONA_PREFIX)
@@ -1924,6 +2013,44 @@ pub fn subagent_runtime_knobs(
 mod tests {
     use super::*;
     use crate::config::CodingAgentConfig;
+
+    #[test]
+    fn external_profiles_convert_and_guard_bypass() {
+        use atomcode_capabilities::subagent::{PermissionMode, SubagentKind};
+        use atomcode_config::config::ExternalSubagentConfig;
+        let cfg = |name: &str, kind: &str, perm: Option<&str>, allow: bool, enabled: bool| {
+            ExternalSubagentConfig {
+                name: name.into(),
+                kind: kind.into(),
+                model: None,
+                permission: perm.map(Into::into),
+                allow_dangerous: allow,
+                timeout_secs: None,
+                enabled,
+            }
+        };
+        let configs = vec![
+            cfg("codex-ro", "codex", None, false, true), // default read-only
+            cfg("cc-edit", "claude-code", Some("accept-edits"), false, true),
+            cfg("codex-bypass", "codex", Some("bypass"), true, true), // wants bypass
+            cfg("bad-kind", "gemini", None, false, true),             // skipped
+            cfg("disabled", "codex", None, false, false),             // skipped
+        ];
+
+        // Interactive context: bypass allowed (profile opted in).
+        let ctx_on = external_subagent_profiles(&configs, true);
+        assert_eq!(ctx_on.len(), 3, "unknown kind + disabled are dropped");
+        assert_eq!(ctx_on[0].permission, PermissionMode::ReadOnly);
+        assert_eq!(ctx_on[0].kind, SubagentKind::Codex);
+        assert_eq!(ctx_on[1].permission, PermissionMode::AcceptEdits);
+        assert_eq!(ctx_on[2].permission, PermissionMode::Bypass);
+        assert!(ctx_on[2].allow_dangerous);
+
+        // Non-interactive context: bypass downgraded to read-only (fail-closed).
+        let ctx_off = external_subagent_profiles(&configs, false);
+        assert_eq!(ctx_off[2].permission, PermissionMode::ReadOnly);
+        assert!(!ctx_off[2].allow_dangerous);
+    }
 
     fn agent_config(model: &str) -> CodingAgentConfig {
         CodingAgentConfig::new("", "", model, ".")
@@ -2034,6 +2161,7 @@ mod tests {
             true,
             true,
             true,
+            false,
         );
 
         assert!(snapshot.messages[0]
@@ -2048,7 +2176,7 @@ mod tests {
         let mut snapshot = SessionSnapshot::new(vec![Message::system("SESSION CONTEXT")]);
         let cfg = agent_config("deepseek-v4-flash");
 
-        reconcile_coding_persona(&mut snapshot, &cfg, false, true, true, true);
+        reconcile_coding_persona(&mut snapshot, &cfg, false, true, true, true, false);
 
         assert!(!snapshot.messages[0].text.contains("## TASK TRACKING"));
         assert!(snapshot.messages[0]
@@ -2080,6 +2208,7 @@ mod tests {
             true,
             true,
             true,
+            false,
         );
 
         let personas = snapshot
@@ -2122,6 +2251,7 @@ mod tests {
             true,
             true,
             true,
+            false,
         );
         reconcile_coding_persona(
             &mut snapshot,
@@ -2130,6 +2260,7 @@ mod tests {
             true,
             true,
             true,
+            false,
         );
 
         assert!(snapshot.messages[0]
@@ -2181,6 +2312,7 @@ mod tests {
             true,
             true,
             true,
+            false,
         );
 
         assert_eq!(snapshot.messages[0].text, persona);
@@ -2205,7 +2337,7 @@ mod tests {
         let mut cfg = agent_config("model-a");
         cfg.preferred_language = Some(Locale::ZhCn);
 
-        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, true);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, true, false);
 
         assert!(snapshot.messages[0]
             .text
@@ -2232,14 +2364,14 @@ mod tests {
             )),
             Message::assistant("I am model-a", vec![]),
         ]);
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true, true);
+        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true, true, false);
         snapshot.messages.push(Message::system(format!(
             "{MODEL_CHANGE_CONTEXT_PREFIX}\nlegacy transition"
         )));
         let mut cfg = agent_config("model-b");
         cfg.preferred_language = Some(Locale::ZhCn);
 
-        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, true);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, true, false);
 
         assert!(!snapshot
             .messages
@@ -2278,6 +2410,7 @@ mod tests {
             plugin_skill_dirs: Vec::new(),
             mcp: true,
             extra_mcp_servers: Vec::new(),
+            external_subagents: Vec::new(),
             memory: false,
             web: false,
             review: false,
@@ -2348,6 +2481,7 @@ mod tests {
             plugin_skill_dirs: Vec::new(),
             mcp: false,
             extra_mcp_servers: Vec::new(),
+            external_subagents: Vec::new(),
             memory: false,
             web: false,
             review: false,

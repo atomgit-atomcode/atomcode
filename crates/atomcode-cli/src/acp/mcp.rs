@@ -41,10 +41,10 @@ pub fn acp_mcp_server_configs(mcp_servers: &[McpServer]) -> (Vec<McpServerConfig
     for server in mcp_servers {
         match server {
             McpServer::Stdio(s) => {
-                let absolute = !s.command.is_absolute();
-                if s.name.is_empty() || s.command.as_os_str().is_empty() || absolute {
+                let relative = !s.command.is_absolute();
+                if s.name.is_empty() || s.command.as_os_str().is_empty() || relative {
                     ignored.push(s.name.clone());
-                    if absolute && !s.name.is_empty() {
+                    if relative && !s.name.is_empty() {
                         eprintln!(
                             "acp: mcpServer `{}` command `{}` is not an absolute path; not connected",
                             s.name,
@@ -105,16 +105,18 @@ pub fn acp_mcp_server_configs(mcp_servers: &[McpServer]) -> (Vec<McpServerConfig
     (configs, ignored)
 }
 
-/// Log client-requested MCP servers this agent does not connect (transports it
-/// does not advertise, or malformed stdio entries). Connected stdio servers are
-/// handed to the coding runtime's MCP assembly via [`acp_mcp_server_configs`].
+/// Log the subset of client-requested MCP servers this agent does NOT connect —
+/// transports it does not advertise (`sse`, unknown/future variants) or
+/// malformed stdio entries. Advertised transports (stdio, http) ARE connected
+/// into the session's tool catalog via [`acp_mcp_server_configs`]; this logs
+/// only the ignored remainder so an operator can see what was dropped.
 pub fn log_ignored_mcp_server_names(names: &[String]) {
     if names.is_empty() {
         return;
     }
     eprintln!(
-        "acp: session/new lists {} client-injected mcpServers ({}); \
-         they are NOT connected — this agent assembles its own MCP catalog from config",
+        "acp: {} client-injected mcpServers were NOT connected ({}): \
+         transport not advertised or entry malformed",
         names.len(),
         names.join(", "),
     );

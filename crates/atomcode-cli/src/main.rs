@@ -2585,11 +2585,20 @@ pub(crate) async fn spawn_native_cli_runtime(
         }
         None => (atomcode_coding::SessionMode::Fresh, None, None),
     };
+    // External-agent subagents (Claude Code / Codex) from `[[subagent.external]]`.
+    // Interactive TUI ⇒ dangerous (`bypass`) modes are allowed to be configured
+    // (each risky call is still approval-gated); headless/daemon paths pass none.
+    let external_subagents = cfg
+        .subagent_config
+        .as_ref()
+        .map(|c| atomcode_coding::parts::external_subagent_profiles(&c.subagent.external, true))
+        .unwrap_or_default();
     let prepare = atomcode_coding::PrepareOptions {
         subagents: atomcode_coding::SubagentPolicy::Enabled,
         session,
         plugin_skill_dirs: atomcode_daemon::gather_plugin_skill_dirs_for(&cfg.working_dir),
         mcp: cfg.mcp,
+        external_subagents,
         rate_limit_source: Some(atomcode_daemon::coding_plan_rate_limit_source()),
         ..atomcode_coding::PrepareOptions::default()
     };
@@ -4077,8 +4086,8 @@ mod tests {
     #[test]
     fn verbose_tool_chunk_strips_ephemeral_activity_marker() {
         assert_eq!(
-            format_verbose_tool_chunk("\u{1e}review · round 2 · read_file"),
-            "[progress] review · round 2 · read_file\n"
+            format_verbose_tool_chunk("\u{1e}review · 2 findings · read_file"),
+            "[progress] review · 2 findings · read_file\n"
         );
     }
 

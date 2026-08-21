@@ -8837,6 +8837,7 @@ mod tests {
                 plugin_skill_dirs: Vec::new(),
                 mcp: false,
                 extra_mcp_servers: Vec::new(),
+                external_subagents: Vec::new(),
                 memory: false,
                 web: false,
                 review: false,

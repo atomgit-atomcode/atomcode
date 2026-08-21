@@ -183,10 +183,15 @@ async fn recovered_truncation_continues_without_warning() {
         .unwrap();
 
     let mut warning: Option<String> = None;
+    let mut recovery_progress = Vec::new();
     let mut completed = false;
     while let Some(ev) = handle.events.recv().await {
         match ev {
             AgentEvent::Warning(w) => warning = Some(w),
+            AgentEvent::OutputTruncationRecovery {
+                attempt,
+                max_attempts,
+            } => recovery_progress.push((attempt, max_attempts)),
             AgentEvent::TurnComplete { .. } => {
                 completed = true;
                 break;
@@ -199,6 +204,7 @@ async fn recovered_truncation_continues_without_warning() {
         warning.is_none(),
         "a truncation that auto-recovers must NOT surface the scary warning; got {warning:?}"
     );
+    assert_eq!(recovery_progress, vec![(1, 2)]);
     assert!(completed, "the turn still completes after the continuation");
     handle.commands.send(AgentCommand::Snapshot).unwrap();
     let snapshot = loop {
@@ -287,9 +293,156 @@ async fn repeated_truncation_is_bounded() {
     // UNRECOVERABLE truncation (budget exhausted, turn actually stops) MUST warn —
     // this is the one case the user needs to see, and the only case that should.
     assert!(
-        warning.as_deref().is_some_and(|w| w.contains("truncated")),
+        warning
+            .as_deref()
+            .is_some_and(|w| w.contains("output limit") && w.contains("continue")),
         "an exhausted, turn-ending truncation must surface the warning; got {warning:?}"
     );
+}
+
+#[tokio::test]
+async fn interactive_truncation_checkpoint_can_continue_after_auto_budget() {
+    let reg = ToolRegistry::new();
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            StreamEvent::TextDelta("part 1".into()),
+            StreamEvent::Done { truncated: true },
+        ],
+        vec![
+            StreamEvent::TextDelta("part 2".into()),
+            StreamEvent::Done { truncated: true },
+        ],
+        vec![
+            StreamEvent::TextDelta("part 3".into()),
+            StreamEvent::Done { truncated: true },
+        ],
+        vec![
+            StreamEvent::TextDelta("finished".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ]));
+    let received = provider.received.clone();
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&[] as &[&str]))
+        .round_cap_checkpoint(true)
+        .build()
+        .spawn();
+    handle.commands.send(send("go")).unwrap();
+
+    let mut checkpoint = None;
+    while let Some(event) = handle.events.recv().await {
+        match event {
+            AgentEvent::Request { id, kind, .. }
+                if kind == atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND =>
+            {
+                checkpoint = Some(id);
+                handle
+                    .commands
+                    .send(AgentCommand::Respond {
+                        id,
+                        value: serde_json::json!({ "continue": true }),
+                    })
+                    .unwrap();
+            }
+            AgentEvent::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    assert!(
+        checkpoint.is_some(),
+        "the exhausted budget must ask the driver"
+    );
+    assert_eq!(received.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn interactive_truncation_checkpoint_stop_does_not_repeat_warning() {
+    let reg = ToolRegistry::new();
+    let turns = (0..3)
+        .map(|_| {
+            vec![
+                StreamEvent::TextDelta("partial".into()),
+                StreamEvent::Done { truncated: true },
+            ]
+        })
+        .collect();
+    let provider = Arc::new(MockProvider::new(turns));
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&[] as &[&str]))
+        .round_cap_checkpoint(true)
+        .build()
+        .spawn();
+    handle.commands.send(send("go")).unwrap();
+
+    let mut warning = None;
+    while let Some(event) = handle.events.recv().await {
+        match event {
+            AgentEvent::Request { id, kind, .. }
+                if kind == atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND =>
+            {
+                handle
+                    .commands
+                    .send(AgentCommand::Respond {
+                        id,
+                        value: serde_json::json!({ "continue": false }),
+                    })
+                    .unwrap();
+            }
+            AgentEvent::Warning(message) => warning = Some(message),
+            AgentEvent::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    assert!(warning.is_none(), "the choice panel already explained the stop");
+}
+
+#[tokio::test]
+async fn interactive_truncation_checkpoint_cancel_uses_cancelled_terminal() {
+    let reg = ToolRegistry::new();
+    let turns = (0..3)
+        .map(|_| {
+            vec![
+                StreamEvent::TextDelta("partial".into()),
+                StreamEvent::Done { truncated: true },
+            ]
+        })
+        .collect();
+    let provider = Arc::new(MockProvider::new(turns));
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&[] as &[&str]))
+        .round_cap_checkpoint(true)
+        .build()
+        .spawn();
+    handle.commands.send(send("go")).unwrap();
+
+    let mut stop = None;
+    while let Some(event) = handle.events.recv().await {
+        match event {
+            AgentEvent::Request { kind, .. }
+                if kind == atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND =>
+            {
+                handle.commands.send(AgentCommand::Cancel).unwrap();
+            }
+            AgentEvent::TurnComplete { reason } => {
+                stop = Some(reason);
+                break;
+            }
+            _ => {}
+        }
+    }
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+
+    assert_eq!(stop, Some(atomcode_kernel::event::StopReason::Cancelled));
 }
 
 // --- local helpers (keep each test terse; mirror spike_claims.rs style) ---

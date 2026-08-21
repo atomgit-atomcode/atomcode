@@ -162,6 +162,10 @@ pub struct SubAgentConfig {
     /// Per-subtask model-round high-water mark. Default 200; `0` means unbounded.
     /// Overridden by `ATOMCODE_SUBAGENT_MAX_ROUNDS` when set.
     pub max_rounds: u32,
+    /// External-agent subagent instances (`[[subagent.external]]`). Each drives
+    /// Claude Code / Codex as a named subagent tool. Empty by default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external: Vec<ExternalSubagentConfig>,
 }
 
 impl Default for SubAgentConfig {
@@ -174,8 +178,35 @@ impl Default for SubAgentConfig {
             // Retained only so existing config files continue to deserialize unchanged.
             timeout_secs: 900,
             max_rounds: 200,
+            external: Vec::new(),
         }
     }
+}
+
+/// One `[[subagent.external]]` entry: a named external coding agent driven as a
+/// subagent. Plain config data — string enums are validated/converted in the
+/// coding layer (which owns the `SubagentKind` / `PermissionMode` types).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalSubagentConfig {
+    /// Instance name, e.g. `"codex-primary"` → tool `subagent_codex_primary`.
+    pub name: String,
+    /// `"codex"` or `"claude-code"`.
+    pub kind: String,
+    /// Optional model override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// `"read-only"` (default) / `"accept-edits"` / `"auto"` / `"bypass"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<String>,
+    /// Permit the dangerous `bypass` permission mode for this instance.
+    #[serde(default)]
+    pub allow_dangerous: bool,
+    /// Overall run timeout in seconds (`None` → adapter default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// Set `false` to keep the profile in config but not mount it.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2096,6 +2127,42 @@ pub enum SeedOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subagent_external_entries_deserialize_with_defaults() {
+        let toml = r#"
+[subagent]
+
+[[subagent.external]]
+name = "codex-primary"
+kind = "codex"
+permission = "accept-edits"
+model = "gpt-5-codex"
+
+[[subagent.external]]
+name = "claude-review"
+kind = "claude-code"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.subagent.external.len(), 2);
+        let a = &cfg.subagent.external[0];
+        assert_eq!(a.name, "codex-primary");
+        assert_eq!(a.kind, "codex");
+        assert_eq!(a.permission.as_deref(), Some("accept-edits"));
+        assert_eq!(a.model.as_deref(), Some("gpt-5-codex"));
+        assert!(!a.allow_dangerous, "defaults to fail-closed");
+        assert!(a.enabled, "defaults enabled");
+        assert!(a.timeout_secs.is_none());
+        let b = &cfg.subagent.external[1];
+        assert_eq!(b.kind, "claude-code");
+        assert_eq!(b.permission, None, "absent permission stays None (→ read-only downstream)");
+    }
+
+    #[test]
+    fn subagent_external_absent_is_empty() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.subagent.external.is_empty());
+    }
 
     #[test]
     fn allowed_effort_levels_defaults_to_all_and_filters_a_subset() {

@@ -168,6 +168,38 @@ pub async fn spawn_and_register_session(
 ///
 /// Shared by the v1 and v2 chains; the caller builds its own wire response
 /// shape (v1 echoes modes/config options, v2 responds `{}`).
+///
+/// Whether the resume request's `cwd` refers to the same directory as the
+/// session's stored `working_dir`. A raw `PathBuf` equality is too strict: a
+/// real client (e.g. an editor) may supply an equivalent-but-not-byte-identical
+/// path — a trailing separator, a redundant `.` segment, a `..`, or a symlinked
+/// project root — and would be wrongly rejected from resuming its own session.
+///
+/// Matching order (cheap → expensive):
+/// 1. exact bytes (also covers the case where neither path exists on disk);
+/// 2. component-wise equality — normalizes away trailing separators and `.`
+///    segments WITHOUT touching the filesystem and WITHOUT case-folding (a
+///    lexical same-path check);
+/// 3. [`pathnorm::canonicalize`] on both — resolves symlinks, `..`, and (on a
+///    case-insensitive filesystem) case differences to the real on-disk path;
+///    requires the paths to exist and falls through to "not equal" otherwise.
+///
+/// Deliberately does NOT case-fold lexically: the storage bucket key
+/// (`stable_project_hash`) case-folds only on Windows, so folding here on other
+/// platforms would admit a `cwd` the storage layer treats as a *different*
+/// project (the snapshot lives in another bucket) — a case-insensitive FS is
+/// instead handled correctly by `canonicalize` resolving to one real path.
+fn cwd_matches(stored: &std::path::Path, requested: &std::path::Path) -> bool {
+    use atomcode_capabilities::pathnorm;
+    if stored == requested || stored.components().eq(requested.components()) {
+        return true;
+    }
+    matches!(
+        (pathnorm::canonicalize(stored), pathnorm::canonicalize(requested)),
+        (Ok(a), Ok(b)) if a == b
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_resume_session(
     engine: &EngineConfig,
@@ -196,7 +228,7 @@ pub async fn handle_resume_session(
         .ok_or_else(|| {
             AcpError::invalid_params().data(format!("unknown session `{}`", wire_id.0))
         })?;
-    if entry.working_dir != cwd {
+    if !cwd_matches(&entry.working_dir, &cwd) {
         return Err(AcpError::invalid_params().data(format!(
             "session `{}` belongs to `{}`; the resume request supplied `{}`",
             wire_id.0,
@@ -298,7 +330,7 @@ pub fn replay_entries_to_v1_updates(
                     )
                     .kind(crate::acp::translate::tool_kind(name))
                     .status(agent_client_protocol::schema::v1::ToolCallStatus::InProgress)
-                    .raw_input(serde_json::from_str::<serde_json::Value>(arguments).ok()),
+                    .raw_input(crate::acp::replay::raw_input_from_arguments(arguments)),
                 ));
                 if let Some((content, is_error)) = result {
                     let status = if *is_error {
@@ -660,6 +692,28 @@ impl TurnWire for V1Wire<'_> {
 mod tests {
     use super::*;
     use crate::acp::sessions::wire_session_id;
+
+    #[test]
+    fn cwd_matches_accepts_equivalent_spellings_and_rejects_others() {
+        use std::path::Path;
+        // Exact match.
+        assert!(cwd_matches(Path::new("/home/u/proj"), Path::new("/home/u/proj")));
+        // Trailing separator — same directory (component-wise equality).
+        assert!(cwd_matches(Path::new("/home/u/proj"), Path::new("/home/u/proj/")));
+        assert!(cwd_matches(Path::new("/home/u/proj/"), Path::new("/home/u/proj")));
+        // Redundant `.` segment — same directory, lexically.
+        assert!(cwd_matches(Path::new("/home/u/proj"), Path::new("/home/u/./proj")));
+        // A genuinely different directory is still rejected.
+        assert!(!cwd_matches(Path::new("/home/u/proj"), Path::new("/home/u/other")));
+        // A sibling that merely shares a prefix is rejected (no substring match).
+        assert!(!cwd_matches(Path::new("/home/u/proj"), Path::new("/home/u/proj2")));
+        // No lexical case-folding: a case difference on nonexistent paths is NOT
+        // a lexical match (a case-insensitive FS is handled by canonicalize only
+        // when the dirs actually exist). This keeps the guard from admitting a
+        // cwd the case-sensitive storage bucket key would treat as a different
+        // project.
+        assert!(!cwd_matches(Path::new("/home/u/Proj"), Path::new("/home/u/proj")));
+    }
 
     #[test]
     fn replay_entries_map_to_v1_chunks_with_shared_message_ids() {

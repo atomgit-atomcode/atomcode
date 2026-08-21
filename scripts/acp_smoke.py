@@ -29,6 +29,13 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+
+# Per-request wall-clock ceiling. A correct response arrives in well under a
+# second; this only bounds a wedged agent (one that accepts a request but never
+# replies and never closes stdout) so a hang surfaces as a loud failure instead
+# of blocking `readline()` forever.
+REQUEST_TIMEOUT_S = 30
 
 
 def usage():
@@ -53,6 +60,13 @@ class Agent:
             env=env,
         )
         self._id = 0
+        # Guards the watchdog: `_active_gen` names the in-flight request; a timer
+        # only fires for the generation it was armed with, and `_lock` makes the
+        # fire-vs-cancel decision atomic so a late timer can never kill a process
+        # already reused by a later request.
+        self._lock = threading.Lock()
+        self._active_gen = 0
+        self._timed_out = False
 
     def request(self, method, params):
         """Send one request and return its matching response.
@@ -66,20 +80,53 @@ class Agent:
         assert self.proc.stdin is not None and self.proc.stdout is not None
         self.proc.stdin.write(json.dumps(obj) + "\n")
         self.proc.stdin.flush()
-        while True:
-            line = self.proc.stdout.readline()
-            if not line:
-                raise RuntimeError(
-                    "agent closed stdout without a response (stderr tail: %s)"
-                    % (self.proc.stderr.read() if self.proc.stderr else "")[-400:]
-                )
-            msg = json.loads(line)
-            if "id" not in msg:
-                print("  (notification) %s" % msg.get("method"))
-                continue
-            if msg.get("id") != self._id:
-                continue  # stale/out-of-order response; keep waiting for ours
-            return msg
+        # Watchdog: kill the agent if it does not respond within the ceiling, so
+        # the blocking readline() below returns EOF instead of hanging forever.
+        with self._lock:
+            self._active_gen += 1
+            gen = self._active_gen
+            self._timed_out = False
+        watchdog = threading.Timer(REQUEST_TIMEOUT_S, self._on_timeout, args=(gen,))
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            while True:
+                line = self.proc.stdout.readline()
+                if not line:
+                    if self._timed_out:
+                        raise RuntimeError(
+                            "agent did not respond to %r within %ds; killed (stderr tail: %s)"
+                            % (
+                                method,
+                                REQUEST_TIMEOUT_S,
+                                (self.proc.stderr.read() if self.proc.stderr else "")[-400:],
+                            )
+                        )
+                    raise RuntimeError(
+                        "agent closed stdout without a response (stderr tail: %s)"
+                        % (self.proc.stderr.read() if self.proc.stderr else "")[-400:]
+                    )
+                msg = json.loads(line)
+                if "id" not in msg:
+                    print("  (notification) %s" % msg.get("method"))
+                    continue
+                if msg.get("id") != self._id:
+                    continue  # stale/out-of-order response; keep waiting for ours
+                return msg
+        finally:
+            # Retire this generation under the lock BEFORE cancelling, so a timer
+            # that already started firing observes a stale gen and no-ops instead
+            # of killing a process a later request will reuse.
+            with self._lock:
+                self._active_gen += 1
+            watchdog.cancel()
+
+    def _on_timeout(self, gen):
+        with self._lock:
+            if gen != self._active_gen:
+                return  # this request already completed; do not kill.
+            self._timed_out = True
+        self.proc.kill()
 
     def close(self):
         if self.proc.stdin:

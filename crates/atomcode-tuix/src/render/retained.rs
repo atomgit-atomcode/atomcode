@@ -21019,13 +21019,13 @@ mod tests {
                         .all(|ch| matches!(ch, '━' | '─' | '=' | '-' | ' '))
             })
             .collect();
+        // Every table rule is a single continuous run spanning the full width —
+        // the inter-column gaps are filled, so no rule breaks into per-column
+        // segments (which read as a broken/dashed line). No rule line therefore
+        // carries an interior space.
         assert!(
-            rules.iter().any(|line| line.contains("  ")),
-            "segmented table rule missing: {lines:#?}"
-        );
-        assert!(
-            rules.iter().any(|line| !line.contains(' ')),
-            "top or bottom table boundary missing: {lines:#?}"
+            !rules.is_empty() && rules.iter().all(|line| !line.contains(' ')),
+            "table rules must be continuous (no interior gap): {lines:#?}"
         );
         assert!(
             rules

@@ -108,11 +108,19 @@ pub fn next_message_id(msg_ids: &AtomicU64) -> String {
 /// native `SessionMeta::auto_name_from_messages` fallback (first line,
 /// control chars → space, ≤40 chars). Returns `None` for empty/whitespace-only
 /// prompts, so attachment-only turns never title the session.
+///
+/// Also returns `None` when the first line is a slash-command invocation
+/// (`/word …`): known commands are handled before the turn reaches here, so a
+/// slash-shaped prompt arriving is an UNKNOWN command that fell through to the
+/// kernel — titling the session with the literal `/nope …` string would be
+/// wrong. A leading path (`/usr/bin/x …`) is NOT command-shaped (its first
+/// token contains a `/`) and still titles normally.
 pub fn derive_title(text: &str) -> Option<String> {
-    let name: String = text
-        .lines()
-        .next()
-        .unwrap_or_default()
+    let first_line = text.lines().next().unwrap_or_default();
+    if looks_like_slash_command(first_line) {
+        return None;
+    }
+    let name: String = first_line
         .chars()
         .map(|character| {
             if character.is_control() {
@@ -125,6 +133,36 @@ pub fn derive_title(text: &str) -> Option<String> {
         .collect();
     let name = name.trim();
     (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Whether `first_line` is a slash-command invocation (`/word` or `/word args`)
+/// rather than a real prompt or a leading filesystem path. Command-shaped means:
+/// starts with `/`, and its first whitespace-delimited token is `/` + an
+/// identifier (`[A-Za-z][A-Za-z0-9_-]*`) with no further `/` — so `/nope` and
+/// `/foo bar` match, but `/usr/bin/x` (a path) does not.
+fn looks_like_slash_command(first_line: &str) -> bool {
+    let Some(rest) = first_line.trim_start().strip_prefix('/') else {
+        return false;
+    };
+    let mut chars = rest.chars();
+    // The char immediately after `/` must start an identifier — a leading space
+    // (`/ and then`) or digit (`/123`) is not a command shape.
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    // The rest of the first token must be identifier chars; whitespace ends the
+    // token (`/foo bar` → command), any other char (e.g. `/` in `/usr/bin/x`)
+    // means it is a path/expression, not a command.
+    for c in chars {
+        if c.is_whitespace() {
+            break;
+        }
+        if !(c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return false;
+        }
+    }
+    true
 }
 
 /// Validate `additionalDirectories` from a session lifecycle request.
@@ -534,6 +572,23 @@ mod tests {
         );
         assert_eq!(derive_title("   \n  "), None, "blank prompt never titles");
         assert_eq!(derive_title(""), None, "empty prompt never titles");
+    }
+
+    #[test]
+    fn derive_title_skips_unknown_slash_commands_but_keeps_paths() {
+        // An unknown slash command that fell through to the kernel must not
+        // become the session title.
+        assert_eq!(derive_title("/nope do the thing"), None);
+        assert_eq!(derive_title("/foo"), None);
+        assert_eq!(derive_title("  /bar baz"), None, "leading space still a command");
+        // A leading filesystem path is real content and still titles.
+        assert_eq!(
+            derive_title("/usr/bin/x is missing").as_deref(),
+            Some("/usr/bin/x is missing")
+        );
+        // A bare slash or non-identifier after the slash is not command-shaped.
+        assert_eq!(derive_title("/ and then").as_deref(), Some("/ and then"));
+        assert_eq!(derive_title("/123 numbers").as_deref(), Some("/123 numbers"));
     }
 
     #[test]

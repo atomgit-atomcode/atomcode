@@ -179,6 +179,7 @@ pub async fn code(args: CodeArgs) -> Result<()> {
         plugin_skill_dirs: Vec::new(),
         mcp: !args.no_mcp,
         extra_mcp_servers: Vec::new(),
+        external_subagents: Vec::new(),
         memory: !args.no_memory,
         web: !args.no_web,
         // The `code` agent can also review the current changes in-session (the dedicated
