@@ -6359,6 +6359,49 @@ mod menu_tests {
     use crate::custom_commands::CustomCommandRegistry;
 
     #[test]
+    fn goal_hatch_only_traps_keys_while_pursuing() {
+        use atomcode_coding::GoalPhase;
+        use crossterm::event::KeyModifiers;
+        let ctrl_c = (KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let esc = (KeyCode::Esc, KeyModifiers::NONE);
+
+        // Actively pursuing: Ctrl+C cancels, bare Esc pauses.
+        assert_eq!(
+            goal_escape_hatch_action(true, GoalPhase::Pursuing, ctrl_c.0, ctrl_c.1, true),
+            Some(GoalHatchAction::Cancel)
+        );
+        assert_eq!(
+            goal_escape_hatch_action(true, GoalPhase::Pursuing, esc.0, esc.1, true),
+            Some(GoalHatchAction::Pause)
+        );
+        // Esc with a non-empty draft is NOT stolen from clearing the buffer.
+        assert_eq!(
+            goal_escape_hatch_action(true, GoalPhase::Pursuing, esc.0, esc.1, false),
+            None
+        );
+
+        // The regression: goal Satisfied (achieved) but still Some until
+        // `/goal clear` — Ctrl+C must fall through so exit can arm.
+        for phase in [
+            GoalPhase::Satisfied,
+            GoalPhase::Paused,
+            GoalPhase::PausedAtCap,
+            GoalPhase::Ended,
+        ] {
+            assert_eq!(
+                goal_escape_hatch_action(true, phase, ctrl_c.0, ctrl_c.1, true),
+                None,
+                "Ctrl+C must not be trapped in {phase:?}"
+            );
+        }
+        // No goal at all → never traps.
+        assert_eq!(
+            goal_escape_hatch_action(false, GoalPhase::Pursuing, ctrl_c.0, ctrl_c.1, true),
+            None
+        );
+    }
+
+    #[test]
     fn main_composer_reserves_plain_tab_for_completion() {
         use crossterm::event::KeyModifiers;
 
@@ -15548,6 +15591,43 @@ fn confirm_idle_menu_selected(
     Ok(())
 }
 
+/// What the idle goal escape hatch does with an intercepted key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoalHatchAction {
+    /// Ctrl+C → cancel the active turn / server-side goal loop.
+    Cancel,
+    /// Bare Esc → pause the goal at its current round.
+    Pause,
+}
+
+/// Decide whether the IDLE goal escape hatch intercepts this key. It fires ONLY
+/// while the goal is actively [`GoalPhase::Pursuing`](atomcode_coding::GoalPhase)
+/// — the one state with a server-side loop to interrupt. After the goal is
+/// Satisfied / Paused / PausedAtCap / Ended, `goal_condition` stays `Some` until
+/// `/goal clear`, but there is nothing to cancel, so the key (notably Ctrl+C)
+/// must fall through to normal handling (exit arming) instead of being trapped
+/// in a no-op cancel. Returns `None` when the hatch does not apply.
+fn goal_escape_hatch_action(
+    goal_condition_some: bool,
+    goal_phase: atomcode_coding::GoalPhase,
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+    buffer_empty: bool,
+) -> Option<GoalHatchAction> {
+    if !goal_condition_some || goal_phase != atomcode_coding::GoalPhase::Pursuing {
+        return None;
+    }
+    let is_ctrl_c =
+        code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+    if is_ctrl_c {
+        Some(GoalHatchAction::Cancel)
+    } else if code == KeyCode::Esc && buffer_empty {
+        Some(GoalHatchAction::Pause)
+    } else {
+        None
+    }
+}
+
 fn handle_idle_key(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -15592,31 +15672,35 @@ fn handle_idle_key(
     // from clearing a draft) pauses the goal and cancels only its current round.
     // The runtime owns both transitions so pending requests, snapshots, and the
     // next-submit resume stay synchronized.
-    if app.state.goal_condition.is_some() {
-        let is_ctrl_c = code == KeyCode::Char('c')
-            && modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
-        let is_bare_esc = code == KeyCode::Esc && app.buf.text.is_empty();
-        let should_pause =
-            is_bare_esc && app.state.goal_phase == atomcode_coding::GoalPhase::Pursuing;
-        if is_ctrl_c || should_pause {
-            let has_active_turn = ctx.runtime.has_active_turn();
-            let sent = if is_ctrl_c {
-                cancel_active_turn(ctx)
-            } else {
-                pause_active_goal(ctx)
-            };
-            if should_arm_interrupt_wait(sent, has_active_turn) {
-                app.interrupt_drain_pending = true;
-            }
-            clear_capturing_modal_on_cancel(app);
-            crate::tuix_trace!(
-                "KEY",
-                "idle goal-active {} -> {}",
-                if is_ctrl_c { "Ctrl+C" } else { "Esc" },
-                if is_ctrl_c { "Cancel" } else { "PauseGoal" }
-            );
-            return Ok(());
+    // GOAL ESCAPE HATCH (Idle) — only while the goal is actively Pursuing. See
+    // `goal_escape_hatch_action`: an achieved/paused/ended-but-uncleared goal
+    // (goal_condition still Some) must NOT trap Ctrl+C, or the user can never arm
+    // exit.
+    if let Some(action) = goal_escape_hatch_action(
+        app.state.goal_condition.is_some(),
+        app.state.goal_phase,
+        code,
+        modifiers,
+        app.buf.text.is_empty(),
+    ) {
+        let is_cancel = action == GoalHatchAction::Cancel;
+        let has_active_turn = ctx.runtime.has_active_turn();
+        let sent = if is_cancel {
+            cancel_active_turn(ctx)
+        } else {
+            pause_active_goal(ctx)
+        };
+        if should_arm_interrupt_wait(sent, has_active_turn) {
+            app.interrupt_drain_pending = true;
         }
+        clear_capturing_modal_on_cancel(app);
+        crate::tuix_trace!(
+            "KEY",
+            "idle goal-active {} -> {}",
+            if is_cancel { "Ctrl+C" } else { "Esc" },
+            if is_cancel { "Cancel" } else { "PauseGoal" }
+        );
+        return Ok(());
     }
     // If the menu is active (buf starts with '/'), intercept navigation keys.
     // Suppress while scrolling history / right after a restore (see
