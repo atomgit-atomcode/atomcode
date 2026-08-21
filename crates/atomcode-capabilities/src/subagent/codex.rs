@@ -19,9 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader, Lines};
 
-use super::proc::{ChildSpec, ManagedChild, WaitOutcome};
+use super::proc::{drain_and_wait, ChildSpec, ManagedChild, WaitOutcome};
 use super::{
     PermissionMode, SubagentBackend, SubagentCapabilities, SubagentError, SubagentEvent,
     SubagentKind, SubagentResult, SubagentRun, SubagentStopReason,
@@ -29,8 +28,6 @@ use super::{
 
 /// Default overall wall-clock ceiling for one delegated run.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
-/// Keep at most this many bytes of stderr for a failure message.
-const STDERR_TAIL_CAP: usize = 2000;
 
 /// A named Codex instance driven via `codex exec`.
 pub struct CodexBackend {
@@ -153,15 +150,6 @@ impl Drop for TempOutput {
     }
 }
 
-/// Await the next line of an optional reader; parks forever when `None` (the
-/// caller guards the select branch so a parked future is never polled).
-async fn next_line<R: AsyncBufRead + Unpin>(lines: &mut Option<Lines<R>>) -> Option<String> {
-    match lines {
-        Some(l) => l.next_line().await.ok().flatten(),
-        None => std::future::pending().await,
-    }
-}
-
 fn result(output: String, stop_reason: SubagentStopReason) -> SubagentResult {
     SubagentResult { output, stop_reason }
 }
@@ -197,72 +185,26 @@ impl SubagentBackend for CodexBackend {
         let spec = ChildSpec::new(&self.program, &req.cwd).args(argv);
         let mut child = ManagedChild::spawn(spec)?;
 
-        let mut out_lines = child.take_stdout().map(|s| BufReader::new(s).lines());
-        let mut err_lines = child.take_stderr().map(|s| BufReader::new(s).lines());
-        let mut stderr_tail = String::new();
-        let mut stdout_done = out_lines.is_none();
-        let mut stderr_done = err_lines.is_none();
+        // Stream stdout as best-effort activity; the authoritative final answer
+        // comes from the `-o` file, so nothing here needs to parse stdout.
+        let (outcome, stderr_tail) =
+            drain_and_wait(&mut child, self.timeout, &req.cancel, |line| {
+                req.emit(SubagentEvent::Activity(line));
+            })
+            .await
+            .map_err(|e| SubagentError::SpawnFailed(e.to_string()))?;
 
-        // Drain BOTH pipes (so a chatty stderr can't fill its buffer and wedge
-        // the child) while racing cancel + timeout. stdout lines become activity
-        // events; stderr is kept as a capped tail for failure diagnostics.
-        let deadline = tokio::time::sleep(self.timeout);
-        tokio::pin!(deadline);
-        loop {
-            if stdout_done && stderr_done {
-                break;
-            }
-            tokio::select! {
-                biased;
-                _ = req.cancel.cancelled() => {
-                    child.kill_tree();
-                    return Ok(result(out.read(), SubagentStopReason::Cancelled));
-                }
-                _ = &mut deadline => {
-                    child.kill_tree();
-                    return Ok(result(out.read(), SubagentStopReason::Timeout));
-                }
-                line = next_line(&mut out_lines), if !stdout_done => match line {
-                    Some(l) => req.emit(SubagentEvent::Activity(l)),
-                    None => stdout_done = true,
-                },
-                line = next_line(&mut err_lines), if !stderr_done => match line {
-                    Some(l) => push_tail(&mut stderr_tail, &l),
-                    None => stderr_done = true,
-                },
-            }
-        }
-
-        // Pipes closed → the process is exiting; also honor cancel/timeout here.
-        match child.wait_or_kill(self.timeout, &req.cancel).await {
-            Ok(WaitOutcome::Exited(status)) if status.success() => {
+        match outcome {
+            WaitOutcome::Exited(status) if status.success() => {
                 Ok(result(out.read(), SubagentStopReason::Completed))
             }
-            Ok(WaitOutcome::Exited(status)) => Err(SubagentError::NonZeroExit {
+            WaitOutcome::Exited(status) => Err(SubagentError::NonZeroExit {
                 code: status.code(),
                 stderr_tail,
             }),
-            Ok(WaitOutcome::TimedOut) => Ok(result(out.read(), SubagentStopReason::Timeout)),
-            Ok(WaitOutcome::Cancelled) => {
-                Ok(result(out.read(), SubagentStopReason::Cancelled))
-            }
-            Err(e) => Err(SubagentError::SpawnFailed(e.to_string())),
+            WaitOutcome::TimedOut => Ok(result(out.read(), SubagentStopReason::Timeout)),
+            WaitOutcome::Cancelled => Ok(result(out.read(), SubagentStopReason::Cancelled)),
         }
-    }
-}
-
-/// Append a line to the capped stderr tail (keeping the LAST `STDERR_TAIL_CAP` bytes).
-fn push_tail(tail: &mut String, line: &str) {
-    tail.push_str(line);
-    tail.push('\n');
-    if tail.len() > STDERR_TAIL_CAP {
-        let cut = tail.len() - STDERR_TAIL_CAP;
-        // Cut on a char boundary.
-        let mut idx = cut;
-        while idx < tail.len() && !tail.is_char_boundary(idx) {
-            idx += 1;
-        }
-        *tail = tail.split_off(idx);
     }
 }
 
@@ -313,19 +255,6 @@ mod tests {
         assert!(argv.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
         assert!(!argv.contains(&"--sandbox".to_string()));
         assert!(argv.windows(2).any(|w| w == ["-m", "gpt-5-codex"]));
-    }
-
-    #[test]
-    fn push_tail_keeps_last_bytes_on_char_boundary() {
-        let mut tail = String::new();
-        for i in 0..1000 {
-            push_tail(&mut tail, &format!("line-{i}-日本語"));
-        }
-        assert!(tail.len() <= STDERR_TAIL_CAP + 64);
-        assert!(tail.is_char_boundary(0));
-        assert!(std::str::from_utf8(tail.as_bytes()).is_ok());
-        // Most recent line survives.
-        assert!(tail.contains("line-999"));
     }
 
     #[tokio::test]

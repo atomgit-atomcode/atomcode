@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
+pub mod claude_code;
 pub mod codex;
 pub mod proc;
 

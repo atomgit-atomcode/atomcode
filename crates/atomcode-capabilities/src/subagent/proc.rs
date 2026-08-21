@@ -19,10 +19,14 @@ use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio_util::sync::CancellationToken;
 
 use super::SubagentError;
+
+/// Keep at most this many bytes of stderr for a failure message.
+pub const STDERR_TAIL_CAP: usize = 2000;
 
 /// Whether the child gets a writable stdin pipe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,12 +213,101 @@ impl ManagedChild {
     }
 }
 
+/// Drain BOTH of a child's pipes to completion (so a chatty stderr can't fill
+/// its buffer and wedge the child) while racing cancel + timeout, then resolve
+/// the exit status. Each stdout line is handed to `on_stdout_line`; stderr is
+/// accumulated into a capped tail returned alongside the outcome.
+///
+/// Shared by the Codex and Claude Code adapters. On cancel/timeout the tree is
+/// killed and the corresponding outcome is returned immediately (the caller
+/// decides what partial output to surface). `stdout`/`stderr` are taken from the
+/// child; call before `wait`.
+pub async fn drain_and_wait<F: FnMut(String)>(
+    child: &mut ManagedChild,
+    timeout: Duration,
+    cancel: &CancellationToken,
+    mut on_stdout_line: F,
+) -> std::io::Result<(WaitOutcome, String)> {
+    let mut out_lines = child.take_stdout().map(|s| BufReader::new(s).lines());
+    let mut err_lines = child.take_stderr().map(|s| BufReader::new(s).lines());
+    let mut stderr_tail = String::new();
+    let mut stdout_done = out_lines.is_none();
+    let mut stderr_done = err_lines.is_none();
+
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    while !(stdout_done && stderr_done) {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                child.kill_tree();
+                return Ok((WaitOutcome::Cancelled, stderr_tail));
+            }
+            _ = &mut deadline => {
+                child.kill_tree();
+                return Ok((WaitOutcome::TimedOut, stderr_tail));
+            }
+            line = next_line(&mut out_lines), if !stdout_done => match line {
+                Some(l) => on_stdout_line(l),
+                None => stdout_done = true,
+            },
+            line = next_line(&mut err_lines), if !stderr_done => match line {
+                Some(l) => push_tail(&mut stderr_tail, &l),
+                None => stderr_done = true,
+            },
+        }
+    }
+    // Pipes closed → the process is exiting; still honor cancel/timeout.
+    let outcome = child.wait_or_kill(timeout, cancel).await?;
+    Ok((outcome, stderr_tail))
+}
+
+/// Await the next line of an optional reader; parks forever when `None` (the
+/// caller guards the select branch so a parked future is never polled).
+async fn next_line<R: AsyncBufRead + Unpin>(lines: &mut Option<Lines<R>>) -> Option<String> {
+    match lines {
+        Some(l) => l.next_line().await.ok().flatten(),
+        None => std::future::pending().await,
+    }
+}
+
+/// Append a line to a capped stderr tail (keeping the LAST [`STDERR_TAIL_CAP`]
+/// bytes, cut on a char boundary).
+pub fn push_tail(tail: &mut String, line: &str) {
+    tail.push_str(line);
+    tail.push('\n');
+    if tail.len() > STDERR_TAIL_CAP {
+        let mut idx = tail.len() - STDERR_TAIL_CAP;
+        while idx < tail.len() && !tail.is_char_boundary(idx) {
+            idx += 1;
+        }
+        *tail = tail.split_off(idx);
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 extern "C" {
     fn killpg(pgid: i32, sig: i32) -> i32;
 }
 #[cfg(not(target_os = "windows"))]
 const SIGKILL: i32 = 9;
+
+#[cfg(test)]
+mod unit_tests {
+    use super::push_tail;
+    use super::STDERR_TAIL_CAP;
+
+    #[test]
+    fn push_tail_keeps_last_bytes_on_char_boundary() {
+        let mut tail = String::new();
+        for i in 0..1000 {
+            push_tail(&mut tail, &format!("line-{i}-日本語"));
+        }
+        assert!(tail.len() <= STDERR_TAIL_CAP + 64);
+        assert!(std::str::from_utf8(tail.as_bytes()).is_ok());
+        assert!(tail.contains("line-999"), "most recent line survives");
+    }
+}
 
 #[cfg(all(test, unix))]
 mod tests {
