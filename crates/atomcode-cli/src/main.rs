@@ -2585,11 +2585,20 @@ pub(crate) async fn spawn_native_cli_runtime(
         }
         None => (atomcode_coding::SessionMode::Fresh, None, None),
     };
+    // External-agent subagents (Claude Code / Codex) from `[[subagent.external]]`.
+    // Interactive TUI ⇒ dangerous (`bypass`) modes are allowed to be configured
+    // (each risky call is still approval-gated); headless/daemon paths pass none.
+    let external_subagents = cfg
+        .subagent_config
+        .as_ref()
+        .map(|c| atomcode_coding::parts::external_subagent_profiles(&c.subagent.external, true))
+        .unwrap_or_default();
     let prepare = atomcode_coding::PrepareOptions {
         subagents: atomcode_coding::SubagentPolicy::Enabled,
         session,
         plugin_skill_dirs: atomcode_daemon::gather_plugin_skill_dirs_for(&cfg.working_dir),
         mcp: cfg.mcp,
+        external_subagents,
         rate_limit_source: Some(atomcode_daemon::coding_plan_rate_limit_source()),
         ..atomcode_coding::PrepareOptions::default()
     };
