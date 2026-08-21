@@ -4165,6 +4165,14 @@ impl ChatRuntimeProjector {
                 vec![ChatEvent::Warning { message }]
             }
             Agent::Warning(message) => vec![ChatEvent::Warning { message }],
+            Agent::OutputTruncationRecovery {
+                attempt,
+                max_attempts,
+            } => vec![ChatEvent::Warning {
+                message: format!(
+                    "output limit reached; automatically continuing ({attempt}/{max_attempts})"
+                ),
+            }],
             Agent::PolicyIntervention { intervention } => {
                 vec![ChatEvent::PolicyIntervention {
                     intervention_id: intervention.id,
@@ -6624,6 +6632,23 @@ mod fs_list_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_projector_keeps_output_truncation_recovery_visible() {
+        let mut projector = ChatRuntimeProjector::default();
+        let events = projector.project_agent(
+            atomcode_kernel::event::AgentEvent::OutputTruncationRecovery {
+                attempt: 1,
+                max_attempts: 2,
+            },
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [ChatEvent::Warning { message }]
+                if message == "output limit reached; automatically continuing (1/2)"
+        ));
+    }
 
     #[test]
     fn display_filter_preserves_snapshot_anchor_coordinates() {

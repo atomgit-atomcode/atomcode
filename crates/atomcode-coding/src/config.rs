@@ -58,8 +58,8 @@ pub struct CodingAgentConfig {
     /// `[coding].max_rounds` or `ATOMCODE_TURN_MAX_ROUNDS`; exact repetition guards remain
     /// active independently.
     pub max_rounds: u32,
-    /// When true, the kernel turns the `max_rounds` cap into an interactive
-    /// checkpoint (see AgentBuilder). Default false; only the TUI driver sets it.
+    /// Enables the kernel's fixed interactive safety checkpoints (round cap and
+    /// exhausted output-limit recovery). Default false; only the TUI sets it.
     pub round_cap_checkpoint: bool,
     /// Generate an ephemeral next-prompt suggestion after a naturally completed
     /// turn. The coding runtime owns the auxiliary request and cancellation;
@@ -196,11 +196,10 @@ pub struct CodingRuntimeConfig {
     pub loop_max_rounds: u32,
     pub turn_max_rounds: u32,
     pub subagent_config: Option<Arc<atomcode_config::config::Config>>,
-    /// When true, a `max_rounds` hit becomes an interactive continue/stop
-    /// checkpoint (the kernel sends a `ROUND_CAP_CHECKPOINT_KIND` Request)
-    /// instead of a hard error. Only the TUI implements the picker, so this
-    /// must stay `false` for headless / ACP / daemon runtimes (there is no
-    /// requester to answer the Request → the kernel fail-closes to a stop).
+    /// Enables TUI-owned interactive safety checkpoints. A `max_rounds` hit
+    /// sends `ROUND_CAP_CHECKPOINT_KIND`; exhausted output-limit recovery sends
+    /// `OUTPUT_TRUNCATION_CHECKPOINT_KIND`. This must stay `false` for headless /
+    /// ACP / daemon runtimes that do not implement these fixed pickers.
     pub round_cap_checkpoint: bool,
     /// Driver opt-in for ephemeral next-prompt sampling. Default false;
     /// currently only the interactive TUI renders and accepts the result.

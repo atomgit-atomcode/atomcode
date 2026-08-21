@@ -1915,6 +1915,16 @@ pub enum Msg<'a> {
         max_attempts: u32,
     },
     StreamRecoverySucceeded,
+    OutputTruncationRunning {
+        attempt: u32,
+        max_attempts: u32,
+    },
+    OutputTruncationHeader,
+    OutputTruncationQuestion,
+    OutputTruncationContinue,
+    OutputTruncationContinueDesc,
+    OutputTruncationStop,
+    OutputTruncationStopDesc,
 
     // ── legacy Windows console (conhost) one-shot hint ──
     /// Shown once at startup ONLY on the classic Windows console host

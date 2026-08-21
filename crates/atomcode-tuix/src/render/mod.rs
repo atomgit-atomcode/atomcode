@@ -813,6 +813,37 @@ pub fn round_cap_view(cap: u32, base: u32, cursor: usize, stats: &str) -> UserIn
     }
 }
 
+/// Fixed driver-owned choice shown after automatic output-limit recovery is
+/// exhausted. Continuing starts one more incremental continuation; stopping
+/// accepts the partial response already persisted in the conversation.
+pub fn output_truncation_view(cursor: usize) -> UserInputPanelView {
+    use atomcode_capabilities::tools::request_user_input::UserInputMode;
+    UserInputPanelView {
+        header: crate::i18n::t(crate::i18n::Msg::OutputTruncationHeader).into_owned(),
+        question: crate::i18n::t(crate::i18n::Msg::OutputTruncationQuestion).into_owned(),
+        mode: UserInputMode::Single,
+        options: vec![
+            (
+                crate::i18n::t(crate::i18n::Msg::OutputTruncationContinue).into_owned(),
+                Some(crate::i18n::t(crate::i18n::Msg::OutputTruncationContinueDesc).into_owned()),
+            ),
+            (
+                crate::i18n::t(crate::i18n::Msg::OutputTruncationStop).into_owned(),
+                Some(crate::i18n::t(crate::i18n::Msg::OutputTruncationStopDesc).into_owned()),
+            ),
+        ],
+        cursor,
+        checked: vec![],
+        text: String::new(),
+        text_cursor_byte: 0,
+        custom_text: String::new(),
+        custom_text_cursor_byte: 0,
+        custom: false,
+        scroll_offset: 0,
+        batch: None,
+    }
+}
+
 /// Progress of the active todo list, rendered as the multi-line footer todo
 /// panel. The renderer collapses the list to fit (`todo_panel_rows`) and
 /// width-truncates item content; the `completed`/`in_progress`/`total` counts
@@ -1086,5 +1117,15 @@ mod tests {
             assert_eq!(k.max_visible_rows(40, 2), 2);
             assert_eq!(k.max_visible_rows(40, 10), 4);
         }
+    }
+
+    #[test]
+    fn output_truncation_view_is_a_closed_continue_stop_choice() {
+        let view = output_truncation_view(0);
+        assert_eq!(view.options.len(), 2);
+        assert!(!view.custom);
+        assert_eq!(view.cursor, 0);
+        assert!(!view.header.is_empty());
+        assert!(!view.question.is_empty());
     }
 }

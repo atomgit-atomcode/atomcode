@@ -22424,6 +22424,13 @@ fn project_kernel_event(
             max_attempts,
             recovered,
         }),
+        Kernel::OutputTruncationRecovery {
+            attempt,
+            max_attempts,
+        } => Some(AgentEvent::OutputTruncationRecovery {
+            attempt,
+            max_attempts,
+        }),
         Kernel::RateLimited {
             reset_at_display,
             reset_label,
@@ -22979,6 +22986,28 @@ fn handle_runtime_event(
                         }
                         state.round_cap_panel =
                             Some(crate::state::RoundCapPanel::new(request.id, cap, base));
+                        state.phase = UiPhase::RoundCap;
+                        redraw_idle_plain(buf, state, ctx, renderer);
+                        return;
+                    }
+                    if request.kind == atomcode_kernel::OUTPUT_TRUNCATION_CHECKPOINT_KIND {
+                        let attempts = request
+                            .payload
+                            .get("attempts")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0) as u32;
+                        let max_attempts = request
+                            .payload
+                            .get("max_attempts")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(attempts as u64)
+                            as u32;
+                        state.round_cap_panel =
+                            Some(crate::state::RoundCapPanel::output_truncation(
+                                request.id,
+                                attempts,
+                                max_attempts,
+                            ));
                         state.phase = UiPhase::RoundCap;
                         redraw_idle_plain(buf, state, ctx, renderer);
                         return;
@@ -26331,6 +26360,17 @@ fn handle_agent_event(
             // only the recovered marker enters scrollback.
             renderer.flush();
         }
+        AgentEvent::OutputTruncationRecovery {
+            attempt,
+            max_attempts,
+        } => {
+            state.spinner_label = crate::i18n::t(crate::i18n::Msg::OutputTruncationRunning {
+                attempt,
+                max_attempts,
+            })
+            .into_owned();
+            renderer.flush();
+        }
         AgentEvent::HookWarningHint(msg) => {
             if let Ok(mut slot) = ctx.hook_warning_hint.lock() {
                 *slot = Some(msg);
@@ -28112,7 +28152,11 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         approval,
         user_input,
         round_cap_panel: state.round_cap_panel.as_ref().map(|p| {
-            crate::render::round_cap_view(p.cap, p.base, p.cursor, &round_cap_stats(state))
+            if p.output_truncation {
+                crate::render::output_truncation_view(p.cursor)
+            } else {
+                crate::render::round_cap_view(p.cap, p.base, p.cursor, &round_cap_stats(state))
+            }
         }),
     }
 }

@@ -1429,6 +1429,17 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         )
         .into(),
         Msg::StreamRecoverySucceeded => "✓ recovered from the interrupted stream".into(),
+        Msg::OutputTruncationRunning { attempt, max_attempts } =>
+            format!("Output limit reached; automatically continuing ({attempt}/{max_attempts})").into(),
+        Msg::OutputTruncationHeader => "Output limit reached".into(),
+        Msg::OutputTruncationQuestion =>
+            "The model reached its per-response output limit and automatic continuation is still incomplete. What should happen next?".into(),
+        Msg::OutputTruncationContinue => "Continue".into(),
+        Msg::OutputTruncationContinueDesc =>
+            "Continue from the preserved output and write the remainder incrementally".into(),
+        Msg::OutputTruncationStop => "Stop".into(),
+        Msg::OutputTruncationStopDesc =>
+            "Keep the output produced so far and end this turn".into(),
         Msg::ConhostScrollHint =>
             "Tip: the classic Windows console is limited — no scroll-back while a task runs, \
              and glyphs/the mascot render degraded. \x1b[1;96mWindows Terminal\x1b[0m gives the full experience."

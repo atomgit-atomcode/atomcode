@@ -904,6 +904,8 @@ pub struct RoundCapPanel {
     /// Re-arm increment (rounds granted per "continue"); may differ from `cap`
     /// after the first continuation, when `cap` has grown but the step stays.
     pub base: u32,
+    /// False = round-cap checkpoint; true = output-limit recovery checkpoint.
+    pub output_truncation: bool,
     pub cursor: usize, // 0=继续 1=停止
 }
 impl RoundCapPanel {
@@ -912,6 +914,16 @@ impl RoundCapPanel {
             id,
             cap,
             base,
+            output_truncation: false,
+            cursor: 0,
+        }
+    }
+    pub fn output_truncation(id: u64, attempts: u32, max_attempts: u32) -> Self {
+        Self {
+            id,
+            cap: attempts,
+            base: max_attempts,
+            output_truncation: true,
             cursor: 0,
         }
     }
@@ -3627,6 +3639,15 @@ mod tests {
         assert!(!p.chosen_continue());
         p.move_up();
         assert!(p.chosen_continue());
+    }
+
+    #[test]
+    fn output_truncation_checkpoint_reuses_continue_stop_navigation() {
+        let mut p = crate::state::RoundCapPanel::output_truncation(11, 2, 2);
+        assert!(p.output_truncation);
+        assert!(p.chosen_continue());
+        p.move_down();
+        assert!(!p.chosen_continue());
     }
 
     #[test]

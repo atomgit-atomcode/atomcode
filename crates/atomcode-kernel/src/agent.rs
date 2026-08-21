@@ -3049,6 +3049,10 @@ impl RunningAgent {
                 // does not pre-empt finishing the truncated content.
                 if truncated && truncation_continuations < MAX_TRUNCATION_CONTINUATIONS {
                     truncation_continuations += 1;
+                    self.rt.emit(AgentEvent::OutputTruncationRecovery {
+                        attempt: truncation_continuations,
+                        max_attempts: MAX_TRUNCATION_CONTINUATIONS,
+                    });
                     self.compact_before_internal_continuation(
                         convo,
                         &mut internal_auto_compaction_attempted_stages,
@@ -3091,13 +3095,53 @@ impl RunningAgent {
                     convo.push(Message::synthetic_user(text));
                     continue;
                 }
+                // Automatic recovery and host continuation hooks both had their
+                // chance. Interactive drivers may now hand control to the user.
+                if truncated && self.round_cap_checkpoint {
+                    let resp = self
+                        .rt
+                        .request(
+                            crate::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND,
+                            serde_json::json!({
+                                "attempts": truncation_continuations,
+                                "max_attempts": MAX_TRUNCATION_CONTINUATIONS,
+                            }),
+                        )
+                        .await;
+                    let cont = resp
+                        .get("continue")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    if !cont && cancel.is_cancelled() {
+                        self.finish_cancelled(
+                            convo,
+                            rollback_len,
+                            &turn_ctx,
+                            internal_cancel.load(Ordering::Acquire),
+                        )
+                        .await;
+                        return;
+                    }
+                    if cont {
+                        self.compact_before_internal_continuation(
+                            convo,
+                            &mut internal_auto_compaction_attempted_stages,
+                        )
+                        .await;
+                        convo.push(Message::synthetic_user(TRUNCATION_RESUME_NUDGE.to_string()));
+                        continue;
+                    }
+                    // The interactive driver already presented the truncation and
+                    // the user chose to stop. Do not append a duplicate warning.
+                    truncated = false;
+                }
                 // The turn is ENDING. If it ends because the output was truncated and
                 // we could NOT recover (auto-continuation budget exhausted, no hook
                 // continuation), surface the warning now — this is the one case the
                 // user needs to see: real work was cut off and is not being finished.
                 if truncated {
                     self.rt.emit(AgentEvent::Warning(
-                        "response truncated: finish_reason=length".into(),
+                        "The model reached its output limit before finishing. Some content may be missing; ask it to continue and write the remainder incrementally.".into(),
                     ));
                 }
                 if partial_stream_recoveries > 0 {
@@ -3914,11 +3958,9 @@ pub struct AgentBuilder {
     clock: Arc<dyn Clock>,
     /// See `Agent::keep_interrupted_context`. Default `false`.
     keep_interrupted_context: bool,
-    /// When true, the `max_rounds` fuse becomes an interactive CHECKPOINT: instead
-    /// of `emit(Error)+MaxRounds`, it round-trips the driver (kind
-    /// `ROUND_CAP_CHECKPOINT_KIND`) and only stops on a non-continue answer. Default
-    /// `false` → today's hard-stop (so a driver that doesn't implement the kind can
-    /// never park). Only a driver that renders the checkpoint sets this true.
+    /// When true, interactive safety stops (round cap and exhausted output-limit
+    /// recovery) round-trip the driver through fixed checkpoint request kinds.
+    /// Default `false` ensures an unimplemented driver can never park.
     round_cap_checkpoint: bool,
 }
 
