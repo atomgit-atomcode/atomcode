@@ -1636,6 +1636,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// terminal palette. Pair with `Role::Secondary` (no fg) to dim
     /// the terminal default fg — the canonical "muted hint" look that
     /// adapts across light/dark themes.
+    ///
+    /// Use this for genuinely-ephemeral HINTS (ghost/placeholder text). For
+    /// subordinate-but-READABLE content (tool `└ …` details, collapsed "Ran N …"
+    /// summaries, completed subagent rows) prefer `style_for(Role::Muted)`:
+    /// stacking SGR 2 on top of an already-muted gray double-dims into ~3:1
+    /// (near-invisible) on many dark terminals — the "灰字看不清" report. The
+    /// muted shade alone (theme-split, ~8:1 dark / ~4.5:1 light) reads as
+    /// subordinate without the contrast-killing faint bit.
     fn style_faint(&self, r: Role) -> CellStyle {
         CellStyle {
             fg: role(self.caps, r),
@@ -1966,11 +1974,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // it atomically. Rendering it as a standalone body row instead orphaned
         // the spinner glyph on commit (the reported bug).
         if let Some(hint) = self.inflight_hint.clone() {
-            let muted = if crate::highlight::theme::is_light_for_render() {
-                self.style_for(Role::Muted)
-            } else {
-                self.style_faint(Role::Muted)
-            };
+            // Solid muted (no SGR-2 faint): readable on both themes; faint on the
+            // dark muted gray double-dims the inflight hint into ~3:1.
+            let muted = self.style_for(Role::Muted);
             let marker = if self.caps.unicode_symbols {
                 "\u{25cb}"
             } else {
@@ -8282,11 +8288,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.screen.width(),
             self.caps.unicode_symbols,
         );
-        let completed_child_style = if crate::highlight::theme::is_light_for_render() {
-            self.style_for(Role::Muted)
-        } else {
-            self.style_faint(Role::Muted)
-        };
+        // Completed children: solid muted (readable). Faint on the dark muted
+        // gray double-dimmed finished subagent rows into near-invisibility.
+        let completed_child_style = self.style_for(Role::Muted);
         let active_child_style = self.style_for(Role::Secondary);
         let stopped_child_style = self.style_for(Role::Warning);
         let failed_child_style = self.style_for(Role::Error);
@@ -8833,11 +8837,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // Render children FAINT on dark to dim them to gray, matching
                 // light theme (DarkGrey children under a black bold header) and
                 // the single tool-call `●` fix.
-                let muted = if crate::highlight::theme::is_light_for_render() {
-                    self.style_for(Role::Muted)
-                } else {
-                    self.style_faint(Role::Muted)
-                };
+                let muted = self.style_for(Role::Muted);
                 let screen_w = self.screen.width();
                 let header_row =
                     build_one_row(&header, &header_style, screen_w, self.caps.unicode_symbols);
@@ -8897,12 +8897,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     None => return,
                 };
 
-                // Match the initial render: faint on dark for hierarchy.
-                let muted = if crate::highlight::theme::is_light_for_render() {
-                    self.style_for(Role::Muted)
-                } else {
-                    self.style_faint(Role::Muted)
-                };
+                // Match the initial render: solid muted (readable on both themes).
+                let muted = self.style_for(Role::Muted);
                 let new_row = self.build_group_child_row(&new_text, &muted);
 
                 // Update in-memory.
@@ -9085,11 +9081,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // `MUTED_LIGHT` (DarkGrey). Light theme keeps the plain
                 // muted color: DarkGrey is already a readable gray, and
                 // faint-on-DarkGrey would over-dim it.
-                let muted_hint = if crate::highlight::theme::is_light_for_render() {
-                    self.style_for(Role::Muted)
-                } else {
-                    self.style_faint(Role::Muted)
-                };
+                // Solid muted: the collapsed tool-result summary (`└ …`) was
+                // faint-on-dark-gray, i.e. ~3:1 and hard to read ("灰字看不清").
+                let muted_hint = self.style_for(Role::Muted);
                 let summary_style = muted_hint.clone();
                 let continuation_style = self.style_for(Role::Secondary);
                 let error_header = self.style_bold(Role::Error);
@@ -15748,7 +15742,7 @@ mod tests {
     /// `MUTED_LIGHT` (DarkGrey). The header itself must stay bold and
     /// NOT faint — it's the prominent tier.
     #[test]
-    fn retained_tool_result_summary_is_faint_in_dark_theme() {
+    fn retained_tool_result_summary_is_readable_muted_in_dark_theme() {
         let _theme = crate::highlight::theme::test_lock();
         crate::highlight::theme::set_theme_mode(false); // dark
         let (mut r, buf) = new_capturing(80, 24);
@@ -15772,29 +15766,27 @@ mod tests {
             attachments: Vec::new(),
         });
         r.flush_deferred();
+        // The `└` result marker carries the muted SHADE but is NOT faint: SGR 2 on
+        // the dark muted gray double-dimmed it to ~3:1 ("灰字看不清"). Solid muted
+        // stays readable (~8:1 dark) while still reading as subordinate.
         assert!(
             r.body_lines
                 .iter()
                 .flatten()
-                .any(|cell| cell.ch == '└' && cell.style.faint),
-            "renderer model must retain the faint result marker"
-        );
-        let raw = buf.lock().unwrap().clone();
-        assert!(
-            raw.windows(4).any(|window| window == b"\x1b[2m"),
-            "renderer byte stream must emit SGR 2 for the faint result marker"
+                .any(|cell| cell.ch == '└' && !cell.style.faint && cell.style.fg.is_some()),
+            "result marker must be solid muted (colored, not faint)"
         );
         drain_into_vterm(&buf, &mut vterm);
 
-        // Result line: the `└` glyph and the summary text must be faint.
+        // Result line: the `└` glyph and the summary text must be readable (not faint).
         let res_idx = (0..vterm.height() as usize)
             .find(|&i| vterm.row_text(i).contains("└") && vterm.row_text(i).contains("3 files"))
             .unwrap_or_else(|| panic!("result row missing\ndump:\n{}", vterm.dump()));
         let arrow_cell = vterm.cell_at(res_idx, 2);
         assert_eq!(arrow_cell.ch, '└');
         assert!(
-            arrow_cell.faint,
-            "`└` glyph must be faint in dark theme, got {:?}",
+            !arrow_cell.faint,
+            "`└` glyph must NOT be faint (readability), got {:?}",
             arrow_cell,
         );
         let summary_col = vterm
@@ -15804,8 +15796,8 @@ mod tests {
             .unwrap();
         let summary_cell = vterm.cell_at(res_idx, summary_col);
         assert!(
-            summary_cell.faint,
-            "summary metadata must be faint in dark theme, got {:?}",
+            !summary_cell.faint,
+            "summary metadata must NOT be faint (readability), got {:?}",
             summary_cell,
         );
 
@@ -18941,17 +18933,15 @@ mod tests {
             .map(|cell| cell.ch)
             .collect::<String>();
         assert!(header.contains("2/2 finished"));
-        let terminal_style = if crate::highlight::theme::is_light_for_render() {
-            r.style_for(Role::Muted)
-        } else {
-            r.style_faint(Role::Muted)
-        };
+        // Completed rows are solid muted (readable) on both themes — no SGR-2
+        // faint, which double-dimmed them on dark.
+        let terminal_style = r.style_for(Role::Muted);
         assert!(
             r.body_lines[group.child_indices[0]]
                 .iter()
                 .filter(|cell| !cell.ch.is_whitespace())
                 .all(|cell| cell.style == terminal_style),
-            "completed Agent rows must be muted"
+            "completed Agent rows must be readable muted (not faint)"
         );
 
         r.reflow_body_to_current_width();
