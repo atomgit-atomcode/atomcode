@@ -45,6 +45,7 @@ const TODO_EAGERNESS: &[&str] = &["auto", "preferred", "always"];
 const THEMES: &[&str] = &["auto", "dark", "light"];
 const LANGUAGES: &[&str] = &["auto", "en", "zh_CN"];
 const SHELL_GUARD_POLICIES: &[&str] = &["prompt", "strict", "off"];
+const SUBAGENT_LEVELS: &[&str] = &["off", "read-only", "accept-edits", "auto"];
 
 pub static SETTINGS: &[SettingSpec] = &[
     bool_setting(
@@ -97,6 +98,24 @@ pub static SETTINGS: &[SettingSpec] = &[
         aliases: &["安全", "凭据", "credential", "shell"],
         kind: SettingKind::Choice(SHELL_GUARD_POLICIES),
         apply: ApplyPolicy::CapabilityReprepare,
+    },
+    SettingSpec {
+        id: "subagent.codex",
+        path: &["subagent", "codex"],
+        label_en: "Codex subagent",
+        label_zh: "Codex 子代理",
+        aliases: &["codex", "外部", "external"],
+        kind: SettingKind::Choice(SUBAGENT_LEVELS),
+        apply: ApplyPolicy::NextStartup,
+    },
+    SettingSpec {
+        id: "subagent.claude",
+        path: &["subagent", "claude"],
+        label_en: "Claude Code subagent",
+        label_zh: "Claude Code 子代理",
+        aliases: &["claude", "cc", "外部", "external"],
+        kind: SettingKind::Choice(SUBAGENT_LEVELS),
+        apply: ApplyPolicy::NextStartup,
     },
     SettingSpec {
         id: "loop_config.max_rounds",
@@ -287,6 +306,8 @@ impl SettingSpec {
             "loop_config.max_rounds" => config.loop_config.max_rounds.to_string(),
             "subagent.max_concurrent" => config.subagent.max_concurrent.to_string(),
             "subagent.max_rounds" => config.subagent.max_rounds.to_string(),
+            "subagent.codex" => config.subagent.codex.clone(),
+            "subagent.claude" => config.subagent.claude.clone(),
             "ui.theme" => format!("{:?}", config.ui.theme).to_lowercase(),
             "ui.auto_copy_code_blocks" => config.ui.auto_copy_code_blocks.to_string(),
             "ui.ai_session_naming" => config.ui.ai_session_naming.to_string(),
@@ -616,6 +637,24 @@ mod tests {
         assert!(document.to_string().contains("enabled = false"));
         setting.patch(&mut document, "auto").unwrap();
         assert!(!document.to_string().contains("enabled"));
+    }
+
+    #[test]
+    fn subagent_codex_switch_defaults_off_and_patches_a_level() {
+        let setting = SETTINGS
+            .iter()
+            .find(|setting| setting.id == "subagent.codex")
+            .unwrap();
+        assert!(matches!(setting.kind, SettingKind::Choice(_)));
+        let defaults = Config::default();
+        assert_eq!(setting.value(&defaults), "off");
+
+        let mut document = DocumentMut::new();
+        setting.patch(&mut document, "read-only").unwrap();
+        let configured: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(setting.value(&configured), "read-only");
+        // An out-of-range value is rejected.
+        assert!(setting.patch(&mut DocumentMut::new(), "yolo").is_err());
     }
 
     #[test]

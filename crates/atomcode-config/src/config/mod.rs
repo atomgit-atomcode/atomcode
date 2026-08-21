@@ -162,10 +162,26 @@ pub struct SubAgentConfig {
     /// Per-subtask model-round high-water mark. Default 200; `0` means unbounded.
     /// Overridden by `ATOMCODE_SUBAGENT_MAX_ROUNDS` when set.
     pub max_rounds: u32,
+    /// Convenience switch for a built-in Codex subagent, editable from `/config`:
+    /// `"off"` (default) / `"read-only"` / `"accept-edits"` / `"auto"`. Any level
+    /// other than off mounts a `subagent_codex` tool at that permission. For
+    /// multiple instances / a model / a timeout / bypass, use `external` instead.
+    #[serde(default = "default_subagent_level")]
+    pub codex: String,
+    /// Convenience switch for a built-in Claude Code subagent (see [`Self::codex`]).
+    #[serde(default = "default_subagent_level")]
+    pub claude: String,
     /// External-agent subagent instances (`[[subagent.external]]`). Each drives
-    /// Claude Code / Codex as a named subagent tool. Empty by default.
+    /// Claude Code / Codex as a named subagent tool. Empty by default. Merged with
+    /// the `codex`/`claude` convenience switches (an explicit entry with the same
+    /// name wins).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external: Vec<ExternalSubagentConfig>,
+}
+
+/// Default for the `codex`/`claude` convenience switches: off.
+fn default_subagent_level() -> String {
+    "off".to_string()
 }
 
 impl Default for SubAgentConfig {
@@ -178,6 +194,8 @@ impl Default for SubAgentConfig {
             // Retained only so existing config files continue to deserialize unchanged.
             timeout_secs: 900,
             max_rounds: 200,
+            codex: default_subagent_level(),
+            claude: default_subagent_level(),
             external: Vec::new(),
         }
     }
@@ -2162,6 +2180,21 @@ kind = "claude-code"
     fn subagent_external_absent_is_empty() {
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.subagent.external.is_empty());
+    }
+
+    #[test]
+    fn subagent_codex_claude_switches_default_off_and_deserialize() {
+        // Absent → "off" (the /config convenience switches).
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.subagent.codex, "off");
+        assert_eq!(cfg.subagent.claude, "off");
+        // Explicit levels round-trip.
+        let cfg: Config = toml::from_str(
+            "[subagent]\ncodex = \"read-only\"\nclaude = \"accept-edits\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.subagent.codex, "read-only");
+        assert_eq!(cfg.subagent.claude, "accept-edits");
     }
 
     #[test]

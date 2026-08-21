@@ -230,6 +230,65 @@ pub fn external_subagent_profiles(
     out
 }
 
+/// Resolve ALL external-agent subagent profiles for a `[subagent]` config: the
+/// `codex`/`claude` convenience switches (`/config`-editable) plus any explicit
+/// `[[subagent.external]]` entries. Explicit entries win on a name clash (the
+/// built-in `codex` / `claude-code` names are only added if not already taken),
+/// so an advanced user can override a switch with a full profile.
+pub fn resolve_external_subagents(
+    sub: &atomcode_config::config::SubAgentConfig,
+    allow_dangerous_context: bool,
+) -> Vec<atomcode_capabilities::subagent::ExternalSubagentProfile> {
+    let mut out = external_subagent_profiles(&sub.external, allow_dangerous_context);
+    let mut names: std::collections::HashSet<String> =
+        out.iter().map(|p| p.name.clone()).collect();
+    let builtins = [
+        (
+            "codex",
+            atomcode_capabilities::subagent::SubagentKind::Codex,
+            sub.codex.as_str(),
+        ),
+        (
+            "claude-code",
+            atomcode_capabilities::subagent::SubagentKind::ClaudeCode,
+            sub.claude.as_str(),
+        ),
+    ];
+    for (name, kind, level) in builtins {
+        if let Some(profile) = builtin_external_profile(name, kind, level) {
+            if names.insert(profile.name.clone()) {
+                out.push(profile);
+            }
+        }
+    }
+    out
+}
+
+/// Build a built-in convenience profile from a `/config` level string. `off` (or
+/// any unrecognized value) yields `None`. Built-ins are always fail-closed
+/// (never `allow_dangerous`); `bypass` is intentionally not offered here.
+fn builtin_external_profile(
+    name: &str,
+    kind: atomcode_capabilities::subagent::SubagentKind,
+    level: &str,
+) -> Option<atomcode_capabilities::subagent::ExternalSubagentProfile> {
+    use atomcode_capabilities::subagent::{ExternalSubagentProfile, PermissionMode};
+    let permission = match level.trim() {
+        "read-only" => PermissionMode::ReadOnly,
+        "accept-edits" => PermissionMode::AcceptEdits,
+        "auto" => PermissionMode::Auto,
+        _ => return None, // "off" / "" / unknown
+    };
+    Some(ExternalSubagentProfile {
+        name: name.to_string(),
+        kind,
+        model: None,
+        permission,
+        allow_dangerous: false,
+        timeout: None,
+    })
+}
+
 /// The session identity + persistence wiring, allocated ONCE by [`prepare`] —
 /// the single owner the design review asked for.
 pub struct SessionBinding {
@@ -2050,6 +2109,42 @@ mod tests {
         let ctx_off = external_subagent_profiles(&configs, false);
         assert_eq!(ctx_off[2].permission, PermissionMode::ReadOnly);
         assert!(!ctx_off[2].allow_dangerous);
+    }
+
+    #[test]
+    fn resolve_external_synthesizes_switches_and_explicit_wins() {
+        use atomcode_capabilities::subagent::{PermissionMode, SubagentKind};
+        use atomcode_config::config::{ExternalSubagentConfig, SubAgentConfig};
+
+        // codex switch on (read-only), claude off, no explicit entries.
+        let mut sub = SubAgentConfig::default();
+        sub.codex = "read-only".into();
+        sub.claude = "off".into();
+        let profiles = resolve_external_subagents(&sub, true);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "codex");
+        assert_eq!(profiles[0].kind, SubagentKind::Codex);
+        assert_eq!(profiles[0].permission, PermissionMode::ReadOnly);
+        assert!(!profiles[0].allow_dangerous, "built-ins are never dangerous");
+
+        // An explicit [[subagent.external]] named "codex" overrides the switch.
+        sub.external = vec![ExternalSubagentConfig {
+            name: "codex".into(),
+            kind: "codex".into(),
+            model: Some("gpt-5-codex".into()),
+            permission: Some("accept-edits".into()),
+            allow_dangerous: false,
+            timeout_secs: None,
+            enabled: true,
+        }];
+        let profiles = resolve_external_subagents(&sub, true);
+        assert_eq!(profiles.len(), 1, "the built-in codex is not added on top");
+        assert_eq!(profiles[0].permission, PermissionMode::AcceptEdits);
+        assert_eq!(profiles[0].model.as_deref(), Some("gpt-5-codex"));
+
+        // off + no explicit → nothing.
+        let empty = resolve_external_subagents(&SubAgentConfig::default(), true);
+        assert!(empty.is_empty());
     }
 
     fn agent_config(model: &str) -> CodingAgentConfig {

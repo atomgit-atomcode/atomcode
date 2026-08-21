@@ -2591,7 +2591,7 @@ pub(crate) async fn spawn_native_cli_runtime(
     let external_subagents = cfg
         .subagent_config
         .as_ref()
-        .map(|c| atomcode_coding::parts::external_subagent_profiles(&c.subagent.external, true))
+        .map(|c| atomcode_coding::parts::resolve_external_subagents(&c.subagent, true))
         .unwrap_or_default();
     let prepare = atomcode_coding::PrepareOptions {
         subagents: atomcode_coding::SubagentPolicy::Enabled,
