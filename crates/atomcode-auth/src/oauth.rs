@@ -377,6 +377,38 @@ pub enum PollOutcome {
     Authorized,
 }
 
+/// Map an `/auth/check` HTTP result to a [`PollOutcome`]. `Authorized`
+/// only when the request succeeded AND the body parsed as `valid=true`;
+/// every other success shape ("not yet") is `Pending`. Pure decision logic,
+/// split out so it's unit-testable without a live server.
+fn interpret_check(status_success: bool, valid: bool) -> PollOutcome {
+    if status_success && valid {
+        PollOutcome::Authorized
+    } else {
+        PollOutcome::Pending
+    }
+}
+
+/// One blocking `/auth/check` round-trip. Shared by [`LoginSession::poll_once`]
+/// and the background poller [`LoginSession::spawn_poller`]. Errors only on
+/// transport failure; a "not yet" answer is `Ok(Pending)`.
+fn check_once(client: &reqwest::blocking::Client, state: &str) -> Result<PollOutcome> {
+    let resp = with_login_context(
+        client
+            .get(platform_check_url())
+            .query(&[("state", state)])
+            .send(),
+        "Failed to call /auth/check",
+    )?;
+    let status_success = resp.status().is_success();
+    let valid = status_success
+        && resp
+            .json::<PlatformCheckResponse>()
+            .map(|c| c.valid)
+            .unwrap_or(false);
+    Ok(interpret_check(status_success, valid))
+}
+
 /// In-flight OAuth session. Returned by `start_login()`. The caller
 /// drives the flow:
 ///
@@ -416,31 +448,72 @@ impl LoginSession {
     /// `Pending` until the user finishes the browser flow, then
     /// `Authorized`. Errors only on transport/parse failures; a
     /// "not yet" answer is `Ok(Pending)`, never `Err`.
+    ///
+    /// NOTE: this BLOCKS the calling thread for the duration of the HTTP
+    /// request (`.join()` on the worker). Interactive wait loops must
+    /// prefer [`spawn_poller`](Self::spawn_poller) so a wedged request
+    /// (hung DNS/connect that reqwest's timeout can't interrupt — the
+    /// Windows "console frozen on cancel" failure mode) can't block the
+    /// thread that reads the ESC keystroke. Kept for one-shot callers.
     pub fn poll_once(&self) -> Result<PollOutcome> {
         let client = match &self.client {
             Some(c) => c.clone(),
             None => return Ok(PollOutcome::Pending),
         };
         let state = self.state.clone();
+        std::thread::spawn(move || check_once(&client, &state))
+            .join()
+            .map_err(|_| anyhow::anyhow!("poll_once thread panicked"))?
+    }
+
+    /// Spawn a DETACHED background thread that polls `/auth/check` every
+    /// `interval` and streams each outcome over the returned channel until
+    /// it reports `Authorized`, hits an error, or the receiver is dropped.
+    ///
+    /// This is the cancellation-safe counterpart to [`poll_once`](Self::poll_once).
+    /// The caller's wait loop stays on a tight, non-blocking cadence (drain
+    /// the channel, check for ESC, sleep briefly) so a request that wedges
+    /// at the socket layer — where reqwest's `connect_timeout`/`timeout`
+    /// can't interrupt a blocking `getaddrinfo` — leaks at most this one
+    /// background thread instead of freezing the UI thread. That freeze is
+    /// the root cause of the Windows "pressing ESC to cancel /login hangs
+    /// the console" bug: `poll_once().join()` blocked the only thread that
+    /// could observe the ESC keypress.
+    ///
+    /// The first check fires immediately (no leading `interval` sleep), so
+    /// an already-authorized session resolves on the first tick, matching
+    /// the old `poll_once`-at-top-of-loop cadence.
+    pub fn spawn_poller(&self, interval: Duration) -> mpsc::Receiver<Result<PollOutcome>> {
+        let (tx, rx) = mpsc::channel();
+        let client = self.client.clone();
+        let state = self.state.clone();
         std::thread::spawn(move || {
-            let resp = with_login_context(
-                client
-                    .get(platform_check_url())
-                    .query(&[("state", &state)])
-                    .send(),
-                "Failed to call /auth/check",
-            )?;
-            if resp.status().is_success() {
-                if let Ok(check) = resp.json::<PlatformCheckResponse>() {
-                    if check.valid {
-                        return Ok(PollOutcome::Authorized);
-                    }
+            let client = match client {
+                // No client (test/degraded session): report Pending once and
+                // stop — mirrors `poll_once`'s `None` arm.
+                None => {
+                    let _ = tx.send(Ok(PollOutcome::Pending));
+                    return;
                 }
+                Some(c) => c,
+            };
+            loop {
+                let outcome = check_once(&client, &state);
+                let stop = !matches!(outcome, Ok(PollOutcome::Pending));
+                // A send error means the caller dropped the receiver
+                // (cancelled or finished) — stop polling and let the thread
+                // exit. If the last request wedged, this thread is already
+                // detached, so no one is blocked on it.
+                if tx.send(outcome).is_err() {
+                    return;
+                }
+                if stop {
+                    return;
+                }
+                std::thread::sleep(interval);
             }
-            Ok(PollOutcome::Pending)
-        })
-        .join()
-        .map_err(|_| anyhow::anyhow!("poll_once thread panicked"))?
+        });
+        rx
     }
 
     /// Final step: `/auth/token` exchange + `LoginSuccess` telemetry.
@@ -634,16 +707,29 @@ pub fn login(tel: Option<&Arc<Telemetry>>) -> Result<AuthInfo> {
 
     session.open_browser_best_effort();
 
+    // Poll on a detached background thread so a wedged `/auth/check` request
+    // can't block the ESC-detection loop below (see `spawn_poller`). The
+    // foreground stays on a tight cadence: drain the channel, then give ESC
+    // a short window, repeat.
+    let poll_rx = session.spawn_poller(Duration::from_secs(2));
     loop {
-        match session.poll_once()? {
-            PollOutcome::Authorized => break,
-            PollOutcome::Pending => {}
+        match poll_rx.try_recv() {
+            Ok(Ok(PollOutcome::Authorized)) => break,
+            Ok(Ok(PollOutcome::Pending)) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                anyhow::bail!("login poller stopped unexpectedly")
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
         }
-        match wait_for_esc_or_timeout(&cbreak, Duration::from_secs(2)) {
+        match wait_for_esc_or_timeout(&cbreak, Duration::from_millis(100)) {
             EscOutcome::Cancelled => anyhow::bail!("login cancelled by user"),
             EscOutcome::Timeout | EscOutcome::OtherInput => {}
         }
     }
+    // Stop the poller before the token exchange: dropping the receiver makes
+    // the next `tx.send` fail so the background thread exits.
+    drop(poll_rx);
 
     session.finish(tel)
 }
@@ -1529,6 +1615,62 @@ fn parse_pasted_callback(input: &str) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interpret_check_only_authorizes_on_success_and_valid() {
+        assert_eq!(interpret_check(true, true), PollOutcome::Authorized);
+        assert_eq!(
+            interpret_check(true, false),
+            PollOutcome::Pending,
+            "2xx but valid=false is 'not yet', not authorized"
+        );
+        assert_eq!(
+            interpret_check(false, true),
+            PollOutcome::Pending,
+            "non-2xx never authorizes even if a stale body said valid"
+        );
+        assert_eq!(interpret_check(false, false), PollOutcome::Pending);
+    }
+
+    /// A session with no client (degraded/test) must not spin: the poller
+    /// reports `Pending` exactly once and then the thread exits, closing the
+    /// channel. This exercises the send-then-stop control flow without a
+    /// live server.
+    #[test]
+    fn spawn_poller_without_client_reports_pending_once_then_exits() {
+        let session = LoginSession {
+            state: "s".to_string(),
+            login_url: "https://example/login".to_string(),
+            client: None,
+        };
+        let rx = session.spawn_poller(Duration::from_millis(10));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap(),
+            PollOutcome::Pending
+        );
+        // Thread has exited → sender dropped → channel disconnected.
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_secs(2)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "poller thread must exit after the no-client Pending report"
+        );
+    }
+
+    /// Dropping the receiver must let the poller thread stop rather than
+    /// leaking or panicking. With no client the thread returns immediately;
+    /// the drop-before-recv path must simply be a clean no-op.
+    #[test]
+    fn spawn_poller_receiver_drop_is_clean() {
+        let session = LoginSession {
+            state: "s".to_string(),
+            login_url: "https://example/login".to_string(),
+            client: None,
+        };
+        let rx = session.spawn_poller(Duration::from_millis(10));
+        drop(rx); // caller cancelled before reading — must not panic.
+    }
 
     #[test]
     fn auth_recovery_failure_classifies_statuses_and_local_errors() {

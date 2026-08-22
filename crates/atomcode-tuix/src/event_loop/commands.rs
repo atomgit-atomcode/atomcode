@@ -6922,7 +6922,7 @@ fn run_oauth_with_renderer(
     ctx: &mut LoopCtx,
 ) -> Result<atomcode_auth::AuthInfo> {
     use crossterm::event::KeyCode;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use tokio::sync::mpsc::error::TryRecvError;
 
     let session = atomcode_auth::start_login()?;
@@ -6941,22 +6941,37 @@ fn run_oauth_with_renderer(
 
     session.open_browser_best_effort();
 
-    // Poll loop. We stay in raw mode and consume keyboard events from
-    // the existing reader thread via `input_rx`. The main event loop is
-    // blocked while we run, so non-ESC events queue harmlessly — we
-    // drain them here so they don't fire as stale input the moment
-    // we return.
+    // Poll loop. The network `/auth/check` runs on a DETACHED background
+    // thread (`spawn_poller`) and reports outcomes over `poll_rx`; the
+    // foreground here only drains that channel and the input channel. This
+    // is the fix for the Windows "pressing ESC to cancel /login freezes the
+    // console" bug: the previous `session.poll_once().join()` blocked this
+    // very thread on the HTTP request, so a wedged socket (hung DNS/connect
+    // that reqwest's timeout can't interrupt) meant ESC was never observed.
+    // Now ESC is checked every ~50ms regardless of network state.
+    //
+    // We stay in raw mode and consume keyboard events from the existing
+    // reader thread via `input_rx`. The main event loop is blocked while we
+    // run, so non-ESC events queue harmlessly — we drain them here so they
+    // don't fire as stale input the moment we return.
+    let poll_rx = session.spawn_poller(Duration::from_secs(2));
     loop {
-        match session.poll_once()? {
-            atomcode_auth::PollOutcome::Authorized => break,
-            atomcode_auth::PollOutcome::Pending => {}
+        match poll_rx.try_recv() {
+            Ok(Ok(atomcode_auth::PollOutcome::Authorized)) => break,
+            Ok(Ok(atomcode_auth::PollOutcome::Pending)) => {}
+            Ok(Err(e)) => {
+                // Dropping `poll_rx` on the way out stops the poller.
+                return Err(e);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                anyhow::bail!("login poller stopped unexpectedly");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // Drain ALL pending input each tick so a queued ESC cancels
+        // immediately rather than one-event-per-sleep.
         loop {
-            if Instant::now() >= deadline {
-                break;
-            }
             match ctx.input_rx.try_recv() {
                 Ok(crate::input::InputEvent::Key(k)) if k.code == KeyCode::Esc => {
                     anyhow::bail!("login cancelled by user");
@@ -6968,15 +6983,17 @@ fn run_oauth_with_renderer(
                     // the loop would replay stale state.
                     continue;
                 }
-                Err(TryRecvError::Empty) => {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
+                Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     anyhow::bail!("input channel closed");
                 }
             }
         }
+
+        std::thread::sleep(Duration::from_millis(50));
     }
+    // Stop the poller before the token exchange.
+    drop(poll_rx);
 
     session.finish(Some(&ctx.telemetry))
 }
