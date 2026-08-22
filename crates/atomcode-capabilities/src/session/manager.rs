@@ -309,11 +309,23 @@ impl Default for StorageOwner {
 pub enum ImportKind {
     Full,
     MetadataOnly,
+    /// Catch-all for legacy/invalid variants encountered in the wild
+    /// (e.g. `snapshot_only` from a previous recovery tool). Enables
+    /// `#[serde(other)]` to deserialize unknown values without crashing
+    /// the catalog scan. Such legacy meta files deserialize AND pass
+    /// `validate_meta` (see below) so the session reappears in /resume
+    /// instead of being silently dropped. Serializing this variant never
+    /// occurs in practice — `#[serde(other)]` variants are not serializable.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImportInfo {
     pub legacy_schema: String,
+    /// Sha256 of the source file. Defaults to empty when absent so that
+    /// meta files created by older recovery tools don't break catalog scans.
+    #[serde(default)]
     pub source_sha256: String,
     pub importer_version: u32,
     pub kind: ImportKind,
@@ -3589,17 +3601,26 @@ fn validate_meta(meta: &SessionMeta) -> SessionResult<()> {
                 message: "importer_version must be non-zero".into(),
             });
         }
-        if import.source_sha256.len() != 64
-            || !import
-                .source_sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
+        // Empty string is the serde(default) — valid for legacy/recovered
+        // sessions where the source file is unknown.
+        if !import.source_sha256.is_empty()
+            && (import.source_sha256.len() != 64
+                || !import
+                    .source_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()))
         {
             return Err(SessionStoreError::Corrupt {
                 kind: "session meta",
                 message: "source_sha256 must be 64 hexadecimal characters".into(),
             });
         }
+        // Unknown ImportKind (e.g. `snapshot_only` from an older recovery
+        // tool) is tolerated here: the whole point of `#[serde(other)]` is
+        // that such legacy meta files deserialize AND pass the catalog scan
+        // so the session reappears in /resume instead of being dropped.
+        // Provenance is recorded by `import_info` regardless; serializing
+        // an Unknown variant round-trips via `#[serde(other)]`.
     }
     if let Some(fork) = &meta.fork_info {
         if meta.owner != StorageOwner::Native {
@@ -4654,6 +4675,67 @@ mod tests {
 
         mgr.write_meta(&meta).unwrap();
         assert_eq!(mgr.read_meta("legacy").unwrap(), meta);
+    }
+
+    #[test]
+    fn unknown_import_kind_is_tolerated_by_validate_meta() {
+        // Build a raw JSON meta with an unknown ImportKind variant name
+        // (e.g. "snapshot_only" from an older recovery tool). We can't
+        // serialize ImportKind::Unknown directly — #[serde(other)] variants
+        // are not serializable — so we construct the JSON by hand.
+        let json = serde_json::json!({
+            "v": 1,
+            "id": "unknown-session",
+            "name": "unknown-session",
+            "user_renamed": false,
+            "ai_named": false,
+            "owner": "native",
+            "import_info": {
+                "legacy_schema": "orphan-snapshot-recovery",
+                "source_sha256": "",
+                "importer_version": 1,
+                "kind": "snapshot_only"
+            },
+            "working_dir": "/p",
+            "created_at": 1,
+            "updated_at": 1,
+            "turn_count": 0,
+            "message_count": 0,
+            "turn_stats": []
+        });
+
+        // Deserializing a meta with an unknown ImportKind should produce Unknown
+        let deserialized: SessionMeta =
+            serde_json::from_value(json).expect("meta with unknown kind should deserialize");
+        assert_eq!(
+            deserialized.import_info.as_ref().unwrap().kind,
+            ImportKind::Unknown
+        );
+
+        // validate_meta must TOLERATE Unknown ImportKind so the session stays
+        // visible in /resume (the whole point of the #[serde(other)] catch-all).
+        assert!(
+            validate_meta(&deserialized).is_ok(),
+            "validate_meta should tolerate Unknown ImportKind (session must remain visible)"
+        );
+    }
+
+    #[test]
+    fn empty_source_sha256_passes_validation() {
+        let mut meta = SessionMeta::new("empty-sha", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        meta.import_info = Some(ImportInfo {
+            legacy_schema: "core-session-json".into(),
+            source_sha256: String::new(), // serde(default) produces empty string
+            importer_version: 1,
+            kind: ImportKind::Full,
+        });
+
+        // validate_meta should accept empty source_sha256
+        assert!(
+            validate_meta(&meta).is_ok(),
+            "validate_meta should accept empty source_sha256"
+        );
     }
 
     #[test]
