@@ -324,13 +324,15 @@ fn model_needs_firm_tool_steering(model: &str) -> bool {
 }
 
 /// Whether `model` needs the blunt [`FIRM_EXECUTION_DISCIPLINE`] behavior restatement.
-/// NARROWER than [`model_needs_firm_tool_steering`]: only DeepSeek, whose execution behavior
-/// (silently deleting code to clear errors, shipping unverified edits, offloading, quitting
-/// early) was actually reported to slip. GLM is more capable and is deliberately EXCLUDED —
-/// it still gets the tool block but not this one. Add another substring here (by evidence)
-/// if a further model is observed to need it.
+/// NARROWER than [`model_needs_firm_tool_steering`]: DeepSeek (silently deleting code to
+/// clear errors, shipping unverified edits, offloading, quitting early) and Qwen (observed:
+/// fires a whole tool batch — use_skill/bash/todowrite — with ZERO text, ignoring the soft
+/// `## PROGRESS SIGNPOSTS` rule, so it needs the hard `SIGNPOST BEFORE ACTING` restatement).
+/// GLM is more capable and is deliberately EXCLUDED — it still gets the tool block but not
+/// this one. Add another substring here (by evidence) if a further model is observed to need it.
 pub(crate) fn model_needs_firm_execution(model: &str) -> bool {
-    model.to_ascii_lowercase().contains("deepseek")
+    let m = model.to_ascii_lowercase();
+    m.contains("deepseek") || m.contains("qwen")
 }
 
 /// Blunt, point-of-decision restatement of the file-tool preference, appended only for
@@ -354,7 +356,7 @@ print access tokens, or construct raw AtomGit API requests with `bash`/`curl`. T
 tools obtain the current OAuth credential internally and preserve the approval boundary.";
 
 /// Blunt, point-of-decision restatement of the EXECUTION guardrails, appended only for the
-/// model flagged by [`model_needs_firm_execution`] (DeepSeek only — GLM excluded). The soft rules in
+/// models flagged by [`model_needs_firm_execution`] (DeepSeek + Qwen — GLM excluded). The soft rules in
 /// `## DOING TASKS` / `## WORKFLOW` / `## WHEN COMMANDS FAIL` already say most of this once;
 /// weak models (GLM / DeepSeek) follow soft guidance unreliably, so we restate the four
 /// behaviors that fail most in practice (silently deleting code/tests to clear an error,
@@ -1102,7 +1104,8 @@ mod tests {
             "signposts section stays tool-agnostic: {section}"
         );
 
-        // FIRM hard restatement is DeepSeek-only (GLM excluded from firm-execution).
+        // FIRM hard restatement covers the firm-execution models (DeepSeek + Qwen);
+        // GLM is excluded from firm-execution and keeps only the universal section.
         let deepseek = coding_persona("deepseek-v4-flash", false, false);
         assert!(
             deepseek.contains("SIGNPOST BEFORE ACTING"),
@@ -1113,6 +1116,13 @@ mod tests {
         assert!(
             deepseek.contains("in ONE short sentence, in the user's language"),
             "deepseek firm signpost binds to the user's language: {deepseek}"
+        );
+        // Qwen was observed firing a full tool batch with zero text; it now gets the same
+        // hard signpost bullet as deepseek (user request: parity with deepseek).
+        let qwen = coding_persona("qwen3.8-27b", false, false);
+        assert!(
+            qwen.contains("SIGNPOST BEFORE ACTING"),
+            "qwen gets the firm signpost bullet: {qwen}"
         );
         let glm = coding_persona("glm-5.2", false, false);
         assert!(
@@ -1507,15 +1517,19 @@ mod tests {
     }
 
     #[test]
-    fn only_deepseek_gets_the_firm_execution_discipline_block() {
-        // The behavior block is DeepSeek-only (its execution behavior was the one reported to
-        // slip): silently deleting code/tests to clear errors, shipping unverified edits,
-        // offloading doable work, quitting after one failure, treating stale memory as truth.
+    fn firm_execution_models_get_the_execution_discipline_block() {
+        // The behavior block covers the firm-execution models (DeepSeek, then Qwen): behavior
+        // reported to slip — silently deleting code/tests to clear errors, shipping unverified
+        // edits, offloading doable work, quitting after one failure, treating stale memory as
+        // truth, and firing a tool batch with zero text (the missing signpost).
+        for model in ["deepseek-v4-flash", "qwen3.8-27b"] {
+            let p = coding_persona(model, true, false);
+            assert!(
+                p.contains("## EXECUTION DISCIPLINE"),
+                "{model} must get the block: {p}"
+            );
+        }
         let p = coding_persona("deepseek-v4-flash", true, false);
-        assert!(
-            p.contains("## EXECUTION DISCIPLINE"),
-            "deepseek must get the block: {p}"
-        );
         // The five behaviors it must cover.
         assert!(
             p.contains("FIX, DON'T HIDE"),
@@ -1566,9 +1580,12 @@ mod tests {
     }
 
     #[test]
-    fn model_needs_firm_execution_is_deepseek_only() {
+    fn model_needs_firm_execution_matches_deepseek_and_qwen() {
         assert!(model_needs_firm_execution("deepseek-v4-flash"));
         assert!(model_needs_firm_execution("deepseek-chat"));
+        // Qwen (any version, including the VL variant) — added for signpost parity.
+        assert!(model_needs_firm_execution("qwen3.8-27b"));
+        assert!(model_needs_firm_execution("Qwen/Qwen3-VL-8B-Instruct"));
         assert!(
             !model_needs_firm_execution("glm-5.2"),
             "GLM excluded from execution block"
