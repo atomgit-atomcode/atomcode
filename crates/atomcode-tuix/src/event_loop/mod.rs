@@ -13637,6 +13637,11 @@ fn handle_input(
                 }
                 let streaming = matches!(app.state.phase, UiPhase::Streaming);
                 if let Some(modal) = app.active_modal.as_mut() {
+                    // Normalize ^H/^? backspace-delete aliases once at the modal
+                    // boundary so every modal's text fields behave the same as the
+                    // main composer on terminals that emit them (see normalize_edit_key).
+                    let (code, modifiers) =
+                        crate::input::key_action::normalize_edit_key(code, modifiers);
                     let action = modal.handle_key(
                         code,
                         modifiers,
@@ -13685,6 +13690,9 @@ fn handle_input(
             }
             if matches!(app.state.phase, UiPhase::Idle) {
                 if let Some(modal) = app.active_modal.as_mut() {
+                    // See the sibling dispatch above: normalize ^H/^? at the boundary.
+                    let (code, modifiers) =
+                        crate::input::key_action::normalize_edit_key(code, modifiers);
                     let action = modal.handle_key(
                         code,
                         modifiers,

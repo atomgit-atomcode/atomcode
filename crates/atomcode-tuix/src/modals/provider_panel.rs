@@ -1502,6 +1502,10 @@ impl Modal for ProviderPanel {
         ctx: &mut LoopCtx,
         renderer: &mut dyn Renderer,
     ) -> Result<ModalAction> {
+        // ^H/^? backspace-delete aliases are normalized upstream at the modal-dispatch
+        // boundary (see `key_action::normalize_edit_key`), so `code`/`mods` here already
+        // carry Backspace/Delete on terminals that emit those chords.
+
         // ── Add form ──
         if let Mode::Add(form) = &mut self.mode {
             match code {
@@ -1685,7 +1689,7 @@ impl Modal for ProviderPanel {
                 KeyCode::Char(' ') if form.focus == ModelField::MakeDefault => {
                     form.make_default = !form.make_default;
                 }
-                KeyCode::Char(c) => match form.focus {
+                KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => match form.focus {
                     ModelField::ApiKey => insert_at_cursor(
                         &mut form.api_key,
                         &mut form.cursor_byte,
