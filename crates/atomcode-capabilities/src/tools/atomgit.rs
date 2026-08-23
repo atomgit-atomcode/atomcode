@@ -459,14 +459,138 @@ impl Tool for AtomgitIssueTool {
     }
 }
 
-/// Register `atomgit_repo` / `atomgit_pr` / `atomgit_issue` into `reg`, all sharing
-/// one client. The embedder builds the [`AtomgitClient`] with its own
-/// [`TokenProvider`](crate::atomgit::TokenProvider) and then `mount`s whichever tool
-/// names it wants to expose.
+// ─────────────────────────── atomgit_api ───────────────────────────
+
+#[derive(Deserialize)]
+struct ApiArgs {
+    method: String,
+    path: String,
+    #[serde(default)]
+    query: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    body: Option<serde_json::Value>,
+}
+
+/// Pull `method` out of the raw args for `risk()` (which classifies before
+/// `execute` parses strictly).
+fn method_of(args: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(str::to_string))
+}
+
+/// The AtomGit REST verbs `atomgit_api` accepts (case-insensitive).
+fn parse_api_method(raw: &str) -> Option<reqwest::Method> {
+    match raw.to_ascii_uppercase().as_str() {
+        "GET" => Some(reqwest::Method::GET),
+        "POST" => Some(reqwest::Method::POST),
+        "PATCH" => Some(reqwest::Method::PATCH),
+        "PUT" => Some(reqwest::Method::PUT),
+        "DELETE" => Some(reqwest::Method::DELETE),
+        _ => None,
+    }
+}
+
+/// Reject anything that isn't a plain path under the fixed API base, so the
+/// model can never redirect the request to another host (absolute or
+/// protocol-relative URLs) through the `path` field.
+fn validate_api_path(path: &str) -> Result<(), String> {
+    if !path.starts_with('/') {
+        Err("path must start with '/' (e.g. \"/user/orgs\")".into())
+    } else if path.starts_with("//") {
+        Err("path must not start with '//' (a protocol-relative host)".into())
+    } else if path.contains("://") {
+        Err("path must be relative to the AtomGit API base, not an absolute URL".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// `atomgit_api` — credential-safe passthrough for AtomGit REST endpoints that
+/// have no dedicated typed tool. The bearer token is injected by the client, so
+/// it never appears in model-visible arguments (unlike a raw `bash`/`curl` call,
+/// which the `AtomgitBashGate` blocks for exactly that reason).
+pub struct AtomgitApiTool {
+    client: Arc<AtomgitClient>,
+}
+
+impl AtomgitApiTool {
+    pub fn new(client: Arc<AtomgitClient>) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl Tool for AtomgitApiTool {
+    fn name(&self) -> &str {
+        "atomgit_api"
+    }
+    fn description(&self) -> &str {
+        "Call any AtomGit REST API endpoint that has no dedicated tool (prefer \
+         atomgit_repo / atomgit_pr / atomgit_issue when they cover the action). \
+         The auth token is attached server-side — NEVER put credentials in the \
+         arguments. `path` is relative to the API base, e.g. \"/user/orgs\" or \
+         \"/repos/{owner}/{repo}/branches\". Returns the raw JSON response."
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "method": { "type": "string", "enum": ["GET","POST","PATCH","PUT","DELETE"] },
+                "path": { "type": "string", "description": "API path relative to the AtomGit base, starting with '/'. Do NOT include the host or a token." },
+                "query": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Optional query-string parameters." },
+                "body": { "type": "object", "description": "Optional JSON request body (POST/PATCH/PUT/DELETE)." }
+            },
+            "required": ["method", "path"]
+        })
+    }
+    fn risk(&self, args: &str) -> RiskLevel {
+        // Reads are Safe; anything that could mutate is Risky (needs approval).
+        match method_of(args)
+            .as_deref()
+            .map(str::to_ascii_uppercase)
+            .as_deref()
+        {
+            Some("GET") => RiskLevel::Safe,
+            _ => RiskLevel::Risky,
+        }
+    }
+    async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
+        let a: ApiArgs = match serde_json::from_str(args) {
+            Ok(a) => a,
+            Err(e) => return err(format!("atomgit_api: invalid arguments: {e}")),
+        };
+        let Some(method) = parse_api_method(&a.method) else {
+            return err(format!(
+                "atomgit_api: unsupported method {:?} (use GET/POST/PATCH/PUT/DELETE)",
+                a.method
+            ));
+        };
+        if let Err(e) = validate_api_path(&a.path) {
+            return err(format!("atomgit_api: {e}"));
+        }
+        let query: Vec<(String, String)> = a.query.unwrap_or_default().into_iter().collect();
+        match self
+            .client
+            .request_raw(method, &a.path, &query, a.body.as_ref())
+            .await
+        {
+            Ok(body) if body.trim().is_empty() => ok("(empty response)".to_string()),
+            Ok(body) => ok(body),
+            Err(e) => err(e),
+        }
+    }
+}
+
+/// Register `atomgit_repo` / `atomgit_pr` / `atomgit_issue` / `atomgit_api` into
+/// `reg`, all sharing one client. The embedder builds the [`AtomgitClient`] with its
+/// own [`TokenProvider`](crate::atomgit::TokenProvider) and then `mount`s whichever
+/// tool names it wants to expose.
 pub fn register_atomgit_tools(reg: &mut ToolRegistry, client: Arc<AtomgitClient>) {
     reg.register(Arc::new(AtomgitRepoTool::new(client.clone())));
     reg.register(Arc::new(AtomgitPrTool::new(client.clone())));
-    reg.register(Arc::new(AtomgitIssueTool::new(client)));
+    reg.register(Arc::new(AtomgitIssueTool::new(client.clone())));
+    reg.register(Arc::new(AtomgitApiTool::new(client)));
 }
 
 /// The tool names registered by [`register_atomgit_tools`], for `mount`.
@@ -700,7 +824,7 @@ mod tests {
     use crate::atomgit::testutil::StaticToken;
     use crate::atomgit::AtomgitConfig;
     use tokio_util::sync::CancellationToken;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn ctx() -> ToolContext {
@@ -769,6 +893,76 @@ mod tests {
             .await;
         assert!(r.is_error);
         assert!(r.content.contains("tag_name are required"), "{}", r.content);
+    }
+
+    fn api_tool(server: &MockServer) -> AtomgitApiTool {
+        let client = AtomgitClient::new(AtomgitConfig {
+            base_url: format!("{}/api/v5", server.uri()),
+            user_agent: "atomcode/test".into(),
+            token: Arc::new(StaticToken("t")),
+        })
+        .unwrap();
+        AtomgitApiTool::new(Arc::new(client))
+    }
+
+    #[test]
+    fn atomgit_api_risk_get_safe_others_risky() {
+        let t = AtomgitApiTool::new(Arc::new(
+            AtomgitClient::new(AtomgitConfig {
+                base_url: "http://x/api/v5".into(),
+                user_agent: "u".into(),
+                token: Arc::new(StaticToken("t")),
+            })
+            .unwrap(),
+        ));
+        assert_eq!(
+            t.risk(r#"{"method":"GET","path":"/user"}"#),
+            RiskLevel::Safe
+        );
+        assert_eq!(
+            t.risk(r#"{"method":"get","path":"/user"}"#),
+            RiskLevel::Safe
+        );
+        assert_eq!(
+            t.risk(r#"{"method":"POST","path":"/gists"}"#),
+            RiskLevel::Risky
+        );
+        assert_eq!(
+            t.risk(r#"{"method":"DELETE","path":"/x"}"#),
+            RiskLevel::Risky
+        );
+        // malformed → fail safe to Risky
+        assert_eq!(t.risk("not json"), RiskLevel::Risky);
+    }
+
+    #[tokio::test]
+    async fn atomgit_api_rejects_host_redirecting_paths() {
+        let server = MockServer::start().await;
+        let t = api_tool(&server);
+        for bad in [
+            r#"{"method":"GET","path":"https://evil.test/x"}"#,
+            r#"{"method":"GET","path":"//evil.test/x"}"#,
+            r#"{"method":"GET","path":"user/orgs"}"#,
+        ] {
+            let r = t.execute(bad, &ctx()).await;
+            assert!(r.is_error, "must reject non-relative path: {bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn atomgit_api_get_returns_raw_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v5/user/orgs"))
+            .and(header("authorization", "Bearer t"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"[{"login":"acme"}]"#))
+            .mount(&server)
+            .await;
+        let r = api_tool(&server)
+            .execute(r#"{"method":"GET","path":"/user/orgs"}"#, &ctx())
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("acme"), "{}", r.content);
     }
 
     #[tokio::test]

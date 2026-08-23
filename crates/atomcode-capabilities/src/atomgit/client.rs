@@ -130,6 +130,31 @@ impl AtomgitClient {
             .await?;
         Ok(())
     }
+
+    /// Generic REST call for AtomGit endpoints that have no typed helper. The
+    /// bearer token is injected by [`AtomgitClient::send`] — it never reaches the
+    /// caller (or the model). `path` is appended to the fixed `base_url`, so a
+    /// caller can only ever reach the AtomGit API host, never redirect elsewhere.
+    /// Returns the raw success body (arbitrary endpoints have no typed model).
+    pub(crate) async fn request_raw(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(String, String)],
+        body: Option<&serde_json::Value>,
+    ) -> Result<String, String> {
+        let mut req = self.http.request(method, self.url(path));
+        if !query.is_empty() {
+            req = req.query(query);
+        }
+        if let Some(body) = body {
+            req = req.json(body);
+        }
+        let resp = self.send(req).await?;
+        resp.text()
+            .await
+            .map_err(|e| format!("failed to read AtomGit response: {e}"))
+    }
 }
 
 #[cfg(test)]
@@ -153,6 +178,51 @@ mod tests {
             token: Arc::new(StaticToken("tok-123")),
         })
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn request_raw_injects_bearer_passes_query_and_returns_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v5/user/orgs"))
+            .and(header("authorization", "Bearer tok-123"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"[{"login":"acme"}]"#))
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let body = c
+            .request_raw(
+                reqwest::Method::GET,
+                "/user/orgs",
+                &[("page".to_string(), "2".to_string())],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(body.contains("acme"), "raw body must be returned: {body}");
+    }
+
+    #[tokio::test]
+    async fn request_raw_sends_json_body_and_maps_non_2xx_to_err() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v5/gists"))
+            .and(header("authorization", "Bearer tok-123"))
+            .respond_with(ResponseTemplate::new(422).set_body_string("bad"))
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let err = c
+            .request_raw(
+                reqwest::Method::POST,
+                "/gists",
+                &[],
+                Some(&json!({ "public": false })),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("422"), "non-2xx must surface: {err}");
     }
 
     #[tokio::test]

@@ -14,8 +14,8 @@ const ATOMGIT_TOKEN_MARKERS: &[&str] = &[
     "$atomgit_access_token",
     "${atomgit_access_token",
 ];
-const ATOMGIT_CREDENTIAL_DENIAL: &str = "credentials must not be passed through shell arguments. Do not retry with scripts, temporary files, environment expansion, or by reading auth files; use atomgit_repo, atomgit_pr, or atomgit_issue";
-const RAW_ATOMGIT_DENIAL: &str = "raw AtomGit API calls through bash are disabled. Do not retry through curl or scripts; use atomgit_repo, atomgit_pr, or atomgit_issue";
+const ATOMGIT_CREDENTIAL_DENIAL: &str = "credentials must not be passed through shell arguments. Do not retry with scripts, temporary files, environment expansion, or by reading auth files; use atomgit_repo, atomgit_pr, or atomgit_issue — or atomgit_api for any other AtomGit REST endpoint";
+const RAW_ATOMGIT_DENIAL: &str = "raw AtomGit API calls through bash are disabled. Do not retry through curl or scripts; use atomgit_repo, atomgit_pr, or atomgit_issue — or atomgit_api for any other AtomGit REST endpoint";
 
 #[derive(Deserialize)]
 struct BashArgs {

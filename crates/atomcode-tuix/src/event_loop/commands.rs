@@ -78,7 +78,10 @@ pub(super) fn dispatch_rewind(state: &UiState, ctx: &LoopCtx, renderer: &mut dyn
         .runtime
         .refresh_rewind_catalog(ctx.foreground_runtime_id, ctx.runtime_event_tx.clone())
     {
-        renderer.render(UiLine::Error(format!("{}: {error}", t(Msg::CmdRewindUnavailable))));
+        renderer.render(UiLine::Error(format!(
+            "{}: {error}",
+            t(Msg::CmdRewindUnavailable)
+        )));
         renderer.flush();
     }
 }
@@ -634,9 +637,7 @@ fn current_live_goal(state: &UiState) -> Option<atomcode_coding::GoalProgress> {
     let phase = state.goal_phase;
     let terminal = match phase {
         atomcode_coding::GoalPhase::Satisfied => Some(atomcode_coding::GoalTerminal::Met),
-        atomcode_coding::GoalPhase::PausedAtCap => {
-            Some(atomcode_coding::GoalTerminal::Stopped)
-        }
+        atomcode_coding::GoalPhase::PausedAtCap => Some(atomcode_coding::GoalTerminal::Stopped),
         _ => None,
     };
     Some(atomcode_coding::GoalProgress {
@@ -683,7 +684,7 @@ pub(crate) fn attach_live_runtime(
     // it in the first snapshot even when no GoalChanged event is replayable.
     if let Some(goal) = current_live_goal(state) {
         atomcode_daemon::native_live::seed_goal_progress(&binding, goal)
-        .map_err(|error| format!("同步当前 Goal 状态失败：{error:?}"))?;
+            .map_err(|error| format!("同步当前 Goal 状态失败：{error:?}"))?;
     }
     // The runtime binding owns execution; the process-level mode seeds the first
     // live snapshot before any ModeChanged event exists.
@@ -3610,13 +3611,12 @@ fn execute_slash_command_impl(
                     // LiveHub's controller snapshot/view and deliberately does
                     // not consume a runtime sequence number; the later native
                     // event remains authoritative for replay and ordering.
-                    if let (Some(binding), Some(goal)) = (
-                        ctx.live_binding.as_ref(),
-                        current_live_goal(state),
-                    ) {
-                        if let Err(error) = atomcode_daemon::native_live::seed_goal_progress(
-                            binding, goal,
-                        ) {
+                    if let (Some(binding), Some(goal)) =
+                        (ctx.live_binding.as_ref(), current_live_goal(state))
+                    {
+                        if let Err(error) =
+                            atomcode_daemon::native_live::seed_goal_progress(binding, goal)
+                        {
                             renderer.render(UiLine::Error(format!(
                                 "Live Goal synchronization failed: {error:?}"
                             )));
@@ -5545,7 +5545,9 @@ mod schedule_list_text_tests {
             title: title.to_string(),
             prompt: "do something".to_string(),
             cwd: "/tmp".to_string(),
-            schedule: Schedule::Daily { time: "09:00".to_string() },
+            schedule: Schedule::Daily {
+                time: "09:00".to_string(),
+            },
             permission_mode: "plan".to_string(),
             notify: "important".to_string(),
             enabled,
@@ -5577,10 +5579,16 @@ mod schedule_list_text_tests {
         let now = 1785657600_i64; // 2026-07-31 08:00 UTC
         let out = build_schedule_list_text(&tasks, now);
         assert!(out.contains("task-1"), "should contain first task id");
-        assert!(out.contains("Daily brief"), "should contain first task title");
+        assert!(
+            out.contains("Daily brief"),
+            "should contain first task title"
+        );
         assert!(out.contains("on"), "enabled task should show 'on'");
         assert!(out.contains("task-2"), "should contain second task id");
-        assert!(out.contains("Weekly report"), "should contain second task title");
+        assert!(
+            out.contains("Weekly report"),
+            "should contain second task title"
+        );
         assert!(out.contains("off"), "disabled task should show 'off'");
         // Order: task-1 line comes before task-2 line
         let pos1 = out.find("task-1").unwrap();
@@ -5803,9 +5811,7 @@ where
     let catalog_dirs = catalog_dirs
         .into_iter()
         .map(|path| atomcode_capabilities::pathnorm::strip_verbatim_path(&path))
-        .filter(|path| {
-            catalog_seen.insert(atomcode_capabilities::pathnorm::path_case_key(path))
-        })
+        .filter(|path| catalog_seen.insert(atomcode_capabilities::pathnorm::path_case_key(path)))
         .filter(|path| is_dir(path))
         .collect::<Vec<_>>();
     let current_key = atomcode_capabilities::pathnorm::path_case_key(&current);
@@ -6436,7 +6442,12 @@ pub(crate) fn count_blocked_untrusted(
 ) -> usize {
     servers
         .iter()
-        .filter(|(_, s)| matches!(s, atomcode_capabilities::mcp::ServerStatus::BlockedUntrusted))
+        .filter(|(_, s)| {
+            matches!(
+                s,
+                atomcode_capabilities::mcp::ServerStatus::BlockedUntrusted
+            )
+        })
         .count()
 }
 
@@ -7749,7 +7760,10 @@ mod tests {
         struct DeniedWriter;
         impl std::io::Write for DeniedWriter {
             fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ))
             }
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
@@ -7837,9 +7851,7 @@ mod tests {
     #[test]
     fn live_user_text_shaped_like_a_reminder_is_still_echoed() {
         let input = atomcode_coding::UserInput {
-            text: atomcode_capabilities::reminder::system_reminder(
-                "Explain why this appears.",
-            ),
+            text: atomcode_capabilities::reminder::system_reminder("Explain why this appears."),
             images: Vec::new(),
         };
 
@@ -7939,16 +7951,12 @@ mod tests {
 
     #[test]
     fn review_prompt_uses_explicit_tool_scopes() {
-        assert!(review_prompt("").contains(
-            r#"{"scope":{"kind":"working_tree"}}"#
-        ));
-        assert!(review_prompt("staged").contains(
-            r#"{"scope":{"kind":"staged"}}"#
-        ));
+        assert!(review_prompt("").contains(r#"{"scope":{"kind":"working_tree"}}"#));
+        assert!(review_prompt("staged").contains(r#"{"scope":{"kind":"staged"}}"#));
         let range = review_prompt("release/v5.0.8");
-        assert!(range.contains(
-            r#"{"scope":{"kind":"range","base":"release/v5.0.8","head":"HEAD"}}"#
-        ));
+        assert!(
+            range.contains(r#"{"scope":{"kind":"range","base":"release/v5.0.8","head":"HEAD"}}"#)
+        );
         assert!(!range.contains(r#"{"base":"#));
     }
 
@@ -7973,7 +7981,10 @@ mod tests {
 
         // `deep <ref>` → range + depth.
         let rng = review_prompt("deep main");
-        assert!(rng.contains(r#""scope":{"kind":"range","base":"main","head":"HEAD"}"#), "{rng}");
+        assert!(
+            rng.contains(r#""scope":{"kind":"range","base":"main","head":"HEAD"}"#),
+            "{rng}"
+        );
         assert!(rng.contains(r#""depth":"deep""#), "{rng}");
 
         // Plain scope carries NO depth (default single).
@@ -7992,12 +8003,18 @@ mod tests {
         assert!(st.contains(r#""depth":"deep+verify""#), "{st}");
 
         let rng = review_prompt("deep+verify main");
-        assert!(rng.contains(r#""scope":{"kind":"range","base":"main","head":"HEAD"}"#), "{rng}");
+        assert!(
+            rng.contains(r#""scope":{"kind":"range","base":"main","head":"HEAD"}"#),
+            "{rng}"
+        );
         assert!(rng.contains(r#""depth":"deep+verify""#), "{rng}");
 
         // Plain `deep` still maps to depth "deep" (not deep+verify).
         let d = review_prompt("deep");
-        assert!(d.contains(r#""depth":"deep""#) && !d.contains("deep+verify"), "{d}");
+        assert!(
+            d.contains(r#""depth":"deep""#) && !d.contains("deep+verify"),
+            "{d}"
+        );
     }
 
     #[test]
@@ -8841,8 +8858,7 @@ mod todo_command_tests {
         let mut msgs = vec![tool_call_msg(vec![ToolCall {
             id: "ok".into(),
             name: "todowrite".into(),
-            arguments:
-                r#"{"todos":[{"content":"keep","status":"in_progress"}]}"#.into(),
+            arguments: r#"{"todos":[{"content":"keep","status":"in_progress"}]}"#.into(),
         }])];
         msgs.push(Message::tool_result("ok", "1 task", false));
         msgs.push(tool_call_msg(vec![ToolCall {

@@ -913,6 +913,16 @@ impl NativeLiveWireProjector {
                 },
                 Kernel::Error { message, .. } => LiveWireEvent::Error { message },
                 Kernel::Warning(message) => LiveWireEvent::Warning { message },
+                Kernel::ProviderRetry {
+                    attempt,
+                    max_attempts,
+                    backoff_secs,
+                    reason,
+                } => LiveWireEvent::Warning {
+                    message: format!(
+                        "API error {reason}，{backoff_secs} 秒后重试({attempt}/{max_attempts})..."
+                    ),
+                },
                 Kernel::StreamRecovery {
                     attempt,
                     max_attempts,

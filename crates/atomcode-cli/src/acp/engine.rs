@@ -74,6 +74,7 @@ pub async fn spawn_session(
         agent: cfg,
         prepare: PrepareOptions {
             session,
+            tools: true,
             subagents: atomcode_coding::SubagentPolicy::Enabled,
             // SDK 2.0.0 的 stable v1 已支持通用 elicitation(表单/URL)。ACP 端通过
             // `elicitation/create`(form) 回环把 `request_user_input` 工具的

@@ -181,11 +181,29 @@ mod tests {
         let base = t0();
         let a = next_click(None, base, 5, 10, MULTI_CLICK_WINDOW);
         assert_eq!(a.count, 1);
-        let b = next_click(Some(a), base + Duration::from_millis(100), 5, 10, MULTI_CLICK_WINDOW);
+        let b = next_click(
+            Some(a),
+            base + Duration::from_millis(100),
+            5,
+            10,
+            MULTI_CLICK_WINDOW,
+        );
         assert_eq!(b.count, 2, "double");
-        let c = next_click(Some(b), base + Duration::from_millis(200), 5, 10, MULTI_CLICK_WINDOW);
+        let c = next_click(
+            Some(b),
+            base + Duration::from_millis(200),
+            5,
+            10,
+            MULTI_CLICK_WINDOW,
+        );
         assert_eq!(c.count, 3, "triple");
-        let d = next_click(Some(c), base + Duration::from_millis(300), 5, 10, MULTI_CLICK_WINDOW);
+        let d = next_click(
+            Some(c),
+            base + Duration::from_millis(300),
+            5,
+            10,
+            MULTI_CLICK_WINDOW,
+        );
         assert_eq!(d.count, 1, "fourth press wraps back to single");
     }
 
@@ -207,7 +225,13 @@ mod tests {
     fn press_at_a_different_cell_is_a_fresh_single() {
         let base = t0();
         let a = next_click(None, base, 5, 10, MULTI_CLICK_WINDOW);
-        let b = next_click(Some(a), base + Duration::from_millis(50), 5, 11, MULTI_CLICK_WINDOW);
+        let b = next_click(
+            Some(a),
+            base + Duration::from_millis(50),
+            5,
+            11,
+            MULTI_CLICK_WINDOW,
+        );
         assert_eq!(b.count, 1, "a different cell restarts the count");
     }
 
@@ -254,7 +278,7 @@ mod tests {
     #[test]
     fn word_bounds_clamps_non_char_boundary_byte() {
         let text = "你好"; // each char 3 bytes
-        // byte 1 is mid-'你'; must clamp down to 0 and select the CJK run
+                           // byte 1 is mid-'你'; must clamp down to 0 and select the CJK run
         let (s, e) = word_bounds(text, 1);
         assert_eq!(&text[s..e], "你好");
     }
@@ -281,10 +305,7 @@ mod tests {
 
     #[test]
     fn line_span_of_a_standalone_run_is_itself() {
-        let runs = vec![
-            run(1, "alpha", false, None),
-            run(2, "beta", false, None),
-        ];
+        let runs = vec![run(1, "alpha", false, None), run(2, "beta", false, None)];
         assert_eq!(line_run_span(&runs, 2), Some((1, 1)));
     }
 
@@ -306,10 +327,7 @@ mod tests {
     #[test]
     fn line_span_does_not_join_when_next_id_mismatches() {
         // soft_wrap is true but next_run_id points elsewhere — not a real chain.
-        let runs = vec![
-            run(10, "a", true, Some(99)),
-            run(11, "b", false, None),
-        ];
+        let runs = vec![run(10, "a", true, Some(99)), run(11, "b", false, None)];
         assert_eq!(line_run_span(&runs, 10), Some((0, 0)));
     }
 

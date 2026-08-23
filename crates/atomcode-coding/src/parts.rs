@@ -106,6 +106,10 @@ impl SubagentPolicy {
 #[derive(Clone, Debug)]
 pub struct PrepareOptions {
     pub session: SessionMode,
+    /// Whether this driver exposes any tools to the model. `false` keeps the
+    /// normal coding runtime/provider lifecycle but publishes an empty tool
+    /// catalog. Headless eval drivers use this to measure model-only behavior.
+    pub tools: bool,
     /// Skill dirs in LOW→HIGH priority order; `None` = the standard home+project
     /// precedence ([`standard_skill_dirs`]).
     pub skill_dirs: Option<Vec<PathBuf>>,
@@ -156,6 +160,7 @@ impl Default for PrepareOptions {
     fn default() -> Self {
         Self {
             session: SessionMode::Fresh,
+            tools: true,
             skill_dirs: None,
             plugin_skill_dirs: Vec::new(),
             mcp: true,
@@ -280,8 +285,7 @@ fn builtin_external_profile(
     // Reuse the single permission parser (normalizes case + `_`→`-`, so
     // `Read-Only`/`readonly`/`accept_edits` all work like the explicit path).
     // `off`/`""`/unknown → None; `bypass` is never offered via the switch.
-    let permission =
-        PermissionMode::from_config_str(level).filter(|p| !p.is_dangerous())?;
+    let permission = PermissionMode::from_config_str(level).filter(|p| !p.is_dangerous())?;
     Some(ExternalSubagentProfile {
         name: name.to_string(),
         kind,
@@ -462,37 +466,43 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // model can't accept a pasted image yet refuse a read_file image. NOTE: this is the
     // PREPARE-time flag; `assemble` re-registers read_file on every model swap (see there)
     // so a `/model` change to/from a VL model can't leave it stale.
-    register_coding_tools_with_vision(&mut registry, cfg.supports_vision);
-    names.extend(
-        atomcode_capabilities::tools::coding_tool_names()
-            .iter()
-            .map(|s| s.to_string()),
-    );
-    let request_user_input_enabled =
-        opts.request_user_input && crate::persona::request_user_input_switch_enabled();
-    let todo_enabled = crate::persona::todo_switch_enabled_for(cfg.todo.enabled);
-    let subagents_enabled = opts
-        .subagents
-        .resolve(std::env::var("ATOMCODE_SUBAGENT").ok().as_deref());
+    if opts.tools {
+        register_coding_tools_with_vision(&mut registry, cfg.supports_vision);
+        names.extend(
+            atomcode_capabilities::tools::coding_tool_names()
+                .iter()
+                .map(|s| s.to_string()),
+        );
+    }
+    let request_user_input_enabled = opts.tools
+        && opts.request_user_input
+        && crate::persona::request_user_input_switch_enabled();
+    let todo_enabled = opts.tools && crate::persona::todo_switch_enabled_for(cfg.todo.enabled);
+    let subagents_enabled = opts.tools
+        && opts
+            .subagents
+            .resolve(std::env::var("ATOMCODE_SUBAGENT").ok().as_deref());
     if !todo_enabled {
         names.retain(|name| name != "todowrite");
     }
     if !request_user_input_enabled {
         names.retain(|name| name != "request_user_input");
     }
-    register_codeintel_tools(&mut registry);
-    names.extend(
-        atomcode_capabilities::codeintel::codeintel_tool_names()
-            .iter()
-            .map(|s| s.to_string()),
-    );
-    if atomcode_capabilities::codeintel::register_lsp_tool(&mut registry, &cfg.lsp) {
-        names.push("lsp".into());
+    if opts.tools {
+        register_codeintel_tools(&mut registry);
+        names.extend(
+            atomcode_capabilities::codeintel::codeintel_tool_names()
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        if atomcode_capabilities::codeintel::register_lsp_tool(&mut registry, &cfg.lsp) {
+            names.push("lsp".into());
+        }
     }
 
     // External-agent subagents (Claude Code / Codex as named subagent tools).
     // Each enabled profile whose binary is present on PATH mounts one tool.
-    let has_external_subagents = if opts.external_subagents.is_empty() {
+    let has_external_subagents = if !opts.tools || opts.external_subagents.is_empty() {
         false
     } else {
         let mounted = atomcode_capabilities::subagent::tool::register_external_subagent_tools(
@@ -505,10 +515,12 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     };
 
     #[cfg(feature = "atomgit")]
-    crate::assemble::register_atomgit_capabilities(&mut registry, &mut names)
-        .map_err(|error| io::Error::other(format!("AtomGit tool setup failed: {error}")))?;
+    if opts.tools {
+        crate::assemble::register_atomgit_capabilities(&mut registry, &mut names)
+            .map_err(|error| io::Error::other(format!("AtomGit tool setup failed: {error}")))?;
+    }
 
-    if opts.web && !atomcode_config::config::offline::is_offline_active() {
+    if opts.tools && opts.web && !atomcode_config::config::offline::is_offline_active() {
         registry.register(Arc::new(WebFetchTool));
         // web_search backend: explicit config wins; else the `ATOMCODE_WEB_SEARCH_PROVIDER`
         // env knob; else Exa. `with_provider` maps unknown values to Exa, the safe default.
@@ -529,7 +541,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // Review-as-capability: a `code_review` sub-agent tool. The provider is filled at
     // assemble (the tool is built here, before the provider exists) via this shared slot,
     // so the reviewer reuses the host's correctly-built — possibly signed — provider.
-    let review_provider: Option<SharedReviewProvider> = if opts.review {
+    let review_provider: Option<SharedReviewProvider> = if opts.tools && opts.review {
         let slot: SharedReviewProvider = Arc::new(std::sync::RwLock::new(None));
         registry.register(Arc::new(
             ReviewTool::new(
@@ -606,80 +618,81 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         .map(|s| s.to_string())
         .collect();
 
-            let reg_e = child_reg.clone();
-            let reg_w = child_reg.clone();
-            let make_explore_tools = move || {
-                let refs: Vec<&str> = explore_names.iter().map(|s| s.as_str()).collect();
-                reg_e.mount(&refs)
-            };
-            let make_worker_tools = move || {
-                let refs: Vec<&str> = worker_names.iter().map(|s| s.as_str()).collect();
-                reg_w.mount(&refs)
-            };
+        let reg_e = child_reg.clone();
+        let reg_w = child_reg.clone();
+        let make_explore_tools = move || {
+            let refs: Vec<&str> = explore_names.iter().map(|s| s.as_str()).collect();
+            reg_e.mount(&refs)
+        };
+        let make_worker_tools = move || {
+            let refs: Vec<&str> = worker_names.iter().map(|s| s.as_str()).collect();
+            reg_w.mount(&refs)
+        };
 
-            // Prefer a runtime-injected tier provider, else fall back to the host-provider
-            // slot (filled at assemble — the single-model / same-as-host collapse path). The
-            // tier provider is a SHARED, swap-aware cell ([`TierProvider`]): it builds lazily on
-            // first `task` use (startup never pays the reqwest-client cost) and its cache is
-            // reset by the runtime on a `/model` swap, so routing re-resolves without a respawn.
-            let fast_cell = cfg.subagent_fast_provider.clone();
-            let cap_cell = cfg.subagent_capable_provider.clone();
-            let slot_fast = slot.clone();
-            let slot_cap = slot.clone();
-            let slot_host = slot.clone();
-            let make_fast = move || {
-                fast_cell.as_ref().and_then(|c| c.get()).unwrap_or_else(|| {
-                    slot_fast
-                        .read()
-                        .ok()
-                        .and_then(|g| g.clone())
-                        .expect("subagent provider slot filled at assemble before any turn")
-                })
-            };
-            let make_capable = move || {
-                cap_cell.as_ref().and_then(|c| c.get()).unwrap_or_else(|| {
-                    slot_cap
-                        .read()
-                        .ok()
-                        .and_then(|g| g.clone())
-                        .expect("subagent provider slot filled at assemble before any turn")
-                })
-            };
-            let make_host = move || {
-                slot_host
+        // Prefer a runtime-injected tier provider, else fall back to the host-provider
+        // slot (filled at assemble — the single-model / same-as-host collapse path). The
+        // tier provider is a SHARED, swap-aware cell ([`TierProvider`]): it builds lazily on
+        // first `task` use (startup never pays the reqwest-client cost) and its cache is
+        // reset by the runtime on a `/model` swap, so routing re-resolves without a respawn.
+        let fast_cell = cfg.subagent_fast_provider.clone();
+        let cap_cell = cfg.subagent_capable_provider.clone();
+        let slot_fast = slot.clone();
+        let slot_cap = slot.clone();
+        let slot_host = slot.clone();
+        let make_fast = move || {
+            fast_cell.as_ref().and_then(|c| c.get()).unwrap_or_else(|| {
+                slot_fast
                     .read()
                     .ok()
-                    .and_then(|provider| provider.clone())
+                    .and_then(|g| g.clone())
                     .expect("subagent provider slot filled at assemble before any turn")
-            };
-
-            // `[subagent]` live knobs. `timeout_secs` remains parse-only compatibility:
-            // a productive child is never cancelled for total wall-clock age.
-            let task_team_manager = team_manager.clone();
-            let mut task_tool = TaskTool::new(
-                make_fast,
-                make_capable,
-                make_explore_tools,
-                make_worker_tools,
-            )
-                .with_host_provider(make_host)
-                .with_max_concurrent(subagent_max_concurrent)
-                .with_max_rounds(subagent_max_rounds)
-                .with_tool_loop_policy(cfg.tool_loop_policy)
-                .with_credential_shell_policy(cfg.credential_shell_policy)
-                .with_worker_middleware(turn_execution_policy.clone())
-                .with_team_event_sink(Arc::new(move |event| {
-                    task_team_manager.publish_external(event);
-                }));
-            if let Some(models) = cfg.subagent_model_providers.clone() {
-                task_tool = task_tool.with_named_provider(move |selection| models.get(selection));
-            }
-            registry.register(Arc::new(task_tool));
-            names.push("task".to_string());
-            Some(slot)
-        } else {
-            None
+            })
         };
+        let make_capable = move || {
+            cap_cell.as_ref().and_then(|c| c.get()).unwrap_or_else(|| {
+                slot_cap
+                    .read()
+                    .ok()
+                    .and_then(|g| g.clone())
+                    .expect("subagent provider slot filled at assemble before any turn")
+            })
+        };
+        let make_host = move || {
+            slot_host
+                .read()
+                .ok()
+                .and_then(|provider| provider.clone())
+                .expect("subagent provider slot filled at assemble before any turn")
+        };
+
+        // `[subagent]` live knobs. `timeout_secs` remains parse-only compatibility:
+        // a productive child is never cancelled for total wall-clock age.
+        let task_team_manager = team_manager.clone();
+        let mut task_tool = TaskTool::new(
+            make_fast,
+            make_capable,
+            make_explore_tools,
+            make_worker_tools,
+        )
+        .with_host_provider(make_host)
+        .with_max_concurrent(subagent_max_concurrent)
+        .with_max_rounds(subagent_max_rounds)
+        .with_stream_timeout(cfg.stream_timeout)
+        .with_tool_loop_policy(cfg.tool_loop_policy)
+        .with_credential_shell_policy(cfg.credential_shell_policy)
+        .with_worker_middleware(turn_execution_policy.clone())
+        .with_team_event_sink(Arc::new(move |event| {
+            task_team_manager.publish_external(event);
+        }));
+        if let Some(models) = cfg.subagent_model_providers.clone() {
+            task_tool = task_tool.with_named_provider(move |selection| models.get(selection));
+        }
+        registry.register(Arc::new(task_tool));
+        names.push("task".to_string());
+        Some(slot)
+    } else {
+        None
+    };
 
     let team_runner = subagent_provider.as_ref().map(|slot| {
         use atomcode_capabilities::team::{TeamDifficulty, TeamPermission};
@@ -745,35 +758,43 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     let instruction_text = session_context_hook.instruction_text();
 
     // Skills: standard home+project precedence unless the caller supplied dirs.
-    let skill_dirs = opts.skill_dirs.clone().unwrap_or_else(|| {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        runtime_skill_dirs(&home, &cfg.working_dir)
-    });
+    let skill_dirs = if opts.tools {
+        opts.skill_dirs.clone().unwrap_or_else(|| {
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            runtime_skill_dirs(&home, &cfg.working_dir)
+        })
+    } else {
+        Vec::new()
+    };
     // Plugin-contributed skills: each (dir, namespace) pair registered as
     // `<namespace>:<skill-name>`, matching the slash-menu's core registry
     // convention. Empty when the driver saw no installed plugins (the L1
     // capabilities crate cannot reach the core plugin loader by design).
     let mut skills = SkillRegistry::load(&skill_dirs);
-    for (dir, ns) in &opts.plugin_skill_dirs {
-        skills.load_dir(dir, Some(ns));
+    if opts.tools {
+        for (dir, ns) in &opts.plugin_skill_dirs {
+            skills.load_dir(dir, Some(ns));
+        }
     }
     let skills = Arc::new(skills);
     // Render the catalog BEFORE the registry is moved into the tools; injected as a
     // leading system message by SkillCatalogHook below (without it the model never
     // learns which skills exist — only the use_skill/list_skills tools were mounted).
     let skill_catalog = skills.render_catalog_prioritizing(&instruction_text);
-    register_skill_tools(&mut registry, skills);
-    names.extend(
-        atomcode_capabilities::skills::skill_tool_names()
-            .iter()
-            .map(|s| s.to_string()),
-    );
+    if opts.tools {
+        register_skill_tools(&mut registry, skills);
+        names.extend(
+            atomcode_capabilities::skills::skill_tool_names()
+                .iter()
+                .map(|s| s.to_string()),
+        );
+    }
 
     // MCP readiness is supplemental: start connections now, but never await them on
     // the session candidate path. `mount()` publishes each connected server's tools
     // atomically for the next turn, then publishes once more when the initial pass
     // reaches its bounded terminal state.
-    let (mcp_registry, mcp_connect_rx) = if opts.mcp {
+    let (mcp_registry, mcp_connect_rx) = if opts.tools && opts.mcp {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         (
             Some(Arc::new(McpRegistry::from_config_background_with_extra(
@@ -953,7 +974,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // production registration of TodoHook — every real entrypoint (CLI, daemon, clix) goes
     // through prepare()/assemble() here; `assemble.rs::build_coding_agent` (which also registers
     // it) is reachable only from tests + examples, so there is no double-registration.
-    if crate::persona::todo_switch_enabled_for(cfg.todo.enabled) {
+    if todo_enabled {
         hooks.push(Arc::new(crate::todo::TodoHook));
     }
     // DeepSeek-only opening-turn skill-first reminder. A weak model (deepseek) skips
@@ -1014,6 +1035,10 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         registry: mcp_registry.clone(),
         publication_enabled: Arc::clone(&mcp_publication_enabled),
     };
+
+    if !opts.tools {
+        names.clear();
+    }
 
     Ok(CodingParts {
         shared_cwd: std::sync::Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
@@ -1660,10 +1685,9 @@ pub fn assemble(
     )
     .map(Arc::new);
     let rate_limit_hook = match &parts.rate_limit_source {
-        Some(source) => crate::rate_limit::RateLimitHook::with_source(
-            cfg.base_url.clone(),
-            source.clone(),
-        ),
+        Some(source) => {
+            crate::rate_limit::RateLimitHook::with_source(cfg.base_url.clone(), source.clone())
+        }
         None => crate::rate_limit::RateLimitHook::new(cfg.base_url.clone()),
     }
     .with_max_attempts(cfg.retry_max_attempts);
@@ -1846,13 +1870,12 @@ pub fn assemble(
             let session_id = b.id.clone();
             let persistence_status = parts.snapshot_persistence_status();
             models.set_usage_recorder_factory(Arc::new(move |selection, model| {
-                let mut recorder =
-                    atomcode_capabilities::session::DetachedUsageRecorder::new(
-                        manager.clone(),
-                        &session_id,
-                        selection,
-                        model,
-                    );
+                let mut recorder = atomcode_capabilities::session::DetachedUsageRecorder::new(
+                    manager.clone(),
+                    &session_id,
+                    selection,
+                    model,
+                );
                 if let Some(status) = persistence_status.clone() {
                     recorder = recorder.with_persistence_status(status);
                 }
@@ -1900,7 +1923,7 @@ pub fn assemble(
             parts.request_user_input_enabled,
             parts.review_provider.is_some(),
             parts.subagent_provider.is_some(),
-                    parts.has_external_subagents,
+            parts.has_external_subagents,
         );
         builder = builder.resume(snapshot);
     }
@@ -2128,7 +2151,10 @@ mod tests {
         assert_eq!(profiles[0].name, "codex");
         assert_eq!(profiles[0].kind, SubagentKind::Codex);
         assert_eq!(profiles[0].permission, PermissionMode::ReadOnly);
-        assert!(!profiles[0].allow_dangerous, "built-ins are never dangerous");
+        assert!(
+            !profiles[0].allow_dangerous,
+            "built-ins are never dangerous"
+        );
 
         // An explicit [[subagent.external]] named "codex" overrides the switch.
         sub.external = vec![ExternalSubagentConfig {
@@ -2170,7 +2196,10 @@ mod tests {
             enabled: false,
         }];
         let p = resolve_external_subagents(&sub, true);
-        assert!(p.is_empty(), "disabled explicit codex blocks the built-in switch");
+        assert!(
+            p.is_empty(),
+            "disabled explicit codex blocks the built-in switch"
+        );
     }
 
     fn agent_config(model: &str) -> CodingAgentConfig {
@@ -2400,7 +2429,10 @@ mod tests {
         assert!(snapshot.messages[first_non_system..]
             .iter()
             .all(|message| message.role != Role::System));
-        assert_eq!(snapshot.messages[first_non_system].text, "what model are you?");
+        assert_eq!(
+            snapshot.messages[first_non_system].text,
+            "what model are you?"
+        );
         assert_eq!(snapshot.messages[first_non_system + 1].text, "I am model-a");
         assert!(!snapshot
             .messages
@@ -2485,7 +2517,15 @@ mod tests {
             )),
             Message::assistant("I am model-a", vec![]),
         ]);
-        reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true, true, false);
+        reconcile_coding_persona(
+            &mut snapshot,
+            &agent_config("model-b"),
+            true,
+            true,
+            true,
+            true,
+            false,
+        );
         snapshot.messages.push(Message::system(format!(
             "{MODEL_CHANGE_CONTEXT_PREFIX}\nlegacy transition"
         )));
@@ -2527,6 +2567,7 @@ mod tests {
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let opts = PrepareOptions {
             session: SessionMode::Disabled,
+            tools: true,
             skill_dirs: Some(vec![]),
             plugin_skill_dirs: Vec::new(),
             mcp: true,
@@ -2598,6 +2639,7 @@ mod tests {
     fn io_free_opts() -> PrepareOptions {
         PrepareOptions {
             session: SessionMode::Disabled,
+            tools: true,
             skill_dirs: Some(vec![]),
             plugin_skill_dirs: Vec::new(),
             mcp: false,
@@ -2625,6 +2667,23 @@ mod tests {
             .iter()
             .any(|name| name == "request_user_input"));
         assert!(!parts.request_user_input_enabled);
+    }
+
+    #[tokio::test]
+    async fn driver_can_publish_an_empty_tool_catalog() {
+        let project = tempfile::tempdir().unwrap();
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        let mut opts = io_free_opts();
+        opts.tools = false;
+        let mut parts = prepare(&cfg, opts).await.unwrap();
+
+        assert!(parts.selected_tool_names().is_empty());
+        assert!(parts.mount().defs().is_empty());
+        assert!(!parts.todo_enabled);
+        assert!(!parts.request_user_input_enabled);
+        assert!(parts.review_provider.is_none());
+        assert!(!parts.has_external_subagents);
+        assert!(parts.mcp_registry.is_none());
     }
 
     #[cfg(feature = "atomgit")]

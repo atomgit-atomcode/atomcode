@@ -299,6 +299,15 @@ pub enum AgentEvent {
         max_attempts: u32,
         recovered: bool,
     },
+    /// A retryable provider OPEN failure is backing off before reopening the
+    /// same logical round. Structured so non-interactive drivers do not parse a
+    /// localized warning string to recover attempt metadata.
+    ProviderRetry {
+        attempt: u32,
+        max_attempts: u32,
+        backoff_secs: u64,
+        reason: String,
+    },
     /// The provider ended a text response with `finish_reason=length`, and the
     /// kernel is using one of its bounded automatic continuation attempts.
     /// Purely observational: drivers may update transient progress UI.

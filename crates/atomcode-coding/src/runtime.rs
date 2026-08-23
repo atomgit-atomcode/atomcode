@@ -8543,9 +8543,9 @@ mod tests {
             _config: &CodingAgentConfig,
             _session_id: Option<&str>,
         ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
-            Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(vec![vec![
-                atomcode_kernel::stream::StreamEvent::Done { truncated: false },
-            ]])))
+            Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(vec![
+                vec![atomcode_kernel::stream::StreamEvent::Done { truncated: false }],
+            ])))
         }
     }
 
@@ -8833,6 +8833,7 @@ mod tests {
             prepare: PrepareOptions {
                 request_user_input: true,
                 session: crate::SessionMode::Disabled,
+                tools: true,
                 skill_dirs: Some(Vec::new()),
                 plugin_skill_dirs: Vec::new(),
                 mcp: false,

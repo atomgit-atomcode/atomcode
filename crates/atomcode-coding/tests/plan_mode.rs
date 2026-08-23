@@ -26,6 +26,7 @@ async fn plan_mode_blocks_a_write_tool_through_full_assembly() {
     cfg.request_timeout = Some(Duration::from_secs(5));
     let opts = PrepareOptions {
         session: SessionMode::Disabled,
+        tools: true,
         skill_dirs: Some(vec![project.path().join("skills")]),
         plugin_skill_dirs: Vec::new(),
         mcp: false,

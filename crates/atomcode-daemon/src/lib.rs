@@ -4165,6 +4165,16 @@ impl ChatRuntimeProjector {
                 vec![ChatEvent::Warning { message }]
             }
             Agent::Warning(message) => vec![ChatEvent::Warning { message }],
+            Agent::ProviderRetry {
+                attempt,
+                max_attempts,
+                backoff_secs,
+                reason,
+            } => vec![ChatEvent::Warning {
+                message: format!(
+                    "API error {reason}，{backoff_secs} 秒后重试({attempt}/{max_attempts})..."
+                ),
+            }],
             Agent::OutputTruncationRecovery {
                 attempt,
                 max_attempts,

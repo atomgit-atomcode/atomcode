@@ -175,6 +175,7 @@ pub async fn code(args: CodeArgs) -> Result<()> {
     let opts = PrepareOptions {
         subagents: atomcode_coding::SubagentPolicy::Enabled,
         session,
+        tools: true,
         skill_dirs: None,
         plugin_skill_dirs: Vec::new(),
         mcp: !args.no_mcp,
@@ -419,6 +420,14 @@ async fn drive_turn(
                 eprintln!("\n[error] {message}")
             }
             CodingRuntimeEvent::Agent(AgentEvent::Warning(w)) => eprintln!("[warn] {w}"),
+            CodingRuntimeEvent::Agent(AgentEvent::ProviderRetry {
+                attempt,
+                max_attempts,
+                backoff_secs,
+                reason,
+            }) => eprintln!(
+                "[retry] API error {reason}; retrying in {backoff_secs}s ({attempt}/{max_attempts})"
+            ),
             CodingRuntimeEvent::Agent(AgentEvent::StreamRecovery {
                 attempt,
                 max_attempts,

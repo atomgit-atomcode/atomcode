@@ -533,6 +533,14 @@ pub struct TaskTool {
     make_worker_tools: Box<dyn Fn() -> MountedTools + Send + Sync>,
     max_concurrent: usize,
     max_rounds: Option<u32>,
+    /// Kernel event-idle liveness guard for each child (parity with the parent
+    /// agent and the team runner). Without it a child whose provider keeps the
+    /// connection nominally alive — SSE keep-alive bytes reset the provider's
+    /// BYTE-idle timeout while no real tokens arrive — hangs unbounded (observed:
+    /// a subagent stuck 683 min). This is an idle/liveness cap, NOT a total
+    /// wall-clock timeout, so it does not contradict the "long research runs
+    /// freely" policy below.
+    stream_timeout: Option<std::time::Duration>,
     tool_loop_policy: Option<ToolLoopPolicy>,
     inherited_worker_middlewares: Vec<Arc<dyn ToolMiddleware>>,
     team_event_sink: Option<Arc<dyn Fn(crate::team::TeamEvent) + Send + Sync>>,
@@ -555,6 +563,7 @@ impl TaskTool {
             make_worker_tools: Box::new(make_worker_tools),
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             max_rounds: Some(super::DEFAULT_CHILD_MAX_ROUNDS),
+            stream_timeout: None,
             tool_loop_policy: Some(ToolLoopPolicy::default()),
             inherited_worker_middlewares: Vec::new(),
             team_event_sink: None,
@@ -594,6 +603,15 @@ impl TaskTool {
     /// the exact no-progress policy is configured independently.
     pub fn with_max_rounds(mut self, n: u32) -> Self {
         self.max_rounds = (n != 0).then_some(n);
+        self
+    }
+
+    /// Set the per-child kernel event-idle stream timeout (parity with the parent
+    /// agent / team runner). A child that produces no stream EVENT for this long
+    /// reconnects and, after the kernel's retry budget, fails cleanly instead of
+    /// hanging forever behind provider keep-alives. `None` leaves it unset (no cap).
+    pub fn with_stream_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.stream_timeout = Some(timeout);
         self
     }
 
@@ -843,6 +861,7 @@ parallel workers NON-OVERLAPPING scopes."
 
         let sem = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent));
         let max_rounds = self.max_rounds;
+        let stream_timeout = self.stream_timeout;
         let tool_loop_policy = self.tool_loop_policy;
         let inherited_worker_middlewares = self.inherited_worker_middlewares.clone();
         let mut set = tokio::task::JoinSet::new();
@@ -955,6 +974,7 @@ parallel workers NON-OVERLAPPING scopes."
                     progress_hook.clone(),
                     tool_loop_policy,
                     max_rounds,
+                    stream_timeout,
                     child_middlewares.clone(),
                 );
                 // DETACH: inner spawn lets the child run independent of this future;
@@ -971,7 +991,9 @@ parallel workers NON-OVERLAPPING scopes."
                 ));
                 // There is deliberately no total wall-clock timeout here. Long-running
                 // research may make steady progress for many minutes; liveness is bounded by
-                // provider idle timeouts, the child round cap, and explicit parent/user cancel.
+                // the kernel event-idle `stream_timeout` (wired via `build_task_child` — the
+                // provider's BYTE-idle timeout alone is defeated by SSE keep-alives), the
+                // child round cap, and explicit parent/user cancel.
                 let mut outcome = match handle.await {
                     Ok(o) => o,
                     Err(join_err) => Outcome {
@@ -1014,6 +1036,7 @@ parallel workers NON-OVERLAPPING scopes."
                         progress_hook.clone(),
                         tool_loop_policy,
                         max_rounds,
+                        stream_timeout,
                         child_middlewares,
                     );
                     outcome = run_child_to_completion(
@@ -1492,6 +1515,7 @@ fn build_task_child(
     progress: Arc<SubtaskProgressHook>,
     tool_loop_policy: Option<ToolLoopPolicy>,
     max_rounds: Option<u32>,
+    stream_timeout: Option<std::time::Duration>,
     middlewares: Vec<Arc<dyn ToolMiddleware>>,
 ) -> Agent {
     let mut builder = Agent::builder()
@@ -1506,6 +1530,12 @@ fn build_task_child(
     }
     if let Some(max_rounds) = max_rounds {
         builder = builder.max_rounds(max_rounds);
+    }
+    // Event-idle liveness guard (parity with parent + team runner). Catches a
+    // child that stalls behind provider keep-alive bytes; the kernel reconnects
+    // then fails cleanly instead of hanging forever.
+    if let Some(timeout) = stream_timeout {
+        builder = builder.stream_timeout(timeout);
     }
     for middleware in middlewares {
         builder = builder.middleware(middleware);
@@ -2596,6 +2626,65 @@ mod tests {
         assert!(
             result.content.contains("Cancelled"),
             "cancel cause must remain visible: {}",
+            result.content
+        );
+    }
+
+    /// Regression: a child whose provider holds the connection open but emits NO
+    /// stream events used to hang forever (observed: a subagent stuck 683 min)
+    /// because `build_task_child` never set the kernel event-idle `stream_timeout`
+    /// — the provider's byte-idle timeout alone is defeated by keep-alives. With
+    /// `with_stream_timeout` wired through, the child reconnects a bounded number
+    /// of times, then fails cleanly WITHOUT any external cancel.
+    #[tokio::test]
+    async fn child_stream_idle_timeout_fails_the_batch_without_cancel() {
+        struct HangingProvider;
+
+        #[async_trait]
+        impl LlmProvider for HangingProvider {
+            fn model_name(&self) -> &str {
+                "hanging"
+            }
+
+            async fn chat_stream(
+                &self,
+                _m: &[Message],
+                _t: &[ToolDef],
+                _o: &ChatOptions,
+            ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+                Ok(stream::pending::<StreamEvent>().boxed())
+            }
+        }
+
+        let reg = Arc::new(ToolRegistry::new());
+        let r1 = reg.clone();
+        let r2 = reg.clone();
+        let tool = TaskTool::new(
+            || Arc::new(HangingProvider) as Arc<dyn LlmProvider>,
+            || Arc::new(HangingProvider) as Arc<dyn LlmProvider>,
+            move || r1.mount(&[]),
+            move || r2.mount(&[]),
+        )
+        // Tiny idle window so the bounded reconnect budget elapses fast in-test.
+        .with_stream_timeout(std::time::Duration::from_millis(20));
+        let context = ctx();
+
+        // Generous outer bound: the real path is ~5 reconnects × exponential
+        // backoff (≈6.3s). If `stream_timeout` were NOT wired the child would hang
+        // and this timeout would fire the panic — exactly the regression.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tool.execute(
+                r#"{"tasks":[{"description":"wait","prompt":"p","subagent_type":"explore"}]}"#,
+                &context,
+            ),
+        )
+        .await
+        .expect("stream_timeout must terminate the idle child, not hang");
+
+        assert!(
+            result.is_error,
+            "a child that never produced a stream event must fail the batch: {}",
             result.content
         );
     }

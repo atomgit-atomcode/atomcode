@@ -2306,11 +2306,12 @@ impl RunningAgent {
                 Err(e) if e.retryable && provider_retry < self.max_provider_retries => {
                     provider_retry += 1;
                     let wait = (provider_retry as u64 * 3).min(15); // 3 / 6 / 9s, matching v1
-                    self.rt.emit(AgentEvent::Warning(format!(
-                        "API error {}，{wait} 秒后重试({provider_retry}/{})...",
-                        retry_reason(&e),
-                        self.max_provider_retries
-                    )));
+                    self.rt.emit(AgentEvent::ProviderRetry {
+                        attempt: provider_retry,
+                        max_attempts: self.max_provider_retries,
+                        backoff_secs: wait,
+                        reason: retry_reason(&e).to_string(),
+                    });
                     // Cancellable backoff: Esc during the wait aborts the turn instead
                     // of forcing the user to sit through the full delay.
                     tokio::select! {

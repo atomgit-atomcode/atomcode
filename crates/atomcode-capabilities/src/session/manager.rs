@@ -1450,31 +1450,51 @@ impl SessionManager {
         operation()
     }
 
-    fn commit_atomic_write(
+    /// Atomic write of one artifact, reporting whether a failure already replaced
+    /// the target (rename done) — see [`AtomicWriteFailure::mutated`]. Test fault
+    /// injection is modelled on the same boundary: `BeforeReplace` leaves the
+    /// target untouched, `AfterReplace` fires once the real rename has committed.
+    fn commit_atomic_write_tracked(
         &self,
         _artifact: CommitArtifact,
         path: &Path,
         bytes: &[u8],
-    ) -> SessionResult<()> {
+    ) -> Result<(), AtomicWriteFailure> {
         #[cfg(test)]
         {
             self.commit_write_log.lock().unwrap().push(_artifact);
             if self.take_commit_write_fault(_artifact, CommitFaultTiming::BeforeReplace) {
-                return Err(io_at(
-                    path,
-                    io::Error::other("injected commit failure before replacement"),
-                ));
+                return Err(AtomicWriteFailure {
+                    error: io_at(
+                        path,
+                        io::Error::other("injected commit failure before replacement"),
+                    ),
+                    mutated: false,
+                });
             }
         }
-        atomic_write(path, bytes)?;
+        atomic_write_tracked(path, bytes)?;
         #[cfg(test)]
         if self.take_commit_write_fault(_artifact, CommitFaultTiming::AfterReplace) {
-            return Err(io_at(
-                path,
-                io::Error::other("injected commit failure after replacement"),
-            ));
+            return Err(AtomicWriteFailure {
+                error: io_at(
+                    path,
+                    io::Error::other("injected commit failure after replacement"),
+                ),
+                mutated: true,
+            });
         }
         Ok(())
+    }
+
+    fn commit_atomic_write(
+        &self,
+        artifact: CommitArtifact,
+        path: &Path,
+        bytes: &[u8],
+    ) -> SessionResult<()> {
+        self.commit_atomic_write_tracked(artifact, path, bytes)
+            .map_err(|failure| failure.error)
     }
 
     fn commit_replacements_with_rollback(
@@ -1482,45 +1502,66 @@ impl SessionManager {
         id: &str,
         replacements: &[CommitReplacement],
     ) -> SessionResult<()> {
-        let mut attempted = Vec::with_capacity(replacements.len());
+        // Only replacements whose `rename` actually completed are "installed" on
+        // disk and owe a rollback. A write that fails BEFORE its rename (e.g. no
+        // disk space to write the tmp) leaves its target untouched, so it must
+        // NOT be rolled back — rolling back an untouched target is what turned a
+        // recoverable disk-full into a false "persistence uncertain" fatal stop.
+        let mut installed = Vec::with_capacity(replacements.len());
         for (index, replacement) in replacements.iter().enumerate() {
-            attempted.push(index);
-            if let Err(commit_error) = self.commit_atomic_write(
+            match self.commit_atomic_write_tracked(
                 replacement.artifact,
                 &replacement.path,
                 &replacement.after,
             ) {
-                let mut rollback_errors = Vec::new();
-                // Restore the catalog-visible metadata commit point first, then
-                // unwind sidecars in reverse publication order.
-                for attempted_index in attempted.into_iter().rev() {
-                    let attempted_replacement = &replacements[attempted_index];
-                    let rollback = match attempted_replacement.before.as_deref() {
-                        Some(before) => self.commit_atomic_write(
-                            attempted_replacement.artifact,
-                            &attempted_replacement.path,
-                            before,
-                        ),
-                        None => self.commit_atomic_remove(
-                            attempted_replacement.artifact,
-                            &attempted_replacement.path,
-                        ),
-                    };
-                    if let Err(rollback_error) = rollback {
-                        rollback_errors.push(format!(
-                            "{}: {rollback_error}",
-                            attempted_replacement.path.display()
-                        ));
+                Ok(()) => installed.push(index),
+                Err(failure) => {
+                    // A failure after the rename still left new bytes on the
+                    // target, so it too must be unwound.
+                    if failure.mutated {
+                        installed.push(index);
                     }
+                    let commit_error = failure.error;
+                    // Nothing was actually replaced on disk (the common disk-full
+                    // case: the first write failed before its rename). The last
+                    // committed state is fully intact — surface a plain,
+                    // recoverable error, NOT an UncertainCommit, so the runtime
+                    // keeps the good snapshot instead of fatal-stopping.
+                    if installed.is_empty() {
+                        return Err(commit_error);
+                    }
+                    let mut rollback_errors = Vec::new();
+                    // Restore the catalog-visible metadata commit point first, then
+                    // unwind sidecars in reverse publication order.
+                    for installed_index in installed.into_iter().rev() {
+                        let installed_replacement = &replacements[installed_index];
+                        let rollback = match installed_replacement.before.as_deref() {
+                            Some(before) => self.commit_atomic_write(
+                                installed_replacement.artifact,
+                                &installed_replacement.path,
+                                before,
+                            ),
+                            None => self.commit_atomic_remove(
+                                installed_replacement.artifact,
+                                &installed_replacement.path,
+                            ),
+                        };
+                        if let Err(rollback_error) = rollback {
+                            rollback_errors.push(format!(
+                                "{}: {rollback_error}",
+                                installed_replacement.path.display()
+                            ));
+                        }
+                    }
+                    if rollback_errors.is_empty() {
+                        return Err(commit_error);
+                    }
+                    return Err(SessionStoreError::UncertainCommit {
+                        id: id.to_string(),
+                        commit_error: commit_error.to_string(),
+                        rollback_errors,
+                    });
                 }
-                if rollback_errors.is_empty() {
-                    return Err(commit_error);
-                }
-                return Err(SessionStoreError::UncertainCommit {
-                    id: id.to_string(),
-                    commit_error: commit_error.to_string(),
-                    rollback_errors,
-                });
             }
         }
         Ok(())
@@ -4023,18 +4064,42 @@ fn io_at(path: &Path, source: io::Error) -> SessionStoreError {
     }
 }
 
+/// An atomic-write failure, tagged with whether the target was already replaced.
+///
+/// `mutated == true` means the `rename` completed — new (possibly not yet
+/// dir-synced) bytes are in place, so the write owes a rollback. `mutated ==
+/// false` means the target is UNTOUCHED (the failure happened before the rename,
+/// e.g. no disk space to write the tmp), so the last committed bytes are intact
+/// and no rollback is owed. This is what keeps a disk-full commit from
+/// escalating into a false "persistence uncertain" fatal stop.
+struct AtomicWriteFailure {
+    error: SessionStoreError,
+    mutated: bool,
+}
+
 /// Write `bytes` to `path` atomically: write a sibling `*.tmp` then `rename` over the
 /// target, then sync the parent directory on Unix so the new directory entry survives
 /// power loss. A crash mid-write never leaves a half-written (corrupt) session file.
 /// The tmp's extension (`…tmp`) is ignored by [`SessionManager::list`]'s `*.meta`
 /// filter, so a leftover tmp from a crash never appears as a session.
 fn atomic_write(path: &Path, bytes: &[u8]) -> SessionResult<()> {
+    atomic_write_tracked(path, bytes).map_err(|failure| failure.error)
+}
+
+/// [`atomic_write`], additionally reporting via [`AtomicWriteFailure::mutated`]
+/// whether a failure occurred AFTER the target was replaced (rename done) or
+/// before (target untouched).
+fn atomic_write_tracked(path: &Path, bytes: &[u8]) -> Result<(), AtomicWriteFailure> {
+    let untouched = |error| AtomicWriteFailure {
+        error,
+        mutated: false,
+    };
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
-    reject_existing_non_regular(path)?;
+    fs::create_dir_all(parent).map_err(|e| untouched(io_at(parent, e)))?;
+    reject_existing_non_regular(path).map_err(untouched)?;
     static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
     let sequence = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
     let file_name = path
@@ -4046,6 +4111,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> SessionResult<()> {
         std::process::id(),
         sequence
     ));
+    let mut renamed = false;
     let result = (|| {
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
@@ -4055,6 +4121,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> SessionResult<()> {
         file.write_all(bytes).map_err(|e| io_at(&tmp, e))?;
         file.sync_all().map_err(|e| io_at(&tmp, e))?;
         fs::rename(&tmp, path).map_err(|e| io_at(path, e))?;
+        // Past this point the target already holds the new bytes.
+        renamed = true;
         #[cfg(unix)]
         File::open(parent)
             .and_then(|directory| directory.sync_all())
@@ -4064,7 +4132,10 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> SessionResult<()> {
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
-    result
+    result.map_err(|error| AtomicWriteFailure {
+        error,
+        mutated: renamed,
+    })
 }
 
 #[cfg(test)]
@@ -6008,6 +6079,54 @@ mod tests {
                 ..
             } if !rollback_errors.is_empty()
         ));
+    }
+
+    #[test]
+    fn commit_fail_before_any_install_stays_recoverable_not_uncertain() {
+        // Disk-full reproduction: the first artifact write fails BEFORE its
+        // rename (target untouched), and a rollback of it would ALSO fail (a
+        // second same-timing fault). The old code rolled back the untouched
+        // target and, when that rollback failed, escalated to a fatal
+        // UncertainCommit even though the last committed snapshot was fully
+        // intact. Now nothing is "installed", so no rollback runs and the error
+        // stays a plain, recoverable one.
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("s1").unwrap();
+        let mut meta = SessionMeta::new("s1", "/before", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &lease,
+            Some(&snap(&["before"])),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        let snapshot_before = std::fs::read(mgr.snapshot_path("s1").unwrap()).unwrap();
+
+        // Snapshot is committed first. Fail its commit write before the rename,
+        // and queue a second identical fault that WOULD break a rollback if one
+        // were (wrongly) attempted.
+        mgr.fail_commit_write(CommitArtifact::Snapshot, CommitFaultTiming::BeforeReplace);
+        mgr.fail_commit_write(CommitArtifact::Snapshot, CommitFaultTiming::BeforeReplace);
+
+        let error = mgr
+            .commit_native_runtime_mutation(&lease, &snap(&["after"]), |_, meta, _| {
+                meta.working_dir = "/after".into();
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(
+            !error.is_uncertain_commit(),
+            "a commit that replaced nothing on disk must stay recoverable, got: {error}"
+        );
+        // The last good snapshot on disk retains its committed bytes.
+        assert_eq!(
+            std::fs::read(mgr.snapshot_path("s1").unwrap()).unwrap(),
+            snapshot_before,
+            "the untouched snapshot must keep its committed bytes"
+        );
     }
 
     #[test]

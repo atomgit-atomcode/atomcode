@@ -1568,8 +1568,16 @@ fn map_usage(u: ChunkUsage) -> TokenUsage {
         .or(u.cached_tokens) // GLM / Zhipu
         .or_else(|| u.prompt_tokens_details.and_then(|d| d.cached_tokens)) // OpenAI
         .unwrap_or(0);
+    // DeepSeek-compatible gateways may omit the aggregate while still reporting
+    // the exact cache split. Normalize that wire variant to the kernel contract:
+    // `prompt` is total input and `cached` is the cache-read subset.
+    let prompt = u.prompt_tokens.unwrap_or_else(|| {
+        u.prompt_cache_hit_tokens
+            .unwrap_or(0)
+            .saturating_add(u.prompt_cache_miss_tokens.unwrap_or(0))
+    });
     TokenUsage {
-        prompt: u.prompt_tokens.unwrap_or(0),
+        prompt,
         completion: u.completion_tokens.unwrap_or(0),
         cached,
     }
@@ -1641,6 +1649,8 @@ struct ChunkUsage {
     completion_tokens: Option<u32>,
     #[serde(default)]
     prompt_cache_hit_tokens: Option<u32>,
+    #[serde(default)]
+    prompt_cache_miss_tokens: Option<u32>,
     #[serde(default)]
     cached_tokens: Option<u32>,
     #[serde(default)]
@@ -3016,6 +3026,22 @@ mod tests {
             })
             .unwrap();
         assert_eq!(u.cached, 2);
+    }
+
+    #[test]
+    fn deepseek_cache_split_recovers_missing_prompt_total() {
+        let usage = map_usage(ChunkUsage {
+            prompt_tokens: None,
+            completion_tokens: Some(7),
+            prompt_cache_hit_tokens: Some(80),
+            prompt_cache_miss_tokens: Some(20),
+            cached_tokens: None,
+            prompt_tokens_details: None,
+        });
+
+        assert_eq!(usage.prompt, 100);
+        assert_eq!(usage.cached, 80);
+        assert_eq!(usage.completion, 7);
     }
 
     #[test]

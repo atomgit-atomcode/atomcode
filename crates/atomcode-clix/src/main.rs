@@ -634,6 +634,14 @@ impl ReviewRun {
                 self.error = Some(message);
             }
             AgentEvent::Warning(w) => eprintln!("    [warn] {w}"),
+            AgentEvent::ProviderRetry {
+                attempt,
+                max_attempts,
+                backoff_secs,
+                reason,
+            } => eprintln!(
+                "    [retry] API error {reason}; retrying in {backoff_secs}s ({attempt}/{max_attempts})"
+            ),
             AgentEvent::StreamRecovery {
                 attempt,
                 max_attempts,

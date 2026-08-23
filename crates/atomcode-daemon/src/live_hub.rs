@@ -2431,7 +2431,9 @@ mod tests {
         )
         .unwrap();
 
-        let observation = receiver.try_recv().expect("effort change must be broadcast");
+        let observation = receiver
+            .try_recv()
+            .expect("effort change must be broadcast");
         assert!(matches!(
             observation.event,
             LiveViewEvent::Runtime(CodingRuntimeEvent::ReasoningEffortChanged {

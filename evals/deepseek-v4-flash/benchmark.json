@@ -1,0 +1,22 @@
+{
+  "suite": "deepseek-v4-flash-quick",
+  "repetitions": 3,
+  "pair_concurrency": 2,
+  "timeout_seconds": 900,
+  "start_skew_ms": 500,
+  "random_seed": 20260823,
+  "atomcode_bin": "atomcode",
+  "codex_bin": "codex",
+  "codex_model": "",
+  "config": "~/.atomcode/config.toml",
+  "candidates": {
+    "official": {
+      "selection": "AtomGit-deepseek-v4-flash",
+      "expected_model": "deepseek-v4-flash"
+    },
+    "volcengine": {
+      "selection": "volcengine/deepseek-v4-flash",
+      "expected_model": "ep-20260822184526-dbhzk"
+    }
+  }
+}

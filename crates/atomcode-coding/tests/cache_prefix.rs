@@ -125,6 +125,7 @@ async fn full_assembly_wire_prefix_is_cacheable_across_turns() {
     // Memory ON — the hook that rewrites the leading-system run is the main risk.
     let opts = PrepareOptions {
         session: SessionMode::Disabled,
+        tools: true,
         skill_dirs: Some(vec![project.path().join("skills")]),
         plugin_skill_dirs: Vec::new(),
         mcp: false,
@@ -217,6 +218,7 @@ async fn tool_block_and_system_are_deterministic_across_independent_assemblies()
     let cfg = cfg(project.path());
     let opts = || PrepareOptions {
         session: SessionMode::Disabled,
+        tools: true,
         skill_dirs: Some(vec![project.path().join("skills")]),
         plugin_skill_dirs: Vec::new(),
         mcp: false,

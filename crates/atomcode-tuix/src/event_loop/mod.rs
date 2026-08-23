@@ -7796,9 +7796,18 @@ mod menu_tests {
     #[test]
     fn mode_setter_mode_identifies_toggle_commands() {
         use crate::state::AgentMode;
-        assert!(matches!(super::mode_setter_mode("plan"), Some(AgentMode::Plan)));
-        assert!(matches!(super::mode_setter_mode("build"), Some(AgentMode::Build)));
-        assert!(matches!(super::mode_setter_mode("auto"), Some(AgentMode::Auto)));
+        assert!(matches!(
+            super::mode_setter_mode("plan"),
+            Some(AgentMode::Plan)
+        ));
+        assert!(matches!(
+            super::mode_setter_mode("build"),
+            Some(AgentMode::Build)
+        ));
+        assert!(matches!(
+            super::mode_setter_mode("auto"),
+            Some(AgentMode::Auto)
+        ));
         assert!(super::mode_setter_mode("goal").is_none());
         assert!(super::mode_setter_mode("plans").is_none());
     }
@@ -12639,8 +12648,14 @@ fn handle_transcript_pointer(
                             let (start, end) =
                                 pointer_select::word_bounds(&run.text, endpoint.byte);
                             (
-                                SemanticEndpoint { run_id: endpoint.run_id, byte: start },
-                                SemanticEndpoint { run_id: endpoint.run_id, byte: end },
+                                SemanticEndpoint {
+                                    run_id: endpoint.run_id,
+                                    byte: start,
+                                },
+                                SemanticEndpoint {
+                                    run_id: endpoint.run_id,
+                                    byte: end,
+                                },
                             )
                         }
                         None => (endpoint, endpoint),
@@ -12648,7 +12663,10 @@ fn handle_transcript_pointer(
                 } else {
                     match pointer_select::line_run_span(&frame.copy_runs, endpoint.run_id) {
                         Some((first, last)) => (
-                            SemanticEndpoint { run_id: frame.copy_runs[first].id, byte: 0 },
+                            SemanticEndpoint {
+                                run_id: frame.copy_runs[first].id,
+                                byte: 0,
+                            },
                             SemanticEndpoint {
                                 run_id: frame.copy_runs[last].id,
                                 byte: frame.copy_runs[last].text.len(),
@@ -13938,7 +13956,10 @@ mod tests {
         let (ev, trailing) = super::coalesce_drag_events(pointer_ev(PointerKind::Down), &mut rx);
         assert!(matches!(ev, crate::input::InputEvent::Pointer(p) if p.kind == PointerKind::Down));
         assert!(trailing.is_none());
-        assert!(rx.try_recv().is_ok(), "a non-drag input must not drain the queue");
+        assert!(
+            rx.try_recv().is_ok(),
+            "a non-drag input must not drain the queue"
+        );
     }
 
     fn pointer_interaction() -> InteractionFrame {
@@ -14221,7 +14242,11 @@ mod tests {
         let publisher = crate::render::interaction::InteractionPublisher::default();
         // run 1 soft-wraps into run 2 (copy_run sets next_run_id = Some(2)):
         // together they are one logical line "foo bar" (no newline between).
-        let frame = transcript_frame(1, 5, vec![copy_run(1, "foo ", true), copy_run(2, "bar", false)]);
+        let frame = transcript_frame(
+            1,
+            5,
+            vec![copy_run(1, "foo ", true), copy_run(2, "bar", false)],
+        );
         let mut selection = None;
         let route = super::handle_transcript_pointer(
             &mut selection,
@@ -22601,6 +22626,14 @@ fn project_kernel_event(
             snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
         }),
         Kernel::Warning(message) => Some(AgentEvent::Warning(message)),
+        Kernel::ProviderRetry {
+            attempt,
+            max_attempts,
+            backoff_secs,
+            reason,
+        } => Some(AgentEvent::Warning(format!(
+            "API error {reason}，{backoff_secs} 秒后重试({attempt}/{max_attempts})..."
+        ))),
         Kernel::StreamRecovery {
             attempt,
             max_attempts,
@@ -28940,7 +28973,11 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             // of a bare "SubagentCodex" with no hint of what it is doing.
             get_str("prompt")
                 .map(|p| {
-                    let first = p.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+                    let first = p
+                        .lines()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("")
+                        .trim();
                     crate::width::truncate_with_ellipsis(first, 100)
                 })
                 .unwrap_or_default()
