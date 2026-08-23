@@ -594,8 +594,13 @@ pub fn register_atomgit_tools(reg: &mut ToolRegistry, client: Arc<AtomgitClient>
 }
 
 /// The tool names registered by [`register_atomgit_tools`], for `mount`.
+///
+/// MUST stay in lockstep with `register_atomgit_tools` above — the embedder mounts
+/// exactly these names, so omitting one registers a tool the model can never call.
+/// `atomgit_api` in particular is where the bash gate steers the model after denying
+/// raw curl/REST calls; if it isn't exposed the model hits a dead end.
 pub fn atomgit_tool_names() -> &'static [&'static str] {
-    &["atomgit_repo", "atomgit_pr", "atomgit_issue"]
+    &["atomgit_repo", "atomgit_pr", "atomgit_issue", "atomgit_api"]
 }
 
 // ─────────────────────────── atomgit_pr ───────────────────────────
@@ -1103,7 +1108,7 @@ mod tests {
     }
 
     #[test]
-    fn register_mounts_all_three() {
+    fn register_mounts_all_four() {
         let client = AtomgitClient::new(AtomgitConfig {
             base_url: "http://x/api/v5".into(),
             user_agent: "u".into(),
@@ -1117,6 +1122,18 @@ mod tests {
         assert!(names.contains(&"atomgit_repo".to_string()));
         assert!(names.contains(&"atomgit_pr".to_string()));
         assert!(names.contains(&"atomgit_issue".to_string()));
+        // Regression: `atomgit_api` was registered but missing from
+        // `atomgit_tool_names()`, so it was never mounted — while the bash gate
+        // steered the model to it. Every registered tool must be exposed.
+        assert!(
+            names.contains(&"atomgit_api".to_string()),
+            "atomgit_api must be mounted (bash gate steers the model to it): {names:?}"
+        );
+        assert_eq!(
+            names.len(),
+            atomgit_tool_names().len(),
+            "every name in atomgit_tool_names() must resolve to a registered tool: {names:?}"
+        );
     }
 
     #[tokio::test]
