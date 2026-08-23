@@ -3791,7 +3791,11 @@ fn run_codingplan_core(
     // the user sees the report ending in "claim failed — run `atomcode
     // login` again" and has to do manually what `codingplan` could
     // do itself.
-    let mut report = atomcode_codingplan::run(&mut config, telemetry)?;
+    let mut report = atomcode_codingplan::run(
+        &mut config,
+        telemetry,
+        atomcode_codingplan::DefaultModelPolicy::AdoptServerDefault,
+    )?;
     if report.auth_expired {
         use atomcode_config::i18n::{t, Msg};
         print!("{}", t(Msg::CpReauthAfter401));
@@ -3799,7 +3803,11 @@ fn run_codingplan_core(
             .and_then(|auth| atomcode_auth::save_auth(&auth).map(|_| auth))
         {
             Ok(_) => {
-                report = atomcode_codingplan::run(&mut config, telemetry)?;
+                report = atomcode_codingplan::run(
+                    &mut config,
+                    telemetry,
+                    atomcode_codingplan::DefaultModelPolicy::AdoptServerDefault,
+                )?;
             }
             Err(e) => {
                 // Re-OAuth itself failed (user pressed Ctrl+C, network
@@ -3812,9 +3820,14 @@ fn run_codingplan_core(
     }
 
     if report.should_persist_config() {
-        let persisted = match atomcode_config::ConfigStore::new(&path)
-            .update(|latest| atomcode_codingplan::merge_successful_config(latest, &config, &report))
-        {
+        let persisted = match atomcode_config::ConfigStore::new(&path).update(|latest| {
+            atomcode_codingplan::merge_successful_config(
+                latest,
+                &config,
+                &report,
+                atomcode_codingplan::DefaultModelPolicy::AdoptServerDefault,
+            )
+        }) {
             Ok(_) => true,
             Err(e) => {
                 eprintln!("  ⚠ Failed to save config to {}: {:#}", path.display(), e);

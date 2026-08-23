@@ -7024,7 +7024,12 @@ fn run_coding_plan_blocking(
     // (`run_login_flow` isn't async) and avoids the need to
     // `Handle::block_on`.
     std::thread::spawn(move || {
-        let report = atomcode_codingplan::run(&mut cfg, Some(&tel));
+        // Interactive `/login`: reset the active default to the server's primary model.
+        let report = atomcode_codingplan::run(
+            &mut cfg,
+            Some(&tel),
+            atomcode_codingplan::DefaultModelPolicy::AdoptServerDefault,
+        );
         (cfg, report)
     })
     .join()
@@ -7136,14 +7141,26 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
         // Config mutation only persists when critical steps passed —
         // don't write a half-set-up config if login or models failed.
         match ctx.config_store.update(|latest| {
-            atomcode_codingplan::merge_successful_config(latest, &prepared_config, &report)
+            atomcode_codingplan::merge_successful_config(
+                latest,
+                &prepared_config,
+                &report,
+                atomcode_codingplan::DefaultModelPolicy::AdoptServerDefault,
+            )
         }) {
-            Ok(commit) => apply_persisted_config(
-                ctx,
-                commit.snapshot.config,
-                commit.snapshot.revision,
-                renderer,
-            ),
+            Ok(commit) => {
+                // Interactive `/login` overrides any runtime pin: drop back to
+                // FollowGlobalDefault so applying the freshly-persisted config
+                // switches the live session to the new server default. (A pin is
+                // a runtime-only state; cross-window sessions keep their own mode.)
+                ctx.provider_selection_mode = crate::ProviderSelectionMode::FollowGlobalDefault;
+                apply_persisted_config(
+                    ctx,
+                    commit.snapshot.config,
+                    commit.snapshot.revision,
+                    renderer,
+                )
+            }
             Err(error) => {
                 renderer.render(UiLine::Error(
                     t(Msg::ConfigSaveFailed {

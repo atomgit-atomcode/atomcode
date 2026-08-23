@@ -24,6 +24,6 @@ pub mod usage;
 // layer only. Consumers that need signing import from `atomcode_auth::gateway_crypto` directly.
 
 pub use client::{api_base_url, is_auth_expired, AuthExpired, Client};
-pub use setup::{merge_successful_config, run, SetupReport, StepResult};
+pub use setup::{merge_successful_config, run, DefaultModelPolicy, SetupReport, StepResult};
 pub use sync_marker::{read_last_sync, write_last_sync_now};
 pub use types::{ClaimResponse, ModelEntry, PlanInfo, PlanType, StatusResponse, UsageInfo};

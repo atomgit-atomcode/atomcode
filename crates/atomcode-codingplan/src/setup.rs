@@ -591,15 +591,36 @@ pub struct ModelsInfo {
     pub all_models: Vec<ModelEntry>,
 }
 
+/// How a catalog refresh decides the active default model.
+///
+/// Interactive `/login` (TUI + CLI) uses [`AdoptServerDefault`](Self::AdoptServerDefault):
+/// the user asked to (re-)login, so we reset the default to the server's primary model
+/// (list-first) — the historical behavior. Background / cross-client sync (daemon/webui)
+/// uses [`PreservePrevious`](Self::PreservePrevious): a refresh triggered by ANOTHER client
+/// must not clobber the model this client is on (see commit a63f6591, "reconcile auth and
+/// provider state across clients").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultModelPolicy {
+    /// Reset the active default to the server's primary (list-first) model.
+    AdoptServerDefault,
+    /// Keep the previously-selected model when it still exists in the new list.
+    PreservePrevious,
+}
+
 /// Entry point. Mutates `config` in place (providers + default_provider);
 /// the caller is responsible for persisting it to disk after a successful
 /// run. This keeps the core free of I/O concerns — tests can call `run`
 /// against a `Config::default()` without touching the filesystem.
 ///
+/// `default_policy` controls whether the active default is reset to the server's
+/// primary model (interactive login) or the user's previous choice is preserved
+/// (background sync) — see [`DefaultModelPolicy`].
+///
 /// Emits exactly one `TakeCodingplan { Success | Fail }` event at each exit path.
 pub fn run(
     config: &mut Config,
     tel: Option<&Arc<atomcode_telemetry::Telemetry>>,
+    default_policy: DefaultModelPolicy,
 ) -> Result<SetupReport> {
     // Step 1: login
     let login = step_login(tel);
@@ -666,7 +687,8 @@ pub fn run(
     };
 
     // Step 3: models — critical. Without models there's nothing to set up.
-    let (models, models_auth_expired) = step_models_and_register(config, plan_type_for_models);
+    let (models, models_auth_expired) =
+        step_models_and_register(config, plan_type_for_models, default_policy);
     if models.is_err() {
         if let Some(t) = tel {
             t.track(atomcode_telemetry::Event::TakeCodingplan {
@@ -896,6 +918,7 @@ fn step_claim() -> (StepResult<ClaimInfo>, Vec<TierAttempt>, bool) {
 fn step_models_and_register(
     config: &mut Config,
     plan_type: PlanType,
+    default_policy: DefaultModelPolicy,
 ) -> (StepResult<ModelsInfo>, bool) {
     let client = match Client::from_stored_auth() {
         Ok(c) => c,
@@ -971,13 +994,27 @@ fn step_models_and_register(
         let pc = build_codingplan_provider(m);
         config.providers.insert(pname.clone(), pc);
     }
-    let default_provider = refreshed_default_provider(
-        config,
-        &previous_default,
-        previous_model.as_deref(),
-        &names,
-        &provider_names,
-    );
+    // A non-CodingPlan custom provider is preserved under both policies (never clobbered
+    // by a CodingPlan refresh); the report must mirror the persisted default exactly.
+    let previous_is_custom_provider = !is_codingplan_provider_name(&previous_default)
+        && config.providers.contains_key(&previous_default);
+    let default_provider = match default_policy {
+        // Interactive login resets to the server's primary (list-first) model.
+        DefaultModelPolicy::AdoptServerDefault if !previous_is_custom_provider => provider_names
+            .first()
+            .cloned()
+            .unwrap_or_else(|| provider_prefix().to_string()),
+        // Background sync (or a preserved custom provider) keeps the previous selection.
+        DefaultModelPolicy::AdoptServerDefault | DefaultModelPolicy::PreservePrevious => {
+            refreshed_default_provider(
+                config,
+                &previous_default,
+                previous_model.as_deref(),
+                &names,
+                &provider_names,
+            )
+        }
+    };
     config.default_provider = default_provider.clone();
 
     // Auto-detect a vision_preprocessor candidate from the freshly
@@ -1066,6 +1103,7 @@ pub fn merge_successful_config(
     latest: &mut Config,
     prepared: &Config,
     report: &SetupReport,
+    default_policy: DefaultModelPolicy,
 ) -> Result<()> {
     let StepResult::Ok(models) = &report.models else {
         anyhow::bail!("CodingPlan model refresh did not complete");
@@ -1086,13 +1124,33 @@ pub fn merge_successful_config(
             .ok_or_else(|| anyhow::anyhow!("prepared provider {name:?} is missing"))?;
         latest.providers.insert(name.clone(), provider.clone());
     }
-    latest.default_provider = refreshed_default_provider(
-        latest,
-        &previous_default,
-        previous_model.as_deref(),
-        &models.display_names,
-        &models.provider_names,
-    );
+    // A non-CodingPlan provider the user configured themselves (their own API key)
+    // is preserved under BOTH policies — `/login` refreshes CodingPlan models but must
+    // never clobber a custom provider selection.
+    let previous_is_custom_provider = !is_codingplan_provider_name(&previous_default)
+        && latest.providers.contains_key(&previous_default);
+    match default_policy {
+        DefaultModelPolicy::AdoptServerDefault if !previous_is_custom_provider => {
+            // Interactive login: force the active selection to the server's primary
+            // (list-first) model. Set BOTH the legacy `default_provider` and the
+            // canonical `default_model`, otherwise `persist_codingplan_as_new_schema`
+            // below keeps a still-valid old `default_model` and syncs the provider
+            // back to it — the model wouldn't actually change.
+            if let Some(server_default) = models.provider_names.first() {
+                latest.default_provider = server_default.clone();
+                latest.default_model = Some(server_default.clone());
+            }
+        }
+        DefaultModelPolicy::AdoptServerDefault | DefaultModelPolicy::PreservePrevious => {
+            latest.default_provider = refreshed_default_provider(
+                latest,
+                &previous_default,
+                previous_model.as_deref(),
+                &models.display_names,
+                &models.provider_names,
+            );
+        }
+    }
 
     let custom_vision = latest
         .vision_preprocessor_provider
@@ -2633,7 +2691,13 @@ mod tests {
         );
         latest.default_provider = "custom".into();
 
-        merge_successful_config(&mut latest, &prepared, &report).unwrap();
+        merge_successful_config(
+            &mut latest,
+            &prepared,
+            &report,
+            DefaultModelPolicy::PreservePrevious,
+        )
+        .unwrap();
 
         assert_eq!(latest.default_provider, "custom");
         assert!(latest.providers.contains_key("custom"));
@@ -2644,6 +2708,90 @@ mod tests {
         assert!(latest.models.contains_key(px()));
         assert!(!latest.providers.contains_key(px()));
         // The user's concurrent non-CodingPlan default is untouched.
+        assert_eq!(latest.default_model, None);
+    }
+
+    #[test]
+    fn interactive_login_adopts_server_default_over_a_codingplan_pin() {
+        // prepared carries the fresh catalog; "first-model" is the server's primary
+        // (list-first) model.
+        let mut prepared = blank_config();
+        let models = run_register(
+            &mut prepared,
+            vec![
+                vl_model_entry("first-model"),
+                vl_model_entry("second-model"),
+            ],
+        );
+        let report = SetupReport {
+            login: StepResult::Skipped("test".into()),
+            claim: StepResult::Skipped("test".into()),
+            claim_attempts: Vec::new(),
+            models: StepResult::Ok(models),
+            status: StepResult::Skipped("test".into()),
+            auth_expired: false,
+        };
+        // latest: the user previously pinned the SECOND (non-first) CodingPlan model,
+        // which still exists in the new list.
+        let mut latest = blank_config();
+        run_register(
+            &mut latest,
+            vec![
+                vl_model_entry("first-model"),
+                vl_model_entry("second-model"),
+            ],
+        );
+        latest.default_provider = pxn("second-model");
+        latest.default_model = Some(pxn("second-model"));
+
+        merge_successful_config(
+            &mut latest,
+            &prepared,
+            &report,
+            DefaultModelPolicy::AdoptServerDefault,
+        )
+        .unwrap();
+
+        // AdoptServerDefault resets to the server's first model, overriding the pin —
+        // in BOTH the legacy `default_provider` and the canonical `default_model`, so
+        // `persist_codingplan_as_new_schema` can't sync the provider back to the old pin.
+        assert_eq!(latest.default_provider, pxn("first-model"));
+        assert_eq!(
+            latest.default_model.as_deref(),
+            Some(pxn("first-model").as_str())
+        );
+    }
+
+    #[test]
+    fn interactive_login_still_preserves_a_custom_non_codingplan_provider() {
+        // Even under AdoptServerDefault, a user's own (non-CodingPlan) provider is never
+        // clobbered — `/login` refreshes CodingPlan models but respects a custom pick.
+        let mut prepared = blank_config();
+        let models = run_register(&mut prepared, vec![vl_model_entry("plan-model")]);
+        let report = SetupReport {
+            login: StepResult::Skipped("test".into()),
+            claim: StepResult::Skipped("test".into()),
+            claim_attempts: Vec::new(),
+            models: StepResult::Ok(models),
+            status: StepResult::Skipped("test".into()),
+            auth_expired: false,
+        };
+        let mut latest = blank_config();
+        latest.providers.insert(
+            "custom".into(),
+            build_codingplan_provider(&vl_model_entry("custom-model")),
+        );
+        latest.default_provider = "custom".into();
+
+        merge_successful_config(
+            &mut latest,
+            &prepared,
+            &report,
+            DefaultModelPolicy::AdoptServerDefault,
+        )
+        .unwrap();
+
+        assert_eq!(latest.default_provider, "custom");
         assert_eq!(latest.default_model, None);
     }
 

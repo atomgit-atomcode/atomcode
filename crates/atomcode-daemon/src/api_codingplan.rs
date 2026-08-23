@@ -451,7 +451,13 @@ pub(crate) async fn codingplan_setup(
         let setup_result = tokio::task::spawn_blocking(move || {
             // step_login will see is_logged_in() == true and skip.
             // Pass None for tel — we emit TakeCodingplan externally in this handler.
-            let report = coding_plan::run(&mut config, None)?;
+            // Background / cross-client sync: preserve the model this client is on
+            // (never clobber another client's selection — see a63f6591).
+            let report = coding_plan::run(
+                &mut config,
+                None,
+                coding_plan::DefaultModelPolicy::PreservePrevious,
+            )?;
             Ok::<_, anyhow::Error>((config, report))
         })
         .await;
@@ -500,7 +506,12 @@ pub(crate) async fn codingplan_setup(
         // Persist config if setup succeeded
         if report.should_persist_config() {
             config = match update_config(|latest| {
-                coding_plan::merge_successful_config(latest, &config, &report)
+                coding_plan::merge_successful_config(
+                    latest,
+                    &config,
+                    &report,
+                    coding_plan::DefaultModelPolicy::PreservePrevious,
+                )
             }) {
                 Ok(config) => config,
                 Err(e) => {
@@ -635,7 +646,13 @@ pub(crate) fn sync_codingplan_after_login(state: AppState, client_mode: SessionM
             };
 
             let setup_result = tokio::task::spawn_blocking(move || {
-                let report = coding_plan::run(&mut config, None)?;
+                // Background / cross-client sync: preserve the model this client is on
+                // (never clobber another client's selection — see a63f6591).
+                let report = coding_plan::run(
+                    &mut config,
+                    None,
+                    coding_plan::DefaultModelPolicy::PreservePrevious,
+                )?;
                 Ok::<_, anyhow::Error>((config, report))
             })
             .await;
@@ -675,7 +692,12 @@ pub(crate) fn sync_codingplan_after_login(state: AppState, client_mode: SessionM
             }
 
             if let Err(e) = update_config(|latest| {
-                coding_plan::merge_successful_config(latest, &config, &report)
+                coding_plan::merge_successful_config(
+                    latest,
+                    &config,
+                    &report,
+                    coding_plan::DefaultModelPolicy::PreservePrevious,
+                )
             }) {
                 state_for_scope.telemetry.track(Event::TakeCodingplan {
                     type_: CodingplanResult::Fail,
