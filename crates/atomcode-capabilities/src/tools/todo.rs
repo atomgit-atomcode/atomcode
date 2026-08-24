@@ -27,6 +27,26 @@ impl TodoStatus {
             _ => None,
         }
     }
+
+    /// Lenient status parse for incremental `update` calls. Long-context turns
+    /// routinely emit near-miss variants (`done`, `in progress`, `InProgress`,
+    /// `completed `, `已完成` …) that strict full-list validation rejects;
+    /// rejecting them turns a valid update into the confusing
+    /// "`update` needs a `status`" error (issue #1456). Trims whitespace and
+    /// folds common synonyms onto the three canonical states. Full-list plans
+    /// keep the strict [`Self::parse`] gate.
+    fn parse_lenient(s: &str) -> Option<TodoStatus> {
+        let normalized = s.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "pending" | "todo" | "open" | "waiting" | "not started" | "not_started" | "待办"
+            | "未开始" => Some(TodoStatus::Pending),
+            "in_progress" | "in-progress" | "in progress" | "inprogress" | "doing" | "started"
+            | "active" | "working" | "running" | "进行中" | "开发中" => Some(TodoStatus::InProgress),
+            "completed" | "complete" | "done" | "finished" | "closed" | "resolved" | "已完成"
+            | "完成" => Some(TodoStatus::Completed),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -232,7 +252,7 @@ fn apply_todo_action_inner(list: &mut Vec<TodoItem>, args: &str, strict: bool) {
                 v.get("id").and_then(|x| x.as_u64()),
                 v.get("status")
                     .and_then(|x| x.as_str())
-                    .and_then(TodoStatus::parse),
+                    .and_then(TodoStatus::parse_lenient),
             ) else {
                 return;
             };
@@ -401,7 +421,7 @@ impl Tool for TodoTool {
                 "update" => {
                     let id = v.get("id").and_then(|x| x.as_u64());
                     let status = v.get("status").and_then(|x| x.as_str());
-                    match (id, status.and_then(TodoStatus::parse)) {
+                    match (id, status.and_then(TodoStatus::parse_lenient)) {
                         // `#<id> → <status>` is the base the TUI `enrich_todo_detail` splices a
                         // title into; keep this exact shape.
                         (Some(id), Some(_)) if id >= 1 => ok(format!("#{} \u{2192} {}", id, status.unwrap())),
@@ -461,6 +481,80 @@ mod tests {
     fn parse_rejects_bad_status() {
         let e = parse_todos(r#"{"todos":[{"content":"a","status":"done"}]}"#).unwrap_err();
         assert!(e.contains("pending"), "{e}");
+    }
+
+    #[test]
+    fn parse_lenient_accepts_synonyms_case_and_whitespace() {
+        // Issue #1456: long-context updates routinely carry near-miss status
+        // variants; the incremental `update` path must not reject them.
+        assert_eq!(TodoStatus::parse_lenient("done"), Some(TodoStatus::Completed));
+        assert_eq!(
+            TodoStatus::parse_lenient("complete"),
+            Some(TodoStatus::Completed)
+        );
+        assert_eq!(
+            TodoStatus::parse_lenient("completed"),
+            Some(TodoStatus::Completed)
+        );
+        assert_eq!(
+            TodoStatus::parse_lenient(" finished "),
+            Some(TodoStatus::Completed)
+        );
+        assert_eq!(
+            TodoStatus::parse_lenient("in progress"),
+            Some(TodoStatus::InProgress)
+        );
+        assert_eq!(
+            TodoStatus::parse_lenient("in-progress"),
+            Some(TodoStatus::InProgress)
+        );
+        assert_eq!(
+            TodoStatus::parse_lenient("InProgress"),
+            Some(TodoStatus::InProgress)
+        );
+        assert_eq!(TodoStatus::parse_lenient("doing"), Some(TodoStatus::InProgress));
+        assert_eq!(TodoStatus::parse_lenient("todo"), Some(TodoStatus::Pending));
+        assert_eq!(
+            TodoStatus::parse_lenient("waiting"),
+            Some(TodoStatus::Pending)
+        );
+        assert_eq!(
+            TodoStatus::parse_lenient("  pending  "),
+            Some(TodoStatus::Pending)
+        );
+        // Chinese aliases.
+        assert_eq!(
+            TodoStatus::parse_lenient("已完成"),
+            Some(TodoStatus::Completed)
+        );
+        assert_eq!(
+            TodoStatus::parse_lenient("进行中"),
+            Some(TodoStatus::InProgress)
+        );
+        // Garbage still rejected.
+        assert_eq!(TodoStatus::parse_lenient("nope"), None);
+    }
+
+    #[tokio::test]
+    async fn execute_update_accepts_lenient_status() {
+        // Issue #1456: an update with `done` must not fail with
+        // "`update` needs a `status` of pending|in_progress|completed".
+        let t = TodoTool::new();
+        let r = t
+            .execute(r#"{"action":"update","id":3,"status":"done"}"#, &ctx())
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.starts_with("#3 \u{2192}"), "{}", r.content);
+    }
+
+    #[test]
+    fn reduce_update_accepts_lenient_status() {
+        let msgs = vec![
+            write_call("1", PLAN3),
+            todo_call("2", r#"{"action":"update","id":2,"status":"done"}"#),
+        ];
+        let todos = derive_current_todos(&msgs);
+        assert_eq!(todos[1].status, TodoStatus::Completed); // #2 (1-based)
     }
 
     #[test]
