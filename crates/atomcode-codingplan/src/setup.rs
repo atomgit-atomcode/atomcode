@@ -1152,16 +1152,22 @@ pub fn merge_successful_config(
         }
     }
 
-    let custom_vision = latest
-        .vision_preprocessor_provider
-        .as_deref()
-        .is_some_and(|name| !name.is_empty() && !is_codingplan_provider_name(name));
-    if !custom_vision {
-        latest.vision_preprocessor_provider = prepared.vision_preprocessor_provider.clone();
-    }
     // Materialize the flat CodingPlan providers onto disk in the new
     // account+model schema (one account per wire format).
     persist_codingplan_as_new_schema(latest);
+
+    // Keep the user's chosen VL preprocessor if it STILL RESOLVES — even a CodingPlan
+    // model they deliberately selected. The old code treated any CodingPlan-named
+    // selection as "not custom" and overwrote it from the server every sync (the bug:
+    // `AtomGit-qwen3.8-27b` kept reverting). Only fill an EMPTY or now-dangling slot
+    // from the server's suggestion. Checked AFTER `persist_codingplan_as_new_schema`
+    // so the freshly-folded CodingPlan models are in place to resolve against.
+    let keep_current = latest.vision_preprocessor_provider.as_deref().is_some_and(|name| {
+        !name.is_empty() && latest.provider_config_for_selection(name).is_some()
+    });
+    if !keep_current {
+        latest.vision_preprocessor_provider = prepared.vision_preprocessor_provider.clone();
+    }
     Ok(())
 }
 
@@ -1183,6 +1189,32 @@ fn persist_codingplan_as_new_schema(config: &mut Config) {
     {
         return;
     }
+    // Remember the prior per-model `supports_vision` before dropping the entries.
+    // A refresh whose flat provider OMITS the field (`None` = server has no opinion
+    // this time — the background auto-sync response can lack it even though the full
+    // interactive login carried it) must NOT null a capability we already know: that
+    // would demote a VL model (e.g. `qwen3.8-27b`, whose name the heuristic doesn't
+    // recognise) to text-only and silently route its images through the VL detour.
+    // Restored below ONLY where the fresh value is `None`; an EXPLICIT fresh value
+    // (`Some(true)`/`Some(false)`) stays authoritative. Keyed by (account, wire model)
+    // — NOT the model id: the id changes when the model count transitions (the last
+    // remaining model folds to the bare prefix), which an id key would miss. The
+    // (account, model) pair is stable across that transition AND unique per provider
+    // (a same-named model under a different wire protocol has a different account), so
+    // it can't cross-contaminate two providers that happen to share a wire model name.
+    // Filter by ACCOUNT (not the model id) so the snapshot covers exactly the set the
+    // rebuild below restores into (`filter(|(_, m)| is_codingplan_provider_name(&m.account))`).
+    // The two must use the same predicate or a model present in one set but not the other
+    // silently misses the restore.
+    let prior_supports_vision: std::collections::HashMap<(String, String), bool> = config
+        .models
+        .iter()
+        .filter(|(_, m)| is_codingplan_provider_name(&m.account))
+        .filter_map(|(_, m)| {
+            m.supports_vision
+                .map(|v| ((m.account.clone(), m.model.clone()), v))
+        })
+        .collect();
     // Drop any prior new-schema CodingPlan entries FIRST, so the freshly-merged
     // flat providers are the sole (authoritative) source for the projection.
     // Otherwise `logical_models`' new-schema precedence would mask updated
@@ -1209,7 +1241,14 @@ fn persist_codingplan_as_new_schema(config: &mut Config) {
     for (id, a) in accounts {
         config.provider_accounts.insert(id, a);
     }
-    for (id, m) in models {
+    for (id, mut m) in models {
+        // Fresh server silence (`None`) shouldn't erase a capability we already knew.
+        if m.supports_vision.is_none() {
+            if let Some(&prior) = prior_supports_vision.get(&(m.account.clone(), m.model.clone()))
+            {
+                m.supports_vision = Some(prior);
+            }
+        }
         config.models.insert(id, m);
     }
 
@@ -3006,6 +3045,196 @@ mod tests {
         assert_eq!(cfg.models[&pxn("GLM-5.2")].context_window, 200_000);
         assert!(!cfg.models.contains_key(&pxn("Dropped")));
         assert!(!cfg.providers.contains_key(&pxn("GLM-5.2")));
+    }
+
+    // A prior login wrote `supports_vision: true` (server-sent then). A later refresh
+    // whose flat provider OMITS the field (`None` = server has no opinion this time,
+    // e.g. the background auto-sync response) must NOT null the known capability —
+    // otherwise it falls back to the name heuristic and a VL model like "qwen3.8-27b"
+    // is wrongly demoted to text-only, silently sending images through the VL detour.
+    #[test]
+    fn persist_preserves_known_supports_vision_when_fresh_data_omits_it() {
+        let mut cfg = blank_config();
+        cfg.provider_accounts.insert(
+            "AtomGit".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1"
+            }))
+            .unwrap(),
+        );
+        cfg.models.insert(
+            pxn("qwen3.8-27b"),
+            serde_json::from_value(serde_json::json!({
+                "account": "AtomGit", "model": "qwen3.8-27b",
+                "context_window": 64000, "supports_vision": true
+            }))
+            .unwrap(),
+        );
+        // This refresh's flat provider carries NO supports_vision (server silent).
+        let fresh = build_codingplan_provider(&entry("qwen3.8-27b"));
+        assert_eq!(fresh.supports_vision, None, "entry() omits supports_vision");
+        cfg.providers.insert(pxn("qwen3.8-27b"), fresh);
+
+        persist_codingplan_as_new_schema(&mut cfg);
+
+        assert_eq!(
+            cfg.models[&pxn("qwen3.8-27b")].supports_vision,
+            Some(true),
+            "server silence must not erase the last-known capability"
+        );
+    }
+
+    // Guard: when the fresh server data has an EXPLICIT opinion, the server stays
+    // authoritative — an explicit `false` overrides a prior `true`.
+    #[test]
+    fn persist_lets_server_explicitly_override_supports_vision() {
+        let mut cfg = blank_config();
+        cfg.provider_accounts.insert(
+            "AtomGit".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1"
+            }))
+            .unwrap(),
+        );
+        cfg.models.insert(
+            pxn("m"),
+            serde_json::from_value(serde_json::json!({
+                "account": "AtomGit", "model": "m", "context_window": 64000, "supports_vision": true
+            }))
+            .unwrap(),
+        );
+        let mut fresh = build_codingplan_provider(&entry("m"));
+        fresh.supports_vision = Some(false); // server explicitly says NO this time
+        cfg.providers.insert(pxn("m"), fresh);
+
+        persist_codingplan_as_new_schema(&mut cfg);
+
+        assert_eq!(
+            cfg.models[&pxn("m")].supports_vision,
+            Some(false),
+            "an explicit server value wins over the prior local value"
+        );
+    }
+
+    // The prior->fresh id can CHANGE when the model count transitions: with 2+ models
+    // the id is `<prefix>-<model>`, but the last remaining model folds to the BARE
+    // prefix (`provider_names_for`). Keying the capability snapshot by id would then
+    // miss on that transition. Keying by (account, wire model) — stable across the
+    // count change AND unique per provider (a same-named model under a different wire
+    // protocol has a different account) — restores it correctly.
+    #[test]
+    fn persist_preserves_supports_vision_across_model_count_transition() {
+        let mut cfg = blank_config();
+        cfg.provider_accounts.insert(
+            "AtomGit".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1"
+            }))
+            .unwrap(),
+        );
+        // Prior era had 2+ models, so this model's id was the `<prefix>-<model>` form.
+        cfg.models.insert(
+            pxn("qwen3.8-27b"),
+            serde_json::from_value(serde_json::json!({
+                "account": "AtomGit", "model": "qwen3.8-27b",
+                "context_window": 64000, "supports_vision": true
+            }))
+            .unwrap(),
+        );
+        // This refresh has only ONE model left → it folds to the BARE prefix id, and
+        // the fresh flat provider omits supports_vision (server silent).
+        let fresh = build_codingplan_provider(&entry("qwen3.8-27b"));
+        assert_eq!(fresh.supports_vision, None);
+        cfg.providers.insert(px().to_string(), fresh);
+
+        persist_codingplan_as_new_schema(&mut cfg);
+
+        // The single remaining model now lives under the bare-prefix id.
+        assert_eq!(
+            cfg.models[px()].supports_vision,
+            Some(true),
+            "capability must survive the id change caused by the model-count transition"
+        );
+    }
+
+    // A user who deliberately picked a CodingPlan model as their VL preprocessor must
+    // keep it across a sync. The old code treated any CodingPlan-named selection as
+    // "not custom" and overwrote it from the server every refresh (the reported bug:
+    // `AtomGit-qwen3.8-27b` kept reverting).
+    #[test]
+    fn merge_keeps_user_codingplan_vision_preprocessor_that_still_exists() {
+        let mut prepared = blank_config();
+        let models = run_register(
+            &mut prepared,
+            vec![vl_model_entry("qwen-vl"), vl_model_entry("other-vl")],
+        );
+        // The server's own auto-suggestion is a DIFFERENT model.
+        prepared.vision_preprocessor_provider = Some(pxn("other-vl"));
+        let report = SetupReport {
+            login: StepResult::Skipped("test".into()),
+            claim: StepResult::Skipped("test".into()),
+            claim_attempts: Vec::new(),
+            models: StepResult::Ok(models),
+            status: StepResult::Skipped("test".into()),
+            auth_expired: false,
+        };
+
+        let mut latest = blank_config();
+        run_register(
+            &mut latest,
+            vec![vl_model_entry("qwen-vl"), vl_model_entry("other-vl")],
+        );
+        // The user deliberately chose the CodingPlan VL model.
+        latest.vision_preprocessor_provider = Some(pxn("qwen-vl"));
+
+        merge_successful_config(
+            &mut latest,
+            &prepared,
+            &report,
+            DefaultModelPolicy::PreservePrevious,
+        )
+        .unwrap();
+
+        assert_eq!(
+            latest.vision_preprocessor_provider.as_deref(),
+            Some(pxn("qwen-vl").as_str()),
+            "the user's still-valid CodingPlan VL preprocessor must survive the sync"
+        );
+    }
+
+    // Guard: a VL preprocessor pointing at a model that no longer exists in the fresh
+    // catalog is dangling — it should be replaced by the server's suggestion, not kept.
+    #[test]
+    fn merge_replaces_dangling_vision_preprocessor() {
+        let mut prepared = blank_config();
+        let models = run_register(&mut prepared, vec![vl_model_entry("fresh-vl")]);
+        prepared.vision_preprocessor_provider = Some(px().into()); // single model → bare prefix
+        let report = SetupReport {
+            login: StepResult::Skipped("test".into()),
+            claim: StepResult::Skipped("test".into()),
+            claim_attempts: Vec::new(),
+            models: StepResult::Ok(models),
+            status: StepResult::Skipped("test".into()),
+            auth_expired: false,
+        };
+
+        let mut latest = blank_config();
+        // Points at a CodingPlan model absent from the fresh catalog.
+        latest.vision_preprocessor_provider = Some(pxn("gone-vl"));
+
+        merge_successful_config(
+            &mut latest,
+            &prepared,
+            &report,
+            DefaultModelPolicy::PreservePrevious,
+        )
+        .unwrap();
+
+        assert_eq!(
+            latest.vision_preprocessor_provider.as_deref(),
+            Some(px()),
+            "a dangling VL preprocessor is replaced by the server's suggestion"
+        );
     }
 
     #[test]
