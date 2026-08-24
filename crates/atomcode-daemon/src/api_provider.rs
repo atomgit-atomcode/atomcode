@@ -70,6 +70,113 @@ fn rename_default_selection(
     }
 }
 
+/// Remove a logical model selection from wherever it lives — new-schema
+/// `config.models` and/or legacy `config.providers` — mirroring
+/// [`Config::logical_models`], which UNIONS both maps to build the catalog the
+/// webui lists. Deleting only `config.providers` (the old behavior) 404'd every
+/// new-schema model with "Provider 'X' not found" even though the row was listed.
+/// Returns `true` if anything was removed. Removes from both on an id collision so
+/// no shadow entry survives; leaves the parent `provider_account` intact (it may
+/// hold other models).
+fn remove_selection(config: &mut atomcode_config::config::Config, name: &str) -> bool {
+    let removed_model = config.models.remove(name).is_some();
+    let removed_legacy = config.providers.remove(name).is_some();
+    removed_model || removed_legacy
+}
+
+/// Apply a PATCH to a NEW-SCHEMA model. Per-model fields (wire model id,
+/// context_window, vision, thinking, reasoning, max_tokens) land on the model profile
+/// `config.models[name]`; connection fields (type/base_url/api_key/user_agent/
+/// skip_tls_verify) land on its account `config.provider_accounts[model.account]`,
+/// which is SHARED by every model under that account — the account IS the connection,
+/// so a base_url/key edit repoints all of them (the chosen, documented semantics).
+///
+/// The old `patch_provider` only mutated `config.providers`, so editing a new-schema
+/// model 404'd. Caller has already verified `name` is in `config.models` and is not
+/// managed; caller owns rename (the id key move).
+///
+/// Returns `false` — mutating NOTHING — when the model's account is absent from
+/// `config.provider_accounts` (a corrupted / half-migrated config). Without this the
+/// connection-field edits (base_url/api_key/type) would be silently dropped while the
+/// per-model fields saved: a confusing partial save. The caller turns `false` into an
+/// error so the whole edit is refused atomically.
+fn apply_patch_to_new_schema_model(
+    config: &mut atomcode_config::config::Config,
+    name: &str,
+    req: PatchProviderRequest,
+) -> bool {
+    let Some(account_id) = config.models.get(name).map(|model| model.account.clone()) else {
+        return false;
+    };
+    // Resolve the account BEFORE mutating anything so a missing account can't leave a
+    // half-applied edit on disk.
+    if !config.provider_accounts.contains_key(&account_id) {
+        return false;
+    }
+    if let Some(model) = config.models.get_mut(name) {
+        if let Some(value) = req.model {
+            model.model = value;
+        }
+        if req.clear_supports_vision {
+            model.supports_vision = None;
+        } else if let Some(value) = req.supports_vision {
+            model.supports_vision = Some(value);
+        }
+        if let Some(value) = req.context_window {
+            model.context_window = value;
+        }
+        if req.clear_max_tokens {
+            model.max_tokens = None;
+        } else if let Some(value) = req.max_tokens {
+            model.max_tokens = value;
+        }
+        if let Some(value) = req.thinking_enabled {
+            model.thinking_enabled = value;
+        }
+        if let Some(value) = req.thinking_budget {
+            model.thinking_budget = value;
+        }
+        if let Some(value) = req.thinking_type {
+            model.thinking_type = value;
+        }
+        if let Some(value) = req.thinking_keep {
+            model.thinking_keep = value;
+        }
+        if let Some(value) = req.reasoning_history {
+            model.reasoning_history = value;
+        }
+        if let Some(value) = req.reasoning_effort {
+            model.reasoning_effort = value;
+        }
+    }
+    // Connection fields → the SHARED account (chosen "account is the connection"
+    // semantics). Presence guaranteed by the up-front check above.
+    if let Some(account) = config.provider_accounts.get_mut(&account_id) {
+        if let Some(value) = req.provider_type {
+            account.provider = value;
+        }
+        if req.clear_api_key {
+            account.api_key = None;
+        } else if let Some(value) = req.api_key {
+            account.api_key = value;
+        }
+        if req.clear_base_url {
+            account.base_url = None;
+        } else if let Some(value) = req.base_url {
+            account.base_url = value;
+        }
+        if req.clear_user_agent {
+            account.user_agent = None;
+        } else if let Some(value) = req.user_agent {
+            account.user_agent = value;
+        }
+        if let Some(value) = req.skip_tls_verify {
+            account.skip_tls_verify = value;
+        }
+    }
+    true
+}
+
 fn replace_deleted_default_selection(
     config: &mut atomcode_config::config::Config,
     deleted_name: &str,
@@ -870,10 +977,30 @@ pub(crate) async fn patch_provider(
             conflict = true;
             anyhow::bail!("provider {final_name:?} already exists");
         }
-        let Some(existing) = config.providers.get_mut(&name) else {
+        // The webui lists the unified catalog, so `name` may be a NEW-SCHEMA model
+        // (in `config.models`) rather than a legacy provider. Editing only
+        // `config.providers` (the old behavior) 404'd every new-schema model.
+        if !config.providers.contains_key(&name) {
+            if config.models.contains_key(&name) {
+                if !apply_patch_to_new_schema_model(config, &name, req) {
+                    // Model's account is missing (corrupted config) — refuse the whole
+                    // edit rather than half-applying it. Nothing was mutated.
+                    anyhow::bail!("account for model {name:?} not found");
+                }
+                if final_name != name {
+                    let model = config.models.remove(&name).expect("contains_key checked above");
+                    config.models.insert(final_name.clone(), model);
+                    rename_default_selection(config, &name, &final_name);
+                }
+                return Ok(());
+            }
             missing = true;
             anyhow::bail!("provider {name:?} not found");
-        };
+        }
+        let existing = config
+            .providers
+            .get_mut(&name)
+            .expect("contains_key checked above");
         if let Some(value) = req.provider_type {
             existing.provider_type = value;
         }
@@ -961,15 +1088,23 @@ pub(crate) async fn patch_provider(
         Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     };
 
-    let default_provider = config.default_provider.clone();
-    let p = config.providers.get(&final_name).unwrap();
-    Json(provider_info(
-        &final_name,
-        p,
-        p.supports_vision,
-        &default_provider,
-    ))
-    .into_response()
+    // Resolve from the unified catalog (not `config.providers`), so a renamed/edited
+    // NEW-SCHEMA model responds correctly instead of panicking on `.unwrap()`.
+    let default_selection = config.effective_model_selection().unwrap_or_default();
+    match config.provider_config_for_selection(&final_name) {
+        Some(p) => Json(provider_info(
+            &final_name,
+            &p,
+            config.model_vision_override(&final_name),
+            &default_selection,
+        ))
+        .into_response(),
+        None => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Provider '{}' vanished after update", final_name),
+        )
+        .into_response(),
+    }
 }
 
 /// DELETE /providers/:name - Delete a provider.
@@ -981,7 +1116,9 @@ pub(crate) async fn delete_provider(Path(name): Path<String>) -> impl IntoRespon
             managed = true;
             anyhow::bail!("managed CodingPlan provider");
         }
-        if config.providers.remove(&name).is_none() {
+        // Remove from the SAME unified catalog the webui lists (new-schema
+        // `config.models` ∪ legacy `config.providers`) — not just legacy providers.
+        if !remove_selection(config, &name) {
             missing = true;
             anyhow::bail!("provider {name:?} not found");
         }
@@ -1134,11 +1271,12 @@ pub(crate) async fn patch_thinking(
 #[cfg(test)]
 mod tests {
     use super::{
-        account_is_managed, discovery_url, fetch_discovery_body, insert_account_models,
-        normalize_discovered_models, parse_discovered_models, rename_default_selection,
-        replace_deleted_default_selection, selection_is_managed, selection_name_is_reserved,
-        stored_discovery_transport, AccountModelConflict, CreateAccountModelRequest,
-        DiscoveryRequestError, DiscoveryTransport, PatchProviderRequest,
+        account_is_managed, apply_patch_to_new_schema_model, discovery_url, fetch_discovery_body,
+        insert_account_models, normalize_discovered_models, parse_discovered_models,
+        remove_selection, rename_default_selection, replace_deleted_default_selection,
+        selection_is_managed, selection_name_is_reserved, stored_discovery_transport,
+        AccountModelConflict, CreateAccountModelRequest, DiscoveryRequestError, DiscoveryTransport,
+        PatchProviderRequest,
     };
     use crate::DiscoveredModelInfo;
     use atomcode_config::config::Config;
@@ -1210,6 +1348,96 @@ mod tests {
         }))
         .unwrap();
         assert!(!selection_is_managed(&custom, "AtomGit-looking"));
+    }
+
+    // The webui lists the UNIFIED catalog (new-schema `config.models` ∪ legacy
+    // `config.providers`), so DELETE /providers/:name must remove a new-schema model
+    // too — the old code only touched `config.providers`, so deleting a new-schema
+    // model 404'd with "Provider 'X' not found" while the row stayed in the list.
+    #[test]
+    fn remove_selection_deletes_new_schema_model_not_only_legacy_providers() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "bai": { "provider": "openai", "base_url": "https://api.b.ai/v1" } },
+            "models": { "bai/deepseek-v4-flash": { "account": "bai", "model": "deepseek-v4-flash" } },
+            "providers": { "legacy": { "type": "openai", "model": "legacy-id" } }
+        }))
+        .unwrap();
+
+        // New-schema model (the reported failure) is removed.
+        assert!(remove_selection(&mut config, "bai/deepseek-v4-flash"));
+        assert!(!config.models.contains_key("bai/deepseek-v4-flash"));
+        // Legacy provider still removable.
+        assert!(remove_selection(&mut config, "legacy"));
+        assert!(!config.providers.contains_key("legacy"));
+        // Unknown id removes nothing → caller 404s.
+        assert!(!remove_selection(&mut config, "does-not-exist"));
+    }
+
+    // Editing a new-schema model (the same rows the delete bug hit) must work too:
+    // per-model fields (wire model id, context_window, vision, thinking) land on the
+    // MODEL; connection fields (type/base_url/api_key) land on its SHARED account (the
+    // account IS the connection). The old handler only did `config.providers.get_mut`,
+    // so editing a new-schema model 404'd "Provider 'X' not found".
+    #[test]
+    fn patch_new_schema_model_writes_model_and_account_fields() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": { "bai": { "provider": "openai", "base_url": "https://api.b.ai/v1", "api_key": "sk-old" } },
+            "models": {
+                "bai/deepseek-v4-flash": { "account": "bai", "model": "deepseek-v4-flash", "context_window": 128000 },
+                "bai/glm": { "account": "bai", "model": "glm-4.6" }
+            }
+        }))
+        .unwrap();
+        let req: PatchProviderRequest = serde_json::from_value(serde_json::json!({
+            "type": "openai",
+            "model": "deepseek-chat",
+            "context_window": 64000,
+            "base_url": "https://api.c.ai/v1",
+            "api_key": "sk-new"
+        }))
+        .unwrap();
+
+        apply_patch_to_new_schema_model(&mut config, "bai/deepseek-v4-flash", req);
+
+        // Per-model fields land on the model.
+        let model = &config.models["bai/deepseek-v4-flash"];
+        assert_eq!(model.model, "deepseek-chat");
+        assert_eq!(model.context_window, 64000);
+        // Connection fields land on the shared account…
+        let account = &config.provider_accounts["bai"];
+        assert_eq!(account.base_url.as_deref(), Some("https://api.c.ai/v1"));
+        assert_eq!(account.api_key.as_deref(), Some("sk-new"));
+        // …and therefore the SIBLING model now resolves to the new endpoint (chosen
+        // "account is the connection" semantics — documented, not accidental).
+        assert_eq!(config.models["bai/glm"].account, "bai");
+        assert_eq!(
+            config.provider_config_for_selection("bai/glm").and_then(|p| p.base_url).as_deref(),
+            Some("https://api.c.ai/v1")
+        );
+    }
+
+    // Guard against a partial save: a new-schema model whose account is missing from
+    // config.provider_accounts (corrupted / half-migrated config) must NOT have its
+    // connection-field edits silently dropped while per-model fields save. The helper
+    // reports the account was unresolved so the caller can refuse the whole edit.
+    #[test]
+    fn patch_new_schema_model_reports_missing_account_and_leaves_model_untouched() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "models": { "orphan/model": { "account": "ghost", "model": "m", "context_window": 128000 } }
+        }))
+        .unwrap();
+        let req: PatchProviderRequest = serde_json::from_value(serde_json::json!({
+            "model": "changed",
+            "context_window": 64000,
+            "base_url": "https://api.c.ai/v1"
+        }))
+        .unwrap();
+
+        // Account "ghost" is absent → helper returns false (unresolved), nothing mutated.
+        assert!(!apply_patch_to_new_schema_model(&mut config, "orphan/model", req));
+        let model = &config.models["orphan/model"];
+        assert_eq!(model.model, "m", "model must be untouched on unresolved account");
+        assert_eq!(model.context_window, 128000, "context_window must be untouched");
     }
 
     #[test]
