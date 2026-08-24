@@ -290,6 +290,10 @@ enum ScopeArg {
         head: String,
     },
     Commit {
+        /// Omit ⇒ HEAD (review the latest commit), mirroring `Range.head`. Weak models
+        /// routinely emit `{"kind":"commit"}` with no `rev`; without this default that is a
+        /// hard `missing field 'rev'` parse error instead of the obviously-intended HEAD review.
+        #[serde(default = "default_head")]
         rev: String,
     },
 }
@@ -443,7 +447,7 @@ impl Tool for ReviewTool {
                         { "type": "object", "properties": { "kind": { "const": "working_tree" } }, "required": ["kind"] },
                         { "type": "object", "properties": { "kind": { "const": "staged" } }, "required": ["kind"] },
                         { "type": "object", "properties": { "kind": { "const": "range" }, "base": { "type": "string" }, "head": { "type": "string", "default": "HEAD" } }, "required": ["kind", "base"] },
-                        { "type": "object", "properties": { "kind": { "const": "commit" }, "rev": { "type": "string" } }, "required": ["kind", "rev"] }
+                        { "type": "object", "properties": { "kind": { "const": "commit" }, "rev": { "type": "string", "default": "HEAD" } }, "required": ["kind"] }
                     ],
                     "description": "Explicit mutually-exclusive review scope. Omit for working-tree changes."
                 },
@@ -983,6 +987,24 @@ mod tests {
         assert!(s.staged);
         let b: Args = serde_json::from_str(r#"{"base":"main"}"#).unwrap();
         assert_eq!(b.base.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn commit_scope_defaults_rev_to_head() {
+        // Weak models emit {"kind":"commit"} without `rev`; it must default to HEAD, not
+        // hard-fail with `missing field 'rev'`.
+        let a: Args = serde_json::from_str(r#"{"scope":{"kind":"commit"}}"#)
+            .expect("commit scope without rev must parse");
+        match a.review_scope().unwrap() {
+            ReviewScope::Commit { rev } => assert_eq!(rev, "HEAD"),
+            _ => panic!("expected Commit{{rev:HEAD}}"),
+        }
+        // An explicit rev is still honored.
+        let e: Args = serde_json::from_str(r#"{"scope":{"kind":"commit","rev":"abc123"}}"#).unwrap();
+        match e.review_scope().unwrap() {
+            ReviewScope::Commit { rev } => assert_eq!(rev, "abc123"),
+            _ => panic!("expected Commit{{rev:abc123}}"),
+        }
     }
 
     #[test]
