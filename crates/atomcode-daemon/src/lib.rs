@@ -3064,7 +3064,7 @@ pub struct ModelInfo {
     pub is_default: bool,
     /// Whether this concrete model endpoint accepts `reasoning_effort`.
     pub effort_applicable: bool,
-    /// Current `reasoning_effort`: `"low"`, `"medium"`, `"high"`, `"max"`,
+    /// Current `reasoning_effort`: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`,
     /// or `null` (the model's own default). Lets the webui reflect the active
     /// effort in the selector.
     pub reasoning_effort: Option<String>,

@@ -2248,17 +2248,22 @@ impl UiState {
         self.toggle_tool_output();
     }
 
-    /// Cycle through reasoning_effort values:
-    /// None → "low" → "medium" → "high" → "max" → None.
-    /// Returns the new value (None = use API default).
+    /// Cycle through reasoning_effort values in canonical order, then back to the
+    /// API default: None → each [`REASONING_EFFORT_LEVELS`] level in order → None
+    /// (e.g. None → low → medium → high → xhigh → max → None). Derived from the
+    /// canonical set so adding a level can never leave a hardcoded ladder skipping
+    /// it. Returns the new value (None = use API default).
+    ///
+    /// [`REASONING_EFFORT_LEVELS`]: atomcode_config::config::REASONING_EFFORT_LEVELS
     pub fn cycle_reasoning_effort(&mut self) -> Option<&'static str> {
+        let levels = atomcode_config::config::REASONING_EFFORT_LEVELS;
         let next: Option<&'static str> = match self.reasoning_effort.as_deref() {
-            None => Some("low"),
-            Some("low") => Some("medium"),
-            Some("medium") => Some("high"),
-            Some("high") => Some("max"),
-            Some("max") => None,
-            _ => Some("low"),
+            None => levels.first().copied(),
+            Some(cur) => match levels.iter().position(|l| l.eq_ignore_ascii_case(cur)) {
+                Some(i) if i + 1 < levels.len() => Some(levels[i + 1]),
+                Some(_) => None,                 // last level → API default
+                None => levels.first().copied(), // unknown value → restart the chain
+            },
         };
         self.reasoning_effort = next.map(|s| s.to_string());
         next
@@ -3548,6 +3553,7 @@ mod tests {
         assert_eq!(state.cycle_reasoning_effort(), Some("low"));
         assert_eq!(state.cycle_reasoning_effort(), Some("medium"));
         assert_eq!(state.cycle_reasoning_effort(), Some("high"));
+        assert_eq!(state.cycle_reasoning_effort(), Some("xhigh"));
         assert_eq!(state.cycle_reasoning_effort(), Some("max"));
         assert_eq!(state.cycle_reasoning_effort(), None);
     }

@@ -1228,7 +1228,7 @@ pub fn codingplan_group_account_id(provider_type: &str) -> &'static str {
 /// `/provider` panel, `/effort`, the daemon, and the webui can never disagree
 /// about which levels exist. (`"auto"`/`None` are capability states handled
 /// separately, not levels.)
-pub const REASONING_EFFORT_LEVELS: [&str; 4] = ["low", "medium", "high", "max"];
+pub const REASONING_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 /// Built-in reasoning levels advertised by an official CodingPlan model.
 /// `None` means the model has no product-owned restriction and should use its
@@ -1286,7 +1286,7 @@ pub fn allowed_effort_levels(declared: Option<&[String]>) -> Vec<&'static str> {
 
 /// Clamp a persisted `reasoning_effort` VALUE to an endpoint's allowed levels, so
 /// the wire (and every display) can never carry a level the endpoint declares
-/// unsupported. A concrete level (`low`/`medium`/`high`/`max`) outside
+/// unsupported. A concrete level (`low`/`medium`/`high`/`xhigh`/`max`) outside
 /// [`allowed_effort_levels`] becomes `None` (the API default); `"auto"` and
 /// `None` are capability states, not levels, and pass through unchanged. A valid
 /// value is returned verbatim (no normalization).
@@ -2202,12 +2202,19 @@ kind = "claude-code"
         // No declared subset ⇒ the full canonical set, in cycle order.
         assert_eq!(
             allowed_effort_levels(None),
-            vec!["low", "medium", "high", "max"]
+            vec!["low", "medium", "high", "xhigh", "max"]
         );
         // An empty list is treated as "unrestricted", not "no levels".
         assert_eq!(
             allowed_effort_levels(Some(&[])),
-            vec!["low", "medium", "high", "max"]
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        // `xhigh` is a recognized canonical level (motivating case: an AtomGit Qwen
+        // endpoint declaring low/medium/xhigh keeps all three, in canonical order).
+        let with_xhigh = ["xhigh".to_string(), "low".to_string(), "medium".to_string()];
+        assert_eq!(
+            allowed_effort_levels(Some(&with_xhigh)),
+            vec!["low", "medium", "xhigh"]
         );
         // A declared subset keeps CANONICAL order (not the config's order),
         // is case-insensitive, and drops unknown tokens.
@@ -2233,7 +2240,7 @@ kind = "claude-code"
         let only_unknown = ["none".to_string(), "bogus".to_string()];
         assert_eq!(
             allowed_effort_levels(Some(&only_unknown)),
-            vec!["low", "medium", "high", "max"]
+            vec!["low", "medium", "high", "xhigh", "max"]
         );
     }
 

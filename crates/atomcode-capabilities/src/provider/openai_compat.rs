@@ -1207,6 +1207,7 @@ fn effort_str(e: ReasoningEffort) -> &'static str {
         ReasoningEffort::Low => "low",
         ReasoningEffort::Medium => "medium",
         ReasoningEffort::High => "high",
+        ReasoningEffort::XHigh => "xhigh",
         ReasoningEffort::Max => "max",
     }
 }

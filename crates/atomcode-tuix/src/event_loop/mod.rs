@@ -6843,6 +6843,48 @@ mod menu_tests {
     }
 
     #[test]
+    fn effort_menu_respects_configured_levels_and_includes_xhigh() {
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        // Endpoint exposing only low/medium/xhigh (the AtomGit Qwen case): the
+        // dropdown lists exactly those (+ default), never high/max.
+        let items = build_menu_items_with_efforts(
+            "/effort ",
+            0,
+            &reg,
+            &custom,
+            None,
+            None,
+            Some(&["low", "medium", "xhigh"]),
+        )
+        .expect("effort dropdown");
+        let names: Vec<&str> = items.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"low") && names.contains(&"medium") && names.contains(&"xhigh"));
+        assert!(!names.contains(&"high") && !names.contains(&"max"), "got: {names:?}");
+        assert!(names.contains(&"default"), "default is always offered");
+        // `None` ⇒ full canonical set, now including xhigh.
+        let all = build_menu_items_with_efforts("/effort ", 0, &reg, &custom, None, None, None)
+            .expect("canonical dropdown");
+        let all_names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
+        for lvl in ["low", "medium", "high", "xhigh", "max"] {
+            assert!(all_names.contains(&lvl), "canonical must include {lvl}: {all_names:?}");
+        }
+        // Prefix narrowing still works against the configured set.
+        let x = build_menu_items_with_efforts(
+            "/effort x",
+            0,
+            &reg,
+            &custom,
+            None,
+            None,
+            Some(&["low", "xhigh"]),
+        )
+        .expect("`x` matches xhigh");
+        assert_eq!(x.len(), 1);
+        assert_eq!(x[0].0, "xhigh");
+    }
+
+    #[test]
     fn effort_applicable_ignores_provider_type_and_matches_webui() {
         // Any endpoint with an explicitly configured effort is applicable — the
         // TUI must no longer hide the control behind a `{deepseek, openai}`
@@ -15338,6 +15380,9 @@ fn build_skill_menu_items(
 /// start with '/' or has whitespace, meaning the user has moved on to args).
 /// Custom commands are appended after built-in matches; duplicates (custom
 /// command with the same name as a built-in) are suppressed.
+/// Thin wrapper preserving the historic 6-arg signature: `None` effort levels ⇒
+/// the `/effort ` dropdown falls back to all canonical levels (unchanged for every
+/// existing caller/test). Endpoint-aware callers use [`build_menu_items_with_efforts`].
 fn build_menu_items(
     buf: &str,
     cursor: usize,
@@ -15345,6 +15390,22 @@ fn build_menu_items(
     custom: &crate::custom_commands::CustomCommandRegistry,
     skill_registry: Option<&std::sync::RwLock<atomcode_capabilities::skills::SkillRegistry>>,
     file_index: Option<&file_index::FileIndex>,
+) -> Option<Vec<(String, String)>> {
+    build_menu_items_with_efforts(buf, cursor, commands, custom, skill_registry, file_index, None)
+}
+
+/// Like [`build_menu_items`], but the `/effort ` dropdown lists exactly
+/// `effort_levels` (the current selection's `reasoning_effort_levels`, canonical
+/// order) instead of the hardcoded four — so the dropdown, the Ctrl+T cycle, and
+/// `/effort <x>` validation all offer the same set. `None` ⇒ every canonical level.
+fn build_menu_items_with_efforts(
+    buf: &str,
+    cursor: usize,
+    commands: &CommandRegistry,
+    custom: &crate::custom_commands::CustomCommandRegistry,
+    skill_registry: Option<&std::sync::RwLock<atomcode_capabilities::skills::SkillRegistry>>,
+    file_index: Option<&file_index::FileIndex>,
+    effort_levels: Option<&[&'static str]>,
 ) -> Option<Vec<(String, String)>> {
     // `@`-mention branch — checked first so it takes priority over any
     // `/` interpretation.
@@ -15422,17 +15483,30 @@ fn build_menu_items(
             return None;
         }
         let prefix = after.to_ascii_lowercase();
-        let items: Vec<(String, String)> = [
+        // Descriptions for every canonical level; the dropdown shows only those in
+        // `allowed` (the selection's exposed levels) so it never offers a level the
+        // endpoint rejects. `None` ⇒ all canonical levels (unchanged behavior).
+        const DESCRIPTIONS: &[(&str, &str)] = &[
             ("low", "Minimal reasoning effort"),
             ("medium", "Moderate reasoning effort"),
             ("high", "Deeper reasoning"),
+            ("xhigh", "Extra-high reasoning effort"),
             ("max", "Maximum reasoning depth"),
-            ("default", "Return to the API default (keeps capability)"),
-        ]
-        .into_iter()
-        .filter(|(n, _)| n.starts_with(prefix.as_str()))
-        .map(|(n, d)| (n.to_string(), d.to_string()))
-        .collect();
+        ];
+        let allowed: &[&str] =
+            effort_levels.unwrap_or(&atomcode_config::config::REASONING_EFFORT_LEVELS);
+        let mut items: Vec<(String, String)> = DESCRIPTIONS
+            .iter()
+            .filter(|(n, _)| allowed.contains(n) && n.starts_with(prefix.as_str()))
+            .map(|(n, d)| (n.to_string(), d.to_string()))
+            .collect();
+        // `default` (return to the API default) is always offered — it is not a level.
+        if "default".starts_with(prefix.as_str()) {
+            items.push((
+                "default".to_string(),
+                "Return to the API default (keeps capability)".to_string(),
+            ));
+        }
         return if items.is_empty() { None } else { Some(items) };
     }
 
@@ -15477,13 +15551,17 @@ fn menu_for_display(buf: &Buffer, ctx: &LoopCtx) -> Option<Vec<(String, String)>
     if buf.is_in_history() || buf.menu_suppressed() {
         return None;
     }
-    build_menu_items(
+    // The steady-state display funnel: make the `/effort ` dropdown reflect exactly
+    // the current selection's exposed levels.
+    let efforts = selection_allowed_efforts(ctx);
+    build_menu_items_with_efforts(
         &buf.text,
         buf.cursor,
         &ctx.commands,
         &ctx.custom_commands,
         Some(&ctx.skill_registry),
         Some(&ctx.file_index),
+        Some(efforts.as_slice()),
     )
 }
 
@@ -15583,13 +15661,15 @@ fn confirm_idle_menu_selected(
     if needs_args {
         app.buf.replace_all_text(format!("/{name} "));
         if matches!(name.as_str(), "skills" | "effort") {
-            if let Some(next_items) = build_menu_items(
+            let efforts = selection_allowed_efforts(ctx);
+            if let Some(next_items) = build_menu_items_with_efforts(
                 &app.buf.text,
                 app.buf.cursor,
                 &ctx.commands,
                 &ctx.custom_commands,
                 Some(&ctx.skill_registry),
                 Some(&ctx.file_index),
+                Some(efforts.as_slice()),
             ) {
                 redraw_with_menu(&app.buf, &next_items, 0, &app.state, ctx, renderer);
                 return Ok(());
@@ -15959,13 +16039,15 @@ fn handle_idle_key(
                     // `/effort` gateway: render the high/max/off sub-menu
                     // immediately so it doesn't blink out and reappear.
                     if name == "effort" {
-                        if let Some(items) = build_menu_items(
+                        let efforts = selection_allowed_efforts(ctx);
+                        if let Some(items) = build_menu_items_with_efforts(
                             &app.buf.text,
                             app.buf.cursor,
                             &ctx.commands,
                             &ctx.custom_commands,
                             Some(&ctx.skill_registry),
                             Some(&ctx.file_index),
+                            Some(efforts.as_slice()),
                         ) {
                             app.menu.selected = 0;
                             redraw_with_menu(&app.buf, &items, 0, &app.state, ctx, renderer);

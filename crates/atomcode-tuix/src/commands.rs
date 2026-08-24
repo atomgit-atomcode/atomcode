@@ -196,12 +196,12 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "auto",    desc: "Switch to Auto mode (auto-approve all tools)", needs_args: false, hidden: false, acp: true },
     Command { name: "review",  desc: "Code review the current changes (/review · /review staged · /review <base>)", needs_args: false, hidden: false, acp: false },
     Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false, hidden: false, acp: false },
-    // Gateway entry: opens a second-level palette (low / medium / high / max / default).
+    // Gateway entry: opens a second-level palette (low / medium / high / xhigh / max / default).
     // needs_args=true so Enter rewrites the buffer to `/effort ` and the
     // sub-mode menu renders the choices. Selecting one commits as
     // `/effort <choice>` → dispatched by the `effort` arm. Runtime label comes
     // from `Msg::CmdDescEffort`; this static `desc` is only a fallback.
-    Command { name: "effort",  desc: "Model reasoning effort control (low / medium / high / max / default)", needs_args: true, hidden: false, acp: true },
+    Command { name: "effort",  desc: "Model reasoning effort control (low / medium / high / xhigh / max / default)", needs_args: true, hidden: false, acp: true },
     // needs_args=true so selecting `/goal` from the palette only completes to
     // `/goal ` and waits for the user to type the goal — it must NOT execute
     // immediately (a bare `/goal` would just print status). Setting a goal

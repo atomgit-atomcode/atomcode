@@ -50,7 +50,7 @@ pub struct ProviderConfig {
     pub reasoning_history: Option<String>,
     /// Reasoning effort control. `"auto"` declares that this concrete endpoint
     /// supports effort switching while leaving the API default in effect;
-    /// `"low" | "medium" | "high" | "max"` also set the model default.
+    /// `"low" | "medium" | "high" | "xhigh" | "max"` also set the model default.
     /// Sent as top-level `reasoning_effort` in the request body.
     /// None = endpoint capability is unknown/disabled; don't send the field.
     /// For OpenAI-compatible endpoints, a configured value explicitly enables
@@ -58,7 +58,7 @@ pub struct ProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     /// Optional per-endpoint restriction of which reasoning-effort LEVELS this
-    /// model exposes (a subset of `["low","medium","high","max"]`). `None`/empty
+    /// model exposes (a subset of `["low","medium","high","xhigh","max"]`). `None`/empty
     /// ⇒ all levels. See [`super::allowed_effort_levels`]. Constrains only what the
     /// UI offers and what `/effort` accepts; the wire still sends a single value.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -428,8 +428,8 @@ struct ModelForm {
     /// `None` = unsupported, `Some("auto")` = supported with API default.
     reasoning_effort: Option<String>,
     /// Per-level toggles for `reasoning_effort_levels` (index = canonical
-    /// low/medium/high/max order). All-true ⇒ unrestricted (persisted as None).
-    effort_levels: [bool; 4],
+    /// low/medium/high/xhigh/max order). All-true ⇒ unrestricted (persisted as None).
+    effort_levels: [bool; EFFORT_LEVEL_COUNT],
     /// Sub-cursor for the EffortLevels multi-select (which level Space toggles).
     effort_level_cursor: usize,
     window: String,
@@ -441,13 +441,18 @@ struct ModelForm {
     edit_id: Option<String>,
 }
 
+/// Number of canonical reasoning-effort levels; the per-level toggle arrays track
+/// [`REASONING_EFFORT_LEVELS`](atomcode_config::config::REASONING_EFFORT_LEVELS) so
+/// adding a level (e.g. `xhigh`) can never desync a hardcoded array length.
+const EFFORT_LEVEL_COUNT: usize = atomcode_config::config::REASONING_EFFORT_LEVELS.len();
+
 /// Convert a persisted `reasoning_effort_levels` list into per-level toggles
-/// (canonical low/medium/high/max order). `None`/empty ⇒ all levels enabled.
-fn effort_levels_from_config(declared: Option<&[String]>) -> [bool; 4] {
+/// (canonical low/medium/high/xhigh/max order). `None`/empty ⇒ all levels enabled.
+fn effort_levels_from_config(declared: Option<&[String]>) -> [bool; EFFORT_LEVEL_COUNT] {
     // Derive from the single source of truth so the toggles agree with what every
     // other surface offers (incl. the "unknown-only list ⇒ all levels" rule).
     let allowed = atomcode_config::config::allowed_effort_levels(declared);
-    let mut bits = [false; 4];
+    let mut bits = [false; EFFORT_LEVEL_COUNT];
     for (i, level) in atomcode_config::config::REASONING_EFFORT_LEVELS
         .iter()
         .enumerate()
@@ -460,7 +465,7 @@ fn effort_levels_from_config(declared: Option<&[String]>) -> [bool; 4] {
 /// Convert per-level toggles back to a persisted `reasoning_effort_levels`.
 /// All-enabled (or, degenerately, all-disabled) ⇒ `None` = unrestricted; there is
 /// no "zero levels" state, since `allowed_effort_levels` treats empty as all.
-fn effort_levels_to_config(bits: [bool; 4]) -> Option<Vec<String>> {
+fn effort_levels_to_config(bits: [bool; EFFORT_LEVEL_COUNT]) -> Option<Vec<String>> {
     if bits.iter().all(|b| *b) || bits.iter().all(|b| !*b) {
         return None;
     }
@@ -500,7 +505,7 @@ impl ModelForm {
             model: String::new(),
             supports_vision: None,
             reasoning_effort: None,
-            effort_levels: [true; 4],
+            effort_levels: [true; EFFORT_LEVEL_COUNT],
             effort_level_cursor: 0,
             window: String::new(),
             make_default: true,
@@ -2809,39 +2814,40 @@ mod tests {
         // Pure config↔toggles round-trip (index = low/medium/high/max).
         assert_eq!(
             effort_levels_from_config(None),
-            [true; 4],
+            [true; EFFORT_LEVEL_COUNT],
             "None ⇒ all levels"
         );
         assert_eq!(
-            effort_levels_to_config([true; 4]),
+            effort_levels_to_config([true; EFFORT_LEVEL_COUNT]),
             None,
             "all ⇒ unrestricted"
         );
         assert_eq!(
-            effort_levels_to_config([false; 4]),
+            effort_levels_to_config([false; EFFORT_LEVEL_COUNT]),
             None,
             "none ⇒ unrestricted (no zero-levels state)"
         );
         assert_eq!(
-            effort_levels_to_config([true, false, true, true]).as_deref(),
+            // low on, medium+xhigh off, high+max on (index = low/medium/high/xhigh/max).
+            effort_levels_to_config([true, false, true, false, true]).as_deref(),
             Some(["low".to_string(), "high".to_string(), "max".to_string()].as_slice())
         );
 
         // new_add starts unrestricted and exposes the EffortLevels field.
         let mut add = ModelForm::new_add(&cfg, Some("acc")).unwrap();
-        assert_eq!(add.effort_levels, [true; 4]);
+        assert_eq!(add.effort_levels, [true; EFFORT_LEVEL_COUNT]);
         assert!(add.fields().contains(&ModelField::EffortLevels));
         // Toggle "medium" (cursor index 1) off.
         add.effort_level_cursor = 1;
         add.toggle_effort_level();
-        assert_eq!(add.effort_levels, [true, false, true, true]);
+        assert_eq!(add.effort_levels, [true, false, true, true, true]);
         assert_eq!(
             add.effort_levels_label(true),
-            " ● low ‹○ medium› ● high  ● max "
+            " ● low ‹○ medium› ● high  ● xhigh  ● max "
         );
         assert_eq!(
             add.effort_levels_label(false),
-            " ● low  ○ medium  ● high  ● max "
+            " ● low  ○ medium  ● high  ● xhigh  ● max "
         );
         // The DEFAULT cycle now skips medium: None → auto → low → high.
         add.reasoning_effort = None;
@@ -2857,9 +2863,9 @@ mod tests {
         f.toggle_effort_level();
         assert_eq!(f.reasoning_effort.as_deref(), Some("auto"));
 
-        // new_edit loads the persisted subset (medium off).
+        // new_edit loads the persisted subset (declares low/high/max ⇒ medium+xhigh off).
         let edit = ModelForm::new_edit(&cfg, "acc/sub").unwrap();
-        assert_eq!(edit.effort_levels, [true, false, true, true]);
+        assert_eq!(edit.effort_levels, [true, false, true, false, true]);
     }
 
     #[test]
