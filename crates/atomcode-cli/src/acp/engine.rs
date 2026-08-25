@@ -37,8 +37,11 @@ impl EngineConfig {
     pub fn to_coding_config(&self, cwd: PathBuf) -> CodingAgentConfig {
         let mut cfg = self.config.clone();
         cfg.working_dir = cwd;
-        // ACP sessions are long-lived and interactive: park on approval, not fail-closed.
+        // ACP sessions are long-lived and interactive: park on approval, not fail-closed, and a
+        // human in the editor reviews edits — so mark them attended (mirrors the request_timeout
+        // clear above; keeps the two intents in sync for the verify-cadence gate).
         cfg.request_timeout = None;
+        cfg.interactive = true;
         cfg
     }
 }

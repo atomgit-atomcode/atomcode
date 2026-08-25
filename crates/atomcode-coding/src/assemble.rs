@@ -148,10 +148,16 @@ fn build_coding_agent_from_tools(
         // Env / project-instructions / git context at session start (after persona).
         .hook(Arc::new(SessionContextHook::new(cfg.working_dir.clone())))
         .hook(turn_execution_policy.clone())
-        .hook(Arc::new(VerifyCadenceHook::with_execution_policy(
-            cfg.working_dir.clone(),
-            turn_execution_policy,
-        )))
+        .hook(Arc::new(
+            VerifyCadenceHook::with_execution_policy(
+                cfg.working_dir.clone(),
+                turn_execution_policy,
+            )
+            // Attended (a present human who reviews edits — CodingAgentConfig::is_attended) →
+            // don't FORCE post-edit checks; headless / scheduled keep the cadence.
+            // `ATOMCODE_VERIFY` overrides. (Mirrors parts.rs.)
+            .attended(cfg.is_attended()),
+        ))
         .working_dir(cfg.working_dir.clone())
         // Cache-friendly task-boundary stub + hard-overflow recovery ladder (stub→truncate
         // →drain+LLM-summary). The overflow path is off the normal path (typed error only).

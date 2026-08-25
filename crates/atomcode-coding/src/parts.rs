@@ -28,7 +28,7 @@ use atomcode_capabilities::memory::MemoryHook;
 use atomcode_capabilities::session::snapshot::SnapshotPersistenceStatus;
 use atomcode_capabilities::session::{
     PresentationFile, RecallTool, SessionContextHook, SessionLease, SessionManager, SessionMeta,
-    SnapshotHook, StatusReminderHook, StorageOwner, TranscriptHook,
+    SnapshotHook, StorageOwner, TranscriptHook,
 };
 use atomcode_capabilities::skills::{
     register_skill_tools, runtime_skill_dirs, SkillCatalogHook, SkillRegistry,
@@ -907,9 +907,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // 3. SnapshotHook  — turn_complete: persist .snapshot + .meta.
     // 4. TranscriptHook— turn_complete: append the .jsonl record. (No coupling with
     //    3 — the order is fixed purely for determinism.)
-    // 5. StatusReminderHook — pre_request tail-append (cache red-line: tail only, and
-    //    SKIPPED on a turn's round 1 so it never pairs with the user message).
-    // 6. VerifyCadenceHook — offer_continuation; FIRST `Some` wins in the chain, so
+    // 5. VerifyCadenceHook — offer_continuation; FIRST `Some` wins in the chain, so
     //    keep it last: any earlier hook's continuation outranks the cadence nudge.
     let mut hooks: Vec<Arc<dyn LifecycleHooks>> = Vec::new();
     let mut compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>> = None;
@@ -949,22 +947,32 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 .with_persistence_status(snapshot_hook.persistence_status()),
         ));
     }
-    // Date awareness is UNCONDITIONAL (production parity): a per-turn <system-reminder> serves
-    // recall's relative-date resolution. Runtime pressure (context usage and round counters) is
-    // deliberately kept internal; projecting it made weak models invent urgency and rush work.
-    // Injected from round 2 of each turn (round 1 is skipped — see StatusReminderHook — to avoid
-    // a user-after-user wire pair).
-    hooks.push(Arc::new(StatusReminderHook::new()));
+    // Date awareness comes from the frozen date anchor in the persona system prompt (cache-stable,
+    // present on EVERY round including round 1), so recall's relative-date resolution has a current
+    // date WITHOUT a per-round <system-reminder> tail. The old StatusReminderHook re-injected the
+    // same date every round from round 2 — redundant with the anchor, and it prompted chatty
+    // mid-tier models to narrate "reminder recorded, continuing" each turn. TRADEOFF: the anchor is
+    // frozen at assemble/reconcile time (spawn, /model swap, resume), NOT refreshed per-round — so a
+    // session left running continuously across midnight keeps the prior day's date until the next
+    // reassemble; the removed hook used to self-correct that live. Accepted as a rare edge vs. the
+    // per-round narration cost. (The hook type still exists but is no longer registered.)
     // Pin the workspace root the cadence uses to gate out-of-workspace edits (e.g. a throwaway
     // /tmp write must not arm the "run cargo check" nudge). INVARIANT: this must equal the dir
     // the edit/write tools resolve relative `file_path` against — they stay in lockstep because
     // `/cd` respawns the agent (rebuilding this hook with the new dir), not by mutating cwd in
     // place. If `/cd` ever moves to an in-place cwd mutation, thread the live cwd in here too.
     hooks.push(turn_execution_policy.clone());
-    hooks.push(Arc::new(VerifyCadenceHook::with_execution_policy(
-        cfg.working_dir.clone(),
-        turn_execution_policy.clone(),
-    )));
+    hooks.push(Arc::new(
+        VerifyCadenceHook::with_execution_policy(
+            cfg.working_dir.clone(),
+            turn_execution_policy.clone(),
+        )
+        // Attended (a present human who reviews edits — see CodingAgentConfig::is_attended) →
+        // don't FORCE post-edit checks (codex-style); headless / scheduled keep the cadence.
+        // `ATOMCODE_VERIFY` overrides. Weak-model anti-hide discipline (FIX, DON'T HIDE) is a
+        // SEPARATE persona block and is unaffected.
+        .attended(cfg.is_attended()),
+    ));
     // Todo hook (native runtime path — the live TUI + webui): per-turn <system-reminder> of the
     // current list so the model keeps it accurate after compaction, PLUS an `offer_continuation`
     // that nudges once to close out open items when the model tries to stop. Gated on the SAME

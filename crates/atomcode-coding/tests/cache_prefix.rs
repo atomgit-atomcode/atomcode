@@ -78,16 +78,6 @@ fn leading_system(messages: &[Message]) -> &[Message] {
     &messages[..n]
 }
 
-/// Strip the CurrentDateHook tail: its `pre_request` appends exactly one trailing
-/// `user` "Current date: …" message — ephemeral (not stored, not part of the cached
-/// prefix). Everything before it is the byte-stable prefix.
-fn without_date_tail(messages: &[Message]) -> &[Message] {
-    match messages.last() {
-        Some(m) if m.text.starts_with("Current date:") => &messages[..messages.len() - 1],
-        _ => messages,
-    }
-}
-
 fn text_turn(t: &str) -> Vec<StreamEvent> {
     vec![
         StreamEvent::TextDelta(t.into()),
@@ -190,11 +180,12 @@ async fn full_assembly_wire_prefix_is_cacheable_across_turns() {
         );
     }
 
-    // (3) append-only: each call's stored history (minus the ephemeral date tail) is a
-    //     STRICT byte prefix of the next — no head mutation, no mid-session rewrite.
+    // (3) append-only: each call's stored history is a STRICT byte prefix of the next — no head
+    //     mutation, no mid-session rewrite. (No ephemeral date tail to strip: the per-round
+    //     status reminder was removed; the date now lives in the frozen persona prefix.)
     for w in calls.windows(2) {
-        let prev = history_repr(without_date_tail(&w[0].0));
-        let next = history_repr(without_date_tail(&w[1].0));
+        let prev = history_repr(&w[0].0);
+        let next = history_repr(&w[1].0);
         assert!(
             is_strict_prefix(&prev, &next),
             "history must be append-only (strict byte prefix).\n  prev = {prev:?}\n  next = {next:?}"

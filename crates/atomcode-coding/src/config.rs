@@ -61,6 +61,13 @@ pub struct CodingAgentConfig {
     /// Enables the kernel's fixed interactive safety checkpoints (round cap and
     /// exhausted output-limit recovery). Default false; only the TUI sets it.
     pub round_cap_checkpoint: bool,
+    /// Whether a HUMAN is attending this run (interactive TUI, ACP editor, webui-live) and
+    /// reviews edits as they happen — as opposed to a headless / scheduled / daemon run. Set by
+    /// every driver that also parks approvals for a present human (it mirrors the same intent as
+    /// clearing `request_timeout`, but is a first-class signal so consumers don't overload the
+    /// approval-timeout field). Consumed by [`Self::is_attended`] to gate the forced post-edit
+    /// verify cadence. Default false (unattended → keep forcing verification).
+    pub interactive: bool,
     /// Generate an ephemeral next-prompt suggestion after a naturally completed
     /// turn. The coding runtime owns the auxiliary request and cancellation;
     /// drivers only project the resulting neutral event. Default false so
@@ -367,6 +374,7 @@ impl CodingRuntimeConfig {
         config.loop_max_rounds = self.loop_max_rounds;
         config.max_rounds = self.turn_max_rounds;
         config.subagent_config = self.subagent_config.clone();
+        config.interactive = self.interactive;
         if self.interactive {
             config.request_timeout = None;
         }
@@ -750,6 +758,15 @@ pub fn resolve_turn_max_rounds(configured: u32, env: Option<&str>) -> u32 {
 }
 
 impl CodingAgentConfig {
+    /// Whether a present human is attending this run (see [`Self::interactive`]). The verify
+    /// mount sites gate on THIS accessor — not on a raw field — so the "is a human here to ask
+    /// for a check?" decision and its rationale live in one place: attended → don't FORCE a
+    /// post-edit verify continuation (the human can request one); unattended (headless /
+    /// scheduled) → keep the forcing cadence.
+    pub fn is_attended(&self) -> bool {
+        self.interactive
+    }
+
     /// Construct with the required fields and sane defaults for the rest.
     pub fn new(
         api_key: impl Into<String>,
@@ -775,6 +792,7 @@ impl CodingAgentConfig {
             max_rounds: default_turn_max_rounds(),
             round_cap_checkpoint: false,
             next_prompt_suggestions: false,
+            interactive: false,
             tool_loop_policy: default_tool_loop_policy(),
             goal_max_rounds: default_goal_max_rounds(),
             goal_max_duration_secs: default_goal_max_duration_secs(),
@@ -1356,6 +1374,7 @@ impl std::fmt::Debug for CodingAgentConfig {
             .field("context_window", &self.context_window)
             .field("stream_timeout", &self.stream_timeout)
             .field("request_timeout", &self.request_timeout)
+            .field("interactive", &self.interactive)
             .field("max_continuations", &self.max_continuations)
             .field("max_rounds", &self.max_rounds)
             .field("tool_loop_policy", &self.tool_loop_policy)
