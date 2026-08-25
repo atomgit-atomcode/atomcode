@@ -3090,9 +3090,13 @@ fn models_from_config(config: &Config) -> Vec<ModelInfo> {
                 model: p.model.clone(),
                 provider_type: p.provider_type.clone(),
                 is_default: id == &default_selection,
-                effort_applicable: p.reasoning_effort.is_some()
-                    || (atomcode_config::config::is_codingplan_provider_name(id)
-                        && p.model.eq_ignore_ascii_case("deepseek-v4-flash")),
+                // Driven by CONFIG — an explicit effort, or a non-empty server-advertised
+                // `reasoning_effort_levels` — never a hardcoded model name. Single source of
+                // truth shared with the TUI `/effort` and the wire capability.
+                effort_applicable: atomcode_config::config::endpoint_supports_reasoning_effort(
+                    p.reasoning_effort.as_deref(),
+                    p.reasoning_effort_levels.as_deref(),
+                ),
                 // Clamp to the allowed levels so the webui trigger never shows a
                 // level the dropdown hides (then drop the `auto` sentinel).
                 reasoning_effort: atomcode_config::config::clamp_effort_to_levels(
@@ -6839,6 +6843,46 @@ mod tests {
         );
         assert!(displayed[1].synthetic);
         assert!(displayed[1].content.is_empty());
+    }
+
+    #[test]
+    fn models_from_config_shows_effort_for_any_model_that_advertises_levels() {
+        // A CodingPlan model whose server-advertised `reasoning_effort_levels` is
+        // non-empty (e.g. qwen3.8-27b) must be effort_applicable in the webui — driven
+        // by config, not a hardcoded `deepseek-v4-flash` name. A level-less model stays off.
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "AtomGit": { "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1" }
+            },
+            "models": {
+                "AtomGit-qwen3.8-27b": {
+                    "account": "AtomGit", "model": "qwen3.8-27b",
+                    "reasoning_effort_levels": ["low", "medium", "xhigh"]
+                },
+                "AtomGit-GLM-5.2": { "account": "AtomGit", "model": "GLM-5.2" }
+            }
+        }))
+        .unwrap();
+
+        let models = models_from_config(&config);
+        let qwen = models
+            .iter()
+            .find(|m| m.model == "qwen3.8-27b")
+            .expect("qwen model listed");
+        assert!(
+            qwen.effort_applicable,
+            "a model advertising effort levels must show the selector"
+        );
+        assert_eq!(qwen.effort_levels, vec!["low", "medium", "xhigh"]);
+
+        let glm = models
+            .iter()
+            .find(|m| m.model == "GLM-5.2")
+            .expect("glm model listed");
+        assert!(
+            !glm.effort_applicable,
+            "a model with no effort levels must not show the selector"
+        );
     }
 
     #[test]

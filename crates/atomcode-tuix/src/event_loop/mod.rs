@@ -6884,32 +6884,6 @@ mod menu_tests {
         assert_eq!(x[0].0, "xhigh");
     }
 
-    #[test]
-    fn effort_applicable_ignores_provider_type_and_matches_webui() {
-        // Any endpoint with an explicitly configured effort is applicable — the
-        // TUI must no longer hide the control behind a `{deepseek, openai}`
-        // provider_type gate the webui/wire never applied.
-        assert!(effort_applicable(
-            Some("medium"),
-            "internal-anthropic",
-            "claude-x"
-        ));
-        assert!(effort_applicable(Some("high"), "internal-ollama", "qwen"));
-        // Unconfigured custom endpoint → not applicable.
-        assert!(!effort_applicable(None, "internal-glm", "glm-5.2"));
-        // Built-in CodingPlan DeepSeek V4 Flash → applicable without a config value
-        // (matches `models_from_config`); a codingplan name with another model is not.
-        assert!(effort_applicable(
-            None,
-            "AtomGit-deepseek-v4-flash",
-            "deepseek-v4-flash"
-        ));
-        assert!(!effort_applicable(
-            None,
-            "AtomGit-deepseek-v4-flash",
-            "glm-5.2"
-        ));
-    }
 
     #[test]
     fn no_skill_registry_is_no_op() {
@@ -29980,29 +29954,17 @@ fn persist_reasoning_effort(ctx: &mut LoopCtx) {
     }
 }
 
-/// Whether the current selection exposes a reasoning-effort control. Mirrors the
-/// daemon's `models_from_config` derivation EXACTLY (an explicitly configured
-/// value declares the capability, plus the one built-in CodingPlan DeepSeek V4
-/// Flash fallback) so the TUI `/effort`, the webui selector, and the wire gate
-/// never disagree. Deliberately NOT gated on `provider_type`: the old
-/// `{deepseek, openai}` restriction hid the control in the TUI for any other
-/// endpoint the user had explicitly configured with an effort, while the webui
-/// still showed it.
-fn effort_applicable(reasoning_effort: Option<&str>, selection: &str, model: &str) -> bool {
-    reasoning_effort.is_some()
-        || (atomcode_config::config::is_codingplan_provider_name(selection)
-            && model.eq_ignore_ascii_case("deepseek-v4-flash"))
-}
-
 pub(crate) fn reasoning_effort_applicable_on_provider(ctx: &LoopCtx) -> bool {
     let selection = ctx.config.effective_model_selection().unwrap_or_default();
     let Some(provider) = ctx.config.provider_config_for_selection(&selection) else {
         return false;
     };
-    effort_applicable(
+    // Drive the control from the endpoint's CONFIG (an explicit effort, or a non-empty
+    // server-advertised `reasoning_effort_levels`) — never a hardcoded model name. Single
+    // source of truth shared with the webui selector and the wire capability.
+    atomcode_config::config::endpoint_supports_reasoning_effort(
         provider.reasoning_effort.as_deref(),
-        &selection,
-        &ctx.model_name,
+        provider.reasoning_effort_levels.as_deref(),
     )
 }
 

@@ -175,9 +175,10 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
 }
 
 fn supports_reasoning_effort(cfg: &CodingAgentConfig) -> bool {
+    // The capability is already resolved from CONFIG when the CodingAgentConfig is built
+    // (`agent_config` / `apply_provider_config` via `endpoint_supports_reasoning_effort`),
+    // so just read it — no hardcoded model name.
     cfg.supports_reasoning_effort
-        || (atomcode_config::config::is_codingplan_provider_name(&cfg.provider_name)
-            && cfg.model.eq_ignore_ascii_case("deepseek-v4-flash"))
 }
 
 pub fn default_max_tokens(context_window: u32) -> u32 {
@@ -227,9 +228,10 @@ pub fn derive_tier_config(
     tier.chat_options.reasoning_effort = atomcode_kernel::provider::ReasoningEffort::from_config(
         provider.reasoning_effort.as_deref(),
     );
-    tier.supports_reasoning_effort = provider.reasoning_effort.is_some()
-        || (atomcode_config::config::is_codingplan_provider_name(provider_name)
-            && provider.model.eq_ignore_ascii_case("deepseek-v4-flash"));
+    tier.supports_reasoning_effort = atomcode_config::config::endpoint_supports_reasoning_effort(
+        provider.reasoning_effort.as_deref(),
+        provider.reasoning_effort_levels.as_deref(),
+    );
     tier.thinking_enabled = provider.thinking_enabled;
     tier.user_agent = provider.user_agent.clone();
     tier.skip_tls_verify = provider.skip_tls_verify;
@@ -281,9 +283,10 @@ pub fn derive_tier_config_from_resolved(
     tier.chat_options.reasoning_effort = atomcode_kernel::provider::ReasoningEffort::from_config(
         resolved.reasoning_effort.as_deref(),
     );
-    tier.supports_reasoning_effort = resolved.reasoning_effort.is_some()
-        || (atomcode_config::config::is_codingplan_provider_name(&resolved.selection_id)
-            && resolved.model.eq_ignore_ascii_case("deepseek-v4-flash"));
+    tier.supports_reasoning_effort = atomcode_config::config::endpoint_supports_reasoning_effort(
+        resolved.reasoning_effort.as_deref(),
+        resolved.reasoning_effort_levels.as_deref(),
+    );
     tier.thinking_enabled = resolved.thinking_enabled;
     tier.user_agent = resolved.user_agent.clone();
     tier.skip_tls_verify = resolved.skip_tls_verify;
@@ -440,22 +443,19 @@ mod tests {
     }
 
     #[test]
-    fn effort_capability_is_explicit_except_for_atomgit_deepseek_flash() {
-        let mut custom = config("openai");
-        custom.model = "glm-5.2".into();
-        custom.provider_name = "internal-glm".into();
-        assert!(!supports_reasoning_effort(&custom));
-
-        custom.supports_reasoning_effort = true;
-        assert!(supports_reasoning_effort(&custom));
-
-        let mut atomgit = config("openai");
-        atomgit.model = "deepseek-v4-flash".into();
-        atomgit.provider_name = "AtomGit-deepseek-v4-flash".into();
-        assert!(supports_reasoning_effort(&atomgit));
-
-        atomgit.provider_name = "private-deepseek".into();
-        assert!(!supports_reasoning_effort(&atomgit));
+    fn supports_reasoning_effort_reads_the_config_resolved_capability() {
+        // The capability is resolved from CONFIG when the CodingAgentConfig is built
+        // (via `endpoint_supports_reasoning_effort`), so this reader just reflects the
+        // field — NO hardcoded model name. (The config-driven derivation itself is
+        // covered by `endpoint_supports_reasoning_effort_is_config_driven` in the config
+        // crate and by `tier_configs_preserve_default_effort_and_capability` below.)
+        let mut cfg = config("openai");
+        cfg.model = "qwen3.8-27b".into();
+        cfg.provider_name = "AtomGit-qwen3.8-27b".into();
+        cfg.supports_reasoning_effort = false;
+        assert!(!supports_reasoning_effort(&cfg));
+        cfg.supports_reasoning_effort = true;
+        assert!(supports_reasoning_effort(&cfg));
     }
 
     #[test]
@@ -487,6 +487,33 @@ mod tests {
             Some(atomcode_kernel::provider::ReasoningEffort::Medium)
         );
         assert_eq!(tier.retry_max_attempts, Some(7));
+    }
+
+    #[test]
+    fn tier_capability_follows_server_advertised_levels_without_an_explicit_effort() {
+        // The qwen3.8-27b case: the endpoint advertises effort LEVELS but no effort is set
+        // yet. `supports_reasoning_effort` must be TRUE (so the wire will send the effort
+        // once the user picks one) — driven by config, not a hardcoded deepseek name.
+        let catalog: atomcode_config::config::Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "custom": { "provider": "openai-compatible", "base_url": "https://example.invalid/v1" }
+            },
+            "models": {
+                "custom/model": {
+                    "account": "custom", "model": "vendor-model",
+                    "reasoning_effort_levels": ["low", "medium", "xhigh"]
+                }
+            },
+            "default_model": "custom/model"
+        }))
+        .unwrap();
+        let resolved = catalog.resolve_model(Some("custom/model")).unwrap();
+        let tier = derive_tier_config_from_resolved(&config("openai"), &resolved);
+        assert!(
+            tier.supports_reasoning_effort,
+            "advertised levels → wire capability on, even with no explicit effort"
+        );
+        assert_eq!(tier.chat_options.reasoning_effort, None);
     }
 
     #[test]

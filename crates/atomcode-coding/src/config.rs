@@ -179,6 +179,10 @@ pub struct CodingRuntimeConfig {
     pub datalog: atomcode_config::config::DatalogConfig,
     pub reasoning_history: Option<String>,
     pub reasoning_effort: Option<String>,
+    /// The effort levels this endpoint exposes (server-advertised or folded builtin).
+    /// Carried so `agent_config` can derive `supports_reasoning_effort` from CONFIG
+    /// (via `endpoint_supports_reasoning_effort`) instead of a hardcoded model name.
+    pub reasoning_effort_levels: Option<Vec<String>>,
     pub provider_type: String,
     pub thinking_enabled: Option<bool>,
     pub thinking_type: Option<String>,
@@ -295,6 +299,7 @@ impl CodingRuntimeConfig {
             datalog: config.datalog.clone(),
             reasoning_history: r.and_then(|r| r.reasoning_history.clone()),
             reasoning_effort: r.and_then(|r| r.reasoning_effort.clone()),
+            reasoning_effort_levels: r.and_then(|r| r.reasoning_effort_levels.clone()),
             provider_type: r
                 .map(|r| r.provider_type.clone())
                 .unwrap_or_else(|| "openai".into()),
@@ -336,9 +341,11 @@ impl CodingRuntimeConfig {
         );
         config.context_window = self.context_window;
         config.supports_vision = self.supports_vision;
-        config.supports_reasoning_effort = self.reasoning_effort.is_some()
-            || (atomcode_config::config::is_codingplan_provider_name(&self.provider_name)
-                && self.model.eq_ignore_ascii_case("deepseek-v4-flash"));
+        config.supports_reasoning_effort =
+            atomcode_config::config::endpoint_supports_reasoning_effort(
+                self.reasoning_effort.as_deref(),
+                self.reasoning_effort_levels.as_deref(),
+            );
         config.preferred_language = self.preferred_language;
         config.todo = self.todo.clone();
         config.provider_name = self.provider_name.clone();
@@ -389,7 +396,10 @@ pub fn apply_provider_config(
     config.chat_options.reasoning_effort = atomcode_kernel::provider::ReasoningEffort::from_config(
         provider.reasoning_effort.as_deref(),
     );
-    config.supports_reasoning_effort = provider.reasoning_effort.is_some();
+    config.supports_reasoning_effort = atomcode_config::config::endpoint_supports_reasoning_effort(
+        provider.reasoning_effort.as_deref(),
+        provider.reasoning_effort_levels.as_deref(),
+    );
     config.provider_type = provider.provider_type.clone();
     config.reasoning_history = provider.reasoning_history.clone();
     config.thinking_enabled = provider.thinking_enabled;

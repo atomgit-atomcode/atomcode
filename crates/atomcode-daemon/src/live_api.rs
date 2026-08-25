@@ -312,6 +312,7 @@ pub(crate) fn chat_runtime_config(
         datalog: config.datalog.clone(),
         reasoning_history: p.and_then(|p| p.reasoning_history.clone()),
         reasoning_effort: p.and_then(|p| p.reasoning_effort.clone()),
+        reasoning_effort_levels: p.and_then(|p| p.reasoning_effort_levels.clone()),
         provider_type: p
             .map(|p| p.provider_type.clone())
             .unwrap_or_else(|| "openai".into()),
@@ -2112,10 +2113,13 @@ pub(crate) async fn live_reasoning_effort(
             .clone()
             .or_else(|| config.effective_model_selection())
             .unwrap_or_default();
-        let builtin_effort = atomcode_config::config::is_codingplan_provider_name(&target)
-            && config
-                .provider_config_for_selection(&target)
-                .is_some_and(|p| p.model.eq_ignore_ascii_case("deepseek-v4-flash"));
+        // Whether this endpoint has an effort capability at all (non-empty
+        // server-advertised / builtin levels) — config-driven, no hardcoded model name.
+        // Used below to keep the `auto` capability marker when the concrete level is cleared.
+        let supports_effort = config
+            .provider_config_for_selection(&target)
+            .and_then(|p| p.reasoning_effort_levels)
+            .is_some_and(|levels| !levels.is_empty());
         // Reject a concrete level the endpoint does not expose. The webui filters
         // its dropdown, but a stale/rogue client could still POST a hidden level;
         // without this it would persist and reach the wire.
@@ -2134,7 +2138,7 @@ pub(crate) async fn live_reasoning_effort(
         // `[providers.*]`.
         let found = config.update_selection_reasoning(&target, |r| {
             previous_effort = r.reasoning_effort.clone();
-            let keep_capability = previous_effort.is_some() || builtin_effort;
+            let keep_capability = previous_effort.is_some() || supports_effort;
             *r.reasoning_effort = effort
                 .clone()
                 .or_else(|| keep_capability.then(|| "auto".to_string()));
