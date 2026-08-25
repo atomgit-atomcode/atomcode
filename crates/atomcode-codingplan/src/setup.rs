@@ -1215,6 +1215,21 @@ fn persist_codingplan_as_new_schema(config: &mut Config) {
                 .map(|v| ((m.account.clone(), m.model.clone()), v))
         })
         .collect();
+    // Same preservation for the gateway-advertised `reasoning_effort_levels`: a later
+    // refresh that OMITS the field falls back to the client builtin, which would revert
+    // the richer persisted server list. Remember the prior NON-EMPTY list keyed by
+    // (account, wire model); restored below only when the fold fell back to the builtin.
+    let prior_effort_levels: std::collections::HashMap<(String, String), Vec<String>> = config
+        .models
+        .iter()
+        .filter(|(_, m)| is_codingplan_provider_name(&m.account))
+        .filter_map(|(_, m)| {
+            m.reasoning_effort_levels
+                .as_ref()
+                .filter(|levels| !levels.is_empty())
+                .map(|levels| ((m.account.clone(), m.model.clone()), levels.clone()))
+        })
+        .collect();
     // Drop any prior new-schema CodingPlan entries FIRST, so the freshly-merged
     // flat providers are the sole (authoritative) source for the projection.
     // Otherwise `logical_models`' new-schema precedence would mask updated
@@ -1247,6 +1262,25 @@ fn persist_codingplan_as_new_schema(config: &mut Config) {
             if let Some(&prior) = prior_supports_vision.get(&(m.account.clone(), m.model.clone()))
             {
                 m.supports_vision = Some(prior);
+            }
+        }
+        // Effort levels: ONLY for a model whose silence-fallback is a concrete NON-EMPTY
+        // builtin list (currently just deepseek-v4-flash) — that's the only case where a
+        // refresh omitting the field folds back to a WRONG concrete list, reverting the
+        // richer persisted server list. When the folded value equals that builtin (the
+        // signal this refresh carried no server list) we restore the prior server list.
+        // Models with NO builtin (builtin == None) reflect the fold directly, so an
+        // EXPLICIT server `[]` (effort removed) is honored, not masked by a stale prior.
+        // (Residual: the server re-sending exactly the builtin list is treated as silence
+        // — contrived, and merely keeps an equal-or-wider prior, never a crash.)
+        if let Some(builtin) = atomcode_config::config::codingplan_builtin_effort_levels(&m.model) {
+            let key = (m.account.clone(), m.model.clone());
+            if m.reasoning_effort_levels.as_deref() == Some(builtin.as_slice()) {
+                if let Some(prior) = prior_effort_levels.get(&key) {
+                    if prior != &builtin {
+                        m.reasoning_effort_levels = Some(prior.clone());
+                    }
+                }
             }
         }
         config.models.insert(id, m);
@@ -1421,8 +1455,17 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
         thinking_keep: None,
         reasoning_history: None,
         reasoning_effort: None,
-        reasoning_effort_levels:
-            atomcode_config::config::codingplan_builtin_effort_levels(&entry.display_model_name),
+        // Prefer the gateway's advertised per-model list (non-empty) verbatim; fall back
+        // to the client builtin when the server omits it or sends an empty list (older /
+        // production servers, or models with no effort switching).
+        reasoning_effort_levels: entry
+            .reasoning_effort_levels
+            .as_deref()
+            .filter(|levels| !levels.is_empty())
+            .map(<[String]>::to_vec)
+            .or_else(|| {
+                atomcode_config::config::codingplan_builtin_effort_levels(&entry.display_model_name)
+            }),
         thinking_enabled: None,
         thinking_budget: None,
         skip_tls_verify: false,
@@ -1655,6 +1698,240 @@ mod tests {
         assert_eq!(glm.reasoning_effort_levels, None);
     }
 
+    // models-v2 now advertises per-model `reasoning_effort_levels`. A NON-EMPTY server
+    // list is persisted verbatim and overrides the client builtin (deepseek -> [high,max]);
+    // an EMPTY list means "no effort switching" and falls back to the builtin (which is
+    // None for a non-builtin model), never persisting a bare empty vec.
+    #[test]
+    fn build_provider_prefers_server_effort_levels_over_builtin() {
+        let served = super::super::types::ModelEntry {
+            reasoning_effort_levels: Some(vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "xhigh".to_string(),
+            ]),
+            ..entry("deepseek-v4-flash")
+        };
+        assert_eq!(
+            build_codingplan_provider(&served)
+                .reasoning_effort_levels
+                .as_deref(),
+            Some(
+                [
+                    "low".to_string(),
+                    "medium".to_string(),
+                    "xhigh".to_string()
+                ]
+                .as_slice()
+            ),
+            "a non-empty server list must be persisted and win over the builtin"
+        );
+
+        let empty = super::super::types::ModelEntry {
+            reasoning_effort_levels: Some(Vec::new()),
+            ..entry("GLM-5.2")
+        };
+        assert_eq!(
+            build_codingplan_provider(&empty).reasoning_effort_levels,
+            None,
+            "an empty server list is not persisted as an empty vec"
+        );
+    }
+
+    // The exact models-v2 payload shape from the (pre-prod) gateway must deserialize,
+    // carrying `reasoning_effort_levels` through to the `ModelEntry`.
+    #[test]
+    fn model_entry_deserializes_server_reasoning_effort_levels() {
+        let e: super::super::types::ModelEntry = serde_json::from_value(serde_json::json!({
+            "display_model_name": "deepseek-v4-flash",
+            "type": "openai",
+            "plan_available": true,
+            "reasoning_effort_levels": ["low", "medium", "xhigh"]
+        }))
+        .unwrap();
+        assert_eq!(
+            e.reasoning_effort_levels.as_deref(),
+            Some(
+                [
+                    "low".to_string(),
+                    "medium".to_string(),
+                    "xhigh".to_string()
+                ]
+                .as_slice()
+            )
+        );
+        // Absent field (older/production server) → None, so the builtin fallback applies.
+        let old: super::super::types::ModelEntry = serde_json::from_value(serde_json::json!({
+            "display_model_name": "deepseek-v4-flash", "type": "openai", "plan_available": true
+        }))
+        .unwrap();
+        assert_eq!(old.reasoning_effort_levels, None);
+    }
+
+    // Same class as the supports_vision revert: once the server list is persisted, a
+    // LATER refresh whose flat provider OMITS `reasoning_effort_levels` (the background
+    // auto-sync response can lack it) must NOT revert the richer persisted list to the
+    // client builtin. The fold falls back to the builtin on silence; we restore the
+    // prior server list keyed by (account, wire model).
+    #[test]
+    fn persist_preserves_server_effort_levels_when_a_later_refresh_omits_them() {
+        let mut cfg = blank_config();
+        cfg.provider_accounts.insert(
+            "AtomGit".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1"
+            }))
+            .unwrap(),
+        );
+        // A prior full login persisted the gateway's richer list.
+        cfg.models.insert(
+            pxn("deepseek-v4-flash"),
+            serde_json::from_value(serde_json::json!({
+                "account": "AtomGit", "model": "deepseek-v4-flash",
+                "context_window": 1_000_000,
+                "reasoning_effort_levels": ["low", "medium", "xhigh"]
+            }))
+            .unwrap(),
+        );
+        // This refresh's flat provider carries NO server list → falls back to the builtin
+        // [high, max] (server silent this sync).
+        let fresh = build_codingplan_provider(&entry("deepseek-v4-flash"));
+        assert_eq!(
+            fresh.reasoning_effort_levels.as_deref(),
+            Some(["high".to_string(), "max".to_string()].as_slice()),
+            "no server list → builtin fallback"
+        );
+        cfg.providers.insert(pxn("deepseek-v4-flash"), fresh);
+
+        persist_codingplan_as_new_schema(&mut cfg);
+
+        assert_eq!(
+            cfg.models[&pxn("deepseek-v4-flash")]
+                .reasoning_effort_levels
+                .as_deref(),
+            Some(
+                [
+                    "low".to_string(),
+                    "medium".to_string(),
+                    "xhigh".to_string()
+                ]
+                .as_slice()
+            ),
+            "a fieldless refresh must not revert the persisted server list to the builtin"
+        );
+    }
+
+    // Guard: for a model with NO builtin fallback (e.g. GLM-5.2), the fold reflects the
+    // server directly — an EXPLICIT server `[]` (effort removed) folds to `None` and must
+    // be honored, NOT masked by restoring a stale prior list. Preservation is only for
+    // models whose silence-fallback is a concrete builtin list (which would wrongly revert).
+    #[test]
+    fn persist_honors_server_removing_effort_for_a_non_builtin_model() {
+        let mut cfg = blank_config();
+        cfg.provider_accounts.insert(
+            "AtomGit".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1"
+            }))
+            .unwrap(),
+        );
+        // GLM once had a server-advertised list persisted.
+        cfg.models.insert(
+            pxn("GLM-5.2"),
+            serde_json::from_value(serde_json::json!({
+                "account": "AtomGit", "model": "GLM-5.2",
+                "reasoning_effort_levels": ["low", "high"]
+            }))
+            .unwrap(),
+        );
+        // This refresh the server sends GLM an EMPTY list (effort removed).
+        let served = super::super::types::ModelEntry {
+            reasoning_effort_levels: Some(Vec::new()),
+            ..entry("GLM-5.2")
+        };
+        cfg.providers
+            .insert(pxn("GLM-5.2"), build_codingplan_provider(&served));
+
+        persist_codingplan_as_new_schema(&mut cfg);
+
+        assert_eq!(
+            cfg.models[&pxn("GLM-5.2")].reasoning_effort_levels, None,
+            "server removing effort (via []) on a non-builtin model must be honored, not reverted"
+        );
+    }
+
+    // Guard: a FRESH server list (differing from the builtin) is authoritative — it must
+    // override a stale prior, not be masked by the preservation.
+    #[test]
+    fn persist_lets_a_fresh_server_effort_list_override_a_prior() {
+        let mut cfg = blank_config();
+        cfg.provider_accounts.insert(
+            "AtomGit".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1"
+            }))
+            .unwrap(),
+        );
+        cfg.models.insert(
+            pxn("deepseek-v4-flash"),
+            serde_json::from_value(serde_json::json!({
+                "account": "AtomGit", "model": "deepseek-v4-flash",
+                "reasoning_effort_levels": ["low", "medium", "xhigh"]
+            }))
+            .unwrap(),
+        );
+        // Fresh refresh advertises a DIFFERENT (narrowed) list.
+        let served = super::super::types::ModelEntry {
+            reasoning_effort_levels: Some(vec!["low".to_string(), "max".to_string()]),
+            ..entry("deepseek-v4-flash")
+        };
+        cfg.providers
+            .insert(pxn("deepseek-v4-flash"), build_codingplan_provider(&served));
+
+        persist_codingplan_as_new_schema(&mut cfg);
+
+        assert_eq!(
+            cfg.models[&pxn("deepseek-v4-flash")]
+                .reasoning_effort_levels
+                .as_deref(),
+            Some(["low".to_string(), "max".to_string()].as_slice()),
+            "a fresh server list wins over the prior"
+        );
+    }
+
+    // End-to-end: a server-advertised effort list must reach `config.models` (persisted to
+    // config.toml) through register → fold, overriding the builtin the whole way.
+    #[test]
+    fn server_effort_levels_persist_into_config_models_through_the_fold() {
+        let mut cfg = blank_config();
+        let served = super::super::types::ModelEntry {
+            reasoning_effort_levels: Some(vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "xhigh".to_string(),
+            ]),
+            ..entry("deepseek-v4-flash")
+        };
+        // Two models keeps the id in the `<prefix>-<model>` form.
+        run_register(&mut cfg, vec![served, entry("GLM-5.2")]);
+        persist_codingplan_as_new_schema(&mut cfg);
+
+        assert_eq!(
+            cfg.models[&pxn("deepseek-v4-flash")]
+                .reasoning_effort_levels
+                .as_deref(),
+            Some(
+                [
+                    "low".to_string(),
+                    "medium".to_string(),
+                    "xhigh".to_string()
+                ]
+                .as_slice()
+            ),
+            "the server's effort list must land in config.models, not the builtin [high,max]"
+        );
+    }
+
     #[test]
     fn build_provider_floors_conservative_server_window() {
         // The gateway reports a conservative 64k for several models; we floor
@@ -1713,6 +1990,7 @@ mod tests {
             supports_vision: Some(true),
             plan_available: true,
             capable_model: None,
+            reasoning_effort_levels: None,
             api_key: None,
         };
         let p = build_codingplan_provider(&e);

@@ -1240,20 +1240,40 @@ pub fn codingplan_builtin_effort_levels(model: &str) -> Option<Vec<String>> {
         .then(|| vec!["high".to_string(), "max".to_string()])
 }
 
-/// Resolve a model's effective level declaration. Official CodingPlan
-/// capabilities are authoritative; custom providers retain their configured
-/// list (or unrestricted `None`).
+/// Resolve a model's effective level declaration. A `declared` list (persisted
+/// from the CodingPlan gateway's `reasoning_effort_levels`, or a custom provider's
+/// own config) is AUTHORITATIVE. The client-side [`codingplan_builtin_effort_levels`]
+/// table is only a FALLBACK for CodingPlan models on older/production servers that
+/// don't advertise the field yet — once the server sends a list, it wins.
 pub fn effective_reasoning_effort_levels(
     codingplan_managed: bool,
     model: &str,
     declared: Option<&[String]>,
 ) -> Option<Vec<String>> {
-    if codingplan_managed {
-        if let Some(levels) = codingplan_builtin_effort_levels(model) {
-            return Some(levels);
-        }
+    // A NON-EMPTY declared list is authoritative. An empty list is "no opinion"
+    // (matching `build_codingplan_provider`'s empty→None filter), so it falls through
+    // rather than being taken as an authoritative "unrestricted" that would widen a
+    // CodingPlan model past its builtin.
+    if let Some(levels) = declared.filter(|l| !l.is_empty()) {
+        return Some(levels.to_vec());
     }
-    declared.map(<[String]>::to_vec)
+    if codingplan_managed {
+        return codingplan_builtin_effort_levels(model);
+    }
+    None
+}
+
+/// Whether an endpoint exposes a reasoning-effort control, derived purely from CONFIG:
+/// an explicitly configured `reasoning_effort`, OR a non-empty `reasoning_effort_levels`
+/// (server-advertised via `models-v2`, or the CodingPlan builtin already folded into it).
+/// The SINGLE source of truth for every "does this model support effort" gate — the webui
+/// selector, the TUI `/effort`, and the wire capability — so none can disagree, and no
+/// hardcoded model name (`deepseek-v4-flash`) is needed anywhere.
+pub fn endpoint_supports_reasoning_effort(
+    reasoning_effort: Option<&str>,
+    reasoning_effort_levels: Option<&[String]>,
+) -> bool {
+    reasoning_effort.is_some() || reasoning_effort_levels.is_some_and(|levels| !levels.is_empty())
 }
 
 /// The ordered subset of reasoning-effort levels an endpoint exposes.
@@ -2311,6 +2331,49 @@ kind = "claude-code"
             Some(expected.as_slice())
         );
         assert_eq!(codingplan_builtin_effort_levels("GLM-5.2"), None);
+    }
+
+    // Once the CodingPlan gateway advertises per-model `reasoning_effort_levels`, that
+    // server list is authoritative: it must override the client-side builtin (which knew
+    // only `deepseek-v4-flash -> [high, max]`). With NO server list the builtin remains
+    // the fallback for older/production servers that don't send the field yet.
+    #[test]
+    fn server_declared_effort_levels_win_over_the_client_builtin() {
+        let declared = [
+            "low".to_string(),
+            "medium".to_string(),
+            "xhigh".to_string(),
+        ];
+        assert_eq!(
+            effective_reasoning_effort_levels(true, "deepseek-v4-flash", Some(&declared)),
+            Some(declared.to_vec()),
+            "a server-advertised effort list must win over the builtin"
+        );
+        assert_eq!(
+            effective_reasoning_effort_levels(true, "deepseek-v4-flash", None),
+            Some(vec!["high".to_string(), "max".to_string()]),
+            "with no server list, the builtin stays the CodingPlan fallback"
+        );
+        // An EMPTY declared list is "no authoritative opinion" (same as build's
+        // empty→None filter), NOT an authoritative "unrestricted" that would widen a
+        // CodingPlan model past its builtin — fall through to the builtin.
+        assert_eq!(
+            effective_reasoning_effort_levels(true, "deepseek-v4-flash", Some(&[])),
+            Some(vec!["high".to_string(), "max".to_string()]),
+            "an empty declared list falls through to the CodingPlan builtin"
+        );
+    }
+
+    #[test]
+    fn endpoint_supports_reasoning_effort_is_config_driven() {
+        let levels = ["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        // Non-empty levels (server-advertised) → supported, regardless of a set effort.
+        assert!(endpoint_supports_reasoning_effort(None, Some(&levels)));
+        // An explicit effort → supported even with no declared levels.
+        assert!(endpoint_supports_reasoning_effort(Some("high"), None));
+        // Neither → not supported. Empty levels → not supported (no switching).
+        assert!(!endpoint_supports_reasoning_effort(None, None));
+        assert!(!endpoint_supports_reasoning_effort(None, Some(&[])));
     }
 
     #[test]
