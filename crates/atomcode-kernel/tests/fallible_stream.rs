@@ -204,7 +204,7 @@ async fn recovered_truncation_continues_without_warning() {
         warning.is_none(),
         "a truncation that auto-recovers must NOT surface the scary warning; got {warning:?}"
     );
-    assert_eq!(recovery_progress, vec![(1, 2)]);
+    assert_eq!(recovery_progress, vec![(1, 4)]);
     assert!(completed, "the turn still completes after the continuation");
     handle.commands.send(AgentCommand::Snapshot).unwrap();
     let snapshot = loop {
@@ -285,17 +285,19 @@ async fn repeated_truncation_is_bounded() {
         "the turn must terminate despite endless truncation"
     );
     let calls = received.lock().unwrap();
-    assert!(
-        calls.len() <= 4,
-        "truncation continuations must be tightly bounded; got {} LLM calls",
-        calls.len()
+    // Exactly 1 initial call + MAX_TRUNCATION_CONTINUATIONS (4) resume rounds = 5.
+    // Pinned with == (not <=) so the bound stays load-bearing if the constant moves.
+    assert_eq!(
+        calls.len(),
+        5,
+        "truncation continuations must be tightly bounded"
     );
     // UNRECOVERABLE truncation (budget exhausted, turn actually stops) MUST warn —
     // this is the one case the user needs to see, and the only case that should.
     assert!(
         warning
             .as_deref()
-            .is_some_and(|w| w.contains("output limit") && w.contains("continue")),
+            .is_some_and(|w| w.contains("上限") && w.contains("继续")),
         "an exhausted, turn-ending truncation must surface the warning; got {warning:?}"
     );
 }
@@ -303,24 +305,22 @@ async fn repeated_truncation_is_bounded() {
 #[tokio::test]
 async fn interactive_truncation_checkpoint_can_continue_after_auto_budget() {
     let reg = ToolRegistry::new();
-    let provider = Arc::new(MockProvider::new(vec![
-        vec![
-            StreamEvent::TextDelta("part 1".into()),
-            StreamEvent::Done { truncated: true },
-        ],
-        vec![
-            StreamEvent::TextDelta("part 2".into()),
-            StreamEvent::Done { truncated: true },
-        ],
-        vec![
-            StreamEvent::TextDelta("part 3".into()),
-            StreamEvent::Done { truncated: true },
-        ],
-        vec![
-            StreamEvent::TextDelta("finished".into()),
-            StreamEvent::Done { truncated: false },
-        ],
-    ]));
+    // The auto-continuation budget is MAX_TRUNCATION_CONTINUATIONS (4): calls 1-4
+    // auto-recover, call 5 truncates with the budget exhausted → the checkpoint
+    // fires. After the driver says "continue", call 6 wraps up cleanly.
+    let mut turns: Vec<Vec<StreamEvent>> = (1..=5)
+        .map(|i| {
+            vec![
+                StreamEvent::TextDelta(format!("part {i}")),
+                StreamEvent::Done { truncated: true },
+            ]
+        })
+        .collect();
+    turns.push(vec![
+        StreamEvent::TextDelta("finished".into()),
+        StreamEvent::Done { truncated: false },
+    ]);
+    let provider = Arc::new(MockProvider::new(turns));
     let received = provider.received.clone();
     let mut handle = Agent::builder()
         .provider(provider)
@@ -356,13 +356,16 @@ async fn interactive_truncation_checkpoint_can_continue_after_auto_budget() {
         checkpoint.is_some(),
         "the exhausted budget must ask the driver"
     );
-    assert_eq!(received.lock().unwrap().len(), 4);
+    // 5 truncated rounds (1 initial + 4 auto-continuations) + 1 clean finish.
+    assert_eq!(received.lock().unwrap().len(), 6);
 }
 
 #[tokio::test]
 async fn interactive_truncation_checkpoint_stop_does_not_repeat_warning() {
     let reg = ToolRegistry::new();
-    let turns = (0..3)
+    // 5 truncated rounds (1 initial + MAX_TRUNCATION_CONTINUATIONS=4 auto-recoveries)
+    // exhaust the auto budget, so the 5th round reaches the interactive checkpoint.
+    let turns = (0..5)
         .map(|_| {
             vec![
                 StreamEvent::TextDelta("partial".into()),
@@ -380,11 +383,13 @@ async fn interactive_truncation_checkpoint_stop_does_not_repeat_warning() {
     handle.commands.send(send("go")).unwrap();
 
     let mut warning = None;
+    let mut checkpoint_fired = false;
     while let Some(event) = handle.events.recv().await {
         match event {
             AgentEvent::Request { id, kind, .. }
                 if kind == atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND =>
             {
+                checkpoint_fired = true;
                 handle
                     .commands
                     .send(AgentCommand::Respond {
@@ -401,13 +406,18 @@ async fn interactive_truncation_checkpoint_stop_does_not_repeat_warning() {
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
 
+    // Pin the intent: the budget must actually be exhausted so the interactive
+    // checkpoint fires (otherwise `warning.is_none()` passes vacuously).
+    assert!(checkpoint_fired, "the exhausted budget must reach the checkpoint");
     assert!(warning.is_none(), "the choice panel already explained the stop");
 }
 
 #[tokio::test]
 async fn interactive_truncation_checkpoint_cancel_uses_cancelled_terminal() {
     let reg = ToolRegistry::new();
-    let turns = (0..3)
+    // 5 truncated rounds (1 initial + MAX_TRUNCATION_CONTINUATIONS=4 auto-recoveries)
+    // exhaust the auto budget, so the 5th round reaches the interactive checkpoint.
+    let turns = (0..5)
         .map(|_| {
             vec![
                 StreamEvent::TextDelta("partial".into()),
@@ -425,11 +435,13 @@ async fn interactive_truncation_checkpoint_cancel_uses_cancelled_terminal() {
     handle.commands.send(send("go")).unwrap();
 
     let mut stop = None;
+    let mut checkpoint_fired = false;
     while let Some(event) = handle.events.recv().await {
         match event {
             AgentEvent::Request { kind, .. }
                 if kind == atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND =>
             {
+                checkpoint_fired = true;
                 handle.commands.send(AgentCommand::Cancel).unwrap();
             }
             AgentEvent::TurnComplete { reason } => {
@@ -441,6 +453,10 @@ async fn interactive_truncation_checkpoint_cancel_uses_cancelled_terminal() {
     }
     handle.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = handle.task.await;
+
+    // Pin the intent: the Cancel must be delivered AT the truncation checkpoint,
+    // not from some unrelated request kind.
+    assert!(checkpoint_fired, "the exhausted budget must reach the checkpoint");
 
     assert_eq!(stop, Some(atomcode_kernel::event::StopReason::Cancelled));
 }

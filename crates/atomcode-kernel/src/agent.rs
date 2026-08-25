@@ -169,8 +169,11 @@ const EMPTY_RESPONSE_MAX_RETRIES: u32 = 5;
 /// is almost always unfinished work; v1 (atomcode-core/src/agent/mod.rs:3064) nudged
 /// the model to resume rather than silently ending the turn. BOUNDED (tightly — the
 /// nudge tells the model to switch to incremental file writes, so it should not need
-/// many) so a model that truncates every round cannot livelock the loop.
-const MAX_TRUNCATION_CONTINUATIONS: u32 = 2;
+/// many) so a model that truncates every round cannot livelock the loop. Set to 4:
+/// a weak model writing a large deliverable often needs several incremental resume
+/// rounds to finish, and each recovered round suppresses the truncation warning; the
+/// bound still caps a genuinely stuck (re-dumping) model at a few wasted rounds.
+const MAX_TRUNCATION_CONTINUATIONS: u32 = 4;
 
 /// Always-on, coarse cross-round repetition fuse. The opt-in exact guard below
 /// compares the executed call, effective cwd, result and success state; this fuse
@@ -3142,7 +3145,7 @@ impl RunningAgent {
                 // user needs to see: real work was cut off and is not being finished.
                 if truncated {
                     self.rt.emit(AgentEvent::Warning(
-                        "The model reached its output limit before finishing. Some content may be missing; ask it to continue and write the remainder incrementally.".into(),
+                        "模型这次回复达到了长度上限，内容可能没写完。可以让它「继续」，会接着把剩下的部分补完。".into(),
                     ));
                 }
                 if partial_stream_recoveries > 0 {

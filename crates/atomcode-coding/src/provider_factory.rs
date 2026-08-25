@@ -182,7 +182,13 @@ fn supports_reasoning_effort(cfg: &CodingAgentConfig) -> bool {
 }
 
 pub fn default_max_tokens(context_window: u32) -> u32 {
-    (context_window / 4).clamp(8_000, 16_384)
+    // Output-token fallback cap when the server does not advertise a per-model
+    // max_tokens. A quarter of the context window, floored at 8K so tiny windows
+    // still get a usable response, ceilinged at 32K so a single large response
+    // (e.g. scaffolding a whole file in one turn) has room to finish before it
+    // trips finish_reason=length. A higher ceiling means fewer unrecoverable
+    // truncations to warn about.
+    (context_window / 4).clamp(8_000, 32_768)
 }
 
 /// Build the adapter retry policy from the user's `retry_max_attempts` config
@@ -426,10 +432,13 @@ mod tests {
     }
 
     #[test]
-    fn default_output_cap_matches_legacy_bounds() {
-        assert_eq!(default_max_tokens(16_000), 8_000);
-        assert_eq!(default_max_tokens(64_000), 16_000);
-        assert_eq!(default_max_tokens(200_000), 16_384);
+    fn default_output_cap_matches_bounds() {
+        assert_eq!(default_max_tokens(16_000), 8_000, "tiny window floors at 8K");
+        assert_eq!(default_max_tokens(64_000), 16_000, "mid window is a quarter");
+        // Large windows ceiling at 32K (raised from 16K) so a single big response
+        // has room to finish before finish_reason=length.
+        assert_eq!(default_max_tokens(200_000), 32_768);
+        assert_eq!(default_max_tokens(128_000), 32_000, "128K/4 sits just under the ceiling");
     }
 
     #[test]
