@@ -4000,6 +4000,11 @@ impl ChatRuntimeProjector {
                     arguments: approval.args,
                 }]
             }
+            // Silent, cache-friendly tool-output folding is invisible transcript
+            // maintenance — suppress its mark (mirrors the TUI `silent_tool_fold`).
+            CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome),
+            } if outcome.committed && outcome.is_silent_auto_tool_fold() => Vec::new(),
             CodingRuntimeEvent::CompactionFinished {
                 completion: CompactionCompletion::Completed(outcome),
             } if outcome.committed => vec![ChatEvent::Warning {

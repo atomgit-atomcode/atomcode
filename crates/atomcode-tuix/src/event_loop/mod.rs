@@ -25037,6 +25037,13 @@ fn handle_coding_runtime_event(
                     // itself before running and remains visible even when replacing
                     // one message with one summary produces zero net removals.
                     // Manual and overflow paths retain their existing feedback.
+                    //
+                    // NOTE: the TUI keys on `!announced` (it sees CompactionStarted),
+                    // which is STRICTER than the driver-neutral
+                    // `outcome.is_silent_auto_tool_fold()` the daemon/webui use — the
+                    // latter can't see the announce and would silence an announced
+                    // auto-summary that netted zero removals (covered by a test here).
+                    // Unifying both onto one signal needs a kernel `stub_only` flag.
                     let silent_tool_fold = matches!(&outcome.trigger, CompactTrigger::Auto { .. })
                         && !compaction_was_announced;
                     if mirror_persisted && !silent_tool_fold {

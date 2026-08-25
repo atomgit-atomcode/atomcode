@@ -113,7 +113,15 @@ impl atomcode_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
     async fn after(
         &self,
         result: &mut atomcode_kernel::tool::ToolResult,
+        tool: Option<&Arc<dyn atomcode_kernel::tool::Tool>>,
     ) -> atomcode_kernel::middleware::AfterOutcome {
+        // A tool that bounds and structures its own output (e.g. `read_file`: self-capped,
+        // 1-based line numbers, pagination) must reach the model WHOLE — head/tail
+        // truncation would corrupt it. Read the contract off the resolved tool, so this is
+        // robust even if an earlier `before` short-circuited the chain with `Allow`.
+        if tool.is_some_and(|t| t.self_bounds_output()) {
+            return atomcode_kernel::middleware::AfterOutcome::Proceed;
+        }
         let total = result.content.len();
         if total <= THRESHOLD_BYTES {
             return atomcode_kernel::middleware::AfterOutcome::Proceed;
@@ -208,7 +216,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mw = super::ArtifactMiddleware::new(std::sync::Arc::new(super::ArtifactStore::new(dir.path())));
         let mut r = ToolResult { call_id: "c".into(), content: "small".into(), is_error: false, images: vec![] };
-        assert!(matches!(mw.after(&mut r).await, AfterOutcome::Proceed));
+        assert!(matches!(mw.after(&mut r, None).await, AfterOutcome::Proceed));
         assert_eq!(r.content, "small");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0); // nothing stored
     }
@@ -224,7 +232,7 @@ mod tests {
         let mk = || ToolResult { call_id: "c".into(), content: big.clone(), is_error: false, images: vec![] };
 
         let mut r1 = mk();
-        mw.after(&mut r1).await;
+        mw.after(&mut r1, None).await;
         // rewritten: smaller, has head+tail+marker, names fetch_output + the id
         assert!(r1.content.len() < big.len());
         assert!(r1.content.contains("fetch_output"));
@@ -235,9 +243,46 @@ mod tests {
 
         // determinism: same output → byte-identical rewritten content
         let mut r2 = mk();
-        mw.after(&mut r2).await;
+        mw.after(&mut r2, None).await;
         assert_eq!(r1.content, r2.content);
         assert!(!r1.is_error);
+    }
+
+    #[tokio::test]
+    async fn self_bounding_tool_output_passes_through_whole() {
+        use atomcode_kernel::middleware::{AfterOutcome, ToolMiddleware};
+        use atomcode_kernel::tool::{Tool, ToolResult};
+        let dir = tempfile::tempdir().unwrap();
+        let mw = super::ArtifactMiddleware::new(std::sync::Arc::new(super::ArtifactStore::new(
+            dir.path(),
+        )));
+        // read_file declares `self_bounds_output() == true`.
+        let tool: std::sync::Arc<dyn Tool> =
+            std::sync::Arc::new(crate::tools::read::ReadFileTool::new(false));
+
+        // A large read_file result (over THRESHOLD) must reach the model WHOLE.
+        let big = "x".repeat(40 * 1024);
+        let mut r = ToolResult {
+            call_id: "rc".into(),
+            content: big.clone(),
+            is_error: false,
+            images: vec![],
+        };
+        assert!(matches!(mw.after(&mut r, Some(&tool)).await, AfterOutcome::Proceed));
+        assert_eq!(r.content, big, "self-bounding output must be untouched");
+        assert!(!r.content.contains("fetch_output"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0); // nothing stored
+
+        // Control: the same size from a non-self-bounding tool (None) is STILL truncated.
+        let mut other = ToolResult {
+            call_id: "bash-1".into(),
+            content: big.clone(),
+            is_error: false,
+            images: vec![],
+        };
+        mw.after(&mut other, None).await;
+        assert!(other.content.len() < big.len());
+        assert!(other.content.contains("fetch_output"));
     }
 
     #[tokio::test]
@@ -248,7 +293,7 @@ mod tests {
         let mw = super::ArtifactMiddleware::new(std::sync::Arc::new(super::ArtifactStore::new(dir.path())));
         let huge = "y".repeat(5 * 1024 * 1024);
         let mut r = ToolResult { call_id: "c".into(), content: huge, is_error: false, images: vec![] };
-        mw.after(&mut r).await;
+        mw.after(&mut r, None).await;
         assert!(r.content.contains("Full output unavailable"));
         assert!(!r.content.contains("fetch_output"));
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);

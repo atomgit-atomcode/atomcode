@@ -313,14 +313,18 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
 }
 
 /// Whether `model` belongs to a family with weaker soft-instruction adherence (GLM,
-/// DeepSeek) that benefits from the blunt [`FIRM_TOOL_DISCIPLINE`] restatement (observed:
-/// both shell out `ls`/`grep` despite the persona preference). Substring match on the
-/// lower-cased name so version suffixes (`glm-5.2`, `deepseek-v4-flash`) all hit. Frontier
-/// models (Claude, GPT) follow the soft `## TOOLS:` preferences and are excluded to keep
-/// their prompt lean and cache-stable.
+/// DeepSeek, Qwen, LongCat) that benefits from the blunt [`FIRM_TOOL_DISCIPLINE`]
+/// restatement. Observed: all four shell out `ls`/`grep` despite the persona preference,
+/// and the weaker ones additionally drive file reads through `python3 -c` / heredoc slices
+/// (read/split/parse a file) — which returns partial data and, being non-`read_file`
+/// output, gets folded to a one-line stub in later turns, forcing wasteful re-runs. The
+/// block now names that anti-pattern explicitly. Substring match on the lower-cased name so
+/// version suffixes (`glm-5.2`, `deepseek-v4-flash`, `qwen3.8-27b`, `longcat-2.0`) all hit.
+/// Frontier models (Claude, GPT) follow the soft `## TOOLS:` preferences and are excluded to
+/// keep their prompt lean and cache-stable.
 fn model_needs_firm_tool_steering(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    m.contains("glm") || m.contains("deepseek")
+    m.contains("glm") || m.contains("deepseek") || m.contains("qwen") || m.contains("longcat")
 }
 
 /// Whether `model` needs the blunt [`FIRM_EXECUTION_DISCIPLINE`] behavior restatement.
@@ -344,9 +348,12 @@ Do NOT shell out for file work:\n\
 - List a directory → list_directory (NOT `bash ls`).\n\
 - Find files by name → glob (NOT `bash find`).\n\
 - Search file contents → grep (NOT `bash grep` / `rg`).\n\
-- Read a file → read_file (NOT `bash cat`).\n\
-Use bash ONLY for git, builds, package managers, running commands, and pipelines / \
-aggregation (wc, sort, uniq, awk, git log) the dedicated tools cannot do.";
+- Read a file, or any slice of one → read_file with offset/limit/ranges (NOT `bash cat`/`head`/`tail`, and NOT a `python`/`awk` script that opens the file and prints lines).\n\
+- Never split, page, or parse a file with a `python -c` / heredoc script: read_file already pages large files and reads several ranges in ONE call, so a shell/python round-trip returns PARTIAL data AND is condensed to a one-line stub in later turns, forcing a wasteful re-run.\n\
+Use bash ONLY for git, builds, package managers, running commands, and short pipelines / \
+aggregation (wc, sort, uniq, git log) the dedicated tools cannot do. Litmus: a pipeline that \
+returns a COUNT, frequency, diff, or checksum → bash; anything that just reads, slices, pages, \
+or reformats file bytes → read_file / grep / glob.";
 
 #[cfg(feature = "atomgit")]
 const ATOMGIT_TOOL_USAGE: &str = "\n\n## ATOMGIT TOOLS:\n\
@@ -627,10 +634,12 @@ MANDATORY parallel scenarios (must be ONE turn):
 
 Sequential is OK ONLY when step N+1's command DEPENDS on step N's output (edit then verify; check error then fix; test then commit).
 Inside one `bash` call, chain dependent shell steps with `&&` / `;` / `||` instead of splitting them across turns.
-To read a file, always use `read_file` — not `bash cat`. `read_file` gives skeletons for large files, \"Did you mean\" suggestions, recovery hints for binary / non-UTF-8 formats, and per-session caching.
+To read a file — or any slice of one — always use `read_file`, never `bash cat`/`head`/`tail` or a `python`/`awk` script that opens the file and prints lines. For a big file or several regions, pass `offset`/`limit` or a `ranges` array to `read_file` in ONE call instead of slicing the file yourself. `read_file` gives skeletons for large files, \"Did you mean\" suggestions, recovery hints for binary / non-UTF-8 formats, and per-session caching; its result also survives history compaction, whereas a large `bash`/`python` output is condensed to a one-line stub in later turns — so rebuilding a file through the shell just gets folded away and forces a re-run.
 To list directories, default to `list_directory` instead of `bash ls` / `find` — it is gitignore-aware and skips build/cache directories. Fall back to `bash ls -la` ONLY when you specifically need file sizes, permissions, or timestamps, which `list_directory` omits.
 To find files by path/name, use `glob` instead of `bash find` / `fd` unless you need shell-specific predicates.
 To search file contents, use `grep` instead of `bash grep` / `rg` unless you need shell-specific flags or streaming output.
+LOCATE then READ: use `grep` / `glob` / `list_symbols` to pin the exact file and line, then `read_file` with `offset`/`limit` (or `ranges`) to pull just that window — don't dump whole files or rebuild them from shell / `python` slices.
+Litmus for bash vs a file tool: a short pipeline that returns a COUNT, frequency, diff, or checksum → `bash`; anything that just reads, pages, slices, or reformats bytes a file tool can fetch → use `read_file` / `grep` / `glob`.
 To change a file, use `edit_file` for targeted in-place replacements (old string → new string) of existing files; reserve `write_file` for brand-new files or full rewrites. Never mutate a file with `bash` (`sed -i`, `echo >>`, heredoc redirects, `python -c '...write...'`): bash edits bypass diff review, encoding handling, and undo.
 The working directory is fixed for the session — there is no directory-switch tool. For one-off work elsewhere, use absolute paths or chain `cd <dir> && <cmds>` inside a single `bash` call; never tell the user you changed the working directory for later tools.
 To open or preview a local file or directory in the GUI, use `open_file` — not `bash open`, not `bash xdg-open`, not `bash start`, and not `bash wslview`.
@@ -1444,7 +1453,7 @@ mod tests {
     fn persona_prefers_builtin_tools_over_shell_equivalents() {
         let p = coding_persona("m", true, false);
         for phrase in [
-            "not `bash cat`",
+            "never `bash cat`",
             "instead of `bash ls`",
             "instead of `bash find`",
             "instead of `bash grep`",
@@ -1458,6 +1467,47 @@ mod tests {
                 "persona must preserve tool preference: {phrase}"
             );
         }
+    }
+
+    #[test]
+    fn persona_steers_reads_away_from_python_and_shell_slicing() {
+        // The reported failure mode: weak models drive file reads through `python3 -c` /
+        // heredoc slices (returning partial data that then gets folded to a stub, forcing
+        // re-runs). The soft `## TOOLS:` block must name that anti-pattern and the
+        // locate-then-read workflow for EVERY model (not just the firm-steered ones).
+        let p = coding_persona("m", true, false);
+        assert!(
+            p.contains("LOCATE then READ"),
+            "persona must teach locate-then-read"
+        );
+        assert!(
+            p.contains("or any slice of one"),
+            "read guidance must cover reading a slice, not just a whole file"
+        );
+        assert!(
+            p.contains("Litmus for bash vs a file tool"),
+            "persona must give the bash-vs-file-tool litmus"
+        );
+    }
+
+    #[test]
+    fn firm_tool_discipline_forbids_python_file_reads_for_weak_models() {
+        // Qwen / LongCat were observed slicing files with python; they must now receive the
+        // firm block, and that block must explicitly forbid the python/heredoc read path.
+        for model in ["qwen3.8-27b", "longcat-2.0", "deepseek-v4-flash", "glm-5.2"] {
+            let p = coding_persona(model, true, false);
+            assert!(
+                p.contains("## TOOL DISCIPLINE (MANDATORY):"),
+                "{model} must get the firm tool-discipline block"
+            );
+            assert!(
+                p.contains("Never split, page, or parse a file with a `python -c`"),
+                "{model}'s firm block must forbid python file slicing"
+            );
+        }
+        // Frontier models stay lean — no firm block.
+        let frontier = coding_persona("claude-opus", true, false);
+        assert!(!frontier.contains("## TOOL DISCIPLINE (MANDATORY):"));
     }
 
     #[cfg(feature = "atomgit")]

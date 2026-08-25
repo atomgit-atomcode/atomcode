@@ -3698,8 +3698,18 @@ impl RunningAgent {
                 // collect any CONTINUATION decision. Middleware sees the RAW
                 // (uncapped) result. The first `Block` reason wins.
                 let mut post_block: Option<String> = None;
+                // The resolved tool travels on the Execute plan; ready results (blocked /
+                // stub / unknown) have no tool. A result transformer keyed on tool
+                // identity (e.g. the artifact middleware honoring `self_bounds_output`)
+                // reads it here rather than pairing before/after state.
+                let plan_tool = match plan {
+                    CallPlan::Execute { tool, .. } => Some(tool),
+                    _ => None,
+                };
                 for mw in &self.middlewares {
-                    if let AfterOutcome::Block { reason } = mw.after(&mut result).await {
+                    if let AfterOutcome::Block { reason } =
+                        mw.after(&mut result, plan_tool).await
+                    {
                         post_block.get_or_insert(reason);
                     }
                 }

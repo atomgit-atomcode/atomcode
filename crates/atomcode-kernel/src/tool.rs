@@ -224,6 +224,17 @@ pub trait Tool: Send + Sync {
     fn read_only_hint(&self) -> bool {
         false
     }
+    /// Whether this tool ALREADY bounds and structures its own output, so a result
+    /// transformer that truncates oversized output (e.g. the artifact head/tail
+    /// middleware) must pass it through WHOLE. A tool returns `true` to promise its
+    /// result is self-capped and carries structure that generic truncation would
+    /// destroy — e.g. `read_file` caps itself at its own byte budget and its 1-based
+    /// line numbering + pagination must survive intact. Default `false` (generic
+    /// truncation applies). This is the tool-side contract that lets the middleware
+    /// stay generic instead of hardcoding a per-tool exemption list.
+    fn self_bounds_output(&self) -> bool {
+        false
+    }
     /// Whether THIS call (with these args) may run CONCURRENTLY with other tools in
     /// the same assistant message. Arg-aware: a tool's safety can depend on its
     /// arguments — `bash` is parallel-safe only for provably read-only commands, so

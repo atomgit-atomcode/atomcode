@@ -48,9 +48,12 @@ impl Tool for GrepTool {
     }
     fn description(&self) -> &str {
         "Search file contents by regular expression under a directory (gitignore-aware; \
-         build/cache dirs and .log files are skipped). Smart-case: case-insensitive \
-         unless the pattern contains an uppercase letter. Escape regex metachars, e.g. \
-         `console\\.log\\(`. Relative paths resolve against the working directory."
+         build/cache dirs and .log files are skipped). Prefer this over `bash grep`/`rg`. \
+         Use it to LOCATE code, then read the exact window with `read_file` (offset/limit/\
+         ranges) rather than dumping whole files or slicing them with a shell/`python` \
+         script. Smart-case: case-insensitive unless the pattern contains an uppercase \
+         letter. Escape regex metachars, e.g. `console\\.log\\(`. Relative paths resolve \
+         against the working directory."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({

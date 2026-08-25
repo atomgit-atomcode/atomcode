@@ -1134,13 +1134,20 @@ impl NativeLiveWireProjector {
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
                 completion: CompactionCompletion::Completed(outcome),
-            }) if outcome.committed => LiveWireEvent::Warning {
-                message: atomcode_config::i18n::format_compaction_mark(
-                    outcome.removed_messages,
-                    outcome.estimated_tokens_before,
-                    outcome.estimated_tokens_after,
-                ),
-            },
+            }) if outcome.committed => {
+                // Silent, cache-friendly tool-output folding is invisible transcript
+                // maintenance — emit nothing (mirrors the TUI `silent_tool_fold`).
+                if outcome.is_silent_auto_tool_fold() {
+                    return None;
+                }
+                LiveWireEvent::Warning {
+                    message: atomcode_config::i18n::format_compaction_mark(
+                        outcome.removed_messages,
+                        outcome.estimated_tokens_before,
+                        outcome.estimated_tokens_after,
+                    ),
+                }
+            }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
                 completion: CompactionCompletion::Failed { error, .. },
             }) => LiveWireEvent::Error {
