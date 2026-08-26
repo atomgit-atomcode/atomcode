@@ -1640,9 +1640,14 @@ impl Modal for ProviderPanel {
                 KeyCode::Enter => {
                     let form = form.clone();
                     if self.save_edit(&form, ctx, renderer) {
-                        return Ok(ModalAction::Close);
+                        // Mirror the add flow: land on this account's model list
+                        // instead of exiting the panel. Editing keeps `form.id`,
+                        // so it is the account we just saved.
+                        self.show_models_for_account(&form.id);
+                    } else {
+                        // Save refused (managed account / stale config): keep editing.
+                        self.mode = Mode::EditAccount(form);
                     }
-                    self.mode = Mode::EditAccount(form);
                 }
                 _ => {}
             }
