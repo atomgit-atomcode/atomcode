@@ -148,6 +148,50 @@ fn resolve_working_dir(cli_dir: Option<PathBuf>) -> PathBuf {
     }
 }
 
+/// The on-exit "how to resume this session" hint, mirroring codex's
+/// `To continue this session, run …`. Headless shows the `-p … --resume <id>`
+/// form (what continues a pipe run); the TUI shows the `resume <id>` subcommand.
+/// Pure so the wording/forms are unit-tested.
+fn resume_hint_line(session_id: &str, headless: bool, zh: bool) -> String {
+    let cmd = if headless {
+        format!("{BIN_NAME} -p \"…\" --resume {session_id}")
+    } else {
+        format!("{BIN_NAME} resume {session_id}")
+    };
+    if zh {
+        format!("继续此会话，运行：{cmd}")
+    } else {
+        format!("To resume this session, run: {cmd}")
+    }
+}
+
+/// What session to resume at launch, unified across `--continue`, `--resume`,
+/// and the `resume` subcommand so one code path (see the launch flow) drives it.
+enum ResumeSelector {
+    /// The most recent session with messages (`--continue` / bare `resume`).
+    Latest,
+    /// An explicit id or name (`--resume <x>` / `resume <x>`).
+    Specific(String),
+}
+
+/// Resolve a `--resume`/`resume <selector>` value to a concrete session id within
+/// a project's scanned catalog: an exact `id` match wins; otherwise the
+/// most-recently-updated session whose `name` equals the selector. `None` when
+/// nothing matches. Pure over the catalog so it is unit-tested without the store.
+fn resolve_in_catalog(
+    catalog: &[atomcode_capabilities::session::CatalogEntry],
+    selector: &str,
+) -> Option<String> {
+    if let Some(entry) = catalog.iter().find(|e| e.id == selector) {
+        return Some(entry.id.clone());
+    }
+    catalog
+        .iter()
+        .filter(|e| e.name == selector)
+        .max_by_key(|e| e.updated_at_ms)
+        .map(|e| e.id.clone())
+}
+
 /// Truncate a string to at most `max_chars` *characters* (not bytes), replacing
 /// any newlines with spaces and appending "..." when truncated.
 ///
@@ -660,6 +704,12 @@ struct Cli {
     #[arg(short = 'c', long = "continue")]
     continue_last: bool,
 
+    /// Resume a SPECIFIC session by id or name (vs `--continue` = the last one).
+    /// Headless: `-p "…" --resume <id>`. Interactive: `--resume <id>` (no `-p`)
+    /// launches the TUI resumed on it — same as the `resume` subcommand.
+    #[arg(long = "resume", value_name = "ID_OR_NAME", conflicts_with_all = ["continue_last", "ephemeral"])]
+    resume: Option<String>,
+
     /// Provider to use (overrides config default)
     #[arg(long)]
     provider: Option<String>,
@@ -770,6 +820,13 @@ enum Commands {
     Logout,
     /// Show current login status
     Status,
+    /// Resume a session by id or name (launches the TUI on it). With no
+    /// argument, resumes the most recent session. Add `-p "<prompt>"` to run
+    /// headless instead. Mirrors `--resume`; the exit hint prints this form.
+    Resume {
+        /// Session id or name to resume (default: the most recent session).
+        session: Option<String>,
+    },
     /// Upgrade atomcode in-place to the latest released version
     Upgrade {
         /// Reinstall even when already on the latest version
@@ -1442,8 +1499,28 @@ async fn run() -> Result<i32> {
     // TUI.
 
     let force_verbose = false;
+    // Capture the resume intent BEFORE the dispatch below moves `cli.command`.
+    // `--resume`/`--continue` are plain flags; the `resume` subcommand is NOT a
+    // terminal command — it falls through to the normal TUI/headless launch with
+    // this selector applied (see the launch flow).
+    let resume_selector: Option<ResumeSelector> = if let Some(sel) = cli.resume.clone() {
+        Some(ResumeSelector::Specific(sel))
+    } else if let Some(Commands::Resume { session }) = &cli.command {
+        Some(match session {
+            Some(s) => ResumeSelector::Specific(s.clone()),
+            None => ResumeSelector::Latest,
+        })
+    } else if cli.continue_last {
+        Some(ResumeSelector::Latest)
+    } else {
+        None
+    };
     if let Some(cmd) = cli.command {
         match cmd {
+            // Not a terminal command: fall through to the TUI/headless launch with
+            // `resume_selector` already captured above (interactive by default; add
+            // `-p` to run headless resumed).
+            Commands::Resume { .. } => {}
             Commands::Login | Commands::Codingplan => {
                 // Unified login flow: OAuth (if needed) → claim → fetch
                 // models → register providers → fetch status. Falls
@@ -1952,13 +2029,24 @@ async fn run() -> Result<i32> {
     // session — no auto-resume, no scrollback replay. Users who want to
     // pick a specific older session can still use `/resume` inside the
     // TUI.
-    let resume_session_id = if cli.continue_last {
-        atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)?
-            .into_iter()
-            .find(|entry| entry.message_count > 0)
-            .map(|entry| entry.id)
-    } else {
-        None
+    let resume_session_id = match &resume_selector {
+        Some(ResumeSelector::Specific(sel)) => {
+            let catalog = atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)?;
+            match resolve_in_catalog(&catalog, sel) {
+                Some(id) => Some(id),
+                None => anyhow::bail!(
+                    "no session matches id or name {sel:?} in this project — run `{} resume` to list, or check the working directory (-C)",
+                    BIN_NAME
+                ),
+            }
+        }
+        Some(ResumeSelector::Latest) => {
+            atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)?
+                .into_iter()
+                .find(|entry| entry.message_count > 0)
+                .map(|entry| entry.id)
+        }
+        None => None,
     };
 
     // The native runtime builds its own provider + tools from
@@ -1995,6 +2083,11 @@ async fn run() -> Result<i32> {
         !is_headless,
     )
     .await?;
+    // The active session id (fresh or resumed) for the on-exit resume hint,
+    // captured before the runtime is moved into the headless/TUI arms below.
+    // `None` for an ephemeral run (no persisted session → nothing to resume).
+    let active_session_id: Option<String> =
+        native_runtime.session.as_ref().map(|s| s.id.clone());
     tracing::info!(
         target: "atomcode::startup",
         stage = "runtime_start",
@@ -2136,6 +2229,15 @@ async fn run() -> Result<i32> {
             dangerously_skip_permissions: cli.dangerously_skip_permissions,
         });
 
+        // Language for the on-exit resume hint (mirrors the resolved UI locale).
+        let hint_zh = cli
+            .lang
+            .as_deref()
+            .map(|l| l.starts_with("zh"))
+            .unwrap_or(matches!(
+                config.language,
+                Some(atomcode_config::locale::Locale::ZhCn)
+            ));
         // Headless mode: -p / --prompt-file triggers non-interactive execution.
         let exit_code = if let Some(prompt) = effective_prompt {
             let verbose = cli.verbose || force_verbose;
@@ -2148,7 +2250,7 @@ async fn run() -> Result<i32> {
             let engine_runtime = native_headless_runtime
                 .take()
                 .expect("native headless runtime built above");
-            match run_native_headless(
+            let result = match run_native_headless(
                 notifications_cfg,
                 engine_runtime,
                 prompt,
@@ -2166,7 +2268,13 @@ async fn run() -> Result<i32> {
             {
                 Err(e) => Err(e),
                 Ok((ec, _captured)) => Ok::<i32, anyhow::Error>(ec),
+            };
+            // Codex-style discovery hint on STDERR so the piped stdout stays the
+            // clean assistant reply. Skipped for ephemeral runs (no session id).
+            if let Some(id) = &active_session_id {
+                eprintln!("\n{}", resume_hint_line(id, true, hint_zh));
             }
+            result
         } else {
             // Fire-and-forget: spawn a setsid'd subprocess to stage the next
             // release if one is out. Detached so a Ctrl+C in this parent doesn't
@@ -2223,7 +2331,7 @@ async fn run() -> Result<i32> {
                 total_ms = run_start.elapsed().as_millis() as u64,
                 "handing control to TUI"
             );
-            match atomcode_tuix::run(
+            let tui_result = match atomcode_tuix::run(
                 config,
                 provider_selection,
                 model_name,
@@ -2242,7 +2350,13 @@ async fn run() -> Result<i32> {
             {
                 Ok(()) => Ok(0),
                 Err(e) => Err(e.into()),
+            };
+            // Codex-style resume hint to STDOUT, after the TUI restored the
+            // terminal, so `atomcode resume <id>` is discoverable on exit.
+            if let Some(id) = &active_session_id {
+                println!("\n{}", resume_hint_line(id, false, hint_zh));
             }
+            tui_result
         };
 
         // Flush telemetry on EVERY exit path — Ok and Err alike. Both session
@@ -3252,6 +3366,11 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             // unreachable in normal execution but kept defensive.
             unreachable!("Login is handled inline in run() before handle_command")
         }
+        Commands::Resume { .. } => {
+            // Resume falls through to the TUI/headless launch in run() before
+            // handle_command is reached; kept defensive like the Login arm.
+            unreachable!("Resume is handled inline in run() before handle_command")
+        }
         Commands::Logout => {
             auth::logout()?;
             telemetry.set_account_id(None);
@@ -4237,12 +4356,86 @@ mod tests {
         headless_completion_notify_reason, headless_denial_exit_code,
         interactive_provider_bootstrap, is_completion_invocation, merge_startup_notices,
         print_shell_completion, resolve_working_dir, runtime_config_from,
-        should_fork_busy_continue, truncate_log_line, Cli, Commands, HeadlessOutputFormat,
-        DEFAULT_LOG_DIRECTIVES,
+        resolve_in_catalog, resume_hint_line, should_fork_busy_continue, truncate_log_line, Cli,
+        Commands, HeadlessOutputFormat, DEFAULT_LOG_DIRECTIVES,
     };
     use clap::Parser;
     use clap_complete::Shell;
     use std::path::PathBuf;
+
+    fn catalog_entry(
+        id: &str,
+        name: &str,
+        updated_at_ms: i64,
+    ) -> atomcode_capabilities::session::CatalogEntry {
+        atomcode_capabilities::session::CatalogEntry {
+            id: id.to_string(),
+            name: name.to_string(),
+            fork_root_id: None,
+            project_bucket: "0123456789abcdef".to_string(),
+            working_dir: PathBuf::from("/w"),
+            created_at_ms: 0,
+            updated_at_ms,
+            message_count: 1,
+            turn_count: 1,
+            presence: atomcode_capabilities::session::CatalogPresence::NativeOnly,
+        }
+    }
+
+    #[test]
+    fn resolve_in_catalog_prefers_exact_id_then_most_recent_name() {
+        let catalog = vec![
+            catalog_entry("aaa", "review", 100),
+            catalog_entry("bbb", "review", 300), // newer duplicate name
+            catalog_entry("ccc", "deploy", 200),
+        ];
+        // Exact id wins even when a name also matches something.
+        assert_eq!(resolve_in_catalog(&catalog, "ccc").as_deref(), Some("ccc"));
+        // Ambiguous name resolves to the most-recently-updated session.
+        assert_eq!(resolve_in_catalog(&catalog, "review").as_deref(), Some("bbb"));
+        // Unique name.
+        assert_eq!(resolve_in_catalog(&catalog, "deploy").as_deref(), Some("ccc"));
+        // No match.
+        assert_eq!(resolve_in_catalog(&catalog, "nope"), None);
+        assert_eq!(resolve_in_catalog(&[], "review"), None);
+    }
+
+    #[test]
+    fn resume_hint_line_forms_match_headless_vs_tui_and_language() {
+        // Headless continues a pipe run with `-p … --resume <id>`.
+        assert_eq!(
+            resume_hint_line("abc", true, false),
+            "To resume this session, run: atomcode -p \"…\" --resume abc"
+        );
+        // TUI shows the `resume <id>` subcommand (codex parity).
+        assert_eq!(
+            resume_hint_line("abc", false, false),
+            "To resume this session, run: atomcode resume abc"
+        );
+        // Chinese locale.
+        assert_eq!(
+            resume_hint_line("abc", false, true),
+            "继续此会话，运行：atomcode resume abc"
+        );
+    }
+
+    #[test]
+    fn resume_flag_and_subcommand_parse() {
+        // `-p "…" --resume <id>` → headless resume.
+        let c = Cli::try_parse_from(["atomcode", "-p", "hi", "--resume", "sid"]).unwrap();
+        assert_eq!(c.resume.as_deref(), Some("sid"));
+        // `resume <id>` subcommand.
+        let c = Cli::try_parse_from(["atomcode", "resume", "sid"]).unwrap();
+        assert!(matches!(
+            c.command,
+            Some(Commands::Resume { session: Some(s) }) if s == "sid"
+        ));
+        // bare `resume` → most recent.
+        let c = Cli::try_parse_from(["atomcode", "resume"]).unwrap();
+        assert!(matches!(c.command, Some(Commands::Resume { session: None })));
+        // `--resume` conflicts with `--continue`.
+        assert!(Cli::try_parse_from(["atomcode", "-p", "hi", "-c", "--resume", "x"]).is_err());
+    }
 
     #[test]
     fn completion_subcommand_defaults_to_bash_and_accepts_all_supported_shells() {
