@@ -75,17 +75,17 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>Plugin 系统</h1>
+<h1 id="plugin-系统">Plugin 系统</h1>
       <p class="lede">Plugin 是一组 skill / 命令 / hook 的集合,通过 git 仓库分发。一行 <code>/plugin install</code> 就能把别人写好的工作流装到 AtomCode 里,装完即用。AtomCode 的 plugin 协议与 Claude Code 兼容,CC 生态的 plugin 仓库可以直接安装运行。</p>
 
-      <h2>核心概念</h2>
+      <h2 id="核心概念">核心概念</h2>
       <ul>
         <li><strong>Marketplace</strong> —— 一个 git 仓库,根目录有 <code>.atomcode-plugin/marketplace.json</code> 或 <code>.claude-plugin/marketplace.json</code>,声明它包含哪些 plugin。</li>
         <li><strong>Plugin</strong> —— marketplace 里的一个条目,可以是同仓库的子目录,也可以指向**外部 git 仓库**(<code>url</code> / <code>github</code> / <code>git</code>)或**本地路径**(<code>local</code>)。</li>
         <li><strong>Skill / 命令 / Hook</strong> —— plugin 安装后会贡献的三类资产。skill 与命令带 <code>plugin-name:</code> 命名空间(避免冲突),hook 按事件触发。</li>
       </ul>
 
-      <h2>命令速查</h2>
+      <h2 id="命令速查">命令速查</h2>
       <table>
         <thead>
           <tr><th>命令</th><th>作用</th></tr>
@@ -103,9 +103,9 @@
         </tbody>
       </table>
 
-      <h2>装一个 plugin</h2>
+      <h2 id="装一个-plugin">装一个 plugin</h2>
 
-      <h3>方式 1:交互式管理器(推荐)</h3>
+      <h3 id="方式-1交互式管理器推荐">方式 1:交互式管理器(推荐)</h3>
       <p>在 TUI 中直接输入 <code>/plugin</code>(不带任何子命令),会打开一个全屏交互式管理器。通过方向键导航、回车确认:</p>
       <pre><code>/plugin
 # → 打开管理器主菜单:
@@ -115,7 +115,7 @@
 #   Installed (N)      — 查看已安装插件列表,回车卸载</code></pre>
       <p>安装插件时,已安装的会显示 ✓ 标记,回车即可切换安装/卸载。克隆和安装是异步的,操作期间底部会显示状态提示,完成后列表自动刷新。</p>
 
-      <h3>方式 2:命令行子命令</h3>
+      <h3 id="方式-2命令行子命令">方式 2:命令行子命令</h3>
       <pre><code># 1. 注册 marketplace(克隆其 git 仓库到本地)
 /plugin marketplace add https://gitcode.com/gmq123/ascend-model-agent-plugin
 
@@ -125,7 +125,7 @@
 # 3. 列出已装
 /plugin list</code></pre>
 
-      <h3>方式 3:CLI</h3>
+      <h3 id="方式-3cli">方式 3:CLI</h3>
       <pre><code>atomcode plugin marketplace add &lt;git-url&gt;
 atomcode plugin install &lt;plugin&gt;@&lt;marketplace&gt;
 atomcode plugin list
@@ -133,14 +133,14 @@ atomcode plugin uninstall &lt;plugin&gt;@&lt;marketplace&gt;
 atomcode plugin marketplace remove|update|list</code></pre>
       <p>CLI 与 TUI 共享 <code>~/.atomcode/plugins/</code> 目录,任意一边装的另一边立即可见。</p>
 
-      <h3>装完之后</h3>
+      <h3 id="装完之后">装完之后</h3>
       <ul>
         <li>plugin 贡献的 skill 出现在 <code>/</code> 菜单,带 <code>&lt;plugin-name&gt;:</code> 前缀。例如 <code>/ascend-model-agent-plugin:ascend-model-verification</code>。</li>
         <li>模型也能通过 <code>UseSkill</code> 工具自动调用这些 skill。</li>
         <li>Hook 需信任后才激活 —— 安装时会打印该插件贡献的 hook 告知(但不运行),运行 <code>atomcode plugin trust &lt;name&gt;</code> 授权后,下次 session 启动时生效。详见<a href="#hook-trust">Hook 信任流程</a>。</li>
       </ul>
 
-      <h2>目录布局</h2>
+      <h2 id="目录布局">目录布局</h2>
       <pre><code>~/.atomcode/plugins/
 ├── marketplaces.json              # 注册的 marketplace 元数据
 ├── installed_plugins.json         # 已装 plugin 的状态记录
@@ -151,7 +151,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
 └── installed/
     └── &lt;marketplace&gt;/&lt;plugin&gt;/    # 外部 source 的 plugin 克隆</code></pre>
 
-      <h2>plugin.json 内嵌结构</h2>
+      <h2 id="pluginjson-内嵌结构">plugin.json 内嵌结构</h2>
       <p>每个 plugin 根目录(或 <code>.claude-plugin/</code> / <code>.atomcode-plugin/</code> 子目录)下的 <code>plugin.json</code>:</p>
       <pre><code>{
   "name": "my-plugin",
@@ -170,7 +170,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
   }
 }</code></pre>
 
-      <h2>Hook 事件</h2>
+      <h2 id="hook-事件">Hook 事件</h2>
       <p>plugin 可以挂以下事件(与 CC 一致)。事件名大小写/风格不敏感——loader 同时接受 PascalCase(<code>PreToolUse</code>、<code>SessionStart</code>)和 snake_case(<code>pre_tool_use</code>、<code>session_start</code>),两种拼写等价。</p>
       <table>
         <thead>
@@ -189,7 +189,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
       </table>
       <p>每个回合结束时都会触发 <strong>且仅触发一个</strong> <code>Stop</code>/<code>StopFailure</code>——不会两个都触发,也不会都不触发。<code>StopFailure</code> 只保留给<em>因为</em> API/provider 失败而结束的回合;回合中途的工具报错<strong>不会</strong>触发它(回合会继续,以真实的终态结束)。stdin payload 携带 <code>hook_event_name</code>、<code>session_id</code>、<code>cwd</code>、会话的 <code>transcript_path</code>(append-only JSONL 会话记录,非持久化运行为 <code>null</code>)、CC 风格的 <code>stop_hook_active</code> 标志(当<em>另有</em>一个终态 hook 配置并会同场触发时为 true——用它可以避免 Stop hook 递归地重新触发自己),以及 kernel 的 <code>stop_reason</code>(如 <code>Stopped</code>、<code>ProviderError</code>、<code>Timeout</code>、<code>Cancelled</code>),hook 无需再解析其他内容即可区分具体结果。
 
-      <h3>默认目录自动发现</h3>
+      <h3 id="默认目录自动发现">默认目录自动发现</h3>
       <p>plugin 的资产目录无需在 <code>plugin.json</code> 中逐一声明——loader 会按以下规则自动下钻:</p>
       <ul>
         <li><strong>Hooks</strong> — 优先读 <code>hooks/hooks.json</code>(CC 布局),其次回退到根目录的 <code>hooks.json</code>。</li>
@@ -211,7 +211,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
       <p>撤销信任:</p>
       <pre><code>atomcode plugin untrust &lt;plugin-name&gt;</code></pre>
 
-      <h3>UserPromptSubmit IO 协议</h3>
+      <h3 id="userpromptsubmit-io-协议">UserPromptSubmit IO 协议</h3>
       <p>Hook 通过 stdin 拿到 JSON,通过 stdout 决定如何处理:</p>
       <pre><code>{
   "session_id": "...",
@@ -229,7 +229,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
       </ul>
       <p>AtomCode 解析 stdout 时,优先用<strong>最后一个非空行</strong>试 JSON;失败再回退到整段文本注入 —— 让 hook 脚本可以前置打印 debug 输出而不影响最终决策。</p>
 
-      <h3>路径变量</h3>
+      <h3 id="路径变量">路径变量</h3>
       <p>Hook 命令字符串中可以引用以下环境变量(由 executor 注入):</p>
       <ul>
         <li><code>${CLAUDE_PLUGIN_ROOT}</code> —— plugin 安装目录绝对路径(CC 兼容)。</li>
@@ -237,7 +237,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
       </ul>
       <p>这些是<strong>真实环境变量</strong>由 shell 自身展开,不是字符串替换 —— 安装路径含空格、引号、<code>$</code>、<code>;</code> 都不会破命令。</p>
 
-      <h2>Marketplace 管理</h2>
+      <h2 id="marketplace-管理">Marketplace 管理</h2>
       <pre><code># 列出已注册的 marketplace
 /plugin marketplace list
 
@@ -247,7 +247,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
 # 移除(若该 marketplace 下还有 plugin 装着,会拒绝)
 /plugin marketplace remove &lt;name&gt;</code></pre>
 
-      <h2>实战:装昇腾插件</h2>
+      <h2 id="实战装昇腾插件">实战:装昇腾插件</h2>
       <pre><code>/plugin marketplace add https://gitcode.com/gmq123/ascend-model-agent-plugin
 # &gt; cloning marketplace from https://gitcode.com/...
 # &gt; marketplace `ascend-model-agent-plugin` added at 7a59537 (1 plugins)
@@ -261,14 +261,14 @@ atomcode plugin marketplace remove|update|list</code></pre>
 # 让模型按照 ascend-model-verification skill 链路执行。
 帮我验证 Qwen3 在昇腾上的适配</code></pre>
 
-      <h2>已知限制</h2>
+      <h2 id="已知限制">已知限制</h2>
       <ul>
         <li><strong>不支持的 CC 事件</strong>:<code>PreCompact</code> / <code>SubagentStop</code> 当前会被静默跳过。</li>
         <li><strong>多行 indent JSON 输出</strong>:hook 用 <code>print(json.dumps(..., indent=2))</code> 输出多行 JSON 时,最后一行是 <code>}</code>,我们的最后一行 JSON parser 会失败,回退到纯文本注入。功能上没问题(LLM 仍能读到内容),但不是结构化路径。建议 hook 作者用单行 <code>json.dumps(...)</code> 输出。</li>
         <li><strong>Skill 名校验严格</strong>:<code>[a-z0-9_-]</code>,与 CC 一致。带 <code>/</code> 或大小写混合的 skill 名会被 skip。</li>
       </ul>
 
-      <h2>下一步</h2>
+      <h2 id="下一步">下一步</h2>
       <ul>
         <li><a href="./skills.html">Skills 扩展</a> —— 写自己的 skill,plugin 里也能用。</li>
         <li><a href="./slash-commands.html">斜杠命令</a> —— 完整的 <code>/plugin</code> 命令列表。</li>

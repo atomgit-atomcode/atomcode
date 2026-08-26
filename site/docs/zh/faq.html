@@ -75,32 +75,32 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>常见问题</h1>
+<h1 id="常见问题">常见问题</h1>
       <p class="lede">把用户群和 issue 里反复出现的问题整理到这里。如果你遇到的问题不在列表里，执行 <code>/login</code> 后可直接让 AtomCode 使用内置 AtomGit 工具创建 Issue，也可以到 <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank">AtomGit 仓库</a> 提交。</p>
 
-      <h2>安装与启动</h2>
+      <h2 id="安装与启动">安装与启动</h2>
 
-      <h3>安装脚本失败、网络超时怎么办？</h3>
+      <h3 id="安装脚本失败网络超时怎么办">安装脚本失败、网络超时怎么办？</h3>
       <p>一键安装脚本默认从 GitCode release 拉二进制。如果网络不通，可以：</p>
       <ul>
         <li>直接到 <a href="https://atomgit.com/atomgit_atomcode/atomcode/releases" target="_blank">releases 页面</a> 手动下载对应平台的压缩包，解压后把 <code>atomcode</code> 放进 <code>PATH</code>；</li>
         <li>或者从源码构建：<code>cargo install --path crates/atomcode-cli --locked</code>（需要 Rust 1.88+）。</li>
       </ul>
 
-      <h3>执行 <code>atomcode</code> 报 "command not found"</h3>
+      <h3 id="执行-atomcode-报-command-not-found">执行 <code>atomcode</code> 报 "command not found"</h3>
       <p>说明安装目录不在 <code>PATH</code> 里。默认安装路径是 <code>~/.atomcode/bin</code>，把它加到 shell 启动脚本里即可：</p>
       <pre><code>export PATH="$HOME/.atomcode/bin:$PATH"</code></pre>
 
-      <h3>macOS 提示"无法打开，因为无法验证开发者"</h3>
+      <h3 id="macos-提示无法打开因为无法验证开发者">macOS 提示"无法打开，因为无法验证开发者"</h3>
       <p>在系统设置 → 隐私与安全性里点"仍要打开"，或在终端执行：</p>
       <pre><code>xattr -d com.apple.quarantine $(which atomcode)</code></pre>
 
-      <h2>登录与模型</h2>
+      <h2 id="登录与模型">登录与模型</h2>
 
-      <h3>OAuth 登录时浏览器打不开</h3>
+      <h3 id="oauth-登录时浏览器打不开">OAuth 登录时浏览器打不开</h3>
       <p>检查是否在无 GUI 的远程服务器上。远程环境推荐改用 API Key 登录（参见 <a href="./login.html">登录方式</a>），或在本地完成 OAuth 后把 <code>~/.atomcode/auth.toml</code> 拷贝到服务器同路径。</p>
 
-      <h3>连不上模型 / 一直转圈 / 报 timeout</h3>
+      <h3 id="连不上模型-一直转圈-报-timeout">连不上模型 / 一直转圈 / 报 timeout</h3>
       <ul>
         <li>先确认 <code>~/.atomcode/config.toml</code> 里的 <code>base_url</code> 是否可达，<code>curl</code> 一下对应的 <code>/v1/models</code> 接口；</li>
         <li>企业网络里常见是代理问题，设置 <code>HTTPS_PROXY</code> 环境变量后重试；</li>
@@ -108,64 +108,64 @@
         <li>国内访问境外模型需要确认出口网络；可以先用 <code>/model</code> 切换到 AtomGit 官方通道确认整体链路是通的。</li>
       </ul>
 
-      <h3>怎么切换模型？</h3>
+      <h3 id="怎么切换模型">怎么切换模型？</h3>
       <p>直接输入 <code>/model</code> 并从菜单选择。命令会切换当前会话，并把所选项保存为后续新会话的默认值；其他已经打开的会话保持原模型。详见 <a href="./configuration.html">配置文件</a>。</p>
 
-      <h3>上下文超限 / "context length exceeded"</h3>
+      <h3 id="上下文超限-context-length-exceeded">上下文超限 / "context length exceeded"</h3>
       <ul>
         <li>运行 <code>/compact</code> 让模型把已有对话压缩成摘要后再继续；</li>
         <li>或 <code>/clear</code> 清空当前上下文重新开始（历史会作为 session 保留，可以随时 <code>/resume</code>）；</li>
         <li>避免一次性把整个巨型文件贴进 prompt，让 AtomCode 用文件工具按需读取即可。</li>
       </ul>
 
-      <h2>权限与安全</h2>
+      <h2 id="权限与安全">权限与安全</h2>
 
-      <h3>每次执行命令都要确认，太烦了</h3>
+      <h3 id="每次执行命令都要确认太烦了">每次执行命令都要确认，太烦了</h3>
       <p>这是默认的安全策略。你可以：</p>
       <ul>
         <li>临时放行：弹出确认时选"一直允许此类操作"；</li>
         <li>配置级放行：在 <code>config.toml</code> 的 <code>[permissions]</code> 里加入白名单命令。</li>
       </ul>
 
-      <h3>AtomCode 会把我的代码发到哪里？</h3>
+      <h3 id="atomcode-会把我的代码发到哪里">AtomCode 会把我的代码发到哪里？</h3>
       <p>只发到你在 <code>config.toml</code> 里配置的模型 endpoint。项目文件由本地的工具读取后作为 prompt 一部分发送，AtomCode 本身不会额外上传或遥测代码内容。</p>
 
-      <h3>能禁用某些工具吗？</h3>
+      <h3 id="能禁用某些工具吗">能禁用某些工具吗？</h3>
       <p>可以。在 <code>config.toml</code> 的 <code>[tools]</code> 段里用 <code>disabled = ["shell", "web_fetch"]</code> 禁用不希望模型使用的工具。</p>
 
-      <h2>使用与交互</h2>
+      <h2 id="使用与交互">使用与交互</h2>
 
-      <h3>怎么让它读某个文件？</h3>
+      <h3 id="怎么让它读某个文件">怎么让它读某个文件？</h3>
       <p>在输入里用 <code>@</code> 触发文件补全，例如 <code>帮我看看 @src/main.rs 的入口逻辑</code>。也可以直接描述路径，工具会自己调用 <code>read_file</code>。</p>
 
-      <h3>如何换行输入多行 prompt？</h3>
+      <h3 id="如何换行输入多行-prompt">如何换行输入多行 prompt？</h3>
       <p><kbd>Shift</kbd>+<kbd>Enter</kbd>、<kbd>Alt</kbd>+<kbd>Enter</kbd> 或 <kbd>Ctrl</kbd>+<kbd>Enter</kbd> 换行，<kbd>Enter</kbd> 发送。完整快捷键见 <a href="./keybindings.html">快捷键</a>。</p>
 
-      <h3>改错了怎么回滚？</h3>
+      <h3 id="改错了怎么回滚">改错了怎么回滚？</h3>
       <p>运行 <code>/undo</code> 把上一轮工具调用产生的文件改动回滚到修改前的状态。详见 <a href="./sessions.html">会话与撤销</a>。</p>
 
-      <h3>上一次的会话还能继续吗？</h3>
+      <h3 id="上一次的会话还能继续吗">上一次的会话还能继续吗？</h3>
       <p>能。启动时加 <code>--continue</code>（或 <code>-c</code>）继续上一次会话，或在新会话里运行 <code>/resume</code>，从历史列表里挑一个继续。</p>
 
-      <h2>Skills 与项目指令</h2>
+      <h2 id="skills-与项目指令">Skills 与项目指令</h2>
 
-      <h3>我的 skill 没出现在菜单里</h3>
+      <h3 id="我的-skill-没出现在菜单里">我的 skill 没出现在菜单里</h3>
       <ul>
         <li>确认路径正确：全局在 <code>~/.atomcode/skills/&lt;name&gt;/SKILL.md</code>，项目在 <code>.atomcode/skills/&lt;name&gt;/SKILL.md</code>；</li>
         <li>确认 frontmatter 格式正确，<code>name</code> 和 <code>description</code> 两个字段必填；</li>
         <li>重启 atomcode 或运行 <code>/reload</code> 重新扫描。</li>
       </ul>
 
-      <h3><code>.atomcode.md</code> 和 skill 有什么区别？</h3>
+      <h3 id="atomcodemd-和-skill-有什么区别"><code>.atomcode.md</code> 和 skill 有什么区别？</h3>
       <p>前者是项目级的"始终生效"约定，后者是可被显式触发的流程。详见 <a href="./skills.html#与项目指令的分工">Skills 扩展 · 与项目指令的分工</a>。</p>
 
-      <h2>排查思路</h2>
+      <h2 id="排查思路">排查思路</h2>
       <div class="callout callout-tip">
         <strong>先看日志</strong>
         <p>出任何问题第一步都是看 <code>~/.atomcode/logs/</code>。启动时加 <code>--log-level debug</code> 可以打印更详细的请求/响应日志。</p>
       </div>
 
-      <h3>提 issue 时请附上</h3>
+      <h3 id="提-issue-时请附上">提 issue 时请附上</h3>
       <ul>
         <li><code>atomcode --version</code> 的输出；</li>
         <li>操作系统和架构；</li>
@@ -173,7 +173,7 @@
         <li>相关日志（记得脱敏 API Key）。</li>
       </ul>
 
-      <h2>下一步</h2>
+      <h2 id="下一步">下一步</h2>
       <ul>
         <li><a href="./index.html">返回概览</a></li>
         <li><a href="./getting-started.html">快速开始</a> —— 从零装一遍</li>

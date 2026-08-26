@@ -75,10 +75,10 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>MCP 集成</h1>
+<h1 id="mcp-集成">MCP 集成</h1>
       <p class="lede">MCP（Model Context Protocol）是一个开放协议,把外部程序或 HTTP 服务的「工具」接到 AtomCode,让模型像调用内置工具一样使用它们。从 v4.20.4 起 AtomCode 内置 MCP 客户端,直接复用 Cursor 等同样使用 <code>mcpServers</code> 配置块的生态。</p>
 
-      <h2>它能做什么</h2>
+      <h2 id="它能做什么">它能做什么</h2>
       <ul>
         <li>通过官方 MCP server 操作 GitHub、GitLab、Jira 等外部服务</li>
         <li>接 Postgres / MySQL / DuckDB 等数据库</li>
@@ -86,7 +86,7 @@
         <li>把团队内部的领域工具暴露给模型,无需改 atomcode 源码</li>
       </ul>
 
-      <h2>两个配置位置</h2>
+      <h2 id="两个配置位置">两个配置位置</h2>
       <table>
         <thead>
           <tr><th>路径</th><th>作用域</th></tr>
@@ -98,7 +98,7 @@
       </table>
       <p>两份可同时存在;<strong>同名 server 以项目级为准</strong>(覆盖用户级)。仓库根目录的 <code>.mcp.json.example</code> 自带 stdio 与 HTTP 双模板和详细注释,推荐从它开始改。</p>
 
-      <h2>配置 schema</h2>
+      <h2 id="配置-schema">配置 schema</h2>
       <p>顶层键固定为 <code>mcpServers</code>(旧键 <code>servers</code> 仍兼容)。每个 server 建议只写一种 transport:</p>
       <ul>
         <li><strong>stdio</strong>:<code>command</code>(必填)+ 可选 <code>args</code>、<code>env</code>、<code>timeout_ms</code>、<code>disabled</code></li>
@@ -108,7 +108,7 @@
       <p>字符串里支持 <code>${VAR}</code> 与 <code>${VAR:-默认值}</code> 的环境变量展开;敏感令牌不要写死,放到环境变量里。<code>disabled: true</code> 可临时关掉某个 server 而不删条目。</p>
       <p><code>.mcp.json</code> 还支持 <strong>JSONC 注释</strong> —— <code>//</code> 行注释和 <code>/* */</code> 块注释 —— 可以给某个 server 加说明或临时注释掉而不必删除。字符串值内部的注释符号(比如 URL 里的 <code>//</code>)会被原样保留。</p>
 
-      <h3>stdio 示例(本地子进程)</h3>
+      <h3 id="stdio-示例本地子进程">stdio 示例(本地子进程)</h3>
       <pre><code>{
   "mcpServers": {
     "filesystem": {
@@ -119,7 +119,7 @@
   }
 }</code></pre>
 
-      <h3>HTTP 示例(远程端点)</h3>
+      <h3 id="http-示例远程端点">HTTP 示例(远程端点)</h3>
       <pre><code>{
   "mcpServers": {
     "github": {
@@ -132,7 +132,7 @@
   }
 }</code></pre>
 
-      <h3>GitHub remote MCP + OAuth</h3>
+      <h3 id="github-remote-mcp-oauth">GitHub remote MCP + OAuth</h3>
       <pre><code>{
   "mcpServers": {
     "github": {
@@ -150,7 +150,7 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github
 atomcode</code></pre>
       <p>TUI 内也可在设置好环境变量后运行 <code>/mcp login github</code>,登录成功后用 <code>/mcp reload</code> 重连。</p>
 
-      <h2>一行命令添加 server</h2>
+      <h2 id="一行命令添加-server">一行命令添加 server</h2>
       <p><code>atomcode mcp add</code> 自动把 stdio 配置写入 JSON,不用手动编辑:</p>
       <pre><code># 写入项目根 .mcp.json(默认当前目录)
 atomcode mcp add playwright npx @playwright/mcp@latest
@@ -169,7 +169,7 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
         <p>同名会<strong>整段覆盖</strong>该 server。GitHub OAuth token 保存在 <code>~/.atomcode/mcp_auth.toml</code>,不会写入 <code>.mcp.json</code>。</p>
       </div>
 
-      <h2>启动后会发生什么</h2>
+      <h2 id="启动后会发生什么">启动后会发生什么</h2>
       <table>
         <thead>
           <tr><th>模式</th><th>连接行为</th><th>工具出现时机</th></tr>
@@ -181,13 +181,13 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
       </table>
       <p>TUI 下可在会话区看到 <code>✓ MCP server 'github' connected</code> 或 <code>✗ MCP server '…' failed: …</code>。<strong>单个 server 失败不会拖垮其他 server 与主程序。</strong></p>
 
-      <h2>工具命名</h2>
+      <h2 id="工具命名">工具命名</h2>
       <p>每个远端 tool 注册成 <code>mcp__&lt;server 键名&gt;__&lt;远端 tool 名&gt;</code>。</p>
       <p>例:配置里 <code>"mcpServers": { "github": { ... } }</code>,远端有 <code>get_issue</code>,模型看到的工具名就是 <code>mcp__github__get_issue</code>。</p>
       <p><code>--disable-tools</code> 也用这个完整名:</p>
       <pre><code>atomcode --disable-tools mcp__github__get_issue,mcp__filesystem__write_file</code></pre>
 
-      <h2>权限审批</h2>
+      <h2 id="权限审批">权限审批</h2>
       <p>MCP 工具默认 <strong>每次调用都需要确认</strong>(等同 <code>RequireApproval</code>),因为远端是外部不可信代码。</p>
       <ul>
         <li>按 <strong>Y</strong> — 单次允许</li>
@@ -199,7 +199,7 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
         <p>把 MCP 工具返回的内容当作不可信数据处理,<strong>不要</strong>让它升级成系统指令。一个返回结果带「请忽略之前的指示」的 MCP server,模型不应该照办。</p>
       </div>
 
-      <h2>项目信任(.mcp.json)</h2>
+      <h2 id="项目信任mcpjson">项目信任(.mcp.json)</h2>
       <p>定义在<strong>项目级</strong> <code>.mcp.json</code> 里的 server <strong>在你信任该项目前都是不受信任的</strong>。一个刚 clone 下来、自带 <code>.mcp.json</code> 的仓库不会在你机器上自动拉起子进程 —— 它的项目级 server 会被挡在连接循环之外(fail-closed),你会看到一条 <em>blocked-untrusted</em> 提示列出它们。用户全局 server(<code>~/.atomcode/mcp.json</code>)不受影响。</p>
       <p>信任按项目目录记录,存于 <code>~/.atomcode/mcp_trust.json</code>:</p>
       <ul>
@@ -208,7 +208,7 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
       </ul>
       <p>在 <a href="./webui.html">Web UI</a> 里,一个 <strong>信任项目</strong> 按钮通过 <code>POST /live/mcp/trust</code> 做同样的事,MCP 状态会显示哪些 server 已连接、哪些被挡下。</p>
 
-      <h2>斜杠命令</h2>
+      <h2 id="斜杠命令">斜杠命令</h2>
       <table>
         <thead>
           <tr><th>命令</th><th>作用</th></tr>
@@ -221,7 +221,7 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
         </tbody>
       </table>
 
-      <h2>当前限制</h2>
+      <h2 id="当前限制">当前限制</h2>
       <ul>
         <li>仅支持 MCP 的 <strong>tools</strong> 能力;尚未实现 resources / prompts / OAuth / roots / elicitation</li>
         <li>HTTP server 无指数退避重连,stdio 子进程退出后不自动重启 — 需用 <code>/mcp reload</code> 手动重连</li>
@@ -230,7 +230,7 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
         <li><code>[A] Always</code> 仅当前会话生效,不写入任何配置文件</li>
       </ul>
 
-      <h2>同类生态对比</h2>
+      <h2 id="同类生态对比">同类生态对比</h2>
       <table>
         <thead>
           <tr><th>产品</th><th>配置位置</th><th>备注</th></tr>
@@ -244,7 +244,7 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
       </table>
       <p>已经在用 Cursor 配 MCP server 的话,常见 <code>command</code> / <code>url</code> 类型配置通常可复用;超出当前字段或能力范围的配置需按 AtomCode 当前实现确认。</p>
 
-      <h2>下一步</h2>
+      <h2 id="下一步">下一步</h2>
       <ul>
         <li>仓库根目录的 <a href="https://atomgit.com/atomgit_atomcode/atomcode/blob/main/.mcp.json.example" target="_blank"><code>.mcp.json.example</code></a> —— 带详细注释的 stdio + HTTP 双模板</li>
         <li><a href="./configuration.html">配置文件</a> —— 整体配置概览</li>

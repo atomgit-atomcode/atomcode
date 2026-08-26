@@ -75,10 +75,10 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>Persistent Memory</h1>
+<h1 id="persistent-memory">Persistent Memory</h1>
       <p class="lede">Use <code>/remember</code> to capture stray preferences, conventions, and commands. AtomCode injects them into the system prompt on every turn. It complements <a href="./project-instructions.html"><code>.atomcode.md</code> project instructions</a>: instructions are for full specs; memory is for the "oh, I should tell it about that" facts.</p>
 
-      <h2>Command overview</h2>
+      <h2 id="command-overview">Command overview</h2>
       <table>
         <thead>
           <tr><th>Command</th><th>Effect</th></tr>
@@ -91,7 +91,7 @@
         </tbody>
       </table>
 
-      <h2>Storage locations</h2>
+      <h2 id="storage-locations">Storage locations</h2>
       <table>
         <thead>
           <tr><th>Scope</th><th>Path</th></tr>
@@ -103,7 +103,7 @@
       </table>
       <p>The format is plain Markdown — one entry per <code>- </code>-prefixed list item. Use <code>/remember</code> or hand-edit; AtomCode rereads on the next turn. <strong>Lines not starting with <code>- </code> are ignored</strong>, so feel free to add comments, blank lines, or grouping headings without affecting entries.</p>
 
-      <h2>How the model "uses" memory</h2>
+      <h2 id="how-the-model-uses-memory">How the model "uses" memory</h2>
       <p>At session start, AtomCode merges <strong>global + project memory</strong> through the coding runtime memory hook (<code>crates/atomcode-coding/src/parts.rs</code>), formatted as:</p>
       <pre><code>=== MEMORY ===
 The user has asked you to remember these facts and preferences:
@@ -117,7 +117,7 @@ The user has asked you to remember these facts and preferences:
 - When CI fails, first check .github/workflows/ci.yml lines 78-92</code></pre>
       <p>The model sees this block on every turn. There is <strong>no "semantic retrieval" or "on-demand recall"</strong> — it's unconditional full injection. The more entries, the more tokens per turn. Prune stale entries to keep this tight.</p>
 
-      <h2>Capacity limits</h2>
+      <h2 id="capacity-limits">Capacity limits</h2>
       <table>
         <thead>
           <tr><th>Limit</th><th>Value</th><th>What happens at the limit</th></tr>
@@ -129,26 +129,26 @@ The user has asked you to remember these facts and preferences:
       </table>
       <p>Once you hit the limit, use <code>/forget</code> to clean up — drop entries that are no longer relevant.</p>
 
-      <h2>Suggested uses</h2>
+      <h2 id="suggested-uses">Suggested uses</h2>
 
-      <h3>1. Project-specific commands, conventions, footguns (project scope)</h3>
+      <h3 id="1-project-specific-commands-conventions-footguns-project-sco">1. Project-specific commands, conventions, footguns (project scope)</h3>
       <pre><code>&gt; /remember use npm run check for type-checking (not npm run typecheck)
 &gt; /remember when CI fails, check .github/workflows/ci.yml lines 78-92 first
 &gt; /remember never use sed -i in this repo (macOS/Linux behaviour differs)
 &gt; /remember DB migration SQL must run on staging before main</code></pre>
 
-      <h3>2. Global coding preferences, workflows (global)</h3>
+      <h3 id="2-global-coding-preferences-workflows-global">2. Global coding preferences, workflows (global)</h3>
       <pre><code>&gt; /remember --global run tests before committing
 &gt; /remember --global don't git push on your own — let me confirm manually
 &gt; /remember --global reply in Chinese but write commit messages in English
 &gt; /remember --global prefer editing existing files — don't create docs (*.md) on your own</code></pre>
 
-      <h3>3. Personal or team info (global)</h3>
+      <h3 id="3-personal-or-team-info-global">3. Personal or team info (global)</h3>
       <pre><code>&gt; /remember --global my GitHub username is alice
 &gt; /remember --global default timezone Asia/Shanghai
 &gt; /remember --global team standup is Mon/Wed/Fri at 9:30</code></pre>
 
-      <h3>4. Cleaning up stale memories</h3>
+      <h3 id="4-cleaning-up-stale-memories">4. Cleaning up stale memories</h3>
       <pre><code>&gt; /forget npm run check
   [project] - use npm run check for type-checking (not npm run typecheck)
   (removed 1 matching entry)
@@ -160,7 +160,7 @@ The user has asked you to remember these facts and preferences:
   [Project] (/Users/alice/code/myrepo/.atomcode/memory.md)
     - when CI fails, check .github/workflows/ci.yml lines 78-92 first</code></pre>
 
-      <h2>Memory vs project instructions vs session history</h2>
+      <h2 id="memory-vs-project-instructions-vs-session-history">Memory vs project instructions vs session history</h2>
       <p>AtomCode offers three ways to persist "context", each with a different role:</p>
       <table>
         <thead>
@@ -182,7 +182,7 @@ The user has asked you to remember these facts and preferences:
       </ul>
       <p>Whether to commit <code>.atomcode/memory.md</code>: if the team also uses AtomCode and the memory is project knowledge (footguns, conventions), commit it; if it's personal notes, add it to <code>.gitignore</code>.</p>
 
-      <h2>Next steps</h2>
+      <h2 id="next-steps">Next steps</h2>
       <ul>
         <li><a href="./project-instructions.html">Project Instructions</a> — the best home for full specs</li>
         <li><a href="./slash-commands.html">Slash Commands</a> — full command reference</li>

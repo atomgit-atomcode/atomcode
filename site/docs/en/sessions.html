@@ -75,10 +75,10 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>Sessions &amp; Undo</h1>
+<h1 id="sessions-undo">Sessions &amp; Undo</h1>
       <p class="lede">AtomCode persists every conversation by default, so you can restore, resume, clear, or compact at any time. A single <code>/undo</code> rewinds conversation memory back to any earlier turn.</p>
 
-      <h2>Session lifecycle</h2>
+      <h2 id="session-lifecycle">Session lifecycle</h2>
       <p>Each <code>atomcode</code> launch creates a session. A session contains:</p>
       <ul>
         <li>Full message history (user prompts, AI replies, tool calls)</li>
@@ -89,16 +89,16 @@
       </ul>
       <p>Session data is persisted under <code>~/.atomcode/sessions/</code>, grouped by project (working-directory hash).</p>
 
-      <h2>Resuming sessions</h2>
-      <h3>Continue the last one from the CLI</h3>
+      <h2 id="resuming-sessions">Resuming sessions</h2>
+      <h3 id="continue-the-last-one-from-the-cli">Continue the last one from the CLI</h3>
       <pre><code>atomcode -c        # or atomcode --continue</code></pre>
       <p>The most common case: pick up exactly where you left off yesterday.</p>
 
-      <h3>Switch sessions inside the TUI</h3>
+      <h3 id="switch-sessions-inside-the-tui">Switch sessions inside the TUI</h3>
       <pre><code>/resume</code></pre>
       <p>Opens the session picker. It lists this project's historical sessions newest-first; jump to any of them quickly. Each entry uses the most recent user prompt as its label for easy recognition.</p>
 
-      <h3>Start a clean new session</h3>
+      <h3 id="start-a-clean-new-session">Start a clean new session</h3>
       <pre><code>/session</code></pre>
       <p>Spin up a fresh context without changing the working directory. Good for "the previous task is wrapped — onto something totally unrelated".</p>
 
@@ -117,7 +117,7 @@
         </tbody>
       </table>
 
-      <h3>Session states</h3>
+      <h3 id="session-states">Session states</h3>
       <p>The <em>state</em> column in <code>/bg list</code> reflects what each background session is doing:</p>
       <ul>
         <li><strong>running</strong> — the model loop is still executing; tool calls and output keep advancing in the background</li>
@@ -127,7 +127,7 @@
       </ul>
       <p>So <code>/bg</code> isn't just "suspend" — the model actually keeps working in the background; when you switch back, the result is already there.</p>
 
-      <h3><code>/background &lt;task&gt;</code> — one-shot dispatch</h3>
+      <h3 id="background-task-one-shot-dispatch"><code>/background &lt;task&gt;</code> — one-shot dispatch</h3>
       <p>If you don't want to swap foreground/background manually and just want to "have it look something up real quick", use the <code>/background</code> compatibility entry:</p>
       <pre><code>/background list every unused dependency under src</code></pre>
       <p>It starts a one-shot task in a <code>/bg</code> slot (configured with a read-only tool subset by default so the main conversation context isn't polluted). When done, check <code>/bg list</code>, use <code>/bg &lt;N&gt;</code> to read the result, <code>/bg drop &lt;N&gt;</code> to discard.</p>
@@ -137,7 +137,7 @@
         <p>The foreground is debugging module A; the model is editing and running <code>cargo check</code> (slow). You realise you also want to refactor module B — <code>/bg</code> straight to a new foreground for B. The build on A finishes in the background, state flips to <em>done</em>; <code>/bg 1</code> to switch back and read the result.</p>
       </div>
 
-      <h2>Clear vs compact vs new session</h2>
+      <h2 id="clear-vs-compact-vs-new-session">Clear vs compact vs new session</h2>
       <table>
         <thead>
           <tr><th>Command</th><th>Keeps history</th><th>Keeps session ID</th><th>When to use</th></tr>
@@ -149,7 +149,7 @@
         </tbody>
       </table>
 
-      <h2>Rewinding conversation memory with <code>/undo</code></h2>
+      <h2 id="rewinding-conversation-memory-with-undo">Rewinding conversation memory with <code>/undo</code></h2>
       <p><code>/undo</code> rewinds <strong>conversation memory</strong> to before a given turn — removing that turn and everything after it — and drops the prompt you typed for that turn back into the input box so you can edit and resend it.</p>
       <pre><code>/undo      # rewind the last turn
 /undo N    # rewind to turn N (1-based; counts only the prompts you actually typed)</code></pre>
@@ -160,13 +160,13 @@
         <p><code>/undo</code> rewinds conversation memory <em>only</em> — it does <strong>not</strong> restore files on disk. If the AI edited code during those turns, those changes stay in your working tree; use <code>/diff</code> to review and revert them manually, or rely on git. You can't <code>/undo</code> while a turn is in flight — press Esc to cancel it first.</p>
       </div>
 
-      <h2>Safe rollback with <code>/rewind</code></h2>
+      <h2 id="safe-rollback-with-rewind">Safe rollback with <code>/rewind</code></h2>
       <p><code>/rewind</code> lists recent user prompts and lets you choose the scope: conversation only, code only, or both conversation and code. Code rollback requires a Git worktree and is confirmed before it runs. For a simple one-turn conversation rollback, <code>/undo</code> remains the lighter option.</p>
 
-      <h2>Recovery after an interrupted exit</h2>
+      <h2 id="recovery-after-an-interrupted-exit">Recovery after an interrupted exit</h2>
       <p>AtomCode saves temporary progress while a turn is running. After a terminal crash or network interruption, <code>/resume</code> attempts to restore the last user prompt, generated response, and tool-call progress instead of falling back to the previous completed turn. Pending permissions and questions are never auto-approved.</p>
 
-      <h2>Inspecting and managing token usage</h2>
+      <h2 id="inspecting-and-managing-token-usage">Inspecting and managing token usage</h2>
       <pre><code>/cost</code></pre>
       <p>Shows cumulative input / output tokens for the current session. When the number approaches the provider's <code>context_window</code>:</p>
       <ul>
@@ -175,14 +175,14 @@
         <li>To avoid keeping large tool-call results, tell the model in the prompt to "stop re-reading those big files"</li>
       </ul>
 
-      <h2>Multi-project workflows</h2>
+      <h2 id="multi-project-workflows">Multi-project workflows</h2>
       <p>AtomCode groups sessions by working directory. Recommended ways to switch:</p>
       <ul>
         <li>From the CLI, specify with <code>-C</code></li>
         <li>While running, use <code>/cd</code>; <code>default_workdir</code> is persisted automatically</li>
       </ul>
 
-      <h2>Next steps</h2>
+      <h2 id="next-steps">Next steps</h2>
       <ul>
         <li><a href="./project-instructions.html">Project Instructions</a> — lock in per-project context with <code>.atomcode.md</code></li>
       </ul>

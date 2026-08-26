@@ -75,10 +75,10 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>斜杠命令</h1>
+<h1 id="斜杠命令">斜杠命令</h1>
       <p class="lede">在 TUI 输入框中以 <code>/</code> 开头即可触发命令,并获得自动补全菜单。按功能分类的 50+ 个内置命令如下;Skills 和 Plugin 加载的命令也会自动出现在补全菜单里。</p>
 
-      <h2>核心功能</h2>
+      <h2 id="核心功能">核心功能</h2>
       <table>
         <thead>
           <tr><th>命令</th><th>作用</th></tr>
@@ -96,7 +96,7 @@
         </tbody>
       </table>
 
-      <h2>工具与实用操作</h2>
+      <h2 id="工具与实用操作">工具与实用操作</h2>
       <table>
         <thead>
           <tr><th>命令</th><th>作用</th></tr>
@@ -131,7 +131,7 @@
         <p>不必等回合结束就能查看状态:<code>/status</code>、<code>/diff</code>、<code>/cost</code>、<code>/usage</code>、<code>/rename</code> 在 agent 流式输出时也能运行。它们以输入框下方的临时面板呈现(按 <kbd>Esc</kbd> 关闭),不打断进行中的回合。<code>/usage</code> 在回合中还能在 Current / Overview / Models 视图间按 Tab 切换。</p>
       </div>
 
-      <h2>对话模式与思考</h2>
+      <h2 id="对话模式与思考">对话模式与思考</h2>
       <table>
         <thead>
           <tr><th>命令</th><th>作用</th></tr>
@@ -149,7 +149,7 @@
         </tbody>
       </table>
 
-      <h2>永久记忆</h2>
+      <h2 id="永久记忆">永久记忆</h2>
       <table>
         <thead>
           <tr><th>命令</th><th>作用</th></tr>
@@ -163,7 +163,7 @@
       </table>
       <p>详细使用与最佳实践见 <a href="./memory.html">永久记忆</a>。</p>
 
-      <h2>扩展生态</h2>
+      <h2 id="扩展生态">扩展生态</h2>
       <table>
         <thead>
           <tr><th>命令</th><th>作用</th></tr>
@@ -184,7 +184,7 @@
       <pre><code>/plugin marketplace add https://atomgit.com/atomgit_atomcode/AtomCode-Channel
 /plugin install weixin@atomcode-channel</code></pre>
 
-      <h2>MCP 集成</h2>
+      <h2 id="mcp-集成">MCP 集成</h2>
       <table>
         <thead>
           <tr><th>命令</th><th>作用</th></tr>
@@ -197,7 +197,7 @@
       </table>
       <p>详细配置与使用见 <a href="./mcp.html">MCP 集成</a>。</p>
 
-      <h2>WebUI 与同步</h2>
+      <h2 id="webui-与同步">WebUI 与同步</h2>
       <table>
         <thead>
           <tr><th>命令</th><th>作用</th></tr>
@@ -214,7 +214,7 @@
       </table>
       <p>详细见 <a href="./webui.html">WebUI 界面</a> 与 <a href="./webui-remote-access.html">远程访问指南</a>。</p>
 
-      <h2>配置与帮助</h2>
+      <h2 id="配置与帮助">配置与帮助</h2>
       <table>
         <thead>
           <tr><th>命令</th><th>作用</th></tr>
@@ -236,7 +236,7 @@
         </tbody>
       </table>
 
-      <h2>命令使用技巧</h2>
+      <h2 id="命令使用技巧">命令使用技巧</h2>
       <ul>
         <li><strong>自动补全</strong> —— 输入 <code>/</code> 后会立刻弹出补全菜单,用 <code>↑↓</code> 选择,<code>Tab</code> / <code>Enter</code> 确认。</li>
         <li><strong>模糊匹配</strong> —— 补全支持子串匹配,比如输入 <code>/prov</code> 就能命中 <code>/provider</code>。</li>
@@ -244,9 +244,9 @@
         <li><strong>Skills 也会出现在菜单里</strong> —— 当你在 <a href="./skills.html">Skills 目录</a>中添加了自定义命令后,它们会以相同格式出现在补全菜单里。</li>
       </ul>
 
-      <h2>典型工作流</h2>
+      <h2 id="典型工作流">典型工作流</h2>
 
-      <h3>第一次启动 — 一键接入</h3>
+      <h3 id="第一次启动-一键接入">第一次启动 — 一键接入</h3>
       <pre><code>&gt; /login
   ✔ Logged in as alice (alice, alice@example.com)
   ✔ CodingPlan claimed — CodingPlan Lite · expires 2026-05-22 (29d / 30d)
@@ -254,7 +254,7 @@
   ✔ Default provider set to AtomGit-GLM
 &gt; 你好</code></pre>
 
-      <h3>做完一件事前看一眼 Token 用量</h3>
+      <h3 id="做完一件事前看一眼-token-用量">做完一件事前看一眼 Token 用量</h3>
       <pre><code>&gt; 重构 src/db 使用连接池
 ... (AI 执行)
 &gt; /cost
@@ -264,7 +264,7 @@ AtomGit · deepseek-v4-flash
   缓存 Token：       5080（70% 命中率）
   Token 总计：       8342</code></pre>
 
-      <h3>问歪了就回退重问</h3>
+      <h3 id="问歪了就回退重问">问歪了就回退重问</h3>
       <pre><code>&gt; 给所有函数加 JSDoc
 ... (回复跑偏了)
 &gt; /undo
@@ -272,12 +272,12 @@ AtomGit · deepseek-v4-flash
 ⚠ 仅回滚了对话记忆,磁盘文件未恢复。如需还原代码,请手动处理或用 /diff 查看。
 (刚才那条 prompt 已还原到输入框,可改完重发)</code></pre>
 
-      <h3>模型表现不好换一个再试</h3>
+      <h3 id="模型表现不好换一个再试">模型表现不好换一个再试</h3>
       <pre><code>&gt; /model
 &gt; (在弹出的菜单里选择 claude-opus-4-6)
 &gt; 再试一次,这次注意保留原有注释</code></pre>
 
-      <h2>下一步</h2>
+      <h2 id="下一步">下一步</h2>
       <ul>
         <li><a href="./keybindings.html">快捷键</a> —— 命令和快捷键配合使用效率翻倍</li>
         <li><a href="./sessions.html">会话与撤销</a> —— <code>/resume</code>、<code>/undo</code>、<code>/compact</code> 的详细行为</li>

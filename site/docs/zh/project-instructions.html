@@ -75,20 +75,20 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>项目指令文件</h1>
+<h1 id="项目指令文件">项目指令文件</h1>
       <p class="lede">在项目根目录放一个 <code>.atomcode.md</code>,可以把项目的技术栈、约定和偏好固化下来,AtomCode 启动时会自动把它注入系统提示,避免每次对话都要重复说一遍规则。</p>
 
-      <h2>为什么需要它</h2>
+      <h2 id="为什么需要它">为什么需要它</h2>
       <p>设想这个常见场景:你的团队统一使用 Composition API,禁止 Options API。每次让 AtomCode 写新组件,你都得提醒一句"用 Composition API"。有了 <code>.atomcode.md</code>,这类偏好会自动带进每一次对话。</p>
 
-      <h2>文件位置</h2>
+      <h2 id="文件位置">文件位置</h2>
       <ul>
         <li>默认路径:项目根目录下的 <code>.atomcode.md</code></li>
         <li>AtomCode 从当前工作目录向上逐级查找,直到找到或到达 <code>$HOME</code></li>
         <li>如果该文件不存在,系统提示中自然不会出现相关内容</li>
       </ul>
 
-      <h2>示例</h2>
+      <h2 id="示例">示例</h2>
       <pre><code># Project Instructions
 
 这是一个 Vue 3 + TypeScript 项目,使用 Pinia 做状态管理、
@@ -113,7 +113,7 @@ Tailwind 做样式、Vitest 做单元测试。
 - 不要修改 `src/generated/*`,那是从 OpenAPI 自动生成的
 - 测试覆盖率要求在 80% 以上,新增模块必须带单元测试</code></pre>
 
-      <h2>写好 .atomcode.md 的几条经验</h2>
+      <h2 id="写好-atomcodemd-的几条经验">写好 .atomcode.md 的几条经验</h2>
       <ul>
         <li><strong>只写"和一般情况不一样"的部分</strong> —— 通用最佳实践模型自己懂,不用在这里重复。</li>
         <li><strong>给出命令,而不是描述</strong> —— "跑测试用 <code>pnpm test</code>",而不是"请运行单元测试"。</li>
@@ -127,7 +127,7 @@ Tailwind 做样式、Vitest 做单元测试。
         <p>如果你有很多重复的工作流(比如每次修 bug 都要跑一套相同的命令),与其在 <code>.atomcode.md</code> 里长篇大论,不如写成一个 <a href="./skills.html">Skill</a>,更清晰也更可复用。</p>
       </div>
 
-      <h2>与 AGENTS.md / CLAUDE.md / GEMINI.md 的关系</h2>
+      <h2 id="与-agentsmd-claudemd-geminimd-的关系">与 AGENTS.md / CLAUDE.md / GEMINI.md 的关系</h2>
       <p>AtomCode 原生支持 <code>AGENTS.md</code>——AI 编程代理持久化上下文的<a href="https://agents.md/">开放标准</a>。如果你的项目已经在使用 <code>AGENTS.md</code>,AtomCode 会自动识别,无需额外配置。查找顺序如下:</p>
       <ol>
         <li><code>.atomcode.md</code></li>
@@ -143,7 +143,7 @@ Tailwind 做样式、Vitest 做单元测试。
       </ul>
       <p>这些文件互不冲突。使用 <code>AGENTS.md</code> 可以让遵循该开放标准的多种 AI 编程工具共享同一份指令文件,避免重复维护。</p>
 
-      <h2>下一步</h2>
+      <h2 id="下一步">下一步</h2>
       <ul>
         <li><a href="./skills.html">Skills 扩展</a> —— 把可复用流程进一步抽象成命令</li>
       </ul>

@@ -76,34 +76,64 @@ function getMain(html) {
   return m ? m[1] : html;
 }
 
-// Parse main content into ordered chunks: heading + plain-text body until
-// the next heading. We treat h1 as the page title (separately) but also
-// include it as the first section so searches matching the title hit it.
-function parseSections(mainHtml) {
-  const sections = [];
+// Collect ordered h1–h3 headings from the main content, assigning each a stable
+// anchor id: an existing `id=""` wins; otherwise `slugify(headingText)`,
+// de-duplicated within the page (`-2`, `-3`, …) so the anchors are valid HTML.
+// The SAME ids feed both the search index (`sectionsOf`) and the id injected
+// back into the HTML (`injectHeadingIds`), so a search hit's `#id` always
+// resolves to a real element on the page.
+function collectHeadings(mainHtml) {
   const re = /<(h[1-3])\b([^>]*)>([\s\S]*?)<\/\1>/gi;
   const heads = [];
+  const used = new Set();
   let m;
   while ((m = re.exec(mainHtml)) !== null) {
+    const raw = m[0];
+    const headingText = toText(m[3]);
+    const existing = attr(raw, 'id');
+    let id = existing || slugify(headingText);
+    let base = id, n = 2;
+    while (used.has(id)) id = `${base}-${n++}`;
+    used.add(id);
     heads.push({
       tag: m[1].toLowerCase(),
       attrs: m[2],
-      raw: m[0],
-      start: m.index,
-      end: m.index + m[0].length,
       headingHtml: m[3],
+      start: m.index,
+      end: m.index + raw.length,
+      headingText,
+      id,
+      hadId: !!existing,
     });
   }
-  for (let i = 0; i < heads.length; i++) {
-    const h = heads[i];
-    const headingText = toText(h.headingHtml);
-    const id = attr(h.raw, 'id') || slugify(headingText);
-    const bodyStart = h.end;
-    const bodyEnd   = i + 1 < heads.length ? heads[i + 1].start : mainHtml.length;
-    const body      = toText(mainHtml.slice(bodyStart, bodyEnd));
-    sections.push({ id, heading: headingText, body });
+  return heads;
+}
+
+// Search-index sections: heading + plain-text body until the next heading. h1
+// (the page title) is included so title-matching searches hit its section.
+function sectionsOf(heads, mainHtml) {
+  return heads.map((h, i) => ({
+    id: h.id,
+    heading: h.headingText,
+    body: toText(mainHtml.slice(h.end, i + 1 < heads.length ? heads[i + 1].start : mainHtml.length)),
+  }));
+}
+
+// Rewrite the main content so every heading that lacked an id carries the id
+// assigned above — this is what makes `#<id>` search links actually scroll.
+// Headings that already had an id are left byte-for-byte unchanged.
+function injectHeadingIds(mainHtml, heads) {
+  let out = '';
+  let last = 0;
+  for (const h of heads) {
+    out += mainHtml.slice(last, h.start);
+    out += h.hadId
+      ? mainHtml.slice(h.start, h.end)
+      : `<${h.tag}${h.attrs} id="${h.id}">${h.headingHtml}</${h.tag}>`;
+    last = h.end;
   }
-  return sections;
+  out += mainHtml.slice(last);
+  return out;
 }
 
 function extractTitle(html) {
@@ -138,27 +168,38 @@ async function buildOne(lang) {
   });
 
   const out = [];
+  let injectedFiles = 0;
   for (const file of files) {
     const slug = file.replace(/\.html$/, '');
     if (!orderedSlugs.includes(slug)) {
       console.warn(`[search-index] ${lang}/ skip ungrouped: ${file}`);
       continue;
     }
-    const html = await fs.readFile(path.join(dir, file), 'utf8');
+    const filePath = path.join(dir, file);
+    const html = await fs.readFile(filePath, 'utf8');
     const main = getMain(html);
+    const heads = collectHeadings(main);
+    // Write missing anchor ids back into the HTML so search `#id` links resolve.
+    // Function replacement avoids `$` in the new HTML being treated as a
+    // back-reference; `main` is a unique region so only that occurrence changes.
+    const newMain = injectHeadingIds(main, heads);
+    if (newMain !== main) {
+      await fs.writeFile(filePath, html.replace(main, () => newMain));
+      injectedFiles++;
+    }
     out.push({
       slug,
       title:    extractTitle(html) || slug,
       group:    groupOf(slug),
       lede:     extractLede(main),
-      sections: parseSections(main),
+      sections: sectionsOf(heads, main),
     });
   }
 
   const outFile = path.join(DOCS_DIR, `search-index.${lang}.json`);
   await fs.writeFile(outFile, JSON.stringify(out));
   const bytes = (await fs.stat(outFile)).size;
-  console.log(`[search-index] ${lang}: ${out.length} pages, ${(bytes/1024).toFixed(1)} KB → ${path.relative(process.cwd(), outFile)}`);
+  console.log(`[search-index] ${lang}: ${out.length} pages, ${(bytes/1024).toFixed(1)} KB, injected ids into ${injectedFiles} page(s) → ${path.relative(process.cwd(), outFile)}`);
 }
 
 async function build() {

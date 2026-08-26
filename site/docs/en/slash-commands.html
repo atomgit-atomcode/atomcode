@@ -75,10 +75,10 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>Slash Commands</h1>
+<h1 id="slash-commands">Slash Commands</h1>
       <p class="lede">Start an input with <code>/</code> in the TUI to trigger a command and get an autocomplete menu. The 50+ built-in commands are organised below; commands loaded from Skills and Plugins also appear in the menu automatically.</p>
 
-      <h2>Core</h2>
+      <h2 id="core">Core</h2>
       <table>
         <thead>
           <tr><th>Command</th><th>Purpose</th></tr>
@@ -96,7 +96,7 @@
         </tbody>
       </table>
 
-      <h2>Tools &amp; utilities</h2>
+      <h2 id="tools-utilities">Tools &amp; utilities</h2>
       <table>
         <thead>
           <tr><th>Command</th><th>Purpose</th></tr>
@@ -131,7 +131,7 @@
         <p>You don't have to wait for a turn to finish to check on things: <code>/status</code>, <code>/diff</code>, <code>/cost</code>, <code>/usage</code>, and <code>/rename</code> run even while the agent is streaming. They render as a transient panel below the input box (press <kbd>Esc</kbd> to dismiss) without interrupting the running turn. <code>/usage</code> mid-turn is also tab-switchable across its Current / Overview / Models views.</p>
       </div>
 
-      <h2>Conversation modes &amp; thinking</h2>
+      <h2 id="conversation-modes-thinking">Conversation modes &amp; thinking</h2>
       <table>
         <thead>
           <tr><th>Command</th><th>Purpose</th></tr>
@@ -149,7 +149,7 @@
         </tbody>
       </table>
 
-      <h2>Persistent memory</h2>
+      <h2 id="persistent-memory">Persistent memory</h2>
       <table>
         <thead>
           <tr><th>Command</th><th>Purpose</th></tr>
@@ -163,7 +163,7 @@
       </table>
       <p>Full usage and best practices at <a href="./memory.html">Persistent Memory</a>.</p>
 
-      <h2>Extension ecosystem</h2>
+      <h2 id="extension-ecosystem">Extension ecosystem</h2>
       <table>
         <thead>
           <tr><th>Command</th><th>Purpose</th></tr>
@@ -184,7 +184,7 @@
       <pre><code>/plugin marketplace add https://atomgit.com/atomgit_atomcode/AtomCode-Channel
 /plugin install weixin@atomcode-channel</code></pre>
 
-      <h2>MCP integration</h2>
+      <h2 id="mcp-integration">MCP integration</h2>
       <table>
         <thead>
           <tr><th>Command</th><th>Purpose</th></tr>
@@ -197,7 +197,7 @@
       </table>
       <p>Full configuration and usage at <a href="./mcp.html">MCP Integration</a>.</p>
 
-      <h2>Web UI &amp; sync</h2>
+      <h2 id="web-ui-sync">Web UI &amp; sync</h2>
       <table>
         <thead>
           <tr><th>Command</th><th>What it does</th></tr>
@@ -214,7 +214,7 @@
       </table>
       <p>More in <a href="./webui.html">Web UI</a> and the <a href="./webui-remote-access.html">Remote Access</a> guide.</p>
 
-      <h2>Config &amp; help</h2>
+      <h2 id="config-help">Config &amp; help</h2>
       <table>
         <thead>
           <tr><th>Command</th><th>Purpose</th></tr>
@@ -236,7 +236,7 @@
         </tbody>
       </table>
 
-      <h2>Tips</h2>
+      <h2 id="tips">Tips</h2>
       <ul>
         <li><strong>Autocomplete</strong> — typing <code>/</code> pops up the menu immediately; use <code>↑↓</code> to navigate, <code>Tab</code> / <code>Enter</code> to confirm.</li>
         <li><strong>Fuzzy match</strong> — completion supports substring matching, e.g. <code>/prov</code> hits <code>/provider</code>.</li>
@@ -244,9 +244,9 @@
         <li><strong>Skills appear in the menu</strong> — once you add your own commands under <a href="./skills.html">Skills</a>, they show up in the menu in the same format.</li>
       </ul>
 
-      <h2>Typical workflows</h2>
+      <h2 id="typical-workflows">Typical workflows</h2>
 
-      <h3>First launch — one-click onboarding</h3>
+      <h3 id="first-launch-one-click-onboarding">First launch — one-click onboarding</h3>
       <pre><code>&gt; /login
   ✔ Logged in as alice (alice, alice@example.com)
   ✔ CodingPlan claimed — CodingPlan Lite · expires 2026-05-22 (29d / 30d)
@@ -254,7 +254,7 @@
   ✔ Default provider set to AtomGit-GLM
 &gt; hello</code></pre>
 
-      <h3>Check token usage before wrapping up</h3>
+      <h3 id="check-token-usage-before-wrapping-up">Check token usage before wrapping up</h3>
       <pre><code>&gt; refactor src/db to use a connection pool
 ... (AI works)
 &gt; /cost
@@ -264,7 +264,7 @@ AtomGit · deepseek-v4-flash
   Cached tokens:     5080 (70% hit rate)
   Total tokens:      8342</code></pre>
 
-      <h3>Rewind and re-ask when the answer goes sideways</h3>
+      <h3 id="rewind-and-re-ask-when-the-answer-goes-sideways">Rewind and re-ask when the answer goes sideways</h3>
       <pre><code>&gt; add JSDoc to every function
 ... (the reply went off the rails)
 &gt; /undo
@@ -272,12 +272,12 @@ Rolled back to turn 3 of 3.
 ⚠ Only conversation memory was rewound; files on disk were not restored. Revert code manually or check /diff.
 (your last prompt is back in the input box — edit and resend)</code></pre>
 
-      <h3>Swap the model when it underperforms</h3>
+      <h3 id="swap-the-model-when-it-underperforms">Swap the model when it underperforms</h3>
       <pre><code>&gt; /model
 &gt; (pick claude-opus-4-6 from the popup)
 &gt; try again — this time preserve existing comments</code></pre>
 
-      <h2>Next steps</h2>
+      <h2 id="next-steps">Next steps</h2>
       <ul>
         <li><a href="./keybindings.html">Keybindings</a> — pair commands with keybindings to double your speed</li>
         <li><a href="./sessions.html">Sessions &amp; Undo</a> — full behaviour of <code>/resume</code>, <code>/undo</code>, <code>/compact</code></li>

@@ -75,20 +75,20 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>Project Instructions</h1>
+<h1 id="project-instructions">Project Instructions</h1>
       <p class="lede">Drop a <code>.atomcode.md</code> in your project root to pin tech-stack details, conventions, and preferences. AtomCode injects it into the system prompt at startup, so you don't have to repeat the rules every conversation.</p>
 
-      <h2>Why bother</h2>
+      <h2 id="why-bother">Why bother</h2>
       <p>A typical scenario: your team uses the Composition API exclusively — Options API is banned. Every time you ask AtomCode to write a new component, you have to remind it. With <code>.atomcode.md</code>, that preference rides along on every conversation automatically.</p>
 
-      <h2>File location</h2>
+      <h2 id="file-location">File location</h2>
       <ul>
         <li>Default path: <code>.atomcode.md</code> at the project root</li>
         <li>AtomCode walks upwards from the current working directory until it finds the file, or hits <code>$HOME</code></li>
         <li>If the file doesn't exist, no related content appears in the system prompt</li>
       </ul>
 
-      <h2>Example</h2>
+      <h2 id="example">Example</h2>
       <pre><code># Project Instructions
 
 This is a Vue 3 + TypeScript project using Pinia for state,
@@ -113,7 +113,7 @@ Tailwind for styles, and Vitest for unit tests.
 - Do not modify `src/generated/*` — it's auto-generated from OpenAPI
 - Test coverage must stay above 80%; new modules must ship with unit tests</code></pre>
 
-      <h2>Tips for writing .atomcode.md</h2>
+      <h2 id="tips-for-writing-atomcodemd">Tips for writing .atomcode.md</h2>
       <ul>
         <li><strong>Only write what's different from the norm</strong> — the model already knows generic best practices; don't repeat them here.</li>
         <li><strong>Prefer commands over descriptions</strong> — "run tests with <code>pnpm test</code>", not "please run the unit tests".</li>
@@ -127,7 +127,7 @@ Tailwind for styles, and Vitest for unit tests.
         <p>If you have repetitive workflows (e.g. the same set of commands every bug fix), don't bloat <code>.atomcode.md</code> — write a <a href="./skills.html">Skill</a> instead. It's clearer and more reusable.</p>
       </div>
 
-      <h2>Relationship to AGENTS.md / CLAUDE.md / GEMINI.md</h2>
+      <h2 id="relationship-to-agentsmd-claudemd-geminimd">Relationship to AGENTS.md / CLAUDE.md / GEMINI.md</h2>
       <p>AtomCode natively supports <code>AGENTS.md</code>, the <a href="https://agents.md/">open standard</a> for AI coding agent context. If you have a project that already uses <code>AGENTS.md</code>, AtomCode will pick it up automatically — no extra setup needed. The lookup order is:</p>
       <ol>
         <li><code>.atomcode.md</code></li>
@@ -143,7 +143,7 @@ Tailwind for styles, and Vitest for unit tests.
       </ul>
       <p>These don't conflict. By using <code>AGENTS.md</code>, you can share the same instruction file across multiple AI coding tools that follow the open standard.</p>
 
-      <h2>Next steps</h2>
+      <h2 id="next-steps">Next steps</h2>
       <ul>
         <li><a href="./skills.html">Skills</a> — abstract reusable workflows into commands</li>
       </ul>

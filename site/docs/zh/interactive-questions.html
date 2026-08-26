@@ -75,7 +75,7 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>交互提问</h1>
+<h1 id="交互提问">交互提问</h1>
       <p class="lede">在真正需要抉择的岔路口——需求含糊、两种可行方案二选一——AtomCode 会停下来向你提一个结构化问题，而不是替你猜。你就地作答，它拿到你的选择后继续。该能力由 <code>request_user_input</code> 工具驱动，<strong>默认开启</strong>。</p>
 
       <div class="callout callout-info">
@@ -83,7 +83,7 @@
         <p><a href="./approvals.html">权限审批</a>问的是「能不能<em>执行某个工具</em>」（跑命令、改文件）；交互提问问的是「<em>你怎么决定</em>」——偏好，或在几种做法之间选一个。两者面板不同、按键不同、含义不同。拒答一个问题从不算错误；拒绝一次审批则会拦下该工具。</p>
       </div>
 
-      <h2>三种提问类型</h2>
+      <h2 id="三种提问类型">三种提问类型</h2>
       <table>
         <thead>
           <tr><th>类型</th><th>行为</th></tr>
@@ -96,7 +96,7 @@
       </table>
       <p>单选和多选还会额外提供一行 <strong>“Other——自己输入答案”</strong>，让你不被限死在给定选项里。只有当模型判定选项已穷尽时才会隐藏该行。</p>
 
-      <h2>在终端里作答</h2>
+      <h2 id="在终端里作答">在终端里作答</h2>
       <table>
         <thead>
           <tr><th>按键</th><th>作用</th></tr>
@@ -113,13 +113,13 @@
       </table>
       <p>单选题一键即可作答（高亮后按 <kbd>Enter</kbd>）；多选题用 <kbd>Enter</kbd>/<kbd>Space</kbd> 勾选各行，只有激活专门的 <strong>Submit</strong> 行才真正提交。</p>
 
-      <h2>一次问多个问题</h2>
+      <h2 id="一次问多个问题">一次问多个问题</h2>
       <p>当同一个抉择点上有不止一个要问的，AtomCode 会把它们（最多四个）合并进一个面板，而不是反复打断你。用 <kbd>Tab</kbd> 在各题间切换，逐一作答，再一次性提交。只有一个问题时的渲染与以前完全一致。</p>
 
-      <h2>在 Web UI 中</h2>
+      <h2 id="在-web-ui-中">在 Web UI 中</h2>
       <p>同样的问题会在 <a href="./webui.html">Web UI</a> 里以 <strong>UserInputCard</strong> 卡片出现：单选按钮、复选框或文本框，以及同样的可选自由文本行。多题会变成一个小步进器——用 <kbd>→</kbd> / <kbd>←</kbd> 按钮前后翻题，最后一个 <strong>Submit</strong> 一次性提交全部答案，<strong>Skip</strong> 则拒答。答案通过实时 SSE 通道回传，所以从浏览器发起的回合会像终端一样暂停、再继续。</p>
 
-      <h2>关闭该功能</h2>
+      <h2 id="关闭该功能">关闭该功能</h2>
       <p>该功能默认开启。若要关闭，启动前设置环境变量：</p>
       <pre><code>ATOMCODE_REQUEST_USER_INPUT=0 atomcode</code></pre>
       <p><code>0</code>、<code>false</code>、<code>off</code> 或空值任一都会关闭；不设置（或其它值）则保持开启。关闭后，AtomCode 不再提问，始终按自己的最佳判断继续。</p>
@@ -128,7 +128,7 @@
         <p>在 <strong>Bypass / 免审批</strong> 模式下，面板会被自动跳过，AtomCode 不等待直接继续。<strong>Build</strong>、<strong>Plan</strong>、<strong>Accept Edits</strong> 模式都会正常展示问题。</p>
       </div>
 
-      <h2>相关</h2>
+      <h2 id="相关">相关</h2>
       <ul>
         <li><a href="./approvals.html">权限审批</a> —— 独立的权限门控系统</li>
         <li><a href="./webui.html">WebUI 界面</a> —— 审批模式与浏览器体验</li>

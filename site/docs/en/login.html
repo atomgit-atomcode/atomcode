@@ -75,10 +75,10 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>Login Methods</h1>
+<h1 id="login-methods">Login Methods</h1>
       <p class="lede">AtomCode supports two ways to connect to an LLM: AtomGit CodingPlan (with free tokens) and traditional API keys. This page helps you pick the right path and walks through the binding.</p>
 
-      <h2>Two methods at a glance</h2>
+      <h2 id="two-methods-at-a-glance">Two methods at a glance</h2>
       <table>
         <thead>
           <tr><th>Method</th><th>Command</th><th>Who it's for</th></tr>
@@ -90,10 +90,10 @@
       </table>
       <p class="callout"><em>As of v4.25.0 <code>/codingplan</code> has been folded into <code>/login</code>; the previous "OAuth-only without claiming tokens" entry has been removed.</em></p>
 
-      <h2>AtomGit CodingPlan (recommended)</h2>
+      <h2 id="atomgit-codingplan-recommended">AtomGit CodingPlan (recommended)</h2>
       <p>AtomGit is the open-source code-hosting platform run by CSDN / OpenAtom Open Source Foundation, and AtomCode natively integrates its OAuth and CodingPlan. <code>/login</code> is the lowest-friction entry point for new users: a single action logs you in → claims free token quota → auto-generates a provider config from the granted model list. After that one command you can start chatting immediately. Re-running it after you're already signed in idempotently re-syncs the model list — no double-claim.</p>
 
-      <h3>CodingPlan tier system</h3>
+      <h3 id="codingplan-tier-system">CodingPlan tier system</h3>
       <p>CodingPlan currently offers three tiers. The system automatically grants the highest tier you're eligible for. Quota is measured on a rolling 5-hour window:</p>
       <table>
         <thead>
@@ -107,7 +107,7 @@
       </table>
       <p>After claiming Pro or above, run <code>/login</code> in AtomCode to sync the updated model list. For details, visit the <a href="https://ai.atomgit.com/serverless-api" target="_blank" rel="noopener">CodingPlan page</a>.</p>
 
-      <h3>From the first-run wizard</h3>
+      <h3 id="from-the-first-run-wizard">From the first-run wizard</h3>
       <ol>
         <li>The first time you run <code>atomcode</code>, the 3-step wizard pops up automatically.</li>
         <li>Step 1 (welcome): press Enter. Step 2 (language): press <code>1</code> / <code>2</code> / <code>3</code> to pick.</li>
@@ -117,37 +117,37 @@
       </ol>
       <p>If you skipped earlier and want to redo the wizard, run <code>/welcome</code> any time.</p>
 
-      <h3>From an existing session</h3>
+      <h3 id="from-an-existing-session">From an existing session</h3>
       <p>Once inside the TUI, run:</p>
       <pre><code>/login</code></pre>
       <p>The browser opens to complete authorization, claim CodingPlan, and refresh the provider list. Running it again re-syncs the model list — the local <code>AtomGit*</code> providers are updated to the latest entitled models.</p>
 
-      <h3>From the command line</h3>
+      <h3 id="from-the-command-line">From the command line</h3>
       <pre><code>atomcode login</code></pre>
       <p>Useful in scripts, remote servers, or container images for a one-shot setup. The CLI subcommand and the TUI <code>/login</code> share the same flow and emit the same report. <em>Note: <code>atomcode codingplan</code> is kept as a hidden alias so existing scripts and muscle memory don't break after the fold.</em></p>
 
-      <h3>Check status / log out</h3>
+      <h3 id="check-status-log-out">Check status / log out</h3>
       <pre><code>atomcode status     # or /status in the TUI — includes CodingPlan usage and expiry
 atomcode logout     # or /logout in the TUI — clears the OAuth token</code></pre>
 
-      <h2>API key method</h2>
+      <h2 id="api-key-method">API key method</h2>
       <p>To use your own OpenAI / Claude / DeepSeek / GLM key, there are three ways:</p>
 
-      <h3>Option A: <code>/provider</code> in the TUI</h3>
+      <h3 id="option-a-provider-in-the-tui">Option A: <code>/provider</code> in the TUI</h3>
       <ol>
         <li>Type <code>/provider</code> in the TUI.</li>
         <li>Choose a vendor preset or a custom account, enter its API key, then add one or more models under that account.</li>
         <li>The configuration is written back to <code>~/.atomcode/config.toml</code>.</li>
       </ol>
 
-      <h3>Option B: hand-edit the config file</h3>
+      <h3 id="option-b-hand-edit-the-config-file">Option B: hand-edit the config file</h3>
       <p>Edit <code>~/.atomcode/config.toml</code> directly and add a <code>[providers.*]</code> entry; see <a href="./configuration.html#provider-config">ProviderConfig fields</a>.</p>
 
-      <h3>Option C: one-shot CLI override</h3>
+      <h3 id="option-c-one-shot-cli-override">Option C: one-shot CLI override</h3>
       <p>Don't want to touch the config file and only need a different provider for one run? Add flags at launch:</p>
       <pre><code>atomcode --provider deepseek --model deepseek-reasoner</code></pre>
 
-      <h2>Which one should I pick?</h2>
+      <h2 id="which-one-should-i-pick">Which one should I pick?</h2>
       <ul>
         <li>First-time user &rarr; <strong>CodingPlan</strong> (<code>/login</code>) — free tokens, just use it.</li>
         <li>Already have your own API key &rarr; skip <code>/login</code> and use the <strong>API key</strong> path (<code>/provider</code> or hand-edit config). If you later need the built-in AtomGit repository, PR, or Issue tools, run <code>/login</code> to authorize them; this also claims CodingPlan and registers <code>AtomGit-*</code> providers.</li>
@@ -155,7 +155,7 @@ atomcode logout     # or /logout in the TUI — clears the OAuth token</code></p
         <li>Fully offline &rarr; configure an <strong>Ollama</strong> provider — no login required.</li>
       </ul>
 
-      <h2>Next steps</h2>
+      <h2 id="next-steps">Next steps</h2>
       <ul>
         <li><a href="./basic-usage.html">Basic Usage</a> — first thing after logging in: learn how to phrase tasks.</li>
         <li><a href="./slash-commands.html">Slash Commands</a> — <code>/provider</code>, <code>/model</code>, <code>/status</code> in detail.</li>

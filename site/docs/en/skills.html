@@ -75,17 +75,17 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>Skills</h1>
+<h1 id="skills">Skills</h1>
       <p class="lede">A skill is a user-defined, reusable command — basically a chunk of markdown with frontmatter telling the AI "here's how to handle this kind of task". Once you've written one, it shows up alongside the built-in slash commands in the menu, or can be invoked on-demand by the <code>use_skill</code> tool.</p>
 
-      <h2>What skills are good for</h2>
+      <h2 id="what-skills-are-good-for">What skills are good for</h2>
       <ul>
         <li>Codifying frequent workflows: <em>cutting a release, writing a changelog, running regression tests, generating weekly reports…</em></li>
         <li>Wrapping complex tasks that need step-by-step guidance: <em>refactor playbooks, bug root-cause analysis, performance tuning</em></li>
         <li>Making the model follow your defined steps and validation rules on a specific topic</li>
       </ul>
 
-      <h2>Skill file layout</h2>
+      <h2 id="skill-file-layout">Skill file layout</h2>
       <p>A skill is usually a directory containing at least a <code>SKILL.md</code>:</p>
       <pre><code>my-skills/
 ├── release/
@@ -122,7 +122,7 @@ When the user says "ship a new version", "cut a release", or "tag it".
 - Never skip tests — fix any failure first.
 - If publish fails, roll back the local tag and changelog edits.</code></pre>
 
-      <h2>Skill directories</h2>
+      <h2 id="skill-directories">Skill directories</h2>
       <p>AtomCode loads skills from a few well-known locations:</p>
       <ul>
         <li><strong>Global</strong>: <code>~/.atomcode/skills/</code></li>
@@ -130,22 +130,22 @@ When the user says "ship a new version", "cut a release", or "tag it".
       </ul>
       <p>Project-level skills override same-named globals, so you can define the same name with different flows per project.</p>
 
-      <h2>Invocation</h2>
+      <h2 id="invocation">Invocation</h2>
 
-      <h3>Via slash command</h3>
+      <h3 id="via-slash-command">Via slash command</h3>
       <p>Every successfully loaded skill appears in the slash-command completion menu:</p>
       <pre><code>&gt; /release
 &gt; /write-changelog
 &gt; /debug-flaky-test</code></pre>
 
-      <h3>Via the <code>$</code> menu</h3>
+      <h3 id="via-the-menu">Via the <code>$</code> menu</h3>
       <p>Type a <code>$</code> at the start of the input box to pop up a skills menu (the same set of invocable skills that <code>/skills</code> lists); keep typing to filter, press <code>Tab</code> to complete the highlighted name, and submit <code>$&lt;name&gt; [args]</code> to invoke that skill. It's a parallel entry point to slash commands: <code>/</code> drives slash-command completion, while <code>$</code> is dedicated to picking a skill and can carry arguments inline, e.g. <code>$brainstorming help me design login</code>.</p>
       <p>In v5.0.3, <code>/skills</code> can match several skill names or fragments in one request and echoes the skills that were actually loaded. Newly installed skills are refreshed automatically, so a restart is normally unnecessary.</p>
 
-      <h3>Model-driven invocation</h3>
+      <h3 id="model-driven-invocation">Model-driven invocation</h3>
       <p>The model can call the <code>use_skill</code> tool itself to run a relevant skill as a sub-flow. If you say "publish a new version", the model may pick this skill on its own without you typing <code>/release</code>.</p>
 
-      <h2>Tips for writing a good skill</h2>
+      <h2 id="tips-for-writing-a-good-skill">Tips for writing a good skill</h2>
       <ul>
         <li><strong>Be specific in the description</strong> — it's the menu's blurb, and the main signal the model uses to decide whether this skill applies.</li>
         <li><strong>Order matters</strong> — the model reads top-to-bottom; put strong dependencies up front.</li>
@@ -166,7 +166,7 @@ When the user says "ship a new version", "cut a release", or "tag it".
         </tbody>
       </table>
 
-      <h2>Next steps</h2>
+      <h2 id="next-steps">Next steps</h2>
       <ul>
         <li><a href="./basic-usage.html">Basic Usage</a> — back to everyday workflows</li>
         <li><a href="./faq.html">FAQ</a> — why isn't my skill showing up in the menu?</li>

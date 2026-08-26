@@ -75,10 +75,10 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>永久记忆</h1>
+<h1 id="永久记忆">永久记忆</h1>
       <p class="lede">用 <code>/remember</code> 把零碎的偏好、约定、命令记下来,AtomCode 会在每一轮对话的系统提示里把它们带给模型。和 <a href="./project-instructions.html"><code>.atomcode.md</code> 项目指令文件</a> 互补:指令文件适合写整篇规范,记忆适合积累那些"突然想起来该告诉它"的零散事实。</p>
 
-      <h2>命令总览</h2>
+      <h2 id="命令总览">命令总览</h2>
       <table>
         <thead>
           <tr><th>命令</th><th>作用</th></tr>
@@ -91,7 +91,7 @@
         </tbody>
       </table>
 
-      <h2>存储位置</h2>
+      <h2 id="存储位置">存储位置</h2>
       <table>
         <thead>
           <tr><th>作用域</th><th>路径</th></tr>
@@ -103,7 +103,7 @@
       </table>
       <p>格式是普通 Markdown,每行一条 <code>- </code> 开头的列表项。可以用 <code>/remember</code> 也可以直接手编辑——AtomCode 在下一轮会重新读取。<strong>非 <code>- </code> 开头的行会被忽略</strong>,所以可以加注释、空行、标题分组,记忆条目本身不受影响。</p>
 
-      <h2>模型怎么"用"这些记忆</h2>
+      <h2 id="模型怎么用这些记忆">模型怎么"用"这些记忆</h2>
       <p>会话启动时,AtomCode 会通过 coding runtime 的 memory hook 合并<strong>全局 + 项目记忆</strong>(<code>crates/atomcode-coding/src/parts.rs</code>),格式如下:</p>
       <pre><code>=== MEMORY ===
 The user has asked you to remember these facts and preferences:
@@ -117,7 +117,7 @@ The user has asked you to remember these facts and preferences:
 - CI 失败时先看 .github/workflows/ci.yml 第 78-92 行</code></pre>
       <p>模型每个 turn 都能看到这块。<strong>没有"语义检索"或"按需召回"</strong>——是无条件全量注入,所以记忆条目越多,每个 turn 消耗的 token 越多。务必删除过时的条目,保持精简。</p>
 
-      <h2>容量限制</h2>
+      <h2 id="容量限制">容量限制</h2>
       <table>
         <thead>
           <tr><th>限制</th><th>数值</th><th>触发后行为</th></tr>
@@ -129,26 +129,26 @@ The user has asked you to remember these facts and preferences:
       </table>
       <p>到上限就用 <code>/forget</code> 清理,把最近不再相关的条目删掉。</p>
 
-      <h2>使用建议</h2>
+      <h2 id="使用建议">使用建议</h2>
 
-      <h3>1. 项目特定的命令、约定、坑(项目级)</h3>
+      <h3 id="1-项目特定的命令约定坑项目级">1. 项目特定的命令、约定、坑(项目级)</h3>
       <pre><code>&gt; /remember 用 npm run check 跑类型检查(不是 npm run typecheck)
 &gt; /remember CI 失败时先看 .github/workflows/ci.yml 第 78-92 行
 &gt; /remember 这个 repo 严禁用 sed -i 改文件(macOS/Linux 行为不一致)
 &gt; /remember 数据库迁移 SQL 必须先在 staging 跑过才能上 main</code></pre>
 
-      <h3>2. 全局编码偏好、工作流(全局)</h3>
+      <h3 id="2-全局编码偏好工作流全局">2. 全局编码偏好、工作流(全局)</h3>
       <pre><code>&gt; /remember --global 改完代码先跑测试再 commit
 &gt; /remember --global 不要主动 git push,让我手动确认
 &gt; /remember --global 中文回复,但 commit message 用英文
 &gt; /remember --global 优先编辑现有文件,不要擅自创建文档(*.md)</code></pre>
 
-      <h3>3. 个人或团队信息(全局)</h3>
+      <h3 id="3-个人或团队信息全局">3. 个人或团队信息(全局)</h3>
       <pre><code>&gt; /remember --global 我的 GitHub 用户名是 alice
 &gt; /remember --global 默认时区 Asia/Shanghai
 &gt; /remember --global 团队 standup 是周一周三周五 9:30</code></pre>
 
-      <h3>4. 清理过时记忆</h3>
+      <h3 id="4-清理过时记忆">4. 清理过时记忆</h3>
       <pre><code>&gt; /forget npm run check
   [project] - 用 npm run check 跑类型检查(不是 npm run typecheck)
   (removed 1 matching entry)
@@ -160,7 +160,7 @@ The user has asked you to remember these facts and preferences:
   [Project] (/Users/alice/code/myrepo/.atomcode/memory.md)
     - CI 失败时先看 .github/workflows/ci.yml 第 78-92 行</code></pre>
 
-      <h2>记忆 vs 项目指令文件 vs 会话历史</h2>
+      <h2 id="记忆-vs-项目指令文件-vs-会话历史">记忆 vs 项目指令文件 vs 会话历史</h2>
       <p>AtomCode 提供了三种持久化"上下文"的方式,各自定位不同:</p>
       <table>
         <thead>
@@ -182,7 +182,7 @@ The user has asked you to remember these facts and preferences:
       </ul>
       <p>关于 <code>.atomcode/memory.md</code> 是否提交进 git:如果团队都用 AtomCode 且记忆是项目知识(如踩过的坑、约定),可以提交;如果是个人开发笔记,可以加进 <code>.gitignore</code>。</p>
 
-      <h2>下一步</h2>
+      <h2 id="下一步">下一步</h2>
       <ul>
         <li><a href="./project-instructions.html">项目指令文件</a> —— 整篇规范的最佳入口</li>
         <li><a href="./slash-commands.html">斜杠命令</a> —— 完整命令参考</li>

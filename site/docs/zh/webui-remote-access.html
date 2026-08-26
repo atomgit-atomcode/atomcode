@@ -75,10 +75,10 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>远程访问指南</h1>
+<h1 id="远程访问指南">远程访问指南</h1>
       <p class="lede">AtomCode 的 webui 默认只监听本机回环地址（<code>127.0.0.1</code>），手机等其他设备访问不到。借助<strong>蒲公英（Oray PGY）</strong>组建的虚拟局域网，你可以在不暴露公网、无需公网 IP 的前提下，从手机/平板安全地打开本机 webui。本页讲解完整的连接流程与安全须知。</p>
 
-      <h2>工作原理</h2>
+      <h2 id="工作原理">工作原理</h2>
       <p>蒲公英是一个异地组网工具：在本机和手机上安装并登录<strong>同一账号</strong>、加入<strong>同一网络</strong>后，两台设备就处在同一个虚拟局域网里，彼此可以用一个 <code>蒲公英虚拟 IP</code> 直接通信。webui 只要绑定到这个虚拟 IP，手机就能通过它访问。整个链路是点对点的私有网络，<strong>不会把你的本机暴露到公网</strong>。</p>
 
       <div class="callout callout-warn">
@@ -86,24 +86,24 @@
         <p>webui / daemon 没有内置鉴权，访问者相当于拿到本机所有工具的执行权（包括 <code>bash</code>、<code>write</code>、<code>edit</code>）。所以请<strong>不要</strong>用 <code>--host 0.0.0.0</code> 把它直接暴露到公网或开放局域网。蒲公英虚拟局域网 + 一次性访问令牌（token），是为普通用户准备的安全远程方案。</p>
       </div>
 
-      <h2>前置条件</h2>
+      <h2 id="前置条件">前置条件</h2>
       <ul>
         <li>本机已经能正常启动 AtomCode 的 webui。</li>
         <li>本机与手机都安装了<strong>蒲公英</strong>客户端：<a href="https://pgy.oray.com" target="_blank" rel="noopener">https://pgy.oray.com</a>。</li>
         <li>两台设备登录<strong>同一蒲公英账号</strong>，并加入<strong>同一网络</strong>。</li>
       </ul>
 
-      <h2>操作步骤</h2>
+      <h2 id="操作步骤">操作步骤</h2>
 
-      <h3>1. 连接蒲公英，拿到虚拟 IP</h3>
+      <h3 id="1-连接蒲公英拿到虚拟-ip">1. 连接蒲公英，拿到虚拟 IP</h3>
       <p>在本机的蒲公英客户端里完成登录与组网，记下分配给本机的<strong>虚拟 IP</strong>（形如 <code>10.x.x.x</code>）。手机端同样登录同一账号、加入同一网络即可，无需记 IP。</p>
 
-      <h3>2. 让 webui 绑定到虚拟 IP</h3>
+      <h3 id="2-让-webui-绑定到虚拟-ip">2. 让 webui 绑定到虚拟 IP</h3>
       <p>默认 webui 只绑回环地址，手机访问不到。在 AtomCode 的 TUI 里用 <code>--host</code> 指定蒲公英虚拟 IP 重新启动 webui：</p>
       <pre><code>/webui --host 10.x.x.x</code></pre>
       <p>把 <code>10.x.x.x</code> 换成上一步记下的本机虚拟 IP。绑定成功后，webui 就会在这个地址上对同一虚拟局域网内的设备开放。</p>
 
-      <h3>3. 在「远程访问」面板扫码连接</h3>
+      <h3 id="3-在远程访问面板扫码连接">3. 在「远程访问」面板扫码连接</h3>
       <p>打开 webui 右上角的<strong>远程访问</strong>（手机图标）面板，AtomCode 会自动检测蒲公英状态并生成：</p>
       <ul>
         <li>一个可直接打开的<strong>远程地址</strong>（已带上访问令牌）；</li>
@@ -116,7 +116,7 @@
         <p>远程地址中带有一次性访问令牌（<code>?token=…</code>），<strong>等同于密码</strong>：任何拿到这条完整链接的人都能操作你的本机。请勿把它发到群里、截图外传或贴到公开页面。</p>
       </div>
 
-      <h2>排错</h2>
+      <h2 id="排错">排错</h2>
       <p>「远程访问」面板会根据检测结果给出不同提示，对应处理如下：</p>
       <table>
         <thead>
@@ -146,7 +146,7 @@
         </tbody>
       </table>
 
-      <h2>下一步</h2>
+      <h2 id="下一步">下一步</h2>
       <ul>
         <li><a href="./headless-daemon.html">Headless 与 Daemon</a> —— 了解 webui 背后的 daemon 与 HTTP/SSE 接口</li>
         <li><a href="./faq.html">常见问题</a> —— 远程 / 登录相关的常见坑</li>
