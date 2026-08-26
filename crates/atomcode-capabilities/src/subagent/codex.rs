@@ -549,4 +549,93 @@ exit 0
         let res = backend.run(run).await.unwrap();
         assert_eq!(res.stop_reason, SubagentStopReason::Cancelled);
     }
+
+    // Stub that reads its stdin (the prompt) and echoes it into the `-o` final
+    // answer. Verifies the end-to-end path: prompt is delivered on stdin (NOT an
+    // argv flag — so it can't be mis-parsed as a flag or show up in `ps`), and
+    // the `-o` file is the authoritative final answer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_sends_prompt_on_stdin_and_uses_output_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("codex-stdin.sh");
+        std::fs::write(
+            &stub,
+            r#"#!/bin/sh
+# Locate the -o path, then write stdin into it.
+out=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-o" ]; then shift; out="$1"; fi
+  shift
+done
+cat > "$out"
+exit 0
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backend = CodexBackend::new("codex-stdin", PermissionMode::ReadOnly)
+            .with_program(&stub)
+            .with_timeout(Duration::from_secs(10));
+
+        let prompt = "list all .rs files and summarize each";
+        let res = backend
+            .run(SubagentRun::new(prompt, dir.path()))
+            .await
+            .unwrap();
+        assert_eq!(res.stop_reason, SubagentStopReason::Completed);
+        // The exact prompt bytes round-tripped through stdin into the answer.
+        assert_eq!(res.output, prompt);
+    }
+
+    // Model override flows through as `-m <model>`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_passes_model_override_to_codex() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("codex-model.sh");
+        // Record every argv into a temp file, then copy that into -o so the
+        // test can assert the full argv. We use a side channel file because
+        // `-o`'s value is consumed by the option parser and must not also be
+        // treated as the output capture here.
+        let capture = dir.path().join("argv.txt");
+        let capture_path = capture.clone();
+        std::fs::write(
+            &stub,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$@" > "{cap}"
+out=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-o" ]; then shift; out="$1"; fi
+  shift
+done
+cp "{cap}" "$out"
+exit 0
+"#,
+                cap = capture_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backend = CodexBackend::new("codex-model", PermissionMode::ReadOnly)
+            .with_program(&stub)
+            .with_model("gpt-5-codex")
+            .with_timeout(Duration::from_secs(10));
+
+        let res = backend
+            .run(SubagentRun::new("x", dir.path()))
+            .await
+            .unwrap();
+        assert_eq!(res.stop_reason, SubagentStopReason::Completed);
+        assert!(
+            res.output.contains("-m") && res.output.contains("gpt-5-codex"),
+            "expected -m flag with model in argv, got: {:?}",
+            res.output
+        );
+    }
 }
