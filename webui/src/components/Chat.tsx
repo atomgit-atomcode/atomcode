@@ -27,7 +27,7 @@
 
 import { VNode } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postCommand, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, searchFiles, changeDir, postConfigReload, postCommand, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -575,6 +575,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const [atIndex, setAtIndex] = useState(0);
   const [atItems, setAtItems] = useState<{ name: string; is_dir: boolean }[]>([]);
   const [atLoading, setAtLoading] = useState(false);
+  // Cross-level `@`-mention search results (recursive, gitignore-aware) from
+  // `/fs/search`. Populated only when the token has a filter word; drill-down
+  // (empty filter) keeps using `atItems` from `/fs/list`. `path` is the full
+  // scope-prefixed relative/absolute path, forward-slashed, dirs suffixed `/`.
+  const [atSearchItems, setAtSearchItems] = useState<{ path: string; is_dir: boolean }[]>([]);
+  // The `@` token these results belong to. Comparing it to the live `atQuery`
+  // tells us whether `atSearchItems` is stale (results not yet in for the current
+  // keystroke) — that derived "stale" flag drives the loading state, so there is
+  // NO separate search-loading boolean to get wedged, and no one-frame flash of a
+  // previous query's rows before the debounced fetch lands.
+  const [atSearchFor, setAtSearchFor] = useState<string | null>(null);
   const [sync, setSync] = useState<boolean>(() => {
     try { return new URLSearchParams(location.search).get('sync') === '1'; } catch { return false; }
   });
@@ -1094,8 +1105,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         : cwd.replace(/\/+$/, '') + '/' + atDirPart;
 
   // 目录变化（cwd 切换 / 进入子目录）时重新拉取；仅过滤词变化不触发。后端会 canonicalize `..`。
+  // 有过滤词时是搜索模式（下方 effect 负责），这里跳过，省掉一次用不到的 /fs/list 请求。
   useEffect(() => {
-    if (!atOpen) return;
+    if (!atOpen || atFilter !== '') return;
     let cancelled = false;
     setAtLoading(true);
     listDir(atTargetDir)
@@ -1112,12 +1124,48 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     return () => { cancelled = true; };
   }, [atOpen, atTargetDir]);
 
-  // 菜单可见行：进入子目录后首行为「..」返回上级（仅无过滤词时展示）；其余按过滤词前缀匹配。
-  const atRows: { name: string; is_dir: boolean; up?: boolean }[] = [];
-  if (atDirPart && atFilter === '') atRows.push({ name: '..', is_dir: true, up: true });
-  for (const it of atItems) {
-    if (it.name.toLowerCase().startsWith(atFilter.toLowerCase())) atRows.push(it);
+  // 有过滤词时改走 /fs/search：递归、gitignore 感知、跨层子串匹配（对齐 CLI 的 @ 弹窗），
+  // 而不是只在单层目录里前缀匹配。debounce 150ms + AbortController 取消在途请求，避免每次
+  // 按键都递归走一遍大仓。无过滤词（或以 / 结尾下钻）仍用上面的 listDir 逐级浏览。
+  //
+  // 搜索根用 atTargetDir（= cwd + 作用域段，且支持绝对/`~` 路径，与下钻一致），只把过滤词
+  // 发给后端；返回的路径相对该根，故补回作用域前缀 atDirPart 才是完整可插入的相对/绝对路径。
+  // 这样 `@/etc/host`、`@~/proj/foo` 这类绝对作用域也能搜（否则固定根在 cwd 会永远搜不到）。
+  useEffect(() => {
+    if (!atOpen || atFilter === '') return;
+    let aborted = false;
+    const controller = new AbortController();
+    const scopePrefix = atDirPart; // 该次搜索所属的作用域，落定于发起时刻
+    const forQuery = atQuery;      // 结果归属的 token；到货时记为已就绪
+    const timer = window.setTimeout(() => {
+      searchFiles(atTargetDir, atFilter, controller.signal)
+        .then((r) => {
+          if (aborted) return;
+          setAtSearchItems(
+            (r.matches || []).map((m) => ({ path: scopePrefix + m.path, is_dir: m.is_dir })),
+          );
+          setAtSearchFor(forQuery);
+        })
+        .catch(() => { if (!aborted) { setAtSearchItems([]); setAtSearchFor(forQuery); } });
+    }, 150);
+    return () => { aborted = true; controller.abort(); window.clearTimeout(timer); };
+  }, [atOpen, atTargetDir, atFilter]);
+
+  // 菜单可见行。两种模式：
+  //  · 搜索模式（有过滤词）：展示 /fs/search 的跨层结果，`path` 已是补好作用域前缀的完整
+  //    相对/绝对路径，`full` 让 chooseAtRow 直接整体插入（不再拼 atDirPart）。
+  //  · 下钻模式（无过滤词）：进入子目录后首行「..」返回上级；其余是该层内容。
+  const searchMode = atFilter !== '';
+  const atRows: { name: string; is_dir: boolean; up?: boolean; full?: string }[] = [];
+  if (searchMode) {
+    for (const m of atSearchItems) atRows.push({ name: m.path, is_dir: m.is_dir, full: m.path });
+  } else {
+    if (atDirPart) atRows.push({ name: '..', is_dir: true, up: true });
+    for (const it of atItems) atRows.push(it);
   }
+  // 搜索结果尚未对上当前 token（首次进入 / 键入中，debounce+请求在途）即视为加载中，避免
+  // 闪现上一次 query 的旧结果或过早的 "No files found"。下钻模式沿用 listDir 的 atLoading。
+  const atMenuLoading = searchMode ? atSearchFor !== atQuery : atLoading;
 
   useEffect(() => {
     if (!atOpen) return;
@@ -2783,7 +2831,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     setInput(next.text);
     setAtOpen(next.keepOpen);
     setAtQuery(next.query);
-    if (next.keepOpen) setAtItems([]);
+    if (next.keepOpen) { setAtItems([]); setAtSearchItems([]); setAtSearchFor(null); }
     setAtIndex(0);
     requestAnimationFrame(() => {
       ta.focus();
@@ -2793,8 +2841,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     });
   }
 
-  // 选择 @ 菜单某一行：「..」仍用于返回上级；目录/文件都插入完整相对路径。
-  function chooseAtRow(row: { name: string; is_dir: boolean; up?: boolean }) {
+  // 选择 @ 菜单某一行：「..」返回上级；搜索结果整体插入其完整相对路径（`full`）；
+  // 下钻行则拼上当前目录段。目录插入后保留 `/` 可继续下钻。
+  function chooseAtRow(row: { name: string; is_dir: boolean; up?: boolean; full?: string }) {
     if (row.up) {
       const trimmed = atDirPart.replace(/\/+$/, '');
       const idx = trimmed.lastIndexOf('/');
@@ -2812,6 +2861,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         const cursor = range.start + 1 + parent.length;
         ta.setSelectionRange(cursor, cursor);
       });
+    } else if (row.full !== undefined) {
+      // Search hit: `full` is already the complete cwd-relative path (dirs end
+      // with `/`), so insert it verbatim — don't re-prefix with atDirPart.
+      setAtMention(row.full, row.is_dir);
     } else {
       setAtMention(atDirPart + row.name + (row.is_dir ? '/' : ''), row.is_dir);
     }
@@ -3096,8 +3149,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       )}
       {atOpen && (
         <div class="at-popover" ref={atRef}>
-          {atLoading && <div class="at-loading">Loading...</div>}
-          {!atLoading && atRows.map((item, i) => (
+          {atMenuLoading && <div class="at-loading">Loading...</div>}
+          {!atMenuLoading && atRows.map((item, i) => (
             <button
               key={(item.up ? 'up:' : item.is_dir ? 'd:' : 'f:') + item.name}
               class={'at-row' + (i === atIndex ? ' active' : '')}
@@ -3110,13 +3163,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
               onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); chooseAtRow(item); }}
               onMouseEnter={() => setAtIndex(i)}
               type="button"
-              title={item.up ? '..' : atDirPart + item.name + (item.is_dir ? '/' : '')}
+              title={item.up ? '..' : (item.full ?? atDirPart + item.name + (item.is_dir ? '/' : ''))}
             >
               <span class="at-icon">{item.up ? '⬆' : item.is_dir ? '📁' : '📄'}</span>
-              <span class="at-name">{item.up ? '..' : atDirPart + item.name + (item.is_dir ? '/' : '')}</span>
+              <span class="at-name">{item.up ? '..' : (item.full ?? atDirPart + item.name + (item.is_dir ? '/' : ''))}</span>
             </button>
           ))}
-          {!atLoading && atRows.length === 0 && (
+          {!atMenuLoading && atRows.length === 0 && (
             <div class="at-empty">No files found</div>
           )}
         </div>

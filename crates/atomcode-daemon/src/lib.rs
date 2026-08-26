@@ -5903,6 +5903,51 @@ async fn fs_list(
 }
 
 #[derive(serde::Deserialize)]
+pub struct FsSearchQuery {
+    pub path: String,
+    /// The raw token typed after `@` (may embed a scope, e.g. `src/apply`).
+    #[serde(default)]
+    pub q: String,
+}
+
+/// Core of [`fs_search`], split out so it can be unit-tested without spinning
+/// the router: split the raw `@` token into `(scope_dir, filter)` and run the
+/// SAME gitignore-aware index the TUI popup uses, then shape the matches as
+/// JSON (`path` relative to `dir`, forward-slashed, dirs suffixed `/`). This is
+/// what guarantees the webui `@`-mention picker matches the CLI exactly.
+fn search_at_mention(dir: &std::path::Path, token: &str) -> Vec<serde_json::Value> {
+    let (scope, filter) = atomcode_capabilities::file_index::split_token(token);
+    atomcode_capabilities::file_index::FileIndex::search_blocking(dir, &scope, &filter)
+        .into_iter()
+        .map(|e| serde_json::json!({ "path": e.rel_path, "is_dir": e.is_dir }))
+        .collect()
+}
+
+/// Recursive, gitignore-aware `@`-mention search for the webui picker. Mirrors
+/// the CLI popup by sharing `FileIndex` with the TUI (see [`search_at_mention`]).
+/// The blocking full-tree walk runs on a blocking thread so it never stalls the
+/// async runtime. Path normalization matches [`fs_list`] so a match handed back
+/// to `/cd`/`/fs/open` lands in the same session bucket.
+async fn fs_search(
+    State(_state): State<AppState>,
+    Query(q): Query<FsSearchQuery>,
+) -> impl IntoResponse {
+    let expanded = normalize_dir_arg(&q.path);
+    let dir = expanded.canonicalize().unwrap_or(expanded);
+    let dir = atomcode_capabilities::pathnorm::strip_verbatim_path(&dir);
+    let search_dir = dir.clone();
+    let token = q.q.clone();
+    let matches = tokio::task::spawn_blocking(move || search_at_mention(&search_dir, &token))
+        .await
+        .unwrap_or_default();
+    Json(serde_json::json!({
+        "path": dir.to_string_lossy(),
+        "matches": matches,
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
 pub struct FsMkdirRequest {
     pub path: String,
 }
@@ -6294,6 +6339,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/skills", get(get_skills))
         // Filesystem API
         .route("/fs/list", get(fs_list))
+        .route("/fs/search", get(fs_search))
         .route("/fs/mkdir", post(fs_mkdir))
         .route("/fs/open", post(fs_open))
         // MCP API
@@ -8777,6 +8823,40 @@ mod tests {
         assert_eq!(files, vec!["a.txt".to_string(), "b.txt".to_string()]);
         // 目录不混入文件列表，但仍出现在 list_subdirs。
         assert!(list_subdirs(&tmp).unwrap().contains(&"subdir".to_string()));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // `/fs/search` core: a `@`-mention token must resolve to cross-level,
+    // gitignore-aware matches (the fuzzy behavior the webui was missing), shaped
+    // as `{path, is_dir}` relative to the search dir. Mirrors the CLI popup.
+    #[test]
+    fn search_at_mention_finds_cross_level_and_skips_gitignored() {
+        let tmp =
+            std::env::temp_dir().join(format!("atomcode_fs_search_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let deep = tmp.join("src/main/java/cn");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("ApplyStockController.java"), b"x").unwrap();
+        std::fs::write(tmp.join(".gitignore"), b"target/\n").unwrap();
+        std::fs::create_dir_all(tmp.join("target")).unwrap();
+        std::fs::write(tmp.join("target/ApplyStockGenerated.java"), b"x").unwrap();
+
+        let matches = search_at_mention(&tmp, "applystock");
+        let paths: Vec<String> = matches
+            .iter()
+            .map(|m| m["path"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            paths.iter().any(|p| p.ends_with("ApplyStockController.java")),
+            "must find the deep controller across levels: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("target/")),
+            "gitignored match must be excluded: {paths:?}"
+        );
+        // is_dir is carried through so the webui can keep drilling into a dir hit.
+        assert!(matches.iter().all(|m| m["is_dir"].is_boolean()));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

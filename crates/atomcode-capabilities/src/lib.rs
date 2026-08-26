@@ -147,6 +147,12 @@ pub mod setup;
 #[cfg(feature = "tools")]
 pub mod tools;
 
+/// `@`-mention infrastructure: token detection + a gitignore-aware project file
+/// index with cross-level substring matching. Shared by the TUI popup and the
+/// daemon `/fs/search` endpoint so the webui picker matches CLI behavior.
+#[cfg(feature = "tools")]
+pub mod file_index;
+
 /// External-agent subagent drivers: drive Claude Code / Codex as named subagent
 /// tools. Backend-neutral contract + CLI adapters. See
 /// `docs/plans/2026-08-21-external-agent-subagent-drivers-spec.md`.
