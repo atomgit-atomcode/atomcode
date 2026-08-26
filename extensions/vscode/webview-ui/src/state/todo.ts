@@ -8,6 +8,30 @@ type TodoOperation =
 
 const TODO_STATUSES = new Set<TodoStatus>(['pending', 'in_progress', 'completed']);
 
+// Lenient status parse for incremental `update` calls, mirroring the Rust
+// backend's `TodoStatus::parse_lenient` (issue #1456). Long-context turns
+// routinely emit near-miss variants (`done`, `in progress`, `InProgress`,
+// `已完成` …); rejecting them here would drop the update client-side and leave
+// the panel stale while the backend already advanced the task. Full-list plans
+// keep the strict `TODO_STATUSES` gate — the two sides must agree, and the Rust
+// `parse_todos` plan path is strict too.
+function normalizeTodoStatus(raw: string): TodoStatus | undefined {
+  switch (raw.trim().toLowerCase()) {
+    case 'pending': case 'todo': case 'open': case 'waiting':
+    case 'not started': case 'not_started': case '待办': case '未开始':
+      return 'pending';
+    case 'in_progress': case 'in-progress': case 'in progress': case 'inprogress':
+    case 'doing': case 'started': case 'active': case 'working': case 'running':
+    case '进行中': case '开发中':
+      return 'in_progress';
+    case 'completed': case 'complete': case 'done': case 'finished':
+    case 'closed': case 'resolved': case '已完成': case '完成':
+      return 'completed';
+    default:
+      return undefined;
+  }
+}
+
 export function isTodoToolName(name: string): boolean {
   return name === 'todowrite' || name === 'todo';
 }
@@ -54,14 +78,15 @@ function parseTodoOperation(name: string, args: string): TodoOperation | undefin
   if (value.action === 'update') {
     if (!Number.isSafeInteger(value.id)
       || (value.id as number) < 1
-      || typeof value.status !== 'string'
-      || !TODO_STATUSES.has(value.status as TodoStatus)) {
+      || typeof value.status !== 'string') {
       return undefined;
     }
+    const status = normalizeTodoStatus(value.status);
+    if (!status) return undefined;
     return {
       kind: 'update',
       id: value.id as number,
-      status: value.status as TodoStatus,
+      status,
     };
   }
 
