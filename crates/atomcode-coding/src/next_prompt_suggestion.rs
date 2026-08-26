@@ -19,6 +19,20 @@ const MAX_TOOL_ARGUMENT_CHARS: usize = 512;
 const MAX_TOOL_RESULT_CHARS: usize = 1_024;
 const SAMPLE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Output-token cap for the prediction request. This is the TOTAL completion
+/// budget (reasoning + visible text) — reasoning models emit their thinking
+/// FIRST, so a cap that's too tight is entirely consumed by reasoning and yields
+/// ZERO visible text (`output_chars=0`), silently dropping every suggestion.
+///
+/// The old 128 was fine for non-reasoning models (a ≤80-char suggestion is ~40
+/// tokens) but starved reasoning models like AtomGit `qwen3.8-27b`, which reason
+/// even at `low` effort (their floor — there is no "off"). 1024 leaves ample room
+/// for low-effort reasoning plus the one-line answer. It is a CAP, not a target:
+/// a non-reasoning model still stops after its sentence, so raising it is ~free
+/// for them. A model whose reasoning STILL overruns 1024 falls back to no
+/// suggestion — the same best-effort, silent degradation as before, not a regression.
+const SAMPLE_MAX_TOKENS: u32 = 1_024;
+
 const INSTRUCTIONS: &str = r#"Predict the short message the user is most likely to type next.
 
 FIRST: Look at the user's recent messages and original request. Use the tool execution records as authoritative evidence of what has already happened.
@@ -41,10 +55,9 @@ pub(crate) async fn generate_next_prompt_suggestion(
     let request = [Message::user(prompt)];
     let options = ChatOptions {
         reasoning_effort: Some(ReasoningEffort::Low),
-        // Reasoning providers may consume part of this budget before emitting
-        // the short visible answer. Keep the request small, but leave enough
-        // room for providers such as DeepSeek to produce a text delta.
-        max_tokens: Some(128),
+        // TOTAL budget (reasoning + visible). See `SAMPLE_MAX_TOKENS` — too tight
+        // and a reasoning model spends it all thinking and emits no suggestion.
+        max_tokens: Some(SAMPLE_MAX_TOKENS),
         temperature: Some(0.2),
         tool_choice: ToolChoice::None,
         ..ChatOptions::default()
