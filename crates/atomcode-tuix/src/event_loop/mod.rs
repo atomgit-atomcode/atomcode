@@ -8164,13 +8164,10 @@ mod tool_format_tests {
     /// middle-dot separators instead.
     #[test]
     fn display_tool_name_splits_mcp_server_and_tool() {
-        assert_eq!(
-            display_tool_name("mcp__zouwu__query"),
-            "mcp · zouwu · query"
-        );
+        assert_eq!(display_tool_name("mcp__zouwu__query"), "zouwu · query");
         assert_eq!(
             display_tool_name("mcp__zouwu-mcp-server__query_requirements"),
-            "mcp · zouwu-mcp-server · query_requirements"
+            "zouwu-mcp-server · query_requirements"
         );
     }
 
@@ -8214,13 +8211,10 @@ mod tool_format_tests {
     /// `mcp · fs · read`.
     #[test]
     fn display_tool_name_short_keeps_mcp_suffix() {
-        assert_eq!(
-            display_tool_name_short("mcp__fs__read_file"),
-            "mcp · fs · read_file"
-        );
+        assert_eq!(display_tool_name_short("mcp__fs__read_file"), "fs · read_file");
         assert_eq!(
             display_tool_name_short("mcp__playwright-mcp-server__browser_snapshot"),
-            "mcp · playwright-mcp-server · browser_snapshot"
+            "playwright-mcp-server · browser_snapshot"
         );
     }
 
@@ -8300,6 +8294,32 @@ mod tool_format_tests {
     fn format_tool_detail_invalid_json_returns_empty() {
         let out = format_tool_detail("read_file", "not json");
         assert_eq!(out, "");
+    }
+
+    #[test]
+    fn format_tool_detail_mcp_string_arg_is_unescaped_and_truncated() {
+        // A JSON string value must NOT be quote-escaped (no `\"` leak) and long
+        // values truncate rather than flooding the row.
+        let args = r#"{"regex":"Create pull request|Open a pull request"}"#;
+        let out = format_tool_detail("mcp__playwright__browser_find", args);
+        assert_eq!(out, "regex: Create pull request|Open a pull request");
+        assert!(!out.contains("\\\""), "must not escape quotes: {out}");
+
+        let long = format!(r#"{{"code":"{}"}}"#, "x".repeat(300));
+        let out = format_tool_detail("mcp__playwright__browser_run_code_unsafe", &long);
+        assert!(out.starts_with("code: "));
+        assert!(out.chars().count() < 100, "long code must truncate: {out}");
+        assert!(out.contains('…'));
+    }
+
+    #[test]
+    fn format_tool_detail_mcp_nested_args_collapse_to_counts() {
+        // Arrays/objects summarize to `[N items]` / `{N keys}` (no JSON dump).
+        let args = r#"{"fields":[{"name":"a"},{"name":"b"}],"opts":{"x":1,"y":2,"z":3}}"#;
+        let out = format_tool_detail("mcp__playwright__browser_fill_form", args);
+        assert!(out.contains("fields: [2 items]"), "{out}");
+        assert!(out.contains("opts: {3 keys}"), "{out}");
+        assert!(!out.contains('\\'), "no escaped JSON dump: {out}");
     }
 
     #[test]
@@ -8599,6 +8619,19 @@ mod tool_format_tests {
     #[test]
     fn summarise_single_line_returned_as_is() {
         assert_eq!(summarise("ok"), "ok");
+    }
+
+    #[test]
+    fn summarise_mcp_result_strips_markdown_heading() {
+        // MCP markdown result: `### Result` → `Result (N lines)`.
+        assert_eq!(
+            summarise_mcp_result("### Result\na\nb"),
+            "Result (3 lines)"
+        );
+        assert_eq!(summarise_mcp_result("### Error\nboom"), "Error (2 lines)");
+        // A `#` with no following space (shell shebang / comment) is untouched.
+        assert_eq!(summarise_mcp_result("#!/bin/sh"), "#!/bin/sh");
+        assert_eq!(summarise_mcp_result("#nospace"), "#nospace");
     }
 
     #[test]
@@ -26120,6 +26153,10 @@ fn handle_agent_event(
                         // Collapse the `{line}\t{indented content}` preview so a
                         // deeply-indented line doesn't render as a big left gap.
                         summarise_read_result(&output)
+                    } else if name.starts_with("mcp__") {
+                        // MCP results are often markdown — strip a leading `###`
+                        // so `### Result` folds to `Result (N lines)`.
+                        summarise_mcp_result(&output)
                     } else {
                         summarise(&output)
                     };
@@ -28763,7 +28800,10 @@ fn format_spinner_label(
 pub fn display_tool_name(snake: &str) -> String {
     if let Some(rest) = snake.strip_prefix("mcp__") {
         if let Some((server, tool)) = rest.split_once("__") {
-            return format!("mcp · {} · {}", server, tool);
+            // `<server> · <tool>` — the server name (e.g. `playwright`) already
+            // signals this is an external MCP call, so the literal `mcp ·` prefix
+            // was redundant (opencode/codex/omp all omit it).
+            return format!("{} · {}", server, tool);
         }
     }
     pascal_case(snake)
@@ -29099,29 +29139,38 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             // parameters are being passed to the external server.
             if name.starts_with("mcp__") {
                 if let Some(obj) = v.as_object() {
+                    // Compact, readable `key: value` — NOT escaped JSON. A long
+                    // string (e.g. a `code` blob) is truncated per-value; nested
+                    // arrays/objects collapse to a `[N items]` / `{N keys}` summary
+                    // (oh-my-pi style) so a big `fields` payload never floods the
+                    // row. The whole detail is then capped so one MCP call can't
+                    // span several transcript lines.
                     let pairs: Vec<String> = obj
                         .iter()
                         .filter_map(|(k, val)| {
                             let s = match val {
-                                serde_json::Value::String(s) => s.clone(),
+                                serde_json::Value::String(s) if !s.is_empty() => {
+                                    crate::width::truncate_with_ellipsis(s, 80)
+                                }
                                 serde_json::Value::Number(n) => n.to_string(),
                                 serde_json::Value::Bool(b) => b.to_string(),
-                                serde_json::Value::Array(a) => {
-                                    serde_json::to_string(a).unwrap_or_default()
-                                }
-                                serde_json::Value::Object(o) => {
-                                    serde_json::to_string(o).unwrap_or_default()
-                                }
+                                serde_json::Value::Array(a) => match a.len() {
+                                    0 => return None,
+                                    1 => "[1 item]".to_string(),
+                                    n => format!("[{n} items]"),
+                                },
+                                serde_json::Value::Object(o) => match o.len() {
+                                    0 => return None,
+                                    1 => "{1 key}".to_string(),
+                                    n => format!("{{{n} keys}}"),
+                                },
                                 _ => return None,
                             };
-                            if s.is_empty() {
-                                return None;
-                            }
-                            Some(format!("{}: \"{}\"", k, s.replace('"', "\\\"")))
+                            Some(format!("{k}: {s}"))
                         })
                         .collect();
                     if !pairs.is_empty() {
-                        return crate::width::truncate_with_ellipsis(&pairs.join(", "), 450);
+                        return crate::width::truncate_with_ellipsis(&pairs.join(", "), 160);
                     }
                 }
             }
@@ -29510,6 +29559,35 @@ pub(crate) fn summarise(output: &str) -> String {
     // `truncate_with_ellipsis` (not bare `truncate_to_width`) so that if
     // the safety bound ever does bite, the cut is visibly marked.
     let trimmed = crate::width::truncate_with_ellipsis(first, 512);
+    if n > 1 {
+        format!("{} ({} lines)", trimmed, n)
+    } else {
+        trimmed
+    }
+}
+
+/// Strip a leading ATX markdown heading marker (`#`..`######` followed by a
+/// space) from a line. MCP servers often return markdown, so a result whose
+/// first line is `### Result` should preview as `Result`, not leak the `###`.
+/// Requires the trailing space so a shell first line like `#!/bin/sh` or
+/// `#comment` (no space after `#`) is left untouched.
+fn strip_atx_heading(line: &str) -> &str {
+    let hashes = line.len() - line.trim_start_matches('#').len();
+    let rest = &line[hashes..];
+    if (1..=6).contains(&hashes) && rest.starts_with(' ') {
+        rest.trim_start()
+    } else {
+        line
+    }
+}
+
+/// Like [`summarise`], but for MCP tool results: the folded preview's first line
+/// has any leading markdown heading stripped (see [`strip_atx_heading`]) so a
+/// server returning `### Result\n…` folds to `Result (N lines)`.
+pub(crate) fn summarise_mcp_result(output: &str) -> String {
+    let first = output.lines().next().unwrap_or("(no output)");
+    let n = output.lines().count();
+    let trimmed = crate::width::truncate_with_ellipsis(strip_atx_heading(first), 512);
     if n > 1 {
         format!("{} ({} lines)", trimmed, n)
     } else {
