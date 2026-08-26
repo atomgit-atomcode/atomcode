@@ -55,25 +55,31 @@ pub const OPENROUTER_ATTRIBUTION_HEADERS: &[(&str, &str); 3] = &[
 /// host). Used to gate the attribution headers — they are meaningless, and would
 /// only leak product identity, on any other OpenAI-compatible endpoint.
 ///
-/// Hand-rolled (no `url` crate): that dep is optional to this crate and only pulled
-/// by the `web`/`mcp` features, while the provider adapter compiles under `provider`
-/// alone. We only need the host, so strip the scheme and any path/port manually.
+/// Hand-rolled host extraction (no `url` crate — that dep is optional to this
+/// crate, pulled only by `web`/`mcp`, while the provider adapter compiles under
+/// `provider` alone). The label-aware suffix match reuses
+/// [`atomcode_config::endpoints::host_matches_domain`] so it agrees with the rest
+/// of the codebase and can't drift.
 pub fn is_openrouter_url(url: &str) -> bool {
     let authority = url
         .split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(url);
-    // Host = everything before the first `/` (path) or `?` (query) or `#` (fragment).
-    let host = authority
+    // Host = the authority minus path/query/fragment...
+    let host_port = authority
         .split(['/', '?', '#'])
         .next()
         .unwrap_or(authority);
-    // Drop an explicit `:port` if present.
-    let host = host.split(':').next().unwrap_or(host);
-    host.eq_ignore_ascii_case("openrouter.ai")
-        || host
-            .to_ascii_lowercase()
-            .ends_with(".openrouter.ai")
+    // ...minus any `userinfo@` prefix. Without this, a crafted
+    // `https://openrouter.ai:x@evil.com/…` would parse the userinfo `openrouter.ai`
+    // as the host and leak the attribution headers to `evil.com`.
+    let host_port = host_port
+        .rsplit_once('@')
+        .map(|(_userinfo, host)| host)
+        .unwrap_or(host_port);
+    // ...minus an explicit `:port`.
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    atomcode_config::endpoints::host_matches_domain(host, "openrouter.ai")
 }
 
 /// Attach the OpenRouter app-attribution headers to `req` when `url` targets
@@ -3784,12 +3790,18 @@ mod tests {
         assert!(is_openrouter_url("https://openrouter.ai/api/v1/chat/completions"));
         // Subdomains count as OpenRouter too.
         assert!(is_openrouter_url("https://api.openrouter.ai/v1"));
+        // Legit userinfo on the real host still matches (host is after `@`).
+        assert!(is_openrouter_url("https://user:pass@openrouter.ai/v1"));
         // Look-alikes / other endpoints must NOT match.
         assert!(!is_openrouter_url("https://api.deepseek.com/v1"));
         assert!(!is_openrouter_url("https://llm-api.atomgit.com/v1"));
         assert!(!is_openrouter_url("https://evilopenrouter.ai/v1"));
         assert!(!is_openrouter_url("https://notopenrouter.ai/v1"));
         assert!(!is_openrouter_url("https://openrouter.ai.evil.com/v1"));
+        // Userinfo spoof: real host is evil.com — the `openrouter.ai:x@` is
+        // userinfo, NOT the host. Must not leak attribution headers to evil.com.
+        assert!(!is_openrouter_url("https://openrouter.ai:x@evil.com/v1"));
+        assert!(!is_openrouter_url("https://openrouter.ai@evil.com/v1"));
         assert!(!is_openrouter_url("not a url"));
     }
 
