@@ -20,18 +20,24 @@ const MAX_TOOL_RESULT_CHARS: usize = 1_024;
 const SAMPLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Output-token cap for the prediction request. This is the TOTAL completion
-/// budget (reasoning + visible text) — reasoning models emit their thinking
-/// FIRST, so a cap that's too tight is entirely consumed by reasoning and yields
-/// ZERO visible text (`output_chars=0`), silently dropping every suggestion.
+/// budget (reasoning + visible text): a reasoning model emits its thinking
+/// FIRST, so if the cap is exhausted while thinking, ZERO visible text comes
+/// back (`output_chars=0`) and the suggestion is silently dropped.
 ///
-/// The old 128 was fine for non-reasoning models (a ≤80-char suggestion is ~40
-/// tokens) but starved reasoning models like AtomGit `qwen3.8-27b`, which reason
-/// even at `low` effort (their floor — there is no "off"). 1024 leaves ample room
-/// for low-effort reasoning plus the one-line answer. It is a CAP, not a target:
-/// a non-reasoning model still stops after its sentence, so raising it is ~free
-/// for them. A model whose reasoning STILL overruns 1024 falls back to no
-/// suggestion — the same best-effort, silent degradation as before, not a regression.
-const SAMPLE_MAX_TOKENS: u32 = 1_024;
+/// Kept small (128) on purpose. A ≤80-char suggestion is ~40 tokens, so this is
+/// ample for a non-reasoning model AND for a light-reasoning one like
+/// deepseek-v4-flash (which reasons briefly at `low` effort and still fits).
+///
+/// A heavy-reasoning model like AtomGit `qwen3.8-27b` (which reasons even at
+/// `low` — its floor, there is no "off") overruns 128 and gets no suggestion.
+/// Raising the cap does NOT help there: its gateway rejects a larger cap with a
+/// generic HTTP 400, so a bigger budget only trades "empty answer" for "failed
+/// request" — no gain, plus error noise. The real fix for such models is
+/// suppressing thinking on this prediction request (`enable_thinking:false` /
+/// `/no_think`), which needs per-endpoint support this qwen gateway does not
+/// reliably offer. Until then a heavy-reasoning model simply gets no
+/// suggestion — acceptable best-effort degradation.
+const SAMPLE_MAX_TOKENS: u32 = 128;
 
 const INSTRUCTIONS: &str = r#"Predict the short message the user is most likely to type next.
 
