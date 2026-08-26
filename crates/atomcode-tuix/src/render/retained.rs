@@ -60,6 +60,19 @@ struct BodyCopyRun {
     next_run_id: Option<u64>,
 }
 
+/// The composer ghost line for a next-prompt suggestion: a dim `Tab: <suggestion>`
+/// hint advertising the accept key (Tab or →). Returns `None` when there is no
+/// usable suggestion so both the paint and the height pass agree on whether the
+/// ghost row exists. The `Tab:` prefix is display-only — accepting stores the raw
+/// suggestion, and the hint vanishes the instant the buffer is non-empty.
+pub(crate) fn next_prompt_ghost_line(suggestion: Option<&str>) -> Option<String> {
+    let raw = suggestion?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(format!("Tab: {}", scrub_controls(raw)))
+}
+
 fn composer_cell_bytes(
     source: &str,
     lines: &[String],
@@ -4632,21 +4645,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let text_budget = crate::width::composer_text_width(input_rule_width, self.caps.jediterm);
 
         // Wrap input + locate cursor in wrapped layout.
-        let ghost_active = self.input_buf.is_empty()
-            && self
-                .status
-                .next_prompt_suggestion
-                .as_deref()
-                .is_some_and(|text| !text.is_empty());
-        let safe = if ghost_active {
-            scrub_controls(
-                self.status
-                    .next_prompt_suggestion
-                    .as_deref()
-                    .unwrap_or_default(),
-            )
+        let ghost_line = if self.input_buf.is_empty() {
+            next_prompt_ghost_line(self.status.next_prompt_suggestion.as_deref())
         } else {
-            scrub_controls(&self.input_buf)
+            None
+        };
+        let ghost_active = ghost_line.is_some();
+        let safe = match ghost_line {
+            Some(line) => line,
+            None => scrub_controls(&self.input_buf),
         };
         let (display, display_cursor_byte) =
             crate::markdown::normalize_circled_list_spacing_with_cursor(
@@ -5841,10 +5848,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let text_budget = crate::width::composer_text_width(screen_width, self.caps.jediterm);
         let rule_width = screen_width.saturating_sub(PAD_COL * 2);
         let safe = if self.input_buf.is_empty() {
-            self.status
-                .next_prompt_suggestion
-                .as_deref()
-                .map(scrub_controls)
+            next_prompt_ghost_line(self.status.next_prompt_suggestion.as_deref())
                 .unwrap_or_default()
         } else {
             scrub_controls(&self.input_buf)
@@ -10386,6 +10390,17 @@ fn spinner_meta_suffix(label: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_prompt_ghost_line_prefixes_tab_hint_and_skips_empty() {
+        assert_eq!(
+            next_prompt_ghost_line(Some("继续审计代码改动")).as_deref(),
+            Some("Tab: 继续审计代码改动")
+        );
+        // No suggestion / blank suggestion → no ghost row at all.
+        assert_eq!(next_prompt_ghost_line(None), None);
+        assert_eq!(next_prompt_ghost_line(Some("   ")), None);
+    }
 
     #[test]
     fn combined_footer_widgets_fit_short_terminal() {

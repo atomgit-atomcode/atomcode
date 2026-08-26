@@ -6145,6 +6145,42 @@ mod buffer_tests {
     }
 
     #[test]
+    fn next_prompt_suggestion_accept_keys_are_tab_and_right_arrow() {
+        use crossterm::event::KeyModifiers;
+        // Right-arrow (existing) and bare Tab (new) both accept. A bare Tab
+        // classifies to `Action::Complete` (key_action.rs), so the predicate must
+        // accept it via the `code == Tab` branch even though the action isn't
+        // CursorRight — pass the REAL classified action here to prove that path.
+        assert!(accepts_next_prompt_suggestion(
+            Action::CursorRight,
+            KeyCode::Right,
+            KeyModifiers::NONE
+        ));
+        assert!(accepts_next_prompt_suggestion(
+            Action::Complete,
+            KeyCode::Tab,
+            KeyModifiers::NONE
+        ));
+        // Shift+Tab classifies to NoOp and stays a mode-cycle key, never an accept.
+        assert!(!accepts_next_prompt_suggestion(
+            Action::NoOp,
+            KeyCode::Tab,
+            KeyModifiers::SHIFT
+        ));
+        // Unrelated keys / modified arrows do not accept.
+        assert!(!accepts_next_prompt_suggestion(
+            Action::Submit,
+            KeyCode::Enter,
+            KeyModifiers::NONE
+        ));
+        assert!(!accepts_next_prompt_suggestion(
+            Action::CursorRight,
+            KeyCode::Right,
+            KeyModifiers::CONTROL
+        ));
+    }
+
+    #[test]
     fn restore_cancelled_text_prepends_before_existing_draft() {
         let mut b = Buffer::new();
         // User started typing a new message while the previous turn ran.
@@ -15561,6 +15597,18 @@ fn menu_handles_selection_key(
         && (code != KeyCode::Enter || idle_menu_confirmation_allowed(commit_gate_pending))
 }
 
+/// Keys that accept the next-prompt ghost suggestion when the composer is empty:
+/// Right-arrow (`CursorRight`) or a bare `Tab`, both without modifiers. Shift+Tab
+/// is excluded so it keeps cycling input modes; the caller still gates on an empty
+/// buffer, so a bare Tab is otherwise inert here (no menu/mode owns it).
+fn accepts_next_prompt_suggestion(
+    action: Action,
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> bool {
+    modifiers.is_empty() && (action == Action::CursorRight || code == KeyCode::Tab)
+}
+
 fn idle_menu_confirmation_allowed(commit_gate_pending: bool) -> bool {
     !commit_gate_pending
 }
@@ -16346,7 +16394,7 @@ fn handle_idle_key(
 
     let action = classify(code, modifiers);
 
-    if action == Action::CursorRight && modifiers.is_empty() && app.buf.text.is_empty() {
+    if accepts_next_prompt_suggestion(action, code, modifiers) && app.buf.text.is_empty() {
         if let Some(suggestion) = app.state.next_prompt_suggestion.clone() {
             if app.buf.accept_next_prompt_suggestion(&suggestion) {
                 app.state.next_prompt_suggestion = None;
