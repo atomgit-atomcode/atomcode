@@ -30,6 +30,72 @@ use serde_json::{json, Map, Value};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
+// OpenRouter app attribution
+// ---------------------------------------------------------------------------
+
+/// App-attribution headers sent to OpenRouter so real user traffic is credited
+/// to a public "AtomCode" app entry on openrouter.ai (rankings / app page).
+///
+/// Per OpenRouter's app-attribution contract:
+///   - `HTTP-Referer` is the app's STABLE identifier (primary domain) — it alone
+///     creates the app page;
+///   - `X-OpenRouter-Title` is the display name on the rankings;
+///   - `X-OpenRouter-Categories` places the app in the marketplace categories.
+///
+/// These are sent ONLY when the request actually targets `openrouter.ai` (see
+/// [`is_openrouter_url`]) so other OpenAI-compatible endpoints — including
+/// AtomGit's own signing gateway — never receive them.
+pub const OPENROUTER_ATTRIBUTION_HEADERS: &[(&str, &str); 3] = &[
+    ("HTTP-Referer", "https://gitcode.com/atomgit_atomcode/atomcode"),
+    ("X-OpenRouter-Title", "AtomCode"),
+    ("X-OpenRouter-Categories", "cli-agent"),
+];
+
+/// True when `url` targets the OpenRouter API (any path under the `openrouter.ai`
+/// host). Used to gate the attribution headers — they are meaningless, and would
+/// only leak product identity, on any other OpenAI-compatible endpoint.
+///
+/// Hand-rolled (no `url` crate): that dep is optional to this crate and only pulled
+/// by the `web`/`mcp` features, while the provider adapter compiles under `provider`
+/// alone. We only need the host, so strip the scheme and any path/port manually.
+pub fn is_openrouter_url(url: &str) -> bool {
+    let authority = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url);
+    // Host = everything before the first `/` (path) or `?` (query) or `#` (fragment).
+    let host = authority
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(authority);
+    // Drop an explicit `:port` if present.
+    let host = host.split(':').next().unwrap_or(host);
+    host.eq_ignore_ascii_case("openrouter.ai")
+        || host
+            .to_ascii_lowercase()
+            .ends_with(".openrouter.ai")
+}
+
+/// Attach the OpenRouter app-attribution headers to `req` when `url` targets
+/// OpenRouter. Credit real user traffic to the public "AtomCode" app entry so
+/// it can appear in openrouter.ai rankings. Gated to `openrouter.ai` only —
+/// the headers are meaningless on any other OpenAI-compatible endpoint and
+/// would only leak product identity there.
+fn apply_openrouter_attribution(
+    url: &str,
+    req: reqwest::RequestBuilder,
+) -> reqwest::RequestBuilder {
+    if !is_openrouter_url(url) {
+        return req;
+    }
+    let mut req = req;
+    for (name, value) in OPENROUTER_ATTRIBUTION_HEADERS {
+        req = req.header(*name, *value);
+    }
+    req
+}
+
+// ---------------------------------------------------------------------------
 // Config + provider
 // ---------------------------------------------------------------------------
 
@@ -704,6 +770,7 @@ async fn open_stream(
         if !session_id.is_empty() {
             req = req.header("x-atomcode-session-id", session_id);
         }
+        req = apply_openrouter_attribution(url, req);
         let was_capped = tls12_probe || atomcode_config::tls::should_cap_url(url);
         // TTFB watchdog for THIS attempt. `send()` resolves as soon as the response
         // HEAD arrives, so wrapping it never truncates a slow streaming body — it only
@@ -3704,6 +3771,66 @@ mod tests {
             head.contains("user-agent: atomcode"),
             "UA fallback must still be present: {head}"
         );
+    }
+
+    // ---- OpenRouter app attribution ----
+
+    #[test]
+    fn is_openrouter_url_matches_only_openrouter_hosts() {
+        // Real OpenRouter endpoints (any path, http or https, explicit port).
+        assert!(is_openrouter_url("https://openrouter.ai/api/v1"));
+        assert!(is_openrouter_url("https://openrouter.ai"));
+        assert!(is_openrouter_url("http://openrouter.ai:443/api/v1/chat/completions"));
+        assert!(is_openrouter_url("https://openrouter.ai/api/v1/chat/completions"));
+        // Subdomains count as OpenRouter too.
+        assert!(is_openrouter_url("https://api.openrouter.ai/v1"));
+        // Look-alikes / other endpoints must NOT match.
+        assert!(!is_openrouter_url("https://api.deepseek.com/v1"));
+        assert!(!is_openrouter_url("https://llm-api.atomgit.com/v1"));
+        assert!(!is_openrouter_url("https://evilopenrouter.ai/v1"));
+        assert!(!is_openrouter_url("https://notopenrouter.ai/v1"));
+        assert!(!is_openrouter_url("https://openrouter.ai.evil.com/v1"));
+        assert!(!is_openrouter_url("not a url"));
+    }
+
+    #[test]
+    fn apply_openrouter_attribution_only_targets_openrouter() {
+        let client = reqwest::Client::new();
+
+        // OpenRouter endpoint → all three attribution headers present.
+        let req = client
+            .post("https://openrouter.ai/api/v1/chat/completions")
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        let built = apply_openrouter_attribution(
+            "https://openrouter.ai/api/v1/chat/completions",
+            req,
+        )
+        .build()
+        .expect("request must build");
+        for (name, value) in OPENROUTER_ATTRIBUTION_HEADERS {
+            assert_eq!(
+                built.headers().get(*name).and_then(|v| v.to_str().ok()),
+                Some(*value),
+                "{name} must be set on openrouter.ai"
+            );
+        }
+
+        // Non-OpenRouter endpoint → NONE of the attribution headers leak.
+        let req = client
+            .post("https://api.deepseek.com/v1/chat/completions")
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        let built = apply_openrouter_attribution(
+            "https://api.deepseek.com/v1/chat/completions",
+            req,
+        )
+        .build()
+        .expect("request must build");
+        for (name, _) in OPENROUTER_ATTRIBUTION_HEADERS {
+            assert!(
+                !built.headers().contains_key(*name),
+                "{name} must not be sent to non-OpenRouter endpoints"
+            );
+        }
     }
 
     // ---- reasoning_effort 400 self-heal (b2) ----
