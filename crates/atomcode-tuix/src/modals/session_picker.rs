@@ -281,8 +281,18 @@ impl SessionPicker {
         let runtime_id = ctx.foreground_runtime_id;
         let preparation = pending.clone();
         tokio::spawn(async move {
+            // The prepare step is internally bounded: a finite catalog scan, a
+            // NON-blocking lease acquire, and a fork-on-busy fallback that only
+            // ever meta-locks a fresh fork id (never contended). So a genuinely
+            // busy session forks fast — it does NOT hang here. What actually
+            // takes time is bounded I/O: scanning a large catalog and converging
+            // a large session (long tasks re-serialize a big snapshot). The old
+            // 15s cap killed that legitimate work mid-flight and then blamed
+            // "another process", which is almost never the real cause. Keep only
+            // a generous backstop against a truly wedged filesystem, and word the
+            // expiry honestly — we cannot assert the session is in use.
             let result = tokio::time::timeout(
-                std::time::Duration::from_secs(15),
+                std::time::Duration::from_secs(60),
                 tokio::task::spawn_blocking(move || {
                     atomcode_daemon::legacy_convert::prepare_catalog_session_resume_or_fork_in_project(
                         &preparation.project_bucket,
@@ -298,7 +308,7 @@ impl SessionPicker {
             .await;
             let result = match result {
                 Ok(joined) => flatten_session_preparation(joined),
-                Err(_) => Err("session preparation timed out after 15 seconds; the session may be in use by another process".into()),
+                Err(_) => Err("session preparation is taking unusually long (large session or slow disk); please try again".into()),
             };
             let _ = event_tx.send(crate::event_loop::bg_runtime::RuntimeEvent {
                 runtime_id,
