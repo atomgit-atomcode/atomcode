@@ -1293,9 +1293,8 @@ fn open_error(e: reqwest::Error) -> ProviderError {
     ProviderError {
         // Broadened: also retry stale-keep-alive resets (is_connect()==false).
         retryable: retry::is_retryable_reqwest_error(&e),
-        // Surface the full source chain so the cause (connection reset / dns /
-        // proxy) is visible in the error line instead of the opaque shell.
-        message: format!("open failed: {}", retry::err_chain(&e)),
+        // Shared builder surfaces the full chain + an unreachable-proxy hint.
+        message: retry::open_failed_message(&e),
         ..Default::default()
     }
 }
