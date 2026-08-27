@@ -25105,28 +25105,18 @@ fn handle_coding_runtime_event(
             }
         }
         CodingRuntimeEvent::CompactionFinished { completion } => {
-            let compaction_was_announced = state.compacting;
             state.compacting = false;
             match completion {
                 CompactionCompletion::Completed(outcome) if outcome.committed => {
                     state.on_compaction_committed(outcome.estimated_tokens_after);
-                    // Match OpenCode/Codex: cheap, automatic pruning of stale
-                    // tool output is invisible transcript maintenance. Keep the
-                    // context gauge authoritative, but do not append a body row
-                    // or flush while the foreground turn is preparing its next
-                    // model request. Slow drain/summarize compaction announces
-                    // itself before running and remains visible even when replacing
-                    // one message with one summary produces zero net removals.
-                    // Manual and overflow paths retain their existing feedback.
-                    //
-                    // NOTE: the TUI keys on `!announced` (it sees CompactionStarted),
-                    // which is STRICTER than the driver-neutral
-                    // `outcome.is_silent_auto_tool_fold()` the daemon/webui use — the
-                    // latter can't see the announce and would silence an announced
-                    // auto-summary that netted zero removals (covered by a test here).
-                    // Unifying both onto one signal needs a kernel `stub_only` flag.
-                    let silent_tool_fold = matches!(&outcome.trigger, CompactTrigger::Auto { .. })
-                        && !compaction_was_announced;
+                    // Match OpenCode/Codex: ALL automatic compaction — cheap stub
+                    // folds AND slow drain/summarize — is invisible transcript
+                    // maintenance. Keep the context gauge authoritative, but never
+                    // append a body row: a "saved ~N tok" mark is noise and misreads
+                    // as "wasting tokens" when it is in fact SAVING context. Only
+                    // MANUAL and OVERFLOW compactions keep their feedback (separate
+                    // arms below).
+                    let silent_tool_fold = matches!(&outcome.trigger, CompactTrigger::Auto { .. });
                     if mirror_persisted && !silent_tool_fold {
                         renderer.render(UiLine::CompactionMark(
                             atomcode_config::i18n::format_compaction_mark(
@@ -25406,7 +25396,7 @@ mod coding_runtime_event_tests {
     }
 
     #[test]
-    fn announced_automatic_summary_with_zero_net_removals_remains_visible() {
+    fn announced_automatic_summary_is_silent() {
         let mut state = UiState::default();
         state.phase = UiPhase::Streaming;
         let mut think = ThinkStripper::default();
@@ -25438,8 +25428,9 @@ mod coding_runtime_event_tests {
         assert!(!state.compacting);
         assert!(matches!(state.phase, UiPhase::Streaming));
         assert!(
-            !output.is_empty(),
-            "an announced automatic summary must render its completion marker"
+            output.is_empty(),
+            "automatic compaction is silent transcript maintenance — no completion marker (got: {})",
+            String::from_utf8_lossy(&output)
         );
     }
 
